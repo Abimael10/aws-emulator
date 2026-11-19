@@ -1140,6 +1140,24 @@ pub fn absent_bucket_message(bucket: &str) -> String {
     format!("S3 Bucket {bucket} does not exist.")
 }
 
+/// A destination table of an Apache Iceberg destination that Firehose could not read out of
+/// the Data Catalog: the role it would have read it with, stated as the refusal states it.
+///
+/// Beside [`absent_bucket_message`] for the same reason, and the same shape of sentence: the
+/// resource a destination names is resolved before the configuration is written, and the
+/// refusal names the call Firehose makes for it. Firehose reads the table with the
+/// configuration's role and states one refusal for both halves of that answer — a role that
+/// may not make the call and a table the catalog does not hold — because the caller learns the
+/// same thing from either. The ROLE is the only variable part: it is the caller's own value,
+/// and the table is not named at all, so the sentence discloses nothing about what this
+/// account's catalog does hold.
+pub fn unreadable_glue_table_message(role_arn: &str) -> String {
+    format!(
+        "Role {role_arn} is not authorized to perform: glue:GetTable for the given table or \
+         the table does not exist."
+    )
+}
+
 /// The `com-amazonaws-firehose-firehose-20150804` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///

@@ -293,6 +293,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_argument(message));
         }
 
+        // And the Data Catalog target an Iceberg update names is resolved before anything is
+        // written, exactly as the create path resolves the one a create names: an update that
+        // repoints a destination at a table the Data Catalog cannot serve is the same argument
+        // fault, and the stream keeps the destination it had.
+        //
+        // Only for an update that really lands on a stored Iceberg destination: an update naming
+        // no such stream or destination, or one holding a configuration of another kind, is a
+        // fault of its own that the walk below answers, and the target it would have written is
+        // beside the point.
+        if let Some(update) = input.iceberg_destination_update.as_ref() {
+            // The configuration in force is read under THIS service's lock, which is released
+            // before the Data Catalog is read: the two stores are never held at once.
+            if let Some(stored) = stored_iceberg_destination(&state, &input) {
+                if let Some(message) =
+                    unresolvable_update_target(&*self.engine, &stored, update)
+                {
+                    return Err(invalid_argument(message));
+                }
+            }
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.materialise_due(now);
@@ -376,6 +397,63 @@ fn invalid_argument(message: String) -> UpdateDestinationError {
         message: Some(message),
     })
     .into()
+}
+
+/// The Iceberg configuration of the destination this update addresses, cloned out from under
+/// this service's lock.
+///
+/// `None` when the update names no such stream or destination, and when the destination it
+/// names holds a configuration of another kind — each of those is a case this handler answers
+/// on its own, with the stream's own state untouched.
+fn stored_iceberg_destination(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsFirehoseFirehose20150804State>,
+    input: &UpdateDestinationInput,
+) -> Option<IcebergDestinationConfiguration> {
+    let store = state.lock();
+    let destination = store
+        .streams
+        .get(&input.delivery_stream_name)?
+        .destinations
+        .iter()
+        .find(|destination| destination.destination_id == input.destination_id)?;
+    match &destination.config {
+        crate::state::DestinationConfigKind::Iceberg(config) => Some((**config).clone()),
+        _ => None,
+    }
+}
+
+/// Why the Data Catalog cannot serve the destination tables `update` names, worded as the
+/// refusal states it; `None` when the update lists none, or lists only tables Firehose can
+/// read.
+///
+/// The gate is over the tables the UPDATE carries, because an update changes only what it
+/// carries: the list `stored` already holds was resolved when it was written. Each of the three
+/// things the resolution needs — the catalog, the role Firehose reads the tables with, and
+/// whether the destination creates missing tables itself — is the update's own where it carries
+/// it and `stored`'s where it does not, which is the configuration the merge leaves in force.
+fn unresolvable_update_target<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    stored: &IcebergDestinationConfiguration,
+    update: &IcebergDestinationUpdate,
+) -> Option<String> {
+    let role_arn = update.role_arn.clone().unwrap_or_else(|| stored.role_arn.clone());
+    let catalog_arn = update
+        .catalog_configuration
+        .as_ref()
+        .and_then(|configured| configured.catalog_arn.clone())
+        .or_else(|| stored.catalog_configuration.catalog_arn.clone());
+    let creates_its_tables = update
+        .table_creation_configuration
+        .as_ref()
+        .or(stored.table_creation_configuration.as_ref())
+        .is_some_and(|configured| configured.enabled);
+    crate::state::iceberg_catalog::unresolvable_tables(
+        engine,
+        update.destination_table_configuration_list.as_deref(),
+        catalog_arn.as_deref(),
+        &role_arn,
+        creates_its_tables,
+    )
 }
 
 /// Every IAM role ARN the update names, each distinct ARN once.

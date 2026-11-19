@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime};
 
 pub mod cloudwatch_logs_pipeline;
 pub mod delivery;
+pub mod iceberg_catalog;
 pub mod kinesis_source;
 pub mod producer;
 

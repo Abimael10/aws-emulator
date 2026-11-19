@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::delivery_stream_lifecycle::{REGION, ROLE_ARN};
+use crate::delivery_stream_lifecycle::{error_code, error_message, REGION, ROLE_ARN};
 use crate::destination_delivery::{base64, Emulator};
 use crate::format_conversion_delivery::{create_database, create_table};
 
@@ -880,4 +880,492 @@ async fn described_encryption(emulator: &Emulator, stream: &str) -> Value {
         )
         .await;
     described["DeliveryStreamDescription"]["DeliveryStreamEncryptionConfiguration"].clone()
+}
+
+// ---------------------------------------------------------------------------------------
+// The Data Catalog target of an Iceberg destination, resolved at the call that writes it.
+//
+// An Iceberg destination delivers to a TABLE of a Data Catalog, and Firehose reads that table
+// with the configuration's `RoleARN` at the call that submits the configuration — so a call
+// naming a table the catalog cannot serve is refused with `InvalidArgumentException` and writes
+// NOTHING: the create registers no stream and leaves the name free, and the update leaves the
+// destination and the version id it found. Once the catalog holds the table the very same call
+// is served.
+// ---------------------------------------------------------------------------------------
+
+/// A destination table this account's catalog holds.
+const PRESENT_TABLE: &str = "present";
+
+/// A destination table no catalog holds.
+const ABSENT_TABLE: &str = "absent_table";
+
+/// A Glue database no catalog holds.
+const ABSENT_DATABASE: &str = "absent_db";
+
+/// A Data Catalog of ANOTHER account, which this account's estate does not reach.
+fn foreign_catalog_arn() -> String {
+    format!("arn:aws:glue:{REGION}:111122223333:catalog")
+}
+
+/// What Firehose states for a destination table it could not read, whichever half of the
+/// answer applies: the call it makes for the table, named with the role it would have made it
+/// with.
+fn unreadable_table_message() -> String {
+    format!(
+        "Role {ROLE_ARN} is not authorized to perform: glue:GetTable for the given table or \
+         the table does not exist."
+    )
+}
+
+/// The modelled `DeliveryStreamARN` of `stream`:
+/// `arn:aws:firehose:<region>:<accountId>:deliverystream/<deliveryStreamName>`.
+fn stream_arn(stream: &str) -> String {
+    format!("arn:aws:firehose:{REGION}:000000000000:deliverystream/{stream}")
+}
+
+/// One `DestinationTableConfiguration` per `(database, table)` pair.
+fn table_list(tables: &[(&str, &str)]) -> Value {
+    Value::Array(
+        tables
+            .iter()
+            .map(|(database, table)| {
+                json!({
+                    "DestinationDatabaseName": database,
+                    "DestinationTableName": table,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// An `IcebergDestinationConfiguration` naming `tables` in the Data Catalog `catalog`, or no
+/// table list at all for `None`.
+fn catalog_target(catalog: &str, tables: Option<&[(&str, &str)]>) -> Value {
+    let mut config = json!({
+        "RoleARN": ROLE_ARN,
+        "CatalogConfiguration": { "CatalogARN": catalog },
+        "S3Configuration": {
+            "RoleARN": ROLE_ARN,
+            "BucketARN": format!("arn:aws:s3:::{BUCKET}"),
+            "ErrorOutputPrefix": "catalog-errors/",
+        },
+    });
+    if let Some(tables) = tables {
+        config["DestinationTableConfigurationList"] = table_list(tables);
+    }
+    config
+}
+
+/// `CreateDeliveryStream` with `config` as the stream's only destination.
+async fn create_with_target(emulator: &Emulator, stream: &str, config: Value) -> (u16, Value) {
+    emulator
+        .firehose(
+            "CreateDeliveryStream",
+            json!({
+                "DeliveryStreamName": stream,
+                "DeliveryStreamType": "DirectPut",
+                "IcebergDestinationConfiguration": config,
+            }),
+        )
+        .await
+}
+
+/// Assert that the answer is the refusal of an unreadable destination table.
+fn assert_table_refusal(case: &str, status: u16, answered: &Value) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected the call to be refused, got {status} with {answered}"
+    );
+    assert_eq!(
+        error_code(answered),
+        "InvalidArgumentException",
+        "case {case:?}: expected InvalidArgumentException, got {answered}"
+    );
+    assert_eq!(
+        error_message(answered),
+        unreadable_table_message(),
+        "case {case:?}: expected the glue:GetTable sentence, got {answered}"
+    );
+}
+
+/// Assert that `stream` is no stream of this account: neither listed nor describable.
+async fn assert_unregistered(emulator: &Emulator, case: &str, stream: &str) {
+    let listed = emulator.firehose_ok("ListDeliveryStreams", json!({})).await;
+    let names = listed["DeliveryStreamNames"].clone();
+    assert!(
+        !names
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .any(|name| name == &json!(stream)),
+        "case {case:?}: a refused create registers no stream, got the listing {names}"
+    );
+    let (status, described) = emulator
+        .firehose(
+            "DescribeDeliveryStream",
+            json!({ "DeliveryStreamName": stream }),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: no stream of that name exists, got {described}"
+    );
+    assert_eq!(
+        error_code(&described),
+        "ResourceNotFoundException",
+        "case {case:?}: expected the not-found refusal, got {described}"
+    );
+}
+
+/// One create whose catalog target the Data Catalog cannot serve.
+struct Unreadable {
+    case: &'static str,
+    stream: &'static str,
+    /// The `(database, table)` pairs the destination lists.
+    tables: &'static [(&'static str, &'static str)],
+    /// Whether the configuration names another account's Data Catalog.
+    foreign_catalog: bool,
+}
+
+/// RULE: a create whose Iceberg destination names a table the Data Catalog cannot serve is
+/// refused with `InvalidArgumentException` and the glue:GetTable sentence, and registers
+/// nothing — so the name it asked for is still free.
+///
+/// The rows differ along WHY the target cannot be served: the database absent, the table
+/// absent inside a database that is there, one absent among two listed, and a table that IS
+/// held named in another account's catalog.
+#[tokio::test]
+async fn a_create_naming_an_unreadable_destination_table_is_refused_and_registers_nothing() {
+    const ROWS: &[Unreadable] = &[
+        Unreadable {
+            case: "the database the destination names is not in the catalog",
+            stream: "iceberg-absent-database",
+            tables: &[(ABSENT_DATABASE, PRESENT_TABLE)],
+            foreign_catalog: false,
+        },
+        Unreadable {
+            case: "the database is there and the table is not",
+            stream: "iceberg-absent-table",
+            tables: &[(DATABASE, ABSENT_TABLE)],
+            foreign_catalog: false,
+        },
+        Unreadable {
+            case: "one of the two tables listed is absent",
+            stream: "iceberg-one-absent-of-two",
+            tables: &[(DATABASE, PRESENT_TABLE), (DATABASE, ABSENT_TABLE)],
+            foreign_catalog: false,
+        },
+        Unreadable {
+            case: "the table is held by this account and the destination names another \
+                   account's catalog",
+            stream: "iceberg-foreign-catalog",
+            tables: &[(DATABASE, PRESENT_TABLE)],
+            foreign_catalog: true,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    emulator.create_bucket(BUCKET).await;
+    create_database(&emulator, DATABASE).await;
+    create_iceberg_table(&emulator, PRESENT_TABLE, &[("id", "string")]).await;
+
+    for row in ROWS {
+        let catalog = if row.foreign_catalog {
+            foreign_catalog_arn()
+        } else {
+            catalog_arn()
+        };
+        let (status, answered) = create_with_target(
+            &emulator,
+            row.stream,
+            catalog_target(&catalog, Some(row.tables)),
+        )
+        .await;
+        assert_table_refusal(row.case, status, &answered);
+        assert!(
+            answered.get("DeliveryStreamARN").is_none(),
+            "case {}: a refused create mints no ARN, got {answered}",
+            row.case
+        );
+        assert_unregistered(&emulator, row.case, row.stream).await;
+    }
+}
+
+/// One create whose catalog target the Data Catalog can serve.
+struct Readable {
+    case: &'static str,
+    stream: &'static str,
+    /// The `(database, table)` pairs the destination lists, or `None` for a destination that
+    /// lists none at all.
+    tables: Option<&'static [(&'static str, &'static str)]>,
+    /// Whether the destination asks Firehose to create its tables itself.
+    creates_its_tables: bool,
+}
+
+/// RULE: a create whose Iceberg destination names tables the catalog CAN serve — including one
+/// naming no table at all ("Firehose will write data with insert if table specific
+/// configuration is not provided here") and one whose tables Firehose creates itself
+/// (`TableCreationConfiguration`, "the configuration to enable automatic table creation") — is
+/// served: it answers the modelled `DeliveryStreamARN` for the name it was given, and the
+/// stream reads back under it.
+///
+/// The rows differ along the FORM of the resolvable target: no list, one table, the same table
+/// twice, a table named in another case (the catalog stores and looks names up folded), a
+/// table that is a plain Hive row rather than an Iceberg one (what Firehose resolves is the
+/// catalog's table, not its format), and an absent table under automatic table creation.
+#[tokio::test]
+async fn a_create_whose_destination_tables_the_catalog_serves_mints_the_modelled_arn() {
+    const HIVE_TABLE: &str = "hive_row";
+    const ROWS: &[Readable] = &[
+        Readable {
+            case: "a destination listing no table at all",
+            stream: "iceberg-no-table-list",
+            tables: None,
+            creates_its_tables: false,
+        },
+        Readable {
+            case: "a destination listing one table the catalog holds",
+            stream: "iceberg-one-table",
+            tables: Some(&[(DATABASE, PRESENT_TABLE)]),
+            creates_its_tables: false,
+        },
+        Readable {
+            case: "a destination listing the same table twice",
+            stream: "iceberg-two-tables",
+            tables: Some(&[(DATABASE, PRESENT_TABLE), (DATABASE, PRESENT_TABLE)]),
+            creates_its_tables: false,
+        },
+        Readable {
+            case: "a destination naming the table in another case, which the catalog folds",
+            stream: "iceberg-folded-name",
+            tables: Some(&[("ICEBERG_DELIVERY_DB", "PRESENT")]),
+            creates_its_tables: false,
+        },
+        Readable {
+            case: "a destination naming a table the catalog holds as a plain Hive row",
+            stream: "iceberg-hive-row",
+            tables: Some(&[(DATABASE, HIVE_TABLE)]),
+            creates_its_tables: false,
+        },
+        Readable {
+            case: "an absent table the destination asks Firehose to create itself",
+            stream: "iceberg-table-creation",
+            tables: Some(&[(DATABASE, ABSENT_TABLE)]),
+            creates_its_tables: true,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    emulator.create_bucket(BUCKET).await;
+    create_database(&emulator, DATABASE).await;
+    create_iceberg_table(&emulator, PRESENT_TABLE, &[("id", "string")]).await;
+    create_table(&emulator, DATABASE, HIVE_TABLE, &[("id", "string")]).await;
+
+    for row in ROWS {
+        let mut config = catalog_target(&catalog_arn(), row.tables);
+        if row.creates_its_tables {
+            config["TableCreationConfiguration"] = json!({ "Enabled": true });
+        }
+        let (status, created) = create_with_target(&emulator, row.stream, config).await;
+        assert_eq!(
+            status, 200,
+            "case {}: expected the create to be served, got {status} with {created}",
+            row.case
+        );
+        assert_eq!(
+            created["DeliveryStreamARN"],
+            json!(stream_arn(row.stream)),
+            "case {}: expected the modelled ARN {}, got {created}",
+            row.case,
+            stream_arn(row.stream)
+        );
+        active(&emulator, row.stream).await;
+        let described = emulator
+            .firehose_ok(
+                "DescribeDeliveryStream",
+                json!({ "DeliveryStreamName": row.stream }),
+            )
+            .await;
+        assert_eq!(
+            described["DeliveryStreamDescription"]["DeliveryStreamARN"],
+            json!(stream_arn(row.stream)),
+            "case {}: the created stream reads back under its ARN, got {described}",
+            row.case
+        );
+    }
+}
+
+/// RULE: a create refused for its catalog target registers NOTHING, so once the catalog holds
+/// the table the very same request is served — the documented order of provisioning a catalog
+/// target and then the stream that delivers to it, under the name the client chose.
+///
+/// The rows differ along WHAT the catalog was missing when the first create was made: the whole
+/// database, or only the table inside a database that was already there.
+#[tokio::test]
+async fn the_same_create_is_served_once_the_catalog_holds_the_destination_table() {
+    /// `(case, stream, database, table)`: the target the create names, created between the
+    /// refused calls and the identical retry.
+    const ROWS: &[(&str, &str, &str, &str)] = &[
+        (
+            "the whole database was missing",
+            "iceberg-retry-database",
+            "retry_db",
+            "events",
+        ),
+        (
+            "only the table was missing",
+            "iceberg-retry-table",
+            DATABASE,
+            "later_events",
+        ),
+    ];
+
+    let emulator = Emulator::new();
+    emulator.create_bucket(BUCKET).await;
+    create_database(&emulator, DATABASE).await;
+
+    for (case, stream, database, table) in ROWS {
+        let tables = [(*database, *table)];
+        let config = catalog_target(&catalog_arn(), Some(&tables));
+
+        // While the catalog cannot serve the table, every create of this stream is refused and
+        // none of them registers anything — a second identical attempt is refused the same
+        // way, never as a name already taken.
+        for attempt in 1..=2 {
+            let (status, answered) = create_with_target(&emulator, stream, config.clone()).await;
+            assert_table_refusal(&format!("{case} (attempt {attempt})"), status, &answered);
+            assert_unregistered(&emulator, case, stream).await;
+        }
+
+        // The catalog target is created, and then the IDENTICAL create.
+        if *database != DATABASE {
+            create_database(&emulator, database).await;
+        }
+        create_table(&emulator, database, table, &[("id", "string")]).await;
+        let (status, created) = create_with_target(&emulator, stream, config.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the retry to be served, got {status} with {created}"
+        );
+        assert_eq!(
+            created["DeliveryStreamARN"],
+            json!(stream_arn(stream)),
+            "case {case:?}: expected the modelled ARN {}, got {created}",
+            stream_arn(stream)
+        );
+        active(&emulator, stream).await;
+        let described = emulator
+            .firehose_ok(
+                "DescribeDeliveryStream",
+                json!({ "DeliveryStreamName": stream }),
+            )
+            .await;
+        let iceberg = &described["DeliveryStreamDescription"]["Destinations"][0]
+            ["IcebergDestinationDescription"];
+        assert_eq!(
+            iceberg["DestinationTableConfigurationList"],
+            table_list(&tables),
+            "case {case:?}: the created stream carries the target it was created with, \
+             got {iceberg}"
+        );
+    }
+}
+
+/// RULE: the same resolution guards the call that REPLACES a destination's table list: an
+/// `UpdateDestination` naming a table the catalog cannot serve is refused with the same
+/// `InvalidArgumentException`, and the stream keeps the destination and the version id it had;
+/// once the catalog holds that table the same update is served and the version id advances.
+#[tokio::test]
+async fn an_update_naming_an_unreadable_destination_table_leaves_the_destination_alone() {
+    let emulator = Emulator::new();
+    emulator.create_bucket(BUCKET).await;
+    create_database(&emulator, DATABASE).await;
+    create_iceberg_table(&emulator, PRESENT_TABLE, &[("id", "string")]).await;
+
+    let stream = "iceberg-updated";
+    let created = [(DATABASE, PRESENT_TABLE)];
+    let (status, answered) = create_with_target(
+        &emulator,
+        stream,
+        catalog_target(&catalog_arn(), Some(&created)),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the stream must be created, got {status} with {answered}"
+    );
+    active(&emulator, stream).await;
+    let described = emulator
+        .firehose_ok(
+            "DescribeDeliveryStream",
+            json!({ "DeliveryStreamName": stream }),
+        )
+        .await;
+    let description = &described["DeliveryStreamDescription"];
+    let version = description["VersionId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let destination_id = description["Destinations"][0]["DestinationId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    let repointed = "repointed";
+    let update = json!({
+        "DeliveryStreamName": stream,
+        "CurrentDeliveryStreamVersionId": version,
+        "DestinationId": destination_id,
+        "IcebergDestinationUpdate": {
+            "DestinationTableConfigurationList": table_list(&[(DATABASE, repointed)]),
+        },
+    });
+
+    // The table does not exist yet: the update is refused and changes nothing.
+    let (status, answered) = emulator.firehose("UpdateDestination", update.clone()).await;
+    assert_table_refusal("the repointed table is not in the catalog", status, &answered);
+    let described = emulator
+        .firehose_ok(
+            "DescribeDeliveryStream",
+            json!({ "DeliveryStreamName": stream }),
+        )
+        .await;
+    let description = &described["DeliveryStreamDescription"];
+    assert_eq!(
+        description["VersionId"],
+        json!(version),
+        "a refused update does not advance the version id, got {description}"
+    );
+    assert_eq!(
+        description["Destinations"][0]["IcebergDestinationDescription"]
+            ["DestinationTableConfigurationList"],
+        table_list(&created),
+        "a refused update leaves the destination it found, got {description}"
+    );
+
+    // The catalog takes the table, and then the SAME update is served.
+    create_iceberg_table(&emulator, repointed, &[("id", "string")]).await;
+    let (status, answered) = emulator.firehose("UpdateDestination", update).await;
+    assert_eq!(
+        status, 200,
+        "the update must be served once the table exists, got {status} with {answered}"
+    );
+    let described = emulator
+        .firehose_ok(
+            "DescribeDeliveryStream",
+            json!({ "DeliveryStreamName": stream }),
+        )
+        .await;
+    let description = &described["DeliveryStreamDescription"];
+    assert_ne!(
+        description["VersionId"],
+        json!(version),
+        "a served update advances the version id, got {description}"
+    );
+    assert_eq!(
+        description["Destinations"][0]["IcebergDestinationDescription"]
+            ["DestinationTableConfigurationList"],
+        table_list(&[(DATABASE, repointed)]),
+        "the served update repoints the destination, got {description}"
+    );
 }

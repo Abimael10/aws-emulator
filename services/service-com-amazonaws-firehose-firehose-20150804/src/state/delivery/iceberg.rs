@@ -193,7 +193,7 @@ fn destination_table(config: &DestinationTableConfiguration) -> DestinationTable
 
 /// The Data Catalog a `CatalogConfiguration$CatalogARN` names: the ACCOUNT of that ARN, which
 /// is how a Data Catalog is addressed (`arn:<partition>:glue:<region>:<account>:catalog`).
-fn catalog_account(catalog_arn: Option<&str>) -> Option<String> {
+pub(crate) fn catalog_account(catalog_arn: Option<&str>) -> Option<String> {
     let account = catalog_arn?.split(':').nth(4)?;
     (!account.is_empty()).then(|| account.to_string())
 }
@@ -349,14 +349,15 @@ pub(super) async fn commit_buffer<Eng: Send + Sync + 'static>(
     Some(commit)
 }
 
-/// The most destination tables one commit walks.
+/// The most destination tables one commit walks, and the most one catalog resolution does
+/// ([`crate::state::iceberg_catalog`]).
 ///
 /// A CHOSEN bound: `DestinationTableConfigurationList` is a caller-written list and the work a
 /// commit does is per table, so this is what keeps a configuration from deciding how much one
 /// delivery does — beside [`MAX_TABLE_COLUMNS`], which bounds the per-table half. Far above the
 /// tables one Firehose stream delivers to, so a configuration a client would really write is
 /// never refused by it.
-const MAX_DESTINATION_TABLES: usize = 1_000;
+pub(crate) const MAX_DESTINATION_TABLES: usize = 1_000;
 
 /// Where every record of a buffer goes: the records each configured table takes, and the
 /// records whose routing names a table the destination does not list.
