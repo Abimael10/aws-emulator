@@ -77,6 +77,14 @@
 //! them together because it is one step, so one verdict is recorded for the task and either
 //! half can be what fails its launch.
 //!
+//! The REGISTRY AUTHENTICATION that account names beside them belongs to that step too, and
+//! comes before every fetch: the agent obtains ONE authorization token for the Amazon ECR
+//! registry as the execution role, granted on the registry rather than on any repository, so
+//! it is one question for the task ([`withheld_registry_auth`]) and a role refused it has
+//! reached no image at all — such a task stops with the agent's account of the execution
+//! resource it could not retrieve ([`unable_to_retrieve_registry_auth_message`]), reported on
+//! the task alone, rather than with the runtime's account of a fetch that was never made.
+//!
 //! LOCK ORDER: the cross-service reads here take the Amazon EC2 store's lock and then the
 //! Amazon ECR store's (which takes the IAM store's), each holding no other while it does,
 //! and hand back owned values — so they are called with NO guard of this service's store
@@ -179,14 +187,77 @@ pub fn cannot_pull_container_message(image: &str) -> String {
     )
 }
 
-/// The `stoppedReason` of a task whose image the registry would not serve to its execution
-/// role: the same `CannotPullContainerError` class, with the condition a registry that
-/// refuses the pull produces (the runtime's words for a registry answering `403 Forbidden`)
-/// and the registry's own refusal as the authorization it was refused by.
-pub fn pull_access_denied_message(image: &str, refusal: &str) -> String {
+/// The `stoppedReason` of a task whose execution role may not obtain the AUTHORIZATION
+/// TOKEN for the Amazon ECR registry its images come from.
+///
+/// That token is not an image: it is one of the EXECUTION RESOURCES the agent retrieves for
+/// the task — as the execution role, in the same step as the revision's `secrets` and before
+/// any manifest is fetched — so a role refused it fails the task in that step and the stop
+/// carries the agent's `ResourceInitializationError` for the resource it could not retrieve
+/// ([`unable_to_retrieve_resource_message`], the one wording of that stop), naming the
+/// registry authentication rather than any image. `refusal` is Amazon ECR's own answer,
+/// under the class that service refuses an unauthorized call with
+/// ([`ACCESS_DENIED_CLASS`]).
+pub fn unable_to_retrieve_registry_auth_message(refusal: &str) -> String {
+    unable_to_retrieve_resource_message(
+        ECR_REGISTRY_AUTH_RESOURCE,
+        &format!("{ACCESS_DENIED_CLASS}: {refusal}"),
+    )
+}
+
+/// What the agent calls the execution resource it retrieves from Amazon ECR: the
+/// authorization token for the registry (`ecr`), obtained once for the task whatever its
+/// containers pull from it.
+const ECR_REGISTRY_AUTH_RESOURCE: &str = "ecr registry auth";
+
+/// The `stoppedReason` of a task whose image the registry REFUSED to serve to its execution
+/// role.
+///
+/// The same `CannotPullContainerError` class, worded for what the runtime saw: the registry
+/// answers a manifest request no authorization covers with `403 Forbidden`
+/// ([`FORBIDDEN_STATUS`]), and the agent reports the request it made and the status it got
+/// back, having retried the fetch to the end of its budget ([`MANIFEST_FETCH_RETRIES`]) as it
+/// does for every manifest it cannot resolve. The authorization decision itself is the
+/// registry's own and is not on this wire: a `docker pull` is answered with an HTTP status,
+/// not with an IAM sentence.
+///
+/// `manifest_url` is the request the registry refused ([`manifest_url`]).
+pub fn pull_access_denied_message(image: &str, manifest_url: &str) -> String {
     format!(
-        "CannotPullContainerError: failed to resolve ref {image}: pull access denied, \
-         repository does not exist or may require authorization: {refusal}"
+        "CannotPullContainerError: pull image manifest has been retried \
+         {MANIFEST_FETCH_RETRIES} time(s): failed to resolve ref {image}: unexpected status \
+         from HEAD request to {manifest_url}: {FORBIDDEN_STATUS}"
+    )
+}
+
+/// The HTTP status a registry answers a request the credential presented does not cover
+/// with: `403 Forbidden` (RFC 9110, "the server understood the request but refuses to
+/// authorize it"), which is what the Docker Registry HTTP API V2 answers such a manifest
+/// request and therefore what the runtime reports for it.
+const FORBIDDEN_STATUS: &str = "403 Forbidden";
+
+/// The URL a container runtime fetches the MANIFEST of `image` at, for a reference that
+/// addresses `reference` of an Amazon ECR registry: the registry the reference was written
+/// against ([`registry_host`]) and the Docker Registry HTTP API V2 manifest route of the
+/// repository it names (`GET /v2/<name>/manifests/<reference>`, where the reference is the
+/// tag or the digest asked for).
+///
+/// The repository and the tag or digest are the registry's OWN reading of the reference
+/// ([`registry_pull::parse_registry_reference`]), so the request named here is the one that
+/// pull makes rather than a second reading of its own.
+fn manifest_url(
+    image: &str,
+    reference: &::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull::RegistryReference,
+) -> String {
+    let asked_for = reference
+        .digest
+        .as_deref()
+        .or(reference.tag.as_deref())
+        .unwrap_or_default();
+    format!(
+        "https://{}/v2/{}/manifests/{asked_for}",
+        registry_host(image),
+        reference.repository_name
     )
 }
 
@@ -276,6 +347,15 @@ pub fn evaluate_image_pulls<Eng: Send + Sync + 'static>(engine: &Eng) {
     let now = SystemTime::now();
     for (launch, verdict) in launches.iter().zip(failures.iter_mut()) {
         if verdict.failure.is_none() {
+            // The registry AUTHENTICATION the agent retrieves for the task comes first: one
+            // token for the registry, obtained as the execution role before any manifest is
+            // fetched, so it is one question for the task and a role refused it has reached
+            // no image ([`withheld_registry_auth`]). Reported on the task alone, like every
+            // other execution resource the agent retrieves for it.
+            if let Some(reason) = withheld_registry_auth(engine, launch) {
+                verdict.failure = Some(reason);
+                continue;
+            }
             let fetched = fetch_launch_images(engine, launch, now);
             if let Some((image, reason)) = fetched.refused {
                 verdict.failed_image = Some(image);
@@ -343,6 +423,85 @@ impl ImagePullVerdict {
             image_digests: Vec::new(),
         }
     }
+}
+
+/// Why the agent could not retrieve the Amazon ECR registry AUTHENTICATION `launch`'s images
+/// need — the `stoppedReason` that earns — and `None` when it could, or when no image of the
+/// task comes from a registry this emulator holds.
+///
+/// "The task execution role ... grants the Amazon ECS container agent permission to make
+/// Amazon Web Services API calls on your behalf" (`TaskDefinition$executionRoleArn`), and the
+/// first of those calls is the registry's authorization token: it is granted on the registry
+/// rather than on a repository, so ONE answer covers every image the task pulls from that
+/// registry and the question is asked once per task — which is also the order the agent makes
+/// them in, the token before any manifest. Amazon ECR decides it, over the documents in force
+/// on the role, exactly as it decides the manifest call
+/// ([`registry_pull::withheld_registry_authorization`]); a reference into another registry
+/// states nothing about this one, so a task pulling from none asks nothing.
+///
+/// Called with no guard of this service's store held: the verdict is Amazon ECR's, taken
+/// under that service's own lock and IAM's.
+fn withheld_registry_auth<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    launch: &TaskLaunch,
+) -> Option<String> {
+    use ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull;
+
+    let pulls_from_this_registry = launch.images.iter().any(|image| {
+        registry_pull::parse_reference(&reference_into_this_registry(image, &launch.task_arn))
+            .is_some()
+    });
+    if !pulls_from_this_registry {
+        return None;
+    }
+    let refusal = registry_pull::withheld_registry_authorization(
+        engine,
+        pull_identity(launch).as_ref().map(PullIdentity::principal),
+    )?;
+    Some(unable_to_retrieve_registry_auth_message(&refusal))
+}
+
+/// The principal Amazon ECS makes a launched task's pulls as: the task's EXECUTION ROLE,
+/// whose documents are in force, and the SESSION the agent assumed it in for that task, which
+/// is what AWS names as the caller of a call made under one — the very pair the execution
+/// resources of the task are retrieved as ([`execution_role_session_arn`]), because the pull
+/// is one of them.
+#[derive(Debug, Clone)]
+struct PullIdentity {
+    /// The execution role's ARN.
+    role_arn: String,
+    /// The session that role was assumed in for this task, and `None` where its ARN states no
+    /// role to name a session of.
+    session_arn: Option<String>,
+}
+
+impl PullIdentity {
+    /// This identity as the registry takes a pull's principal.
+    fn principal(
+        &self,
+    ) -> ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull::PullPrincipal<'_>
+    {
+        ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull::PullPrincipal {
+            role_arn: &self.role_arn,
+            session_arn: self.session_arn.as_deref(),
+        }
+    }
+}
+
+/// The identity `launch`'s pulls are made as, and `None` for a task whose revision and
+/// overrides name no execution role — which states nothing for a policy to be read against.
+fn pull_identity(launch: &TaskLaunch) -> Option<PullIdentity> {
+    let role_arn = launch.execution_role_arn.clone()?;
+    let task_id = launch
+        .task_arn
+        .rsplit('/')
+        .next()
+        .unwrap_or(launch.task_arn.as_str());
+    let session_arn = execution_role_session_arn(&role_arn, task_id);
+    Some(PullIdentity {
+        role_arn,
+        session_arn,
+    })
 }
 
 /// Fetch each image of `launch` from the registry its reference names, and answer what that
@@ -436,13 +595,19 @@ fn fetch_image<Eng: Send + Sync + 'static>(
     if let Some(served) = registry_pull::serve_reference_pull(
         engine,
         &addressed,
-        launch.execution_role_arn.as_deref(),
+        pull_identity(launch).as_ref().map(PullIdentity::principal),
         now,
     ) {
         return match served {
             Ok(digest) => ImageFetch::Served(digest),
-            Err(registry_pull::PullRefusal::NotAuthorized { message, .. }) => {
-                ImageFetch::Refused(pull_access_denied_message(image, &message))
+            // The registry refused the manifest request the fetch makes, which the runtime
+            // reports as the status it got back: the request is the one the registry's own
+            // reading of the reference names.
+            Err(registry_pull::PullRefusal::NotAuthorized { .. }) => {
+                let refused = registry_pull::parse_registry_reference(&addressed)
+                    .map(|(_, reference)| manifest_url(image, &reference))
+                    .unwrap_or_default();
+                ImageFetch::Refused(pull_access_denied_message(image, &refused))
             }
             Err(registry_pull::PullRefusal::NotFound { .. }) => {
                 ImageFetch::Refused(image_not_found_message(image))

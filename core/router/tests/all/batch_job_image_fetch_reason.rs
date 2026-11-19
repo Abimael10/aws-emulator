@@ -17,8 +17,8 @@
 //! container as the third. Which registry answers is read out of the reference itself: a
 //! private Amazon ECR registry of this account decides the pull AS the job's execution role
 //! ("for jobs that run on Fargate resources, you must provide an execution role" —
-//! `ContainerProperties$executionRoleArn`), so a role no policy grants
-//! `ecr:GetAuthorizationToken`/`ecr:BatchGetImage` to is refused the pull it makes; the Amazon
+//! `ContainerProperties$executionRoleArn`), so a role no policy grants `ecr:BatchGetImage` to
+//! is refused the manifest request that pull makes; the Amazon
 //! ECR Public gallery answers for a reference into the registry alias it was assigned, and an
 //! alias it holds no registry for names another account's public registry this emulator has no
 //! store for; and a reference naming a registry this emulator does not
@@ -49,7 +49,10 @@
 //! public gallery, a registry alias no gallery here holds), WHAT that registry holds for it
 //! (the image, another tag, nothing at that digest, no such alias), HOW it addresses the image
 //! (by tag or by digest) and WHO the pull is made as (a role granted the calls a pull makes, a
-//! role granted none of them).
+//! role granted the registry's token but not the manifest call). The step BEFORE the fetch —
+//! the registry authentication retrieved as that role, which a job whose role may not obtain
+//! it fails in, reporting no fetch at all — is asserted by that same owning suite's
+//! `a_job_whose_role_cannot_get_the_registry_token_fails_the_resource_retrieval`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -551,7 +554,7 @@ async fn a_placed_job_reports_what_the_fetch_of_its_image_answered() {
     .await;
 
     // Two execution roles: one carrying the calls a pull of a private image makes, one
-    // carrying an unrelated Amazon ECR call and none of them.
+    // carrying the registry's authorization token and not the manifest call the FETCH makes.
     let granted = role(
         &router,
         "batchpullgranted",
@@ -563,7 +566,12 @@ async fn a_placed_job_reports_what_the_fetch_of_its_image_answered() {
         ]),
     )
     .await;
-    let withheld = role(&router, "batchpullwithheld", &grant(&["ecr:ListImages"])).await;
+    let withheld = role(
+        &router,
+        "batchpullwithheld",
+        &grant(&["ecr:GetAuthorizationToken"]),
+    )
+    .await;
 
     // A MANAGED, ENABLED Fargate environment behind one queue: the capacity a job has to be
     // placed on before its image is fetched at all.
@@ -620,11 +628,16 @@ async fn a_placed_job_reports_what_the_fetch_of_its_image_answered() {
     )
     .await;
 
-    /// The clause a refusal carries when no document in force on the role grants a call that
-    /// a pull makes: the pull is refused to the PRINCIPAL it was made as, so the sentence
-    /// names that role.
-    fn names_the_role(role_arn: &str) -> String {
-        format!("User: {role_arn} is not authorized to perform:")
+    /// What a refusal carries when no document in force on the role grants the MANIFEST call
+    /// the fetch makes: the registry answers that request with `403 Forbidden`, and the
+    /// runtime reports the request it made and the status it got back — the authorization
+    /// decision itself is the registry's own and is not on this wire.
+    fn refused_manifest(repository: &str, reference: &str) -> String {
+        format!(
+            "unexpected status from HEAD request to \
+             https://{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/v2/{repository}\
+             /manifests/{reference}: 403 Forbidden"
+        )
     }
     // A reference into THIS account's private Amazon ECR registry, which `addressed` ends
     // with the tag or digest form of: the host the Amazon ECR User Guide gives for a pull,
@@ -658,12 +671,12 @@ async fn a_placed_job_reports_what_the_fetch_of_its_image_answered() {
         },
         Row {
             // The pull of a private image is made AS the job's execution role, so a role no
-            // document in force grants those calls to is refused it.
-            case: "the private image, by a role no document grants the pull to",
+            // document in force grants the manifest call to is refused it.
+            case: "the private image, by a role no document grants the manifest call to",
             image: private_image(&format!(":{PRIVATE_TAG}")),
             execution_role: withheld.clone(),
             refused: true,
-            says: Some(names_the_role(&withheld)),
+            says: Some(refused_manifest(PRIVATE_REPOSITORY, PRIVATE_TAG)),
         },
         Row {
             // A SECOND registry whose image is served: the end a served fetch leaves a job at

@@ -258,6 +258,10 @@ enum Outcome {
     Ran,
     /// The registry would not serve it, so the task never started.
     FailedToStart,
+    /// The registry withheld the authorization TOKEN the agent retrieves before any fetch, so
+    /// the task failed in the execution-resource retrieval having reached no image
+    /// ([`REGISTRY_AUTH_RETRIEVAL_FAILED`]).
+    RegistryAuthWithheld,
 }
 
 /// One row of the table: a revision running `image` as `execution_role`, and the terminal
@@ -268,9 +272,16 @@ struct Row {
     image: String,
     execution_role: Option<String>,
     expected: Outcome,
-    /// A clause the task's `stoppedReason` must carry, for a row whose refusal says WHY the
-    /// registry would not serve the pull.
+    /// A clause the task's `stoppedReason` must carry, for a row whose stop says WHAT the
+    /// registry answered about the pull.
     says: Option<String>,
+}
+
+impl Row {
+    /// This row with `expected` in place of the outcome it was built with.
+    fn with_outcome(self, expected: Outcome) -> Self {
+        Self { expected, ..self }
+    }
 }
 
 /// One task launched by the table, waiting to be read back.
@@ -280,6 +291,9 @@ struct Launched {
     task_arn: String,
     expected: Outcome,
     says: Option<String>,
+    /// The execution role the task pulls as, which a refusal of one of the pull's calls names
+    /// the session of, and `None` for a task that names none.
+    execution_role: Option<String>,
 }
 
 #[tokio::test]
@@ -433,8 +447,16 @@ async fn a_task_pulls_its_ecr_image_as_its_execution_role_and_then_settles() {
     fn nothing_allows(action: &str) -> String {
         format!("because no identity-based policy allows the {action} action")
     }
-    /// The clause a refusal carries when the REPOSITORY's own policy denies the call.
-    const RESOURCE_DENY: &str = "with an explicit deny in a resource-based policy";
+    /// The clause a refusal carries when the REGISTRY answered the manifest request the fetch
+    /// made: a `docker pull` is refused with an HTTP status, which is what the runtime
+    /// reports.
+    fn refused_manifest(repository: &str, reference: &str) -> String {
+        format!(
+            "unexpected status from HEAD request to \
+             https://{ACCOUNT}.dkr.ecr.{SIGNED_REGION}.amazonaws.com/v2/{repository}\
+             /manifests/{reference}: 403 Forbidden"
+        )
+    }
     let rows = vec![
         row(
             "an image the registry holds, pulled by a granted role",
@@ -471,11 +493,15 @@ async fn a_task_pulls_its_ecr_image_as_its_execution_role_and_then_settles() {
                 "nogrant",
                 ecr_image("app:1"),
                 Some(&none),
-                Outcome::FailedToStart,
+                // The agent never reaches the image: the registry's authorization token is
+                // the execution resource it retrieves first, and this role is refused it
+                // (the table in
+                // `a_task_whose_role_cannot_get_the_registry_token_fails_the_resource_retrieval`).
+                Outcome::RegistryAuthWithheld,
             )
         },
         Row {
-            says: Some(nothing_allows("ecr:BatchGetImage")),
+            says: Some(refused_manifest("app", "1")),
             ..row(
                 "a role granted the registry token but not the manifest",
                 "tokenonly",
@@ -492,7 +518,7 @@ async fn a_task_pulls_its_ecr_image_as_its_execution_role_and_then_settles() {
             Outcome::Ran,
         ),
         Row {
-            says: Some(RESOURCE_DENY.to_string()),
+            says: Some(refused_manifest("denied", "1")),
             ..row(
                 "a repository whose own policy denies the pull a role is granted",
                 "deniedrepo",
@@ -542,6 +568,7 @@ async fn a_task_pulls_its_ecr_image_as_its_execution_role_and_then_settles() {
             task_arn,
             expected: row.expected,
             says: row.says.clone(),
+            execution_role: row.execution_role.clone(),
         });
     }
 
@@ -551,6 +578,7 @@ async fn a_task_pulls_its_ecr_image_as_its_execution_role_and_then_settles() {
         task_arn,
         expected,
         says,
+        execution_role,
     } in launched
     {
         let task = stopped(&router, &task_arn, case).await;
@@ -591,9 +619,9 @@ async fn a_task_pulls_its_ecr_image_as_its_execution_role_and_then_settles() {
                     "case {case:?}: expected the stoppedReason to name the image {image}, got \
                      {reason:?}"
                 );
-                // A row that is about WHY the registry withheld the pull asserts that
-                // clause too: an explicit deny in the repository's own policy is not the
-                // same answer as a grant nothing wrote.
+                // A row that is about what the registry ANSWERED asserts that too: a manifest
+                // request it refused is answered with an HTTP status, which is not the same
+                // answer as a reference it resolves to nothing.
                 if let Some(says) = says.as_deref() {
                     assert!(
                         reason.contains(says),
@@ -604,6 +632,20 @@ async fn a_task_pulls_its_ecr_image_as_its_execution_role_and_then_settles() {
                 assert!(
                     task["startedAt"].is_null(),
                     "case {case:?}: expected no startedAt on a task that never ran, got {task}"
+                );
+            }
+            Outcome::RegistryAuthWithheld => {
+                assert_eq!(
+                    stop_code, TASK_FAILED_TO_START,
+                    "case {case:?}: expected a task whose registry authentication was \
+                     withheld to stop with {TASK_FAILED_TO_START}, got {task}"
+                );
+                assert_registry_auth_withheld(
+                    case,
+                    &task,
+                    &image,
+                    says.as_deref(),
+                    execution_role.as_deref(),
                 );
             }
         }
@@ -1128,4 +1170,413 @@ async fn a_service_whose_image_the_registry_resolves_to_nothing_stops_a_task_tha
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
+}
+
+/// The fixed text of the `stoppedReason` the agent words for the Amazon ECR registry
+/// AUTHENTICATION it could not retrieve — the execution resource it obtains before any
+/// manifest is fetched — followed by the class Amazon ECR refuses an unauthorized call with.
+/// Spelled out here rather than imported, so a wrong constant in the implementation cannot
+/// make a test pass.
+const REGISTRY_AUTH_RETRIEVAL_FAILED: &str =
+    "ResourceInitializationError: unable to pull secrets or registry auth: execution resource \
+     retrieval failed: unable to retrieve ecr registry auth: service call has been retried 1 \
+     time(s): AccessDeniedException: ";
+
+/// What the refusal inside that reason names: the registry-level authorization token, decided
+/// on no resource narrower than the registry — not the manifest call the fetch itself makes.
+const WITHHELD_REGISTRY_CALL: &str =
+    "is not authorized to perform: ecr:GetAuthorizationToken on resource: *";
+
+/// Assert everything the stop of a task whose execution role could not obtain the registry's
+/// authorization token carries: the agent's account of the execution resource it could not
+/// retrieve, Amazon ECR's own refusal of the registry-level call inside it — naming the
+/// SESSION the agent assumed `execution_role` in for this task, which is the principal AWS
+/// reports for a call made under one — `says` where the row states WHY the grant was
+/// withheld, and nothing of an image, because none was reached.
+fn assert_registry_auth_withheld(
+    case: &str,
+    task: &Value,
+    image: &str,
+    says: Option<&str>,
+    execution_role: Option<&str>,
+) {
+    let reason = string(task, "stoppedReason", case);
+    assert!(
+        reason.starts_with(REGISTRY_AUTH_RETRIEVAL_FAILED),
+        "case {case:?}: expected the stoppedReason to begin \
+         {REGISTRY_AUTH_RETRIEVAL_FAILED:?}, got {reason:?}"
+    );
+    assert!(
+        reason.contains(WITHHELD_REGISTRY_CALL),
+        "case {case:?}: expected the stoppedReason to carry {WITHHELD_REGISTRY_CALL:?}, got \
+         {reason:?}"
+    );
+    // The principal the refusal names: the agent retrieves the token AS the execution role,
+    // so the caller is an assumed-role session of that role named after the task it is for.
+    if let Some(role_arn) = execution_role {
+        let role_name = role_arn.rsplit('/').next().unwrap_or_default();
+        let task_arn = string(task, "taskArn", case);
+        let task_id = task_arn.rsplit('/').next().unwrap_or_default().to_string();
+        let expected = format!(
+            "User: arn:aws:sts::{ACCOUNT}:assumed-role/{role_name}/{task_id} \
+             {WITHHELD_REGISTRY_CALL}"
+        );
+        assert!(
+            reason.contains(&expected),
+            "case {case:?}: expected the stoppedReason to carry {expected:?}, got {reason:?}"
+        );
+    }
+    if let Some(says) = says {
+        assert!(
+            reason.contains(says),
+            "case {case:?}: expected the stoppedReason to carry {says:?}, got {reason:?}"
+        );
+    }
+    // A fetch that was never made is not reported: the token is retrieved before any image,
+    // so neither the runtime's class for a failed fetch nor the reference itself is in it.
+    for absent in [CANNOT_PULL, image] {
+        assert!(
+            !reason.contains(absent),
+            "case {case:?}: expected no {absent:?} in the stoppedReason of a task that \
+             reached no image, got {reason:?}"
+        );
+    }
+    assert!(
+        task["startedAt"].is_null(),
+        "case {case:?}: expected no startedAt on a task that never ran, got {task}"
+    );
+    // The resource the agent retrieves is the TASK's, not one container's, so the failure is
+    // reported on the task alone — the way every other execution resource's is.
+    for container in list(task, "containers", case) {
+        assert_eq!(
+            container["reason"].as_str(),
+            None,
+            "case {case:?}: expected no reason on a container whose image was never fetched, \
+             got {container}"
+        );
+    }
+}
+
+/// The repository a cache rule covers in the table below, under the rule's own prefix: the
+/// registry holds nothing for it until a pull caches it.
+const CACHED_REPOSITORY: &str = "hub/library/alpine";
+
+#[tokio::test]
+async fn a_task_whose_role_cannot_get_the_registry_token_fails_the_resource_retrieval() {
+    let router = emulator_with_ecr_and_iam();
+    cluster(&router).await;
+    let case = "the registry's records";
+
+    // One repository holding one tagged image, and one pull through cache rule whose prefix
+    // nothing has been cached under yet.
+    ecr(
+        &router,
+        "CreateRepository",
+        json!({ "repositoryName": "app" }),
+        case,
+    )
+    .await;
+    let pushed = ecr(
+        &router,
+        "PutImage",
+        json!({
+            "repositoryName": "app",
+            "imageManifest": MANIFEST,
+            "imageTag": "1",
+        }),
+        case,
+    )
+    .await;
+    let digest = string(&pushed["image"]["imageId"], "imageDigest", case);
+    ecr(
+        &router,
+        "CreatePullThroughCacheRule",
+        json!({
+            "ecrRepositoryPrefix": "hub",
+            "upstreamRegistryUrl": "registry-1.docker.io",
+            "credentialArn": UPSTREAM_CREDENTIAL_ARN,
+        }),
+        case,
+    )
+    .await;
+    // A repository whose own policy shares its images with a role: a resource-based policy is
+    // the document a repository can be pulled from by, and it is never the document a
+    // registry-level call is granted on.
+    ecr(
+        &router,
+        "CreateRepository",
+        json!({ "repositoryName": "shared" }),
+        case,
+    )
+    .await;
+    ecr(
+        &router,
+        "PutImage",
+        json!({
+            "repositoryName": "shared",
+            "imageManifest": MANIFEST,
+            "imageTag": "1",
+        }),
+        case,
+    )
+    .await;
+
+    // The roles, each carrying a different part of what a pull takes — and one whose document
+    // DENIES the registry-level call the others are simply not granted.
+    let token_and_manifest = role(
+        &router,
+        "tokenpull",
+        Some(&grant(&["ecr:GetAuthorizationToken", "ecr:BatchGetImage"])),
+    )
+    .await;
+    let manifest_only = role(&router, "manifestonly", Some(&grant(&["ecr:BatchGetImage"]))).await;
+    let token_only = role(
+        &router,
+        "tokenonlypull",
+        Some(&grant(&["ecr:GetAuthorizationToken"])),
+    )
+    .await;
+    let unrelated = role(&router, "unrelated", Some(&grant(&["ecr:ListImages"]))).await;
+    let denied = role(
+        &router,
+        "tokendenied",
+        Some(
+            &json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    { "Effect": "Allow", "Action": "ecr:*", "Resource": "*" },
+                    {
+                        "Effect": "Deny",
+                        "Action": "ecr:GetAuthorizationToken",
+                        "Resource": "*",
+                    },
+                ],
+            })
+            .to_string(),
+        ),
+    )
+    .await;
+    ecr(
+        &router,
+        "SetRepositoryPolicy",
+        json!({
+            "repositoryName": "shared",
+            "policyText": json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": { "AWS": manifest_only },
+                    "Action": "ecr:BatchGetImage",
+                }],
+            }).to_string(),
+        }),
+        case,
+    )
+    .await;
+
+    /// The clause a refusal carries when nothing grants the call: IAM's default deny, naming
+    /// the action (`service_common::iam_authorization::no_identity_policy_allows`).
+    fn nothing_allows(action: &str) -> String {
+        format!("because no identity-based policy allows the {action} action")
+    }
+    /// The clause it carries when a document of the role's own DENIES the call.
+    const IDENTITY_DENY: &str = "with an explicit deny in an identity-based policy";
+    let withheld = |case: &'static str, family: &'static str, image: String, role: &String| Row {
+        case,
+        family,
+        image,
+        execution_role: Some(role.clone()),
+        expected: Outcome::RegistryAuthWithheld,
+        says: Some(nothing_allows("ecr:GetAuthorizationToken")),
+    };
+    // The rows differ along what the rule generalises over: which document withholds the
+    // token, which other half of the pull the role DOES hold, what the registry holds for the
+    // reference, and the form the reference takes — none of which the registry-level call is
+    // decided on.
+    let rows = vec![
+        withheld(
+            "a role granted the manifest call but not the registry token",
+            "manifestonlytask",
+            ecr_image("app:1"),
+            &manifest_only,
+        ),
+        withheld(
+            "a role granted nothing of the pull at all",
+            "unrelatedtask",
+            ecr_image("app:1"),
+            &unrelated,
+        ),
+        withheld(
+            "a role the repository's own policy shares the image with",
+            "sharedreptask",
+            ecr_image("shared:1"),
+            &manifest_only,
+        ),
+        withheld(
+            "a reference this registry holds no repository for",
+            "absentreptask",
+            ecr_image("absent:1"),
+            &manifest_only,
+        ),
+        withheld(
+            "a reference a pull through cache rule covers",
+            "cachedtask",
+            ecr_image(&format!("{CACHED_REPOSITORY}:latest")),
+            &manifest_only,
+        ),
+        withheld(
+            "a reference addressing a digest rather than a tag",
+            "digesttask",
+            ecr_image(&format!("app@{digest}")),
+            &manifest_only,
+        ),
+        Row {
+            says: Some(IDENTITY_DENY.to_string()),
+            ..withheld(
+                "a role whose own document denies the registry token",
+                "tokendeniedtask",
+                ecr_image("app:1"),
+                &denied,
+            )
+        },
+        // The OTHER half of the pull, to keep the two steps apart: a role that obtained the
+        // token and was refused the manifest fails at the FETCH, which the runtime reports as
+        // the request it made and the status the registry answered it with.
+        Row {
+            says: Some(format!(
+                "unexpected status from HEAD request to \
+                 https://{ACCOUNT}.dkr.ecr.{SIGNED_REGION}.amazonaws.com/v2/app/manifests/1: \
+                 403 Forbidden"
+            )),
+            ..withheld(
+                "a role granted the registry token but not the manifest",
+                "tokenonlytask",
+                ecr_image("app:1"),
+                &token_only,
+            )
+        }
+        .with_outcome(Outcome::FailedToStart),
+        // And the rows nothing is withheld from: both calls granted, no role at all to decide
+        // anything against, and a reference into a registry this emulator does not hold, for
+        // which no token of ours is retrieved.
+        Row {
+            says: None,
+            ..withheld(
+                "a role granted both calls a pull makes",
+                "fullgranttask",
+                ecr_image("app:1"),
+                &token_and_manifest,
+            )
+        }
+        .with_outcome(Outcome::Ran),
+        Row {
+            case: "no execution role at all",
+            family: "noroletask",
+            image: ecr_image("app:1"),
+            execution_role: None,
+            expected: Outcome::Ran,
+            says: None,
+        },
+        Row {
+            case: "a registry this emulator holds nothing of, pulled by an ungranted role",
+            family: "publictask",
+            image: "public.ecr.aws/nginx/nginx:latest".to_string(),
+            execution_role: Some(unrelated.clone()),
+            expected: Outcome::Ran,
+            says: None,
+        },
+    ];
+
+    // Every task is launched first and polled afterwards: each settles on its own clock, so
+    // the whole table costs one run rather than one per row.
+    let mut launched = Vec::new();
+    for row in &rows {
+        let task_arn = run(
+            &router,
+            row.family,
+            &row.image,
+            row.execution_role.as_deref(),
+            row.case,
+        )
+        .await;
+        launched.push((row, task_arn));
+    }
+
+    for (row, task_arn) in launched {
+        let case = row.case;
+        let task = stopped(&router, &task_arn, case).await;
+        let stop_code = string(&task, "stopCode", case);
+        match row.expected {
+            Outcome::RegistryAuthWithheld => {
+                assert_eq!(
+                    stop_code, TASK_FAILED_TO_START,
+                    "case {case:?}: expected a task whose registry authentication was \
+                     withheld to stop with {TASK_FAILED_TO_START}, got {task}"
+                );
+                assert_registry_auth_withheld(
+                    case,
+                    &task,
+                    &row.image,
+                    row.says.as_deref(),
+                    row.execution_role.as_deref(),
+                );
+            }
+            Outcome::FailedToStart => {
+                assert_eq!(
+                    stop_code, TASK_FAILED_TO_START,
+                    "case {case:?}: expected a task that could not pull {} to stop with \
+                     {TASK_FAILED_TO_START}, got {task}",
+                    row.image
+                );
+                let reason = string(&task, "stoppedReason", case);
+                // The token WAS obtained, so what failed is the fetch: the runtime's class,
+                // naming the reference it could not resolve.
+                for expected in [CANNOT_PULL, row.image.as_str()] {
+                    assert!(
+                        reason.contains(expected),
+                        "case {case:?}: expected the stoppedReason to carry {expected:?}, got \
+                         {reason:?}"
+                    );
+                }
+                assert!(
+                    !reason.starts_with("ResourceInitializationError"),
+                    "case {case:?}: expected a fetch failure rather than a resource \
+                     retrieval, got {reason:?}"
+                );
+                if let Some(says) = row.says.as_deref() {
+                    assert!(
+                        reason.contains(says),
+                        "case {case:?}: expected the stoppedReason to carry {says:?}, got \
+                         {reason:?}"
+                    );
+                }
+            }
+            Outcome::Ran => {
+                assert_eq!(
+                    stop_code, ESSENTIAL_CONTAINER_EXITED,
+                    "case {case:?}: expected a task that pulled {} to end with \
+                     {ESSENTIAL_CONTAINER_EXITED}, got {task}",
+                    row.image
+                );
+                assert!(
+                    !task["startedAt"].is_null(),
+                    "case {case:?}: expected a startedAt on a task that ran, got {task}"
+                );
+            }
+        }
+    }
+
+    // A pull that was never made cached nothing: the repository the covered reference names
+    // is still absent from the registry, read back through Amazon ECR's own report.
+    let case = "the covered repository";
+    let listed = ecr(&router, "DescribeRepositories", json!({}), case).await;
+    let names: Vec<String> = list(&listed, "repositories", case)
+        .iter()
+        .map(|repository| string(repository, "repositoryName", case))
+        .collect();
+    assert!(
+        !names.iter().any(|name| name == CACHED_REPOSITORY),
+        "case {case:?}: expected no repository to be cached for a task whose registry \
+         authentication was withheld, got {names:?}"
+    );
 }

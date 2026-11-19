@@ -15,6 +15,13 @@
 //! `exitCode`, and the CloudWatch Logs stream the attempt names — opened for the task, so it
 //! exists either way (see [`super::job_logs`]) — holds no event, because nothing wrote one.
 //!
+//! The fetch of an image held in an Amazon ECR registry is preceded by the retrieval of an
+//! EXECUTION RESOURCE: one authorization token for that registry, obtained as the job's
+//! execution role and granted on the registry rather than on any repository. A role refused
+//! it has reached no image, so what such a job reports is that retrieval
+//! ([`unable_to_retrieve_registry_auth_message`]) rather than the runtime's account of a
+//! fetch that was never made — again the sentence the Amazon ECS task's own stop carries.
+//!
 //! # Who answers the fetch
 //!
 //! The registry the reference names does, and only where this emulator HOLDS that registry:
@@ -77,15 +84,94 @@ pub fn cannot_pull_image_message(image: &str, refusal: &str) -> String {
     format!("CannotPullContainerError: failed to resolve ref {image}: not found: {refusal}")
 }
 
-/// The `statusReason` of a job whose image the registry would not serve to its execution
-/// role: the same class, with the condition the runtime words for a registry that refuses the
-/// pull and the registry's own refusal as the authorization it was refused by.
-pub fn pull_access_denied_message(image: &str, refusal: &str) -> String {
+/// The `statusReason` of a job whose image the registry REFUSED to serve to its execution
+/// role.
+///
+/// The same `CannotPullContainerError` class, worded for what the runtime saw: the registry
+/// answers a manifest request no authorization covers with `403 Forbidden`
+/// ([`FORBIDDEN_STATUS`]), and the runtime reports the request it made and the status it got
+/// back, having retried the fetch to the end of its budget ([`MANIFEST_FETCH_RETRIES`]). The
+/// authorization decision itself is the registry's own and is not on this wire: a `docker
+/// pull` is answered with an HTTP status, not with an IAM sentence.
+///
+/// `manifest_url` is the request the registry refused ([`manifest_url`]).
+pub fn pull_access_denied_message(image: &str, manifest_url: &str) -> String {
     format!(
-        "CannotPullContainerError: failed to resolve ref {image}: pull access denied, \
-         repository does not exist or may require authorization: {refusal}"
+        "CannotPullContainerError: pull image manifest has been retried \
+         {MANIFEST_FETCH_RETRIES} time(s): failed to resolve ref {image}: unexpected status \
+         from HEAD request to {manifest_url}: {FORBIDDEN_STATUS}"
     )
 }
+
+/// The HTTP status a registry answers a request the credential presented does not cover
+/// with: `403 Forbidden` (RFC 9110, "the server understood the request but refuses to
+/// authorize it"), which is what the Docker Registry HTTP API V2 answers such a manifest
+/// request and therefore what the runtime reports for it.
+const FORBIDDEN_STATUS: &str = "403 Forbidden";
+
+/// How many times the runtime retried the image MANIFEST fetch before it reported the
+/// failure: a registry that refuses a request refuses it however often it is asked, so the
+/// fetch is retried until the whole retry budget is spent and that budget is what the failure
+/// reports.
+const MANIFEST_FETCH_RETRIES: u32 = 7;
+
+/// The URL a container runtime fetches the MANIFEST of `image` at, for a reference that
+/// addresses `reference` of an Amazon ECR registry: the registry the reference was written
+/// against and the Docker Registry HTTP API V2 manifest route of the repository it names
+/// (`GET /v2/<name>/manifests/<reference>`, where the reference is the tag or the digest
+/// asked for).
+///
+/// The repository and the tag or digest are the registry's OWN reading of the reference
+/// ([`registry_pull::parse_registry_reference`]), so the request named here is the one that
+/// pull makes rather than a second reading of its own.
+fn manifest_url(
+    image: &str,
+    reference: &::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull::RegistryReference,
+) -> String {
+    let asked_for = reference
+        .digest
+        .as_deref()
+        .or(reference.tag.as_deref())
+        .unwrap_or_default();
+    let host = image.split_once('/').map_or(image, |(host, _)| host);
+    format!(
+        "https://{host}/v2/{}/manifests/{asked_for}",
+        reference.repository_name
+    )
+}
+
+/// The `statusReason` of a job whose execution role may not obtain the AUTHORIZATION TOKEN
+/// for the Amazon ECR registry its image comes from.
+///
+/// That token is not an image: it is one of the EXECUTION RESOURCES retrieved for the
+/// container before it starts — as the execution role, before any manifest is fetched — so a
+/// role refused it fails the job in that step, and what the job reports is the agent's
+/// account of the resource it could not retrieve rather than the runtime's account of a fetch
+/// that was never made. The class is `ResourceInitializationError`, the resource is the
+/// registry authentication ([`ECR_REGISTRY_AUTH_RESOURCE`]) and `refusal` is Amazon ECR's own
+/// answer under the class that service refuses an unauthorized call with
+/// ([`ACCESS_DENIED_CLASS`]), so nothing here is authored about the authorization.
+pub fn unable_to_retrieve_registry_auth_message(refusal: &str) -> String {
+    format!(
+        "ResourceInitializationError: unable to pull secrets or registry auth: execution \
+         resource retrieval failed: unable to retrieve {ECR_REGISTRY_AUTH_RESOURCE}: service \
+         call has been retried {RETRIEVAL_ATTEMPTS} time(s): {ACCESS_DENIED_CLASS}: {refusal}"
+    )
+}
+
+/// What the agent calls the execution resource it retrieves from Amazon ECR: the
+/// authorization token for the registry (`ecr`), obtained once before the container's image
+/// is fetched.
+const ECR_REGISTRY_AUTH_RESOURCE: &str = "ecr registry auth";
+
+/// How many attempts at the retrieval the reason reports: the agent states how often it
+/// retried the call it could not complete, and this emulator makes that call ONCE — the
+/// answer it gets is the emulated service's own and does not change between attempts.
+const RETRIEVAL_ATTEMPTS: usize = 1;
+
+/// The error class Amazon ECR refuses an unauthorized call with, which is the AWS common
+/// `AccessDeniedException` — the class the agent's own account of a failed retrieval names.
+const ACCESS_DENIED_CLASS: &str = "AccessDeniedException";
 
 /// What the fetch of ONE job's container image answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,16 +290,34 @@ pub fn settle_job_image_fetches<Eng: Send + Sync + 'static>(engine: &Eng) {
     let verdicts: Vec<(String, ImageFetch)> = waiting
         .into_iter()
         .map(|fetch| {
-            let verdict = if let Some(served) = registry_pull::serve_reference_pull(
-                engine,
-                &fetch.image,
-                fetch.execution_role_arn.as_deref(),
-                now,
-            ) {
+            // The registry AUTHENTICATION comes before the fetch: one authorization token is
+            // obtained for the Amazon ECR registry as the job's execution role, granted on
+            // the registry rather than on any repository, so a role refused it has reached no
+            // image and what the job reports is that retrieval
+            // ([`unable_to_retrieve_registry_auth_message`]). A reference into another
+            // registry states nothing about this one, so nothing is asked for it.
+            let pulled_as = fetch
+                .execution_role_arn
+                .as_deref()
+                .map(registry_pull::PullPrincipal::of_role);
+            let verdict = if let Some(refusal) = registry_pull::parse_reference(&fetch.image)
+                .and_then(|_| {
+                    registry_pull::withheld_registry_authorization(engine, pulled_as)
+                })
+            {
+                ImageFetch::Refused(unable_to_retrieve_registry_auth_message(&refusal))
+            } else if let Some(served) =
+                registry_pull::serve_reference_pull(engine, &fetch.image, pulled_as, now)
+            {
                 match served {
                     Ok(_) => ImageFetch::Served,
-                    Err(registry_pull::PullRefusal::NotAuthorized { message, .. }) => {
-                        ImageFetch::Refused(pull_access_denied_message(&fetch.image, &message))
+                    // The registry refused the manifest request the fetch makes, which the
+                    // runtime reports as the status it got back.
+                    Err(registry_pull::PullRefusal::NotAuthorized { .. }) => {
+                        let refused = registry_pull::parse_registry_reference(&fetch.image)
+                            .map(|(_, reference)| manifest_url(&fetch.image, &reference))
+                            .unwrap_or_default();
+                        ImageFetch::Refused(pull_access_denied_message(&fetch.image, &refused))
                     }
                     Err(registry_pull::PullRefusal::NotFound { message }) => {
                         ImageFetch::Refused(cannot_pull_image_message(&fetch.image, &message))

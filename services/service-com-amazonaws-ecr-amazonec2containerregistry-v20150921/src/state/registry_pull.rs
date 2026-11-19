@@ -169,10 +169,10 @@ pub enum PullRefusal {
 /// image when a pull through cache rule covers the repository and the registry does not
 /// hold it yet.
 ///
-/// `principal` is the ARN of the ROLE the pull is made as — a task's execution role — and
-/// `None` for a pull whose caller names none, which states nothing for a policy to be read
-/// against. `now` is the instant the pull is made at, which is what an imported image
-/// records as its push instant.
+/// `principal` is the ROLE the pull is made as — a task's execution role, with the session
+/// the pulling service assumed it in ([`PullPrincipal`]) — and `None` for a pull whose caller
+/// names none, which states nothing for a policy to be read against. `now` is the instant the
+/// pull is made at, which is what an imported image records as its push instant.
 ///
 /// What the pull SERVED — the manifest the registry resolved the reference to, reported as
 /// its DIGEST, which is the image's identity in this registry and what a compute service
@@ -186,7 +186,7 @@ pub enum PullRefusal {
 pub fn serve_pull<Eng: Send + Sync + 'static>(
     engine: &Eng,
     reference: &RegistryReference,
-    principal: Option<&str>,
+    principal: Option<PullPrincipal<'_>>,
     now: SystemTime,
 ) -> Result<Option<String>, PullRefusal> {
     if let Some(refusal) = withheld_pull(engine, reference, principal) {
@@ -247,7 +247,7 @@ pub fn serve_pull<Eng: Send + Sync + 'static>(
 pub fn serve_reference_pull<Eng: Send + Sync + 'static>(
     engine: &Eng,
     image: &str,
-    principal: Option<&str>,
+    principal: Option<PullPrincipal<'_>>,
     now: SystemTime,
 ) -> Option<Result<Option<String>, PullRefusal>> {
     let (addressed_registry, reference) = parse_registry_reference(image)?;
@@ -280,13 +280,14 @@ pub fn serve_reference_pull<Eng: Send + Sync + 'static>(
 fn cross_account_refusal(
     registry_id: &str,
     reference: &RegistryReference,
-    principal: Option<&str>,
+    principal: Option<PullPrincipal<'_>>,
 ) -> PullRefusal {
-    let Some(role_arn) = principal else {
+    let Some(principal) = principal else {
         return PullRefusal::NotFound {
             message: repository_not_found_in_message(&reference.repository_name, registry_id),
         };
     };
+    let role_arn = principal.reported_arn();
     let action = super::authorization::action_for(BATCH_GET_IMAGE_ACTION);
     let resource = repository_arn_in(&reference.region, registry_id, &reference.repository_name);
     // The refusal is the security-relevant event of this pull, so it is attributable the way
@@ -430,29 +431,9 @@ fn not_found_message(
 fn withheld_pull<Eng: Send + Sync + 'static>(
     engine: &Eng,
     reference: &RegistryReference,
-    principal: Option<&str>,
+    principal: Option<PullPrincipal<'_>>,
 ) -> Option<PullRefusal> {
-    let role_arn = principal?;
-    let iam = iam_store::service_state(engine)?;
-    let (statements, boundary) = {
-        let store = iam.lock();
-        // A role this account's IAM holds no record for may belong to another account, so
-        // its documents are not this store's to read.
-        store.roles.values().find(|role| role.arn == role_arn)?;
-        let policies = store.principal_policies(role_arn)?;
-        // An attachment whose document this account does not hold — an entry of AWS's own
-        // catalog — may be the very policy that carries the grant, so nothing is withheld
-        // on it.
-        if !policies.uncarried.is_empty() {
-            return None;
-        }
-        (
-            policies.documents,
-            store.permissions_boundary_document(role_arn),
-        )
-    };
-    let prepared = iam::prepare_documents(&statements);
-    let capped = boundary.map(|document| iam::prepare_documents(::std::slice::from_ref(&document)));
+    let decided = PreparedPrincipal::prepare(engine, principal)?;
     // The document the repository SHARES itself with, which is the other way a pull is
     // allowed: a repository policy naming the role grants it with no identity-based grant
     // at all.
@@ -463,26 +444,150 @@ fn withheld_pull<Eng: Send + Sync + 'static>(
             .ok()
             .and_then(|repository| repository.policy_text.clone())
     });
-    // Every spelling a repository policy may name this role by: the role itself and the
-    // account it belongs to, read the way every other service in this tree reads them.
-    let mut principals = vec![role_arn.to_string()];
-    principals.extend(iam::account_principals(role_arn));
     let repository = repository_arn(&reference.region, &reference.repository_name);
     // The registry-level call first, the way the agent makes them: a role that cannot
-    // obtain a token never reaches a manifest.
-    for (action, resource, repository_scoped) in [
-        (GET_AUTHORIZATION_TOKEN_ACTION, ANY_RESOURCE, false),
-        (BATCH_GET_IMAGE_ACTION, repository.as_str(), true),
-    ] {
-        let action = super::authorization::action_for(action);
-        let request = iam::Request::new(&action, resource, &principals);
-        let identity = iam::identity_decision_prepared(&prepared, &request);
-        // A registry-level action is granted on the registry, which no repository policy
-        // is the document for.
-        let stated = match (repository_scoped, shared.as_deref()) {
-            (true, Some(document)) => iam::resource_decision(document, &request),
-            _ => Decision::NotStated,
+    // obtain a token never reaches a manifest. A registry-level action is granted on the
+    // registry, which no repository policy is the document for.
+    decided
+        .withheld(GET_AUTHORIZATION_TOKEN_ACTION, ANY_RESOURCE, None)
+        .or_else(|| decided.withheld(BATCH_GET_IMAGE_ACTION, &repository, shared.as_deref()))
+}
+
+/// Why no policy in force on `principal` permits it the REGISTRY-level authorization token
+/// a pull begins with ([`GET_AUTHORIZATION_TOKEN_ACTION`]), in AWS's own words, and `None`
+/// when it is permitted — or when nothing of the kind can be shown (see the module docs).
+///
+/// This is the one call of a pull that addresses no repository: "A client can use the
+/// returned token to access any Amazon ECR registry that the IAM principal has access to"
+/// (`GetAuthorizationToken`), decided on [`ANY_RESOURCE`] and on the identity documents
+/// alone. A compute service's agent obtains ONE token for the registry before it fetches any
+/// manifest, so it asks this question once for a task however many of that task's images
+/// come from this registry, and a principal that is refused the token has not reached an
+/// image at all.
+///
+/// A READ: the stores are only consulted, so asking changes nothing a later caller sees.
+pub fn withheld_registry_authorization<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    principal: Option<PullPrincipal<'_>>,
+) -> Option<String> {
+    match PreparedPrincipal::prepare(engine, principal)?
+        .withheld(GET_AUTHORIZATION_TOKEN_ACTION, ANY_RESOURCE, None)?
+    {
+        PullRefusal::NotAuthorized { message, .. } => Some(message),
+        // [`PreparedPrincipal::withheld`] words every refusal it takes as the withheld call
+        // it is; nothing there answers about the contents of a repository.
+        PullRefusal::NotFound { .. } => None,
+    }
+}
+
+/// The principal a pull is made as.
+///
+/// A compute service pulls as a ROLE it ASSUMED for the workload — "the task execution role
+/// that grants the Amazon ECS container agent permission to make Amazon Web Services API
+/// calls on your behalf" (`TaskDefinition$executionRoleArn`) — so the documents in force are
+/// the role's while the caller AWS reports is the session, which is the same split every
+/// other gate over an assumed role in this tree takes.
+#[derive(Debug, Clone, Copy)]
+pub struct PullPrincipal<'a> {
+    /// The IAM ROLE whose identity-based documents are in force on the pull, and which a
+    /// repository policy grants the pull by naming.
+    pub role_arn: &'a str,
+    /// What a refusal NAMES as the principal: the ARN of the SESSION the pulling service
+    /// assumed that role in, which is what AWS reports for a call made under one. `None`
+    /// names the role itself, for a caller that holds no session of its own.
+    pub session_arn: Option<&'a str>,
+}
+
+impl<'a> PullPrincipal<'a> {
+    /// The pull made as the role `role_arn` itself, with no session of its own to name.
+    #[must_use]
+    pub fn of_role(role_arn: &'a str) -> Self {
+        Self {
+            role_arn,
+            session_arn: None,
+        }
+    }
+
+    /// The ARN a refusal names as the principal (see [`Self::session_arn`]).
+    fn reported_arn(&self) -> &'a str {
+        self.session_arn.unwrap_or(self.role_arn)
+    }
+}
+
+/// Everything the authorization of a pull is decided from about the PRINCIPAL it is made as:
+/// the role, the identity documents in force on it, the ceiling its permissions boundary
+/// sets, and every spelling a resource-based policy may name it by.
+///
+/// Prepared ONCE ([`PreparedPrincipal::prepare`]) and then asked about each call the pull
+/// makes ([`PreparedPrincipal::withheld`]), so the IAM store is read one time however many of
+/// them there are.
+struct PreparedPrincipal<'role> {
+    /// The principal the pull is made as, which a refusal names ([`PullPrincipal`]).
+    principal: PullPrincipal<'role>,
+    /// The identity documents in force on it, prepared for the decisions below.
+    prepared: Vec<iam::PreparedDocument>,
+    /// The permissions boundary's document, prepared the same way, and `None` for a role
+    /// carrying none.
+    capped: Option<Vec<iam::PreparedDocument>>,
+    /// Every spelling a resource-based policy may name this pull's principal by: the session
+    /// it is made in, the role whose permissions are in force, and the account each belongs to
+    /// — read the way every other service in this tree reads them.
+    principals: Vec<String>,
+}
+
+impl<'role> PreparedPrincipal<'role> {
+    /// What the documents in force on `principal` decide a pull by, and `None` where nothing
+    /// of the kind can be shown: a pull made with no principal, an engine carrying no IAM
+    /// store, a role that store holds no record for, or one carrying an attachment whose
+    /// document this account does not hold (see the module docs).
+    fn prepare<Eng: Send + Sync + 'static>(
+        engine: &Eng,
+        principal: Option<PullPrincipal<'role>>,
+    ) -> Option<Self> {
+        let principal = principal?;
+        let role_arn = principal.role_arn;
+        let iam = iam_store::service_state(engine)?;
+        let (statements, boundary) = {
+            let store = iam.lock();
+            // A role this account's IAM holds no record for may belong to another account, so
+            // its documents are not this store's to read.
+            store.roles.values().find(|role| role.arn == role_arn)?;
+            let policies = store.principal_policies(role_arn)?;
+            // An attachment whose document this account does not hold — an entry of AWS's own
+            // catalog — may be the very policy that carries the grant, so nothing is withheld
+            // on it.
+            if !policies.uncarried.is_empty() {
+                return None;
+            }
+            (
+                policies.documents,
+                store.permissions_boundary_document(role_arn),
+            )
         };
+        let mut principals = vec![role_arn.to_string()];
+        if let Some(session_arn) = principal.session_arn {
+            principals.push(session_arn.to_string());
+        }
+        principals.extend(iam::account_principals(role_arn));
+        Some(Self {
+            principal,
+            prepared: iam::prepare_documents(&statements),
+            capped: boundary
+                .map(|document| iam::prepare_documents(::std::slice::from_ref(&document))),
+            principals,
+        })
+    }
+
+    /// The refusal ONE call of a pull earns — `action` on `resource`, with `shared` the
+    /// resource-based policy of the repository it addresses and `None` for a registry-level
+    /// call no repository policy is the document for — and `None` when it is permitted.
+    fn withheld(&self, action: &str, resource: &str, shared: Option<&str>) -> Option<PullRefusal> {
+        let action = super::authorization::action_for(action);
+        let request = iam::Request::new(&action, resource, &self.principals);
+        let identity = iam::identity_decision_prepared(&self.prepared, &request);
+        let stated = shared.map_or(Decision::NotStated, |document| {
+            iam::resource_decision(document, &request)
+        });
         let granted = iam::is_allowed(identity, stated);
         // A permissions boundary CAPS what the documents grant; it grants nothing itself,
         // and a call an explicit deny already refuses reads no ceiling.
@@ -490,12 +595,12 @@ fn withheld_pull<Eng: Send + Sync + 'static>(
         let ceiling = if refused_outright {
             Decision::Allowed
         } else {
-            capped.as_deref().map_or(Decision::Allowed, |boundary| {
+            self.capped.as_deref().map_or(Decision::Allowed, |boundary| {
                 iam::identity_decision_prepared(boundary, &request)
             })
         };
         if granted && ceiling == Decision::Allowed {
-            continue;
+            return None;
         }
         // Why the grant was withheld: the two documents' own clauses are this service's one
         // wording of them ([`super::authorization::withheld_because`]), and the ceiling's are
@@ -517,18 +622,22 @@ fn withheld_pull<Eng: Send + Sync + 'static>(
             audit = true,
             operation = "ServeImagePull",
             outcome = "refused_access_denied",
-            principal = %role_arn,
+            principal = %self.principal.reported_arn(),
             action = %action,
             resource = %resource,
             explicit_deny = refused_outright || ceiling == Decision::Denied,
             "no policy in force permits this role to pull this image"
         );
-        return Some(PullRefusal::NotAuthorized {
-            message: iam::not_authorized_by_identity_policy(role_arn, &action, resource, &reason),
+        Some(PullRefusal::NotAuthorized {
+            message: iam::not_authorized_by_identity_policy(
+                self.principal.reported_arn(),
+                &action,
+                resource,
+                &reason,
+            ),
             action,
-        });
+        })
     }
-    None
 }
 
 /// The call a pull makes against the LAYERS of the image it resolved: "Retrieves the

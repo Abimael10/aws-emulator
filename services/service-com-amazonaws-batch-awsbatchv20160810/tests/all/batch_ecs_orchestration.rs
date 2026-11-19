@@ -63,15 +63,18 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// than imported.
 const CANNOT_PULL: &str = "CannotPullContainerError";
 
-/// Batch, Amazon ECS, both Amazon ECR surfaces and CloudWatch Logs on ONE shared engine, the
-/// way the router mounts every service.
+/// The IAM API version an awsQuery body carries.
+const IAM_API_VERSION: &str = "2010-05-08";
+
+/// Batch, Amazon ECS, both Amazon ECR surfaces, CloudWatch Logs and IAM on ONE shared engine,
+/// the way the router mounts every service.
 ///
-/// Each of the four is here because this chain reaches it: the cluster backing a compute
+/// Each of the five is here because this chain reaches it: the cluster backing a compute
 /// environment is Amazon ECS's resource, the image a job's container runs is served by the
-/// registry that holds it (a private Amazon ECR registry or the ECR Public gallery), and the
-/// log stream a placed container writes to is CloudWatch Logs'. Each claims only requests
-/// scoped to its own signing name, so no Batch call below is routed any differently for their
-/// presence.
+/// registry that holds it (a private Amazon ECR registry or the ECR Public gallery), the log
+/// stream a placed container writes to is CloudWatch Logs', and the policies in force on the
+/// execution role a private pull is made as are IAM's. Each claims only requests scoped to its
+/// own signing name, so no Batch call below is routed any differently for their presence.
 struct Emulator {
     router: MultiServiceRouter,
 }
@@ -105,6 +108,9 @@ impl Emulator {
             service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
                 &engine,
             )),
+        );
+        router.register_service(
+            service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(engine),
         );
         Self { router }
     }
@@ -183,6 +189,64 @@ impl Emulator {
             "case ecr-public {operation}: expected HTTP 200, got {status} with {answered}"
         );
         answered
+    }
+
+    /// One call to the private Amazon ECR registry, as a client makes it: a repository and the
+    /// image in it are created through THAT service's own API, never written into a store.
+    async fn ecr(&self, operation: &str, body: Value) -> Value {
+        let (status, answered) = self
+            .rpc(
+                "ecr",
+                "AmazonEC2ContainerRegistry_V20150921",
+                operation,
+                body,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case ecr {operation}: expected HTTP 200, got {status} with {answered}"
+        );
+        answered
+    }
+
+    /// One awsQuery call to IAM that must succeed, answering its XML body: a role and the
+    /// documents in force on it are created through IAM's OWN API.
+    ///
+    /// The body carries each value literally, which is what an
+    /// `application/x-www-form-urlencoded` body of these calls needs: the only bytes that
+    /// form encoding exists for are `&`, `=`, `+`, `%` and whitespace, and no value below
+    /// holds one — the policy documents are written compactly for exactly that reason
+    /// ([`grant`], [`role`]). A suite whose values need escaping takes the maintained
+    /// encoder instead, the way this crate's manifest takes a crate for anything it would
+    /// otherwise write by hand.
+    async fn iam(&self, action: &str, params: &[(&str, String)]) -> String {
+        let mut body = format!("Action={action}&Version={IAM_API_VERSION}");
+        for (name, value) in params {
+            assert!(
+                !value.contains(['&', '=', '+', '%', ' ']),
+                "case iam {action}: the value of {name} needs form escaping: {value:?}"
+            );
+            body.push('&');
+            body.push_str(name);
+            body.push('=');
+            body.push_str(value);
+        }
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "iam.amazonaws.com")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("authorization", authorization("iam"))
+            .body(bytes::Bytes::from(body))
+            .expect("a well-formed awsQuery request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let text = String::from_utf8_lossy(response.body()).to_string();
+        assert_eq!(
+            status, 200,
+            "case iam {action}: expected HTTP 200, got {status} with {text}"
+        );
+        text
     }
 
     /// One CloudWatch Logs call, as a client makes it; answers the status and the body, because
@@ -917,6 +981,276 @@ async fn an_image_no_registry_here_serves_fails_the_job_at_the_fetch() {
         assert_eq!(
             attempt["container"]["exitCode"].as_i64(),
             (!row.refused).then_some(0),
+            "case {case}: the exit code belongs to a container that exited, got {attempt}"
+        );
+    }
+}
+
+/// The fixed text of the `statusReason` the agent words for the Amazon ECR registry
+/// AUTHENTICATION it could not retrieve — the execution resource it obtains before any
+/// manifest is fetched — followed by the class Amazon ECR refuses an unauthorized call with.
+/// Spelled out here rather than imported, so a wrong constant in the implementation cannot
+/// make a test pass.
+const REGISTRY_AUTH_RETRIEVAL_FAILED: &str =
+    "ResourceInitializationError: unable to pull secrets or registry auth: execution resource \
+     retrieval failed: unable to retrieve ecr registry auth: service call has been retried 1 \
+     time(s): AccessDeniedException: ";
+
+/// What the refusal inside that reason names: the registry-level authorization token, decided
+/// on no resource narrower than the registry — not the manifest call the fetch itself makes.
+const WITHHELD_REGISTRY_CALL: &str =
+    "is not authorized to perform: ecr:GetAuthorizationToken on resource: *";
+
+/// An identity-based document allowing `actions` on every resource.
+///
+/// Rendered compactly (`to_string` writes no whitespace), so the form body that carries it
+/// to IAM needs no escaping ([`Emulator::iam`]).
+fn grant(actions: &[&str]) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{ "Effect": "Allow", "Action": actions, "Resource": "*" }],
+    })
+    .to_string()
+}
+
+/// Create the IAM role `name`, trusted by Amazon ECS's task runtime and carrying `policy` as
+/// its one inline policy, through IAM's own API — and answer its ARN.
+///
+/// The trust policy is rendered the same compact way as [`grant`].
+async fn role(emulator: &Emulator, name: &str, policy: &str) -> String {
+    let trust = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": "ecs-tasks.amazonaws.com" },
+            "Action": "sts:AssumeRole",
+        }],
+    })
+    .to_string();
+    emulator
+        .iam(
+            "CreateRole",
+            &[
+                ("RoleName", name.to_string()),
+                ("AssumeRolePolicyDocument", trust),
+            ],
+        )
+        .await;
+    emulator
+        .iam(
+            "PutRolePolicy",
+            &[
+                ("RoleName", name.to_string()),
+                ("PolicyName", "inline".to_string()),
+                ("PolicyDocument", policy.to_string()),
+            ],
+        )
+        .await;
+    format!("arn:aws:iam::{ACCOUNT}:role/{name}")
+}
+
+/// One row of the registry-authentication table: what the job's execution role is granted,
+/// what its container runs, and the step the job must fail at — `None` for a row that runs.
+struct RegistryAuthRow {
+    case: &'static str,
+    /// Which of the prepared roles the job runs as, and `None` for a job that names none.
+    role: Option<usize>,
+    /// The repository of this account's private registry the reference names, with its tag.
+    reference: &'static str,
+    /// The step the job fails at.
+    fails_at: Option<Step>,
+}
+
+/// Where a job's launch failed: the execution-resource retrieval that precedes every fetch,
+/// or the fetch itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    /// The registry withheld the authorization token, so no image was reached.
+    RegistryAuthRetrieval,
+    /// The token was obtained and the registry would not serve the reference.
+    ImageFetch,
+}
+
+/// RULE: the authorization token for an Amazon ECR registry is an EXECUTION RESOURCE retrieved
+/// as the job's execution role before any image is fetched, and it is granted on the registry
+/// rather than on a repository — so a job whose role no policy permits that registry-level
+/// call fails in that retrieval, reporting the agent's `ResourceInitializationError` for the
+/// registry authentication it could not get and naming no image, whatever the registry holds
+/// for the reference. A role that DID obtain the token and is refused the manifest fails at
+/// the fetch instead, which is the container runtime's account of an image it could not pull.
+#[tokio::test]
+async fn a_job_whose_role_cannot_get_the_registry_token_fails_the_resource_retrieval() {
+    let fixture = placeable().await;
+    let emulator = &fixture.emulator;
+
+    // One repository of this account's private registry, holding one tagged image, created
+    // and pushed through Amazon ECR's own API.
+    emulator
+        .ecr("CreateRepository", json!({"repositoryName": "app"}))
+        .await;
+    emulator
+        .ecr(
+            "PutImage",
+            json!({
+                "repositoryName": "app",
+                "imageManifest": json!({"schemaVersion": 2}).to_string(),
+                "imageTag": HELD_TAG,
+            }),
+        )
+        .await;
+
+    // The roles, each carrying a different part of what a pull takes.
+    let roles = [
+        role(
+            emulator,
+            "batchmanifestonly",
+            &grant(&["ecr:BatchGetImage"]),
+        )
+        .await,
+        role(emulator, "batchtokenonly", &grant(&["ecr:GetAuthorizationToken"])).await,
+        role(
+            emulator,
+            "batchfullpull",
+            &grant(&["ecr:GetAuthorizationToken", "ecr:BatchGetImage"]),
+        )
+        .await,
+    ];
+    // The rows differ along what the rule generalises over: which half of the pull the role
+    // holds, and what the registry holds for the reference — which the registry-level call is
+    // not decided on.
+    let rows: &[RegistryAuthRow] = &[
+        RegistryAuthRow {
+            case: "a role granted the manifest call but not the registry token",
+            role: Some(0),
+            reference: "app:v1",
+            fails_at: Some(Step::RegistryAuthRetrieval),
+        },
+        RegistryAuthRow {
+            case: "the same role, pulling a repository this registry does not hold",
+            role: Some(0),
+            reference: "absent:v1",
+            fails_at: Some(Step::RegistryAuthRetrieval),
+        },
+        RegistryAuthRow {
+            case: "a role granted the registry token but not the manifest",
+            role: Some(1),
+            reference: "app:v1",
+            fails_at: Some(Step::ImageFetch),
+        },
+        RegistryAuthRow {
+            case: "a role granted both calls a pull makes",
+            role: Some(2),
+            reference: "app:v1",
+            fails_at: None,
+        },
+        RegistryAuthRow {
+            // A job that names no role states nothing for a policy to be read against, so
+            // nothing is withheld and the registry answers about the image alone.
+            case: "no execution role at all",
+            role: None,
+            reference: "app:v1",
+            fails_at: None,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let image = format!("{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/{}", row.reference);
+        let mut container = json!({
+            "image": &image,
+            "command": ["echo", "hi"],
+            "resourceRequirements": [
+                {"type": "VCPU", "value": "1"},
+                {"type": "MEMORY", "value": "512"},
+            ],
+        });
+        if let Some(which) = row.role {
+            container["executionRoleArn"] = json!(roles[which]);
+        }
+        let definition = emulator
+            .batch_ok(
+                "/v1/registerjobdefinition",
+                json!({
+                    "jobDefinitionName": format!("jd-auth-{index}"),
+                    "type": "container",
+                    "containerProperties": container,
+                }),
+            )
+            .await["jobDefinitionArn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let job_id = emulator
+            .batch_ok(
+                "/v1/submitjob",
+                json!({
+                    "jobName": format!("job-auth-{index}"),
+                    "jobQueue": &fixture.queue,
+                    "jobDefinition": definition,
+                }),
+            )
+            .await["jobId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let detail = until_terminal(emulator, case, &job_id).await;
+        let expected_status = if row.fails_at.is_some() {
+            state::JOB_FAILED
+        } else {
+            state::JOB_SUCCEEDED
+        };
+        assert_eq!(
+            detail["status"].as_str(),
+            Some(expected_status),
+            "case {case}: expected the job to end {expected_status}, got {detail}"
+        );
+        let reason = detail["statusReason"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: expected a statusReason, got {detail}"));
+        match row.fails_at {
+            Some(Step::RegistryAuthRetrieval) => {
+                assert!(
+                    reason.starts_with(REGISTRY_AUTH_RETRIEVAL_FAILED),
+                    "case {case}: expected the statusReason to begin \
+                     {REGISTRY_AUTH_RETRIEVAL_FAILED:?}, got {reason:?}"
+                );
+                assert!(
+                    reason.contains(WITHHELD_REGISTRY_CALL),
+                    "case {case}: expected the statusReason to carry \
+                     {WITHHELD_REGISTRY_CALL:?}, got {reason:?}"
+                );
+                // A fetch that was never made is not reported: neither the runtime's class
+                // for a failed fetch nor the reference itself is in it.
+                for absent in [CANNOT_PULL, image.as_str()] {
+                    assert!(
+                        !reason.contains(absent),
+                        "case {case}: expected no {absent:?} in the statusReason of a job that \
+                         reached no image, got {reason:?}"
+                    );
+                }
+            }
+            Some(Step::ImageFetch) => {
+                assert!(
+                    reason.starts_with(CANNOT_PULL) && reason.contains(&image),
+                    "case {case}: expected a {CANNOT_PULL} naming {image:?}, got {reason:?}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    Some(reason),
+                    Some(state::ESSENTIAL_CONTAINER_EXITED_REASON),
+                    "case {case}: expected the reason a container that exited carries, got \
+                     {reason:?}"
+                );
+            }
+        }
+        // Nothing ran for a job that failed before its container was created, whichever step
+        // failed: the exit code belongs to a container that exited.
+        let attempt = detail["attempts"][0].clone();
+        assert_eq!(
+            attempt["container"]["exitCode"].as_i64(),
+            row.fails_at.is_none().then_some(0),
             "case {case}: the exit code belongs to a container that exited, got {attempt}"
         );
     }

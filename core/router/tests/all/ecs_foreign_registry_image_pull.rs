@@ -12,10 +12,10 @@
 //! one this emulator serves is a cross-account pull nothing here serves: the task never runs
 //! — it is reported `STOPPED` with `Task$stopCode` `TaskFailedToStart` and a
 //! `Task$stoppedReason` carrying the container runtime's `CannotPullContainerError` for the
-//! reference, whose clause names what the fetch found: for a pull made as a role, the
-//! authorization refusal naming the principal, `ecr:BatchGetImage` and the repository ARN
-//! inside the registry that was ADDRESSED, and for a launch that resolved no role to pull as,
-//! a reference that resolved to nothing — and nothing of this account's own registry is
+//! reference, whose clause names what the fetch found: for a pull made as a role, the manifest
+//! request the runtime made against the registry that was ADDRESSED and the `403 Forbidden`
+//! that registry answered it with, and for a launch that resolved no role to pull as, a
+//! reference that resolved to nothing — and nothing of this account's own registry is
 //! served in its place.
 //!
 //! Three services have to agree for the rule to hold, which is why this suite lives beside
@@ -60,6 +60,10 @@ const CAPACITY_INSTANCE_ID: &str = "i-0d0ffee0d0ffee0d2";
 const REPOSITORY: &str = "app";
 const TAG: &str = "1";
 
+/// The tag a container runtime appends to a reference that names none, which is the tag such a
+/// reference's manifest request asks for.
+const DEFAULT_TAG: &str = "latest";
+
 /// Two accounts that are not the one this emulator serves, so two registries no policy here
 /// shares: the rule is about the registry the host names and not about one spelling of it.
 const OTHER_ACCOUNT: &str = "210987654321";
@@ -88,9 +92,10 @@ const ESSENTIAL_CONTAINER_EXITED: &str = "EssentialContainerExited";
 /// part of such a `stoppedReason`.
 const CANNOT_PULL: &str = "CannotPullContainerError";
 
-/// The registry call a pull resolves a manifest with, as the IAM Service Authorization
-/// Reference publishes it — the action a cross-account refusal names.
-const BATCH_GET_IMAGE: &str = "ecr:BatchGetImage";
+/// The HTTP status a registry answers a manifest request no authorization covers with, which
+/// is what the runtime reports for a refused pull: a `docker pull` is refused with a status,
+/// not with an IAM sentence.
+const FORBIDDEN: &str = "403 Forbidden";
 
 /// A Docker image manifest V2 schema 2 referencing no blob: what is under test is whose
 /// registry a reference addresses, not which blobs an image is built from.
@@ -239,10 +244,14 @@ fn registry_image(account: &str, region: &str, repository: &str) -> String {
     format!("{account}.dkr.ecr.{region}.amazonaws.com/{repository}")
 }
 
-/// The ARN of `repository` inside the registry of `account`, which is the resource a pull's
-/// manifest call is decided against there.
-fn repository_arn(account: &str, region: &str, repository: &str) -> String {
-    format!("arn:aws:ecr:{region}:{account}:repository/{repository}")
+/// The MANIFEST request a pull of `repository` in the registry of `account` makes, addressing
+/// `reference` (a tag or a digest): the Docker Registry HTTP API V2 route
+/// (`GET /v2/<name>/manifests/<reference>`) on that registry's host, which is the request a
+/// registry that will not serve the pull refuses.
+fn manifest_request(account: &str, region: &str, repository: &str, reference: &str) -> String {
+    format!(
+        "https://{account}.dkr.ecr.{region}.amazonaws.com/v2/{repository}/manifests/{reference}"
+    )
 }
 
 /// Create the IAM role `name`, trusted by Amazon ECS and granted both calls an Amazon ECR
@@ -433,16 +442,16 @@ async fn a_reference_into_another_accounts_registry_is_not_served_to_the_executi
 
     let role = pulling_role(&router, ROLE).await;
     let tagged = format!("{REPOSITORY}:{TAG}");
-    // The clause a refusal carries when only the ADDRESSED registry's own resource-based
-    // policy could have allowed the call
-    // (`service_common::iam_authorization::not_authorized_by_resource_policy`).
-    let cross_account = |account: &str, repository: &str| {
+    // What a refusal carries when only the ADDRESSED registry's own resource-based policy
+    // could have allowed the call: that registry answers the manifest request the fetch makes
+    // with `403 Forbidden`, and the runtime reports the request and the status — the
+    // authorization decision itself is the registry's own and is not on this wire.
+    let cross_account = |account: &str, repository: &str, reference: &str| {
         Outcome::FailedToStart(vec![
             CANNOT_PULL.to_string(),
             format!(
-                "User: {role} is not authorized to perform: {BATCH_GET_IMAGE} on resource: {} \
-                 because no resource-based policy allows the {BATCH_GET_IMAGE} action",
-                repository_arn(account, REGION, repository)
+                "unexpected status from HEAD request to {}: {FORBIDDEN}",
+                manifest_request(account, REGION, repository, reference)
             ),
         ])
     };
@@ -459,28 +468,28 @@ async fn a_reference_into_another_accounts_registry_is_not_served_to_the_executi
             family: "foreignheld",
             image: registry_image(OTHER_ACCOUNT, REGION, &tagged),
             execution_role: Some(role.clone()),
-            expected: cross_account(OTHER_ACCOUNT, REPOSITORY),
+            expected: cross_account(OTHER_ACCOUNT, REPOSITORY, TAG),
         },
         Row {
             case: "another account's registry, naming a repository nothing here holds",
             family: "foreignabsent",
             image: registry_image(OTHER_ACCOUNT, REGION, "absent:7"),
             execution_role: Some(role.clone()),
-            expected: cross_account(OTHER_ACCOUNT, "absent"),
+            expected: cross_account(OTHER_ACCOUNT, "absent", "7"),
         },
         Row {
             case: "a third account's registry, so the rule is not about one account id",
             family: "thirdaccount",
             image: registry_image(THIRD_ACCOUNT, REGION, &tagged),
             execution_role: Some(role.clone()),
-            expected: cross_account(THIRD_ACCOUNT, REPOSITORY),
+            expected: cross_account(THIRD_ACCOUNT, REPOSITORY, TAG),
         },
         Row {
             case: "a foreign reference with no tag, which asks the registry's default tag",
             family: "foreignuntagged",
             image: registry_image(OTHER_ACCOUNT, REGION, REPOSITORY),
             execution_role: Some(role.clone()),
-            expected: cross_account(OTHER_ACCOUNT, REPOSITORY),
+            expected: cross_account(OTHER_ACCOUNT, REPOSITORY, DEFAULT_TAG),
         },
         Row {
             // This account's registry in another Region is still this account's: the fetch is
