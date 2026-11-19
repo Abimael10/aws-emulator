@@ -5,7 +5,8 @@
 //! configuration option catalog the platform version of the named configuration set —
 //! a stored configuration template, or a stored running environment — publishes, and
 //! reports one `error` `ValidationMessage` per setting whose value that option does not
-//! take. This is the ONLY file to touch for this operation.
+//! take, then one `warning` `ValidationMessage` per advisory the resulting configuration
+//! carries. This is the ONLY file to touch for this operation.
 //!
 //! The settings are evaluated, never stored: this operation "determines whether those
 //! values are valid" and persists nothing of its own.
@@ -270,9 +271,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // selection is evaluated against the option catalog the platform
         // version that configuration set runs publishes, and against the
         // configuration these settings would put in force — the same evaluation
-        // every operation that writes option settings is refused by. A
-        // selection the platform version accepts produces none, which is the
-        // empty list rather than an absent member.
+        // every operation that writes option settings is refused by — and the
+        // configuration they result in is reported with the advisories it
+        // carries as well, at the severity of information the caller should take
+        // into account. A selection the platform version accepts and that
+        // carries no advisory produces none, which is the empty list rather than
+        // an absent member.
         let messages = store.configuration_validation_messages(
             &region,
             solution_stack_name.as_deref(),

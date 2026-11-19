@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! Whether a DESIRED configuration option value is one the platform version
-//! accepts: the evaluation `ValidateConfigurationSettings` reports as
-//! `ValidationMessage`s.
+//! accepts, and what the configuration those values result in should be pointed
+//! out for: the evaluation `ValidateConfigurationSettings` reports as
+//! `ValidationMessage`s, at both severities the model declares — an `error` for a
+//! value the option does not take, a `warning` for information the caller should
+//! take into account about a configuration whose values are each acceptable.
 //!
 //! The published description of an option states what values it takes — a
 //! numeric range, a length, a regular expression, a value set — and
@@ -32,15 +35,32 @@ use crate::ops::types::{ValidationMessage, VALIDATION_SEVERITY_VALUES};
 /// reports no severity the model does not declare.
 pub const VALIDATION_SEVERITY_ERROR: &str = VALIDATION_SEVERITY_VALUES[0];
 
-/// One `ValidationMessage` about the option `namespace` / `option_name`, at the
-/// severity of a value that is not valid for it.
-fn invalid_setting(namespace: &str, option_name: &str, message: String) -> ValidationMessage {
+/// `ValidationSeverity$warning`: "this message is providing information you
+/// should take into account". Read from the same modelled value set, so an
+/// advisory this service reports carries a severity the model declares and the
+/// caller can tell apart from a value it must correct.
+pub const VALIDATION_SEVERITY_WARNING: &str = VALIDATION_SEVERITY_VALUES[1];
+
+/// One `ValidationMessage` about the option `namespace` / `option_name`, at
+/// `severity`.
+fn reported_setting(
+    severity: &str,
+    namespace: &str,
+    option_name: &str,
+    message: String,
+) -> ValidationMessage {
     ValidationMessage {
         message: Some(message),
-        severity: Some(VALIDATION_SEVERITY_ERROR.to_string()),
+        severity: Some(severity.to_string()),
         namespace: Some(namespace.to_string()),
         option_name: Some(option_name.to_string()),
     }
+}
+
+/// One `ValidationMessage` about the option `namespace` / `option_name`, at the
+/// severity of a value that is not valid for it.
+fn invalid_setting(namespace: &str, option_name: &str, message: String) -> ValidationMessage {
+    reported_setting(VALIDATION_SEVERITY_ERROR, namespace, option_name, message)
 }
 
 /// The sentence a value the option does not take is reported with: the value the
@@ -55,6 +75,58 @@ fn invalid_value_message(
         "Invalid option value: '{value}' (Namespace: '{namespace}', OptionName: \
          '{option_name}'): {requirement}"
     )
+}
+
+/// The requirement a value that is not a number at all fails, on an option whose
+/// published description bounds it by a numeric range: the option takes a number,
+/// so the value is reported as not being one rather than as being outside a bound
+/// it cannot be compared with.
+const NOT_A_NUMBER_REQUIREMENT: &str = "Value is not a number";
+
+/// The option that names the IAM instance profile the instances a configuration
+/// launches are given — "an instance profile enables Amazon EC2 instances to
+/// access other Amazon Web Services resources" — in the launch-configuration
+/// namespace every platform version this service publishes defines.
+const OPTION_IAM_INSTANCE_PROFILE: &str = "IamInstanceProfile";
+
+/// The advisory a configuration that associates no IAM instance profile with its
+/// instances is reported with. FIXED text: it names nothing from the request or
+/// from the store, and the option the advice is about is identified by the
+/// message's own `Namespace` / `OptionName` instead.
+const NO_INSTANCE_PROFILE_ADVISORY: &str = "The environment does not have an IAM instance profile \
+                                            associated with it. To improve deployment speed \
+                                            please associate an IAM instance profile with the \
+                                            environment.";
+
+/// The advisories the configuration `written` — the settings the configuration
+/// set holds with the desired ones over them — carries: information the caller
+/// "should take into account" about a configuration whose values are each one
+/// their option takes.
+///
+/// One such check is stated: a configuration that sets no IAM instance profile
+/// for its instances launches them without one, which is a deployment the
+/// service still performs, degraded, rather than a value to correct — so it is
+/// reported at the advisory severity, scoped to the option that would carry the
+/// profile. A setting carrying no value, or the empty one, associates no profile,
+/// the same as not setting the option at all.
+fn configuration_advisory_messages(
+    written: &[ConfigurationOptionSetting],
+) -> Vec<ValidationMessage> {
+    let associated = option_value(
+        written,
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        OPTION_IAM_INSTANCE_PROFILE,
+    )
+    .is_some_and(|profile| !profile.trim().is_empty());
+    if associated {
+        return Vec::new();
+    }
+    vec![reported_setting(
+        VALIDATION_SEVERITY_WARNING,
+        NAMESPACE_LAUNCH_CONFIGURATION,
+        OPTION_IAM_INSTANCE_PROFILE,
+        NO_INSTANCE_PROFILE_ADVISORY.to_string(),
+    )]
 }
 
 /// What a refusal of a request that WRITES option settings opens with, ahead of
@@ -87,16 +159,22 @@ pub fn configuration_validation_refusal(
 }
 
 impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
-    /// The errors the desired settings `desired` carry for the configuration set
-    /// of the platform version named by `solution_stack_name` / `platform_arn`,
-    /// whose own settings are `stored` — what `ValidateConfigurationSettings`
-    /// answers with.
+    /// The errors and the advisories the desired settings `desired` carry for the
+    /// configuration set of the platform version named by `solution_stack_name` /
+    /// `platform_arn`, whose own settings are `stored` — what
+    /// `ValidateConfigurationSettings` answers with.
     ///
     /// The evaluation is made against that version's published catalog, and
     /// against the configuration the desired settings would put in force (see
     /// [`Self::resolved_configuration_settings`]), so a bound one option states
     /// in terms of another is resolved the way a read of the set resolves its
     /// values.
+    ///
+    /// Both severities the model declares are reported: one error per setting
+    /// whose value its option does not take, then the advisories the resulting
+    /// configuration carries (see [`configuration_advisory_messages`]) — which is
+    /// what makes "any errors or warnings associated with the selection of option
+    /// values" the whole answer rather than the errors alone.
     pub fn configuration_validation_messages(
         &self,
         region: &str,
@@ -106,13 +184,17 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
         desired: &[ConfigurationOptionSetting],
     ) -> Vec<ValidationMessage> {
         let stack = configuration_platform(region, solution_stack_name, platform_arn);
+        let written = merge_option_settings(stored, desired);
         let in_force = self.resolved_configuration_settings(
             region,
             solution_stack_name,
             platform_arn,
-            &merge_option_settings(stored, desired),
+            &written,
         );
-        configuration_validation_messages(&self.published_option_catalog(stack), desired, &in_force)
+        let catalog = self.published_option_catalog(stack);
+        let mut messages = configuration_validation_messages(&catalog, desired, &in_force);
+        messages.extend(configuration_advisory_messages(&written));
+        messages
     }
 
     /// The refusal a write of the option settings `written` to a configuration
@@ -219,7 +301,7 @@ fn unmet_requirement(
         // A range is published only for an option whose value IS a number, so a
         // value that is not one meets no bound of it.
         let Ok(number) = value.parse::<i64>() else {
-            return Some("Value is not a valid integer".to_string());
+            return Some(NOT_A_NUMBER_REQUIREMENT.to_string());
         };
         if let Some(minimum) = minimum {
             if number < minimum {

@@ -13,8 +13,13 @@
 //!   the regular expression it matches — and one error-severity
 //!   `ValidationMessage` per defective setting is reported, naming that
 //!   setting's namespace, option and the value sent; a setting the option takes
-//!   contributes none, which makes an empty list the answer to a valid
+//!   contributes none, which makes the advisories alone the answer to a valid
 //!   selection;
+//! * the configuration those values RESULT IN is reported with the advisories it
+//!   carries as well — information the caller should take into account rather
+//!   than a value to correct — each a warning-severity `ValidationMessage` scoped
+//!   to the option the advice is about, reported after the errors, and a
+//!   configuration that carries none is reported with none;
 //! * a bound one option states in terms of ANOTHER (`MinSize` must be "no
 //!   greater than MaxSize") is resolved against the configuration the desired
 //!   settings put IN FORCE, so an inverted pair is reported on both halves, and
@@ -29,7 +34,8 @@
 //! * an operation that WRITES option settings refuses a value that same
 //!   evaluation calls an error, with `ConfigurationValidationException` and the
 //!   sentence the service states a configuration it cannot accept with, and
-//!   stores nothing.
+//!   stores nothing — and is NOT refused for an advisory, which is information
+//!   rather than a value the platform cannot honour.
 //!
 //! Each table row is a different point in those classes — a different
 //! restriction kind, a different published bound, a different way of naming the
@@ -70,6 +76,19 @@ const APP_ENV: &str = "aws:elasticbeanstalk:application:environment";
 /// service's catalogue likewise does not publish.
 const SCHEDULED: &str = "aws:autoscaling:scheduledaction";
 
+/// The launch-configuration namespace and the option in it that names the IAM
+/// instance profile the instances a configuration launches are given.
+const LAUNCH_CONFIGURATION: &str = "aws:autoscaling:launchconfiguration";
+/// See [`LAUNCH_CONFIGURATION`].
+const IAM_INSTANCE_PROFILE: &str = "IamInstanceProfile";
+
+/// The sentence a configuration that associates no IAM instance profile with its
+/// instances is advised with, word for word as the service states it: it names
+/// nothing from the request, so it is written out here rather than built.
+const NO_INSTANCE_PROFILE: &str = "The environment does not have an IAM instance profile \
+                                   associated with it. To improve deployment speed please \
+                                   associate an IAM instance profile with the environment.";
+
 /// One `ValidationMessage` as the answer reports it, read member by member off
 /// ONE element so an answer that mixes up which message belongs to which option
 /// fails rather than matching independent flat lists.
@@ -100,6 +119,28 @@ fn reported_messages(answer: &Answer) -> Vec<ReportedMessage> {
                 .replace("&amp;", "&"),
         })
         .collect()
+}
+
+/// The error-severity messages in `answer`: the findings about a value the
+/// option does not take, read apart from the advisories the configuration
+/// carries, so a row about one class is asserted on that class alone.
+fn reported_errors(answer: &Answer) -> Vec<ReportedMessage> {
+    reported_messages(answer)
+        .into_iter()
+        .filter(|message| message.severity == "error")
+        .collect()
+}
+
+/// The advisory a configuration that associates no IAM instance profile carries,
+/// as the answer must report it: the fixed sentence, at the advisory severity,
+/// scoped to the option the advice is about.
+fn instance_profile_advisory() -> ReportedMessage {
+    ReportedMessage {
+        namespace: LAUNCH_CONFIGURATION.to_string(),
+        option_name: IAM_INSTANCE_PROFILE.to_string(),
+        severity: "warning".to_string(),
+        message: NO_INSTANCE_PROFILE.to_string(),
+    }
 }
 
 /// The published description of `namespace` / `option_name` on the platform
@@ -288,7 +329,7 @@ async fn every_desired_value_is_evaluated_against_its_options_published_restrict
             namespace: ASG,
             option_name: MIN_SIZE,
             value: "two".to_string(),
-            requirement: Some("Value is not a valid integer".to_string()),
+            requirement: Some("Value is not a number".to_string()),
         },
         RestrictionCase {
             case: "inside the published value set",
@@ -362,11 +403,11 @@ async fn every_desired_value_is_evaluated_against_its_options_published_restrict
             &[(case.namespace, case.option_name, &case.value, "")],
         )
         .await;
-        let reported = reported_messages(&answer);
+        let reported = reported_errors(&answer);
         match case.requirement.as_deref() {
             None => assert!(
                 reported.is_empty(),
-                "case {:?}: expected no validation message, got {reported:?}",
+                "case {:?}: expected no error-severity validation message, got {reported:?}",
                 case.case
             ),
             Some(requirement) => assert_eq!(
@@ -414,7 +455,7 @@ async fn one_message_is_reported_per_defective_setting() {
         ],
     )
     .await;
-    let reported: Vec<(String, String)> = reported_messages(&answer)
+    let reported: Vec<(String, String)> = reported_errors(&answer)
         .into_iter()
         .map(|message| (message.namespace, message.option_name))
         .collect();
@@ -444,7 +485,7 @@ async fn an_inverted_auto_scaling_group_pair_is_reported_on_both_halves() {
         &[(ASG, MIN_SIZE, "4", ""), (ASG, MAX_SIZE, "2", "")],
     )
     .await;
-    let reported = reported_messages(&answer);
+    let reported = reported_errors(&answer);
     assert_eq!(
         reported,
         vec![
@@ -479,7 +520,7 @@ async fn an_inverted_auto_scaling_group_pair_is_reported_on_both_halves() {
     // bound comes from the configuration in force, so the half the request sent
     // is the one reported.
     let answer = validated(&emulator, &[(ASG, MIN_SIZE, "12", "")]).await;
-    let reported = reported_messages(&answer);
+    let reported = reported_errors(&answer);
     assert_eq!(
         reported
             .iter()
@@ -494,9 +535,238 @@ async fn an_inverted_auto_scaling_group_pair_is_reported_on_both_halves() {
     // reads the configuration set's own value, not only the platform default.
     let answer = validated(&emulator, &[(ASG, MIN_SIZE, "8", "")]).await;
     assert!(
-        reported_messages(&answer).is_empty(),
-        "case \"below the stored maximum\": expected no message, got {}",
+        reported_errors(&answer).is_empty(),
+        "case \"below the stored maximum\": expected no error, got {}",
         answer.body
+    );
+}
+
+/// One row of the advisory table: the configuration set the evaluation is made
+/// for, the settings the request sends for it, and whether the answer must carry
+/// the instance-profile advisory.
+struct AdvisoryCase {
+    case: &'static str,
+    /// The request members that name the configuration set.
+    named: Vec<(String, String)>,
+    settings: Vec<(&'static str, &'static str, &'static str, &'static str)>,
+    advised: bool,
+}
+
+#[tokio::test]
+async fn a_configuration_that_associates_no_instance_profile_is_advised() {
+    let emulator = emulator_with_configuration_sets().await;
+
+    // A second template that carries the profile ITSELF: the advisory is about
+    // the configuration the desired settings RESULT IN, so a set that already
+    // associates one is not advised for a request that says nothing about it.
+    const WITH_PROFILE: &str = "profiled-template";
+    let mut template = vec![
+        ("ApplicationName".to_string(), APPLICATION.to_string()),
+        ("TemplateName".to_string(), WITH_PROFILE.to_string()),
+        ("SolutionStackName".to_string(), published_stack(0).name()),
+    ];
+    template.extend(option_params(&[(
+        LAUNCH_CONFIGURATION,
+        IAM_INSTANCE_PROFILE,
+        "my-instance-profile",
+        "",
+    )]));
+    created(
+        &emulator,
+        "CreateConfigurationTemplate",
+        &as_params(&template),
+    )
+    .await;
+
+    let against = |member: &str, name: &str| -> Vec<(String, String)> {
+        vec![
+            ("ApplicationName".to_string(), APPLICATION.to_string()),
+            (member.to_string(), name.to_string()),
+        ]
+    };
+
+    // Rows differ along where the profile is associated (nowhere, by the
+    // request, by the configuration set, unset by the request over a set that
+    // carries it), along the value it is associated by, and along which kind of
+    // configuration set the evaluation is made for.
+    let cases = vec![
+        AdvisoryCase {
+            case: "a request that says nothing about the profile",
+            named: against("TemplateName", TEMPLATE),
+            settings: vec![(ASG, MIN_SIZE, "2", "")],
+            advised: true,
+        },
+        AdvisoryCase {
+            case: "a request that associates a profile",
+            named: against("TemplateName", TEMPLATE),
+            settings: vec![(LAUNCH_CONFIGURATION, IAM_INSTANCE_PROFILE, "eb-ec2-role", "")],
+            advised: false,
+        },
+        AdvisoryCase {
+            case: "a request that associates a differently named profile",
+            named: against("TemplateName", TEMPLATE),
+            settings: vec![(
+                LAUNCH_CONFIGURATION,
+                IAM_INSTANCE_PROFILE,
+                "another-instance-profile",
+                "",
+            )],
+            advised: false,
+        },
+        AdvisoryCase {
+            case: "a request that sets the profile option to no value",
+            named: against("TemplateName", TEMPLATE),
+            settings: vec![(LAUNCH_CONFIGURATION, IAM_INSTANCE_PROFILE, "", "")],
+            advised: true,
+        },
+        AdvisoryCase {
+            case: "a request that sets the profile option to blanks",
+            named: against("TemplateName", TEMPLATE),
+            settings: vec![(LAUNCH_CONFIGURATION, IAM_INSTANCE_PROFILE, "   ", "")],
+            advised: true,
+        },
+        AdvisoryCase {
+            case: "a configuration set that carries the profile itself",
+            named: against("TemplateName", WITH_PROFILE),
+            settings: vec![(ASG, MIN_SIZE, "2", "")],
+            advised: false,
+        },
+        AdvisoryCase {
+            case: "a request that unsets the profile the configuration set carries",
+            named: against("TemplateName", WITH_PROFILE),
+            settings: vec![(LAUNCH_CONFIGURATION, IAM_INSTANCE_PROFILE, "", "")],
+            advised: true,
+        },
+        AdvisoryCase {
+            case: "a running environment that associates none",
+            named: against("EnvironmentName", ENVIRONMENT),
+            settings: vec![(ASG, MIN_SIZE, "2", "")],
+            advised: true,
+        },
+    ];
+
+    for case in &cases {
+        let mut params = case.named.clone();
+        params.extend(option_params(&case.settings));
+        let answer = created(
+            &emulator,
+            "ValidateConfigurationSettings",
+            &as_params(&params),
+        )
+        .await;
+        let reported = reported_messages(&answer);
+        let expected: Vec<ReportedMessage> = if case.advised {
+            vec![instance_profile_advisory()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            reported, expected,
+            "case {:?}: expected {} in the 200 body, got {reported:?}",
+            case.case,
+            if case.advised {
+                "the instance-profile advisory"
+            } else {
+                "no message at all"
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_advisories_are_reported_after_the_errors() {
+    let emulator = emulator_with_configuration_sets().await;
+    let published_maximum = published(ASG, MAX_SIZE)
+        .max_value
+        .expect("the catalogue publishes a MaxValue for the group's maximum size");
+    let above = (i64::from(published_maximum) + 1).to_string();
+
+    // One value the option does not take, and a configuration that associates no
+    // profile: both severities are reported, in the 200 body, the errors first.
+    let answer = validated(
+        &emulator,
+        &[
+            (ASG, MAX_SIZE, &above, ""),
+            (ASG, MIN_SIZE, "not-a-number", ""),
+        ],
+    )
+    .await;
+    assert_eq!(
+        reported_messages(&answer),
+        vec![
+            ReportedMessage {
+                namespace: ASG.to_string(),
+                option_name: MAX_SIZE.to_string(),
+                severity: "error".to_string(),
+                message: invalid_value(
+                    ASG,
+                    MAX_SIZE,
+                    &above,
+                    &format!("Value exceeds maximum allowed value: {published_maximum}")
+                ),
+            },
+            ReportedMessage {
+                namespace: ASG.to_string(),
+                option_name: MIN_SIZE.to_string(),
+                severity: "error".to_string(),
+                message: invalid_value(ASG, MIN_SIZE, "not-a-number", "Value is not a number"),
+            },
+            instance_profile_advisory(),
+        ],
+        "case \"two defective values and no instance profile\": expected the errors in request \
+         order, then the advisory, got {}",
+        answer.body
+    );
+}
+
+#[tokio::test]
+async fn a_write_is_not_refused_for_an_advisory() {
+    let emulator = emulator_with_configuration_sets().await;
+    let advised = validated(&emulator, &[(ASG, MIN_SIZE, "2", "")]).await;
+    assert_eq!(
+        reported_messages(&advised),
+        vec![instance_profile_advisory()],
+        "case \"before the write\": expected the advisory the write must not be refused for, \
+         got {}",
+        advised.body
+    );
+
+    // The same settings written through: an advisory is information the caller
+    // should take into account, not a value the platform cannot honour, so the
+    // write is performed and the configuration set carries it.
+    let mut params = vec![
+        ("ApplicationName".to_string(), APPLICATION.to_string()),
+        ("TemplateName".to_string(), TEMPLATE.to_string()),
+    ];
+    params.extend(option_params(&[(ASG, MIN_SIZE, "2", "")]));
+    let written = emulator
+        .call("UpdateConfigurationTemplate", &as_params(&params))
+        .await;
+    assert_eq!(
+        written.status, 200,
+        "case \"a write of an advised configuration\": expected the write to be performed, got \
+         {} and body {}",
+        written.status, written.body
+    );
+    let settings = created(
+        &emulator,
+        "DescribeConfigurationSettings",
+        &[("ApplicationName", APPLICATION), ("TemplateName", TEMPLATE)],
+    )
+    .await;
+    let stored_minimum: Vec<String> = settings
+        .elements_at("OptionSettings/member")
+        .iter()
+        .filter(|member| {
+            member.value("Namespace") == Some(ASG) && member.value("OptionName") == Some(MIN_SIZE)
+        })
+        .filter_map(|member| member.value("Value").map(str::to_string))
+        .collect();
+    assert_eq!(
+        stored_minimum,
+        vec!["2".to_string()],
+        "case \"after the write\": expected the advised value stored, got {}",
+        settings.body
     );
 }
 
@@ -518,7 +788,7 @@ async fn the_configuration_set_validated_against_is_the_one_the_request_names() 
         &as_params(&against_environment),
     )
     .await;
-    let reported = reported_messages(&answer);
+    let reported = reported_errors(&answer);
     assert_eq!(
         reported
             .iter()
@@ -531,7 +801,7 @@ async fn the_configuration_set_validated_against_is_the_one_the_request_names() 
 
     let answer = validated(&emulator, &[(ASG, MIN_SIZE, "8", "")]).await;
     assert!(
-        reported_messages(&answer).is_empty(),
+        reported_errors(&answer).is_empty(),
         "case \"against the template\": the template's own maximum admits the minimum, got {}",
         answer.body
     );
