@@ -314,6 +314,179 @@ async fn a_constraint_refusal_names_the_member_path_and_the_constraint() {
     }
 }
 
+/// RULE: every error body this service answers under one of its MODELLED error codes
+/// reports its sentence in the `Message` member those shapes declare — the constraint
+/// report the framework renders before any handler runs included — while a failure whose
+/// class this model does not declare keeps the member the framework wrote it in.
+///
+/// The rows span the class the rule generalises over: each constraint kind (pattern, both
+/// length bounds, the numeric bounds, the enum set, an absent member), the member and its
+/// nesting, several operations and job families, both error codes this service names for a
+/// bad value, and the sentences handlers serialize themselves.
+#[tokio::test]
+async fn every_modelled_error_reports_its_sentence_in_the_message_member() {
+    let router = router();
+
+    // The job a handler-produced refusal needs: a stop that names a job in a terminal
+    // status is a modelled error a handler serialized, so it pins the same member on the
+    // handler side of the walk.
+    let terminal = start_job(&router).await;
+    let (status, answer) = call(
+        &router,
+        "StopEntitiesDetectionV2Job",
+        &json!({"JobId": terminal.clone()}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "stop a running job: expected 200, got {status} {answer}"
+    );
+    // Wait for the stop the clock owes, so the next stop of that job is the
+    // already-terminal refusal rather than a second accepted stop.
+    for _ in 0..600 {
+        if describe_job(&router, &terminal).await["JobStatus"].as_str() == Some("STOPPED") {
+            break;
+        }
+        wait(50);
+    }
+
+    // (case, operation, body, the code expected, the whole sentence expected)
+    let cases: Vec<(&str, &str, Value, &str, String)> = vec![
+        (
+            "a job id outside its pattern",
+            "DescribePHIDetectionJob",
+            json!({"JobId": "bad$id!"}),
+            "InvalidRequestException",
+            one_error(
+                "jobId",
+                &format!("Member must satisfy regular expression pattern: {NAME_PATTERN}"),
+            ),
+        ),
+        (
+            "the same member of another job family, past its length maximum",
+            "DescribeEntitiesDetectionV2Job",
+            json!({"JobId": "j".repeat(33)}),
+            "InvalidRequestException",
+            one_error("jobId", "Member must have length less than or equal to 32"),
+        ),
+        (
+            "a required member left out",
+            "StopEntitiesDetectionV2Job",
+            json!({}),
+            "InvalidRequestException",
+            "1 validation error detected: Value null at 'jobId' failed to satisfy constraint: \
+             Member must not be null"
+                .to_string(),
+        ),
+        (
+            "a filter member outside its pattern, nested one level down",
+            "ListPHIDetectionJobs",
+            json!({"Filter": {"JobName": "bad#name#!"}}),
+            "InvalidRequestException",
+            one_error(
+                "filter.jobName",
+                &format!("Member must satisfy regular expression pattern: {NAME_PATTERN}"),
+            ),
+        ),
+        (
+            "a page size above its range maximum",
+            "ListEntitiesDetectionV2Jobs",
+            json!({"MaxResults": 501}),
+            "InvalidRequestException",
+            one_error(
+                "maxResults",
+                "Member must have value less than or equal to 500",
+            ),
+        ),
+        (
+            "a page size below its range minimum",
+            "ListEntitiesDetectionV2Jobs",
+            json!({"MaxResults": 0}),
+            "InvalidRequestException",
+            one_error(
+                "maxResults",
+                "Member must have value greater than or equal to 1",
+            ),
+        ),
+        (
+            "a language code the enum does not carry",
+            "StartEntitiesDetectionV2Job",
+            start_body(vec![("LanguageCode", json!("de"))]),
+            "InvalidRequestException",
+            one_error("languageCode", "Member must satisfy enum value set: [en]"),
+        ),
+        (
+            "text past its length maximum, this service's other refusal code",
+            "DetectEntitiesV2",
+            json!({"Text": "a".repeat(20_001)}),
+            "TextSizeLimitExceededException",
+            one_error("text", "Member must have length less than or equal to 20000"),
+        ),
+        (
+            "text below its length minimum",
+            "InferRxNorm",
+            json!({"Text": ""}),
+            "InvalidRequestException",
+            one_error("text", "Member must have length greater than or equal to 1"),
+        ),
+        (
+            "a role ARN outside the modelled shape, worded by this service",
+            "StartEntitiesDetectionV2Job",
+            start_body(vec![("DataAccessRoleArn", json!("not-a-valid-arn"))]),
+            "InvalidRequestException",
+            ROLE_ARN_INVALID.to_string(),
+        ),
+        (
+            "an unknown job, a sentence a handler serialized",
+            "DescribeEntitiesDetectionV2Job",
+            json!({"JobId": "nosuchjob"}),
+            "ResourceNotFoundException",
+            "Could not find specified job.".to_string(),
+        ),
+        (
+            "a stop of a job that has finished, another handler's sentence",
+            "StopEntitiesDetectionV2Job",
+            json!({"JobId": terminal.clone()}),
+            "InvalidRequestException",
+            ALREADY_TERMINAL.to_string(),
+        ),
+    ];
+
+    for (case, operation, body, code, sentence) in cases {
+        let (status, answer) = call(&router, operation, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} {answer}"
+        );
+        assert_eq!(
+            answer["__type"].as_str(),
+            Some(code),
+            "case {case:?}: expected {code}, got {answer}"
+        );
+        assert_eq!(
+            answer["Message"].as_str(),
+            Some(sentence.as_str()),
+            "case {case:?}: expected {sentence:?} in the modelled Message member, got {answer}"
+        );
+        assert!(
+            answer["message"].is_null(),
+            "case {case:?}: the sentence must be carried under ONE member, got {answer}"
+        );
+    }
+
+    // A failure whose class this model does not declare — the scaffold's own 501 — is
+    // answered exactly as the framework rendered it, in the member it wrote.
+    let (status, answer) = call(&router, "StartICD10CMInferenceJob", &start_body(vec![])).await;
+    assert_eq!(
+        status, 501,
+        "case a scaffolded operation: expected 501, got {status} {answer}"
+    );
+    assert!(
+        answer["Message"].is_null() && answer["message"].is_string(),
+        "case a scaffolded operation: expected the framework's own member, got {answer}"
+    );
+}
+
 /// RULE: the clause states the member and the constraint, and never the value the caller
 /// submitted — whatever member it was and however distinctive the value.
 #[tokio::test]

@@ -22,7 +22,9 @@
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   generated routing table. Here it serves every modelled operation through the
+//!   layer that reports an error's sentence in the member this model's error shapes
+//!   declare (`error_message_member`), without changing which operation is routed to.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -52,6 +54,12 @@ pub(crate) mod validation;
 /// the modelled error shape, its one fixed sentence, and the status this service answers
 /// that refusal with. One place, so no per-id job operation words it on its own.
 pub(crate) mod job_refusal;
+
+/// Which body member an error of this service reports its sentence in. The framework's own
+/// pre-handler renderer writes a synthetic `message`, while this model's error shapes all
+/// declare `Message`, so the one member every error body of this service carries is stated
+/// there.
+mod error_message_member;
 
 /// The `com-amazonaws-comprehendmedical-comprehendmedical-20181030` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -95,12 +103,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve the operation the generated routing table names, through the layer that
+        // reports an error's sentence in the `Message` member every error shape of this
+        // model declares (see `error_message_member`, whose wrapper is
+        // `service_common::restated_refusal`'s): the framework's own refusal renderer
+        // writes that sentence under its synthetic `message` for every service, while this
+        // service names one of its MODELLED error shapes as the code of every refusal.
+        // The routing decision itself is NOT overridden — the key is resolved by the
+        // model's own protocol — and a request the table cannot serve is declined here, so
+        // the framework's routing-error path stays exactly as it was.
+        ::service_common::restated_refusal::routes(self.definition(), req).then_some(
+            &error_message_member::SERVED_OPERATION_LAYER as &dyn ErasedOperation,
+        )
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
