@@ -800,6 +800,22 @@ pub fn nat_gateway_not_found<E>(nat_gateway_id: &str) -> Scaffolded<E> {
     id_not_found(NAT_GATEWAY_NOT_FOUND, "natgateway ID", nat_gateway_id)
 }
 
+/// Refuse a ROUTE whose target names a NAT gateway the account holds none of: HTTP 400
+/// [`INVALID_NAT_GATEWAY_ID_NOT_FOUND`], naming the member that carried the id the way every
+/// other unresolvable route target is named ([`id_not_found_message`]) — `natGateway ID`,
+/// which is the kind a recorded `CreateRoute` refusal spells.
+///
+/// The route family's code for this condition rather than the NAT gateway family's
+/// ([`nat_gateway_not_found`]) — see [`INVALID_NAT_GATEWAY_ID_NOT_FOUND`] for why the two
+/// differ.
+pub fn invalid_nat_gateway_route_target_not_found<E>(nat_gateway_id: &str) -> Scaffolded<E> {
+    id_not_found(
+        INVALID_NAT_GATEWAY_ID_NOT_FOUND,
+        "natGateway ID",
+        nat_gateway_id,
+    )
+}
+
 /// The NAT gateway `nat_gateway_id` names, refusing a malformed id before an unknown one —
 /// the order the service asks the two questions in, so "not a NAT gateway id" is never
 /// reported as "no such NAT gateway".
@@ -825,18 +841,39 @@ pub fn nat_gateway_payload_bytes(gateway: &NatGateway) -> usize {
 }
 
 impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another `count` NAT gateways fit inside the store's ceiling
+    /// ([`MAX_STORED_RECORDS_PER_STORE`]).
+    ///
+    /// A writer must ask this BEFORE inserting and refuse when it answers `false`, the way
+    /// [`Self::has_fleet_capacity`] gates its own store.
+    pub fn has_nat_gateway_capacity(&self, count: usize) -> bool {
+        self.nat_gateways.len().saturating_add(count) <= MAX_STORED_RECORDS_PER_STORE
+    }
+
     /// Store a NAT gateway under the `NatGatewayId` it already carries, charging the
     /// caller-chosen bytes it holds against the store's byte budget so no path can store
-    /// them uncharged, and answer that id.
+    /// them uncharged, and answer that id — or `None`, with NOTHING written, when the
+    /// store's own ceilings refuse it.
     ///
-    /// The same contract as [`Self::insert_address`]: the record IS the modelled shape
-    /// every operation that reports this gateway answers with, so a member a writer sets
-    /// round-trips without a field-by-field copy.
-    pub fn insert_nat_gateway(&mut self, gateway: NatGateway) -> String {
+    /// BOTH ceilings are asked HERE, before the first write: the record count
+    /// ([`Self::has_nat_gateway_capacity`]) and the caller-chosen bytes
+    /// ([`Self::would_exceed_stored_bytes`]), exactly as [`Self::insert_fleet`] asks its
+    /// own — so no path can get past them by forgetting to, and nothing in this emulator
+    /// reclaims a stored gateway. A caller must map `None` onto the quota error its
+    /// operation answers ([`nat_gateway_limit_exceeded`]).
+    ///
+    /// The same contract as [`Self::insert_address`] otherwise: the record IS the modelled
+    /// shape every operation that reports this gateway answers with, so a member a writer
+    /// sets round-trips without a field-by-field copy.
+    pub fn insert_nat_gateway(&mut self, gateway: NatGateway) -> Option<String> {
+        let charge = nat_gateway_payload_bytes(&gateway);
+        if !self.has_nat_gateway_capacity(1) || self.would_exceed_stored_bytes(charge) {
+            return None;
+        }
         let nat_gateway_id = gateway.nat_gateway_id.clone().unwrap_or_default();
-        self.add_stored_bytes(nat_gateway_payload_bytes(&gateway));
+        self.add_stored_bytes(charge);
         self.nat_gateways.insert(nat_gateway_id.clone(), gateway);
-        nat_gateway_id
+        Some(nat_gateway_id)
     }
 
     /// How many Elastic IP addresses the NAT gateway `nat_gateway_id` holds right now,
@@ -1711,10 +1748,11 @@ pub fn require_known_mac_modification_task<E>(
 ///
 /// Both tasks act on "an Amazon EC2 Mac instance" (`MacModificationTask$InstanceId`), so an
 /// instance of a family that does not run macOS ([`is_mac_instance_family`]) is no instance
-/// either task can be created for, and an instance on its way to `terminated` has no macOS
-/// left to configure. The ONE reading of those three refusals, so the two creates cannot
-/// disagree about which instance a task may name, and the resolved record is handed back so
-/// a handler reads the instance once.
+/// either task can be created for — a refusal about the instance's TYPE
+/// ([`instance_type_is_ineligible`]) rather than about the id the request carried — and an
+/// instance on its way to `terminated` has no macOS left to configure. The ONE reading of
+/// those three refusals, so the two creates cannot disagree about which instance a task may
+/// name, and the resolved record is handed back so a handler reads the instance once.
 pub fn require_mac_instance<'store, E>(
     store: &'store ComAmazonawsEc2Amazonec2State,
     instance_id: &str,
@@ -1731,11 +1769,7 @@ pub fn require_mac_instance<'store, E>(
     )?;
     let instance_family = instance_family_of(&instance.instance_type);
     if !is_mac_instance_family(instance_family) {
-        return Err(invalid_parameter_value(format!(
-            "Invalid value '{instance_id}' for instanceId. The instance is a \
-             '{instance_type}' instance, which is not an Amazon EC2 Mac instance",
-            instance_type = instance.instance_type,
-        )));
+        return Err(instance_type_is_ineligible());
     }
     if instance.state.is_terminating() {
         return Err(Scaffolded::incorrect_instance_state(
@@ -1745,6 +1779,30 @@ pub fn require_mac_instance<'store, E>(
     }
     Ok(instance)
 }
+
+/// Refuse a call whose instance EXISTS but whose instance TYPE cannot do what the operation
+/// asks: HTTP 400 [`INVALID_INSTANCE_TYPE`] with the sentence EC2 words it in — "The
+/// instance type is not supported for this operation", which has no variable part at all.
+///
+/// The condition is about the type rather than about the id the request carried, so it is
+/// reported in EC2's own code for an instance type that cannot serve the request — a caller
+/// has to be able to tell "this id is wrong" (the `InvalidInstanceID.*` family) from "this
+/// instance family cannot do it", which is the difference between fixing the id and choosing
+/// another instance. The sentence names neither the instance nor its type: what the caller
+/// sent is already in its own request, and the ONE wording lives here so every operation
+/// with a type prerequisite answers the same one.
+pub fn instance_type_is_ineligible<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_INSTANCE_TYPE,
+        400,
+        INSTANCE_TYPE_NOT_SUPPORTED_MESSAGE,
+    )
+}
+
+/// The sentence [`instance_type_is_ineligible`] carries, on its own, so a suite asserting it
+/// and the refusal that answers it cannot drift apart.
+pub const INSTANCE_TYPE_NOT_SUPPORTED_MESSAGE: &str =
+    "The instance type is not supported for this operation";
 
 /// The members this service reads WITHOUT REGARD TO ASCII CASE, as `(the input shape that
 /// carries the member, the modelled member name, the values it is read against)`.

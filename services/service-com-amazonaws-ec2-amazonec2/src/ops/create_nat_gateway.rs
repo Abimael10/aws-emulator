@@ -575,7 +575,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             route_table_id: None,
         };
         let stored = gateway.clone();
-        store.insert_nat_gateway(gateway);
+        // The store refuses the write itself when it is full, so the ceilings hold even if
+        // the gates above are ever moved.
+        if store.insert_nat_gateway(gateway).is_none() {
+            return Err(nat_gateway_limit_exceeded(format!(
+                "This emulator holds {MAX_STORED_RECORDS_PER_STORE} NAT gateways, which is \
+                 as many as it stores"
+            )));
+        }
         // What the clock now owes the gateway and each of its settling addresses:
         // recorded rather than slept for, so a caller that reads the gateway straight away
         // still sees the `pending` state and the transient address statuses a create starts

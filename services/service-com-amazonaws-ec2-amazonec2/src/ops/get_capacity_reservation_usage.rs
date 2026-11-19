@@ -223,16 +223,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The number of instances the Amazon Web Services account currently has in the
         // Capacity Reservation" (`InstanceUsage$UsedInstanceCount`) counts INSTANCES.
         //
-        // No instance in this store belongs to a Capacity Reservation: an [`InstanceRecord`]
-        // carries no capacity reservation target, because `RunInstances` does not place an
-        // instance into one yet (its `CapacityReservationSpecification` is its own issue).
-        // So no account — the owner included — has usage of this reservation to report, and
-        // the set is empty, which is also why `CapacityReservation$CapacityAllocations` is.
-        // Deliberately NOT `TotalInstanceCount - AvailableInstanceCount`: capacity moved
+        // So the usage is counted off the INSTANCES that are running in this reservation —
+        // the ones whose launch targeted it ([`crate::state::ComAmazonawsEc2Amazonec2State::
+        // instances_in_capacity_reservation`]) — rather than derived from
+        // `TotalInstanceCount - AvailableInstanceCount`, which would be wrong: capacity moved
         // into an interruptible reservation lowers the available count without any instance
-        // running, and that capacity is reported by `InterruptibleCapacityAllocation`, so
-        // deriving usage from the counts would make the two members disagree.
-        let usages: Vec<InstanceUsage> = Vec::new();
+        // running, and that capacity is reported by `InterruptibleCapacityAllocation`.
+        //
+        // Every instance of this emulator belongs to the account that launched it, so the one
+        // account with usage to report is this reservation's owner, and a reservation nothing
+        // runs in reports an empty set.
+        let used_instance_count = store.instances_in_capacity_reservation(
+            &input.capacity_reservation_id,
+        );
+        let usages: Vec<InstanceUsage> = if used_instance_count > 0 {
+            vec![InstanceUsage {
+                account_id: view.owner_id.clone(),
+                used_instance_count: Some(used_instance_count),
+            }]
+        } else {
+            Vec::new()
+        };
         // Paged in account-id order, which the cursor below names a position in. The paging
         // is written for the list in general — it is what grows the day an instance joins a
         // reservation, or a shared reservation has another account's usage in it.

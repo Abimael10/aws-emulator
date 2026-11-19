@@ -41,10 +41,10 @@ use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, NetworkInsightsAnalysisSpec,
     NetworkInsightsPathSpec, ANALYSIS_STATUS_FAILED, ANALYSIS_STATUS_RUNNING,
     IDEMPOTENT_PARAMETER_MISMATCH, INVALID_FILTER, INVALID_NETWORK_INSIGHTS_ANALYSIS_ID_NOT_FOUND,
-    INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND, MAX_ANALYSIS_SCOPING_ENTRIES,
-    MAX_NETWORK_INSIGHTS_ANALYSES, NETWORK_INSIGHTS_ANALYSIS_ID_PREFIX,
-    PATH_ANALYSIS_UNSUPPORTED_STATUS_MESSAGE, RESOURCE_COUNT_EXCEEDED,
-    RESOURCE_TYPE_NETWORK_INSIGHTS_ANALYSIS, TRANSITION_DELAY,
+    INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND, INVALID_PARAMETER_VALUE,
+    MAX_ANALYSIS_SCOPING_ENTRIES, MAX_NETWORK_INSIGHTS_ANALYSES,
+    NETWORK_INSIGHTS_ANALYSIS_ID_PREFIX, PATH_ANALYSIS_UNSUPPORTED_STATUS_MESSAGE,
+    RESOURCE_COUNT_EXCEEDED, RESOURCE_TYPE_NETWORK_INSIGHTS_ANALYSIS, TRANSITION_DELAY,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -769,7 +769,8 @@ async fn an_id_the_account_does_not_hold_is_refused() {
         );
     }
 
-    // The start resolves the path the same way, and stores nothing when it refuses.
+    // The start ACTS on the one path it is given, so it states that the path id it was given
+    // is not a valid one — and stores nothing when it refuses.
     for path in [UNKNOWN_PATH_ID, "not-a-path"] {
         let (status, body) = start(
             &router,
@@ -782,8 +783,8 @@ async fn an_id_the_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
-            "case {path:?}: expected {INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND}, got {body}"
+            INVALID_PARAMETER_VALUE,
+            "case {path:?}: expected {INVALID_PARAMETER_VALUE}, got {body}"
         );
         assert_eq!(
             stored_count(&engine),

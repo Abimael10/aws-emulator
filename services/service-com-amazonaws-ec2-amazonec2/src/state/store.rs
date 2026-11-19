@@ -280,6 +280,9 @@ pub const SUPPORTED_INSTANCE_FILTERS: &[&str] = &[
     "architecture",
     "availability-zone",
     "availability-zone-id",
+    // "capacity-reservation-id - The ID of the Capacity Reservation into which the instance
+    // was launched", which an instance that targeted one stores.
+    "capacity-reservation-id",
     "client-token",
     "ebs-optimized",
     "image-id",

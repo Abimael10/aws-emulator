@@ -481,8 +481,12 @@ pub(crate) fn resolve_target<E>(
             Ok(RouteTarget::Gateway(value.to_string()))
         }
         "natGatewayId" => {
+            // A target the account does not hold is reported by the member that carried it,
+            // in the route family's own code for an unresolvable NAT gateway target
+            // ([`state::invalid_nat_gateway_route_target_not_found`]) rather than in the NAT
+            // gateway family's `NatGatewayNotFound`, which its own operations answer.
             if !store.nat_gateways.contains_key(value) {
-                return Err(state::nat_gateway_not_found(value));
+                return Err(state::invalid_nat_gateway_route_target_not_found(value));
             }
             Ok(RouteTarget::NatGateway(value.to_string()))
         }

@@ -30,8 +30,7 @@
 use ec2::ops::types::{FilterPortRange, PathFilter, Tag};
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, NetworkInsightsPathSpec, DRY_RUN_OPERATION,
-    INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND, INVALID_PARAMETER_VALUE,
-    NETWORK_INSIGHTS_ANALYSIS_ID_PREFIX, NETWORK_INSIGHTS_PATH_ID_PREFIX,
+    INVALID_PARAMETER_VALUE, NETWORK_INSIGHTS_ANALYSIS_ID_PREFIX, NETWORK_INSIGHTS_PATH_ID_PREFIX,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -287,9 +286,15 @@ async fn deleting_a_path_removes_exactly_it_and_answers_its_id() {
         );
         assert_eq!(
             error_code(&body),
-            INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
-            "case {case:?}: expected {INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND} from the \
-             start on the deleted path, got {body}"
+            INVALID_PARAMETER_VALUE,
+            "case {case:?}: expected {INVALID_PARAMETER_VALUE} from the start on the deleted \
+             path, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("NetworkInsightsPathId ({path_id}) is not valid"),
+            "case {case:?}: expected the start's own sentence for a path it cannot resolve, \
+             got {body}"
         );
         let (status, body) = analysis_start(&router, &remaining[0], "another-path").await;
         assert_eq!(

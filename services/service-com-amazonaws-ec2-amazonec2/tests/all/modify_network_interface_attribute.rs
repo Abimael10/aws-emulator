@@ -1066,9 +1066,9 @@ async fn an_attachment_change_names_the_attachment_it_changes() {
         "the two attachments of this fixture must differ"
     );
 
-    // No id at all, a value this service never issued as one, and the id of ANOTHER
-    // interface's attachment: the id has to name the attachment holding the interface the
-    // request modifies.
+    // No id at all, a value that is not an attachment id at all, a well-formed id the
+    // account holds no attachment under, and the id of ANOTHER interface's attachment: the id
+    // has to name the attachment holding the interface the request modifies.
     let rows: [(&str, Vec<Param>, &str); 4] = [
         (
             "no attachment id",
@@ -1084,12 +1084,12 @@ async fn an_attachment_change_names_the_attachment_it_changes() {
             INVALID_ATTACHMENT_ID_MALFORMED,
         ),
         (
-            "an id this service never issued",
+            "a well-formed id naming no attachment",
             vec![
                 param("Attachment.AttachmentId", "eni-attach-0123456789abcdef0"),
                 param("Attachment.DeleteOnTermination", "true"),
             ],
-            INVALID_ATTACHMENT_ID_MALFORMED,
+            INVALID_ATTACHMENT_ID_NOT_FOUND,
         ),
         (
             "another interface's attachment",

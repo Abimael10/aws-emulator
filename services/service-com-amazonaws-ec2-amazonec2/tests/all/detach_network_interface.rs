@@ -16,14 +16,14 @@
 //!    index the attachment sits at and how many of one instance's interfaces are taken down,
 //!    and the completion is asserted to be owed by the call that STARTED it, so a second
 //!    detach of an attachment already on its way down does not postpone it.
-//! 2. AN ID THIS SERVICE COULD NOT HAVE ISSUED IS REFUSED BEFORE ANYTHING IS LOOKED UP:
+//! 2. A VALUE OUTSIDE THE ATTACHMENT ID FORM IS REFUSED BEFORE ANYTHING IS LOOKED UP:
 //!    `InvalidNetworkInterfaceAttachmentId.Malformed` with the service's one malformed-id
-//!    sentence `Invalid id: "<value>"`, while an id it DID issue that names no attachment is
-//!    `InvalidAttachmentID.NotFound` — so a caller can tell "fix the caller" from "that
-//!    attachment is gone". The table spans the forms a value can take around the issued one:
-//!    not an id at all, another resource's id, the documentation-shaped long ids, a leading
-//!    digit above zero, the all-zero placeholder, the short form, upper-case digits, a digit
-//!    too few and too many, and the very next value the mint has not issued yet.
+//!    sentence `Invalid id: "<value>"`, while a value OF that form which names no attachment
+//!    is `InvalidAttachmentID.NotFound` — so a caller can tell "fix the caller" from "that
+//!    attachment is gone". The table spans the forms a value can take around the printed one:
+//!    not an id at all, another resource's id, upper-case digits, a digit too few and too
+//!    many — against the values of the printed form the account could hold an attachment
+//!    under, whether or not this store's own mint has reached them.
 //! 3. WHAT CANNOT BE DETACHED IS REFUSED AND NOTHING MOVES: the instance's PRIMARY interface
 //!    (device index 0) and an interface another Amazon Web Services service manages are both
 //!    `OperationNotPermitted`, whatever `Force` says, and a `DryRun` of a detach that would
@@ -452,8 +452,8 @@ async fn a_detach_takes_the_attachment_down_on_the_clock() {
     }
 }
 
-/// Rule 2: an attachment id this service could not have issued is refused as malformed before
-/// anything is looked up, while one it did issue that names no attachment is not found.
+/// Rule 2: a value outside the attachment id form is refused as malformed before anything is
+/// looked up, while one OF that form which names no attachment is not found.
 #[tokio::test]
 async fn detach_tells_an_unissuable_attachment_id_from_one_that_names_nothing() {
     let (router, engine) = super::ec2_query::emulator();
@@ -462,9 +462,8 @@ async fn detach_tells_an_unissuable_attachment_id_from_one_that_names_nothing() 
     let (network_interface_id, held_attachment_id) =
         seed_attached_interface(&engine, &instance_id, &subnet_id, 1, None);
 
-    // Two values a digit apart around the mint's own position: one it HAS issued (so it is
-    // looked up, and the attachment it named is not there) and the very next one, which it has
-    // not issued and so could not have handed to any caller.
+    // Two values a digit apart around the mint's own position: both are of the form an
+    // attachment id takes, so both are looked up and neither names an attachment.
     let (issued_but_unheld, the_next_unissued) = {
         let state = engine.state::<Ec2State>();
         let mut store = state.lock();
@@ -476,28 +475,11 @@ async fn detach_tells_an_unissuable_attachment_id_from_one_that_names_nothing() 
         (issued, unissued)
     };
 
-    // The forms a value can take around the one this service issues (`eni-attach-` and 17
-    // lowercase hexadecimal digits under a leading `0`, from the store's own mint).
+    // The forms a value can take OUTSIDE the one this service issues (`eni-attach-` and
+    // hexadecimal digits in one of the two widths EC2 issues ids in).
     let malformed: Vec<(&str, String)> = vec![
         ("not an id at all", "not-an-attachment-id".to_string()),
         ("another resource's id", network_interface_id.clone()),
-        (
-            "the documentation-shaped long id",
-            "eni-attach-0123456789abcdef0".to_string(),
-        ),
-        (
-            "another documentation-shaped long id",
-            "eni-attach-0fedcba987654321f".to_string(),
-        ),
-        (
-            "a long id whose leading digit is above zero",
-            "eni-attach-1234567890abcdef0".to_string(),
-        ),
-        (
-            "the all-zero placeholder",
-            "eni-attach-00000000000000000".to_string(),
-        ),
-        ("the short id form", "eni-attach-0a1b2c3d".to_string()),
         (
             "upper-case digits",
             "eni-attach-0123456789ABCDEF0".to_string(),
@@ -510,7 +492,6 @@ async fn detach_tells_an_unissuable_attachment_id_from_one_that_names_nothing() 
             "one digit too many",
             "eni-attach-000000000000000001".to_string(),
         ),
-        ("the next value the mint has not issued", the_next_unissued),
     ];
     for (case, attachment_id) in &malformed {
         let (status, body) = detach(&router, attachment_id, &[]).await;
@@ -532,24 +513,50 @@ async fn detach_tells_an_unissuable_attachment_id_from_one_that_names_nothing() 
         );
     }
 
-    // An id the mint HAS issued is looked up, and the attachment it names not being there is
-    // the other half of the pair.
-    let (status, body) = detach(&router, &issued_but_unheld, &[]).await;
-    assert_eq!(
-        status, 400,
-        "expected HTTP 400 for an issued id naming no attachment, got {status} with body {body}"
-    );
-    assert_eq!(
-        error_code(&body),
-        INVALID_ATTACHMENT_ID_NOT_FOUND,
-        "expected {INVALID_ATTACHMENT_ID_NOT_FOUND} for an issued id naming no attachment, \
-         got {body}"
-    );
-    assert_eq!(
-        error_message(&body),
-        format!("The attachment ID '{issued_but_unheld}' does not exist"),
-        "expected the not-found sentence naming the attachment id from the request, got {body}"
-    );
+    // Every value OF the printed attachment-id form is looked up, and the attachment it
+    // names not being there is the other half of the pair — whether the value sits below
+    // this store's mint, beyond it, is one of the documentation-shaped ids a caller writes
+    // by hand, or is the short form or the all-zero placeholder.
+    let not_found: Vec<(&str, String)> = vec![
+        ("an id the mint has issued", issued_but_unheld),
+        ("the next value the mint has not issued", the_next_unissued),
+        (
+            "the documentation-shaped long id",
+            "eni-attach-0123456789abcdef0".to_string(),
+        ),
+        (
+            "another documentation-shaped long id",
+            "eni-attach-0fedcba987654321f".to_string(),
+        ),
+        (
+            "a long id whose leading digit is above zero",
+            "eni-attach-1234567890abcdef0".to_string(),
+        ),
+        (
+            "the all-zero placeholder",
+            "eni-attach-00000000000000000".to_string(),
+        ),
+        ("the short id form", "eni-attach-0a1b2c3d".to_string()),
+    ];
+    for (case, attachment_id) in &not_found {
+        let (status, body) = detach(&router, attachment_id, &[]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400 for {attachment_id}, got {status} with body {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            INVALID_ATTACHMENT_ID_NOT_FOUND,
+            "case {case:?}: expected {INVALID_ATTACHMENT_ID_NOT_FOUND} for {attachment_id}, \
+             got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("The interface attachment '{attachment_id}' does not exist."),
+            "case {case:?}: expected the not-found sentence naming the attachment id from the \
+             request, got {body}"
+        );
+    }
 
     // Every refusal above left the one attachment the account holds exactly as it was.
     let untouched = reported("the refusals", &router, &network_interface_id).await;

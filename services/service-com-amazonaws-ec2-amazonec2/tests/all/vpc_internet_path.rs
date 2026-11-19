@@ -36,7 +36,7 @@
 
 use service_com_amazonaws_ec2_amazonec2::state::{
     DRY_RUN_OPERATION, DRY_RUN_OPERATION_MESSAGE, DRY_RUN_OPERATION_STATUS,
-    RESOURCE_ALREADY_ASSOCIATED,
+    INVALID_PARAMETER_VALUE,
 };
 
 use super::ec2_query::{element, elements, error_code, error_message, filters};
@@ -269,9 +269,12 @@ async fn an_internet_gateway_is_created_unattached_and_attaches_to_one_vpc() {
 
 /// The rule's refusal half: "you can attach only one internet gateway to a VPC at a time"
 /// (Amazon VPC User Guide, "Connect to the internet using an internet gateway"), and a
-/// gateway attaches one VPC — so a second claim on EITHER side is refused with EC2's
-/// `Resource.AlreadyAssociated` and nothing is added beside the attachment that holds,
-/// while an id naming no resource is that resource's own not-found refusal.
+/// gateway attaches one VPC — so a second claim on either side is refused and nothing is
+/// added beside the attachment that holds, while an id naming no resource is that resource's
+/// own not-found refusal. The two sides are refused DIFFERENTLY: a gateway that is already
+/// attached somewhere is the association conflict `Resource.AlreadyAssociated`, naming the
+/// pair that holds, while a network that already has a gateway is a bad `VpcId` —
+/// `InvalidParameterValue`, naming the network.
 ///
 /// The rows differ in which side of the pair the request collides with and in which id
 /// names nothing.
@@ -314,8 +317,8 @@ async fn a_second_claim_on_either_side_of_an_internet_gateway_attachment_is_refu
             "a second gateway for the VPC",
             other_gateway_id.as_str(),
             vpc_id.as_str(),
-            "Resource.AlreadyAssociated",
-            internet_gateway_id.as_str(),
+            "InvalidParameterValue",
+            vpc_id.as_str(),
         ),
         (
             "a gateway id naming nothing",
@@ -2027,7 +2030,7 @@ async fn a_dry_run_attach_is_answered_as_a_probe_and_records_no_attachment() {
 }
 
 /// An attachment is a PAIR each side holds one of at a time, not a permanent claim: while it
-/// holds, the VPC's side refuses a second gateway (`Resource.AlreadyAssociated`), and a
+/// holds, the VPC's side refuses a second gateway (`InvalidParameterValue`), and a
 /// `DetachInternetGateway` frees BOTH sides — the gateway goes on to attach another VPC and
 /// the freed VPC takes another gateway, each attachment being the only one its describe then
 /// reports.
@@ -2083,8 +2086,14 @@ async fn an_internet_gateway_attachment_is_a_pair_that_moves_after_a_detach() {
         );
         assert_eq!(
             error_code(&body),
-            RESOURCE_ALREADY_ASSOCIATED,
-            "case {case:?}: expected {RESOURCE_ALREADY_ASSOCIATED}, got {body}"
+            INVALID_PARAMETER_VALUE,
+            "case {case:?}: expected {INVALID_PARAMETER_VALUE}, got {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("Network {vpc_id} already has an internet gateway attached"),
+            "case {case:?}: expected the refusal to name the network that already has one, \
+             got {body}"
         );
 
         // The detach frees both sides: the gateway reports no attachment …

@@ -27,7 +27,8 @@
 use std::time::Instant;
 
 use crate::ops::types::{
-    CAPACITY_RESERVATION_PREFERENCE_VALUES, CapacityReservationSpecificationResponse, CpuOptions,
+    CAPACITY_RESERVATION_PREFERENCE_VALUES, CapacityReservationSpecificationResponse,
+    CapacityReservationTargetResponse, CpuOptions,
     EbsInstanceBlockDevice, EnclaveOptions, EnclaveOptionsRequest, HOSTNAME_TYPE_VALUES,
     HTTP_TOKENS_STATE_VALUES, HibernationOptions, INSTANCE_AUTO_RECOVERY_STATE_VALUES,
     INSTANCE_BANDWIDTH_WEIGHTING_VALUES, INSTANCE_METADATA_ENDPOINT_STATE_VALUES,
@@ -109,6 +110,14 @@ pub const TENANCY_DEFAULT: &str = "default";
 /// (`RunInstancesRequest$CapacityReservationSpecification`).
 pub const CAPACITY_RESERVATION_PREFERENCE_OPEN: &str = "open";
 
+/// `CapacityReservationPreference`'s `capacity-reservations-only`: "the instance will only
+/// run in a Capacity Reservation or Capacity Reservation group. If capacity isn't available,
+/// the instance will fail to launch" — the ONE preference a launch may name beside a
+/// `CapacityReservationTarget`: "you can only specify `CapacityReservationPreference` and
+/// `CapacityReservationTarget` if the `CapacityReservationPreference` is
+/// `capacity-reservations-only`" (`CapacityReservationSpecification`).
+pub const CAPACITY_RESERVATION_PREFERENCE_ONLY: &str = "capacity-reservations-only";
+
 /// `InstanceAutoRecoveryState`'s `default`: Amazon EC2's own recovery behaviour, which is
 /// what an instance whose launch asked for nothing else has
 /// (`InstanceMaintenanceOptions$AutoRecovery`).
@@ -177,6 +186,16 @@ pub struct InstanceDetail {
     pub instance_initiated_shutdown_behavior: &'static str,
     /// `CapacityReservationSpecificationResponse$CapacityReservationPreference`.
     pub capacity_reservation_preference: &'static str,
+    /// The Capacity Reservation this instance was launched INTO
+    /// (`Instance$CapacityReservationId`), or `None` for an instance whose launch targeted
+    /// none.
+    ///
+    /// The id the launch TARGETED, already resolved against the reservation store by the
+    /// handler that served the launch — so an instance never reports a reservation the
+    /// account does not hold. Fixed-size: the value is an id of the form
+    /// [`super::capacity_reservation_id_is_well_formed`] admits rather than text the caller
+    /// chose the length of.
+    pub capacity_reservation_id: Option<String>,
     /// `InstanceMaintenanceOptions$AutoRecovery`.
     pub auto_recovery: &'static str,
     /// `InstanceMaintenanceOptions$RebootMigration` — the reboot-migration behaviour the
@@ -227,6 +246,7 @@ impl Default for InstanceDetail {
             disable_api_stop: DEFAULT_DISABLE_API_STOP,
             instance_initiated_shutdown_behavior: DEFAULT_SHUTDOWN_BEHAVIOR,
             capacity_reservation_preference: CAPACITY_RESERVATION_PREFERENCE_OPEN,
+            capacity_reservation_id: None,
             auto_recovery: AUTO_RECOVERY_DEFAULT,
             reboot_migration: REBOOT_MIGRATION_DEFAULT,
             bandwidth_weighting: BANDWIDTH_WEIGHTING_DEFAULT,
@@ -345,6 +365,7 @@ impl InstanceDetail {
                 CAPACITY_RESERVATION_PREFERENCE_VALUES,
             )?
             .unwrap_or(CAPACITY_RESERVATION_PREFERENCE_OPEN),
+            capacity_reservation_id: spec.capacity_reservation_id.map(str::to_string),
             auto_recovery: requested_word(
                 "AutoRecovery",
                 spec.maintenance_options
@@ -492,6 +513,10 @@ pub struct InstanceDetailSpec<'request> {
     /// `CapacityReservationSpecification$CapacityReservationPreference`, as the launch
     /// named it.
     pub capacity_reservation_preference: Option<&'request str>,
+    /// `CapacityReservationTarget$CapacityReservationId` — the Capacity Reservation the
+    /// launch targeted, already resolved against the reservation store by the handler that
+    /// serves the launch.
+    pub capacity_reservation_id: Option<&'request str>,
     /// `RunInstancesRequest$MaintenanceOptions`.
     pub maintenance_options: Option<&'request InstanceMaintenanceOptionsRequest>,
     /// `RunInstancesRequest$NetworkPerformanceOptions`.
@@ -651,6 +676,10 @@ impl ComAmazonawsEc2Amazonec2State {
                 .capacity_reservation_specification
                 .as_ref()
                 .and_then(|specification| specification.capacity_reservation_preference.as_deref()),
+            // A template-driven launch resolves the reservation it targets in the handler
+            // that serves it, exactly as a launch naming the member itself does, so the
+            // detail this reader builds for a VERSION carries none.
+            capacity_reservation_id: None,
             maintenance_options: maintenance_options.as_ref(),
             network_performance_options: network_performance_options.as_ref(),
             private_dns_name_options: private_dns_name_options.as_ref(),
@@ -920,10 +949,19 @@ impl ComAmazonawsEc2Amazonec2State {
             ),
             // "The action returns the `capacityReservationTarget` response element if the
             // instance explicitly targets a specific Capacity Reservation or Capacity
-            // Reservation group" (`CapacityReservationSpecificationResponse`): this launch
-            // targets none, so it reports the preference alone.
-            capacity_reservation_target: None,
+            // Reservation group" (`CapacityReservationSpecificationResponse`), so an
+            // instance whose launch targeted one reports it and one that targeted none
+            // reports the preference alone.
+            capacity_reservation_target: detail.capacity_reservation_id.as_ref().map(|id| {
+                CapacityReservationTargetResponse {
+                    capacity_reservation_id: Some(id.clone()),
+                    capacity_reservation_resource_group_arn: None,
+                }
+            }),
         });
+        // "The ID of the Capacity Reservation" (`Instance$CapacityReservationId`): the
+        // reservation the instance RUNS IN, which is the one its launch targeted.
+        view.capacity_reservation_id = detail.capacity_reservation_id.clone();
         // "This setting only applies to supported instances that have a scheduled reboot
         // event" (`InstanceMaintenanceOptions$RebootMigration`), and the setting itself is a
         // property of the instance either way: an instance nothing has disabled migration

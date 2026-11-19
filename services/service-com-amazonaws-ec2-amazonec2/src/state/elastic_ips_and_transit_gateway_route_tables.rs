@@ -97,9 +97,10 @@ impl ComAmazonawsEc2Amazonec2State {
             outpost_arn: None,
             capacity_reservation_fleet_id: None,
             placement_group_arn: None,
-            // "Information about instance capacity usage": nothing in this emulator
-            // launches an instance INTO a Capacity Reservation, so no capacity of one is
-            // allocated to a running instance.
+            // "Information about instance capacity usage": nothing has launched into a
+            // reservation this call mints, so none of its capacity is allocated to a running
+            // instance yet. A launch that TARGETS it records the `used` allocation then
+            // ([`Self::take_capacity_reservation_capacity`]), and a termination takes it back.
             capacity_allocations: Some(Vec::new()),
             reservation_type: Some(CAPACITY_RESERVATION_TYPE_DEFAULT.to_string()),
             // "The ID of the Amazon Web Services account to which billing of the unused
@@ -160,6 +161,82 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         Some(capacity_reservation_id)
+    }
+
+    /// Record that one more instance now RUNS IN the Capacity Reservation
+    /// `capacity_reservation_id` names: that much of its capacity is no longer available, and
+    /// the usage it reports counts the instance.
+    ///
+    /// "The remaining capacity. Indicates the number of instances that can be launched in the
+    /// Capacity Reservation" (`CapacityReservation$AvailableInstanceCount`) and "`used`
+    /// indicates that the instance capacity is in use by instances that are running in the
+    /// Capacity Reservation" (`CapacityAllocation$AllocationType`): a launch into a
+    /// reservation takes capacity, so a reservation nothing has launched into and one holding
+    /// a running instance cannot report the same remaining capacity. The ONE writer of that,
+    /// paired with [`Self::release_capacity_reservation_capacity`], which gives it back.
+    ///
+    /// Called with the instance ALREADY in the store, so the usage it publishes counts it.
+    /// A reservation this store does not hold changes nothing: the caller has already
+    /// resolved the reservation, and this records what it resolved.
+    pub fn take_capacity_reservation_capacity(&mut self, capacity_reservation_id: &str) {
+        self.record_capacity_reservation_usage(capacity_reservation_id, 1);
+    }
+
+    /// Give one instance's capacity back to the Capacity Reservation
+    /// `capacity_reservation_id` names: an instance that has stopped running in it no longer
+    /// uses its capacity, so the reservation can be launched into again.
+    ///
+    /// The mirror of [`Self::take_capacity_reservation_capacity`] — written where an instance
+    /// LEAVES a reservation (its termination), so the capacity a reservation reports is the
+    /// capacity the instances it holds leave free. Called once the instance is already on its
+    /// way out, so the usage it publishes no longer counts it.
+    pub fn release_capacity_reservation_capacity(&mut self, capacity_reservation_id: &str) {
+        self.record_capacity_reservation_usage(capacity_reservation_id, -1);
+    }
+
+    /// Move the remaining capacity of `capacity_reservation_id` by `taken` instances —
+    /// positive for capacity a launch takes, negative for capacity a termination gives back —
+    /// and publish the usage the instances now in it make of it.
+    ///
+    /// The available count is moved by a DELTA rather than derived: capacity moved into an
+    /// interruptible allocation lowers it with no instance running
+    /// ([`Self::release_interruptible_allocation`]'s counterpart in
+    /// `ops::create_interruptible_capacity_reservation_allocation`), so deriving it from the
+    /// instances would give that capacity back. It never leaves `0..=TotalInstanceCount`,
+    /// being "the number of instances that can be launched in the Capacity Reservation"
+    /// (`CapacityReservation$AvailableInstanceCount`), which can be neither negative nor more
+    /// than the reservation reserved.
+    ///
+    /// The ALLOCATIONS are counted off the instances actually in the reservation
+    /// ([`Self::instances_in_capacity_reservation`]) — the same count
+    /// `GetCapacityReservationUsage` reports — and NOT from `TotalInstanceCount -
+    /// AvailableInstanceCount`, so interruptible capacity is never reported as `used` and the
+    /// two reports cannot disagree about one reservation.
+    fn record_capacity_reservation_usage(&mut self, capacity_reservation_id: &str, taken: i32) {
+        let used = self.instances_in_capacity_reservation(capacity_reservation_id);
+        let Some(record) = self.capacity_reservations.get_mut(capacity_reservation_id) else {
+            return;
+        };
+        let total = record.view.total_instance_count.unwrap_or_default();
+        let available = record
+            .view
+            .available_instance_count
+            .unwrap_or(total)
+            .saturating_sub(taken)
+            .clamp(0, total.max(0));
+        record.view.available_instance_count = Some(available);
+        record.view.capacity_allocations = Some(if used > 0 {
+            vec![crate::ops::types::CapacityAllocation {
+                allocation_type: Some(ALLOCATION_TYPE_USED.to_string()),
+                count: Some(used),
+                // "Additional metadata associated with the capacity allocation"
+                // (`CapacityAllocation$AllocationMetadata`): this emulator records none, so
+                // the entry carries the usage alone rather than a key nothing set.
+                allocation_metadata: None,
+            }]
+        } else {
+            Vec::new()
+        });
     }
 
     /// Cancel the Capacity Reservation `capacity_reservation_id` names, and answer whether
@@ -499,6 +576,61 @@ pub fn require_well_formed_capacity_reservation_id<E>(
     }
     Err(invalid_capacity_reservation_id_malformed(
         capacity_reservation_id,
+    ))
+}
+
+/// EC2's error code for a request a Capacity Reservation has no capacity for
+/// (`ReservationCapacityExceeded`): the reservation resolved and its attributes match, but
+/// what it holds cannot cover the request.
+pub const RESERVATION_CAPACITY_EXCEEDED: &str = "ReservationCapacityExceeded";
+
+/// Refuse a launch a targeted Capacity Reservation has no capacity for: HTTP 400
+/// [`RESERVATION_CAPACITY_EXCEEDED`].
+///
+/// "The number of instances that can be launched in the Capacity Reservation"
+/// (`CapacityReservation$AvailableInstanceCount`) is capacity in ONE Availability Zone
+/// (`$AvailabilityZone`), so a launch placed in another zone, and one asking for more
+/// instances than the reservation holds, are the same cause: there is no capacity of this
+/// reservation for the request. The reservation the request targeted is named, from the
+/// request.
+///
+/// Only the CODE is recorded for this refusal; the sentence is this crate's, built from the
+/// request the way every other refusal of this module builds one.
+pub fn reservation_capacity_exceeded<E>(
+    capacity_reservation_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        RESERVATION_CAPACITY_EXCEEDED,
+        400,
+        format!(
+            "There is not enough capacity available in the Capacity Reservation \
+             '{capacity_reservation_id}' for this request"
+        ),
+    )
+}
+
+/// Refuse a request that targets a Capacity Reservation whose attributes are not the ones it
+/// asks for: HTTP 400 `InvalidParameterValue`.
+///
+/// A reservation serves an instance only when it "has matching attributes (instance type,
+/// platform, Availability Zone, and tenancy)" (`CapacityReservationPreference`), so a
+/// request that explicitly targets one and asks for something else has named a reservation
+/// that cannot hold it — a bad parameter value, not a reservation that does not exist: the id
+/// resolved, and retrying it unchanged can only fail again. `attribute` names which attribute
+/// disagreed, `reserved` is the value the STORED reservation carries and `requested` the one
+/// the request asked for.
+///
+/// Only the CODE is recorded for this refusal; the sentence is this crate's, built from the
+/// request and the stored reservation.
+pub fn capacity_reservation_attributes_do_not_match<E>(
+    capacity_reservation_id: &str,
+    attribute: &str,
+    reserved: &str,
+    requested: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "The Capacity Reservation '{capacity_reservation_id}' does not have matching \
+         attributes: its {attribute} is '{reserved}' and the request asks for '{requested}'"
     ))
 }
 

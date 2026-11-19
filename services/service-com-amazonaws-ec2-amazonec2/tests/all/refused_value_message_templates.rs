@@ -19,7 +19,8 @@
 //!    quoted template, which this suite pins as the contrast
 //!    ([`super::malformed_id_message_template`] owns that template).
 //! 2. AN UNKNOWN NETWORK INSIGHTS PATH is reported by the id ALONE — "<id> does not exist" —
-//!    whichever operation resolved it.
+//!    by every operation that SELECTS paths with it, while the one that ACTS on the path it
+//!    is given states that the `NetworkInsightsPathId` it was given is not a valid one.
 //! 3. A MEMBER THAT HAS TO NAME A REGION is refused with "Region name '<value>' is invalid.",
 //!    a sentence about the VALUE rather than about the member it arrived in, so one wording
 //!    covers every such member of the service.
@@ -37,7 +38,8 @@
 //! generates per run.
 
 use ec2::state::{
-    INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND, INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND,
+    INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND, INVALID_PARAMETER_VALUE,
+    INVALID_TRANSIT_GATEWAY_ID_NOT_FOUND,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -216,10 +218,10 @@ async fn the_request_boundary_keeps_its_own_template_for_the_same_values() {
 // RULE 2: an unknown network insights path
 // ---------------------------------------------------------------------------
 
-/// The operations that resolve a `NetworkInsightsPathId`, with the form field each names it
-/// under: two describes and the start of an analysis, so the sentence belongs to the resource
-/// rather than to one handler. The start names a client token too, which its model declares
-/// `@required`.
+/// The operations that resolve a `NetworkInsightsPathId` by SELECTING paths with it, with the
+/// form field each names it under: the two describes, so the sentence belongs to the resource
+/// rather than to one handler. `StartNetworkInsightsAnalysis` ACTS on the one path it is
+/// given and answers the other refusal of the pair, which is asserted on its own below.
 fn path_resolvers(path_id: &str) -> Vec<(&'static str, Vec<Param>)> {
     vec![
         (
@@ -230,18 +232,13 @@ fn path_resolvers(path_id: &str) -> Vec<(&'static str, Vec<Param>)> {
             "DescribeNetworkInsightsAnalyses",
             vec![param("NetworkInsightsPathId", path_id)],
         ),
-        (
-            "StartNetworkInsightsAnalysis",
-            vec![
-                param("NetworkInsightsPathId", path_id),
-                param("ClientToken", "one-analysis-per-token"),
-            ],
-        ),
     ]
 }
 
-/// RULE 2: a path id the account holds no path for is reported by the id ALONE, whichever
-/// operation resolved it — and a refused call leaves the account's paths as they were.
+/// RULE 2: a path id the account holds no path for is reported by the id ALONE by every
+/// operation that SELECTS paths with it, while the start of an analysis — which acts on the
+/// one path it is given — states that the `NetworkInsightsPathId` it was given is not valid;
+/// and a refused call leaves the account's paths as they were.
 #[tokio::test]
 async fn an_unknown_network_insights_path_is_reported_by_its_id_alone() {
     let router = emulator();
@@ -265,6 +262,22 @@ async fn an_unknown_network_insights_path_is_reported_by_its_id_alone() {
             )
             .await;
         }
+        // The start of an analysis acts on the ONE path it is given, so it states that the
+        // `NetworkInsightsPathId` it was given is not a valid one — one answer for every id
+        // it cannot resolve, whatever its form. Its model declares `ClientToken` `@required`,
+        // and a distinct token per row, so no row is answered as a replay of another.
+        assert_refusal(
+            &format!("{case} (StartNetworkInsightsAnalysis)"),
+            &router,
+            "StartNetworkInsightsAnalysis",
+            &[
+                param("NetworkInsightsPathId", path_id),
+                param("ClientToken", &format!("one-analysis-per-token-{path_id}")),
+            ],
+            INVALID_PARAMETER_VALUE,
+            &format!("NetworkInsightsPathId ({path_id}) is not valid"),
+        )
+        .await;
     }
 
     // The refusals above are about the ids: the account's own report is still served, and

@@ -174,8 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can attach only one internet gateway to a VPC at a time" (Amazon VPC User
         // Guide, "Connect to the internet using an internet gateway"), and a gateway
         // attaches at most one VPC — so an attachment either side of the pair already has
-        // is refused rather than silently added beside the one that holds. The refusal
-        // names the pair that is in the way, whichever side the request collided with.
+        // is refused rather than silently added beside the one that holds. The two sides are
+        // DIFFERENT refusals: the gateway being spoken for is the association conflict
+        // `Resource.AlreadyAssociated`, naming the pair that holds, while a network that
+        // already has a gateway is a bad `VpcId` ([`state::network_already_has_internet_gateway`]).
         if let Some(attached_vpc) = store.internet_gateway_attached_vpc(&input.internet_gateway_id)
         {
             return Err(state::resource_already_attached(
@@ -183,11 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &attached_vpc,
             ));
         }
-        if let Some(attached_gateway) = store.internet_gateway_of_vpc(&input.vpc_id) {
-            return Err(state::resource_already_attached(
-                &attached_gateway,
-                &input.vpc_id,
-            ));
+        if store.internet_gateway_of_vpc(&input.vpc_id).is_some() {
+            return Err(state::network_already_has_internet_gateway(&input.vpc_id));
         }
 
         // The request is one that would have succeeded, so a dry run stops HERE: "If you

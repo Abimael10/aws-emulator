@@ -742,6 +742,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Region's first. A launch that named a zone keeps it; the two are checked
         // against each other by nothing here, because the model's `Placement` is what the
         // caller asked for.
+        //
+        // A launch that named NEITHER, and targets a Capacity Reservation, runs in THAT
+        // reservation's zone: a reservation reserves capacity in one Availability Zone
+        // (`CapacityReservation$AvailabilityZone`), so the zone the caller left open is the
+        // reservation's — a launch into the Region's first zone would be a launch the
+        // reservation it explicitly targeted could not hold.
+        let targeted_reservation_zone = input
+            .capacity_reservation_specification
+            .as_ref()
+            .and_then(|specification| specification.capacity_reservation_target.as_ref())
+            .and_then(|target| target.capacity_reservation_id.as_deref())
+            .filter(|capacity_reservation_id| !capacity_reservation_id.is_empty())
+            .and_then(|capacity_reservation_id| {
+                store.capacity_reservations.get(capacity_reservation_id)
+            })
+            .and_then(|record| record.view.availability_zone.clone());
         let availability_zone = if input
             .placement
             .as_ref()
@@ -754,6 +770,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_deref()
                 .and_then(|subnet_id| store.subnets.get(subnet_id))
                 .and_then(|subnet| subnet.availability_zone.clone())
+                .or(targeted_reservation_zone)
                 .unwrap_or(availability_zone)
         };
 
@@ -793,6 +810,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // launch that names more than its type can hold is refused before anything is
         // stored.
         refuse_too_many_interfaces(&planned_interfaces, &instance_type)?;
+        // "You can only specify `CapacityReservationPreference` and
+        // `CapacityReservationTarget` if the `CapacityReservationPreference` is
+        // `capacity-reservations-only`" (`CapacityReservationSpecification`): any other
+        // preference describes where the instance runs INSTEAD of a reservation the request
+        // also targets, so the two members name two different placements and cannot be
+        // combined. Asked BEFORE the target is resolved, the way EC2 orders a parameter
+        // combination against a resource lookup: a request whose members cannot be served
+        // together is refused for that, not for the id it also carried.
+        if let Some(specification) = input.capacity_reservation_specification.as_ref() {
+            let targets_a_reservation = specification.capacity_reservation_target.is_some();
+            let preference = specification
+                .capacity_reservation_preference
+                .as_deref()
+                .filter(|preference| !preference.is_empty());
+            if targets_a_reservation
+                && preference.is_some_and(|preference| {
+                    preference != crate::state::CAPACITY_RESERVATION_PREFERENCE_ONLY
+                })
+            {
+                return Err(crate::state::parameters_cannot_be_combined(
+                    "capacityReservationPreference",
+                    "capacityReservationTarget",
+                ));
+            }
+        }
+        // "Use the CapacityReservationTarget parameter to explicitly target a specific
+        // Capacity Reservation or a Capacity Reservation group"
+        // (`CapacityReservationSpecification`), and a reservation serves an instance only
+        // when it "has matching attributes (instance type, platform, Availability Zone, and
+        // tenancy)" (`CapacityReservationPreference`) — so a launch that TARGETS one is held
+        // to the reservation's own instance type before anything is minted.
+        // The Capacity Reservation this launch TARGETS, resolved against the reservation
+        // store here and carried onto every instance the launch mints, so an instance never
+        // reports a reservation the account does not hold.
+        let targeted_capacity_reservation: Option<String> = match input
+            .capacity_reservation_specification
+            .as_ref()
+            .and_then(|specification| specification.capacity_reservation_target.as_ref())
+            .and_then(|target| target.capacity_reservation_id.as_deref())
+            .filter(|id| !id.is_empty())
+        {
+            None => None,
+            Some(capacity_reservation_id) => {
+                // The reservation is resolved the way this operation's validator reads a
+                // `cr-` id: a value EC2 could not have ISSUED — the all-zero placeholder
+                // among them — is malformed before any lookup, and only an issuable id the
+                // account holds no reservation under is reported not found
+                // ([`crate::state::require_known_capacity_reservation`]).
+                let reservation = crate::state::require_known_capacity_reservation(
+                    &store,
+                    capacity_reservation_id,
+                )?;
+                let reserved_instance_type = reservation.view.instance_type.clone();
+                let reserved_zone = reservation.view.availability_zone.clone();
+                let available = reservation.available_instance_count();
+                if reserved_instance_type
+                    .as_deref()
+                    .is_some_and(|reserved| reserved != instance_type)
+                {
+                    return Err(crate::state::capacity_reservation_attributes_do_not_match(
+                        capacity_reservation_id,
+                        "instance type",
+                        reserved_instance_type.as_deref().unwrap_or_default(),
+                        &instance_type,
+                    ));
+                }
+                // A reservation reserves capacity in ONE Availability Zone
+                // (`CapacityReservation$AvailabilityZone`), so a launch placed in another
+                // zone has no capacity of this reservation to take, and neither has one
+                // asking for more instances than the reservation holds — the same cause,
+                // which EC2 reports as the reservation's capacity being exceeded rather than
+                // as a bad parameter.
+                let requested_count = usize::try_from(input.max_count).unwrap_or(usize::MAX);
+                if reserved_zone
+                    .as_deref()
+                    .is_some_and(|zone| zone != availability_zone)
+                    || usize::try_from(available).unwrap_or(0) < requested_count
+                {
+                    return Err(crate::state::reservation_capacity_exceeded(
+                        capacity_reservation_id,
+                    ));
+                }
+                Some(capacity_reservation_id.to_string())
+            }
+        };
         // "The block device mapping, which defines the EBS volumes and instance store
         // volumes to attach to the instance at launch"
         // (`RunInstancesRequest$BlockDeviceMappings`): the root device every instance of this
@@ -923,6 +1025,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .capacity_reservation_specification
                 .as_ref()
                 .and_then(|specification| specification.capacity_reservation_preference.as_deref()),
+            capacity_reservation_id: targeted_capacity_reservation.as_deref(),
             maintenance_options: input.maintenance_options.as_ref(),
             network_performance_options: input.network_performance_options.as_ref(),
             private_dns_name_options: input.private_dns_name_options.as_ref(),

@@ -146,9 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            architecture_for, require_mac_instance, require_service_state,
-            tags_from_specifications, MacModificationTaskSpec, ARCHITECTURE_ARM64_MAC,
-            MAC_MODIFICATION_TASK_TAGGABLE_RESOURCE,
+            architecture_for, instance_type_is_ineligible, require_mac_instance,
+            require_service_state, tags_from_specifications, MacModificationTaskSpec,
+            ARCHITECTURE_ARM64_MAC, MAC_MODIFICATION_TASK_TAGGABLE_RESOURCE,
             MAC_MODIFICATION_TASK_TYPE_VOLUME_OWNERSHIP_DELEGATION, MAX_CLIENT_TOKEN_CHARS,
         };
 
@@ -193,15 +193,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instance" (`CreateDelegateMacVolumeOwnershipTask`): the delegation is a fact of
         // Apple silicon hardware, so an Intel Mac instance — the one Mac family whose
         // architecture is not `arm64_mac` ([`architecture_for`]) — has no volume ownership to
-        // delegate.
+        // delegate. Its TYPE is what makes it ineligible, so it is refused the way every
+        // type prerequisite of this crate is ([`instance_type_is_ineligible`]).
         let architecture = architecture_for(&instance.instance_type);
         if architecture != ARCHITECTURE_ARM64_MAC {
-            let instance_type = instance.instance_type.clone();
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{instance_id}' for instanceId. The instance is a \
-                 '{instance_type}' instance, which is not an Apple silicon Mac instance",
-                instance_id = input.instance_id,
-            )));
+            return Err(instance_type_is_ineligible());
         }
 
         // DryRun sits AFTER every parameter has been validated and the instance resolved,

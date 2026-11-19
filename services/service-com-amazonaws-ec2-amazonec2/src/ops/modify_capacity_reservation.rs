@@ -342,16 +342,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from, since the difference of the two counts is NOT usage: capacity allocated to an
         // interruptible reservation also lowers the available count
         // (`crate::ops::get_capacity_reservation_usage`). That difference is still a FLOOR on
-        // what a modification may leave reserved, so the larger of the two decides. A
-        // reservation this emulator holds reports no usage at all — nothing launches an
-        // instance into a Capacity Reservation yet — which leaves that floor at none.
+        // what a modification may leave reserved, so the larger of the two decides. The
+        // `used` allocations are the instances RUNNING in the reservation, which a launch
+        // that targets one now records
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::take_capacity_reservation_capacity`]),
+        // and the word for them is the state module's own so this reader and that writer
+        // cannot disagree about which allocations count as in use.
         let allocated = view
             .capacity_allocations
             .as_deref()
             .unwrap_or_default()
             .iter()
             .filter(|allocation| {
-                allocation.allocation_type.as_deref() == Some(ALLOCATION_TYPE_USED)
+                allocation.allocation_type.as_deref()
+                    == Some(crate::state::ALLOCATION_TYPE_USED)
             })
             .map(|allocation| allocation.count.unwrap_or_default())
             .fold(0i32, i32::saturating_add);
@@ -572,13 +576,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// refuse on a Capacity Reservation's state spell it
 /// (`crate::ops::cancel_capacity_reservation`).
 const CAPACITY_RESERVATION: &str = "Capacity Reservation";
-
-/// The `AllocationType` of the capacity a Capacity Reservation has instances RUNNING in:
-/// "`used` indicates that the instance capacity is in use by instances that are running in
-/// the Capacity Reservation" (`CapacityAllocation$AllocationType`), one member of the
-/// modelled enum (`smithy_query(query="shape",shape="AllocationType")`) beside the `future`
-/// and `cancelling` capacity nothing is running in.
-const ALLOCATION_TYPE_USED: &str = "used";
 
 /// How far one request may move a Capacity Reservation's instance count: "The number of
 /// instances can't be increased or decreased by more than `1000` in a single request"

@@ -1059,6 +1059,18 @@ pub const NAT_GATEWAY_NOT_FOUND: &str = "NatGatewayNotFound";
 /// id at all, so there is nothing to look up.
 pub const NAT_GATEWAY_MALFORMED: &str = "NatGatewayMalformed";
 
+/// `InvalidNatGatewayID.NotFound` (HTTP 400): the code the ROUTE operations answer for a
+/// NAT gateway id the account holds no gateway for.
+///
+/// The NAT gateway family's own operations (`DescribeNatGateways`, `DeleteNatGateway`, the
+/// address calls) answer [`NAT_GATEWAY_NOT_FOUND`] for the same condition. Which of the two
+/// a request gets is a fact of the OPERATION, not of the id: an operation of the ROUTE
+/// family resolves a NAT gateway as a route TARGET, and reports a target it cannot resolve
+/// in the `Invalid<Resource>ID.NotFound` family every other route target is reported in
+/// (`InvalidGatewayID.NotFound`, `InvalidNetworkInterfaceID.NotFound`), which is what a
+/// recorded `CreateRoute` naming an absent gateway carries.
+pub const INVALID_NAT_GATEWAY_ID_NOT_FOUND: &str = "InvalidNatGatewayID.NotFound";
+
 /// EC2's quota code for one NAT gateway too many (EC2 API "Error codes":
 /// `NatGatewayLimitExceeded`).
 pub const NAT_GATEWAY_LIMIT_EXCEEDED: &str = "NatGatewayLimitExceeded";

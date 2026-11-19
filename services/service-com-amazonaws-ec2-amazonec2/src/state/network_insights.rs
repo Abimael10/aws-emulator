@@ -1133,14 +1133,19 @@ pub fn invalid_network_insights_path_id_not_found<E>(path_id: &str) -> Scaffolde
 /// Which of the two refusals EC2 answers for an id it cannot resolve is a fact of the
 /// OPERATION rather than of the id — the split
 /// [`invalid_network_insights_access_scope_id_value`] records for the Network Access Scope
-/// surface: the describes and the start answer this resource's own
-/// [`INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND`], while the operation that acts on the one
-/// path it is given states that the `NetworkInsightsPathId` it was given is not a valid one
-/// — one answer for every id it cannot resolve, whatever its form. This is the ONE place
-/// that second wording lives, so the operation and the suite that asserts it cannot drift
-/// apart.
+/// surface: the DESCRIBES, which select paths by id, answer this resource's own
+/// [`INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND`], while an operation that acts on the ONE
+/// path it is given — the delete, and the start of an analysis — states that the
+/// `NetworkInsightsPathId` it was given is not a valid one, one answer for every id it
+/// cannot resolve, whatever its form. This is the ONE place that second wording lives, so
+/// the operations and the suites that assert it cannot drift apart. The id is the one the
+/// REQUEST sent, bounded by [`echoed_resource_id`] the way every refusal of this crate that
+/// echoes a caller-chosen id is.
 pub fn invalid_network_insights_path_id_value<E>(path_id: &str) -> Scaffolded<E> {
-    invalid_parameter_value(format!("NetworkInsightsPathId ({path_id}) is not valid"))
+    invalid_parameter_value(format!(
+        "NetworkInsightsPathId ({}) is not valid",
+        echoed_resource_id(path_id)
+    ))
 }
 
 /// Refuse an analysis id a request named that the account holds no analysis under: HTTP 400

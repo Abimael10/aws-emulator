@@ -219,21 +219,40 @@ pub fn route_is_local(route: &Route) -> bool {
     route.gateway_id.as_deref() == Some(LOCAL_ROUTE_GATEWAY_ID)
 }
 
-/// Refuse an attachment the resource already has: HTTP 400
-/// [`super::RESOURCE_ALREADY_ASSOCIATED`], the code EC2's error list gives for exactly this
-/// — "the resource is already associated. For example, you might be trying to attach more
-/// than one internet gateway to a VPC".
+/// Refuse an attachment the GATEWAY the request named already has: HTTP 400
+/// [`super::RESOURCE_ALREADY_ASSOCIATED`], the code EC2's error list gives for a resource
+/// that "is already associated".
 ///
-/// The message names the PAIR that already holds, whichever side of it the request
-/// collided with: the gateway the request named when that gateway is attached somewhere,
-/// and the gateway the VPC already has when the VPC is the side that is taken. A caller
-/// cannot act on the refusal without being told which association is in the way.
+/// This is the GATEWAY's side of the pair, and only that side: the gateway the request named
+/// is already attached to a network, so there is no second attachment for it to take. The
+/// message names the pair that is in the way — a caller cannot act on the refusal without
+/// being told which association holds. The VPC's side is a different refusal with a
+/// different code ([`network_already_has_internet_gateway`]), because the two conditions are
+/// not the same thing to a caller: one says "this gateway is spoken for", the other says
+/// "this network already has one".
 pub fn resource_already_attached<E>(internet_gateway_id: &str, vpc_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         super::RESOURCE_ALREADY_ASSOCIATED,
         400,
         format!("resource {internet_gateway_id} is already attached to network {vpc_id}"),
     )
+}
+
+/// Refuse a second internet gateway for a network that already has one: HTTP 400
+/// `InvalidParameterValue` with the sentence EC2 words it in — the fixed `Network ` and
+/// ` already has an internet gateway attached` around the VPC id the REQUEST named.
+///
+/// "You can attach only one internet gateway to a VPC at a time" (Amazon VPC User Guide,
+/// "Connect to the internet using an internet gateway"), and EC2 reports the VPC's side of
+/// that ceiling as a bad PARAMETER VALUE rather than as the association conflict
+/// [`resource_already_attached`] answers for the gateway's side: what the caller got wrong
+/// is the `VpcId` it passed, and the gateway it named is free to attach another network. The
+/// gateway already attached is NOT named — the refusal is about the network the request
+/// chose.
+pub fn network_already_has_internet_gateway<E>(vpc_id: &str) -> Scaffolded<E> {
+    super::invalid_parameter_value(format!(
+        "Network {vpc_id} already has an internet gateway attached"
+    ))
 }
 
 /// Refuse a detach of a pair that is not attached: HTTP 400 [`GATEWAY_NOT_ATTACHED`], the

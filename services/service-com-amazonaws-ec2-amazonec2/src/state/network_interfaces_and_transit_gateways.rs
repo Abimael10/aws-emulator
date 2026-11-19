@@ -150,15 +150,20 @@ pub fn invalid_network_interface_attachment_id_malformed<E>(attachment_id: &str)
 /// Refuse a readable attachment id the account holds no attachment for: HTTP 400
 /// [`INVALID_ATTACHMENT_ID_NOT_FOUND`].
 ///
-/// Worded the way this family of refusals words one about an id of a NAMED kind — the kind,
-/// the value from the request in single quotes, and that it does not exist — which is the
-/// sentence [`invalid_network_interface_id_not_found`] carries for the interface the
-/// attachment is of.
+/// The sentence a recorded `DetachNetworkInterface` refusal of a well-formed attachment id
+/// nothing is attached under carries: the fixed `The interface attachment '`, the id the
+/// REQUEST named, and `' does not exist.` — the resource named as the ATTACHMENT of an
+/// interface, and the sentence closed with a period, where [`id_not_found_message`] names a
+/// resource kind bare and ends without one. The id is bounded by [`echoed_resource_id`] the
+/// way every refusal of this crate that echoes a caller-chosen id is.
 pub fn invalid_attachment_id_not_found<E>(attachment_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_ATTACHMENT_ID_NOT_FOUND,
         400,
-        format!("The attachment ID '{attachment_id}' does not exist"),
+        format!(
+            "The interface attachment '{}' does not exist.",
+            echoed_resource_id(attachment_id)
+        ),
     )
 }
 
@@ -431,19 +436,26 @@ impl ComAmazonawsEc2Amazonec2State {
             .is_some_and(|interface| interface.requester_managed == Some(true))
     }
 
-    /// Whether `attachment_id` is a network interface attachment id this service could have
-    /// ISSUED, which is what an operation that resolves a `NetworkInterfaceAttachmentId`
-    /// reads one as.
+    /// Whether `attachment_id` is a network interface attachment id EC2 could have ISSUED,
+    /// which is what an operation that resolves a `NetworkInterfaceAttachmentId` reads one as.
     ///
-    /// [`Self::id_was_issued`] under this resource's own
-    /// [`NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX`]: AWS was recorded refusing a hand-written
-    /// long-form `eni-attach-…` id — a value inside the generic EC2 id form that it never
-    /// issued — with [`INVALID_NETWORK_INTERFACE_ATTACHMENT_ID_MALFORMED`] BEFORE any
-    /// attachment was looked up, so this id kind is read as the ids the service issues rather
-    /// than as anything that merely looks hexadecimal. An id it DID issue is looked up, and is
-    /// answered [`invalid_attachment_id_not_found`] when the attachment it named is gone.
+    /// [`prefixed_id_is_well_formed`] under this resource's own
+    /// [`NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX`]: the printed id form — the prefix and
+    /// hexadecimal digits in one of the two widths EC2 issues ids in. A value of that form the
+    /// account holds no attachment under is LOOKED UP and answered
+    /// [`invalid_attachment_id_not_found`], in BOTH widths: the recorded contract of
+    /// `DetachNetworkInterface` answers [`INVALID_ATTACHMENT_ID_NOT_FOUND`] for a
+    /// hand-written long-form `eni-attach-…` id nothing is attached under, and the sentence
+    /// that refusal carries was recorded for a SHORT-form one whose leading digit is above
+    /// zero. That supersedes the earlier reading of this id kind, which refused both as
+    /// malformed on the strength of the mint's own counter. A caller cleaning up has to be
+    /// able to read "that attachment is gone" rather than "that is not an id" — the reading
+    /// the INTERFACE the attachment is of already takes
+    /// ([`invalid_network_interface_id_not_found`]'s callers) — and
+    /// [`INVALID_NETWORK_INTERFACE_ATTACHMENT_ID_MALFORMED`] is left for a value outside the
+    /// form, which names no attachment that could ever have existed.
     pub fn network_interface_attachment_id_is_well_formed(&self, attachment_id: &str) -> bool {
-        self.id_was_issued(NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX, attachment_id)
+        prefixed_id_is_well_formed(NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX, attachment_id)
     }
 
     /// The network interface the attachment `attachment_id` holds, or `None` when no interface

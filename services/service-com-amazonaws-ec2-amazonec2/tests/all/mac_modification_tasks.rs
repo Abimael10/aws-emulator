@@ -725,7 +725,7 @@ async fn the_instance_a_task_names_is_resolved_first() {
         (
             format!("an instance of the {other_type} family, which runs no macOS"),
             sip(other_instance.as_str()),
-            "InvalidParameterValue",
+            "InvalidInstanceType",
         ),
     ];
     for (label, params, code) in rows {
@@ -749,13 +749,13 @@ async fn the_instance_a_task_names_is_resolved_first() {
             "a delegation on an Intel Mac",
             intel_instance.as_str(),
             400,
-            "InvalidParameterValue",
+            "InvalidInstanceType",
         ),
         (
             "a delegation on an instance of no Mac family",
             other_instance.as_str(),
             400,
-            "InvalidParameterValue",
+            "InvalidInstanceType",
         ),
         (
             "a delegation on an Apple silicon Mac",

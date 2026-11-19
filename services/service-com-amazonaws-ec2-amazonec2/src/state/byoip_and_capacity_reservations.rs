@@ -2239,6 +2239,14 @@ pub const CAPACITY_RESERVATION_TYPE_DEFAULT: &str = "default";
 /// [`ComAmazonawsEc2Amazonec2State::insert_purchased_capacity_block`] writes.
 pub const CAPACITY_RESERVATION_TYPE_CAPACITY_BLOCK: &str = "capacity-block";
 
+/// "`used` indicates that the instance capacity is in use by instances that are running in
+/// the Capacity Reservation" (`CapacityAllocation$AllocationType`): the member of the
+/// modelled `AllocationType` enum
+/// (`smithy_query(query="shape",shape="AllocationType")`) a reservation's own allocations
+/// carry, the other two (`future`, `cancelling`) belonging to capacity nothing is running
+/// in yet or capacity on its way out.
+pub const ALLOCATION_TYPE_USED: &str = "used";
+
 /// The only member of the modelled `InterruptionType` enum
 /// (`smithy_query(query="shape",shape="InterruptionType")`), so it is the one value
 /// `InterruptionInfo$InterruptionType` and the allocation's own `InterruptionType` carry.

@@ -242,13 +242,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The ID of the path" (`NetworkInsightsPathId`): an id that names no path of the
-        // account is refused rather than analyzed.
+        // account is refused rather than analyzed. This operation ACTS on the one path it is
+        // given, so it states that the `NetworkInsightsPathId` it was given is not a valid
+        // one ([`state::invalid_network_insights_path_id_value`]) — one answer for every id
+        // it cannot resolve, whatever its form — where the describes, which SELECT paths by
+        // id, report the path's own not-found code.
         if replayed.is_none()
             && !store
                 .network_insights_paths
                 .contains_key(&spec.network_insights_path_id)
         {
-            return Err(state::invalid_network_insights_path_id_not_found(
+            return Err(state::invalid_network_insights_path_id_value(
                 &spec.network_insights_path_id,
             ));
         }

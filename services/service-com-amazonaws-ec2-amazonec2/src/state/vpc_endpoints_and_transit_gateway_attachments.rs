@@ -115,22 +115,24 @@ impl ComAmazonawsEc2Amazonec2State {
     /// The ONE writer of an acceptance, so the state the consumer reads off its endpoint and
     /// the state the owner reads off the connection cannot drift apart. An endpoint this
     /// store holds no record of — one of another account, which only the connection is
-    /// stored for — moves nothing but its connection.
+    /// stored for — moves nothing but its connection, and an id this store holds NEITHER a
+    /// connection nor an endpoint under moves nothing at all: a move is recorded only beside
+    /// the record it moves, so no caller can grow these maps with ids that name nothing.
     pub fn accept_vpc_endpoint_connection(&mut self, vpc_endpoint_id: &str) {
         if let Some(connection) = self.vpc_endpoint_connections.get_mut(vpc_endpoint_id) {
             connection.vpc_endpoint_state = Some(VPC_ENDPOINT_STATE_PENDING.to_string());
+            self.vpc_endpoint_connection_moves.insert(
+                vpc_endpoint_id.to_string(),
+                PendingStateMove::starting_now(VPC_ENDPOINT_STATE_AVAILABLE),
+            );
         }
-        self.vpc_endpoint_connection_moves.insert(
-            vpc_endpoint_id.to_string(),
-            PendingStateMove::starting_now(VPC_ENDPOINT_STATE_AVAILABLE),
-        );
         if let Some(endpoint) = self.vpc_endpoints.get_mut(vpc_endpoint_id) {
             endpoint.state = Some(VPC_ENDPOINT_STATE_PENDING.to_string());
+            self.vpc_endpoint_moves.insert(
+                vpc_endpoint_id.to_string(),
+                PendingStateMove::starting_now(VPC_ENDPOINT_STATE_AVAILABLE),
+            );
         }
-        self.vpc_endpoint_moves.insert(
-            vpc_endpoint_id.to_string(),
-            PendingStateMove::starting_now(VPC_ENDPOINT_STATE_AVAILABLE),
-        );
     }
 
     /// Record that the owner of the endpoint service REJECTED the connection request of the
@@ -869,10 +871,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// answered with is at or below it.
     ///
     /// Which kinds read their ids this way is a fact about each kind, recorded with it:
-    /// [`Self::network_interface_attachment_id_is_well_formed`] does, on the recorded refusal
-    /// cited there, while a kind recorded answering `NotFound` for a hand-written long-form id
-    /// reads the wider [`prefixed_id_is_well_formed`] or [`issued_long_id_is_well_formed`]
-    /// instead.
+    /// [`Self::image_id_was_issued`] does, on the recorded refusal cited there, while a kind
+    /// recorded answering `NotFound` for a hand-written long-form id reads the wider
+    /// [`prefixed_id_is_well_formed`] or [`issued_long_id_is_well_formed`] instead — which is
+    /// what [`ComAmazonawsEc2Amazonec2State::network_interface_attachment_id_is_well_formed`]
+    /// reads, on the recording cited there.
     ///
     /// The counter is the store's ONE id counter, shared by every resource kind, so this says
     /// "a value the mint has reached" rather than "a value reached for THIS kind" — an id at

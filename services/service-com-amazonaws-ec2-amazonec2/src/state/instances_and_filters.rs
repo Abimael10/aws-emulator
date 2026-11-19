@@ -185,13 +185,46 @@ impl ComAmazonawsEc2Amazonec2State {
             .stored_bytes
             .saturating_add(instance_payload_bytes(&record));
         let instance_id = record.instance_id.clone();
+        let ran_in_reservation = record.detail.capacity_reservation_id.clone();
         self.instances.insert(record.instance_id.clone(), record);
+        // An instance launched INTO a Capacity Reservation takes that much of its capacity:
+        // recorded here, where the instance enters the store — so no launch path can place an
+        // instance in a reservation without the reservation reporting it — and AFTER the
+        // insert, so the usage it publishes counts the instance just stored.
+        if let Some(capacity_reservation_id) = ran_in_reservation {
+            self.take_capacity_reservation_capacity(&capacity_reservation_id);
+        }
         self.mint_launched_root_volume(&instance_id);
         if interfaces.is_empty() {
             self.mint_launched_primary_interface(&instance_id);
             return true;
         }
         self.mint_launched_interfaces(&instance_id, interfaces)
+    }
+
+    /// How many instances of the account are RUNNING IN the Capacity Reservation
+    /// `capacity_reservation_id` names: the instances whose launch targeted it that have not
+    /// started terminating.
+    ///
+    /// "The number of instances the Amazon Web Services account currently has in the Capacity
+    /// Reservation" (`InstanceUsage$UsedInstanceCount`), read off the instances themselves —
+    /// the one place that fact lives ([`super::InstanceDetail::capacity_reservation_id`]) —
+    /// so the usage a reservation reports and the instances a describe reports for it cannot
+    /// disagree. An instance on its way to `terminated` has already given its capacity back
+    /// ([`Self::begin_instance_termination`]) and so is not counted.
+    ///
+    /// A pass over the instance store, which [`MAX_STORED_INSTANCES`] bounds.
+    pub fn instances_in_capacity_reservation(&self, capacity_reservation_id: &str) -> i32 {
+        let running = self
+            .instances
+            .values()
+            .filter(|instance| {
+                instance.detail.capacity_reservation_id.as_deref()
+                    == Some(capacity_reservation_id)
+                    && !instance.state.is_terminating()
+            })
+            .count();
+        i32::try_from(running).unwrap_or(i32::MAX)
     }
 
     /// Start the termination of the instance `instance_id` names, as of `at`, and answer the
@@ -211,6 +244,7 @@ impl ComAmazonawsEc2Amazonec2State {
         let instance = self.instances.get_mut(instance_id)?;
         let previous = instance.state;
         let placed_by = instance.spot_instance_request_id.clone();
+        let ran_in_reservation = instance.detail.capacity_reservation_id.clone();
         if !previous.is_terminating() {
             instance.state = InstanceStateName::ShuttingDown;
             instance.pending_transition =
@@ -232,6 +266,14 @@ impl ComAmazonawsEc2Amazonec2State {
                     EVENT_SUB_TYPE_TERMINATED,
                     at,
                 );
+            }
+            // An instance on its way out no longer runs in the Capacity Reservation it was
+            // launched into, so that capacity is available again. Written on the SAME
+            // idempotent arm as the move itself, so a second termination cannot give the
+            // same capacity back twice, and after the state has moved, so the usage it
+            // publishes no longer counts this instance.
+            if let Some(capacity_reservation_id) = ran_in_reservation {
+                self.release_capacity_reservation_capacity(&capacity_reservation_id);
             }
         }
         Some(previous)
@@ -2526,6 +2568,13 @@ impl ComAmazonawsEc2Amazonec2State {
             "instance-state-code" => single(Some(instance.state.code().to_string())),
             "instance-state-name" => single(Some(instance.state.as_str().to_string())),
             "instance-type" => single(Some(instance.instance_type.clone())),
+            // "capacity-reservation-id - The ID of the Capacity Reservation into which the
+            // instance was launched" (`DescribeInstancesRequest$Filters`): read off the same
+            // member the instance report carries (`Instance$CapacityReservationId`), so a
+            // filter and a report cannot disagree about which reservation an instance runs
+            // in. An instance whose launch targeted none holds no value for it, so a filter
+            // naming one selects only instances that do.
+            "capacity-reservation-id" => single(instance.detail.capacity_reservation_id.clone()),
             // "instance.group-id - The ID of the security group for the instance" and
             // "instance.group-name - The name of the security group for the instance"
             // (`DescribeInstancesRequest$Filters`): read off the SAME projection the
