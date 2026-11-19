@@ -866,7 +866,10 @@ async fn a_preferred_maintenance_window_is_stored_with_its_day_names_folded() {
 
 /// A window whose next occurrence is DAYS away, whatever day the test runs on: the day after
 /// tomorrow, at a fixed time of day.
-fn window_days_ahead() -> String {
+///
+/// `pub(crate)` so the sibling suites of this one test target stage a change for a window
+/// that is not open the same way rather than keeping a second copy of this calendar walk.
+pub(crate) fn window_days_ahead() -> String {
     let day = weekday_index(2);
     format!("{day}:12:00-{day}:12:30")
 }

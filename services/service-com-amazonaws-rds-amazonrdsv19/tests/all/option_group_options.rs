@@ -178,7 +178,10 @@ fn assert_allows_both(case: &str, xml: &str, expected: bool) {
 }
 
 /// The `<OptionName>` of every option an answer reports for its group, in order.
-fn reported_option_names(xml: &str) -> Vec<String> {
+///
+/// `pub(crate)` so the sibling suites of this one test target read an answer's options the
+/// same way rather than keeping a second copy of this walk.
+pub(crate) fn reported_option_names(xml: &str) -> Vec<String> {
     subtrees(xml, "Option")
         .iter()
         .map(|option| text(option, "OptionName"))

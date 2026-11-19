@@ -170,6 +170,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         check_no_contradiction(&to_include, &to_remove)
             .map_err(ModifyOptionGroupError::validation)?;
+        // A modification has to ask for something: what this operation changes about a group
+        // is exactly the options `OptionsToInclude` adds or updates and the ones
+        // `OptionsToRemove` drops, so a request naming an option in neither list asks for no
+        // change at all and a 200 would report a modification that never happened. The
+        // request itself is what cannot be served, so this is decided before the group it
+        // names is resolved, and answered with the Query API's `InvalidParameterValue` and
+        // the fixed sentence Amazon RDS words this refusal with
+        // ([`crate::state::AT_LEAST_ONE_OPTION_CHANGE_MESSAGE`]).
+        if to_include.is_empty() && to_remove.is_empty() {
+            return Err(ModifyOptionGroupError::invalid_parameter_value(
+                crate::state::AT_LEAST_ONE_OPTION_CHANGE_MESSAGE,
+            ));
+        }
 
         // No store means this service was mounted on an engine it has no state in, so
         // it cannot serve the operation at all. Unreachable with the engine the router

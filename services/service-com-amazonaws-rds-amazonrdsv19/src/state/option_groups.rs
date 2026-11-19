@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// How Amazon RDS refuses a `ModifyOptionGroup` that names no option to add, to update or
+/// to remove: ONE fixed sentence, naming neither the group nor the members the request
+/// could have carried, so it is a constant rather than a `format!` over the request.
+pub const AT_LEAST_ONE_OPTION_CHANGE_MESSAGE: &str =
+    "At least one option must be added, modified, or removed.";
+
 /// One option a `ModifyOptionGroup` call added to a group: the caller's CONFIGURATION
 /// of it.
 ///

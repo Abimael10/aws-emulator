@@ -968,7 +968,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `PendingModifiedValues` is "returned only when there are pending changes" for.
             if pending.is_empty() {
                 record.deferred_modification = None;
-            } else {
+            } else if apply_immediately {
+                // Those settings are being applied FROM NOW, so this modification is one the
+                // instance is busy with. A modification left for the maintenance window is
+                // NOT: see the status block below for why only the former moves the status.
                 changed = true;
             }
         }
@@ -1112,9 +1115,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if changed {
-            // RDS answers a modification with the instance in `modifying`; it settles
-            // back to `available` on its own, at the instant the settings it staged are
-            // applied (`accepted_at` above).
+            // RDS answers a modification that is APPLYING something with the instance in
+            // `modifying`; it settles back to `available` on its own, at the instant the
+            // settings it staged are applied (`accepted_at` above).
+            //
+            // A modification whose every setting waits for the maintenance window applies
+            // nothing yet — "changes to the DB instance are applied during the next
+            // maintenance window" — so it does not reach here: `DBInstanceStatus` reports
+            // what the instance is doing NOW, the instance goes on running under the
+            // settings it has, and the staged ones are reported as pending until the window
+            // comes round or a reboot applies them. That is what leaves the instance in a
+            // state a caller can act on, so the reboot a deferred change waits for —
+            // rotating a CA certificate is one — is accepted straight after the
+            // modification is staged.
             record.status = "modifying".to_string();
             record.pending_status = Some(crate::state::PendingStatus::in_a_moment_after(
                 accepted_at,

@@ -205,6 +205,10 @@ async fn a_delete_is_accepted_from_every_status_and_the_instance_then_disappears
                         "ModifyDBInstance",
                         &params![
                             "DBInstanceIdentifier" => row.identifier,
+                            // The modification has to be one the instance is APPLYING for it
+                            // to report `modifying`: a change left for the next maintenance
+                            // window applies nothing yet and leaves the instance available.
+                            "ApplyImmediately" => true,
                             "AllocatedStorage" => 50,
                         ],
                     )
