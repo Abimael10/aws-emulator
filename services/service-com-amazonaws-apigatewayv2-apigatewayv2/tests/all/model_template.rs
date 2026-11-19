@@ -2,33 +2,48 @@
 
 //! End-to-end HTTP tests for ApiGatewayV2 `GetModelTemplate`.
 //!
-//! The rule these cases assert: **`GetModelTemplate` GENERATES the mapping template of
-//! the model the api holds under the requested id** — a Velocity (VTL) skeleton that maps
-//! an incoming payload onto the shape the model's JSON Schema declares: the
-//! `#set($inputRoot = $input.path('$'))` preamble, then each declared property mapped to
-//! its path under `$inputRoot` (a `string` quoted, any other scalar bare), an `array`
-//! mapped as a `#foreach` over its elements and a nested `object` nested. It reads the
-//! store and writes nothing, so two calls on an unchanged model answer the same template;
-//! a model the api does not hold is 404 `NotFoundException`.
+//! The rule these cases assert: **`GetModelTemplate` GENERATES the sample mapping template
+//! of the model the api holds under the requested id** — the
+//! `#set($inputRoot = $input.path('$'))` preamble followed by an EXAMPLE of the payload the
+//! model's JSON Schema declares, in which every declared property carries a sample value of
+//! the JSON type declared for that property (a `string` a sample string, an `integer` an
+//! integer, a `number` a fractional number, a `boolean` a boolean, an `object` an object of
+//! its own declared properties, an `array` one sample element), and where the schema itself
+//! states the value (an `enum` entry, a `default`) that value is the sample. The value slot
+//! is therefore never a reference into the incoming payload: it illustrates the declared
+//! type. It reads the store and writes nothing, so two calls on an unchanged model answer
+//! the same template; a model the api does not hold is 404 `NotFoundException`.
 //!
 //! The rows vary what the rule generalises over: the JSON type the schema declares
 //! (`object`, `array`, `string`, `integer`, `number`, `boolean`, `null`, a union of types,
-//! a type implied by `properties`/`items`/`enum`, none at all), how deeply the declaration
-//! nests, how many properties it declares, how a property is addressed, and whether the
-//! schema is reached directly or through a `$ref`. The recorded case that filed the issue
-//! — one `GetModelTemplate` on a JSON Schema model — is one row of the first table.
+//! a type implied by `properties`/`items`/`enum`, a type stated by a composition, none at
+//! all), how deeply the declaration nests, how many properties it declares, how a property
+//! is named, and whether the schema is reached directly or through a `$ref`. The recorded
+//! case that filed the issue — one `GetModelTemplate` on a JSON Schema model declaring a
+//! single string property — is one row of the first table.
 
 use serde_json::{json, Value};
 
 use crate::api_lifecycle::{as_str, call, emulator, error_code};
 
 /// The line a generated template opens with: it binds `$inputRoot` to the root of the
-/// incoming payload, so the mapped members below are addressed relative to it.
+/// incoming payload, which is what a caller maps from once they edit the sample.
 const PREAMBLE: &str = "#set($inputRoot = $input.path('$'))";
 
 /// A whole template: the preamble, then `body`.
 fn template(body: &str) -> String {
     format!("{PREAMBLE}\n{body}")
+}
+
+/// The generated template's body — everything after the preamble — parsed as the JSON
+/// document the sample payload is.
+fn parsed_sample(value: &str, case: &str) -> Value {
+    let body = value
+        .split_once('\n')
+        .map(|(_, body)| body)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a preamble and a body, got {value:?}"));
+    serde_json::from_str(body)
+        .unwrap_or_else(|_| panic!("case {case:?}: expected the sample to be JSON, got {body:?}"))
 }
 
 /// One row: a model's schema, and the template `GetModelTemplate` must generate from it.
@@ -59,10 +74,10 @@ fn rows() -> Vec<Row> {
             }),
             expected_body: [
                 "{",
-                "  \"id\" : \"$inputRoot.id\",",
-                "  \"paid\" : $inputRoot.paid,",
-                "  \"quantity\" : $inputRoot.quantity,",
-                "  \"total\" : $inputRoot.total",
+                "  \"id\" : \"foo\",",
+                "  \"paid\" : true,",
+                "  \"quantity\" : 0,",
+                "  \"total\" : 0.0",
                 "}",
             ]
             .join("\n"),
@@ -94,16 +109,14 @@ fn rows() -> Vec<Row> {
             expected_body: [
                 "{",
                 "  \"customer\" : {",
-                "    \"name\" : \"$inputRoot.customer.name\"",
+                "    \"name\" : \"foo\"",
                 "  },",
-                "  \"total\" : $inputRoot.total",
+                "  \"total\" : 0.0",
                 "}",
             ]
             .join("\n"),
         },
         Row {
-            // The shape of a generated template for an array of objects, as the API
-            // Gateway "Models and mapping templates" documentation shows it.
             case: "an array of objects",
             content_type: Some("application/json"),
             schema: json!({
@@ -119,12 +132,10 @@ fn rows() -> Vec<Row> {
                 }
             }),
             expected_body: [
-                "[#foreach($elem in $inputRoot)",
-                "  {",
-                "    \"class\" : \"$elem.class\",",
-                "    \"number\" : $elem.number",
-                "  }#if($foreach.hasNext),#end",
-                "#end]",
+                "[ {",
+                "  \"class\" : \"foo\",",
+                "  \"number\" : 0",
+                "} ]",
             ]
             .join("\n"),
         },
@@ -132,30 +143,18 @@ fn rows() -> Vec<Row> {
             case: "an array of strings",
             content_type: Some("application/json"),
             schema: json!({ "type": "array", "items": { "type": "string" } }),
-            expected_body: [
-                "[#foreach($elem in $inputRoot)",
-                "  \"$elem\"#if($foreach.hasNext),#end",
-                "#end]",
-            ]
-            .join("\n"),
+            expected_body: "[ \"foo\" ]".to_string(),
         },
         Row {
-            // The inner loop needs its OWN element variable, or it would shadow the
-            // element its parent is iterating.
+            // One sample element, whatever the element itself is: an array of arrays
+            // describes one array of one integer.
             case: "an array of arrays",
             content_type: Some("application/json"),
             schema: json!({
                 "type": "array",
                 "items": { "type": "array", "items": { "type": "integer" } }
             }),
-            expected_body: [
-                "[#foreach($elem in $inputRoot)",
-                "  [#foreach($elem2 in $elem)",
-                "    $elem2#if($foreach.hasNext),#end",
-                "  #end]#if($foreach.hasNext),#end",
-                "#end]",
-            ]
-            .join("\n"),
+            expected_body: "[ [ 0 ] ]".to_string(),
         },
         Row {
             case: "an object whose property is an array of objects",
@@ -174,11 +173,9 @@ fn rows() -> Vec<Row> {
             }),
             expected_body: [
                 "{",
-                "  \"items\" : [#foreach($elem in $inputRoot.items)",
-                "    {",
-                "      \"sku\" : \"$elem.sku\"",
-                "    }#if($foreach.hasNext),#end",
-                "  #end]",
+                "  \"items\" : [ {",
+                "    \"sku\" : \"foo\"",
+                "  } ]",
                 "}",
             ]
             .join("\n"),
@@ -202,7 +199,7 @@ fn rows() -> Vec<Row> {
             expected_body: [
                 "{",
                 "  \"pet\" : {",
-                "    \"name\" : \"$inputRoot.pet.name\"",
+                "    \"name\" : \"foo\"",
                 "  }",
                 "}",
             ]
@@ -210,7 +207,7 @@ fn rows() -> Vec<Row> {
         },
         Row {
             // Draft-04 section 5.5.2 allows a union of types; the first type that is not
-            // `null` is the one the value is mapped as.
+            // `null` is the one the sample carries.
             case: "properties declaring a union of types",
             content_type: Some("application/json"),
             schema: json!({
@@ -220,66 +217,98 @@ fn rows() -> Vec<Row> {
                     "note": { "type": ["string", "null"] }
                 }
             }),
-            expected_body: [
-                "{",
-                "  \"count\" : $inputRoot.count,",
-                "  \"note\" : \"$inputRoot.note\"",
-                "}",
-            ]
-            .join("\n"),
+            expected_body: ["{", "  \"count\" : 0,", "  \"note\" : \"foo\"", "}"].join("\n"),
         },
         Row {
-            // No `type` keyword: every value of an `enum` carries the JSON type its
-            // entries do.
+            // A schema that RESTRICTS its instance to a set of values (draft-04 section
+            // 5.5.1) has already stated the value it means, so the sample is the first of
+            // them — whatever JSON type the entries carry, and with no `type` keyword
+            // needed to say so.
             case: "properties typed only by their enum values",
             content_type: Some("application/json"),
             schema: json!({
                 "type": "object",
                 "properties": {
-                    "retries": { "enum": [0, 1, 2] },
+                    "retries": { "enum": [2, 3] },
                     "status": { "enum": ["OPEN", "CLOSED"] }
+                }
+            }),
+            expected_body: ["{", "  \"retries\" : 2,", "  \"status\" : \"OPEN\"", "}"]
+                .join("\n"),
+        },
+        Row {
+            // And a schema that supplies a `default` for its instance (section 6.2) has
+            // stated one too.
+            case: "a property carrying a default",
+            content_type: Some("application/json"),
+            schema: json!({
+                "type": "object",
+                "properties": { "region": { "type": "string", "default": "us-east-1" } }
+            }),
+            expected_body: ["{", "  \"region\" : \"us-east-1\"", "}"].join("\n"),
+        },
+        Row {
+            // draft-04 section 5.5.3: an instance satisfying `allOf` satisfies EVERY
+            // subschema, so the sample describes what all of them declare together.
+            case: "an object composed with allOf",
+            content_type: Some("application/json"),
+            schema: json!({
+                "$schema": "http://json-schema.org/draft-04/schema#",
+                "type": "object",
+                "allOf": [{ "$ref": "#/definitions/Audited" }],
+                "properties": { "sku": { "type": "string" } },
+                "definitions": {
+                    "Audited": {
+                        "type": "object",
+                        "properties": { "createdAt": { "type": "integer" } }
+                    }
                 }
             }),
             expected_body: [
                 "{",
-                "  \"retries\" : $inputRoot.retries,",
-                "  \"status\" : \"$inputRoot.status\"",
+                "  \"createdAt\" : 0,",
+                "  \"sku\" : \"foo\"",
                 "}",
             ]
             .join("\n"),
         },
         Row {
-            // `$inputRoot.order id` is no Velocity reference, so such a name is
-            // addressed through the map's own `get`.
-            case: "a property name that is no Velocity identifier",
+            // Sections 5.5.4 and 5.5.5: an instance satisfying `anyOf`/`oneOf` satisfies
+            // one branch, so the sample describes the first of them — which is also what
+            // types the value where the schema states no type of its own.
+            case: "a property composed with oneOf",
+            content_type: Some("application/json"),
+            schema: json!({
+                "type": "object",
+                "properties": {
+                    "amount": { "oneOf": [{ "type": "number" }, { "type": "string" }] },
+                    "tag": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+                }
+            }),
+            expected_body: ["{", "  \"amount\" : 0.0,", "  \"tag\" : \"foo\"", "}"]
+                .join("\n"),
+        },
+        Row {
+            // A property name is a JSON member name whatever it carries, and the sample's
+            // own structure is the generator's, never a name's.
+            case: "a property name that is no identifier",
             content_type: Some("application/json"),
             schema: json!({
                 "type": "object",
                 "properties": { "order id": { "type": "string" } }
             }),
-            expected_body: [
-                "{",
-                "  \"order id\" : \"$inputRoot.get('order id')\"",
-                "}",
-            ]
-            .join("\n"),
+            expected_body: ["{", "  \"order id\" : \"foo\"", "}"].join("\n"),
         },
         Row {
-            // A name carrying a quote of either kind must not close the Velocity literal
-            // it is addressed through, nor the JSON literal the member is rendered
-            // inside: the structure of the template is the generator's, not the name's.
+            // A name carrying a quote of either kind must not close the JSON literal the
+            // member name is rendered inside.
             case: "a property name carrying quotes",
             content_type: Some("application/json"),
             schema: json!({
                 "type": "object",
                 "properties": { "o'rder \"x\"": { "type": "string" } }
             }),
-            expected_body: [
-                "{",
-                r#"  "o'rder \"x\"" : "$inputRoot.get('o\'rder \"x\"')""#,
-                "}",
-            ]
-            .join("\n"),
+            expected_body: ["{", r#"  "o'rder \"x\"" : "foo""#, "}"].join("\n"),
         },
         Row {
             case: "a property name carrying a newline and a backslash",
@@ -288,12 +317,7 @@ fn rows() -> Vec<Row> {
                 "type": "object",
                 "properties": { "a\nb\\c": { "type": "string" } }
             }),
-            expected_body: [
-                "{",
-                r#"  "a\nb\\c" : "$inputRoot.get('a\nb\\c')""#,
-                "}",
-            ]
-            .join("\n"),
+            expected_body: ["{", r#"  "a\nb\\c" : "foo""#, "}"].join("\n"),
         },
         Row {
             case: "a property declared null",
@@ -310,47 +334,39 @@ fn rows() -> Vec<Row> {
             case: "an object typed only by declaring properties",
             content_type: Some("application/json"),
             schema: json!({ "properties": { "name": { "type": "string" } } }),
-            expected_body: ["{", "  \"name\" : \"$inputRoot.name\"", "}"].join("\n"),
+            expected_body: ["{", "  \"name\" : \"foo\"", "}"].join("\n"),
         },
         Row {
             // And an array is what `items` applies to (section 5.3.1).
             case: "an array typed only by declaring items",
             content_type: Some("application/json"),
             schema: json!({ "items": { "type": "number" } }),
-            expected_body: [
-                "[#foreach($elem in $inputRoot)",
-                "  $elem#if($foreach.hasNext),#end",
-                "#end]",
-            ]
-            .join("\n"),
+            expected_body: "[ 0.0 ]".to_string(),
         },
         Row {
+            // An array declaring no items constrains no element, so there is none to
+            // describe.
             case: "an array declaring no items, whose elements are of unknown shape",
             content_type: Some("application/json"),
             schema: json!({ "type": "array" }),
-            expected_body: [
-                "[#foreach($elem in $inputRoot)",
-                "  $elem#if($foreach.hasNext),#end",
-                "#end]",
-            ]
-            .join("\n"),
+            expected_body: "[ ]".to_string(),
         },
         Row {
-            // A value the schema gives no type for is mapped by reference, so whatever
-            // the payload carries at that path flows through.
+            // A value the schema declares nothing about is rendered as the JSON value that
+            // says nothing about it.
             case: "a property whose schema declares no type at all",
             content_type: Some("application/json"),
             schema: json!({
                 "type": "object",
                 "properties": { "payload": { "description": "anything at all" } }
             }),
-            expected_body: ["{", "  \"payload\" : $inputRoot.payload", "}"].join("\n"),
+            expected_body: ["{", "  \"payload\" : null", "}"].join("\n"),
         },
         Row {
             case: "the empty schema, which matches every document",
             content_type: Some("application/json"),
             schema: json!({}),
-            expected_body: "$inputRoot".to_string(),
+            expected_body: "null".to_string(),
         },
         Row {
             // A `+json` media type (RFC 6839) names JSON Schema as its schema language
@@ -361,7 +377,7 @@ fn rows() -> Vec<Row> {
                 "type": "object",
                 "properties": { "sku": { "type": "string" } }
             }),
-            expected_body: ["{", "  \"sku\" : \"$inputRoot.sku\"", "}"].join("\n"),
+            expected_body: ["{", "  \"sku\" : \"foo\"", "}"].join("\n"),
         },
     ]
 }
@@ -451,7 +467,7 @@ async fn get_model_template_generates_the_template_the_models_schema_declares() 
         assert_eq!(
             value,
             template(&row.expected_body),
-            "case {:?}: expected the template its schema declares, got {value:?}",
+            "case {:?}: expected the sample its schema declares, got {value:?}",
             row.case
         );
         // Every template opens with the preamble that binds `$inputRoot`.
@@ -459,6 +475,95 @@ async fn get_model_template_generates_the_template_the_models_schema_declares() 
             value.starts_with(PREAMBLE),
             "case {:?}: expected the template to open with {PREAMBLE:?}, got {value:?}",
             row.case
+        );
+        // Whatever the schema declares, the generated sample is itself a JSON document:
+        // each value slot carries an example value, never a reference into the payload.
+        parsed_sample(&value, row.case);
+    }
+}
+
+#[tokio::test]
+async fn every_sample_value_carries_the_json_type_its_schema_declares() {
+    let emulator = emulator();
+    let api_id = create_api(&emulator, "the typed api", "model-template-types").await;
+
+    // One property per declared type, each checked against what the parsed sample must
+    // carry for it. The rows span every type a JSON Schema declares for a value, plus the
+    // two forms that state a value outright and the union spelling.
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(&str, Value, fn(&Value) -> bool)> = vec![
+        ("a string", json!({ "type": "string" }), |value| {
+            value.is_string()
+        }),
+        ("an integer", json!({ "type": "integer" }), |value| {
+            value.is_i64()
+        }),
+        ("a number", json!({ "type": "number" }), |value| {
+            value.is_f64() && !value.is_i64()
+        }),
+        ("a boolean", json!({ "type": "boolean" }), |value| {
+            value.is_boolean()
+        }),
+        ("a null", json!({ "type": "null" }), |value| value.is_null()),
+        (
+            "an object",
+            json!({ "type": "object", "properties": { "inner": { "type": "string" } } }),
+            |value| value.is_object(),
+        ),
+        (
+            "an array",
+            json!({ "type": "array", "items": { "type": "integer" } }),
+            |value| value.is_array(),
+        ),
+        ("an integer enum", json!({ "enum": [7, 8] }), |value| {
+            value.is_i64()
+        }),
+        (
+            "a string default",
+            json!({ "type": "string", "default": "set" }),
+            |value| value.is_string(),
+        ),
+        (
+            "a union of a number and null",
+            json!({ "type": ["number", "null"] }),
+            |value| value.is_f64(),
+        ),
+    ];
+
+    let properties: serde_json::Map<String, Value> = rows
+        .iter()
+        .enumerate()
+        .map(|(index, (_, schema, _))| (format!("member{index}"), schema.clone()))
+        .collect();
+    let case = "one model declaring every type";
+    let model_id = create_model(
+        &emulator,
+        case,
+        &api_id,
+        "EveryType",
+        Some("application/json"),
+        &json!({ "type": "object", "properties": properties }).to_string(),
+    )
+    .await;
+
+    let (status, body) = call(
+        &emulator,
+        "GET",
+        &format!("/v2/apis/{api_id}/models/{model_id}/template"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from GetModelTemplate, got {status} {body}"
+    );
+    let sample = parsed_sample(&as_str(&body, "value"), case);
+    for (index, (declared, _, carries)) in rows.iter().enumerate() {
+        let member = format!("member{index}");
+        let example = &sample[&member];
+        assert!(
+            carries(example),
+            "case {declared}: expected {member} to carry the declared type, got {example:?}"
         );
     }
 }
@@ -670,7 +775,7 @@ async fn a_schema_that_refers_to_itself_still_answers_one_template() {
     let api_id = create_api(&emulator, "the recursive api", "model-template-recursive").await;
 
     // A node whose child is the same schema: the descent is bounded, so the generation
-    // terminates and the deepest mapped member is taken by reference.
+    // terminates and the deepest value is described as one of unknown shape.
     let schema = json!({
         "$schema": "http://json-schema.org/draft-04/schema#",
         "type": "object",
@@ -706,7 +811,7 @@ async fn a_schema_that_refers_to_itself_still_answers_one_template() {
         value.starts_with(PREAMBLE),
         "expected the template to open with {PREAMBLE:?}, got {value:?}"
     );
-    // The recursion descended and stopped: the self-referring member is mapped at every
+    // The recursion descended and stopped: the self-referring member is described at every
     // level reached, and the descent is bounded well under the schema's infinite depth.
     let depth = value.matches("\"child\" : ").count();
     assert!(
@@ -736,11 +841,10 @@ async fn a_schema_whose_template_would_not_fit_the_bounds_is_refused_not_expande
     let emulator = emulator();
     let api_id = create_api(&emulator, "the bounded api", "model-template-bounded").await;
 
-    // Each row is a small schema whose template, expanded without a bound, would be
+    // Each row is a small schema whose sample, expanded without a bound, would be
     // enormous: the rows vary HOW it grows — a branching self-reference (exponential in
-    // the branching factor), a branching reference into a definition, a chain of
-    // definitions that each fan out, and a flat schema with many long property names
-    // (which fits the step bound but not the output bound).
+    // the branching factor), a branching reference into a definition, and arrays whose
+    // items refer back to the whole document.
     let mut branching = serde_json::Map::new();
     for index in 0..10 {
         branching.insert(format!("child{index}"), json!({ "$ref": "#" }));
@@ -748,6 +852,13 @@ async fn a_schema_whose_template_would_not_fit_the_bounds_is_refused_not_expande
     let mut fanning = serde_json::Map::new();
     for index in 0..8 {
         fanning.insert(format!("node{index}"), json!({ "$ref": "#/definitions/Node" }));
+    }
+    let mut nesting = serde_json::Map::new();
+    for index in 0..10 {
+        nesting.insert(
+            format!("list{index}"),
+            json!({ "type": "array", "items": { "$ref": "#" } }),
+        );
     }
     let rows: Vec<(&str, Value)> = vec![
         (
@@ -768,18 +879,10 @@ async fn a_schema_whose_template_would_not_fit_the_bounds_is_refused_not_expande
             }),
         ),
         (
-            "an array whose items refer back to the whole document",
-            json!({
-                "type": "object",
-                "properties": {
-                    "left": { "type": "array", "items": { "$ref": "#" } },
-                    "right": { "type": "array", "items": { "$ref": "#" } },
-                    "third": { "type": "array", "items": { "$ref": "#" } },
-                    "fourth": { "type": "array", "items": { "$ref": "#" } },
-                    "fifth": { "type": "array", "items": { "$ref": "#" } },
-                    "sixth": { "type": "array", "items": { "$ref": "#" } }
-                }
-            }),
+            // The same growth through arrays: each element is one sample, so an array
+            // whose items refer back to the document re-expands it once per property.
+            "ten arrays whose items refer back to the whole document",
+            json!({ "type": "object", "properties": Value::Object(nesting) }),
         ),
     ];
 
@@ -844,7 +947,7 @@ async fn a_schema_whose_template_would_not_fit_the_bounds_is_refused_not_expande
     let value = as_str(&body, "value");
     assert_eq!(
         value,
-        template(&["{", "  \"id\" : \"$inputRoot.id\"", "}"].join("\n")),
-        "expected the template its schema declares, got {value:?}"
+        template(&["{", "  \"id\" : \"foo\"", "}"].join("\n")),
+        "expected the sample its schema declares, got {value:?}"
     );
 }

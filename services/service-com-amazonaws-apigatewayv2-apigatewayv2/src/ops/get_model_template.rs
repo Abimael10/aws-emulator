@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetModelTemplate
-//! IMPLEMENTED: generates the mapping template of the [`crate::state::Model`] record its
-//! parent api holds under the requested `ModelId` — a Velocity (VTL) skeleton that maps an
-//! incoming payload onto the shape the model's JSON Schema declares. This is the ONLY file
-//! to touch for this operation.
+//! IMPLEMENTED: generates the sample mapping template of the [`crate::state::Model`] record
+//! its parent api holds under the requested `ModelId` — the
+//! `#set($inputRoot = $input.path('$'))` preamble followed by an EXAMPLE of the payload the
+//! model's JSON Schema declares, every declared property carrying a sample value of the JSON
+//! type declared for it. This is the ONLY file to touch for this operation.
 //!
-//! The generation is a pure function of the stored schema ([`generate_template`], which
+//! The generation is a pure function of the stored schema ([`generate_sample_payload`], which
 //! reads the schema language both gateway control planes share), so the operation is
 //! REPORTING: it reads the store and writes nothing, and two calls on an unchanged model
 //! answer the same template. The record is copied out from under the state guard before
@@ -77,12 +78,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The reading of a model's JSON Schema document and the mapping skeleton generated from
-/// it, stated in the shared service crate because BOTH gateway control planes read that one
-/// schema language — and re-exported here so the module docs above and the suite that
-/// asserts the bounds a template is generated within name one definition of them.
+/// The reading of a model's JSON Schema document and the sample payload generated from it,
+/// stated in the shared service crate because BOTH gateway control planes read that one
+/// schema language and generate that one document from it — and re-exported here so the
+/// module docs above and the suite that asserts the bounds a template is generated within
+/// name one definition of them.
 pub use ::service_common::model_mapping_template::{
-    generate_template, Exhausted, MAX_DEPTH, MAX_STEPS, MAX_TEMPLATE_BYTES,
+    generate_sample_payload, Exhausted, MAX_DEPTH, MAX_STEPS, MAX_TEMPLATE_BYTES,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -227,8 +229,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // A template MAPS a payload onto the structure the schema declares, so the schema
-        // has to declare a structure to map: an `object` whose properties are mapped one by
-        // one, or an `array` whose items are mapped under a `#foreach`
+        // has to declare a structure to map: an `object` whose properties are described one
+        // by one, or an `array` whose items describe its elements
         // (`::service_common::model_mapping_template`). A schema whose root declares a
         // SCALAR type declares no members at all, so API Gateway reports that data type as
         // one it does not generate a mapping template for rather than answering a template
@@ -246,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // does not fit those bounds is REFUSED rather than expanded: one request can
         // therefore cost at most a fixed amount of work and return at most a fixed amount
         // of output, however the stored schema branches or refers back to itself.
-        let value = generate_template(&document).map_err(|exhausted| {
+        let value = generate_sample_payload(&document).map_err(|exhausted| {
             crate::scaffolded::Scaffolded::validation(format!(
                 "Unable to generate a template for model {}: its schema expands past {}, \
                  the bound this service generates a template within.",

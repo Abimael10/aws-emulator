@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ONE reading of the JSON Schema document a gateway model carries, and the two
-//! documents a gateway control plane generates from it.
+//! The ONE reading of the JSON Schema document a gateway model carries, and the document a
+//! gateway control plane generates from it.
 //!
 //! A model describes the data structure of a method request or response, and a gateway can
 //! generate, from that structure, the Velocity (VTL) template content a caller starts a
@@ -10,26 +10,16 @@
 //! what a `$ref` resolves to, and the bounds a generation runs within — is stated ONCE
 //! here instead of once per service.
 //!
-//! What each generates from that reading is its own, because the wire each one answers is:
+//! [`generate_sample_payload`] is what each of them generates from that reading: the
+//! preamble followed by a SAMPLE PAYLOAD in the structure the schema declares, in which
+//! every declared property carries an example value of the type declared FOR THAT PROPERTY,
+//! so the generated document is itself JSON and illustrates each property's declared type.
+//! That is what the recorded calls of both control planes answer — a template whose body
+//! parses as JSON and whose example for an `integer` property is an integer — so the one
+//! rendering is stated here rather than once per service.
 //!
-//! * [`generate_sample_payload`] — the preamble followed by a SAMPLE PAYLOAD in the
-//!   structure the schema declares: every declared property carries an example value of
-//!   the type declared for it, so the generated document is itself JSON. This is what the
-//!   REST control plane's recorded calls answer: a template whose body parses as JSON and
-//!   whose example for an `integer` property is an integer
-//!   (`apigateway.get-model-template-generates-example-json`,
-//!   `apigateway.get-model-template-generates-example-payload`).
-//! * [`generate_template`] — the preamble followed by a MAPPING SKELETON: every declared
-//!   property mapped to its path under `$inputRoot`, an `array` to a `#foreach` over its
-//!   elements and a nested `object` nested. This is what the other control plane's
-//!   recorded call answers (`apigatewayv2.get-model-template-returns-schema`).
-//!
-//! The two renderings are each the one their own service's recording shows; neither was
-//! chosen here. Which of them the OTHER service would answer is not knowable from either
-//! recording, so nothing in this module assumes they agree.
-//!
-//! Both are PURE functions of the document — the same schema generates the same text, and
-//! nothing is read or written beside it — and both are bounded in descent ([`MAX_DEPTH`]),
+//! It is a PURE function of the document — the same schema generates the same text, and
+//! nothing is read or written beside it — and it is bounded in descent ([`MAX_DEPTH`]),
 //! in STEPS ([`MAX_STEPS`]) and in output ([`MAX_TEMPLATE_BYTES`]). A step is every unit of
 //! work a generation does on the document: each value rendered, each property name
 //! considered and each segment of a `$ref` walked, so what one call costs is bounded by the
@@ -191,25 +181,6 @@ pub fn generate_sample_payload(document: &::serde_json::Value) -> Result<String,
     Ok(writer.template)
 }
 
-/// Generate the MAPPING SKELETON of a model whose schema is `document`.
-///
-/// The text is the preamble followed by a skeleton of the payload the schema declares: each
-/// declared property is mapped to its path under `$inputRoot`, a string-typed value is
-/// quoted and any other scalar is not, an `array` becomes a `#foreach` over its items, and
-/// a nested `object` nests. A schema that declares no type for a value maps that value by
-/// reference, which preserves it whatever it is — including one that declares only a
-/// composition of subschemas, which [`generate_sample_payload`] reads through and this
-/// rendering deliberately does not: a value of unknown shape flows through a mapping
-/// template unchanged, so there is nothing for the skeleton to gain from reading it.
-///
-/// Bounded exactly as [`generate_sample_payload`] is.
-pub fn generate_template(document: &::serde_json::Value) -> Result<String, Exhausted> {
-    let mut writer = Writer::new();
-    writer.preamble()?;
-    render(document, document, INPUT_ROOT, 0, 0, 0, &mut writer)?;
-    Ok(writer.template)
-}
-
 /// The JSON Schema types a mapping template is generated for: the two COMPOSITE types,
 /// whose members are what a template maps.
 const TEMPLATED_DATA_TYPES: [&str; 2] = ["object", "array"];
@@ -234,11 +205,11 @@ pub fn unsupported_template_data_type_message(data_type: &str) -> String {
 /// generated for, naming that type. A scalar declared INLINE is a leaf the generation
 /// renders in place, which is the ordinary case and no refusal.
 ///
-/// A value that declares NO type names no data type to refuse — the generations above read
-/// such a value's structure from its `properties` or `items`, and map a value of unknown
-/// shape by reference — and a reference that resolves to nothing is such a value. A `type`
-/// written as a union of names is read as those generations read it, through the first name
-/// that is not `null`.
+/// A value that declares NO type names no data type to refuse — the generation above reads
+/// such a value's structure from its `properties` or `items`, and describes a value of
+/// unknown shape as one it knows nothing about — and a reference that resolves to nothing is
+/// such a value. A `type` written as a union of names is read as that generation reads it,
+/// through the first name that is not `null`.
 ///
 /// Bounded exactly as a generation is: the descent is bounded by [`MAX_DEPTH`], the work by
 /// [`MAX_STEPS`] and the references resolved OUTSIDE the document by
@@ -583,46 +554,6 @@ fn render_sample_array(
     writer.push(" ]")
 }
 
-/// Render the value `schema` describes, reachable in the template at `path`, into `writer`.
-///
-/// `root` is the whole schema document, so a `$ref` can be resolved against it; `indent`
-/// is how deep the rendered lines sit, `loops` how many `#foreach`s enclose this value
-/// (which names its loop variable), and `depth` the descent bounded by [`MAX_DEPTH`].
-/// Following a `$ref` costs a level of that descent, so a schema that refers back into
-/// itself is not re-expanded for free.
-fn render(
-    root: &::serde_json::Value,
-    schema: &::serde_json::Value,
-    path: &str,
-    indent: usize,
-    loops: usize,
-    depth: usize,
-    writer: &mut Writer,
-) -> Result<(), Exhausted> {
-    writer.step()?;
-    if depth >= MAX_DEPTH {
-        // Past the descent bound the value is mapped by reference, which is the mapping
-        // for a value of unknown shape — whatever the payload carries there flows through.
-        return writer.push(path);
-    }
-    if let Some(target) = referenced(root, schema, writer)? {
-        return render(root, target, path, indent, loops, depth + 1, writer);
-    }
-    match kind(schema) {
-        Kind::Object => render_object(root, schema, path, indent, loops, depth, writer),
-        Kind::Array => render_array(root, schema, path, indent, loops, depth, writer),
-        // A string value is quoted, so the template renders valid JSON; every other
-        // scalar is substituted bare.
-        Kind::Str => {
-            writer.push("\"")?;
-            writer.push(path)?;
-            writer.push("\"")
-        }
-        Kind::Integer | Kind::Number | Kind::Boolean | Kind::Unknown => writer.push(path),
-        Kind::Null => writer.push("null"),
-    }
-}
-
 /// The schema a `$ref` names, when it resolves inside this document.
 ///
 /// JSON Schema draft-04 section 7 addresses a referenced schema by URI fragment, and the
@@ -668,8 +599,8 @@ fn stated_value(schema: &::serde_json::Value) -> Option<&::serde_json::Value> {
 ///
 /// Every name considered charges one step, so building a member list is covered by the same
 /// budget the rendering is: a schema declaring a wide object cannot be re-read for free.
-/// The ORDER is the caller's to settle — the sample path merges several sources through an
-/// ordered map, and the skeleton path sorts what it reads.
+/// The ORDER is the caller's to settle — [`declared_properties_of`] merges the sources a
+/// composed schema is read from through an ordered map, which is what settles it.
 fn declared_properties<'doc>(
     schema: &'doc ::serde_json::Value,
     writer: &mut Writer,
@@ -759,145 +690,6 @@ fn kind(schema: &::serde_json::Value) -> Kind {
         },
         None => Kind::Unknown,
     }
-}
-
-/// Render an object: a JSON literal whose members are the schema's declared properties,
-/// each mapped to its own path under `path`.
-///
-/// The properties are emitted in lexicographic order, so one model has ONE template
-/// however the schema document happened to be written and however a JSON map iterates. A
-/// schema that declares no properties constrains no member, so there is nothing to map and
-/// the object is rendered empty.
-fn render_object(
-    root: &::serde_json::Value,
-    schema: &::serde_json::Value,
-    path: &str,
-    indent: usize,
-    loops: usize,
-    depth: usize,
-    writer: &mut Writer,
-) -> Result<(), Exhausted> {
-    let mut properties = declared_properties(schema, writer)?;
-    // Lexicographic, so one model has ONE template however the document was written and
-    // however a JSON member map iterates.
-    properties.sort_by_key(|(name, _)| *name);
-    if properties.is_empty() {
-        return writer.push("{ }");
-    }
-
-    let inner = INDENT.repeat(indent + 1);
-    writer.push("{\n")?;
-    for (position, (name, property)) in properties.into_iter().enumerate() {
-        if position > 0 {
-            writer.push(",\n")?;
-        }
-        writer.push(&inner)?;
-        writer.push(&quoted(name))?;
-        writer.push(" : ")?;
-        render(
-            root,
-            property,
-            &member_path(path, name),
-            indent + 1,
-            loops,
-            depth + 1,
-            writer,
-        )?;
-    }
-    writer.push("\n")?;
-    writer.push(&INDENT.repeat(indent))?;
-    writer.push("}")
-}
-
-/// Render an array: a `#foreach` over the value at `path`, whose body is the element its
-/// `items` schema describes.
-///
-/// `items` may be a single schema (every element) or, in draft-04, a tuple of schemas
-/// (section 5.3.1), of which the first describes the element rendered here. The separating
-/// comma is emitted for every element but the last (`$foreach.hasNext`), so the rendered
-/// payload is valid JSON.
-fn render_array(
-    root: &::serde_json::Value,
-    schema: &::serde_json::Value,
-    path: &str,
-    indent: usize,
-    loops: usize,
-    depth: usize,
-    writer: &mut Writer,
-) -> Result<(), Exhausted> {
-    let items = declared_items(schema);
-    let element = loop_variable(loops);
-    writer.push(&format!("[#foreach({element} in {path})\n"))?;
-    writer.push(&INDENT.repeat(indent + 1))?;
-    match items {
-        Some(items) => render(root, items, &element, indent + 1, loops + 1, depth + 1, writer)?,
-        // Elements of unspecified shape are mapped by reference, one per element.
-        None => writer.push(&element)?,
-    }
-    writer.push("#if($foreach.hasNext),#end\n")?;
-    writer.push(&INDENT.repeat(indent))?;
-    writer.push("#end]")
-}
-
-/// The Velocity variable the `#foreach` at nesting level `loops` binds its element to.
-///
-/// The outermost loop binds `$elem`, the loop inside it `$elem2`, and so on: a nested loop
-/// needs its own name or it would shadow the element its parent is iterating.
-fn loop_variable(loops: usize) -> String {
-    if loops == 0 {
-        "$elem".to_string()
-    } else {
-        format!("$elem{}", loops + 1)
-    }
-}
-
-/// How the property `name` of the value at `path` is addressed in a template.
-///
-/// `$inputRoot.id` is the dotted reference Velocity resolves on a map, but it is only a
-/// reference when the name is an identifier (a letter or `_` followed by letters, digits,
-/// `_` or `-`): `$inputRoot.order id` would not parse. Every other name is addressed
-/// through the map's own `get`, which takes the name as a single-quoted Velocity string
-/// literal, with the name ESCAPED for that literal ([`escaped`]) — so the structure of the
-/// emitted template is this generator's, never a property name's.
-fn member_path(path: &str, name: &str) -> String {
-    let mut characters = name.chars();
-    let identifier = characters
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-        && characters.all(|character| {
-            character.is_ascii_alphanumeric() || character == '_' || character == '-'
-        });
-    if identifier {
-        format!("{path}.{name}")
-    } else {
-        format!("{path}.get('{}')", escaped(name))
-    }
-}
-
-/// `name`, escaped for the single-quoted Velocity literal it is embedded in.
-///
-/// A quote of either kind, a backslash and every control character is emitted in backslash
-/// form: a name carrying an apostrophe would otherwise close that literal, and one
-/// carrying a double quote or a newline would close the double-quoted JSON literal a
-/// string-typed member is rendered inside (or its line). Escaping them is what keeps the
-/// emitted template well formed whatever the stored schema names its properties.
-fn escaped(name: &str) -> String {
-    let mut escaped = String::with_capacity(name.len());
-    for character in name.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '\'' => escaped.push_str("\\'"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            control if control.is_control() => {
-                escaped.push_str(&format!("\\u{:04x}", control as u32));
-            }
-            plain => escaped.push(plain),
-        }
-    }
-    escaped
 }
 
 /// `value` as a JSON string literal, with whatever it carries escaped.
