@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDirectConnectGatewayAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDirectConnectGatewayAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDirectConnectGatewayAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +138,230 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDirectConnectGatewayAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDirectConnectGatewayAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDirectConnectGatewayAssociation"))
+        // The gateway being associated is the account's resource in the Region the
+        // request is signed for, so that Region is where it is resolved and what the
+        // association reports for it.
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateDirectConnectGatewayAssociationErrorModeled::DirectConnectServerException(
+                    DirectConnectServerException {
+                        message: Some(
+                            "the Direct Connect store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let client_error = |message: String| -> CreateDirectConnectGatewayAssociationError {
+            CreateDirectConnectGatewayAssociationErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+        let owner_account = ::engine::emulator_account_id().to_string();
+
+        // "The ID of the virtual private gateway or transit gateway" (`gatewayId`)
+        // and "The ID of the virtual private gateway" (`virtualGatewayId`) name the
+        // SAME gateway, `virtualGatewayId` being the older spelling: a request
+        // carrying both must agree, and one carrying neither names no gateway to
+        // associate.
+        let named = |value: Option<&String>| -> Option<String> {
+            value
+                .map(|id| id.trim().to_string())
+                .filter(|id| !id.is_empty())
+        };
+        let gateway_id = match (
+            named(input.gateway_id.as_ref()),
+            named(input.virtual_gateway_id.as_ref()),
+        ) {
+            (Some(gateway_id), Some(virtual_gateway_id)) if gateway_id != virtual_gateway_id => {
+                return Err(client_error(
+                    "gatewayId and virtualGatewayId must name the same gateway".to_string(),
+                ))
+            }
+            (Some(gateway_id), _) | (None, Some(gateway_id)) => gateway_id,
+            (None, None) => {
+                return Err(client_error(
+                    "Either gatewayId or virtualGatewayId must be specified".to_string(),
+                ))
+            }
+        };
+        // Which kind of gateway the identifier names decides which owner resolves it
+        // and what `GatewayType` the association reports; an identifier that names
+        // neither kind names no gateway the account could hold.
+        let Some(kind) = crate::state::ec2_network::GatewayKind::of(&gateway_id) else {
+            return Err(client_error(format!(
+                "The VirtualGateway {gateway_id} for owner {owner_account} does not exist"
+            )));
+        };
+
+        // "The Amazon VPC prefixes to advertise to the Direct Connect gateway", as the
+        // request named them. The member is the transit gateway's: "This parameter is
+        // required when you create an association to a transit gateway", whose VPCs
+        // are attachments of its own, while a virtual private gateway association
+        // advertises the blocks of the VPCs that gateway is attached to, which the
+        // caller does not choose. So a request that names prefixes for a virtual
+        // private gateway is REFUSED rather than accepted with its list discarded, and
+        // the list is bounded only where it is used.
+        let requested_prefixes: Vec<String> = input
+            .add_allowed_prefixes_to_direct_connect_gateway
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| prefix.cidr)
+            .filter(|cidr| !cidr.trim().is_empty())
+            .collect();
+        match kind {
+            crate::state::ec2_network::GatewayKind::VirtualPrivate => {
+                if !requested_prefixes.is_empty() {
+                    return Err(client_error(format!(
+                        "addAllowedPrefixesToDirectConnectGateway cannot be specified for an \
+                         association to the VirtualGateway {gateway_id}; the prefixes advertised \
+                         to a Direct Connect gateway are the CIDR blocks of the VPCs the virtual \
+                         private gateway is attached to"
+                    )));
+                }
+            }
+            crate::state::ec2_network::GatewayKind::Transit => {
+                if requested_prefixes.len()
+                    > crate::state::gateway_associations::MAX_ALLOWED_PREFIXES_PER_ASSOCIATION
+                {
+                    return Err(client_error(format!(
+                        "{} prefixes were supplied; this emulator advertises at most {} prefixes \
+                         per association",
+                        requested_prefixes.len(),
+                        crate::state::gateway_associations::MAX_ALLOWED_PREFIXES_PER_ASSOCIATION
+                    )));
+                }
+            }
+        }
+
+        // The Direct Connect gateway the association is made ON. Checked before the
+        // owner of gateways is asked anything, and the guard is dropped before that
+        // hop: no store lock is held across a call into another service.
+        {
+            let mut store = state.lock();
+            store.settle_due_transitions();
+            if !store
+                .gateways
+                .get(&input.direct_connect_gateway_id)
+                .is_some_and(|gateway| gateway.direct_connect_gateway_state != "deleted")
+            {
+                return Err(client_error(format!(
+                    "Direct Connect gateway ID {} does not exist",
+                    input.direct_connect_gateway_id
+                )));
+            }
+        }
+
+        // ASKED, never assumed: the gateway, its owner, its Region and the VPCs it
+        // attaches come from the service that owns them.
+        let Some(gateway) =
+            crate::state::ec2_network::resolve_gateway(ctx, &region, &gateway_id, kind).await
+        else {
+            return Err(client_error(format!(
+                "The {noun} {gateway_id} for owner {owner_account} does not exist",
+                noun = kind.refusal_noun()
+            )));
+        };
+
+        // "The virtual private gateway must be attached to a VPC": a gateway attached
+        // to nothing advertises no VPC prefixes, so there is no association to make.
+        let allowed_prefixes = match kind {
+            crate::state::ec2_network::GatewayKind::VirtualPrivate => {
+                if gateway.attached.vpc_ids.is_empty() {
+                    return Err(client_error(format!(
+                        "The VirtualGateway {gateway_id} is not attached to a VPC"
+                    )));
+                }
+                gateway.attached.cidrs.clone()
+            }
+            crate::state::ec2_network::GatewayKind::Transit => {
+                if requested_prefixes.is_empty() {
+                    return Err(client_error(
+                        "addAllowedPrefixesToDirectConnectGateway is required when you create an \
+                         association to a transit gateway"
+                            .to_string(),
+                    ));
+                }
+                requested_prefixes
+            }
+        };
+
+        let mut store = state.lock();
+        store.settle_due_transitions();
+
+        // The Direct Connect gateway is re-read after the hop: it may have been torn
+        // down while the owner of gateways was being asked.
+        if !store
+            .gateways
+            .get(&input.direct_connect_gateway_id)
+            .is_some_and(|stored| stored.direct_connect_gateway_state != "deleted")
+        {
+            return Err(client_error(format!(
+                "Direct Connect gateway ID {} does not exist",
+                input.direct_connect_gateway_id
+            )));
+        }
+
+        // The gateway "must not be associated with another Direct Connect gateway":
+        // one association holds it until that association has fully disassociated, so
+        // the gateway is at its ceiling of one until then.
+        if store.association_holding(&gateway.id).is_some() {
+            return Err(client_error(format!(
+                "The maximum number of Direct Connect Gateway Associations to {gateway_id} has \
+                 been reached"
+            )));
+        }
+
+        // The emulator's own memory ceiling for this store (not an AWS quota). The
+        // settle above has already removed every association the clock ended, so
+        // there is nothing further to reclaim: refuse rather than grow past it.
+        if !crate::state::ComAmazonawsDirectconnectOvertureserviceState::has_room(
+            store.gateway_associations.len(),
+        ) {
+            return Err(client_error(format!(
+                "this emulator holds at most {} Direct Connect gateway associations; delete one \
+                 before creating another",
+                crate::state::MAX_RECORDS_PER_STORE
+            )));
+        }
+
+        let association_id = store.next_association_id();
+        let association = crate::state::gateway_associations::GatewayAssociation {
+            association_id: association_id.clone(),
+            direct_connect_gateway_id: input.direct_connect_gateway_id,
+            direct_connect_gateway_owner_account: owner_account,
+            // "associating: The initial state after calling
+            // CreateDirectConnectGatewayAssociation"; "associated: ... successfully
+            // associated and ready to pass traffic" is what the clock owes from here.
+            association_state: crate::state::gateway_associations::ASSOCIATION_STATE_ASSOCIATING
+                .to_string(),
+            state_change_error: None,
+            associated_gateway_id: gateway.id,
+            associated_gateway_type: gateway.gateway_type,
+            associated_gateway_owner_account: gateway.owner_account,
+            associated_gateway_region: gateway.region,
+            allowed_prefixes,
+            due: Some(crate::state::DueTransition {
+                at: std::time::Instant::now() + crate::state::TRANSITION_DELAY,
+                to: crate::state::gateway_associations::ASSOCIATION_STATE_ASSOCIATED.to_string(),
+            }),
+        };
+
+        let output = association.output(
+            association.advertised_prefixes(Some(gateway.attached.cidrs.as_slice())),
+        );
+        store
+            .gateway_associations
+            .insert(association_id.clone(), association);
+        store.association_order.push(association_id);
+        Ok(CreateDirectConnectGatewayAssociationOutput {
+            direct_connect_gateway_association: Some(output),
+        })
     }
 }

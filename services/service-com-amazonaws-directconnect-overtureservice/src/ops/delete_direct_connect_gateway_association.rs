@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDirectConnectGatewayAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDirectConnectGatewayAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDirectConnectGatewayAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +135,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDirectConnectGatewayAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDirectConnectGatewayAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDirectConnectGatewayAssociation"))
+        // Which association is torn down is named by the request; the Region on the
+        // record is where the associated gateway's owner is asked what it attaches.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteDirectConnectGatewayAssociationErrorModeled::DirectConnectServerException(
+                    DirectConnectServerException {
+                        message: Some(
+                            "the Direct Connect store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let client_error = |message: String| -> DeleteDirectConnectGatewayAssociationError {
+            DeleteDirectConnectGatewayAssociationErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // The record is read, moved into `disassociating` and SNAPSHOT under the lock,
+        // which is then released: the store is not held while the owner of the
+        // associated gateway is asked what it attaches.
+        let association = {
+            let mut store = state.lock();
+            store.settle_due_transitions();
+
+            // "We recommend that you specify the associationID to delete the
+            // association. Alternatively, ... you can specify the virtualGatewayId and
+            // directConnectGatewayId to delete an association." Either names ONE
+            // association that still holds its gateway; a request naming neither names
+            // nothing to delete.
+            let association_id = match (
+                input.association_id.as_deref(),
+                input.direct_connect_gateway_id.as_deref(),
+                input.virtual_gateway_id.as_deref(),
+            ) {
+                (Some(association_id), _, _) => store
+                    .gateway_associations
+                    .get(association_id)
+                    .filter(|association| association.holds_its_gateway())
+                    .map(|association| association.association_id.clone())
+                    .ok_or_else(|| {
+                        client_error(format!(
+                            "Direct Connect gateway association ID {association_id} does not exist"
+                        ))
+                    })?,
+                (None, Some(gateway_id), Some(virtual_gateway_id)) => store
+                    .associations_in_order()
+                    .into_iter()
+                    .find(|association| {
+                        association.direct_connect_gateway_id == gateway_id
+                            && association.associated_gateway_id == virtual_gateway_id
+                            && association.holds_its_gateway()
+                    })
+                    .map(|association| association.association_id.clone())
+                    .ok_or_else(|| {
+                        client_error(format!(
+                            "No association exists between the Direct Connect gateway \
+                             {gateway_id} and the VirtualGateway {virtual_gateway_id}"
+                        ))
+                    })?,
+                _ => {
+                    return Err(client_error(
+                        "Either associationId, or both directConnectGatewayId and \
+                         virtualGatewayId, must be specified"
+                            .to_string(),
+                    ))
+                }
+            };
+
+            let Some(association) = store.gateway_associations.get_mut(&association_id) else {
+                return Err(
+                    DeleteDirectConnectGatewayAssociationErrorModeled::DirectConnectServerException(
+                        DirectConnectServerException {
+                            message: Some(format!(
+                                "the association {association_id} resolved a moment ago is not \
+                                 in the store any more"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+
+            // "disassociating: The initial state after calling
+            // DeleteDirectConnectGatewayAssociation"; the terminal `disassociated`, in
+            // which "traffic flow ... is stopped" and the gateway is free again, is
+            // what the clock owes from here. A delete of an association already on its
+            // way out leaves the instant it was already owed, so repeating the call
+            // cannot push that completion further away.
+            if association.association_state
+                != crate::state::gateway_associations::ASSOCIATION_STATE_DISASSOCIATING
+            {
+                association.association_state =
+                    crate::state::gateway_associations::ASSOCIATION_STATE_DISASSOCIATING
+                        .to_string();
+                association.due = Some(crate::state::DueTransition {
+                    at: std::time::Instant::now() + crate::state::TRANSITION_DELAY,
+                    to: crate::state::gateway_associations::ASSOCIATION_STATE_DISASSOCIATED
+                        .to_string(),
+                });
+            }
+            association.clone()
+        };
+
+        // The prefixes the association still advertises while it disassociates are the
+        // ones it advertised: its gateway's attached VPC blocks, as their owner
+        // reports them now.
+        let attached = if association.advertises_its_vpc_blocks() {
+            crate::state::ec2_network::attached_networks(
+                ctx,
+                &association.associated_gateway_region,
+                std::slice::from_ref(&association.associated_gateway_id),
+            )
+            .await
+            .remove(&association.associated_gateway_id)
+        } else {
+            None
+        };
+
+        Ok(DeleteDirectConnectGatewayAssociationOutput {
+            direct_connect_gateway_association: Some(association.output(
+                association
+                    .advertised_prefixes(attached.as_ref().map(|network| network.cidrs.as_slice())),
+            )),
+        })
     }
 }

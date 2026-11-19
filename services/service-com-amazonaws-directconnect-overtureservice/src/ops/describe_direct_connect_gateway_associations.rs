@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDirectConnectGatewayAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDirectConnectGatewayAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDirectConnectGatewayAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDirectConnectGatewayAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDirectConnectGatewayAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDirectConnectGatewayAssociations"))
+        // An association is global the way the Direct Connect gateway it is made on
+        // is, so this listing is not windowed by the request's Region: the Region the
+        // associated gateway sits in is a property of that gateway, reported on the
+        // record — and is where the owner of that gateway is asked what it attaches.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeDirectConnectGatewayAssociationsErrorModeled::DirectConnectServerException(
+                    DirectConnectServerException {
+                        message: Some(
+                            "the Direct Connect store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let client_error = |message: String| -> DescribeDirectConnectGatewayAssociationsError {
+            DescribeDirectConnectGatewayAssociationsErrorModeled::DirectConnectClientException(
+                DirectConnectClientException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        };
+
+        // The page is taken as a SNAPSHOT under the lock, so the store is not held
+        // while the owner of gateways is asked what each associated gateway attaches.
+        let (page_items, next_token) = {
+            let mut store = state.lock();
+            // Materialise only what the clock already made due: an association whose
+            // `associating` span has elapsed is `associated` whether or not anybody
+            // asked.
+            store.settle_due_transitions();
+
+            // "Lists the associations between your Direct Connect gateways and virtual
+            // private gateways and transit gateways", narrowed by each selector the
+            // request carries: every one of them must hold, so naming both a Direct
+            // Connect gateway and a gateway answers "the association between" the two.
+            // `virtualGatewayId` is "the ID of the virtual private gateway or transit
+            // gateway", the older spelling of `associatedGatewayId`, so both select on
+            // the associated gateway.
+            let selected: Vec<&crate::state::gateway_associations::GatewayAssociation> = store
+                .associations_in_order()
+                .into_iter()
+                .filter(|association| {
+                    input
+                        .association_id
+                        .as_deref()
+                        .is_none_or(|id| association.association_id == id)
+                        && input
+                            .direct_connect_gateway_id
+                            .as_deref()
+                            .is_none_or(|id| association.direct_connect_gateway_id == id)
+                        && input
+                            .associated_gateway_id
+                            .as_deref()
+                            .is_none_or(|id| association.associated_gateway_id == id)
+                        && input
+                            .virtual_gateway_id
+                            .as_deref()
+                            .is_none_or(|id| association.associated_gateway_id == id)
+                })
+                .collect();
+
+            let Some(page) = crate::state::paginate(
+                selected,
+                input.max_results,
+                input.next_token.as_deref(),
+                |association| association.association_id.clone(),
+            ) else {
+                let token = input.next_token.unwrap_or_default();
+                return Err(client_error(format!(
+                    "Pagination token {token} is not valid"
+                )));
+            };
+            let items: Vec<crate::state::gateway_associations::GatewayAssociation> =
+                page.items.into_iter().cloned().collect();
+            (items, page.next_token)
+        };
+
+        // What each associated gateway attaches RIGHT NOW, asked of its owner once per
+        // Region this page spans rather than once per association — so a block
+        // associated with an attached VPC after the association was made is advertised
+        // too. Nothing is written: the answer is rendered from the snapshot above and
+        // what the owner reports.
+        let mut asked: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for association in &page_items {
+            if association.advertises_its_vpc_blocks() {
+                asked
+                    .entry(association.associated_gateway_region.clone())
+                    .or_default()
+                    .push(association.associated_gateway_id.clone());
+            }
+        }
+        let mut attached: std::collections::BTreeMap<
+            (String, String),
+            crate::state::ec2_network::AttachedNetwork,
+        > = std::collections::BTreeMap::new();
+        for (region, gateway_ids) in asked {
+            for (gateway_id, network) in
+                crate::state::ec2_network::attached_networks(ctx, &region, &gateway_ids).await
+            {
+                attached.insert((region.clone(), gateway_id), network);
+            }
+        }
+
+        Ok(DescribeDirectConnectGatewayAssociationsOutput {
+            direct_connect_gateway_associations: Some(
+                page_items
+                    .iter()
+                    .map(|association| {
+                        let network = attached.get(&(
+                            association.associated_gateway_region.clone(),
+                            association.associated_gateway_id.clone(),
+                        ));
+                        association.output(
+                            association.advertised_prefixes(
+                                network.map(|network| network.cidrs.as_slice()),
+                            ),
+                        )
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

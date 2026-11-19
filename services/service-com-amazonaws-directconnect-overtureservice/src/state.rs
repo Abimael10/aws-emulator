@@ -13,6 +13,11 @@ use std::time::{Duration, Instant};
 
 use crate::ops::types::{BGPPeer, RouteFilterPrefix, Tag};
 
+/// The gateways the ACCOUNT holds, asked of the service that owns them.
+pub mod ec2_network;
+/// The associations between a Direct Connect gateway and those gateways.
+pub mod gateway_associations;
+
 /// The Region a request names in its SigV4 credential scope when it carries no
 /// `Authorization` header at all. Matches the Region the emulator's own generated
 /// shared config names (`emulator_server`'s `[default] region = us-east-1`).
@@ -519,6 +524,15 @@ pub struct ComAmazonawsDirectconnectOvertureserviceState {
     /// location. A `BTreeMap`, so the catalog is answered in a stable order
     /// (by location code) rather than a per-process-random one.
     pub locations: BTreeMap<String, LocationRecord>,
+    /// Stored associations between a Direct Connect gateway and a virtual private
+    /// gateway or transit gateway, keyed by `associationId`.
+    ///
+    /// An association id is a UUID rather than a monotonic suffix, so key order is
+    /// NOT creation order here: [`Self::association_order`] carries that, and
+    /// `DescribeDirectConnectGatewayAssociations` answers through it.
+    pub gateway_associations: BTreeMap<String, gateway_associations::GatewayAssociation>,
+    /// The keys of [`Self::gateway_associations`] in creation order.
+    pub association_order: Vec<String>,
 }
 
 impl Default for ComAmazonawsDirectconnectOvertureserviceState {
@@ -533,6 +547,8 @@ impl Default for ComAmazonawsDirectconnectOvertureserviceState {
             gateway_order: Vec::new(),
             id_counter: 0,
             locations: built_in_location_catalog(),
+            gateway_associations: BTreeMap::new(),
+            association_order: Vec::new(),
         }
     }
 }
@@ -549,10 +565,17 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
     ///
     /// A Direct Connect gateway id is not one of the `dxcon-`/`dxvif-` prefixed
     /// ids: AWS hands out a version-4 UUID (`DirectConnectGatewayId` is an opaque
-    /// string), so the minted id has that shape. The low 12 hex digits ARE the
-    /// monotonic counter, so every minted id is unique within a run, and the rest
-    /// is derived from it, so it is reproducible.
+    /// string), so the minted id has that shape.
     pub fn next_gateway_id(&mut self) -> String {
+        self.next_uuid()
+    }
+
+    /// Mint the next opaque version-4 UUID this service hands a resource out under.
+    ///
+    /// The low 12 hex digits ARE the monotonic counter, so every minted id is unique
+    /// within a run, and the rest is derived from it, so it is reproducible. ONE
+    /// minter, so a gateway id and an association id can never collide.
+    pub fn next_uuid(&mut self) -> String {
         self.id_counter += 1;
         let seed = fnv1a64(&self.id_counter.to_be_bytes());
         format!(
@@ -646,6 +669,7 @@ impl ComAmazonawsDirectconnectOvertureserviceState {
                 }
             }
         }
+        self.settle_due_associations();
     }
 
     /// Reclaim the records the clock has already torn down.

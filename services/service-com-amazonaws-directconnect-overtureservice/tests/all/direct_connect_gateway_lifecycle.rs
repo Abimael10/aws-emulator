@@ -16,6 +16,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
+use service_com_amazonaws_directconnect_overtureservice::state::gateway_associations::MAX_ALLOWED_PREFIXES_PER_ASSOCIATION;
 use service_com_amazonaws_directconnect_overtureservice::state::{
     DEFAULT_AMAZON_SIDE_ASN, MAX_RESULT_SET_SIZE, PRIVATE_AMAZON_SIDE_ASN_RANGES,
 };
@@ -610,4 +611,202 @@ async fn a_private_virtual_interface_terminates_on_a_stored_gateway() {
             error_code(&response)
         );
     }
+}
+
+/// The associations `DescribeDirectConnectGatewayAssociations` answers for `body`.
+async fn associations(dx: &Emulator, case: &str, body: Value) -> Vec<Value> {
+    let (status, response) = dx
+        .call("DescribeDirectConnectGatewayAssociations", body)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the describe to be served, got {status} with {response}"
+    );
+    response["directConnectGatewayAssociations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Rule: the gateway a Direct Connect gateway association is made on is a resource of
+// the service that OWNS virtual private gateways and transit gateways, resolved there
+// before anything is stored. So Direct Connect alone refuses a request that names no
+// Direct Connect gateway, names no gateway to associate, names an identifier that is
+// no gateway identifier at all, or names more prefixes than this emulator advertises
+// per association — and with no owner of gateways on this engine to ask, every
+// gateway identifier resolves to nothing, which is fail-closed: nothing is stored and
+// no association is reported.
+//
+// The ACCEPTED side needs that owner beside this service on one engine, so it is
+// driven end to end in
+// `core/router/tests/all/direct_connect_gateway_association_network.rs`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_association_naming_no_gateway_the_account_holds_is_refused_and_stores_nothing() {
+    let dx = Emulator::new();
+    let gateway_id = gateway(&dx, "association-refusals").await;
+    // One prefix past the ceiling this emulator advertises per association.
+    let too_many: Vec<Value> = (0..=MAX_ALLOWED_PREFIXES_PER_ASSOCIATION)
+        .map(|n| json!({"cidr": format!("10.{}.{}.0/24", n / 256, n % 256)}))
+        .collect();
+
+    // (case, the request body, the text the refusal must name)
+    let rows: Vec<(String, Value, String)> = vec![
+        (
+            "a Direct Connect gateway id naming nothing".to_string(),
+            json!({
+                "directConnectGatewayId": "00000000-0000-4000-8000-000000000000",
+                "gatewayId": "vgw-0123456789abcdef0",
+            }),
+            "00000000-0000-4000-8000-000000000000".to_string(),
+        ),
+        (
+            "no gateway to associate at all".to_string(),
+            json!({"directConnectGatewayId": &gateway_id}),
+            "virtualGatewayId".to_string(),
+        ),
+        (
+            "gatewayId and virtualGatewayId naming different gateways".to_string(),
+            json!({
+                "directConnectGatewayId": &gateway_id,
+                "gatewayId": "vgw-0123456789abcdef0",
+                "virtualGatewayId": "vgw-0f1e2d3c4b5a69780",
+            }),
+            "virtualGatewayId".to_string(),
+        ),
+        (
+            "an identifier that is no gateway identifier".to_string(),
+            json!({"directConnectGatewayId": &gateway_id, "gatewayId": "potato"}),
+            "potato".to_string(),
+        ),
+        (
+            "a virtual private gateway no owner answers for".to_string(),
+            json!({"directConnectGatewayId": &gateway_id, "gatewayId": "vgw-0123456789abcdef0"}),
+            "vgw-0123456789abcdef0".to_string(),
+        ),
+        (
+            "a transit gateway no owner answers for".to_string(),
+            json!({
+                "directConnectGatewayId": &gateway_id,
+                "gatewayId": "tgw-0f1e2d3c4b5a69780",
+                "addAllowedPrefixesToDirectConnectGateway": [{"cidr": "10.0.0.0/16"}],
+            }),
+            "tgw-0f1e2d3c4b5a69780".to_string(),
+        ),
+        (
+            "one prefix past the ceiling".to_string(),
+            json!({
+                "directConnectGatewayId": &gateway_id,
+                "gatewayId": "tgw-0f1e2d3c4b5a69780",
+                "addAllowedPrefixesToDirectConnectGateway": too_many,
+            }),
+            MAX_ALLOWED_PREFIXES_PER_ASSOCIATION.to_string(),
+        ),
+        (
+            "prefixes named for a virtual private gateway, whose prefixes are its \
+             attached VPCs' blocks"
+                .to_string(),
+            json!({
+                "directConnectGatewayId": &gateway_id,
+                "gatewayId": "vgw-0123456789abcdef0",
+                "addAllowedPrefixesToDirectConnectGateway": [{"cidr": "10.0.0.0/16"}],
+            }),
+            "addAllowedPrefixesToDirectConnectGateway".to_string(),
+        ),
+    ];
+
+    for (case, body, named) in &rows {
+        let (status, response) = dx
+            .call("CreateDirectConnectGatewayAssociation", body.clone())
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a refusal, got {status} with {response}"
+        );
+        assert!(
+            error_code(&response).contains("DirectConnectClientException"),
+            "case {case:?}: expected DirectConnectClientException, got {:?}",
+            error_code(&response)
+        );
+        let message = response["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains(named.as_str()),
+            "case {case:?}: expected the refusal to name {named:?}, got {response}"
+        );
+        // A refused create stores nothing, so no association is reported.
+        let stored = associations(&dx, case, json!({})).await;
+        assert!(
+            stored.is_empty(),
+            "case {case:?}: a refused create must store no association, got {stored:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delete_that_names_no_stored_association_is_refused() {
+    let dx = Emulator::new();
+    let gateway_id = gateway(&dx, "delete-refusals").await;
+
+    // (case, the request body)
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "an associationId naming nothing",
+            json!({"associationId": "00000000-0000-4000-8000-000000000000"}),
+            ),
+        (
+            "a Direct Connect gateway and a gateway with no association between them",
+            json!({
+                "directConnectGatewayId": &gateway_id,
+                "virtualGatewayId": "vgw-0123456789abcdef0",
+            }),
+        ),
+        (
+            "neither an associationId nor both gateway ids",
+            json!({"directConnectGatewayId": &gateway_id}),
+        ),
+        ("nothing at all", json!({})),
+    ];
+
+    for (case, body) in &rows {
+        let (status, response) = dx
+            .call("DeleteDirectConnectGatewayAssociation", body.clone())
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a refusal, got {status} with {response}"
+        );
+        assert!(
+            error_code(&response).contains("DirectConnectClientException"),
+            "case {case:?}: expected DirectConnectClientException, got {:?}",
+            error_code(&response)
+        );
+    }
+
+    // And a describe of a store holding no association is an empty page, not a
+    // refusal; a pagination token naming nothing in it IS a refusal.
+    for body in [
+        json!({}),
+        json!({"directConnectGatewayId": &gateway_id}),
+        json!({"virtualGatewayId": "vgw-0123456789abcdef0"}),
+        json!({"associationId": "00000000-0000-4000-8000-000000000000"}),
+    ] {
+        let stored = associations(&dx, "an empty store", body.clone()).await;
+        assert!(
+            stored.is_empty(),
+            "case {body:?}: expected an empty page, got {stored:?}"
+        );
+    }
+    let (status, response) = dx
+        .call(
+            "DescribeDirectConnectGatewayAssociations",
+            json!({"nextToken": "00000000-0000-4000-8000-000000000000"}),
+        )
+        .await;
+    assert_eq!(
+        status, 400,
+        "case \"a pagination token naming nothing\": expected a refusal, got {status} with \
+         {response}"
+    );
 }

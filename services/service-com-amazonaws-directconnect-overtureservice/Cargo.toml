@@ -21,6 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for EC2, driven over the in-process callback into this same
+# emulator: a virtual private gateway, a transit gateway and the VPCs a gateway
+# is attached to are EC2's resources, so `src/state/ec2_network.rs` asks EC2
+# what the account holds rather than deciding it here. Only the generated client
+# is needed — the emulator supplies the transport — and `behavior-version-latest`
+# is what `BehaviorVersion::latest()` in that module is gated behind.
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["behavior-version-latest"] }
+# `arn::region_label`: the ONE reading of a caller-supplied Region as a Region
+# LABEL, which is what the endpoint the EC2 call above is made at is built from.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
