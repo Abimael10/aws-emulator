@@ -9,7 +9,7 @@
 //! value taken from one call.
 //!
 //! * The NAMED-RESOURCE families whose create is refused "by name" — a policy, a
-//!   mitigation action — word it
+//!   mitigation action, a scheduled audit — word it
 //!   `<Family> cannot be created - name already exists (name=<name>)`
 //!   ([`name_already_exists`]).
 //! * The ROLE ALIAS family states the collision with the family's own two-word noun and
@@ -162,6 +162,20 @@ pub fn existing_certificate_message(certificate_id: &str) -> String {
 /// own noun.
 pub fn existing_mitigation_action_message(action_name: &str) -> String {
     name_already_exists("MitigationAction", action_name)
+}
+
+/// How this service refuses a `CreateScheduledAudit` under a name the account already
+/// holds a scheduled audit under.
+///
+/// The nearest create this service already refuses by name is the other DEVICE DEFENDER
+/// named resource's ([`existing_mitigation_action_message`]), so a scheduled audit's
+/// collision is stated in that same by-name form with this family's own noun — the
+/// resource's own spelling of itself, as that form takes it. The family's NOT-FOUND
+/// sentence is in the audit subsystem's voice instead
+/// ([`super::missing_scheduled_audit_message`]), exactly as the mitigation-action family's
+/// two sentences are.
+pub fn existing_scheduled_audit_message(scheduled_audit_name: &str) -> String {
+    name_already_exists("ScheduledAudit", scheduled_audit_name)
 }
 
 /// How this service refuses a `CreatePackage` under a name the catalog already holds.

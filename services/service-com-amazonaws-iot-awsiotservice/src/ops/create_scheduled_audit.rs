@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateScheduledAudit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateScheduledAudit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateScheduledAudit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a scheduled audit that is run at a specified time interval.
+//!
+//! The name is the schedule's identity, so a name the account already holds a scheduled
+//! audit under is a conflict ([`crate::state::existing_scheduled_audit_message`]) and
+//! nothing is written. Which DAY the schedule must name follows from its frequency, and
+//! which CHECKS it may target is the account's own audit configuration — the same rule an
+//! audit a caller starts on demand is held to ("Checks must be enabled for your account")
+//! — and both are read before anything is written, so a refused request records no
+//! schedule.
+//!
+//! What is persisted is the record `DescribeScheduledAudit` reports
+//! ([`crate::state::ScheduledAudit`]), and the ARN this call answers is the one on that
+//! record, so the create and the read cannot drift.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +129,19 @@ impl From<CreateScheduledAuditErrorModeled> for CreateScheduledAuditError {
     }
 }
 
+/// Refuse this request as invalid, with the operation's modelled `InvalidRequestException`
+/// ("The request is not valid", HTTP 400).
+///
+/// The message names the member and the rule it broke; the rules themselves live with the
+/// schedule the request asked for ([`crate::state::ScheduleRefusal`]) and with the audit
+/// the checks would be performed by ([`crate::state::AuditTaskRefusal`]).
+fn invalid_request(message: String) -> CreateScheduledAuditError {
+    CreateScheduledAuditErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `CreateScheduledAudit` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +178,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateScheduledAudit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateScheduledAuditErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateScheduledAudit"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateScheduledAuditErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // Which DAY the schedule must name follows from its frequency, so the pair is read
+        // first: it is a property of the request alone, whatever the account holds.
+        if let Some(refusal) = crate::state::schedule_refusal(
+            &input.frequency,
+            input.day_of_month.as_deref(),
+            input.day_of_week.as_deref(),
+        ) {
+            return Err(invalid_request(refusal.message()));
+        }
+
+        // `Tag$Key` is `@required` and keys a resource's tag set, so the last value given
+        // for a key is the one the resource carries, and how MANY tags one request may
+        // carry is bounded for the reason every other store's tag ceiling exists.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_SCHEDULED_AUDIT_TAGS {
+            return Err(invalid_request(format!(
+                "a scheduled audit may carry at most {} tags; this request carries {}",
+                crate::state::MAX_SCHEDULED_AUDIT_TAGS,
+                requested_tags.len()
+            )));
+        }
+        let tags: ::std::collections::BTreeMap<String, Option<String>> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let mut store = state.lock();
+
+        // "Checks must be enabled for your account": which checks a scheduled audit may
+        // perform is the account's own audit configuration, read through the one rule
+        // every audit of this account is held to.
+        crate::state::targetable_checks(&store, &input.target_check_names)
+            .map_err(|refusal| invalid_request(refusal.message()))?;
+
+        // The name is the schedule's identity, so a name already taken is a conflict:
+        // `ResourceAlreadyExistsException` (HTTP 409), worded with this family's own
+        // already-exists sentence rather than one phrased here. Like the other families
+        // whose 409 reports no identity members, it sends the message alone: a scheduled
+        // audit has no id of its own beside the name the request already carried.
+        if let Some(existing) = store.scheduled_audits.get(&input.scheduled_audit_name) {
+            return Err(
+                CreateScheduledAuditErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(crate::state::existing_scheduled_audit_message(
+                            &existing.scheduled_audit_name,
+                        )),
+                        resource_id: None,
+                        resource_arn: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Past the ceiling nothing is written and the create is refused with the modelled
+        // `LimitExceededException` ("A limit has been exceeded", HTTP 410), rather than
+        // growing the store without bound.
+        if store.scheduled_audits.len() >= crate::state::MAX_SCHEDULED_AUDITS {
+            return Err(CreateScheduledAuditErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} scheduled audits is already reached",
+                        crate::state::MAX_SCHEDULED_AUDITS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let scheduled_audit_arn =
+            crate::state::scheduled_audit_arn(&region, &input.scheduled_audit_name);
+        let scheduled_audit = crate::state::ScheduledAudit::new(
+            input.scheduled_audit_name,
+            scheduled_audit_arn,
+            input.frequency,
+            input.day_of_month,
+            input.day_of_week,
+            input.target_check_names,
+            tags,
+        );
+
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what the next `DescribeScheduledAudit` reads are one
+        // value, not two that could drift.
+        let output = CreateScheduledAuditOutput {
+            scheduled_audit_arn: Some(scheduled_audit.scheduled_audit_arn.clone()),
+        };
+        store.scheduled_audits.insert(
+            scheduled_audit.scheduled_audit_name.clone(),
+            scheduled_audit,
+        );
+        Ok(output)
     }
 }

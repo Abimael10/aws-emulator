@@ -49,6 +49,15 @@ use smithy_server_runtime::MultiServiceRouter;
 #[path = "on_demand_audit_task/mitigation_actions.rs"]
 mod mitigation_actions;
 
+/// `CreateScheduledAudit` and the `DescribeScheduledAudit` reader that proves what it
+/// persisted: the SCHEDULE an audit of this account runs on, which is the third half of
+/// this crate's Device Defender coverage — a scheduled audit targets the same checks an
+/// on-demand audit does, and may target only the ones the account enabled, so the two are
+/// read against one emulator's rules. The `#[path]` keeps it a child of THIS suite, for
+/// the reason the declaration above states.
+#[path = "on_demand_audit_task/scheduled_audits.rs"]
+mod scheduled_audits;
+
 /// The region every request in this suite is signed for. An audit is account-wide, so no
 /// assertion depends on it.
 const REGION: &str = "eu-west-2";

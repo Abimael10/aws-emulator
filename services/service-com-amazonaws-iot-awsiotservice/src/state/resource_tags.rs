@@ -83,6 +83,9 @@ const CA_CERTIFICATE_TYPE: &str = "cacert";
 const CERTIFICATE_PROVIDER_TYPE: &str = "certificateprovider";
 /// The resource-type token of a topic rule's ARN, as [`super::topic_rule_arn`] mints it.
 const TOPIC_RULE_TYPE: &str = "rule";
+/// The resource-type token of a scheduled audit's ARN, as
+/// [`super::scheduled_audit_arn`] mints it.
+const SCHEDULED_AUDIT_TYPE: &str = "scheduledaudit";
 
 /// Which resource of this account a `resourceArn` names, for the operations that address
 /// a resource by ARN alone.
@@ -124,6 +127,8 @@ pub enum TaggedResource {
     CertificateProvider(String),
     /// `rule/<ruleName>`: a topic rule.
     TopicRule(String),
+    /// `scheduledaudit/<scheduledAuditName>`: a Device Defender scheduled audit.
+    ScheduledAudit(String),
 }
 
 /// Which resource `resource_arn` names, or the sentence a request naming no resource of
@@ -185,6 +190,7 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Result<TaggedResource, Strin
             Ok(TaggedResource::CertificateProvider(identifier.to_string()))
         }
         TOPIC_RULE_TYPE => Ok(TaggedResource::TopicRule(identifier.to_string())),
+        SCHEDULED_AUDIT_TYPE => Ok(TaggedResource::ScheduledAudit(identifier.to_string())),
         _ => Err(untaggable_resource_message(resource_arn)),
     }
 }
@@ -280,6 +286,10 @@ impl TaggedResource {
                 .topic_rules
                 .get_mut(name)
                 .map(|rule| ResourceTagSet::Optional(&mut rule.tags)),
+            Self::ScheduledAudit(name) => store
+                .scheduled_audits
+                .get_mut(name)
+                .map(|scheduled_audit| ResourceTagSet::Optional(&mut scheduled_audit.tags)),
         }
     }
 
@@ -313,6 +323,7 @@ impl TaggedResource {
             Self::CaCertificate(id) => super::missing_certificate_message(id),
             Self::CertificateProvider(name) => super::missing_certificate_provider_message(name),
             Self::TopicRule(name) => missing_topic_rule_message(name),
+            Self::ScheduledAudit(name) => super::missing_scheduled_audit_message(name),
         }
     }
 }
@@ -492,6 +503,10 @@ mod tests {
             (
                 crate::state::topic_rule_arn(region, "temperature"),
                 TaggedResource::TopicRule("temperature".to_string()),
+            ),
+            (
+                crate::state::scheduled_audit_arn(region, "nightly"),
+                TaggedResource::ScheduledAudit("nightly".to_string()),
             ),
         ];
         for (arn, expected) in cases {

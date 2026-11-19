@@ -1120,6 +1120,17 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// [`mitigation_actions::MAX_MITIGATION_ACTIONS`] is the ceiling
     /// `CreateMitigationAction` refuses past.
     pub mitigation_actions: BTreeMap<String, RegisteredMitigationAction>,
+    /// Every DEVICE DEFENDER SCHEDULED AUDIT that exists, keyed by `scheduledAuditName`.
+    ///
+    /// The name is the schedule's identity — the model binds it as the `@httpLabel` of
+    /// `/audit/scheduledaudits/{scheduledAuditName}` on every single-audit operation — so
+    /// a `BTreeMap` keyed by name is the store itself, ordered for the same reason the
+    /// mitigation actions are: `ListScheduledAudits` is `@paginated`.
+    ///
+    /// A caller grows this store, so it is bounded:
+    /// [`scheduled_audits::MAX_SCHEDULED_AUDITS`] is the ceiling `CreateScheduledAudit`
+    /// refuses past.
+    pub scheduled_audits: BTreeMap<String, ScheduledAudit>,
     /// The AWS-MANAGED JOB TEMPLATE catalog: the published templates a job can be
     /// created from, keyed by `templateName`.
     ///
@@ -3375,6 +3386,18 @@ pub use audit_tasks::{
     AUDIT_TASK_IN_PROGRESS, MAX_AUDIT_TASKS, ON_DEMAND_AUDIT_TASK_TYPE,
 };
 
+// What a DEVICE DEFENDER SCHEDULED AUDIT is — the record one holds, the schedule a
+// frequency demands and what a reader of one reports — lives in
+// `state/scheduled_audits.rs`, beside the audit configuration that decides which checks
+// one may target and the audit tasks a run of one amounts to. Its names are re-exported
+// here so a handler reaches them as `crate::state::<name>`.
+pub mod scheduled_audits;
+pub use scheduled_audits::{
+    missing_scheduled_audit_message, schedule_refusal, scheduled_audit_arn, ScheduleRefusal,
+    ScheduledAudit, AUDIT_FREQUENCY_BIWEEKLY, AUDIT_FREQUENCY_DAILY, AUDIT_FREQUENCY_MONTHLY,
+    AUDIT_FREQUENCY_WEEKLY, MAX_SCHEDULED_AUDITS, MAX_SCHEDULED_AUDIT_TAGS,
+};
+
 // How a request that named a resource this service does not hold is REFUSED — the fixed
 // sentence each resource family states such a miss with — lives in `state/not_found.rs`,
 // beside the store accessor for the same reason the rules engine does. Its names are
@@ -3398,8 +3421,8 @@ pub use already_exists::{
     existing_certificate_message, existing_certificate_provider_message, existing_command_message,
     existing_job_message, existing_job_template_message, existing_mitigation_action_message,
     existing_package_message, existing_policy_message, existing_role_alias_message,
-    existing_thing_group_message, existing_thing_message, existing_thing_type_message,
-    existing_topic_rule_message,
+    existing_scheduled_audit_message, existing_thing_group_message, existing_thing_message,
+    existing_thing_type_message, existing_topic_rule_message,
 };
 
 // What an AWS-MANAGED JOB TEMPLATE is — the published catalog `ListManagedJobTemplates`
