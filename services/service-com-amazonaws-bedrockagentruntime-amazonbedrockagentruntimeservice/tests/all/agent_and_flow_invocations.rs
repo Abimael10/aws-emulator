@@ -70,6 +70,29 @@ const FLOW_ROLE: &str = "arn:aws:iam::000000000000:role/service-role/AmazonBedro
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT: &str = "000000000000";
 
+/// The `FlowStatus` an invocable flow stands in, which is also the status an invocation has
+/// to leave it in (`smithy_query(query="shape",shape="FlowStatus")` -> Failed, Prepared,
+/// Preparing, NotPrepared).
+const PREPARED: &str = "Prepared";
+
+/// The working copy of a flow, as a routing configuration names the version an alias routes
+/// to (`DraftVersion` is `^DRAFT$`); every other value it may name is a `NumericalVersion`.
+const DRAFT_VERSION: &str = "DRAFT";
+
+/// The one member of `FlowResponseStream` that ends a run
+/// (`smithy_query(query="shape",shape="FlowResponseStream")`).
+const COMPLETION_EVENT: &str = "flowCompletionEvent";
+
+/// See [`COMPLETION_EVENT`]: the member one value leaving the flow travels under.
+const OUTPUT_EVENT: &str = "flowOutputEvent";
+
+/// See [`COMPLETION_EVENT`]: the member one trace of the run travels under.
+const TRACE_EVENT: &str = "flowTraceEvent";
+
+/// See [`COMPLETION_EVENT`]: the member a failure of something the run depended on travels
+/// under.
+const DEPENDENCY_FAILED_EVENT: &str = "dependencyFailedException";
+
 /// One frame of an event-stream body, read the way an SDK's decoder reads it.
 pub(crate) struct Frame {
     /// `:message-type`: `event` for a data event, `exception` for an in-band modelled
@@ -226,13 +249,26 @@ impl Emulator {
     /// Create an alias on `flow_id` routing to `flow_version`, and answer its
     /// `(aliasId, aliasArn)`.
     async fn create_flow_alias(&self, case: &str, flow_id: &str, flow_version: &str) -> (String, String) {
+        self.create_named_flow_alias(case, flow_id, "probe-alias", flow_version)
+            .await
+    }
+
+    /// The same, under a name the caller chooses: one flow holds at most one alias of a
+    /// given name, so a flow carrying several aliases names each of them.
+    async fn create_named_flow_alias(
+        &self,
+        case: &str,
+        flow_id: &str,
+        name: &str,
+        flow_version: &str,
+    ) -> (String, String) {
         let reply = self
             .bedrock(
                 ACCOUNT_KEY,
                 "POST",
                 &format!("/flows/{flow_id}/aliases/"),
                 Some(json!({
-                    "name": "probe-alias",
+                    "name": name,
                     "routingConfiguration": [{ "flowVersion": flow_version }],
                 })),
             )
@@ -248,6 +284,77 @@ impl Emulator {
             created["id"].as_str().expect("a minted aliasId").to_string(),
             created["arn"].as_str().expect("a minted alias ARN").to_string(),
         )
+    }
+
+    /// Publish the prepared draft of `flow_id` as a numbered version through the build-time
+    /// plane's own `CreateFlowVersion` (`POST /flows/{flowIdentifier}/versions`), and answer
+    /// the `NumericalVersion` it cut.
+    async fn create_flow_version(&self, case: &str, flow_id: &str) -> String {
+        let reply = self
+            .bedrock(
+                ACCOUNT_KEY,
+                "POST",
+                &format!("/flows/{flow_id}/versions"),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(
+            reply.status, 201,
+            "case {case}: CreateFlowVersion must answer 201, got {} {:?}",
+            reply.status,
+            reply.json(case)
+        );
+        reply.json(case)["version"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case}: CreateFlowVersion answered no version: {:?}",
+                    reply.json(case)
+                )
+            })
+            .to_string()
+    }
+
+    /// Move the DRAFT of `flow_id` to `definition` through the build-time plane's own
+    /// `UpdateFlow` (`PUT /flows/{flowIdentifier}/`), which that operation documents as
+    /// returning the flow to `NotPrepared`.
+    async fn update_flow(&self, case: &str, flow_id: &str, name: &str, definition: Value) {
+        let reply = self
+            .bedrock(
+                ACCOUNT_KEY,
+                "PUT",
+                &format!("/flows/{flow_id}/"),
+                Some(json!({
+                    "name": name,
+                    "executionRoleArn": FLOW_ROLE,
+                    "definition": definition,
+                })),
+            )
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case}: UpdateFlow must answer 200, got {} {:?}",
+            reply.status,
+            reply.json(case)
+        );
+    }
+
+    /// The `status` the build-time plane reports for `flow_id` through its own `GetFlow`,
+    /// which is where a flow's status is read from.
+    async fn flow_status(&self, case: &str, flow_id: &str) -> String {
+        let reply = self
+            .bedrock(ACCOUNT_KEY, "GET", &format!("/flows/{flow_id}/"), None)
+            .await;
+        assert_eq!(
+            reply.status, 200,
+            "case {case}: GetFlow must answer 200, got {} {:?}",
+            reply.status,
+            reply.json(case)
+        );
+        reply.json(case)["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
     }
 }
 
@@ -1597,4 +1704,265 @@ async fn an_identifier_naming_another_place_runs_no_flow() {
 /// `:` and `/`, which would otherwise split the path segment.
 fn label(identifier: &str) -> String {
     identifier.replace(':', "%3A").replace('/', "%2F")
+}
+
+/// RULE: a flow invocation is served by the service whose own model binds the route, whatever
+/// signing name that service's family shares, and it runs the definition the version its
+/// alias routes to PACKAGES — so an alias on a published numbered version delivers what that
+/// version packaged even once the draft has moved on. Each invocation answers HTTP 200
+/// `application/vnd.amazon.eventstream` reporting the execution it ran in the modelled
+/// `executionId` header, and the stream carries one `flowOutputEvent` per output node the
+/// input reached and exactly one `flowCompletionEvent` as its LAST frame, with
+/// `flowTraceEvent`s only when the request asked for the trace. Running a flow is not a
+/// change to it: the flow's own status is where the invocations found it.
+///
+/// The rows differ along what the rule generalises over: what the alias routes to (a cut taken
+/// before the draft moved on, a cut taken after it, the draft itself) and with it the shape of
+/// the definition that version packages (one output node, two), the form of the document the
+/// invocation carries (an object, a nested object, a bare string, a number), whether the
+/// request asks for the trace, and whether the input addresses a node the packaged definition
+/// holds.
+#[tokio::test]
+async fn an_alias_on_a_published_version_runs_the_version_it_packages() {
+    let emulator = Emulator::new();
+    let name = "published-flow";
+
+    // ONE flow whose draft MOVES between two cuts: the first version packages the passthrough
+    // definition, and the draft the second is cut from fans the same input out to two output
+    // nodes. So the three aliases below route to three different packaged definitions, and an
+    // invocation that walked the live draft rather than the version its alias names would
+    // deliver the wrong output nodes.
+    let (flow, _) = emulator.create_flow(name, passthrough_definition()).await;
+    emulator.prepare_flow("the first cut", &flow).await;
+    let first = emulator.create_flow_version("the first cut", &flow).await;
+    // `UpdateFlow` returns the flow to `NotPrepared`, so the moved draft is prepared again
+    // before it is cut; the version already cut keeps what it packaged.
+    emulator
+        .update_flow("the draft moving on", &flow, name, fan_out_definition())
+        .await;
+    emulator.prepare_flow("the draft moving on", &flow).await;
+    let later = emulator.create_flow_version("a later cut", &flow).await;
+    for version in [&first, &later] {
+        assert!(
+            !version.is_empty() && version.chars().all(|digit| digit.is_ascii_digit()),
+            "setup: expected a NumericalVersion, got {version:?}"
+        );
+    }
+    assert_ne!(first, later, "setup: two cuts of one flow are two versions");
+    assert_eq!(
+        emulator.flow_status("setup", &flow).await,
+        PREPARED,
+        "setup: the flow must stand {PREPARED} before it is invoked"
+    );
+
+    // (what the alias routes to, the version it names, the output nodes an invocation through
+    // it reaches, in the order the stream reports them)
+    let routes: Vec<(&str, &str, Vec<&str>)> = vec![
+        (
+            "a cut taken before the draft moved on",
+            first.as_str(),
+            vec!["FlowOutput"],
+        ),
+        (
+            "a cut taken after the draft moved on",
+            later.as_str(),
+            vec!["LeftOutput", "RightOutput"],
+        ),
+        (
+            "the draft itself",
+            DRAFT_VERSION,
+            vec!["LeftOutput", "RightOutput"],
+        ),
+    ];
+
+    // The `Document` forms one invocation may carry, which the run passes through unchanged.
+    let documents = [
+        json!({ "data": "the pump is serviced every 90 days" }),
+        json!({ "data": { "left": [1, 2, 3], "right": null } }),
+        json!("a bare string"),
+        json!(7),
+    ];
+
+    // Every execution the invocations below ran as: each names none, so each is one of this
+    // service's own minting and no two are the same.
+    let mut executions: Vec<String> = Vec::new();
+
+    for (routed_case, routed, outputs) in routes {
+        let (alias, _) = emulator
+            .create_named_flow_alias(routed_case, &flow, &format!("routes-to-{routed}"), routed)
+            .await;
+
+        for (document_index, document) in documents.iter().enumerate() {
+            for traced in [false, true] {
+                let case = format!(
+                    "an alias routing to {routed_case}, document {document_index}, \
+                     enableTrace {traced}"
+                );
+                let case = case.as_str();
+                let mut body = flow_request("FlowInput", document.clone());
+                if traced {
+                    body["enableTrace"] = json!(true);
+                }
+                let reply = emulator.invoke_flow(&flow, &alias, body).await;
+                assert_eq!(
+                    reply.status,
+                    200,
+                    "case {case:?}: expected 200, got {} {:?}",
+                    reply.status,
+                    String::from_utf8_lossy(&reply.body)
+                );
+                assert_eq!(
+                    reply.content_type, EVENT_STREAM,
+                    "case {case:?}: expected an event-stream body, got {:?}",
+                    reply.content_type
+                );
+                let reported = reply.header(EXECUTION_ID_HEADER);
+                assert!(
+                    is_flow_execution_id(&reported),
+                    "case {case:?}: expected a FlowExecutionId in {EXECUTION_ID_HEADER}, got \
+                     {reported:?}"
+                );
+                executions.push(reported);
+
+                let frames = decode_frames(case, &reply.body);
+                let names = frame_names(&frames);
+                // The run delivered: one output event per output node of the definition the
+                // alias's own version packages, then the completion — whether or not the
+                // trace was asked for.
+                let delivered: Vec<&str> = names
+                    .iter()
+                    .copied()
+                    .filter(|name| *name != TRACE_EVENT)
+                    .collect();
+                let mut expected: Vec<&str> = vec![OUTPUT_EVENT; outputs.len()];
+                expected.push(COMPLETION_EVENT);
+                assert_eq!(
+                    delivered, expected,
+                    "case {case:?}: expected one output event per output node of the packaged \
+                     definition, then the completion, got {names:?}"
+                );
+                assert_eq!(
+                    names.last(),
+                    Some(&COMPLETION_EVENT),
+                    "case {case:?}: the completion event is the LAST frame, got {names:?}"
+                );
+                assert_eq!(
+                    names.iter().filter(|name| **name == COMPLETION_EVENT).count(),
+                    1,
+                    "case {case:?}: exactly one completion event, got {names:?}"
+                );
+                // The trace is served only to a request that asked for it, and every trace of
+                // a run arrives before the run is reported complete.
+                let traces = names.iter().filter(|name| **name == TRACE_EVENT).count();
+                assert_eq!(
+                    traces,
+                    match traced {
+                        true => 1 + outputs.len(),
+                        false => 0,
+                    },
+                    "case {case:?}: expected the traces of the run the request asked for, got \
+                     {names:?}"
+                );
+                let completed_at = names
+                    .iter()
+                    .position(|name| *name == COMPLETION_EVENT)
+                    .unwrap_or_default();
+                assert!(
+                    names
+                        .iter()
+                        .enumerate()
+                        .all(|(at, name)| *name != TRACE_EVENT || at < completed_at),
+                    "case {case:?}: every trace arrives before the completion, got {names:?}"
+                );
+
+                for (frame, node) in frames
+                    .iter()
+                    .filter(|frame| frame.name == OUTPUT_EVENT)
+                    .zip(&outputs)
+                {
+                    assert_eq!(
+                        frame.payload["nodeName"].as_str(),
+                        Some(*node),
+                        "case {case:?}: expected the output to name {node:?}, got {:?}",
+                        frame.payload
+                    );
+                    assert_eq!(
+                        frame.payload["content"]["document"],
+                        *document,
+                        "case {case:?}: expected the document that entered the flow, got {:?}",
+                        frame.payload
+                    );
+                    assert!(
+                        frame.payload.get("nodeType").is_none(),
+                        "case {case:?}: an output event publishes no nodeType, got {:?}",
+                        frame.payload
+                    );
+                }
+                for frame in &frames {
+                    assert_eq!(
+                        frame.message_type, "event",
+                        "case {case:?}: a run that reached the end carries no in-stream \
+                         exception, got {} {:?}",
+                        frame.name, frame.payload
+                    );
+                }
+            }
+        }
+
+        // An input addressed at a node the PACKAGED definition does not hold leaves the flow's
+        // own input node without the input the run depends on, which is still a served
+        // execution: the failure travels inside the stream.
+        let case =
+            format!("an alias routing to {routed_case}, an input node the flow does not hold");
+        let case = case.as_str();
+        let reply = emulator
+            .invoke_flow(
+                &flow,
+                &alias,
+                flow_request("NoSuchInputNode", json!({ "data": "the pump" })),
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case:?}: an invocation that has begun answers 200, got {} {:?}",
+            reply.status,
+            String::from_utf8_lossy(&reply.body)
+        );
+        let frames = decode_frames(case, &reply.body);
+        assert_eq!(
+            frame_names(&frames),
+            vec![DEPENDENCY_FAILED_EVENT],
+            "case {case:?}: expected the in-stream {DEPENDENCY_FAILED_EVENT}"
+        );
+        assert_eq!(
+            frames[0].message_type, "exception",
+            "case {case:?}: an in-stream modelled error travels as an exception, got {:?}",
+            frames[0].message_type
+        );
+        assert_eq!(
+            frames[0].payload["resourceName"].as_str(),
+            Some("NoSuchInputNode"),
+            "case {case:?}: the refusal names the dependency that failed, got {:?}",
+            frames[0].payload
+        );
+        executions.push(reply.header(EXECUTION_ID_HEADER));
+    }
+
+    // Running a flow is not a change to it: every invocation above left the flow in the status
+    // the build-time plane reported before any of them ran.
+    assert_eq!(
+        emulator.flow_status("the invocations", &flow).await,
+        PREPARED,
+        "the invocations must leave the flow {PREPARED}"
+    );
+
+    let mut distinct = executions.clone();
+    distinct.sort();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        executions.len(),
+        "every invocation that named no execution runs as one of its own, got {executions:?}"
+    );
 }
