@@ -253,9 +253,18 @@ impl SessionContext {
                 master_username: record.master_username.clone(),
                 password: record.master_user_password.clone(),
                 requires_secure_transport: store.requires_secure_transport(record),
-                served_host: endpoint.map(|endpoint| endpoint.endpoint.host.clone()),
-                served_port: endpoint
-                    .and_then(|endpoint| u16::try_from(endpoint.endpoint.port).ok()),
+                // The address of the endpoint this session arrived on, read from the ONE
+                // projection the control plane publishes it by
+                // ([`crate::state::DbInstanceRecord::endpoint_address`] and
+                // `published_port`, which `DescribeDBInstances` reports as
+                // `Endpoint{Address,Port}`) rather than from the listener a second time: a
+                // client mints its authentication token for the PUBLISHED pair, so the pair
+                // a describe reports and the pair a token is read against cannot drift. An
+                // instance the store holds no listener for has no address of its own here
+                // (the name it publishes is one this machine does not resolve), which is
+                // what `facts_of` answers a refusal with.
+                served_host: endpoint.map(|_| record.endpoint_address()),
+                served_port: endpoint.and_then(|_| u16::try_from(record.published_port()).ok()),
                 region: record.region.clone(),
                 iam_database_authentication_enabled: record.iam_database_authentication_enabled,
                 // An instance created as a READ REPLICA is replaying its source's writes:
