@@ -285,6 +285,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 hidden_by_default: None,
             });
 
+        // The findings this template's parameters earn, read through the ONE reading of them
+        // ([`crate::state::launch_template_warning`]) BEFORE the store is touched: one of
+        // them asks the component that OWNS instance profiles whether the account has the one
+        // the template names, which is a read of ANOTHER service's state and so is made
+        // outside this service's own lock — the same ordering `RunInstances` keeps for the
+        // same reference.
+        let warning = crate::state::launch_template_warning(
+            &*self.engine,
+            &input.launch_template_data,
+        );
+
         let spec = LaunchTemplateSpec {
             name: input.launch_template_name.clone(),
             // "The principal that created the launch template" (`LaunchTemplate$CreatedBy`):
@@ -394,10 +405,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             launch_template: Some(launch_template),
             // "If the launch template contains parameters or parameter combinations that
             // are not valid, an error code and an error message are returned for each
-            // issue that's found" (`CreateLaunchTemplateResult$Warning`). Every parameter
-            // this handler checks is refused outright rather than warned about, so a
-            // stored template has no findings to report.
-            warning: None,
+            // issue that's found" (`CreateLaunchTemplateResult$Warning`). A template is a
+            // set of launch PARAMETERS rather than a launch, so a parameter or a combination
+            // no launch could use is stored and reported as a finding — read above through
+            // the one reading of those findings, which `CreateLaunchTemplateVersion` answers
+            // from as well.
+            warning,
         })
     }
 }

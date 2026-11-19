@@ -795,7 +795,7 @@ async fn describe_tags_refuses_a_filter_list_past_its_ceilings() {
     /// The most filters one request may carry (`crate::state::MAX_FILTERS`).
     const MAX_FILTERS: usize = 32;
     /// The most values one filter may carry (`crate::state::MAX_FILTER_VALUES`).
-    const MAX_FILTER_VALUES: usize = 64;
+    const MAX_FILTER_VALUES: usize = 200;
     /// The most bytes one filter value may carry (`crate::state::MAX_FILTER_VALUE_BYTES`, the
     /// longest tag value EC2 accepts in its widest UTF-8 encoding).
     const MAX_FILTER_VALUE_BYTES: usize = 1024;

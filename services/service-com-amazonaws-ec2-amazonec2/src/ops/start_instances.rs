@@ -149,11 +149,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, require_known_instance, require_service_state, InstanceStateName,
-            PendingTransition, MAX_RESOURCE_IDS, TRANSITION_DELAY,
+            deduplicate_ids, request_region, require_instance_record_in_region,
+            require_service_state, InstanceStateName, PendingTransition, MAX_RESOURCE_IDS,
+            TRANSITION_DELAY,
         };
 
-        let _ = ctx;
+        // EC2 is a REGIONAL service: the instances this call may start are the ones of the
+        // Region the request was signed for, so that Region is what each named id is
+        // resolved against below.
+        let region = request_region(ctx.parts());
 
         if input.instance_ids.is_empty() {
             return Err(Scaffolded::missing_parameter(
@@ -179,10 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The whole batch is checked first: EC2 refuses the call rather than starting
         // some of the instances it names.
         for instance_id in &instance_ids {
-            require_known_instance(&store, instance_id)?;
-            let Some(instance) = store.instances.get(instance_id) else {
-                continue;
-            };
+            // An instance of ANOTHER Region is no instance this request can name: EC2 is
+            // reached through a regional endpoint, so the id names nothing here.
+            let instance = require_instance_record_in_region(&store, &region, instance_id)?;
             if !matches!(
                 instance.state,
                 InstanceStateName::Stopped

@@ -350,7 +350,26 @@ impl ComAmazonawsEc2Amazonec2State {
                     .and_then(|operator| operator.principal.clone()),
             ),
             "outpost-arn" => one(reported.outpost_arn.clone()),
-            "platform" => one(reported.platform.clone()),
+            // "platform - The platform. To list only Windows instances, use `windows`"
+            // (`DescribeInstancesRequest$Filters`): answered off the value the instance
+            // REPORTS for the member ([`INSTANCE_PLATFORM_WINDOWS`]), which is that same
+            // word, so the filter and the report cannot disagree. The spelling the modelled
+            // enum carries ([`IMAGE_PLATFORM_WINDOWS`]) selects the instance as well, the way
+            // `DescribeImages` answers the same filter with both spellings, so a caller that
+            // took the value off an image's own report still finds the instances it launched.
+            "platform" => Some(
+                reported
+                    .platform
+                    .iter()
+                    .flat_map(|platform| {
+                        if platform == INSTANCE_PLATFORM_WINDOWS {
+                            vec![platform.clone(), IMAGE_PLATFORM_WINDOWS.to_string()]
+                        } else {
+                            vec![platform.clone()]
+                        }
+                    })
+                    .collect(),
+            ),
             "platform-details" => one(reported.platform_details.clone()),
             "private-dns-name-options.enable-resource-name-dns-a-record" => {
                 flag(hostname.and_then(|options| options.enable_resource_name_dns_a_record))

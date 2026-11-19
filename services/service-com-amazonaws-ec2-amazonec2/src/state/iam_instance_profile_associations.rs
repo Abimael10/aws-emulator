@@ -460,6 +460,27 @@ pub fn existing_iam_instance_profile_association<E>(instance_id: &str) -> Scaffo
     )
 }
 
+/// The sentence EC2's parameter layer gives an `iamInstanceProfile.name` that names no
+/// instance profile it can use: the value the caller sent, the parameter it sent it as, and
+/// what is wrong with it.
+///
+/// The ONE wording of it, so every refusal of an unusable profile reference words it the
+/// same way.
+fn unusable_iam_instance_profile_name(name: &str) -> String {
+    format!(
+        "Value ({name}) for parameter iamInstanceProfile.name is invalid. \
+         Invalid IAM Instance Profile name"
+    )
+}
+
+/// The same sentence for the other spelling of a profile, `iamInstanceProfile.arn`.
+fn unusable_iam_instance_profile_arn(arn: &str) -> String {
+    format!(
+        "Value ({arn}) for parameter iamInstanceProfile.arn is invalid. \
+         Invalid IAM Instance Profile ARN"
+    )
+}
+
 /// The most characters an IAM instance profile name may carry: IAM's own
 /// `instanceProfileNameType` (len 1..128, pattern `^[\w+=,.@-]+$`), the type every
 /// `InstanceProfileName` member of the IAM model carries, so a name EC2 accepts here is one
@@ -494,7 +515,7 @@ pub fn iam_instance_profile_name_is_well_formed(name: &str) -> bool {
 /// `None` when this account's IAM records hold no profile under that name: a profile this
 /// emulator has no record of is reported as the request spelled it and with NO id, rather
 /// than with one invented here.
-fn iam_held_instance_profile<Eng: Send + Sync + 'static>(
+pub(super) fn iam_held_instance_profile<Eng: Send + Sync + 'static>(
     engine: &Eng,
     name: &str,
 ) -> Option<IamInstanceProfile> {
@@ -546,10 +567,9 @@ pub fn resolve_iam_instance_profile<E, Eng: Send + Sync + 'static>(
         )),
         (Some(arn), None) => {
             if !iam_instance_profile_arn_is_well_formed(arn) {
-                return Err(invalid_parameter_value(format!(
-                    "Value ({arn}) for parameter iamInstanceProfile.arn is invalid. \
-                     Invalid IAM Instance Profile ARN"
-                )));
+                return Err(invalid_parameter_value(
+                    unusable_iam_instance_profile_arn(arn),
+                ));
             }
             // An ARN names the profile IAM holds under exactly that ARN: the name is the
             // last segment of it, and the record is read only when the ARN IAM holds that
@@ -565,10 +585,9 @@ pub fn resolve_iam_instance_profile<E, Eng: Send + Sync + 'static>(
         }
         (None, Some(name)) => {
             if !iam_instance_profile_name_is_well_formed(name) {
-                return Err(invalid_parameter_value(format!(
-                    "Value ({name}) for parameter iamInstanceProfile.name is invalid. \
-                     Invalid IAM Instance Profile name"
-                )));
+                return Err(invalid_parameter_value(
+                    unusable_iam_instance_profile_name(name),
+                ));
             }
             Ok(
                 iam_held_instance_profile(engine, name).unwrap_or_else(|| IamInstanceProfile {

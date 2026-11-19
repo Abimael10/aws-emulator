@@ -365,19 +365,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "launch template version '{version_number}' was not stored"
             ))
         })?;
+        let launch_template_version =
+            crate::ops::describe_launch_template_versions::launch_template_version_view(
+                record, version,
+            );
+        // The version's own STORED parameters (which a `SourceVersion` may have contributed
+        // to), taken before this service's lock is released so that what is judged is what
+        // was stored.
+        let stored_data = version.data.clone();
+        drop(store);
         Ok(CreateLaunchTemplateVersionOutput {
-            launch_template_version: Some(
-                crate::ops::describe_launch_template_versions::launch_template_version_view(
-                    record, version,
-                ),
-            ),
+            launch_template_version: Some(launch_template_version),
             // "If the new version of the launch template contains parameters or parameter
             // combinations that are not valid, an error code and an error message are
             // returned for each issue that's found"
-            // (`CreateLaunchTemplateVersionResult$Warning`). Every parameter this handler
-            // checks is refused outright rather than warned about, so a stored version has no
-            // findings to report.
-            warning: None,
+            // (`CreateLaunchTemplateVersionResult$Warning`). A version is a set of launch
+            // PARAMETERS rather than a launch, so a parameter or a combination no launch
+            // could use is stored and reported as a finding — through the one reading of
+            // those findings `CreateLaunchTemplate` answers from as well, with this
+            // service's lock RELEASED because one finding asks the component that owns
+            // instance profiles whether the account has the one the version names.
+            warning: crate::state::launch_template_warning(&*self.engine, &stored_data),
         })
     }
 }

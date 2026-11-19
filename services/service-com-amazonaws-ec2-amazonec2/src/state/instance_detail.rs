@@ -59,6 +59,16 @@ use super::{
 /// (`InstanceMetadataOptionsResponse$State`).
 pub const METADATA_OPTIONS_STATE_APPLIED: &str = "applied";
 
+/// The value an INSTANCE's `Platform` reports for a Windows instance: "this value is
+/// `windows` for Windows instances; otherwise, it is empty" (`Instance$Platform`).
+///
+/// The lower-case word the member's own documentation publishes, which is also the one the
+/// `platform` filter of every instance read documents ("to list only Windows instances, use
+/// `windows`") — the modelled `PlatformValues` spells its enum member `Windows`, which is
+/// the value an IMAGE reports ([`super::IMAGE_PLATFORM_WINDOWS`]), so the two spellings live
+/// one beside the other rather than one being derived from the other by case folding.
+pub const INSTANCE_PLATFORM_WINDOWS: &str = "windows";
+
 /// `InstanceMetadataOptionsState`'s `pending`: "the metadata options are being updated and
 /// the instance is not ready to process metadata traffic with the new selection"
 /// (`InstanceMetadataOptionsResponse$State`) — the state a launch's options are in until
@@ -969,9 +979,17 @@ impl ComAmazonawsEc2Amazonec2State {
         view.usage_operation_update_time =
             image.and_then(|image| image_creation_time(image.creation_date.as_deref()));
         // "The platform. This value is `windows` for Windows instances; otherwise, it is
-        // empty" (`Instance$Platform`), and the same reading for NitroTPM support: both are
-        // facts of the AMI, reported only for an AMI that carries them.
-        view.platform = image.and_then(|image| image.platform.clone());
+        // empty" (`Instance$Platform`): the member's own documented value, which is the
+        // lower-case word — the modelled `PlatformValues` spells the enum member `Windows`,
+        // and the value an INSTANCE reports for it is the one that sentence publishes, the
+        // same word the operation's own `platform` filter documents ("to list only Windows
+        // instances, use `windows`"). An instance launched from an AMI that carries no
+        // platform at all reports none, which is the "otherwise" half.
+        view.platform = image
+            .and_then(|image| image.platform.as_deref())
+            .map(|_| INSTANCE_PLATFORM_WINDOWS.to_string());
+        // The same reading for NitroTPM support: a fact of the AMI, reported only for an AMI
+        // that carries it.
         view.tpm_support = image.and_then(|image| image.tpm_support.clone());
         // "The boot mode that was specified by the AMI" (`Instance$BootMode`) and "the boot
         // mode that is used to boot the instance at launch or start"
@@ -1040,8 +1058,16 @@ impl ComAmazonawsEc2Amazonec2State {
         });
 
         // The option sets the launch chose (and a modify of them since), reported back
-        // from the record that stored them.
-        view.metadata_options = Some(detail.metadata_options_at(now));
+        // from the record that stored them. A TERMINATED instance is the one exception:
+        // `applied` means "the metadata options have been successfully applied on the
+        // instance" (`InstanceMetadataOptionsResponse$State`), and an instance that no
+        // longer runs is "not ready to process metadata traffic" — the sentence that
+        // member's `pending` carries — so the options it reports are not applied ones.
+        let mut metadata_options = detail.metadata_options_at(now);
+        if instance.state == InstanceStateName::Terminated {
+            metadata_options.state = Some(METADATA_OPTIONS_STATE_PENDING.to_string());
+        }
+        view.metadata_options = Some(metadata_options);
         view.enclave_options = Some(EnclaveOptions {
             enabled: Some(detail.enclave_enabled),
         });

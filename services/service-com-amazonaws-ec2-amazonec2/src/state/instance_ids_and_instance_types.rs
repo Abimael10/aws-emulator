@@ -358,6 +358,32 @@ pub fn require_known_instance<E>(
     require_instance_record(store, instance_id).map(|_| ())
 }
 
+/// [`require_known_instance`] for an operation reached through a REGIONAL endpoint: the same
+/// two refusals, plus `InvalidInstanceID.NotFound` for an instance of another Region.
+///
+/// EC2 is a regional service reached through a regional endpoint, so "the instances" an
+/// operation of it acts on are the ones of the Region the request was signed for: an instance
+/// that runs in another Region is invisible here, and an id naming one names no instance at
+/// all. The Region an instance runs in is read through the crate's one answer to that
+/// ([`instance_region`]), so an operation that ACTS on an instance and one that REPORTS it
+/// cannot disagree about which Region holds it — the same scope `DescribeInstances` applies
+/// to the ids it is given.
+///
+/// The ONE place that scope is applied to a named instance, so no operation re-spells it.
+pub fn require_instance_record_in_region<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    region: &str,
+    instance_id: &str,
+) -> Result<&'store InstanceRecord, crate::scaffolded::Scaffolded<E>> {
+    let instance = require_instance_record(store, instance_id)?;
+    if instance_region(instance) != region {
+        return Err(crate::scaffolded::Scaffolded::invalid_instance_id_not_found(
+            instance_id,
+        ));
+    }
+    Ok(instance)
+}
+
 /// The stored instance `instance_id` names for an operation that DECODES a long-form id
 /// before it looks anything up: a long-form id this service never issued is
 /// `InvalidInstanceID.Malformed`, where a short-form one it holds no instance for is
@@ -784,9 +810,47 @@ pub fn architecture_for(instance_type: &str) -> String {
 
 /// The reason EC2 records on a state change a caller asked for, naming the
 /// instant it happened.
+///
+/// "The reason for the most recent state transition. This might be an empty string"
+/// (`Instance$StateTransitionReason`), which the `reason` filter documents EC2 wording as
+/// `User Initiated [date]` for a stop or a terminate
+/// (`smithy_query(query="doc",shape="DescribeInstancesRequest",member="Filters")`). The DATE
+/// in it is a civil UTC date and time with the zone spelled out, not the ISO 8601 instant the
+/// timestamp members of this surface carry — [`USER_INITIATED_REASON_TIME_FORMAT`] — so a
+/// consumer that parses the reason reads the one form every state change of this crate words
+/// it in. The instant is the caller's own; only its rendering lives here.
 pub fn user_initiated_reason(at: SystemTime) -> String {
-    format!("User initiated ({})", iso8601_utc(at))
+    format!(
+        "User initiated ({})",
+        civil_utc(at, USER_INITIATED_REASON_TIME_FORMAT)
+    )
 }
+
+/// `at` rendered on the CIVIL calendar in UTC, in the `strftime` form `format`.
+///
+/// The ONE such rendering in this crate, so every surface that writes a civil date — the
+/// reason above and the times a Client VPN connection carries
+/// (`super::client_vpn_connections`) — handles the epoch and the conversion the same way and
+/// differs only in the form it asks for. An instant the calendar cannot carry renders as the
+/// EMPTY string rather than panicking.
+///
+/// The calendar conversion is `chrono`'s, as every civil-calendar rendering of this crate's
+/// is; the ISO 8601 rendering of the same instant is [`iso8601_utc`], which the modelled
+/// timestamp members take.
+pub fn civil_utc(at: SystemTime, format: &str) -> String {
+    let seconds = at
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64;
+    ::chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|at| at.format(format).to_string())
+        .unwrap_or_default()
+}
+
+/// The `strftime` form of the date [`user_initiated_reason`] carries: `YYYY-MM-DD HH:MM:SS`
+/// in UTC, named by its zone.
+const USER_INITIATED_REASON_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S GMT";
 
 /// The `StateReason$Code` EC2 records on an instance a caller asked to shut down.
 pub const INSTANCE_STATE_REASON_USER_INITIATED_SHUTDOWN: &str = "Client.UserInitiatedShutdown";

@@ -562,6 +562,12 @@ impl ComAmazonawsEc2Amazonec2State {
         // called again, and with them the subnet addresses and security group references
         // they held.
         self.delete_interfaces_of_terminated_instances();
+        // And it no longer holds the EBS volumes it was launched with either: "indicates
+        // whether the volume is deleted on instance termination"
+        // (`EbsBlockDevice$DeleteOnTermination`) was answered at that same instant, so a
+        // volume marked for it is gone from the account's volume store and a volume marked
+        // otherwise is attached to nothing.
+        self.release_volumes_of_terminated_instances();
         let vpcs = &mut self.vpcs;
         self.vpc_available_at.retain(|vpc_id, due_at| {
             if now < *due_at {
@@ -2456,10 +2462,17 @@ impl ComAmazonawsEc2Amazonec2State {
             // Documented on `Instance$privateDnsName`: the private hostname names the
             // private address the instance HOLDS, which is assigned by the launch, so the
             // name is reported from the launch's own answer on. A TERMINATED instance holds
-            // no address any more (its interfaces were deleted with it), so it reports no
-            // name for one either.
-            private_dns_name: (instance.state != InstanceStateName::Terminated)
-                .then(|| instance.private_dns_name.clone()),
+            // no address any more (its interfaces were deleted with it), so it has no name
+            // for one either — reported as the EMPTY name rather than left out, which is
+            // what EC2 renders for an instance that has none while it still reports the
+            // instance at all.
+            private_dns_name: Some(
+                if instance.state == InstanceStateName::Terminated {
+                    String::new()
+                } else {
+                    instance.private_dns_name.clone()
+                },
+            ),
             public_ip_address: instance.public_ip.clone(),
             launch_time: Some(system_time_to_date_time(instance.launch_time)),
             ami_launch_index: Some(instance.ami_launch_index),

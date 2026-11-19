@@ -2294,10 +2294,21 @@ pub use launch_template_instance_tags::*;
 pub mod launch_template_security_groups;
 pub use launch_template_security_groups::*;
 
+/// The validation WARNINGS a launch template's parameters earn — the findings a create of a
+/// template, and a create of a new version of one, report back for a combination of
+/// parameters no launch could use. Everything it declares is re-exported below.
+pub mod launch_template_warnings;
+pub use launch_template_warnings::*;
+
 /// The PRIMARY network interface a LAUNCH creates for the instance it stores, in the subnet
 /// the launch places it in — one method on the state, in a module of its own, beside the
 /// root volume the same launch creates.
 mod launched_primary_interfaces;
+
+/// The EBS volumes a TERMINATION takes off the instance that held them — deleted with it
+/// where its attachment says so and detached from it otherwise — in a module of its own,
+/// beside the volume a launch mints and the interfaces the same termination deletes.
+mod terminated_instance_volumes;
 
 /// The network interfaces a launch was TOLD to give its instance
 /// (`RunInstancesRequest$NetworkInterfaces`) — what one of them resolves to and the one

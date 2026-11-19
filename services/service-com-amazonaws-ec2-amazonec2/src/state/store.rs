@@ -95,9 +95,14 @@ pub const MAX_STORED_INSTANCES: usize = 4096;
 /// stored instances, and the model bounds none of the three.
 pub const MAX_FILTERS: usize = 32;
 
-/// The most values one `DescribeInstances` filter may carry. CHOSEN, see
-/// [`MAX_FILTERS`].
-pub const MAX_FILTER_VALUES: usize = 64;
+/// The most values one `DescribeInstances` filter may carry.
+///
+/// AWS's own per-call cap: EC2's describe operations refuse a filter carrying more than 200
+/// values ("the maximum number of filter values specified on a single call is 200"), so a
+/// request at or below it is SERVED — with the resources its values select, and with an
+/// empty set when they select none — rather than refused. The model declares no `@length` on
+/// `Filter$Values`, so the handler is the only place the bound can exist.
+pub const MAX_FILTER_VALUES: usize = 200;
 
 /// The largest page `DescribeInstances` will serve, and the page size it uses when
 /// the request names none.

@@ -156,11 +156,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            deduplicate_ids, require_instance_record, require_service_state, InstanceStateName,
-            MAX_RESOURCE_IDS,
+            deduplicate_ids, request_region, require_instance_record_in_region,
+            require_service_state, InstanceStateName, MAX_RESOURCE_IDS,
         };
 
-        let _ = ctx;
+        // EC2 is a REGIONAL service: the instances this call may reboot are the ones of the
+        // Region the request was signed for, so that Region is what each named id is
+        // resolved against below.
+        let region = request_region(ctx.parts());
 
         // `InstanceIds` is `@required` but `clientOptional`: the boundary validator refuses
         // a request that OMITS the list, and this is this operation's own answer for one
@@ -201,8 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // made exactly once.
         let mut to_reboot: Vec<&String> = Vec::new();
         for instance_id in &instance_ids {
-            // Malformed before unknown, the order this service resolves an instance id in.
-            let instance = require_instance_record(&store, instance_id)?;
+            // Malformed before unknown, the order this service resolves an instance id in —
+            // and an instance of ANOTHER Region is no instance this request can name, EC2
+            // being reached through a regional endpoint.
+            let instance = require_instance_record_in_region(&store, &region, instance_id)?;
             // "Requests to reboot terminated instances are ignored" — the one state this
             // operation neither acts on nor refuses.
             if instance.state == InstanceStateName::Terminated {

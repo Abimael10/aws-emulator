@@ -152,18 +152,16 @@ pub struct ClientVpnConnectionSpec {
 /// (`smithy_query(query="shape",shape="ClientVpnConnection")` targets `String` for
 /// `Timestamp`, `ConnectionEstablishedTime` and `ConnectionEndTime`), and that is the form
 /// the Client VPN surface writes them in — a civil date and time separated by a space, with
-/// no zone suffix — so it is spelled here once rather than per writer. The calendar
-/// conversion is `chrono`'s, like every other civil-calendar rendering in this crate.
+/// no zone suffix — so it is spelled here once rather than per writer. The rendering goes
+/// through the crate's ONE civil-calendar conversion ([`super::civil_utc`]), so this surface
+/// and the reason a state change records handle the epoch the same way.
 pub fn client_vpn_connection_time(at: SystemTime) -> String {
-    let seconds = at
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .min(i64::MAX as u64) as i64;
-    ::chrono::DateTime::from_timestamp(seconds, 0)
-        .map(|at| at.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_default()
+    super::civil_utc(at, CLIENT_VPN_CONNECTION_TIME_FORMAT)
 }
+
+/// The `strftime` form of a Client VPN connection's times: the civil date and the time of
+/// day, separated by a space.
+const CLIENT_VPN_CONNECTION_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// The caller-chosen bytes one stored client connection holds: the endpoint it is connected
 /// to, who connected, the address assigned to the client and the two times it carries, on
