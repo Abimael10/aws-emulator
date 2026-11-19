@@ -180,6 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // Which account is the family's PAYER is the standing a transfer's ownership is
+        // decided against, and the organization's management account is that payer: read
+        // from the Organizations store BEFORE this service's guard is taken — one lock at
+        // a time, in one direction.
+        let organization_payer = crate::state::organization_management_account_id(&*self.engine);
         let mut state = state.lock();
         let transfer_arn = input.responsibility_transfer_arn;
         let requested = input.auto_billing_transfer_billing_group_creation;
@@ -191,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Conductor never creates, so only a transfer the store holds a record of exists.
         // Any other ARN is this operation's modelled 404, and a preference is never
         // recorded against a transfer that does not exist.
-        if !state.billing_transfer_exists(&transfer_arn) {
+        if !state.billing_transfer_exists(&transfer_arn, organization_payer.as_deref()) {
             return Err(UpdateBillingTransferPreferenceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: "the billing transfer does not exist".to_string(),

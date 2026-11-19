@@ -107,11 +107,17 @@
 //! operation shares rather than in 34 handlers: constraint refusal (400), then caller
 //! authorization (403), then the operation.
 //!
-//! The decision itself lives in state beside the resources, as
-//! [`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::payer_account_id`]:
-//! this emulator records no organization, so no account is the payer and the control
-//! plane is reachable by nobody — which is exactly what AWS answers the non-payer
-//! callers every recorded response was taken from.
+//! WHO the payer account is comes from
+//! [`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::payer_account`]:
+//! an account is the payer of a consolidated billing family by being the MANAGEMENT
+//! account of an organization, which is an AWS Organizations fact no request of this API
+//! writes, so the gate reads it from that store on the shared engine
+//! ([`crate::state::organization_management_account_id`]) beside the designation this
+//! service's own store may hold. A client that creates an organization is therefore
+//! served this control plane over HTTP alone, while an engine whose stores record no
+//! organization and no designation has no payer account at all and the control plane is
+//! reachable by nobody — which is exactly what AWS answers the non-payer callers every
+//! recorded response was taken from.
 //!
 //! The TAGGING operations are not on that gate (`PAYER_UNGATED_OPERATIONS`): a
 //! recorded `TagResource` call from a non-payer account against a billing-group ARN

@@ -65,7 +65,11 @@ const LINKED_ACCOUNT: &str = "000000000001";
 /// The organization itself is established first, through Organizations' own single
 /// organization writer: membership comes from a `CreateOrganization` request and not from
 /// mounting that control plane, so a store nobody has asked holds none.
-fn link_account_to_the_organization(engine: &InMemoryEngine, account_id: &str) {
+///
+/// `pub(crate)` because the sibling suite
+/// `tests/all/billingconductor_payer_from_organizations.rs` puts a linked account in the
+/// family the same way rather than keeping a second copy of this arrangement.
+pub(crate) fn link_account_to_the_organization(engine: &InMemoryEngine, account_id: &str) {
     let state = engine.state::<OrganizationsState>();
     let mut store = state.lock();
     if store.organization.is_none() {

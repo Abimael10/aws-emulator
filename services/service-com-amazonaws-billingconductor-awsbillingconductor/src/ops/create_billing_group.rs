@@ -210,10 +210,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateBillingGroupErrorModeled::ValidationException(refusal).into());
         }
 
-        // The consolidated billing family's roster, which AWS Organizations owns: read
-        // from that store BEFORE this service's guard is taken — one lock at a time, in
-        // one direction.
+        // The consolidated billing family's roster, and the family's PAYER account — both
+        // facts AWS Organizations owns: read from that store BEFORE this service's guard
+        // is taken — one lock at a time, in one direction.
         let organization = crate::state::organization_linked_accounts(&*self.engine);
+        let organization_payer = crate::state::organization_management_account_id(&*self.engine);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateBillingGroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -372,7 +373,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .responsibility_transfer_arn
             .as_deref()
         {
-            if !state.billing_transfer_exists(transfer_arn) {
+            if !state.billing_transfer_exists(transfer_arn, organization_payer.as_deref()) {
                 return Err(validation(
                     "INVALID_ARN",
                     "AccountGrouping.ResponsibilityTransferArn",

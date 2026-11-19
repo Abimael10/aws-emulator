@@ -3002,13 +3002,18 @@ pub struct ComAmazonawsBillingconductorAwsbillingconductorState {
     /// Billing Conductor is a payer-account-only API: its control plane is authorized
     /// for the payer account of the consolidated billing family alone, and every other
     /// caller is refused `AccessDeniedException` (see
-    /// [`Self::is_payer_account`] and [`not_payer_account`]). This emulator presents one
-    /// account ([`caller_account_id`]) and emulates no Organizations control plane, so
-    /// there is no organization and no payer account to record: the field holds `None`
-    /// and the emulated account is a standalone, non-payer account — the caller every
-    /// recorded Billing Conductor response was taken from. A test (or a future
-    /// Organizations surface) designates a payer account by setting it, which is the
-    /// only way the control plane becomes reachable.
+    /// [`Self::is_payer_account`] and [`not_payer_account`]).
+    ///
+    /// An account becomes the payer of a consolidated billing family by being the
+    /// MANAGEMENT account of an organization, which is an AWS Organizations fact that no
+    /// request of this API writes: the payer account is therefore read from that store
+    /// ([`organization_management_account_id`]), and this field is the seam for an
+    /// engine that mounts no Organizations surface — the designation this store was
+    /// given directly, which it answers by while it holds one ([`Self::payer_account`]).
+    /// It holds `None` by default, and a store nothing designated a payer for whose
+    /// engine records no organization has no payer account at all: its control plane is
+    /// reachable by nobody, which is what AWS answers the standalone, non-payer account
+    /// every recorded Billing Conductor response was taken from.
     pub payer_account_id: Option<String>,
     /// The ids of the consolidated billing family's linked accounts as THIS store
     /// records them, beside the roster the organization itself records
@@ -3197,13 +3202,19 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// management account, the organization, the direction and the transfer id — has to
     /// match a transfer the store holds. A pattern-conforming ARN is not a transfer.
     ///
-    /// Fails CLOSED, like the authorization gate: a store that records no payer account
-    /// records no organization, so it owns no transfer, and a transfer whose management
-    /// account is not the payer belongs to another organization than the one this store
-    /// answers for.
-    pub fn billing_transfer(&self, arn: &str) -> Option<&BillingTransferRecord> {
+    /// Fails CLOSED, like the authorization gate: a family with no payer account owns no
+    /// transfer, and a transfer whose management account is not that payer belongs to
+    /// another organization than the one this store answers for. The payer is the one
+    /// [`Self::payer_account`] answers, so `organization_management_account` is the
+    /// management account the Organizations store records, read before this store's guard
+    /// is taken.
+    pub fn billing_transfer(
+        &self,
+        arn: &str,
+        organization_management_account: Option<&str>,
+    ) -> Option<&BillingTransferRecord> {
         let record = self.billing_transfers.get(arn)?;
-        if self.payer_account_id.as_deref() == Some(record.management_account_id.as_str()) {
+        if self.is_payer_account(&record.management_account_id, organization_management_account) {
             Some(record)
         } else {
             None
@@ -3213,8 +3224,13 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// Whether this organization has the billing transfer `arn` names — the existence
     /// decision behind the modelled `ResourceNotFoundException` of every operation that
     /// addresses one. See [`Self::billing_transfer`].
-    pub fn billing_transfer_exists(&self, arn: &str) -> bool {
-        self.billing_transfer(arn).is_some()
+    pub fn billing_transfer_exists(
+        &self,
+        arn: &str,
+        organization_management_account: Option<&str>,
+    ) -> bool {
+        self.billing_transfer(arn, organization_management_account)
+            .is_some()
     }
 
     /// Record a billing transfer the organization HAS, answering whether the store holds
@@ -4228,14 +4244,39 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .filter(|existing| *existing != group_arn)
     }
 
-    /// Whether `account_id` is the payer (management) account of the organization this
-    /// store records.
+    /// The payer (management) account of the consolidated billing family this store
+    /// answers for, or `None` while that family has no payer account.
     ///
-    /// False whenever no payer account is recorded, which is the store's default (see
+    /// TWO sources, in this order: the designation this store holds
+    /// ([`Self::payer_account_id`]), and — while it holds none — the management account
+    /// of the organization the presented account belongs to, which is the account that IS
+    /// the payer of that organization's consolidated billing family
+    /// ([`organization_management_account_id`], passed in as
+    /// `organization_management_account` because it is read from the Organizations store
+    /// before this one's guard is taken). Neither source naming an account means the
+    /// family has no payer, which is a store nothing designated one for on an engine that
+    /// records no organization — the default.
+    pub fn payer_account<'a>(
+        &'a self,
+        organization_management_account: Option<&'a str>,
+    ) -> Option<&'a str> {
+        self.payer_account_id
+            .as_deref()
+            .or(organization_management_account)
+    }
+
+    /// Whether `account_id` is the payer (management) account of the consolidated billing
+    /// family this store answers for. See [`Self::payer_account`].
+    ///
+    /// False whenever no payer account is known at all, which is the store's default (see
     /// [`Self::payer_account_id`]): the Billing Conductor control plane is then
     /// available to nobody, exactly as it is to an account that is not a payer.
-    pub fn is_payer_account(&self, account_id: &str) -> bool {
-        self.payer_account_id.as_deref() == Some(account_id)
+    pub fn is_payer_account(
+        &self,
+        account_id: &str,
+        organization_management_account: Option<&str>,
+    ) -> bool {
+        self.payer_account(organization_management_account) == Some(account_id)
     }
 
     /// The tags stored for the resource a tagging `ResourceArn` names, or `None` when
@@ -4848,14 +4889,57 @@ pub fn organization_linked_accounts<Eng: Send + Sync + 'static>(
 }
 
 /// The authorization decision for one call of this service's payer-gated surface: whether
-/// the caller IS the payer account this store records.
+/// the caller IS the payer account of the consolidated billing family.
 ///
-/// A READ — it takes the store's lock to compare one account id and writes nothing, so a
-/// denied request changes nothing a later caller sees.
+/// A READ — it takes each store's lock to compare one account id and writes nothing, so a
+/// denied request changes nothing a later caller sees, and neither does an admitted one
+/// before its operation runs.
 ///
 /// Fails CLOSED: a store this process cannot reach records no payer account, and an
 /// authorization check that cannot run must not admit the request. The refusal itself is
 /// [`not_payer_account`].
+///
+/// Who the payer account IS comes from [`ComAmazonawsBillingconductorAwsbillingconductorState::payer_account`],
+/// so a caller the Organizations store records as the management account of the
+/// organization it belongs to is authorized without this service having been told
+/// anything: that store is read first, guard-free, and this store's guard is taken after
+/// it — one lock at a time, in one direction.
 pub fn caller_is_payer_account<Eng: Send + Sync + 'static>(engine: &Eng) -> bool {
-    service_state(engine).is_some_and(|state| state.lock().is_payer_account(caller_account_id()))
+    let organization = organization_management_account_id(engine);
+    service_state(engine).is_some_and(|state| {
+        state
+            .lock()
+            .is_payer_account(caller_account_id(), organization.as_deref())
+    })
+}
+
+/// The management account of the organization the presented account belongs to, or `None`
+/// while that account is in no organization.
+///
+/// An account becomes the payer account of a consolidated billing family by being the
+/// management account of an organization — "the account whose user is calling the
+/// CreateOrganization operation automatically becomes the management account of the new
+/// organization" — and no Billing Conductor request puts an account anywhere, so that
+/// standing is state the AWS Organizations control plane owns: it is READ from that store
+/// through the one shared engine rather than copied into this service.
+///
+/// A one-directional, guard-free read, like [`organization_linked_accounts`] beside it: it
+/// takes the Organizations store's lock, holds no other while it does, hands back owned
+/// values and writes nothing — so call it with NO guard of this service's own store held.
+///
+/// `None` for an engine that mounts no Organizations control plane, and for one whose
+/// store records no organization: no organization is recorded anywhere this process can
+/// see, so the presented account is standalone and the management account of nothing.
+pub fn organization_management_account_id<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<String> {
+    let organizations =
+        ::service_com_amazonaws_organizations_awsorganizationsv20161128::state::service_state(
+            engine,
+        )?;
+    let organizations = organizations.lock();
+    organizations
+        .organization
+        .as_ref()
+        .map(|organization| organization.master_account_id.clone())
 }
