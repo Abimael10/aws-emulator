@@ -25,9 +25,9 @@ use service_com_amazonaws_pricing_awspricelistservice::state::{
 };
 
 use super::pricing_support::{
-    all_attribute_values, all_offer_documents, attribute_values, column_of, csv_rows, list_member,
-    offer_attribute, ok, product_sku, router, router_with_engine, split_https_url, JAN_1_2024,
-    JUL_1_2024, MAX_PAGE,
+    all_attribute_values, all_offer_documents, attribute_values, call, column_of, csv_rows,
+    list_member, offer_attribute, offer_dimension_values, offer_documents, ok, product_sku, router,
+    router_with_engine, service_entry, split_https_url, JAN_1_2024, JUL_1_2024, MAX_PAGE,
 };
 
 /// Instance types the Price List API publishes `instanceType` values for, across the
@@ -80,6 +80,19 @@ fn arn_version(arn: &str) -> String {
     arn.rsplit('/').nth(1).unwrap_or_default().to_string()
 }
 
+/// Whether `value` names a member of the family `family` names: the member's name is the
+/// family's, extended with `.` and the size (`a1.large` of `a1`).
+fn is_member_of(value: &str, family: &str) -> bool {
+    value
+        .strip_prefix(family)
+        .is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Whether `value` names a family that `values` also publishes members of.
+fn names_a_family(value: &str, values: &[String]) -> bool {
+    values.iter().any(|other| is_member_of(other, value))
+}
+
 #[tokio::test]
 async fn an_attribute_enumeration_spans_pages_and_yields_every_value_once() {
     let router = router();
@@ -103,14 +116,53 @@ async fn an_attribute_enumeration_spans_pages_and_yields_every_value_once() {
         published.len()
     );
 
-    // One defined order: ascending, with no value twice — so a page boundary always
-    // names the same place in the set.
-    let mut ascending = published.clone();
-    ascending.sort();
-    ascending.dedup();
+    // One defined order, with no value twice — so a page boundary always names the same
+    // place in the set: ascending, except that a value which NAMES A FAMILY the service
+    // also publishes members of (`a1` beside `a1.large`) is published behind that
+    // family's members, which is where the API lists it.
+    let distinct: BTreeSet<&String> = published.iter().collect();
     assert_eq!(
-        published, ascending,
-        "the values must be enumerated in ascending order, without duplicates"
+        distinct.len(),
+        published.len(),
+        "the values must be enumerated without duplicates, got {} distinct of {}",
+        distinct.len(),
+        published.len()
+    );
+    let families: Vec<String> = published
+        .iter()
+        .filter(|value| names_a_family(value, &published))
+        .cloned()
+        .collect();
+    assert!(
+        !families.is_empty(),
+        "the published instance-type vocabulary must carry family-level values beside \
+         the per-size ones, got {} values",
+        published.len()
+    );
+    for family in &families {
+        let family_at = published
+            .iter()
+            .position(|value| value == family)
+            .expect("the family value is published");
+        for (position, value) in published.iter().enumerate() {
+            if is_member_of(value, family) {
+                assert!(
+                    position < family_at,
+                    "case {family}: the family is published behind its members, but \
+                     {value} is published at {position} after it at {family_at}"
+                );
+            }
+        }
+    }
+    let sized: Vec<&String> = published
+        .iter()
+        .filter(|value| !families.contains(value))
+        .collect();
+    let mut ascending = sized.clone();
+    ascending.sort();
+    assert_eq!(
+        sized, ascending,
+        "read without the family-level values, the enumeration must be ascending"
     );
 
     // Rows differ in page size, including both published bounds of MaxResults on this
@@ -879,4 +931,532 @@ async fn every_published_version_has_its_own_publication_instant() {
             );
         }
     }
+}
+
+/// The head of the attribute-name list the Price List API publishes for a service, in its
+/// published order: the dimensions of the offer document every service publishes, then the
+/// dimensions that service's own products are priced along.
+///
+/// The source is the service's published `DescribeServices` answer, whose list opens with
+/// these rather than with the alphabetical projection of the product rows. The rows cover
+/// a service priced per instance type, one priced per storage class and two priced with
+/// one usage type per Region.
+const PUBLISHED_ATTRIBUTE_NAMES: &[(&str, &[&str])] = &[
+    (
+        "AmazonEC2",
+        &[
+            "termType",
+            "productFamily",
+            "servicecode",
+            "location",
+            "instanceType",
+            "usagetype",
+        ],
+    ),
+    (
+        "AmazonS3",
+        &[
+            "termType",
+            "productFamily",
+            "servicecode",
+            "location",
+            "storageClass",
+            "usagetype",
+        ],
+    ),
+    (
+        "AWSLambda",
+        &[
+            "termType",
+            "productFamily",
+            "servicecode",
+            "location",
+            "usagetype",
+        ],
+    ),
+    (
+        "AmazonSNS",
+        &[
+            "termType",
+            "productFamily",
+            "servicecode",
+            "location",
+            "usagetype",
+        ],
+    ),
+];
+
+#[tokio::test]
+async fn describe_services_publishes_the_service_s_own_attribute_name_list() {
+    let router = router();
+
+    for (service_code, published_head) in PUBLISHED_ATTRIBUTE_NAMES.iter().copied() {
+        let described = ok(
+            &router,
+            "DescribeServices",
+            &json!({ "ServiceCode": service_code }),
+        )
+        .await;
+        let entry = service_entry(&described, service_code)
+            .unwrap_or_else(|| panic!("case {service_code}: expected the service, got {described}"));
+        let names: Vec<String> = list_member(&entry, "AttributeNames")
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        let head: Vec<String> = published_head
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        assert_eq!(
+            names.get(..head.len()),
+            Some(head.as_slice()),
+            "case {service_code}: the list must open with the published dimensions in \
+             their published order, got {names:?}"
+        );
+
+        // Not the alphabetical projection of the catalog's product rows: the list names
+        // the dimensions the offer DOCUMENT carries, which no product attribute has a key
+        // for, and it names them first.
+        let documents = offer_documents(
+            &ok(
+                &router,
+                "GetProducts",
+                &json!({ "ServiceCode": service_code, "MaxResults": 1 }),
+            )
+            .await,
+        );
+        let document = documents
+            .first()
+            .unwrap_or_else(|| panic!("case {service_code}: expected a priced product"));
+        for name in ["termType", "productFamily"] {
+            assert!(
+                offer_attribute(document, name).is_none(),
+                "case {service_code}/{name}: the dimension is published as an attribute \
+                 name although no product attribute carries that key, got {document}"
+            );
+        }
+        let mut alphabetical = names.clone();
+        alphabetical.sort();
+        assert_ne!(
+            names, alphabetical,
+            "case {service_code}: the published list must be in the published order, not \
+             sorted"
+        );
+
+        // Every published name resolves to a value set, and a value read off the list
+        // selects products when a client filters on it — so iterating the list never
+        // leads to a dead end.
+        for name in &names {
+            let values = all_attribute_values(
+                &router,
+                &json!({ "ServiceCode": service_code, "AttributeName": name }),
+            )
+            .await;
+            assert!(
+                !values.is_empty(),
+                "case {service_code}/{name}: a published attribute name must resolve to \
+                 the published value set, got {values:?}"
+            );
+            // Bounded: the first rows of the set are enough to show the vocabulary is
+            // usable as a filter, and the whole set is covered by
+            // `every_published_attribute_value_selects_a_priced_product`.
+            for value in values.iter().take(3) {
+                let selected = offer_documents(
+                    &ok(
+                        &router,
+                        "GetProducts",
+                        &json!({
+                            "ServiceCode": service_code,
+                            "Filters": [
+                                { "Type": "TERM_MATCH", "Field": name, "Value": value },
+                            ],
+                            "MaxResults": 1,
+                        }),
+                    )
+                    .await,
+                );
+                assert!(
+                    !selected.is_empty(),
+                    "case {service_code}/{name}={value}: a published value must select at \
+                     least one product"
+                );
+                assert!(
+                    offer_dimension_values(&selected[0], name)
+                        .iter()
+                        .any(|published| published == value),
+                    "case {service_code}/{name}={value}: a selected product must publish \
+                     the filtered value, got {}",
+                    selected[0]
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_instance_type_vocabulary_publishes_a_family_behind_its_sizes() {
+    let router = router();
+
+    let published = all_attribute_values(
+        &router,
+        &json!({ "ServiceCode": "AmazonEC2", "AttributeName": "instanceType" }),
+    )
+    .await;
+
+    // Rows: instance families the catalog prices, across generations and processors, and
+    // beyond the one the published vocabulary was read against. A family is priced per
+    // family rather than per size — that is what a dedicated host is — so the family's
+    // own name is a published `instanceType` value, published behind the sizes it covers
+    // and selecting the host product when a client filters on it.
+    for family in ["a1", "t3", "m5", "c5", "r6g", "x1e"] {
+        let family_at = published
+            .iter()
+            .position(|value| value == family)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {family}: the published instance-type vocabulary must carry the \
+                     family-level value, got {} values",
+                    published.len()
+                )
+            });
+        let last_member = published
+            .iter()
+            .rposition(|value| is_member_of(value, family))
+            .unwrap_or_else(|| panic!("case {family}: expected sized values of the family"));
+        assert_eq!(
+            family_at,
+            last_member + 1,
+            "case {family}: the family must be published directly behind its sizes, got \
+             it at {family_at} with its last size at {last_member}"
+        );
+
+        let selected = offer_documents(
+            &ok(
+                &router,
+                "GetProducts",
+                &json!({
+                    "ServiceCode": "AmazonEC2",
+                    "Filters": [
+                        { "Type": "TERM_MATCH", "Field": "instanceType", "Value": family },
+                    ],
+                    "MaxResults": 5,
+                }),
+            )
+            .await,
+        );
+        assert!(
+            !selected.is_empty(),
+            "case {family}: the family-level value must select the products priced per \
+             family"
+        );
+        for document in &selected {
+            assert_eq!(
+                offer_attribute(document, "instanceType").as_deref(),
+                Some(family),
+                "case {family}: a selected product must be priced for the family itself, \
+                 got {document}"
+            );
+            assert_eq!(
+                document
+                    .pointer("/product/productFamily")
+                    .and_then(Value::as_str),
+                Some("Dedicated Host"),
+                "case {family}: what is priced per instance family is the dedicated host, \
+                 got {document}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_offer_document_s_own_dimensions_are_published_attributes() {
+    let router = router();
+
+    // The term type and the product family are dimensions of the offer DOCUMENT, so a
+    // client enumerates and filters on them like any product attribute. Rows differ in
+    // the service: one priced under reservations as well as on demand, and one priced on
+    // demand only.
+    let cases: &[(&str, &[&str])] = &[
+        ("AmazonEC2", &["OnDemand", "Reserved"]),
+        ("AmazonS3", &["OnDemand"]),
+        ("AWSLambda", &["OnDemand"]),
+    ];
+
+    for &(service_code, expected_term_types) in cases {
+        let term_types = all_attribute_values(
+            &router,
+            &json!({ "ServiceCode": service_code, "AttributeName": "termType" }),
+        )
+        .await;
+        assert_eq!(
+            term_types,
+            expected_term_types
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<String>>(),
+            "case {service_code}/termType: expected the term types the service's offers \
+             are priced under, got {term_types:?}"
+        );
+
+        let families = all_attribute_values(
+            &router,
+            &json!({ "ServiceCode": service_code, "AttributeName": "productFamily" }),
+        )
+        .await;
+        assert!(
+            !families.is_empty(),
+            "case {service_code}/productFamily: expected the families the service prices"
+        );
+
+        // Filtering on either dimension selects exactly the products that publish the
+        // filtered value.
+        for term_type in &term_types {
+            let selected = offer_documents(
+                &ok(
+                    &router,
+                    "GetProducts",
+                    &json!({
+                        "ServiceCode": service_code,
+                        "Filters": [
+                            { "Type": "TERM_MATCH", "Field": "termType", "Value": term_type },
+                        ],
+                        "MaxResults": 5,
+                    }),
+                )
+                .await,
+            );
+            assert!(
+                !selected.is_empty(),
+                "case {service_code}/termType={term_type}: expected products priced under \
+                 that term type"
+            );
+            for document in &selected {
+                assert!(
+                    document.pointer(&format!("/terms/{term_type}")).is_some(),
+                    "case {service_code}/termType={term_type}: a selected product must be \
+                     priced under that term type, got {document}"
+                );
+            }
+        }
+        for family in families.iter().take(3) {
+            let selected = offer_documents(
+                &ok(
+                    &router,
+                    "GetProducts",
+                    &json!({
+                        "ServiceCode": service_code,
+                        "Filters": [
+                            { "Type": "TERM_MATCH", "Field": "productFamily", "Value": family },
+                        ],
+                        "MaxResults": 5,
+                    }),
+                )
+                .await,
+            );
+            assert!(
+                !selected.is_empty(),
+                "case {service_code}/productFamily={family}: expected products in that \
+                 family"
+            );
+            for document in &selected {
+                assert_eq!(
+                    document
+                        .pointer("/product/productFamily")
+                        .and_then(Value::as_str),
+                    Some(family.as_str()),
+                    "case {service_code}/productFamily={family}: a selected product must \
+                     be in the filtered family, got {document}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_published_attribute_is_matched_without_regard_to_case() {
+    let router = router();
+
+    // Rows: dimensions the service's own products are priced along and the two
+    // dimensions of the offer document, each asked for under a casing other than the
+    // published one — the same comparison this API makes on a filter VALUE. The same
+    // dimension answers the same published vocabulary whichever casing names it, so a
+    // client that asks for it under another casing discovers the values rather than an
+    // empty set.
+    let cases: &[(&str, &str, &str)] = &[
+        ("AmazonEC2", "operatingSystem", "OperatingSystem"),
+        ("AmazonEC2", "instanceType", "INSTANCETYPE"),
+        ("AmazonEC2", "location", "Location"),
+        ("AmazonEC2", "termType", "TermType"),
+        ("AmazonEC2", "productFamily", "productfamily"),
+        ("AmazonS3", "storageClass", "storageclass"),
+    ];
+
+    for (service_code, published, asked) in cases.iter().copied() {
+        let expected = all_attribute_values(
+            &router,
+            &json!({ "ServiceCode": service_code, "AttributeName": published }),
+        )
+        .await;
+        assert!(
+            !expected.is_empty(),
+            "case {service_code}/{published}: the published name must have a vocabulary"
+        );
+        let actual = all_attribute_values(
+            &router,
+            &json!({ "ServiceCode": service_code, "AttributeName": asked }),
+        )
+        .await;
+        assert_eq!(
+            actual, expected,
+            "case {service_code}/{asked}: expected the vocabulary of {published}, got \
+             {actual:?}"
+        );
+
+        // And a filter that names the dimension in that casing selects the same
+        // products, so a value discovered under one casing is usable under the other.
+        let value = &expected[0];
+        for field in [published, asked] {
+            let selected = offer_documents(
+                &ok(
+                    &router,
+                    "GetProducts",
+                    &json!({
+                        "ServiceCode": service_code,
+                        "Filters": [
+                            { "Type": "TERM_MATCH", "Field": field, "Value": value },
+                        ],
+                        "MaxResults": 1,
+                    }),
+                )
+                .await,
+            );
+            assert!(
+                !selected.is_empty(),
+                "case {service_code}/{field}={value}: the filter must select the products \
+                 publishing that value"
+            );
+        }
+    }
+
+    // A name that differs from a published one by more than case still selects nothing:
+    // the comparison ignores case, it does not guess a name.
+    for asked in ["operating_system", "instanceTypes", "instanceType "] {
+        let values = all_attribute_values(
+            &router,
+            &json!({ "ServiceCode": "AmazonEC2", "AttributeName": asked }),
+        )
+        .await;
+        assert!(
+            values.is_empty(),
+            "case {asked}: a name the service does not publish must answer no values, \
+             got {values:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_price_query_s_next_token_continues_that_same_filtered_set() {
+    let router = router();
+
+    // The filter set a cost-estimation client pins to price one platform of one instance
+    // type across the Regions it is offered in: more products than a bounded page, so
+    // the answer carries a token for exactly as long as products remain and the walk
+    // covers that set once, in one order. Rows differ in the page size.
+    let query = json!({
+        "ServiceCode": "AmazonEC2",
+        "Filters": [
+            { "Type": "TERM_MATCH", "Field": "instanceType", "Value": "t3.nano" },
+            { "Type": "TERM_MATCH", "Field": "operatingSystem", "Value": "Linux" },
+            { "Type": "TERM_MATCH", "Field": "tenancy", "Value": "Shared" },
+            { "Type": "TERM_MATCH", "Field": "capacitystatus", "Value": "Used" },
+            { "Type": "TERM_MATCH", "Field": "preInstalledSw", "Value": "NA" },
+        ],
+    });
+    let matched: Vec<String> = all_offer_documents(&router, &query)
+        .await
+        .iter()
+        .map(product_sku)
+        .collect();
+    assert!(
+        matched.len() > 1,
+        "the filter set must select more than one product for this rule to span, got \
+         {matched:?}"
+    );
+
+    for page_size in [1_i64, 2, 5] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut body = query.clone();
+        body["MaxResults"] = json!(page_size);
+        loop {
+            let page = ok(&router, "GetProducts", &body).await;
+            walked.extend(offer_documents(&page).iter().map(product_sku));
+            let token = page
+                .get("NextToken")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            assert_eq!(
+                token.is_some(),
+                walked.len() < matched.len(),
+                "case MaxResults={page_size}: expected a NextToken while {} of {} \
+                 products remain, got {page}",
+                matched.len().saturating_sub(walked.len()),
+                matched.len()
+            );
+            match token {
+                Some(token) => body["NextToken"] = json!(token),
+                None => break,
+            }
+            assert!(
+                walked.len() <= matched.len(),
+                "case MaxResults={page_size}: paging must terminate, got {} of {}",
+                walked.len(),
+                matched.len()
+            );
+        }
+        assert_eq!(
+            walked, matched,
+            "case MaxResults={page_size}: the token must continue the same filtered set"
+        );
+    }
+
+    // A token describes the query it was minted for: replaying it against another filter
+    // set is refused rather than continuing an unrelated set.
+    let first = ok(
+        &router,
+        "GetProducts",
+        &{
+            let mut body = query.clone();
+            body["MaxResults"] = json!(1);
+            body
+        },
+    )
+    .await;
+    let token = first
+        .get("NextToken")
+        .and_then(Value::as_str)
+        .expect("the bounded page carries a token")
+        .to_string();
+    let (status, parsed) = call(
+        &router,
+        "GetProducts",
+        &json!({
+            "ServiceCode": "AmazonEC2",
+            "Filters": [
+                { "Type": "TERM_MATCH", "Field": "instanceType", "Value": "m5.large" },
+            ],
+            "NextToken": token,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a token minted for another filter set must be refused, got {status} with {parsed}"
+    );
+    assert_eq!(
+        parsed.get("__type").and_then(Value::as_str),
+        Some("InvalidNextTokenException"),
+        "a token minted for another filter set must be refused as an invalid token, got \
+         {parsed}"
+    );
 }

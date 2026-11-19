@@ -23,7 +23,7 @@
 //! published bandwidth and the instance's normalized size, exactly as this catalog's
 //! rates are its own.
 
-use super::{normalization_size_factor, InstanceTypeSeed};
+use super::{instance_family_name, normalization_size_factor, InstanceTypeSeed};
 
 /// The value the Price List API publishes for an attribute that does not apply to a
 /// product.
@@ -418,9 +418,7 @@ static UNPUBLISHED_FAMILY_SHAPE: FamilyShapeSeed = FamilyShapeSeed::new(
 
 /// The published specifications of the family an instance type belongs to.
 fn family_shape(instance_type: &str) -> &'static FamilyShapeSeed {
-    let family = instance_type
-        .split_once('.')
-        .map_or(instance_type, |(family, _size)| family);
+    let family = instance_family_name(instance_type);
     EC2_FAMILY_SHAPES
         .iter()
         .find(|seed| seed.family == family)

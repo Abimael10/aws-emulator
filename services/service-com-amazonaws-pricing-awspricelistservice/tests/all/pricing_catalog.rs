@@ -18,9 +18,9 @@ use service_com_amazonaws_pricing_awspricelistservice::state::{
 
 use super::pricing_support::{
     all_attribute_values, all_offer_documents, attribute_values, call, column_of, csv_rows, err,
-    is_loopback, list_member, offer_attribute, offer_documents, ok, product_sku, router,
-    router_with_engine, service_codes, service_entry, split_https_url, ARN_PREFIX, JAN_1_2022,
-    JAN_1_2024, JUL_1_2024,
+    is_loopback, list_member, offer_attribute, offer_dimension_values, offer_documents, ok,
+    product_sku, router, router_with_engine, service_codes, service_entry, split_https_url,
+    ARN_PREFIX, JAN_1_2022, JAN_1_2024, JUL_1_2024,
 };
 
 #[tokio::test]
@@ -71,8 +71,9 @@ async fn describe_services_reports_the_catalog_and_its_attribute_names() {
         );
 
         // Every attribute name reported must have values, and those values must be the
-        // ones the service's own products carry. Both sides are PAGED to the end: a
-        // service whose products or values outrun one page would otherwise be compared
+        // ones the service's own products publish for it — a product metadata attribute
+        // or one of the offer document's own dimensions. Both sides are PAGED to the end:
+        // a service whose products or values outrun one page would otherwise be compared
         // on two different page boundaries.
         let documents =
             all_offer_documents(&router, &json!({ "ServiceCode": service_code })).await;
@@ -89,7 +90,7 @@ async fn describe_services_reports_the_catalog_and_its_attribute_names() {
             );
             let from_products: BTreeSet<String> = documents
                 .iter()
-                .filter_map(|document| offer_attribute(document, name))
+                .flat_map(|document| offer_dimension_values(document, name))
                 .collect();
             assert_eq!(
                 values.iter().cloned().collect::<BTreeSet<String>>(),

@@ -241,6 +241,27 @@ pub fn offer_attribute(document: &Value, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The values one offer document publishes for an attribute name: its own
+/// `product.attributes` entry, or — for the dimensions of the DOCUMENT that the service
+/// publishes as attribute names too — the family it reports and the term types that price
+/// it, which the document carries beside `attributes` rather than inside it.
+pub fn offer_dimension_values(document: &Value, name: &str) -> Vec<String> {
+    match name {
+        "productFamily" => document
+            .pointer("/product/productFamily")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .into_iter()
+            .collect(),
+        "termType" => document
+            .get("terms")
+            .and_then(Value::as_object)
+            .map(|terms| terms.keys().cloned().collect())
+            .unwrap_or_default(),
+        _ => offer_attribute(document, name).into_iter().collect(),
+    }
+}
+
 /// The header row and the dimension rows of a price-list file's CSV form.
 ///
 /// The published layout carries the file header in leading `name,value` lines, so the

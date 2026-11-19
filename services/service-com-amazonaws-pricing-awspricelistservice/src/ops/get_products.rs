@@ -276,10 +276,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// Whether `product` satisfies `filter`.
 ///
-/// The field names a product metadata attribute, or the pseudo-field `ServiceCode`,
-/// which the model documents alongside the attribute names. The comparison is the one
-/// the filter's type documents: `TERM_MATCH`/`EQUALS` an exact value, `CONTAINS` a
-/// substring, and `ANY_OF`/`NONE_OF` membership of the filter's comma-separated list.
+/// The field names one of the attributes the service publishes — a product metadata
+/// attribute, or one of the offer document's own dimensions (the product family and the
+/// term type, which [`crate::state::Product::values_of`] reads) — or the pseudo-field
+/// `ServiceCode`, which the model documents alongside the attribute names. The comparison
+/// is the one the filter's type documents: `TERM_MATCH`/`EQUALS` an exact value,
+/// `CONTAINS` a substring, and `ANY_OF`/`NONE_OF` membership of the filter's
+/// comma-separated list. A product satisfies the filter when ANY value it publishes for
+/// the field does, which matters only for the one attribute a product takes more than one
+/// value for.
 ///
 /// A filter's VALUE is compared to the attribute's without regard to case, so a client
 /// that forwards an attribute value cased differently from the way the catalog publishes
@@ -290,21 +295,27 @@ fn filter_matches(
     catalog: &crate::state::ServiceCatalog,
     product: &crate::state::Product,
 ) -> bool {
-    let field_value: Option<&str> = if filter.field == "ServiceCode" {
-        Some(catalog.service_code.as_str())
+    let field_values: Vec<&str> = if filter.field == "ServiceCode" {
+        vec![catalog.service_code.as_str()]
     } else {
-        product.attributes.get(&filter.field).map(String::as_str)
+        product.values_of(&filter.field)
     };
 
     match filter.r#type.as_str() {
-        "TERM_MATCH" | "EQUALS" => {
-            field_value.is_some_and(|value| same_value(value, &filter.value))
-        }
-        "CONTAINS" => field_value.is_some_and(|value| contains_value(value, &filter.value)),
-        "ANY_OF" => field_value.is_some_and(|value| any_of(&filter.value, value)),
+        "TERM_MATCH" | "EQUALS" => field_values
+            .iter()
+            .any(|value| same_value(value, &filter.value)),
+        "CONTAINS" => field_values
+            .iter()
+            .any(|value| contains_value(value, &filter.value)),
+        "ANY_OF" => field_values
+            .iter()
+            .any(|value| any_of(&filter.value, value)),
         // A product that carries the field at all must not hold one of the listed
         // values; one that does not carry it holds none of them.
-        "NONE_OF" => field_value.is_none_or(|value| !any_of(&filter.value, value)),
+        "NONE_OF" => !field_values
+            .iter()
+            .any(|value| any_of(&filter.value, value)),
         _ => false,
     }
 }

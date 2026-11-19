@@ -8,10 +8,11 @@
 //! first touch) and every handler derives its answer from it. No handler writes here.
 //!
 //! The one catalog is also what keeps the operations consistent with each other:
-//! `DescribeServices.AttributeNames` is [`ServiceCatalog::attribute_names`],
-//! `GetAttributeValues` is the distinct values those attributes take on the SAME
-//! products `GetProducts` returns, and the `PriceListArn` `ListPriceLists` reports is
-//! the key `GetPriceListFileUrl` resolves.
+//! `DescribeServices.AttributeNames` is the service's PUBLISHED attribute-name list
+//! ([`published_attribute_names`]), `GetAttributeValues` is the distinct values an
+//! attribute takes on the SAME products `GetProducts` returns — every published name
+//! among them — and the `PriceListArn` `ListPriceLists` reports is the key
+//! `GetPriceListFileUrl` resolves.
 //!
 //! The price-list FILES are served by the emulator itself: the first
 //! `GetPriceListFileUrl` opens one loopback-bound HTTP listener through
@@ -153,6 +154,30 @@ const CSV_DIMENSION_COLUMNS: &[&str] = &[
     "ProductFamily",
 ];
 
+/// `productFamily`: the dimension of the offer DOCUMENT that names the family a product
+/// belongs to. The Price List API publishes it as an attribute name of the service — a
+/// client enumerates and filters on it like any product attribute — while the document
+/// carries it beside `attributes` rather than inside it.
+pub const PRODUCT_FAMILY_ATTRIBUTE: &str = "productFamily";
+
+/// `termType`: the dimension of the offer document that names which kind of term prices a
+/// product. Published as an attribute name of the service, like
+/// [`PRODUCT_FAMILY_ATTRIBUTE`], and the one attribute a product takes more than one
+/// value for — a product priced both ways is published under both term types.
+pub const TERM_TYPE_ATTRIBUTE: &str = "termType";
+
+/// The term type of the on-demand prices in an offer document (`terms.OnDemand`), which
+/// every product in this catalog is priced under.
+const ON_DEMAND_TERM_TYPE: &str = "OnDemand";
+
+/// The term type of the reservation prices in an offer document (`terms.Reserved`),
+/// carried only by a product AWS also offers under a reservation.
+const RESERVED_TERM_TYPE: &str = "Reserved";
+
+/// The character that separates a family-level value from a member of that family in the
+/// names this API publishes (`a1` and `a1.large`).
+const FAMILY_SEPARATOR: u8 = b'.';
+
 /// One product offer in the catalog.
 ///
 /// `offer_json` is the `aws_v1` product-offer document `GetProducts` returns in
@@ -165,8 +190,40 @@ pub struct Product {
     pub sku: String,
     /// The product metadata, keyed by attribute name (e.g. `instanceType`).
     pub attributes: BTreeMap<String, String>,
+    /// The family the offer document reports this product in (`Compute Instance`).
+    pub product_family: String,
+    /// The term types the offer document prices this product under, in the order the
+    /// document carries them.
+    pub term_types: Vec<String>,
     /// The full product-offer JSON document for this product.
     pub offer_json: String,
+}
+
+impl Product {
+    /// The values this product publishes for `attribute_name`: its own metadata
+    /// attribute, or one of the offer document's own dimensions
+    /// ([`PRODUCT_FAMILY_ATTRIBUTE`], [`TERM_TYPE_ATTRIBUTE`]).
+    ///
+    /// A product publishes at most one value for a metadata attribute and one for its
+    /// family, and one per term type that prices it — so this answers a LIST, and an
+    /// attribute the product does not carry answers an empty one.
+    pub fn values_of(&self, attribute_name: &str) -> Vec<&str> {
+        if let Some(value) = self.attributes.get(attribute_name) {
+            return vec![value.as_str()];
+        }
+        if attribute_name.eq_ignore_ascii_case(PRODUCT_FAMILY_ATTRIBUTE) {
+            return vec![self.product_family.as_str()];
+        }
+        if attribute_name.eq_ignore_ascii_case(TERM_TYPE_ATTRIBUTE) {
+            return self.term_types.iter().map(String::as_str).collect();
+        }
+        self.attributes
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(attribute_name))
+            .map(|(_, value)| value.as_str())
+            .into_iter()
+            .collect()
+    }
 }
 
 /// Everything the catalog holds for one service code.
@@ -174,37 +231,137 @@ pub struct Product {
 pub struct ServiceCatalog {
     /// The service's code, e.g. `AmazonEC2`.
     pub service_code: String,
-    /// The attribute names available for this service, sorted.
+    /// The attribute names this service publishes, in its published order.
     pub attribute_names: Vec<String>,
     /// The service's products, in catalog order (stable, so pagination is stable).
     pub products: Vec<Product>,
 }
 
 impl ServiceCatalog {
-    /// Build a catalog whose `attribute_names` is the union of the attribute names
-    /// its products carry, so every name `DescribeServices` reports has at least one
-    /// value for `GetAttributeValues` to return.
+    /// Build a catalog whose `attribute_names` is the list the Price List API PUBLISHES
+    /// for the service, in its published order ([`published_attribute_names`]).
     fn new(service_code: &str, products: Vec<Product>) -> Self {
-        let attribute_names: BTreeSet<String> = products
-            .iter()
-            .flat_map(|product| product.attributes.keys().cloned())
-            .collect();
         Self {
             service_code: service_code.to_string(),
-            attribute_names: attribute_names.into_iter().collect(),
+            attribute_names: published_attribute_names(service_code, &products),
             products,
         }
     }
 
-    /// The distinct values `attribute_name` takes across this service's products,
-    /// in sorted order. Derived on read — never stored a second time.
+    /// The distinct values `attribute_name` takes across this service's products, in the
+    /// order the API publishes them ([`published_value_order`]). Derived on read — never
+    /// stored a second time.
     pub fn attribute_values(&self, attribute_name: &str) -> Vec<String> {
-        self.products
-            .iter()
-            .filter_map(|product| product.attributes.get(attribute_name).cloned())
-            .collect::<BTreeSet<String>>()
-            .into_iter()
-            .collect()
+        published_value_order(
+            self.products
+                .iter()
+                .flat_map(|product| product.values_of(attribute_name))
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+}
+
+/// The attribute names `DescribeServices` publishes for a service, in the order it
+/// publishes them.
+///
+/// The list is the service's published DISCOVERY list — what a client reads before it
+/// calls `GetAttributeValues` or builds a `GetProducts` filter — so it is NOT the
+/// alphabetical projection of the attribute keys the catalog's products happen to carry.
+/// It opens with the dimensions the API publishes for every service
+/// ([`COMMON_ATTRIBUTE_NAMES`]), including the two the offer DOCUMENT carries rather than
+/// its `attributes` map, continues with the dimensions that service's own products are
+/// priced along ([`SERVICE_ATTRIBUTE_NAMES`]), and then names every other attribute its
+/// products publish — so a client finds every dimension it can filter a price lookup by,
+/// and every name here resolves to a non-empty `GetAttributeValues` vocabulary.
+fn published_attribute_names(service_code: &str, products: &[Product]) -> Vec<String> {
+    let published: Vec<&str> = COMMON_ATTRIBUTE_NAMES
+        .iter()
+        .copied()
+        .chain(
+            SERVICE_ATTRIBUTE_NAMES
+                .iter()
+                .find(|(code, _)| *code == service_code)
+                .map_or(DEFAULT_SERVICE_ATTRIBUTE_NAMES, |(_, names)| *names)
+                .iter()
+                .copied(),
+        )
+        .collect();
+    let others: BTreeSet<&str> = products
+        .iter()
+        .flat_map(|product| product.attributes.keys().map(String::as_str))
+        .filter(|name| !published.contains(name))
+        .collect();
+    published
+        .iter()
+        .chain(others.iter())
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+/// The dimensions EVERY service publishes, in published order: the kind of term a price
+/// is published under, the family the product belongs to, the service that prices it and
+/// the location it is priced in.
+const COMMON_ATTRIBUTE_NAMES: &[&str] = &[
+    TERM_TYPE_ATTRIBUTE,
+    PRODUCT_FAMILY_ATTRIBUTE,
+    "servicecode",
+    "location",
+];
+
+/// The dimensions a service's OWN products are priced along, in published order, keyed by
+/// service code: what a price lookup for that service selects a product by, published
+/// after the dimensions every service publishes.
+const SERVICE_ATTRIBUTE_NAMES: &[(&str, &[&str])] = &[
+    (EC2_SERVICE_CODE, &["instanceType", "usagetype"]),
+    (S3_SERVICE_CODE, &["storageClass", "usagetype"]),
+];
+
+/// The dimensions published for a service [`SERVICE_ATTRIBUTE_NAMES`] does not name: the
+/// usage its products are billed under, which every service in this catalog prices by.
+const DEFAULT_SERVICE_ATTRIBUTE_NAMES: &[&str] = &["usagetype"];
+
+/// The order the Price List API publishes an attribute's values in: ascending, except that
+/// a value which NAMES A FAMILY the service also publishes members of — the instance type
+/// `a1` beside `a1.large`, where a member extends the family's name with
+/// [`FAMILY_SEPARATOR`] and a size — is published BEHIND that family's members, the way
+/// the published instance-type vocabulary lists a family after the sizes it covers.
+fn published_value_order(values: BTreeSet<String>) -> Vec<String> {
+    let ascending: Vec<String> = values.into_iter().collect();
+    let mut ordered: Vec<(String, String)> = ascending
+        .iter()
+        .enumerate()
+        .map(|(position, value)| {
+            (
+                published_order_key(&ascending[position + 1..], value),
+                value.clone(),
+            )
+        })
+        .collect();
+    ordered.sort();
+    ordered.into_iter().map(|(_, value)| value).collect()
+}
+
+/// The key a value sorts at: the value itself, or — when `rest`, the values ascending
+/// after it, holds a member of the family this value names — a key just behind every
+/// member of that family.
+fn published_order_key(rest: &[String], value: &str) -> String {
+    let names_a_family = rest
+        .iter()
+        // Every value that extends this one is contiguous with it in ascending order.
+        .take_while(|other| other.starts_with(value))
+        .any(|other| other.as_bytes().get(value.len()) == Some(&FAMILY_SEPARATOR));
+    if names_a_family {
+        // A member sorts as `<family><separator><size>`, so a key of the family's name,
+        // the separator and the highest character sorts behind every member of the family
+        // and ahead of the next family's values.
+        format!(
+            "{value}{}{}",
+            char::from(FAMILY_SEPARATOR),
+            char::MAX
+        )
+    } else {
+        value.to_string()
     }
 }
 
@@ -1171,11 +1328,25 @@ fn build_seeded_catalog() -> (
 /// it, so the document can never disagree with the attributes the filters read.
 fn product_from_draft(service_code: &str, draft: ProductDraft) -> Product {
     let offer_json = offer_document(service_code, &draft);
+    let term_types = term_types_of(&draft);
     Product {
         sku: draft.sku,
         attributes: draft.attributes,
+        product_family: draft.product_family.to_string(),
+        term_types,
         offer_json,
     }
+}
+
+/// The term types an offer document prices a product under: the on-demand prices every
+/// product in this catalog carries, and the reservation prices only a product AWS also
+/// offers under a reservation does — the `terms` blocks [`offer_document`] writes.
+fn term_types_of(draft: &ProductDraft) -> Vec<String> {
+    let mut term_types = vec![ON_DEMAND_TERM_TYPE.to_string()];
+    if draft.reserved {
+        term_types.push(RESERVED_TERM_TYPE.to_string());
+    }
+    term_types
 }
 
 /// The `aws_v1` product-offer document for one product: the `product` block with its
@@ -1189,14 +1360,14 @@ fn product_from_draft(service_code: &str, draft: ProductDraft) -> Product {
 fn offer_document(service_code: &str, draft: &ProductDraft) -> String {
     let mut terms = serde_json::Map::new();
     terms.insert(
-        "OnDemand".to_string(),
+        ON_DEMAND_TERM_TYPE.to_string(),
         serde_json::Value::Object(on_demand_term(draft)),
     );
     // Only a product AWS also offers under a reservation carries a Reserved term; one
     // priced on demand only carries none, so the block is absent rather than empty.
     if draft.reserved {
         terms.insert(
-            "Reserved".to_string(),
+            RESERVED_TERM_TYPE.to_string(),
             serde_json::Value::Object(reserved_terms(draft)),
         );
     }
@@ -1958,6 +2129,15 @@ fn instance_type_seed(name: &str) -> Option<&'static InstanceTypeSeed> {
         .find(|seed| seed.instance_type == name)
 }
 
+/// The instance FAMILY part of an instance type's name (`t3` of `t3.nano`), which is the
+/// `instanceType` value the API publishes for what is priced per family rather than per
+/// size — a dedicated host.
+pub(crate) fn instance_family_name(instance_type: &str) -> &str {
+    instance_type
+        .split_once(char::from(FAMILY_SEPARATOR))
+        .map_or(instance_type, |(family, _size)| family)
+}
+
 /// The normalized-unit factor AWS publishes for the SIZES in an instance type's name.
 ///
 /// AWS documents the normalization factors reserved-instance size flexibility is
@@ -2178,6 +2358,91 @@ const EC2_COMPUTE_PLAN: &[ComputePlan] = &[
     ComputePlan::new("cn-north-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
     ComputePlan::new("cn-northwest-1", PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
 ];
+
+// --- AmazonEC2: dedicated hosts --------------------------------------------
+
+/// The `productFamily` of the product that prices a whole host dedicated to one instance
+/// family.
+///
+/// A dedicated host runs the SIZES of one instance family, so the Price List API prices
+/// it per family and its `instanceType` attribute is the family's own name (`a1`, `t3`)
+/// rather than one size of it. That is what publishes family-level `instanceType` values
+/// beside the per-size ones, and what a `TERM_MATCH` filter on a family name selects.
+const DEDICATED_HOST_FAMILY: &str = "Dedicated Host";
+
+/// The usage a dedicated host's hours are billed under, which is what its `usagetype`
+/// names it by (`HostBoxUsage:<family>`).
+const HOST_USAGE_KIND: &str = "HostBoxUsage";
+
+/// The `operation` a dedicated host's hours are billed under: the host is charged for the
+/// hardware rather than for a licensed platform, so it carries the plain instance-launch
+/// operation whatever its instances run.
+const HOST_OPERATION: &str = "RunInstances";
+
+/// The instance families AWS offers a dedicated host for, which is what decides whether
+/// the published `instanceType` vocabulary carries a family's own name beside its sizes.
+///
+/// The source is the published dedicated-host capacity table: AWS supports hosts on the
+/// families from the second generation on, and among the burstable families on `t3` only,
+/// so the earliest generations and the other burstable families are priced per size only.
+const DEDICATED_HOST_FAMILIES: &[&str] = &[
+    "a1", "c3", "c4", "c5", "c5a", "c5n", "c6g", "c6i", "d2", "g4dn", "i3", "m4", "m5", "m5a",
+    "m5n", "m6g", "m6i", "p3", "r4", "r5", "r6g", "t3", "x1", "x1e", "z1d",
+];
+
+/// The dedicated-host products of one Region: one per instance family the Region prices
+/// instance types for AND AWS offers a host for, priced at the on-demand rate of the
+/// LARGEST instance of that family — the size that fills the whole host.
+fn dedicated_host_drafts(
+    region: &RegionSeed,
+    instance_types: &[&'static InstanceTypeSeed],
+) -> Vec<ProductDraft> {
+    let mut largest_of_family: BTreeMap<&str, &'static InstanceTypeSeed> = BTreeMap::new();
+    for instance in instance_types {
+        let family = instance_family_name(instance.instance_type);
+        if !DEDICATED_HOST_FAMILIES.contains(&family) {
+            continue;
+        }
+        largest_of_family
+            .entry(family)
+            .and_modify(|held| {
+                if held.rate_e10 < instance.rate_e10 {
+                    *held = instance;
+                }
+            })
+            .or_insert(instance);
+    }
+    largest_of_family
+        .into_iter()
+        .map(|(family, largest)| ProductDraft {
+            sku: sku(&["Host", family, region.code]),
+            product_family: DEDICATED_HOST_FAMILY,
+            unit: "Hrs",
+            rate_e10: scale(largest.rate_e10, region.rate_percent),
+            // AWS also offers a host under a reservation, so its offer document carries
+            // both term types, exactly as a compute instance's does.
+            reserved: true,
+            attributes: attributes(vec![
+                ("instanceFamily", largest.instance_family.to_string()),
+                ("instanceType", family.to_string()),
+                ("location", region.location.to_string()),
+                ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
+                ("operation", HOST_OPERATION.to_string()),
+                ("physicalProcessor", largest.physical_processor.to_string()),
+                ("regionCode", region.code.to_string()),
+                ("servicecode", EC2_SERVICE_CODE.to_string()),
+                ("servicename", EC2_SERVICE_NAME.to_string()),
+                (
+                    "usagetype",
+                    format!(
+                        "{}{HOST_USAGE_KIND}:{family}",
+                        region.usage_prefix
+                    ),
+                ),
+            ]),
+        })
+        .collect()
+}
 
 // --- AmazonEC2: EBS volumes ------------------------------------------------
 
@@ -2480,24 +2745,16 @@ const GENERIC_SERVICES: &[GenericServiceSeed] = &[
 // --- Building the products --------------------------------------------------
 
 /// The seeded `AmazonEC2` products: the on-demand compute instances the Price List
-/// API prices per instance type, Region and operating system, and the EBS volume
-/// products that carry the `volumeType` attribute the model's `Filter` example names.
+/// API prices per instance type, Region and operating system, the dedicated hosts it
+/// prices per instance FAMILY, and the EBS volume products that carry the `volumeType`
+/// attribute the model's `Filter` example names.
 fn ec2_products() -> Vec<Product> {
     let mut products = Vec::new();
     for plan in EC2_COMPUTE_PLAN {
         let Some(region) = region(plan.region_code) else {
             continue;
         };
-        // A plan prices either every type the catalog publishes or exactly the types it
-        // names, of those the catalog publishes.
-        let instance_types: Vec<&'static InstanceTypeSeed> = match plan.instance_types {
-            PlannedInstanceTypes::Every => EC2_INSTANCE_TYPES.iter().collect(),
-            PlannedInstanceTypes::Named(names) => names
-                .iter()
-                .filter_map(|name| instance_type_seed(name))
-                .collect(),
-        };
-        for instance in instance_types {
+        for instance in planned_instance_types(plan) {
             // The attributes of the instance's own hardware, which every SKU of that type
             // publishes whatever platform, tenancy or capacity status it prices.
             let shape = instance_shape_attributes(instance);
@@ -2580,7 +2837,29 @@ fn ec2_products() -> Vec<Product> {
             }
         }
     }
+    // AWS prices a Dedicated Host per instance family, in every Region the family's
+    // instances are offered in.
+    for plan in EC2_COMPUTE_PLAN {
+        let Some(region) = region(plan.region_code) else {
+            continue;
+        };
+        for draft in dedicated_host_drafts(region, &planned_instance_types(plan)) {
+            products.push(product_from_draft(EC2_SERVICE_CODE, draft));
+        }
+    }
     products
+}
+
+/// The instance types one [`ComputePlan`] prices: either every type the catalog
+/// publishes or exactly the types the plan names, of those the catalog publishes.
+fn planned_instance_types(plan: &ComputePlan) -> Vec<&'static InstanceTypeSeed> {
+    match plan.instance_types {
+        PlannedInstanceTypes::Every => EC2_INSTANCE_TYPES.iter().collect(),
+        PlannedInstanceTypes::Named(names) => names
+            .iter()
+            .filter_map(|name| instance_type_seed(name))
+            .collect(),
+    }
 }
 
 /// The `Storage` product of one EBS volume type in one Region: the volume itself,

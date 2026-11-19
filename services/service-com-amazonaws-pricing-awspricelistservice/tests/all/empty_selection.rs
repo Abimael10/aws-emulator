@@ -72,12 +72,13 @@ async fn a_selection_that_matches_nothing_is_an_empty_page() {
             "PriceList",
         ),
         (
-            "GetProducts with a published attribute name in the wrong case",
+            "GetProducts with a filter field that differs from a published name by more \
+             than case",
             "GetProducts",
             json!({
                 "ServiceCode": "AmazonEC2",
                 "Filters": [
-                    { "Type": "TERM_MATCH", "Field": "OperatingSystem", "Value": "Linux" },
+                    { "Type": "TERM_MATCH", "Field": "operating_system", "Value": "Linux" },
                 ],
             }),
             "PriceList",
@@ -135,9 +136,10 @@ async fn a_selection_that_matches_nothing_is_an_empty_page() {
             "AttributeValues",
         ),
         (
-            "GetAttributeValues for a published attribute in the wrong case",
+            "GetAttributeValues for a name that differs from a published one by more \
+             than case",
             "GetAttributeValues",
-            json!({ "ServiceCode": "AmazonEC2", "AttributeName": "InstanceType" }),
+            json!({ "ServiceCode": "AmazonEC2", "AttributeName": "instanceType " }),
             "AttributeValues",
         ),
         (
