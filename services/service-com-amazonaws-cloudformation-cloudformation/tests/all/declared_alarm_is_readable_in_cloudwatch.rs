@@ -273,7 +273,15 @@ fn template_of(row: &Row) -> String {
 ///
 /// `MaxRecords` is one, so a name the store held more than one entry for would really be
 /// paged rather than reported in a single answer.
-async fn alarms_named(router: &MultiServiceRouter, case: &str, name: &str) -> Vec<Value> {
+///
+/// `pub(crate)` so the suite over the whole lifecycle of a declared alarm
+/// (`declared_alarm_lifecycle_in_cloudwatch.rs`) asks CloudWatch what it holds under a name
+/// through this one reader rather than spelling the paging of a `DescribeAlarms` read again.
+pub(crate) async fn alarms_named(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> Vec<Value> {
     let mut found: Vec<Value> = Vec::new();
     let mut token: Option<String> = None;
     for _ in 0..PAGE_LIMIT {
