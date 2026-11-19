@@ -54,17 +54,34 @@ pub fn updated_optional_member<T>(
 /// `DocumentVersion`.
 #[must_use]
 pub fn replace_requires_member_message(member: &str) -> String {
-    let clause = format!(
+    replace_requires_members_message(std::slice::from_ref(&member))
+}
+
+/// [`replace_requires_member_message`] over EVERY member such a request left out.
+///
+/// A create may require several members, and the boundary walk states one clause per member
+/// that must not be null inside a single envelope rather than stopping at the first — so a
+/// replacing update missing several of them is refused the same way, naming each in the
+/// order the model declares them.
+#[must_use]
+pub fn replace_requires_members_message(members: &[&str]) -> String {
+    let clauses: Vec<String> = members.iter().copied().map(missing_member_clause).collect();
+    // The envelope answers `None` only for NO clause at all, and a caller refuses a request
+    // only over a member it found missing, so the fallback is unreachable; it keeps the
+    // clauses themselves rather than panicking on an envelope that could not be worded.
+    ::service_common::validation_message::envelope_over(&clauses)
+        .unwrap_or_else(|| clauses.concat())
+}
+
+/// The clause the boundary walk states over a member that must not be null, worded for
+/// `member`.
+fn missing_member_clause(member: &str) -> String {
+    format!(
         "Value null at '{member}' failed to satisfy constraint: {}",
         ::service_common::validation_message::requirement(
             ::aws_smithy_schema_server::constraints::ViolationKind::MissingRequiredMember
         )
-    );
-    // The envelope answers `None` only for NO clause at all, and there is exactly one here,
-    // so the fallback is unreachable; it keeps the clause itself rather than panicking on an
-    // envelope that could not be worded.
-    ::service_common::validation_message::envelope_over(std::slice::from_ref(&clause))
-        .unwrap_or(clause)
+    )
 }
 
 #[cfg(test)]

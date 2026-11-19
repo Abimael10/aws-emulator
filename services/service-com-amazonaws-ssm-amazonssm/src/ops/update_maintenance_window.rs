@@ -1,15 +1,32 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateMaintenanceWindow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateMaintenanceWindow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Modify a maintenance window already created — the edit half of this service's
+//! maintenance-window slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateMaintenanceWindow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! It writes the one store `CreateMaintenanceWindow` minted the window into and
+//! `GetMaintenanceWindow` and `DescribeMaintenanceWindows` report it out of
+//! ([`crate::state::maintenance_windows`]), so what this update persists is what a later
+//! read reports. The window's identity does not move: no input member carries the minted
+//! id, the Region or the instant the create recorded, so the update edits the schedule, the
+//! span and the labels alone and records when the window was last written.
+//!
+//! A window is reached through the endpoint of ONE Region, so the id is resolved against
+//! that Region's records: an id this endpoint holds no window for is refused
+//! `DoesNotExistException` and nothing is written — which is also what a window a delete
+//! already removed is refused with.
+//!
+//! "Only specified parameters are modified", and under `Replace` "optional fields that
+//! aren't specified are set to null" while the members `CreateMaintenanceWindow` requires
+//! are required here too — the one reading of an omitted member every update of this
+//! service holds to ([`crate::state::replacing_update`]).
+//!
+//! The schedule, its zone and the cutoff taken against the duration are held to the SAME
+//! rules the create is held to ([`crate::state::maintenance_windows::schedule_violation`],
+//! [`crate::state::maintenance_windows::schedule_timezone_violation`],
+//! [`crate::state::maintenance_windows::cutoff_violation`]), decided on the window this
+//! update WOULD leave behind — a window that could never open cannot be updated into
+//! existence either, and such a request writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +159,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::maintenance_windows::CREATED_ENABLED;
+use crate::state::replacing_update::{
+    replace_requires_members_message, updated_member, updated_optional_member,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -211,18 +233,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateMaintenanceWindow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateMaintenanceWindowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `WindowId`'s presence, length and pattern, `Name`'s pattern and length,
+        // `Schedule`'s length, `Duration`'s 1..24 range, `Cutoff`'s 0..23 range and
+        // `ScheduleOffset`'s 1..6 range are MODELLED constraints the centralized walk has
+        // already refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateMaintenanceWindowErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the maintenance window store is unavailable".to_string()),
+            })
+        })?;
+
+        // "If True, then all fields that are required by the CreateMaintenanceWindow
+        // operation are also required for this API request": a replacing update leaving out
+        // one of them is missing a member it was required to carry — decided before anything
+        // is read, so such a request cannot touch the window, and stated over EVERY member
+        // it left out in the order the model declares them.
+        let replace = input.replace.unwrap_or(false);
+        if replace {
+            let missing = missing_replacement_members(&input);
+            if !missing.is_empty() {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    replace_requires_members_message(&missing),
+                ));
+            }
+        }
+
+        // A window lives in the Region its endpoint names, which is the signed credential
+        // scope's — so the id is resolved against that Region's records and against no
+        // other's.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(mut record) = store.maintenance_window(&region, &input.window_id).cloned() else {
+            return Err(UpdateMaintenanceWindowErrorModeled::DoesNotExistException(
+                DoesNotExistException {
+                    message: Some(
+                        crate::state::maintenance_windows::maintenance_window_not_found_message(
+                            &input.window_id,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "Only specified parameters are modified": every member the request supplied is
+        // applied to the window the store holds and every member it left out keeps the value
+        // that window holds — unless the update replaces the window, where a member left out
+        // is cleared to what a create that named it nothing would have persisted
+        // ([`updated_member`]). The members the create REQUIRES carry no such nothing, so a
+        // replacing update was refused above for leaving one out and a patch that leaves one
+        // out keeps what is stored.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateMaintenanceWindow"))
+        // The window's identity is not among them: no input member carries the minted id or
+        // the Region, so both stay as the create persisted them, as do the idempotency token
+        // that create carried, the window's tags, when it was created and which create of
+        // this store minted it — the order a listing walks the account's windows in.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        if let Some(schedule) = input.schedule {
+            record.schedule = schedule;
+        }
+        if let Some(duration) = input.duration {
+            record.duration = duration;
+        }
+        if let Some(cutoff) = input.cutoff {
+            record.cutoff = cutoff;
+        }
+        if let Some(allow_unassociated_targets) = input.allow_unassociated_targets {
+            record.allow_unassociated_targets = allow_unassociated_targets;
+        }
+        record.description = updated_optional_member(input.description, record.description, replace);
+        // Modelled as plain strings, so each bounding instant is held exactly as the request
+        // stated it.
+        record.start_date = updated_optional_member(input.start_date, record.start_date, replace);
+        record.end_date = updated_optional_member(input.end_date, record.end_date, replace);
+        record.schedule_timezone =
+            updated_optional_member(input.schedule_timezone, record.schedule_timezone, replace);
+        record.schedule_offset =
+            updated_optional_member(input.schedule_offset, record.schedule_offset, replace);
+        // A create carries no `Enabled` member at all, so the nothing a create could have
+        // stated for it is the enabled window it mints ([`CREATED_ENABLED`]).
+        record.enabled = updated_member(input.enabled, record.enabled, CREATED_ENABLED, replace);
+        record.modified_date = now;
+
+        // The schedule, its zone and the cutoff taken against the duration are the rules
+        // every WRITE of a window is held to, decided on the window this update would leave
+        // behind rather than on the request alone: a member the request left out keeps
+        // whatever the window already stated, so the pair that matters is the stored one.
+        // The model declares no error for any of the three, so each is a 400
+        // `ValidationException`, raised before anything is written.
+        if let Some(why) = crate::state::maintenance_windows::schedule_violation(&record.schedule) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+        if let Some(why) = crate::state::maintenance_windows::schedule_timezone_violation(
+            record.schedule_timezone.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+        if let Some(why) =
+            crate::state::maintenance_windows::cutoff_violation(record.cutoff, record.duration)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+
+        // What the update persisted is what this call reports and what a later read reports.
+        // A member the window now carries nothing for is reported as nothing at all, the way
+        // a read of a window whose create named none of them does.
+        let output = UpdateMaintenanceWindowOutput {
+            window_id: Some(record.window_id.clone()),
+            name: Some(record.name.clone()),
+            description: record.description.clone(),
+            start_date: record.start_date.clone(),
+            end_date: record.end_date.clone(),
+            schedule: Some(record.schedule.clone()),
+            schedule_timezone: record.schedule_timezone.clone(),
+            schedule_offset: record.schedule_offset,
+            duration: Some(record.duration),
+            cutoff: record.cutoff,
+            allow_unassociated_targets: record.allow_unassociated_targets,
+            enabled: record.enabled,
+        };
+        store.insert_maintenance_window(record);
+        Ok(output)
     }
+}
+
+/// The members `CreateMaintenanceWindow` requires that a REPLACING update left out, in the
+/// order the model declares them and in the spelling this service's refusals carry a member
+/// in — its modelled name with a lowercase first letter, the way `documentVersion` names
+/// `DocumentVersion`.
+///
+/// Those members are the required ones of `CreateMaintenanceWindowRequest`
+/// (`smithy_query(query="operation",operation="CreateMaintenanceWindow")`: `Name`,
+/// `Schedule`, `Duration`, `Cutoff` and `AllowUnassociatedTargets`) that this update also
+/// carries. The create's remaining members are not among them: `WindowId` is required of
+/// this request anyway, and no input member of this update carries a tag or an idempotency
+/// token at all, so a replacing update leaves the tags and the token the create persisted
+/// alone.
+fn missing_replacement_members(input: &UpdateMaintenanceWindowInput) -> Vec<&'static str> {
+    [
+        ("name", input.name.is_none()),
+        ("schedule", input.schedule.is_none()),
+        ("duration", input.duration.is_none()),
+        ("cutoff", input.cutoff.is_none()),
+        (
+            "allowUnassociatedTargets",
+            input.allow_unassociated_targets.is_none(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(member, missing)| missing.then_some(member))
+    .collect()
 }
