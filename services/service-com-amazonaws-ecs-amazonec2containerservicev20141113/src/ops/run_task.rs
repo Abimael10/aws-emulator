@@ -824,7 +824,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
             let schedule =
                 crate::state::placement_schedule(awaiting_capacity, &attachments, now);
-            let containers = guard.mint_containers(
+            let mut containers = guard.mint_containers(
                 &region,
                 &cluster_name,
                 &task_id,
@@ -838,6 +838,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(placement) => placement.hosts.get(placed).cloned(),
                 None => guard.select_task_host(&cluster_name, launch_type.as_deref()),
             };
+            // The HOST ports a task placed on a container instance has its containers bound
+            // to, recorded once the host is known ([`crate::state::host_port_bindings`]).
+            guard.bind_task_host_ports(
+                container_instance_arn.as_deref(),
+                &definition.network_mode,
+                &definition.container_definitions,
+                &mut containers,
+            );
 
             let record = crate::state::TaskRecord {
                 task_arn: task_arn.clone(),

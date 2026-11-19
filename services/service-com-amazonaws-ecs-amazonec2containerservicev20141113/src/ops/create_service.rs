@@ -635,6 +635,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })?
         };
 
+        // "The name or full Amazon Resource Name (ARN) of the IAM role that allows Amazon ECS
+        // to make calls to your load balancer on your behalf": a create that hands over a role
+        // has the load-balancer binding validated UNDER that role — Amazon ECS assumes it and
+        // reads the target group with it — so whether the role may perform what the
+        // registration performs there is a question for the service that owns those actions and
+        // that group (`…elasticloadbalancingv2…::state::withheld_target_registration_action`).
+        // Asked HERE, before this service's store is locked, for the same reason the reads
+        // above are: the answer is read out of another service's store under that store's own
+        // lock.
+        //
+        // A create that hands over NO role takes the Amazon ECS service-linked role, which is
+        // AWS's own and carries the permissions the registration needs, so there is nothing of
+        // the account's to judge. `UpdateService` has no role member at all — the role a
+        // service registers through is fixed when it is made — so this is the one call the
+        // question is put for.
+        let registration_withheld = match crate::state::requested_role_arn(input.role.as_deref()) {
+            Some(role_arn) => target_group_arns.iter().any(|target_group_arn| {
+                ::service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::
+                    withheld_target_registration_action(
+                        &*self.engine,
+                        &role_arn,
+                        target_group_arn,
+                    )
+                    .is_some()
+            }),
+            None => false,
+        };
+
         // "The details of the service discovery registry to associate with this service":
         // the registry is a CLOUD MAP service, so whether this one can be registered into is
         // READ from that service's store here — before ours is locked, for the same reason
@@ -945,6 +973,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // ...and the validation Amazon ECS makes of that binding is made UNDER the role the
+        // create handed over, so a role that may not read the group back and register a target
+        // into it is a binding Amazon ECS could not validate at all — which is what it says,
+        // naming the member and the role's permissions and nothing of the value the request
+        // carried ([`crate::state::UNVALIDATED_TARGET_GROUP_MESSAGE`]).
+        if registration_withheld {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::UNVALIDATED_TARGET_GROUP_MESSAGE.to_string()),
                 },
             )
             .into());

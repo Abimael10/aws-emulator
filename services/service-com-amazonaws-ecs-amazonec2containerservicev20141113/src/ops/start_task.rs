@@ -566,13 +566,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // only its start, and the attach of any interface it was allocated, are still
             // owed ([`crate::state::placement_schedule`]).
             let schedule = crate::state::placement_schedule(false, &attachments, now);
-            let containers = guard.mint_containers(
+            let mut containers = guard.mint_containers(
                 &region,
                 &cluster_name,
                 &task_id,
                 &task_arn,
                 &definition.container_definitions,
                 schedule.last_status,
+            );
+            // The HOST ports this task's containers are bound to on the instance the caller
+            // named ([`crate::state::host_port_bindings`]).
+            guard.bind_task_host_ports(
+                Some(&container_instance_arn),
+                &definition.network_mode,
+                &definition.container_definitions,
+                &mut containers,
             );
             // The zone of the capacity the caller named, read off the instance's own
             // reported attributes — as is the architecture its containers run on.

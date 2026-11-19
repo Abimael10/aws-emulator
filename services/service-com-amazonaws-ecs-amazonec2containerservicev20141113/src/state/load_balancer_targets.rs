@@ -35,11 +35,14 @@
 //! registration a `RegisterTargets` CALLER made is never touched (it carries no
 //! `RegisteredTarget::registered_for`, which is what tells the two apart).
 //!
-//! An `instance` target group receives nothing here: an instance target is the Amazon EC2
-//! instance the task runs on, and the scheduler in this emulator places a service's task
-//! without choosing one of the cluster's container instances
-//! (`TaskRecord::container_instance_arn` is `None` for such a task), so there is no instance
-//! to register and none is invented.
+//! A task of any OTHER network mode is reached at the host that runs it instead, so it is a
+//! target of an `instance` group: the target is the Amazon EC2 instance of the container
+//! instance the scheduler placed it on (`Task$containerInstanceArn`, "the ARN of the container
+//! instance that hosts the task"), on the HOST port that task's container had the binding's
+//! `containerPort` bound to ([`super::host_port_bindings`]) — the port the load balancer can
+//! reach the container at, which under the `bridge` network mode is not the container's own.
+//! A task placed on no container instance at all (a Fargate placement without an interface)
+//! is reached through nothing this store holds, so no target is invented for it.
 //!
 //! LOCK ORDER: [`reconcile_target_group_registrations`] takes the Amazon EC2 store's lock
 //! and then the Elastic Load Balancing v2 store's, and holds no guard of THIS service's
@@ -87,8 +90,15 @@ pub const MAX_GUARDING_GROUPS: usize = 16;
 pub struct TargetRegistration {
     /// The target group the binding named (`LoadBalancer$targetGroupArn`).
     pub target_group_arn: String,
-    /// The address the load balancer reaches the task at: the private IPv4 address of the
-    /// elastic network interface the task was allocated.
+    /// The `TargetType` this registration is for, which is the one the task's own placement
+    /// decides: `ip` for a task reached at its own interface, `instance` for one reached at
+    /// the host that runs it. A group of the other type holds no registration of it — the
+    /// pairing `CreateService` itself holds a binding to
+    /// ([`crate::state::required_target_type`]).
+    pub target_type: &'static str,
+    /// What the load balancer reaches the task at: the private IPv4 address of the elastic
+    /// network interface the task was allocated, or the id of the Amazon EC2 instance that
+    /// hosts it.
     pub target_id: String,
     /// The port the target receives traffic on — `LoadBalancer$containerPort`, "the port on
     /// the container to associate with the load balancer" — and `None` for a binding that
@@ -141,10 +151,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// again when it stops, so a task that is still provisioning or starting — and one that
     /// is stopping or stopped — is not a target traffic is sent to.
     ///
-    /// Only a task that HOLDS an elastic network interface is registered, because the
-    /// address a target of an `awsvpc` service is reached at is that interface's: a task
-    /// whose network mode gives it none is reached at its container instance's address,
-    /// which this store does not hold (see this module's header).
+    /// WHAT each task is registered as is the target type its own placement decides: a task
+    /// holding an elastic network interface is an `ip` target at that interface's address, and
+    /// a task placed on a container instance is an `instance` target of that instance on the
+    /// host port its container was bound to (see this module's header). A task that is neither
+    /// is reached through nothing this store holds and is registered nowhere.
     ///
     /// The bindings are the PLACEMENT's: a task a task set placed registers into that task
     /// set's own `loadBalancers`, which is the configuration it was placed under, rather
@@ -168,13 +179,17 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 {
                     continue;
                 }
-                let Some(address) = task
+                let interface_address = task
                     .attachments
                     .iter()
-                    .find_map(AttachmentRecord::private_ipv4_address)
-                else {
-                    continue;
-                };
+                    .find_map(AttachmentRecord::private_ipv4_address);
+                // The Amazon EC2 instance of the container instance that hosts the task,
+                // which is what an `instance` target names.
+                let host_instance_id = task
+                    .container_instance_arn
+                    .as_deref()
+                    .and_then(|arn| self.container_instances.get(arn))
+                    .map(|held| held.ec2_instance_id.clone());
                 let subnet_id = task
                     .attachments
                     .iter()
@@ -186,25 +201,71 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 // The security groups governing that address, read off the placement that
                 // placed the task — once for the task, for the same reason.
                 let guarding_groups = self.placement_security_groups(service, task);
+                // The ports a target reached at the task's HOST answers on, which are the
+                // host's and not the container's.
+                let host_ports = ServedPorts::from(self.task_bound_host_ports(task));
                 for binding in self.placement_load_balancers(service, task) {
                     let Some(arn) = binding.target_group_arn.as_deref() else {
                         continue;
                     };
-                    if !seen.insert((
-                        arn.to_string(),
-                        address.to_string(),
-                        binding.container_port,
-                    )) {
+                    // One registration per binding, as the target type the task's own
+                    // placement decides.
+                    let placed = match (interface_address, host_instance_id.as_deref()) {
+                        (Some(address), _) => Some((
+                            TARGET_TYPE_IP,
+                            address.to_string(),
+                            binding.container_port,
+                            subnet_id.clone(),
+                            served_ports.clone(),
+                            GuardingGroups::clone(&guarding_groups),
+                        )),
+                        (None, Some(instance_id)) => self
+                            .bound_host_port(
+                                task,
+                                binding.container_name.as_deref(),
+                                binding.container_port,
+                            )
+                            .map(|host_port| {
+                                (
+                                    TARGET_TYPE_INSTANCE,
+                                    instance_id.to_string(),
+                                    Some(host_port),
+                                    // The zone of an instance target is the INSTANCE's, which
+                                    // this store holds no subnet of: carried as none rather
+                                    // than as a zone read off another placement's subnet.
+                                    None,
+                                    ServedPorts::clone(&host_ports),
+                                    // The groups governing an instance are Amazon EC2's own
+                                    // records of that instance and not this placement's, so
+                                    // this registration declares none.
+                                    GuardingGroups::from(Vec::new()),
+                                )
+                            }),
+                        (None, None) => None,
+                    };
+                    let Some((
+                        target_type,
+                        target_id,
+                        port,
+                        subnet_id,
+                        served_ports,
+                        guarding_groups,
+                    )) = placed
+                    else {
+                        continue;
+                    };
+                    if !seen.insert((arn.to_string(), target_id.clone(), port)) {
                         continue;
                     }
                     registrations.push(TargetRegistration {
                         target_group_arn: arn.to_string(),
-                        target_id: address.to_string(),
-                        port: binding.container_port,
-                        subnet_id: subnet_id.clone(),
+                        target_type,
+                        target_id,
+                        port,
+                        subnet_id,
                         task_arn: task.task_arn.clone(),
-                        served_ports: served_ports.clone(),
-                        guarding_groups: GuardingGroups::clone(&guarding_groups),
+                        served_ports,
+                        guarding_groups,
                     });
                 }
             }
@@ -437,12 +498,13 @@ pub fn reconcile_target_group_registrations<Eng: Send + Sync + 'static>(
                 group.deregister(&key, now);
             }
         }
-        // An address is a target of an `ip` group alone — the type the binding of an
-        // `awsvpc` service's task definition is held to (`crate::state::required_target_type`).
-        if group.target_type != TARGET_TYPE_IP {
-            continue;
-        }
         for (key, registration) in wanted {
+            // A registration is only ever made in a group of the type it is FOR: an address
+            // is a target of an `ip` group and an instance of an `instance` one, which is the
+            // pairing a binding is held to (`crate::state::required_target_type`).
+            if group.target_type != registration.target_type {
+                continue;
+            }
             // Whether the group ALREADY holds this registration decides how to read the
             // answer below: a key that is already there is the steady state, while a key
             // that is not and still is not afterwards is a registration the group had no

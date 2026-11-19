@@ -208,6 +208,14 @@ pub use load_balancer_endpoint::{
     certificate_key_material_directory, open_load_balancer_endpoint, LoadBalancerEndpoint,
 };
 
+/// Whether an IAM ROLE another service was handed may perform the actions a target-group
+/// REGISTRATION performs here.
+pub mod role_target_group_access;
+
+pub use role_target_group_access::{
+    withheld_target_registration_action, TARGET_REGISTRATION_ACTIONS,
+};
+
 /// The FORM a caller-supplied identifier carries — a target id, and the ARN of a resource
 /// this API addresses — read before anything is looked up.
 pub mod identifier_syntax;

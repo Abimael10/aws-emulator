@@ -3879,7 +3879,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             now,
         );
         let schedule = placement_schedule(awaiting_capacity, &attachments, now);
-        let containers = self.mint_containers(
+        let mut containers = self.mint_containers(
             region,
             &service.cluster_name,
             &task_id,
@@ -3930,6 +3930,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let availability_zone = self.task_availability_zone(
             container_instance_arn.as_deref(),
             &configured_subnets(placement.network_configuration.as_ref()),
+        );
+        // The HOST ports the containers of a task placed on a container instance are bound to,
+        // recorded once the host is known ([`super::host_port_bindings`]).
+        self.bind_task_host_ports(
+            container_instance_arn.as_deref(),
+            &definition.network_mode,
+            &definition.container_definitions,
+            &mut containers,
         );
         // The architecture the capacity this placement chose runs
         // ([`task_cpu_architecture`]).

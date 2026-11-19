@@ -303,6 +303,11 @@ mod store;
 mod circuit_breaker;
 pub use circuit_breaker::*;
 
+/// The HOST ports the containers of a task placed on a container instance are bound to —
+/// `Container$networkBindings`, and what an `instance` target of such a task is reached at.
+mod host_port_bindings;
+pub use host_port_bindings::*;
+
 /// The Elastic Load Balancing v2 targets a load-balanced service's RUNNING tasks occupy,
 /// and the drain a stopped task's target leaves through.
 mod load_balancer_targets;
