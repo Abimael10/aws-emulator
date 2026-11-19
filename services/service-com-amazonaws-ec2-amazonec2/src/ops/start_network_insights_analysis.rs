@@ -6,7 +6,10 @@
 //! `running`, carrying the id, the ARN and the start date the store derives, the accounts
 //! and ARNs the request scopes it with, and the tags it assigns. The end of the analysis is
 //! owed to the clock rather than to this call, and a path the account does not hold is
-//! refused rather than analyzed.
+//! refused rather than analyzed — with the refusal the VALUE calls for
+//! ([`crate::state::network_insights_path_id_not_resolved`]): a value EC2 could never have
+//! issued a path id as is `InvalidParameterValue` naming the member, while an id in a form
+//! EC2 does issue is the path resource's own `InvalidNetworkInsightsPathId.NotFound`.
 //!
 //! Nothing here traces the path: "If the path is reachable, the operation returns the
 //! shortest feasible path" is a computation over the account's real network, which this
@@ -242,17 +245,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The ID of the path" (`NetworkInsightsPathId`): an id that names no path of the
-        // account is refused rather than analyzed. This operation ACTS on the one path it is
-        // given, so it states that the `NetworkInsightsPathId` it was given is not a valid
-        // one ([`state::invalid_network_insights_path_id_value`]) — one answer for every id
-        // it cannot resolve, whatever its form — where the describes, which SELECT paths by
-        // id, report the path's own not-found code.
+        // account is refused rather than analyzed, with whichever of this surface's two
+        // refusals the VALUE calls for ([`state::network_insights_path_id_not_resolved`]) —
+        // a value EC2 could never have issued a path id as is the parameter being wrong,
+        // while an id in a form EC2 does issue names a path that is not there.
         if replayed.is_none()
             && !store
                 .network_insights_paths
                 .contains_key(&spec.network_insights_path_id)
         {
-            return Err(state::invalid_network_insights_path_id_value(
+            return Err(state::network_insights_path_id_not_resolved(
                 &spec.network_insights_path_id,
             ));
         }

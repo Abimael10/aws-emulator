@@ -1117,8 +1117,10 @@ pub fn network_insights_analysis_payload_bytes(spec: &NetworkInsightsAnalysisSpe
 /// transit gateway family's refusals name their resource bare
 /// ([`invalid_transit_gateway_id_not_found`]). The ONE place it is worded, so every
 /// operation that resolves a `NetworkInsightsPathId` it holds no path for answers the same
-/// sentence. The id is the one the REQUEST sent, bounded by [`echoed_resource_id`] the way
-/// every refusal of this crate that echoes a caller-chosen id is.
+/// sentence — the not-found half of the pair
+/// [`network_insights_path_id_not_resolved`] chooses between. The id is the one the REQUEST
+/// sent, bounded by [`echoed_resource_id`] the way every refusal of this crate that echoes a
+/// caller-chosen id is.
 pub fn invalid_network_insights_path_id_not_found<E>(path_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
@@ -1127,25 +1129,45 @@ pub fn invalid_network_insights_path_id_not_found<E>(path_id: &str) -> Scaffolde
     )
 }
 
-/// Refuse a path id the operation ACTING on the one path it names cannot resolve: HTTP 400
+/// Refuse a value that is no path id EC2 could have ISSUED: HTTP 400
 /// `InvalidParameterValue`, naming the member that carried it and the value.
 ///
-/// Which of the two refusals EC2 answers for an id it cannot resolve is a fact of the
-/// OPERATION rather than of the id — the split
-/// [`invalid_network_insights_access_scope_id_value`] records for the Network Access Scope
-/// surface: the DESCRIBES, which select paths by id, answer this resource's own
-/// [`INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND`], while an operation that acts on the ONE
-/// path it is given — the delete, and the start of an analysis — states that the
-/// `NetworkInsightsPathId` it was given is not a valid one, one answer for every id it
-/// cannot resolve, whatever its form. This is the ONE place that second wording lives, so
-/// the operations and the suites that assert it cannot drift apart. The id is the one the
-/// REQUEST sent, bounded by [`echoed_resource_id`] the way every refusal of this crate that
-/// echoes a caller-chosen id is.
+/// The parameter-shape half of the pair [`network_insights_path_id_not_resolved`] chooses
+/// between — a value the request got wrong rather than a path that is not there. This is the
+/// ONE place that wording lives, so the operations and the suites that assert it cannot drift
+/// apart. The id is the one the REQUEST sent, bounded by [`echoed_resource_id`] the way every
+/// refusal of this crate that echoes a caller-chosen id is.
 pub fn invalid_network_insights_path_id_value<E>(path_id: &str) -> Scaffolded<E> {
     invalid_parameter_value(format!(
         "NetworkInsightsPathId ({}) is not valid",
         echoed_resource_id(path_id)
     ))
+}
+
+/// Refuse a `NetworkInsightsPathId` that resolved to no path of the account, with whichever
+/// of this surface's two refusals the VALUE calls for.
+///
+/// WHICH one EC2 answers is a fact of the id rather than of what the operation does with it:
+/// a value EC2 could never have issued a path id as — one outside the two published widths,
+/// one whose long form does not lead with `0`, or the all-zero placeholder, which is what
+/// [`issued_id_is_well_formed`] reads — is the parameter being wrong
+/// ([`invalid_network_insights_path_id_value`]), while an id in a form EC2 does issue names a
+/// path that is simply not there ([`invalid_network_insights_path_id_not_found`]). The
+/// recorded refusals of the operations that resolve ONE path id carry both halves: the
+/// placeholder id is answered with the parameter sentence and an id in the issued form with
+/// the resource's own not-found code, so neither reading can be a fact of the operation.
+///
+/// The ONE place that choice is made, so the start of an analysis and the delete of a path
+/// cannot answer the same value two ways. The DESCRIBES, which select paths by a LIST of ids
+/// at the request boundary, keep this resource's not-found code for every value that resolves
+/// to no path, whatever its form — the same contrast the instance surface keeps between its
+/// boundary and the operations that resolve one instance.
+pub fn network_insights_path_id_not_resolved<E>(path_id: &str) -> Scaffolded<E> {
+    if issued_id_is_well_formed(NETWORK_INSIGHTS_PATH_ID_PREFIX, path_id) {
+        invalid_network_insights_path_id_not_found(path_id)
+    } else {
+        invalid_network_insights_path_id_value(path_id)
+    }
 }
 
 /// Refuse an analysis id a request named that the account holds no analysis under: HTTP 400

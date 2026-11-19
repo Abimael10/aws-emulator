@@ -19,8 +19,12 @@
 //!    quoted template, which this suite pins as the contrast
 //!    ([`super::malformed_id_message_template`] owns that template).
 //! 2. AN UNKNOWN NETWORK INSIGHTS PATH is reported by the id ALONE — "<id> does not exist" —
-//!    by every operation that SELECTS paths with it, while the one that ACTS on the path it
-//!    is given states that the `NetworkInsightsPathId` it was given is not a valid one.
+//!    by every operation that resolves a `NetworkInsightsPathId` for an id in a form EC2
+//!    issues, while a value EC2 could never have issued one as is the parameter being wrong:
+//!    the operations that act on the ONE path they are given state that the
+//!    `NetworkInsightsPathId` they were given is not a valid one, and the describes, which
+//!    SELECT paths with a LIST of ids at the request boundary, keep the resource's own
+//!    not-found sentence for every value.
 //! 3. A MEMBER THAT HAS TO NAME A REGION is refused with "Region name '<value>' is invalid.",
 //!    a sentence about the VALUE rather than about the member it arrived in, so one wording
 //!    covers every such member of the service.
@@ -220,8 +224,9 @@ async fn the_request_boundary_keeps_its_own_template_for_the_same_values() {
 
 /// The operations that resolve a `NetworkInsightsPathId` by SELECTING paths with it, with the
 /// form field each names it under: the two describes, so the sentence belongs to the resource
-/// rather than to one handler. `StartNetworkInsightsAnalysis` ACTS on the one path it is
-/// given and answers the other refusal of the pair, which is asserted on its own below.
+/// rather than to one handler. The operations that ACT on the one path they are given — the
+/// start of an analysis and the delete — keep the same sentence for an id in a form EC2
+/// issues, which is asserted on its own below.
 fn path_resolvers(path_id: &str) -> Vec<(&'static str, Vec<Param>)> {
     vec![
         (
@@ -235,10 +240,11 @@ fn path_resolvers(path_id: &str) -> Vec<(&'static str, Vec<Param>)> {
     ]
 }
 
-/// RULE 2: a path id the account holds no path for is reported by the id ALONE by every
-/// operation that SELECTS paths with it, while the start of an analysis — which acts on the
-/// one path it is given — states that the `NetworkInsightsPathId` it was given is not valid;
-/// and a refused call leaves the account's paths as they were.
+/// RULE 2: a path id in a form EC2 issues that the account holds no path for is reported by
+/// the id ALONE by every operation that resolves it — the describes that SELECT paths with it
+/// and the start of an analysis, which acts on the one path it is given — while a value EC2
+/// could never have issued a path id as is the parameter being wrong, worded with the member
+/// and the value; and a refused call leaves the account's paths as they were.
 #[tokio::test]
 async fn an_unknown_network_insights_path_is_reported_by_its_id_alone() {
     let router = emulator();
@@ -262,10 +268,10 @@ async fn an_unknown_network_insights_path_is_reported_by_its_id_alone() {
             )
             .await;
         }
-        // The start of an analysis acts on the ONE path it is given, so it states that the
-        // `NetworkInsightsPathId` it was given is not a valid one — one answer for every id
-        // it cannot resolve, whatever its form. Its model declares `ClientToken` `@required`,
-        // and a distinct token per row, so no row is answered as a replay of another.
+        // The start of an analysis resolves the ONE path it is given against the same store,
+        // so an id of a form EC2 issues gets that same sentence from it. Its model declares
+        // `ClientToken` `@required`, and a distinct token per row, so no row is answered as a
+        // replay of another.
         assert_refusal(
             &format!("{case} (StartNetworkInsightsAnalysis)"),
             &router,
@@ -274,6 +280,42 @@ async fn an_unknown_network_insights_path_is_reported_by_its_id_alone() {
                 param("NetworkInsightsPathId", path_id),
                 param("ClientToken", &format!("one-analysis-per-token-{path_id}")),
             ],
+            INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
+            &format!("{path_id} does not exist"),
+        )
+        .await;
+    }
+
+    // A value EC2 could never have issued a path id as is the OTHER sentence of the pair from
+    // the operations that act on the one path they are given, each row outside that form for
+    // a different reason: the all-zero placeholder the mint never produces, a long form whose
+    // leading digit no issued id carries, and free text.
+    let unissuable: [(&str, &str); 3] = [
+        ("the all-zero placeholder", "nip-00000000000000000"),
+        (
+            "a long form whose leading digit no issued id carries",
+            "nip-fedcba9876543210f",
+        ),
+        ("free text", "not-a-network-insights-path"),
+    ];
+    for (case, path_id) in unissuable {
+        assert_refusal(
+            &format!("{case} (StartNetworkInsightsAnalysis)"),
+            &router,
+            "StartNetworkInsightsAnalysis",
+            &[
+                param("NetworkInsightsPathId", path_id),
+                param("ClientToken", &format!("one-analysis-per-token-{path_id}")),
+            ],
+            INVALID_PARAMETER_VALUE,
+            &format!("NetworkInsightsPathId ({path_id}) is not valid"),
+        )
+        .await;
+        assert_refusal(
+            &format!("{case} (DeleteNetworkInsightsPath)"),
+            &router,
+            "DeleteNetworkInsightsPath",
+            &[param("NetworkInsightsPathId", path_id)],
             INVALID_PARAMETER_VALUE,
             &format!("NetworkInsightsPathId ({path_id}) is not valid"),
         )

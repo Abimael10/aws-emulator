@@ -769,9 +769,14 @@ async fn an_id_the_account_does_not_hold_is_refused() {
         );
     }
 
-    // The start ACTS on the one path it is given, so it states that the path id it was given
-    // is not a valid one — and stores nothing when it refuses.
-    for path in [UNKNOWN_PATH_ID, "not-a-path"] {
+    // The start resolves the ONE path it is given against the same store, and answers the
+    // refusal that id's FORM calls for: an id of a form EC2 issues names a path that is not
+    // there, a value outside that form is the parameter being wrong — and it stores nothing
+    // either way.
+    for (path, expected) in [
+        (UNKNOWN_PATH_ID, INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND),
+        ("not-a-path", INVALID_PARAMETER_VALUE),
+    ] {
         let (status, body) = start(
             &router,
             &start_params(path, &format!("unknown-{path}"), &[], Scoping::default()),
@@ -783,8 +788,8 @@ async fn an_id_the_account_does_not_hold_is_refused() {
         );
         assert_eq!(
             error_code(&body),
-            INVALID_PARAMETER_VALUE,
-            "case {path:?}: expected {INVALID_PARAMETER_VALUE}, got {body}"
+            expected,
+            "case {path:?}: expected {expected}, got {body}"
         );
         assert_eq!(
             stored_count(&engine),

@@ -12,10 +12,12 @@
 //!    held go back to the store's budget, and the path is gone for every later caller —
 //!    `StartNetworkInsightsAnalysis`, which resolves a path id against the same store, no
 //!    longer resolves it;
-//! 2. an id this account holds no path under is REFUSED — whatever its form, including the
-//!    id of a path an earlier call already deleted — with EC2's `InvalidParameterValue`
-//!    stating that the `NetworkInsightsPathId` it was given is not a valid one, and nothing
-//!    is removed; a request naming no path at all is refused at the boundary;
+//! 2. an id this account holds no path under is REFUSED — including the id of a path an
+//!    earlier call already deleted — with the refusal that id's FORM calls for: a value EC2
+//!    could never have issued a path id as gets EC2's `InvalidParameterValue` stating that
+//!    the `NetworkInsightsPathId` it was given is not a valid one, and an id in a form EC2
+//!    does issue gets the path resource's own `InvalidNetworkInsightsPathId.NotFound`; either
+//!    way nothing is removed, and a request naming no path at all is refused at the boundary;
 //! 3. a `DryRun` reports `DryRunOperation` and removes nothing, while `DryRun=false` is an
 //!    ordinary delete — and a dry run naming a path the account does not hold is refused
 //!    with that reason instead.
@@ -30,7 +32,8 @@
 use ec2::ops::types::{FilterPortRange, PathFilter, Tag};
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, NetworkInsightsPathSpec, DRY_RUN_OPERATION,
-    INVALID_PARAMETER_VALUE, NETWORK_INSIGHTS_ANALYSIS_ID_PREFIX, NETWORK_INSIGHTS_PATH_ID_PREFIX,
+    INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND, INVALID_PARAMETER_VALUE,
+    NETWORK_INSIGHTS_ANALYSIS_ID_PREFIX, NETWORK_INSIGHTS_PATH_ID_PREFIX,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -284,17 +287,18 @@ async fn deleting_a_path_removes_exactly_it_and_answers_its_id() {
             "case {case:?}: expected the start on the deleted path to be refused, got {status} \
              with body {body}"
         );
+        // The id was MINTED by this store, so it is of a form EC2 issues: the path it named
+        // is simply not there any more.
         assert_eq!(
             error_code(&body),
-            INVALID_PARAMETER_VALUE,
-            "case {case:?}: expected {INVALID_PARAMETER_VALUE} from the start on the deleted \
-             path, got {body}"
+            INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
+            "case {case:?}: expected {INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND} from the \
+             start on the deleted path, got {body}"
         );
         assert_eq!(
             error_message(&body),
-            format!("NetworkInsightsPathId ({path_id}) is not valid"),
-            "case {case:?}: expected the start's own sentence for a path it cannot resolve, \
-             got {body}"
+            format!("{path_id} does not exist"),
+            "case {case:?}: expected the id followed by the fixed text, got {body}"
         );
         let (status, body) = analysis_start(&router, &remaining[0], "another-path").await;
         assert_eq!(
@@ -393,16 +397,16 @@ async fn the_bytes_a_deleted_path_held_go_back_to_the_store() {
 // RULE 2: an id that names no path of the account
 // ---------------------------------------------------------------------------
 
-/// RULE 2: an id this account holds no path under is refused — HTTP 400
+/// RULE 2: a value EC2 could never have issued a path id as is refused — HTTP 400
 /// `InvalidParameterValue`, stating that the `NetworkInsightsPathId` it was given is not a
 /// valid one and naming the value the request sent — and nothing is removed. The rows are
-/// each way a value can fail to name a path of the account: both published EC2 id suffix
-/// lengths with digits nothing was created for, a suffix of neither length, an upper-case
-/// suffix, a non-hexadecimal suffix, the id of the analysis resource of the same surface,
-/// another resource type's id, free text, and a value carrying the characters that are
-/// significant in the XML envelope the refusal is written into.
+/// each way a value can fall outside the form EC2 issues a path id in: both published EC2 id
+/// suffix lengths carrying the all-zero placeholder no mint produces, a suffix of neither
+/// length, an upper-case suffix, a non-hexadecimal suffix, the id of the analysis resource of
+/// the same surface, another resource type's id, free text, and a value carrying the
+/// characters that are significant in the XML envelope the refusal is written into.
 #[tokio::test]
-async fn a_path_id_that_names_no_path_is_refused() {
+async fn a_value_that_is_no_path_id_is_refused_as_a_parameter() {
     let prefix = NETWORK_INSIGHTS_PATH_ID_PREFIX;
     let cases = [
         ("the long form", format!("{prefix}-00000000000000000")),
@@ -460,8 +464,9 @@ async fn a_path_id_that_names_no_path_is_refused() {
 }
 
 /// RULE 2: a delete is not idempotent — the path is gone after the first call, so a second
-/// call naming the same id names no path of the account and gets the same refusal any other
-/// unresolvable id gets, naming that id. One row per seeded path.
+/// call naming the same id names no path of the account and is refused naming that id. The
+/// id was minted by this store, so it is of a form EC2 issues and the refusal is the path
+/// resource's own not-found. One row per seeded path.
 #[tokio::test]
 async fn deleting_the_same_path_twice_refuses_the_second_call() {
     for (position, (case, _)) in fixtures().into_iter().enumerate() {
@@ -480,14 +485,17 @@ async fn deleting_the_same_path_twice_refuses_the_second_call() {
             status, 400,
             "case {case:?}: the second delete expected HTTP 400, got {status} with body {body}"
         );
+        // The id was MINTED by this store, so it is of a form EC2 issues: the second call
+        // names a path that is not there any more rather than a value that is no path id.
         assert_eq!(
             error_code(&body),
-            INVALID_PARAMETER_VALUE,
-            "case {case:?}: the second delete expected {INVALID_PARAMETER_VALUE}, got {body}"
+            INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
+            "case {case:?}: the second delete expected \
+             {INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND}, got {body}"
         );
         assert_eq!(
             error_message(&body),
-            format!("NetworkInsightsPathId ({path_id}) is not valid"),
+            format!("{path_id} does not exist"),
             "case {case:?}: the second delete must name {path_id}, got {body}"
         );
         assert_eq!(

@@ -6,14 +6,14 @@
 //! operation.
 //!
 //! `NetworkInsightsPathId` carries no modelled pattern, and this operation asks ONE question
-//! about it: does it resolve to a path this account holds? Every id that does not — whatever
-//! its form — is refused with EC2's `InvalidParameterValue` stating that the
-//! `NetworkInsightsPathId` it was given is not a valid one
-//! ([`crate::state::invalid_network_insights_path_id_value`]), rather than with the
-//! `Invalid<Resource>Id.NotFound` the describes and `StartNetworkInsightsAnalysis` answer:
-//! WHICH of the two EC2 answers for an id it cannot resolve is a fact of the operation and
-//! not of the id. A delete of a path that is already gone is therefore a refusal and not a
-//! silent success, so a caller can tell the deletion it performed from one it did not.
+//! about it: does it resolve to a path this account holds? An id that does not is refused
+//! with whichever of this surface's two refusals the VALUE calls for
+//! ([`crate::state::network_insights_path_id_not_resolved`]): a value EC2 could never have
+//! issued a path id as is `InvalidParameterValue` naming the member, while an id in a form
+//! EC2 does issue is the path resource's own `InvalidNetworkInsightsPathId.NotFound` — WHICH
+//! of the two EC2 answers is a fact of the id and not of the operation. A delete of a path
+//! that is already gone is therefore a refusal and not a silent success, so a caller can
+//! tell the deletion it performed from one it did not.
 //!
 //! `DryRun` is answered AFTER the id is resolved, the way the rest of this surface orders the
 //! two: a dry run naming a path the account does not hold is refused with that reason, and
@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused rather than answered as a delete that happened (see the module docs for
         // which refusal this operation answers with).
         if !store.network_insights_paths.contains_key(&path_id) {
-            return Err(state::invalid_network_insights_path_id_value(&path_id));
+            return Err(state::network_insights_path_id_not_resolved(&path_id));
         }
 
         // The request is one that would have succeeded, so the dry run stops HERE: "If you

@@ -31,9 +31,11 @@
 //! 4. A NETWORK THAT ALREADY HAS AN INTERNET GATEWAY refuses the `VpcId` it was given
 //!    (`InvalidParameterValue`), where a GATEWAY that is already attached somewhere is the
 //!    association conflict `Resource.AlreadyAssociated` naming the pair that holds.
-//! 5. THE START OF A PATH ANALYSIS, which acts on the ONE path it is given, answers
-//!    `InvalidParameterValue` for every path id it cannot resolve, while the describes, which
-//!    SELECT paths by id, keep the path's own `InvalidNetworkInsightsPathId.NotFound`.
+//! 5. THE START OF A PATH ANALYSIS answers the refusal the path id's own FORM calls for: a
+//!    value EC2 could never have issued a path id as is `InvalidParameterValue` naming the
+//!    member, and an id in a form EC2 does issue is the path's own
+//!    `InvalidNetworkInsightsPathId.NotFound` — which is also what the describes, which SELECT
+//!    paths by a list of ids at the request boundary, keep for every value.
 //! 6. AN ATTACHMENT ID OF THE PRINTED ID FORM IS LOOKED UP: one that names no attachment is
 //!    `InvalidAttachmentID.NotFound`, so a caller cleaning up reads "already detached", and
 //!    only a value OUTSIDE that form is
@@ -1007,27 +1009,62 @@ fn seed_path(engine: &engine::InMemoryEngine) -> String {
         .expect("the store holds room for one path")
 }
 
-/// RULE 5: `StartNetworkInsightsAnalysis` acts on the ONE path it is given, so every path id
-/// it cannot resolve is `InvalidParameterValue` stating that the `NetworkInsightsPathId` it
-/// was given is not valid, while the describes — which SELECT paths with the id — keep the
-/// path's own not-found code for the same value. The path the account does hold is analyzed,
-/// and the analysis reads back.
+/// RULE 5: `StartNetworkInsightsAnalysis` answers the refusal the path id's own FORM calls
+/// for: a value EC2 could never have issued a path id as is `InvalidParameterValue` stating
+/// that the `NetworkInsightsPathId` it was given is not valid, while an id in a form EC2 does
+/// issue names a path that is not there and is the path resource's own not-found code with
+/// the id and the fixed text. The describes, which SELECT paths with a list of ids, keep that
+/// not-found code for every value. The path the account does hold is analyzed, and the
+/// analysis reads back.
 ///
-/// The rows differ in the id's width and payload and in whether it is of the id form at all.
+/// The rows differ in the id's width and payload and in whether it is of the form EC2 issues
+/// a path id in at all.
 #[tokio::test]
-async fn the_start_of_an_analysis_refuses_a_path_id_it_cannot_resolve_as_a_parameter_value() {
+async fn the_start_of_an_analysis_refuses_a_path_id_by_the_form_of_the_id() {
     let (router, engine) = emulator();
     let path_id = seed_path(&engine);
 
-    // (case, a path id the account holds no path under)
+    // (case, a path id the account holds no path under, the code, the sentence)
     let cases = [
-        ("the long id form", "nip-0123456789abcdef0"),
-        ("another long-form payload", "nip-0fedcba987654321f"),
-        ("the short id form", "nip-0a1b2c3d"),
-        ("a value of no id form at all", "not-a-path-id"),
+        (
+            "the long id form",
+            "nip-0123456789abcdef0",
+            INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
+            "nip-0123456789abcdef0 does not exist".to_string(),
+        ),
+        (
+            "another long-form payload",
+            "nip-0fedcba987654321f",
+            INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
+            "nip-0fedcba987654321f does not exist".to_string(),
+        ),
+        (
+            "the short id form",
+            "nip-0a1b2c3d",
+            INVALID_NETWORK_INSIGHTS_PATH_ID_NOT_FOUND,
+            "nip-0a1b2c3d does not exist".to_string(),
+        ),
+        (
+            "a long form whose leading digit no issued id carries",
+            "nip-fffffffffffffffff",
+            INVALID_PARAMETER_VALUE,
+            "NetworkInsightsPathId (nip-fffffffffffffffff) is not valid".to_string(),
+        ),
+        (
+            "the all-zero placeholder",
+            "nip-00000000000000000",
+            INVALID_PARAMETER_VALUE,
+            "NetworkInsightsPathId (nip-00000000000000000) is not valid".to_string(),
+        ),
+        (
+            "a value of no id form at all",
+            "not-a-path-id",
+            INVALID_PARAMETER_VALUE,
+            "NetworkInsightsPathId (not-a-path-id) is not valid".to_string(),
+        ),
     ];
 
-    for (case, unknown) in cases {
+    for (case, unknown, expected_code, expected_message) in cases {
         let body = refused(
             case,
             &router,
@@ -1040,13 +1077,13 @@ async fn the_start_of_an_analysis_refuses_a_path_id_it_cannot_resolve_as_a_param
         .await;
         assert_eq!(
             error_code(&body),
-            INVALID_PARAMETER_VALUE,
-            "case {case:?}: expected {INVALID_PARAMETER_VALUE} from the start, got {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code} from the start, got {body}"
         );
         assert_eq!(
             error_message(&body),
-            format!("NetworkInsightsPathId ({unknown}) is not valid"),
-            "case {case:?}: expected the start's own sentence, got {body}"
+            expected_message,
+            "case {case:?}: expected {expected_message:?}, got {body}"
         );
 
         // The describes select paths BY the id, and keep the path's own not-found code.
