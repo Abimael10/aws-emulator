@@ -1907,10 +1907,14 @@ async fn the_largest_accepted_operand_moves_with_the_clauses_stated_beside_it() 
 /// what an SDK branches a non-retryable marshalling failure on.
 const SERIALIZATION_EXCEPTION: &str = "com.amazon.coral.service#SerializationException";
 
-/// What the refusal states where the member's modelled type holds other values (a list, a
-/// map, a structure) and the body carried something else there, or where a member modelled
-/// as a single value carried a collection.
+/// What the refusal states where the modelled type of a FIELD the body names holds other
+/// values (a list, a map, a structure) and the body carried something else there, or where a
+/// field modelled as a single value carried a collection.
 const UNEXPECTED_FIELD_TYPE: &str = "Unexpected field type";
+
+/// What the same defect states where the value stands INSIDE a collection instead — an
+/// element of a list or the value of a map entry — which no modelled member names.
+const UNEXPECTED_VALUE_TYPE: &str = "Unexpected value type in payload";
 
 /// The one assertion both halves of the class boundary are read through: the status, the
 /// error class as the wire spells it, and which body member carries the prose.
@@ -2094,10 +2098,12 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
             "NUMBER_VALUE cannot be converted to String".to_string(),
         ),
         (
+            // INSIDE the list, where no member names the value: the same defect, stated as
+            // the payload value it is rather than as a field.
             "a scalar where a tag set's element is a structure",
             "TagResource",
             json!({"ResourceArn": tagged.clone(), "Tags": ["k=v"]}),
-            UNEXPECTED_FIELD_TYPE.to_string(),
+            UNEXPECTED_VALUE_TYPE.to_string(),
         ),
         (
             "a number where a tag key set's element is a string",

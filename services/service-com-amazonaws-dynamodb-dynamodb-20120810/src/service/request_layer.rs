@@ -15,7 +15,8 @@
 //!   ([`body_reading`]);
 //! * a value whose JSON class the modelled type of its member admits no reading of — a
 //!   number where the model declares a string, a string where it declares a long, a scalar
-//!   where it declares a list — never becomes a value at all. That is a failure of the
+//!   where it declares a list — never becomes a value at all, and neither does base64 text
+//!   no blob can be decoded from. That is a failure of the
 //!   MARSHALLING, which AWS answers at the deserialization layer: HTTP 400 under the
 //!   protocol's own [`SERIALIZATION_EXCEPTION`], with the reason under the capitalized
 //!   [`MESSAGE_MEMBER`] — the member a protocol-level error of this service states its prose
@@ -62,8 +63,9 @@
 //!
 //! * a `null` ELEMENT of a list: no member stands there for it to state the absence of, and
 //!   dropping it would renumber the elements beside it, so the codec answers it as it stands;
-//! * a read that failed for a reason that is not a value's JSON class — text that is not a
-//!   timestamp, an absent `@required` member the body never carried at all — which the
+//! * a read that failed for a reason that is neither a value's JSON class nor a base64 text's
+//!   length — text that is not a timestamp, base64 of a legal length that still does not
+//!   decode, an absent `@required` member the body never carried at all — which the
 //!   framework and this service's own constraint wording answer, unchanged;
 //! * a target type this layer states no name for ([`named_type`]) or no expectation for
 //!   ([`Expected::of`] — a structure, a union, a timestamp or a blob, none of which is read
@@ -106,12 +108,32 @@ pub const DIAGNOSIS_MEMBER: &str = "message";
 /// something no operation could be given, so it is a client error.
 const SERIALIZATION_EXCEPTION_STATUS: u16 = 400;
 
-/// What the refusal states when the member's modelled type is an AGGREGATE — a list, a map,
-/// a structure or a union — and the body carried something else there, or when a member
-/// modelled as a single value carried a collection: no conversion between two single values
-/// was even attempted, so what the sentence states is that the FIELD's type was unexpected,
-/// naming neither a class nor a type.
+/// What the refusal states when the value stands in a member a structure (or a union)
+/// DECLARES — a field the body names — and the modelled type of that field is an AGGREGATE
+/// the body carried something else for, or the field is a single value the body carried a
+/// collection for: no conversion between two single values was even attempted, so what the
+/// sentence states is that the FIELD's type was unexpected, naming neither a class nor a
+/// type.
 const UNEXPECTED_FIELD_TYPE: &str = "Unexpected field type";
+
+/// What the same defect states when the value stands INSIDE a collection — an element of a
+/// list or the value of a map entry — instead: no member declares that position, so there is
+/// no field whose type could be called unexpected, and what the sentence names is the value
+/// carried in the payload ([`Slot`]).
+const UNEXPECTED_VALUE_TYPE: &str = "Unexpected value type in payload";
+
+/// What the refusal states when text standing where a blob is modelled is not a whole number
+/// of base64 groups, followed by the length the body carried.
+///
+/// Base64 encodes every three bytes as four characters, so text whose length is not a
+/// multiple of four encodes no bytes at all, and the sentence names the one fact that makes
+/// it undecodable: the length found. The length is the only variable part — the refusal
+/// neither names the member nor echoes the text.
+const BASE64_LENGTH: &str = "Base64 encoded length is expected a multiple of 4 bytes but found: ";
+
+/// How many characters base64 encodes each group of bytes as: text that is not a whole
+/// number of these groups is text no bytes can be decoded from.
+const BASE64_GROUP: usize = 4;
 
 /// Dispatch one reader of a request's body on the routing key, one line per modelled
 /// operation.
@@ -219,7 +241,7 @@ pub fn coercion_refusal<Eng: Send + Sync + 'static>(
     req: &RtRequest,
 ) -> Option<String> {
     let unreadable = unreadable_value::<Eng>(key, protocol, req)?;
-    sentence(unreadable.class, unreadable.target)
+    sentence(&unreadable)
 }
 
 /// The value the framework's own deserializer for the operation `key` names stopped at in
@@ -1073,6 +1095,9 @@ fn probe<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Op
         let mut probe = Probe {
             inner: &mut *deserializer,
             found: &found,
+            // The input IS a structure, so the members the body states for it are fields
+            // of it.
+            slot: Slot::Field,
             accepted: None,
         };
         <O::Input as DeserializableStruct>::deserialize(&mut probe)
@@ -1101,14 +1126,15 @@ fn null_read_target<O: Operation>(
         let mut probe = Probe {
             inner: &mut *deserializer,
             found: &found,
+            slot: Slot::Field,
             accepted: Some(&accepted),
         };
         let _ = <O::Input as DeserializableStruct>::deserialize(&mut probe);
     }
-    let failed = found
-        .into_inner()
-        .filter(|unreadable| unreadable.class == NULL_VALUE)
-        .map(|unreadable| unreadable.target);
+    let failed = found.into_inner().and_then(|unreadable| match unreadable {
+        Unreadable::Class { target, class, .. } if class == NULL_VALUE => Some(target),
+        _ => None,
+    });
     failed.or_else(|| accepted.into_inner())
 }
 
@@ -1130,22 +1156,45 @@ fn unsatisfied_member<O: Operation>(
 /// The sentence one unreadable value is refused with, or `None` when this service states no
 /// name for the type the failing read was for.
 ///
-/// Two sentences, because a caller has two different defects to fix. A single value sent
+/// Three sentences, because a caller has three different defects to fix. A single value sent
 /// where the model declares another single value is a CONVERSION that could not be
 /// performed, and the sentence names the two facts to reconcile: the class of value sent and
 /// the type it could not become. Anything with a collection on either side — a scalar where
 /// the model declares a list, a structure or a map, or a collection where it declares one
-/// value — is not a conversion at all but a field of the wrong TYPE
-/// ([`UNEXPECTED_FIELD_TYPE`]).
+/// value — is not a conversion at all, and what it is called depends on WHERE the value
+/// stands: a member a structure declares is a field whose type was unexpected
+/// ([`UNEXPECTED_FIELD_TYPE`]), while a value inside a collection is named by no member at
+/// all, so what the sentence states is the value the payload carried
+/// ([`UNEXPECTED_VALUE_TYPE`], [`Slot`]). And base64 text no blob can be decoded from is a
+/// defect of the TEXT rather than of its class ([`BASE64_LENGTH`]).
 ///
 /// An explicit `null` is no sentence of this class at all: nothing was converted, because
 /// `null` states that the member is ABSENT, which is what [`BodyReading`] answers.
-fn sentence(class: &str, target: ShapeType) -> Option<String> {
+fn sentence(unreadable: &Unreadable) -> Option<String> {
+    let (target, class, slot) = match unreadable {
+        Unreadable::Base64Length { characters } => {
+            return Some(format!("{BASE64_LENGTH}{characters}"));
+        }
+        Unreadable::Class {
+            target,
+            class,
+            slot,
+        } => (*target, *class, *slot),
+    };
     if class == NULL_VALUE {
         return None;
     }
-    if is_aggregate(target) || class == ARRAY_VALUE || class == OBJECT_VALUE {
+    if class == ARRAY_VALUE || class == OBJECT_VALUE {
         return Some(UNEXPECTED_FIELD_TYPE.to_string());
+    }
+    if is_aggregate(target) {
+        return Some(
+            match slot {
+                Slot::Field => UNEXPECTED_FIELD_TYPE,
+                Slot::Inside => UNEXPECTED_VALUE_TYPE,
+            }
+            .to_string(),
+        );
     }
     Some(format!("{class} cannot be converted to {}", named_type(target)?))
 }
@@ -1180,12 +1229,33 @@ fn named_type(target: ShapeType) -> Option<&'static str> {
     }
 }
 
-/// What one unreadable value is refused with: the type the failing read was FOR, and the
-/// class the codec's own complaint named the submitted value under.
+/// What one unreadable value is refused with.
 #[derive(Debug)]
-struct Unreadable {
-    target: ShapeType,
-    class: &'static str,
+enum Unreadable {
+    /// A value whose JSON CLASS the modelled type of the slot it stands in admits no reading
+    /// of: the type the failing read was for, the class the codec's own complaint named the
+    /// submitted value under, and the kind of slot the value stands in.
+    Class {
+        target: ShapeType,
+        class: &'static str,
+        slot: Slot,
+    },
+    /// Text standing where a blob is modelled that is not a whole number of base64 groups,
+    /// with the number of characters the body carried — the one fact the sentence for it
+    /// states ([`BASE64_LENGTH`]).
+    Base64Length { characters: usize },
+}
+
+/// WHERE the value a read is for stands, which is what a defect involving a collection is
+/// named after ([`sentence`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    /// A member a structure or a union DECLARES, which the body names: a field. The input
+    /// itself is a structure, so its own members stand here too.
+    Field,
+    /// A value INSIDE a collection — an element of a list, or the value of a map entry —
+    /// which no modelled member names.
+    Inside,
 }
 
 /// The framework's deserializer, watched.
@@ -1193,11 +1263,16 @@ struct Unreadable {
 /// Every method forwards to the real deserializer and returns its answer unchanged — this is
 /// not a codec, and it reimplements no part of one. The ONE thing it adds is that a read
 /// which fails on a JSON class mismatch is recorded with the modelled type that read was
-/// for, which the error does not carry. The first such read wins: it is the one the caller
-/// has to fix first, and the reads after it are reading a body the parser has already left.
+/// for and the kind of slot it stood in, neither of which the error carries. The first such
+/// read wins: it is the one the caller has to fix first, and the reads after it are reading a
+/// body the parser has already left.
 struct Probe<'d, 'f> {
     inner: &'d mut (dyn ShapeDeserializer + 'd),
     found: &'f RefCell<Option<Unreadable>>,
+    /// Where the value this probe reads stands: a field of the structure (or union) being
+    /// read, or a value inside a collection. Each container read hands the probe it builds
+    /// for what is INSIDE it the slot that applies there ([`Slot`]).
+    slot: Slot,
     /// Where a `null` the codec reads WITHOUT failing is recorded, as the modelled type that
     /// read was for: a structure, a list and a map each take a `null` as absence, so the type
     /// expected where a body stated one is otherwise unstated. `None` leaves those reads
@@ -1212,13 +1287,13 @@ impl Probe<'_, '_> {
     /// The first record wins, like a failing read's: the body this is watched over carries one
     /// stated absence ([`null_read_target`]).
     fn note_accepted(&self, schema: &Schema) {
-        let Some(slot) = self.accepted else {
+        let Some(recorder) = self.accepted else {
             return;
         };
         if !self.inner.is_null() {
             return;
         }
-        let mut held = slot.borrow_mut();
+        let mut held = recorder.borrow_mut();
         if held.is_none() {
             *held = Some(schema.shape_type());
         }
@@ -1240,6 +1315,7 @@ impl Probe<'_, '_> {
 fn note_in(
     found: &RefCell<Option<Unreadable>>,
     target: ShapeType,
+    slot: Slot,
     error: SerdeError,
 ) -> SerdeError {
     let Some(class) = value_class(&error) else {
@@ -1247,9 +1323,32 @@ fn note_in(
     };
     let mut held = found.borrow_mut();
     if held.is_none() {
-        *held = Some(Unreadable { target, class });
+        *held = Some(Unreadable::Class {
+            target,
+            class,
+            slot,
+        });
     }
     error
+}
+
+/// Record `text` — standing where a blob is modelled, and undecodable — as the defect of its
+/// LENGTH, when that is what makes it undecodable.
+///
+/// Base64 carries every three bytes as a group of four characters, so text that is not a
+/// whole number of those groups encodes no bytes at all, whatever characters it holds. Text
+/// of a legal length that still does not decode is left unrecorded: this service states no
+/// sentence for that defect, so inventing one here would answer a caller with prose nothing
+/// grounds, and the codec's own refusal of it stands.
+fn note_base64(found: &RefCell<Option<Unreadable>>, text: &str) {
+    let characters = text.chars().count();
+    if characters.is_multiple_of(BASE64_GROUP) {
+        return;
+    }
+    let mut held = found.borrow_mut();
+    if held.is_none() {
+        *held = Some(Unreadable::Base64Length { characters });
+    }
 }
 
 /// The CLASS of JSON value a codec refusal is about, or `None` when the refusal is not about
@@ -1296,16 +1395,17 @@ fn value_class(error: &SerdeError) -> Option<&'static str> {
 /// the type that read is FOR — which is the read's own target type, named beside it here,
 /// rather than the shape type of the schema it is handed.
 ///
-/// `found` is copied out of `self` BEFORE the read starts, so the recorder is still reachable
-/// while the deserializer underneath is mutably borrowed.
+/// `found` and the slot are copied out of `self` BEFORE the read starts, so the recorder is
+/// still reachable while the deserializer underneath is mutably borrowed.
 macro_rules! watched_reads {
     ($($method:ident -> $value:ty as $target:ident),+ $(,)?) => {
         $(
             fn $method(&mut self, schema: &Schema) -> Result<$value, SerdeError> {
                 let found = self.found;
+                let slot = self.slot;
                 self.inner
                     .$method(schema)
-                    .map_err(|error| note_in(found, ShapeType::$target, error))
+                    .map_err(|error| note_in(found, ShapeType::$target, slot, error))
             }
         )+
     };
@@ -1320,17 +1420,21 @@ impl ShapeDeserializer for Probe<'_, '_> {
         self.note_accepted(schema);
         let found = self.found;
         let accepted = self.accepted;
+        let slot = self.slot;
+        // What a structure (or a union) holds are the members it DECLARES, so every value
+        // read inside this one stands in a field of it.
         let mut watched = |member: &Schema, inner: &mut dyn ShapeDeserializer| {
             let mut probe = Probe {
                 inner,
                 found,
+                slot: Slot::Field,
                 accepted,
             };
             consumer(member, &mut probe)
         };
         self.inner
             .read_struct(schema, &mut watched)
-            .map_err(|error| note_in(found, schema.shape_type(), error))
+            .map_err(|error| note_in(found, schema.shape_type(), slot, error))
     }
 
     fn read_list(
@@ -1341,17 +1445,20 @@ impl ShapeDeserializer for Probe<'_, '_> {
         self.note_accepted(schema);
         let found = self.found;
         let accepted = self.accepted;
+        let slot = self.slot;
+        // An element is named by no member: it stands INSIDE the collection.
         let mut watched = |inner: &mut dyn ShapeDeserializer| {
             let mut probe = Probe {
                 inner,
                 found,
+                slot: Slot::Inside,
                 accepted,
             };
             consumer(&mut probe)
         };
         self.inner
             .read_list(schema, &mut watched)
-            .map_err(|error| note_in(found, schema.shape_type(), error))
+            .map_err(|error| note_in(found, schema.shape_type(), slot, error))
     }
 
     fn read_map(
@@ -1362,17 +1469,21 @@ impl ShapeDeserializer for Probe<'_, '_> {
         self.note_accepted(schema);
         let found = self.found;
         let accepted = self.accepted;
+        let slot = self.slot;
+        // An entry's value is named by its KEY rather than by a member the model declares,
+        // so it too stands inside the collection rather than in a field.
         let mut watched = |key: String, inner: &mut dyn ShapeDeserializer| {
             let mut probe = Probe {
                 inner,
                 found,
+                slot: Slot::Inside,
                 accepted,
             };
             consumer(key, &mut probe)
         };
         self.inner
             .read_map(schema, &mut watched)
-            .map_err(|error| note_in(found, schema.shape_type(), error))
+            .map_err(|error| note_in(found, schema.shape_type(), slot, error))
     }
 
     // Every value read, forwarded and watched. The list is the trait's own scalar surface,
@@ -1388,9 +1499,32 @@ impl ShapeDeserializer for Probe<'_, '_> {
         read_big_integer -> BigInteger as BigInteger,
         read_big_decimal -> BigDecimal as BigDecimal,
         read_string -> String as String,
-        read_blob -> Blob as Blob,
         read_document -> Document as Document,
         read_timestamp -> DateTime as Timestamp,
+    }
+
+    /// A blob, read as the base64 TEXT this protocol carries one as.
+    ///
+    /// The value handed to this read is a string either way, and reading it as the text it is
+    /// leaves the DECODING to be asked about on its own: the codec's refusal of text no bytes
+    /// can be decoded from names no JSON class, so nothing above it could otherwise tell that
+    /// failure from a value that was read and then broke a rule ([`note_base64`]). The
+    /// decoder asked is the one the codec itself decodes a blob with, so this read admits
+    /// exactly the texts the read it stands in for admits.
+    fn read_blob(&mut self, schema: &Schema) -> Result<Blob, SerdeError> {
+        let found = self.found;
+        let slot = self.slot;
+        let text = self
+            .inner
+            .read_string(schema)
+            .map_err(|error| note_in(found, ShapeType::Blob, slot, error))?;
+        match ::aws_smithy_types::base64::decode(&text) {
+            Ok(bytes) => Ok(Blob::new(bytes)),
+            Err(undecodable) => {
+                note_base64(found, &text);
+                Err(SerdeError::custom(format!("invalid base64: {undecodable}")))
+            }
+        }
     }
 
     fn read_null(&mut self) -> Result<(), SerdeError> {
@@ -1481,6 +1615,7 @@ mod tests {
             let mut probe = Probe {
                 inner: &mut deserializer,
                 found: &found,
+                slot: Slot::Field,
                 accepted: None,
             };
             if T::deserialize(&mut probe).is_ok() {
@@ -1488,7 +1623,7 @@ mod tests {
             }
         }
         let unreadable = found.into_inner()?;
-        sentence(unreadable.class, unreadable.target)
+        sentence(&unreadable)
     }
 
     /// RULE: a value of a class the modelled type of its member admits no reading of earns
@@ -1551,8 +1686,8 @@ mod tests {
         let element = recorded::<TagResourceInput>(r#"{"ResourceArn":"arn","Tags":["k=v"]}"#);
         assert_eq!(
             element.as_deref(),
-            Some(UNEXPECTED_FIELD_TYPE),
-            "a scalar where a list of structures is declared: got {element:?}"
+            Some(UNEXPECTED_VALUE_TYPE),
+            "a scalar INSIDE a list of structures, which no member names: got {element:?}"
         );
 
         // A scalar where the model declares the LIST itself, and a number past the modelled
