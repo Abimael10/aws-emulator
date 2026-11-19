@@ -674,10 +674,10 @@ async fn a_custom_step_target_reports_its_outcome_through_the_runtimes_transfer_
         (
             json!(false),
             json!(NOT_FOUND),
-            json!(404),
+            json!(transfer_state::RESOURCE_NOT_FOUND_HTTP_STATUS),
             json!(UNKNOWN_EXECUTION)
         ),
-        "case {case:?}: expected the modelled not-found with its fixed text, got {}",
+        "case {case:?}: expected the service's not-found with its fixed text, got {}",
         made[4]
     );
 
@@ -756,10 +756,10 @@ async fn a_custom_step_target_reports_its_outcome_through_the_runtimes_transfer_
         (
             json!(false),
             json!(NOT_FOUND),
-            json!(404),
+            json!(transfer_state::RESOURCE_NOT_FOUND_HTTP_STATUS),
             json!(UNKNOWN_EXECUTION)
         ),
-        "case {case:?}: expected the modelled not-found with its fixed text, got {}",
+        "case {case:?}: expected the service's not-found with its fixed text, got {}",
         replayed[0]
     );
     let described_after = transfer(

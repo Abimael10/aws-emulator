@@ -12,8 +12,9 @@
 //! not a different input, so each row changes one of those instead.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_transfer_transferservice::state as st;
 
-use crate::harness::{is_modelled_server_id, member_of, Emulator, ROLE};
+use crate::harness::{is_modelled_server_id, member_of, Answer, Emulator, ACCOUNT, REGION, ROLE};
 
 /// Syntactically valid `ServerId`s (`len 19..19`, `^s-([0-9a-f]{17})$`, per the
 /// `ServerId` shape) that no `CreateServer` ever minted: the low end of the id space,
@@ -307,6 +308,262 @@ async fn operations_on_deleted_resources_answer_the_same_generic_400_not_found()
 
     assert_same_message("Server", &server_messages);
     assert_same_message("User", &user_messages);
+}
+
+/// RULE: the HTTP status a Transfer refusal of a reference it cannot resolve goes out
+/// under belongs to the SERVICE, not to the operation, the plane or the resource kind —
+/// every operation answers `ResourceNotFoundException` at the one status this service
+/// answers an unresolvable reference with (`state::RESOURCE_NOT_FOUND_HTTP_STATUS`),
+/// with the body the model's own.
+///
+/// The rows differ along the operation, the resource kind, the plane the call belongs to
+/// (a reader, the tag plane, a workflow callback) and WHY the reference resolves to
+/// nothing — never minted, or, for a callback token, already consumed.
+#[tokio::test]
+async fn every_unresolvable_reference_is_refused_at_the_services_one_not_found_status() {
+    let emulator = Emulator::new();
+    let server_id = emulator.create_server(json!({})).await;
+    emulator.create_user(&server_id, "alice").await;
+    let workflow_id = create_callback_workflow(&emulator).await;
+
+    // One run of that workflow, with one pending custom step, whose token is then
+    // CONSUMED: the replay of it is the second reference the callback cannot resolve.
+    let live_execution = "a1b2c3d4-e5f6-4a5b-8c9d-0e1f2a3b4c5d";
+    let live_token = "live_token";
+    seed_execution(&emulator, &workflow_id, live_execution, live_token);
+    let reported = callback(&emulator, &workflow_id, live_execution, live_token, "SUCCESS").await;
+    assert_eq!(
+        (reported.status, &reported.body),
+        (200, &json!({})),
+        "the first callback of a pending step must be accepted, got {} with body {}",
+        reported.status,
+        reported.body
+    );
+
+    // `ExecutionId`s satisfying the modelled `len 36..36` UUID pattern that this
+    // workflow is not running: the low end of the id space and an upper-case one.
+    let absent_executions = [
+        "00000000-0000-0000-0000-000000000000",
+        "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF",
+    ];
+    let transfer_arn =
+        |resource: &str| format!("arn:aws:transfer:{REGION}:{ACCOUNT}:{resource}");
+
+    // (case, operation, request, ResourceType, Resource)
+    let mut rows: Vec<(String, &str, Value, &str, String)> = vec![
+        (
+            "a reader of a server that was never minted".to_string(),
+            "DescribeServer",
+            json!({"ServerId": NEVER_MINTED[0]}),
+            "Server",
+            NEVER_MINTED[0].to_string(),
+        ),
+        (
+            "a reader of a user the stored server does not hold".to_string(),
+            "DescribeUser",
+            json!({"ServerId": &server_id, "UserName": ABSENT_USERS[0]}),
+            "User",
+            ABSENT_USERS[0].to_string(),
+        ),
+        (
+            "a reader of a workflow that was never minted".to_string(),
+            "DescribeWorkflow",
+            json!({"WorkflowId": "w-00000000000000000"}),
+            "Workflow",
+            "w-00000000000000000".to_string(),
+        ),
+        (
+            "a reader of a connector that was never minted".to_string(),
+            "DescribeConnector",
+            json!({"ConnectorId": "c-00000000000000000"}),
+            "Connector",
+            "c-00000000000000000".to_string(),
+        ),
+        (
+            "a reader of an agreement the stored server does not hold".to_string(),
+            "DescribeAgreement",
+            json!({"ServerId": &server_id, "AgreementId": "a-00000000000000000"}),
+            "Agreement",
+            "a-00000000000000000".to_string(),
+        ),
+        (
+            "the tag plane, for a server ARN that was never minted".to_string(),
+            "TagResource",
+            json!({
+                "Arn": transfer_arn(&format!("server/{}", NEVER_MINTED[1])),
+                "Tags": [{"Key": "env", "Value": "prod"}],
+            }),
+            "Server",
+            NEVER_MINTED[1].to_string(),
+        ),
+        (
+            "the callback, for a token whose step has already reported".to_string(),
+            "SendWorkflowStepState",
+            json!({
+                "WorkflowId": &workflow_id,
+                "ExecutionId": live_execution,
+                "Token": live_token,
+                "Status": "FAILURE",
+            }),
+            "Execution",
+            live_execution.to_string(),
+        ),
+    ];
+
+    // The run a reader and the callback are both asked about, for each unrun id: the
+    // same unresolvable reference reached through two different operations.
+    for absent in absent_executions {
+        rows.push((
+            format!("a reader of the execution {absent}, which is not running"),
+            "DescribeExecution",
+            json!({"WorkflowId": &workflow_id, "ExecutionId": absent}),
+            "Execution",
+            absent.to_string(),
+        ));
+        rows.push((
+            format!("the callback, for the execution {absent}, which is not running"),
+            "SendWorkflowStepState",
+            json!({
+                "WorkflowId": &workflow_id,
+                "ExecutionId": absent,
+                "Token": "deadbeef",
+                "Status": "SUCCESS",
+            }),
+            "Execution",
+            absent.to_string(),
+        ));
+    }
+
+    let mut statuses: Vec<(String, u16)> = Vec::new();
+    for (case, op, request, resource_type, resource) in rows {
+        let answer = emulator.call(op, request).await;
+        assert_eq!(
+            answer.status,
+            st::RESOURCE_NOT_FOUND_HTTP_STATUS,
+            "case {case:?}: expected HTTP {}, got {} with body {}",
+            st::RESOURCE_NOT_FOUND_HTTP_STATUS,
+            answer.status,
+            answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {}",
+            answer.body
+        );
+        assert_eq!(
+            member_of(&answer.body, "ResourceType").as_str(),
+            Some(resource_type),
+            "case {case:?}: expected ResourceType {resource_type:?}, got {}",
+            answer.body
+        );
+        assert_eq!(
+            member_of(&answer.body, "Resource").as_str(),
+            Some(resource.as_str()),
+            "case {case:?}: expected Resource {resource:?}, got {}",
+            answer.body
+        );
+        statuses.push((case, answer.status));
+    }
+
+    // ONE status for the whole service: no row answers a different one.
+    let (first_case, first) = statuses[0].clone();
+    for (case, status) in &statuses {
+        assert_eq!(
+            *status, first,
+            "case {case:?}: expected the same status as case {first_case:?} ({first}), \
+             got {status}"
+        );
+    }
+
+    // The callback's refusal carries this service's fixed text for an execution
+    // reference, with no variable part — the body the override leaves untouched.
+    let refused = callback(
+        &emulator,
+        &workflow_id,
+        absent_executions[0],
+        "deadbeef",
+        "SUCCESS",
+    )
+    .await;
+    assert_eq!(
+        member_of(&refused.body, "Message").as_str(),
+        Some(st::NOT_FOUND_EXECUTION.message),
+        "expected the fixed execution not-found message, got {}",
+        refused.body
+    );
+}
+
+/// Create a workflow whose one step is the `CUSTOM` step `SendWorkflowStepState` is the
+/// callback of, over the wire, and return its `WorkflowId`.
+///
+/// `CustomStepDetails.Target` satisfies `CustomStepTarget`'s modelled `len 0..170`,
+/// pattern `^arn:[a-z-]+:lambda:.*$`.
+async fn create_callback_workflow(emulator: &Emulator) -> String {
+    let answer = emulator
+        .call(
+            "CreateWorkflow",
+            json!({
+                "Steps": [{
+                    "Type": "CUSTOM",
+                    "CustomStepDetails": {
+                        "Name": "callback-step",
+                        "Target": format!(
+                            "arn:aws:lambda:{REGION}:{ACCOUNT}:function:workflow-callback"
+                        ),
+                        "TimeoutSeconds": 120,
+                    },
+                }],
+            }),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "CreateWorkflow: expected 200, got {} with body {}",
+        answer.status, answer.body
+    );
+    answer
+        .get("WorkflowId")
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateWorkflow returned no WorkflowId: {}", answer.body))
+        .to_string()
+}
+
+/// Seed one run of `workflow_id` with a single pending custom step addressed by `token`:
+/// no emulated data plane uploads a file here, so nothing else starts an execution.
+fn seed_execution(emulator: &Emulator, workflow_id: &str, execution_id: &str, token: &str) {
+    let state = emulator.store();
+    let mut guard = state.lock();
+    guard.workflow_executions.insert(
+        (workflow_id.to_string(), execution_id.to_string()),
+        st::WorkflowExecution {
+            workflow_id: workflow_id.to_string(),
+            execution_id: execution_id.to_string(),
+            step_states: [(token.to_string(), None)].into_iter().collect(),
+            ..st::WorkflowExecution::default()
+        },
+    );
+}
+
+/// One `SendWorkflowStepState` callback, over the wire.
+async fn callback(
+    emulator: &Emulator,
+    workflow_id: &str,
+    execution_id: &str,
+    token: &str,
+    status: &str,
+) -> Answer {
+    emulator
+        .call(
+            "SendWorkflowStepState",
+            json!({
+                "WorkflowId": workflow_id,
+                "ExecutionId": execution_id,
+                "Token": token,
+                "Status": status,
+            }),
+        )
+        .await
 }
 
 /// Every row of one resource type must answer the SAME `Message`: it is derived from

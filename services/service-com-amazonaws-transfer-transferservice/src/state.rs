@@ -355,17 +355,17 @@ pub const SERVER_STATE_STOP_FAILED: &str = "STOP_FAILED";
 /// RESOURCE REFERENCE it cannot resolve.
 ///
 /// The model puts `@httpError(404)` on the shape, but the recorded Transfer wire
-/// answers an unknown server or user with HTTP **400** and `__type`
+/// answers a reference it cannot resolve with HTTP **400** and `__type`
 /// `ResourceNotFoundException` — so the status on the wire is 400 and the shape's
 /// `httpError` does not describe the service. Handlers return it through
 /// [`not_found`], which keeps the body the model's own and changes only the status
 /// line.
 ///
-/// The override's scope is the operations that were recorded answering it:
-/// `SendWorkflowStepState`'s callback — a different component of the service, whose
-/// recorded answer to a callback resolving to no running execution is the modelled
-/// 404 — returns the error WITHOUT this override, so each operation answers the status
-/// it was recorded answering.
+/// The status belongs to the SERVICE, not to one operation: every operation of this
+/// service that reports an unresolvable reference — including
+/// `SendWorkflowStepState`'s callback, whose unknown execution and already-consumed
+/// token are the same condition — answers it here, so a client that branches on the
+/// status line before it reads `__type` classifies all of them alike.
 pub const RESOURCE_NOT_FOUND_HTTP_STATUS: u16 = 400;
 
 /// `ResourceType` for the server resource: the resource name capitalized, as the

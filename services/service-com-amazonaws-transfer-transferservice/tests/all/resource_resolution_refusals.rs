@@ -26,9 +26,8 @@
 //!    for an absent grant, `StartFileTransfer` on an absent connector,
 //!    `SendWorkflowStepState` for an execution a resolved workflow is not running),
 //!    with `ResourceType` the resource name capitalized and `Resource` the identifier
-//!    the request named — at the status that operation answers it with (this service's
-//!    recorded 400, and the modelled 404 for `SendWorkflowStepState`'s callback; see
-//!    `state::RESOURCE_NOT_FOUND_HTTP_STATUS`).
+//!    the request named — at this service's recorded status for an unresolvable
+//!    reference (see `state::RESOURCE_NOT_FOUND_HTTP_STATUS`).
 //! 4. A resource that IS stored is acted on: `DeleteAccess` removes the grant (and a
 //!    second delete then cannot find it), and `SendWorkflowStepState` records the
 //!    reported `Status` on the custom step its `Token` addresses, ONCE — a replay of a
@@ -195,9 +194,9 @@ fn test_identity_provider_requests(server_id: &str) -> Vec<(String, Value)> {
 }
 
 /// Assert one answer is the modelled not-found for `resource_type`/`resource` at
-/// `status`: this service answers `ResourceNotFoundException` with HTTP 400 (see
-/// `state::RESOURCE_NOT_FOUND_HTTP_STATUS`) everywhere its recorded wire did, and with
-/// the modelled 404 from `SendWorkflowStepState`'s callback.
+/// `status`: this service answers `ResourceNotFoundException` with the status its
+/// recorded wire did (`state::RESOURCE_NOT_FOUND_HTTP_STATUS`), not the shape's
+/// `@httpError`.
 fn assert_not_found_at(
     case: &str,
     answer: &Answer,
@@ -231,16 +230,29 @@ fn assert_not_found_at(
 }
 
 /// Assert one answer is the modelled not-found for `resource_type`/`resource` at this
-/// service's recorded 400.
+/// service's recorded status for an unresolvable reference.
 fn assert_not_found(case: &str, answer: &Answer, resource_type: &str, resource: &str) {
-    assert_not_found_at(case, answer, 400, resource_type, resource);
+    assert_not_found_at(
+        case,
+        answer,
+        st::RESOURCE_NOT_FOUND_HTTP_STATUS,
+        resource_type,
+        resource,
+    );
 }
 
 /// Assert one answer is `SendWorkflowStepState`'s refusal of a callback that resolves
-/// to no running execution: the modelled 404, the fixed `Message` this service answers
-/// for an execution reference it cannot resolve, and the `ExecutionId` in `Resource`.
+/// to no running execution: this service's not-found status, the fixed `Message` it
+/// answers for an execution reference it cannot resolve, and the `ExecutionId` in
+/// `Resource`.
 fn assert_callback_not_found(case: &str, answer: &Answer, execution_id: &str) {
-    assert_not_found_at(case, answer, 404, "Execution", execution_id);
+    assert_not_found_at(
+        case,
+        answer,
+        st::RESOURCE_NOT_FOUND_HTTP_STATUS,
+        "Execution",
+        execution_id,
+    );
     assert_eq!(
         member_of(&answer.body, "Message").as_str(),
         Some(st::NOT_FOUND_EXECUTION.message),

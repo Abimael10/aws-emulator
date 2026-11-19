@@ -1155,9 +1155,13 @@ async fn an_upload_starts_the_servers_workflow_whose_callback_token_is_consumed_
             .await;
         assert_eq!(
             (replay.status, replay.error_code().as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: expected the replayed token to be refused 404 \
-             ResourceNotFoundException, got {} with body {}",
+            (
+                st::RESOURCE_NOT_FOUND_HTTP_STATUS,
+                "ResourceNotFoundException"
+            ),
+            "case {case:?}: expected the replayed token to be refused \
+             {} ResourceNotFoundException, got {} with body {}",
+            st::RESOURCE_NOT_FOUND_HTTP_STATUS,
             replay.status,
             replay.body
         );
@@ -1457,7 +1461,7 @@ struct StepEffect {
 /// That is the whole documented managed-workflow pattern, asserted end to end: the
 /// invocation is observed through the function's OWN effects, read back through Amazon S3
 /// (one object per token), and the run then reports the status its callbacks made due. A
-/// replay of a consumed token is refused with the modelled 404 and leaves
+/// replay of a consumed token is refused as a reference to no running execution and leaves
 /// `DescribeExecution` answering exactly as before.
 ///
 /// The rows differ along how many `CUSTOM` steps the workflow holds — one, and two, which
@@ -1666,9 +1670,13 @@ async fn an_upload_invokes_each_custom_steps_function_with_its_callback_token() 
             .await;
         assert_eq!(
             (replay.status, replay.error_code().as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: expected the replayed token to be refused 404 \
-             ResourceNotFoundException, got {} with body {}",
+            (
+                st::RESOURCE_NOT_FOUND_HTTP_STATUS,
+                "ResourceNotFoundException"
+            ),
+            "case {case:?}: expected the replayed token to be refused \
+             {} ResourceNotFoundException, got {} with body {}",
+            st::RESOURCE_NOT_FOUND_HTTP_STATUS,
             replay.status,
             replay.body
         );
