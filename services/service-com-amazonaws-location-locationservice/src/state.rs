@@ -14,6 +14,10 @@ use std::collections::{BTreeMap, BTreeSet};
 mod geofence_geometry;
 pub use geofence_geometry::{validate_geofence_geometry, GeometryRefusal};
 
+/// The verdict each ring form of a polygon geometry earns, asserted through those checks:
+/// a question about one function, so it is asked beside it rather than through a request.
+mod ring_geometry;
+
 /// The resource a tag operation's `ResourceArn` names, and the tag map it reads and
 /// writes on it, kept beside this module because the three tag operations and the
 /// resources' own reads all reach the same per-resource tag map.
