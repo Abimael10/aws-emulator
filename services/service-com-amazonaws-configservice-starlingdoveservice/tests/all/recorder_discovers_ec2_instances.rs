@@ -59,11 +59,27 @@ const REQUIRED_TAGS_RULE: &str = "REQUIRED_TAGS";
 /// read narrowing by it is a read for an instance that could exist and does not.
 const ABSENT_INSTANCE_ID: &str = "i-0abcdef01";
 
+/// The state Amazon EC2 answers a LAUNCH with, and the one state EC2's own clock moves a
+/// launched instance out of without anybody asking: `pending`, the first member of
+/// `InstanceStateName`, from
+/// `smithy_query(model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/\
+/// com-amazonaws-ec2-amazonec2.json", query="shape", shape="InstanceStateName")` — whose
+/// members are `pending`, `running`, `shutting-down`, `terminated`, `stopping` and
+/// `stopped`.
+///
+/// A poll that waits for EC2 to report an instance PAST this state is waiting for EC2's own
+/// clock, never for a span, and the state EC2 then has the instance in is one no call below
+/// moves again — so the recorded item and EC2's own report can be compared without either
+/// moving under the comparison.
+const EC2_LAUNCHING_STATE: &str = "pending";
+
 /// How long a poll waits for the discovery pass the clock owes. A pass falls due a
 /// fraction of a second after the call that makes it due, and an instance reaches its
-/// launched state a fraction of a second after the launch, so this is many passes' worth
-/// of slack and not a span the behaviour depends on.
-const CONVERGENCE_BUDGET: Duration = Duration::from_secs(20);
+/// launched state a fraction of a second after the launch, so this is a hundred passes'
+/// worth of slack and not a span the behaviour depends on: the deadline is here only so a
+/// condition that never holds reports which read answered what instead of hanging, and it
+/// is generous enough that a host running the whole suite at once never reaches it.
+const CONVERGENCE_BUDGET: Duration = Duration::from_secs(60);
 
 /// How long a row waits while asserting that nothing is admitted — several passes' worth of
 /// time, so an admission that was going to happen would have happened.
@@ -522,8 +538,13 @@ async fn a_discovered_instance_is_read_back_as_the_configuration_item_ec2_report
         "the configuration carries the instance type EC2 reports, got {configuration}"
     );
 
-    // The state the item records is the one EC2 itself reports for the instance, which is
-    // what the poll above waited for: read from the owner rather than expected here.
+    // The state the item records is the one EC2 itself reports for the instance: read from
+    // the owner rather than expected here, and read once the poll above has EC2 past the
+    // state it moves the instance out of on its own, so the state this reads is the one EC2
+    // settled the instance in rather than one its clock is about to replace. That the item
+    // records the SETTLED state — a recorder that keeps recording re-records the instance as
+    // its owner's clock moves it, rather than keeping the state it was discovered in — is
+    // what the poll above converges on.
     let recorded_state = configuration["state"]["name"]
         .as_str()
         .unwrap_or_else(|| panic!("the configuration carries a state, got {configuration}"))
@@ -538,6 +559,9 @@ async fn a_discovered_instance_is_read_back_as_the_configuration_item_ec2_report
 
 /// The `InstanceState$Name` EC2 reports for `instance_id`, or `None` when EC2 reports no
 /// state for it at all.
+///
+/// Read from EC2 itself, so a test asserting about a recorded state compares it with the
+/// owner's own answer rather than with a state named here.
 async fn ec2_state(emulator: &Emulator, instance_id: &str) -> Option<String> {
     emulator
         .ec2()
@@ -553,16 +577,25 @@ async fn ec2_state(emulator: &Emulator, instance_id: &str) -> Option<String> {
         .find_map(|held| held.state()?.name().map(|name| name.as_str().to_string()))
 }
 
-/// The configuration item Config holds for `instance_id` once the state it records is the
-/// one EC2 has the instance in.
+/// The configuration item Config holds for `instance_id` once EC2 has the instance past its
+/// launching state and the item records the state EC2 has it in.
 ///
-/// What is being waited for is the recording pass the recorder owes after EC2's own clock
-/// moved the instance along, never a span: the assertion that fails at the deadline names
-/// both states.
+/// What is being waited for is EC2's own clock taking the instance out of
+/// [`EC2_LAUNCHING_STATE`] and the recording pass the recorder owes after it, never a span:
+/// the assertion that fails at the deadline names both states. Waiting for the launching
+/// state to be BEHIND the instance is what makes the comparison deterministic — an item that
+/// records a state EC2 is about to leave agrees with EC2 only until EC2's clock moves, so a
+/// caller of this helper that reads EC2 again would race that move on a host slow enough to
+/// cross it.
 async fn await_item_in_ec2s_state(emulator: &Emulator, instance_id: &str) -> Value {
     let deadline = Instant::now() + CONVERGENCE_BUDGET;
     loop {
         let reported = ec2_state(emulator, instance_id).await;
+        // The instance is past its launch once EC2 reports it in any other state, which is
+        // the point from which EC2's own clock stops moving it.
+        let past_launch = reported
+            .as_deref()
+            .is_some_and(|state| state != EC2_LAUNCHING_STATE);
         let history = emulator
             .config(
                 "GetResourceConfigHistory",
@@ -585,13 +618,14 @@ async fn await_item_in_ec2s_state(emulator: &Emulator, instance_id: &str) -> Val
             .and_then(|configuration| {
                 configuration["state"]["name"].as_str().map(str::to_string)
             });
-        if recorded.is_some() && recorded == reported {
+        if past_launch && recorded == reported {
             return item;
         }
         assert!(
             Instant::now() < deadline,
             "the recorded configuration item of {instance_id} must reach the state EC2 \
-             reports: EC2 reports {reported:?}, the item records {recorded:?}"
+             reports once EC2 has the instance past {EC2_LAUNCHING_STATE:?}: EC2 reports \
+             {reported:?}, the item records {recorded:?}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
