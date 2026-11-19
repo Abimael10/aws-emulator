@@ -328,7 +328,7 @@ async fn each_listed_asset_is_the_record_the_create_persisted() {
             body[key] = value;
         }
         let (status, asset) = call(&router, "POST", "/assets", Some(body)).await;
-        assert_eq!(status, 200, "case {case:?}: CreateAsset body {asset}");
+        assert_eq!(status, 202, "case {case:?}: CreateAsset body {asset}");
         created.push((case, id, asset));
     }
 

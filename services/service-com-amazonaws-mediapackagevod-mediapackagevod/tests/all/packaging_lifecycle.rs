@@ -172,7 +172,7 @@ pub(crate) async fn create_asset(router: &MultiServiceRouter, id: &str, group_id
         "sourceRoleArn": format!("arn:aws:iam::{}:role/MediaPackageVod", account_id()),
     });
     let (status, asset) = call(router, "POST", "/assets", Some(body)).await;
-    assert_eq!(status, 200, "CreateAsset {id}: body {asset}");
+    assert_eq!(status, 202, "CreateAsset {id}: body {asset}");
     asset
 }
 
@@ -784,6 +784,9 @@ async fn creates_are_refused_at_each_capacity_bound() {
         let expected = if short_of_bound { 200 } else { 429 };
         // A successful `CreatePackagingConfiguration` answers 202, not 200.
         let expected_config = if short_of_bound { 202 } else { 429 };
+        // A successful `CreateAsset` answers 202 as well: the submit is accepted and
+        // the ingest finishes afterwards.
+        let expected_asset = if short_of_bound { 202 } else { 429 };
         assert_eq!(
             status, expected,
             "CreatePackagingGroup holding {held} of {}: got {status}, body {body}",
@@ -881,7 +884,7 @@ async fn creates_are_refused_at_each_capacity_bound() {
         )
         .await;
         assert_eq!(
-            status, expected,
+            status, expected_asset,
             "CreateAsset holding {held} of {}: got {status}, body {body}",
             vod::MAX_ASSETS
         );

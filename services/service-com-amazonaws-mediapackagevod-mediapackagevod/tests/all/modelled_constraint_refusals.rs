@@ -261,7 +261,7 @@ async fn an_absent_required_member_is_a_member_violation() {
         (
             "/assets",
             &asset,
-            200,
+            202,
             &["id", "packagingGroupId", "sourceArn", "sourceRoleArn"],
         ),
         (

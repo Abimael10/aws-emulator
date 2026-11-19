@@ -455,7 +455,7 @@ async fn describe_of_an_unknown_id_is_not_found() {
         })),
     )
     .await;
-    assert_eq!(status, 200, "CreateAsset: body {asset}");
+    assert_eq!(status, 202, "CreateAsset: body {asset}");
 
     // (case, the id to address)
     let cases: Vec<(&str, &str)> = vec![

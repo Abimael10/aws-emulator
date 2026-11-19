@@ -203,7 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if package_blocks != 1 {
             return Err(crate::scaffolded::UnprocessableEntity::request(
-                crate::scaffolded::PACKAGING_CONFIGURATION_LABEL,
+                // The FIXED sentence of this refusal class spells the resource type
+                // out in full, unlike the id-bound messages below.
+                crate::scaffolded::PACKAGING_CONFIGURATION_TYPE,
                 "must include one single type of packaging settings",
             )
             .into());

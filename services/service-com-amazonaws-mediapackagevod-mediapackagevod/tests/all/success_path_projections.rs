@@ -23,7 +23,10 @@
 //! * `DeletePackagingGroup` removes the group, so the following read is a modelled
 //!   404 `NotFoundException` carrying a message and the `x-amzn-errortype` header;
 //! * `ListAssets` reports every stored asset, filtered by `packagingGroupId` when the
-//!   request names one, each entry carrying the modelled `AssetShallow` members.
+//!   request names one, each entry carrying the modelled `AssetShallow` members;
+//! * every create answers the success status of its own recording — 202 Accepted where
+//!   the service finishes the work after the call returns, 200 OK where the resource is
+//!   complete when it does — and the created resource reads back either way.
 
 use serde_json::{json, Value};
 
@@ -714,7 +717,7 @@ async fn list_assets_reports_resource_id_only_where_the_caller_stated_it() {
         }
 
         let (status, created) = call(&router, "POST", "/assets", Some(body)).await;
-        assert_eq!(status, 200, "case {case:?}: body {created}");
+        assert_eq!(status, 202, "case {case:?}: body {created}");
         assert_eq!(
             created["resourceId"], expected,
             "case {case:?}: CreateAsset must report {expected}, got {}",
@@ -732,6 +735,128 @@ async fn list_assets_reports_resource_id_only_where_the_caller_stated_it() {
             page["assets"][0]["resourceId"], expected,
             "case {case:?}: the listing must report {expected}, got {}",
             page["assets"][0]["resourceId"]
+        );
+    }
+}
+
+/// Every create answers the success status this service's recordings show for it: the
+/// two whose work the service finishes after the call returns — the asset submitted for
+/// ingest and the configuration being provisioned — answer `202 Accepted`, while the
+/// group, whose resource is complete when the call returns, answers `200 OK`. The 202 is
+/// a real create, so each resource reads back through its own Describe.
+#[tokio::test]
+async fn each_create_answers_the_success_status_of_its_own_recording() {
+    let source_role = format!("arn:aws:iam::{}:role/MediaPackageVod", account_id());
+    // (case, the collection the create posts to, the request body, the status it is
+    // answered with, the route that reads the created resource back). The asset rows
+    // vary in id form, the optional members carried and the source object; the
+    // configuration rows in the packaging format; the group rows in their tag map.
+    let mut cases: Vec<(String, &str, Value, u16, String)> = Vec::new();
+    for (case, id, optional) in [
+        ("an asset with no optional member", "asset-plain", json!({})),
+        (
+            "an asset carrying a resourceId",
+            "Asset_42",
+            json!({ "resourceId": "speke-resource-7" }),
+        ),
+        (
+            "an asset carrying tags",
+            "dotted.asset-id-0123456789",
+            json!({ "tags": { "env": "test", "team": "video" } }),
+        ),
+        (
+            "an asset under a long id",
+            "asset-with-a-considerably-longer-identifier-0123456789",
+            json!({ "resourceId": "r", "tags": { "env": "prod" } }),
+        ),
+    ] {
+        let mut body = json!({
+            "id": id,
+            "packagingGroupId": "g",
+            "sourceArn": format!("arn:aws:s3:::test-bucket/{id}.smil"),
+            "sourceRoleArn": source_role,
+        });
+        let Value::Object(members) = optional else {
+            panic!("case {case:?}: the optional members must be a JSON object");
+        };
+        for (key, value) in members {
+            body[key] = value;
+        }
+        cases.push((
+            case.to_string(),
+            "/assets",
+            body,
+            202,
+            format!("/assets/{id}"),
+        ));
+    }
+    // One row per modelled packaging format (`smithy_query(query="operation",
+    // operation="CreatePackagingConfiguration")`: CmafPackage, DashPackage, HlsPackage,
+    // MssPackage).
+    for (format, block) in [
+        ("hlsPackage", json!({ "hlsManifests": [{}] })),
+        ("dashPackage", json!({ "dashManifests": [{}] })),
+        ("cmafPackage", json!({ "hlsManifests": [{}] })),
+        ("mssPackage", json!({ "mssManifests": [{}] })),
+    ] {
+        let id = format!("cfg-{format}");
+        cases.push((
+            format!("a packaging configuration with a {format}"),
+            "/packaging_configurations",
+            json!({ "id": id, "packagingGroupId": "g", format: block }),
+            202,
+            format!("/packaging_configurations/{id}"),
+        ));
+    }
+    for (case, id, optional) in [
+        ("a packaging group with no optional member", "group-plain", json!({})),
+        (
+            "a packaging group carrying tags",
+            "group-tagged",
+            json!({ "tags": { "env": "test" } }),
+        ),
+    ] {
+        let mut body = json!({ "id": id });
+        let Value::Object(members) = optional else {
+            panic!("case {case:?}: the optional members must be a JSON object");
+        };
+        for (key, value) in members {
+            body[key] = value;
+        }
+        cases.push((
+            case.to_string(),
+            "/packaging_groups",
+            body,
+            200,
+            format!("/packaging_groups/{id}"),
+        ));
+    }
+
+    let router = router();
+    create_group(&router, "g", None).await;
+    for (case, route, body, expected, probe) in cases {
+        let id = body["id"].as_str().unwrap_or_default().to_string();
+        let (status, created) = call(&router, "POST", route, Some(body)).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected HTTP {expected}, got {status} body {created}"
+        );
+        assert_eq!(
+            created["id"].as_str(),
+            Some(id.as_str()),
+            "case {case:?}: the answer must report the created id, got {}",
+            created["id"]
+        );
+
+        let (status, described) = call(&router, "GET", &probe, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the created resource must read back, got {status} body {described}"
+        );
+        assert_eq!(
+            described["arn"], created["arn"],
+            "case {case:?}: the read must report the created resource, got {} instead of {}",
+            described["arn"], created["arn"]
         );
     }
 }

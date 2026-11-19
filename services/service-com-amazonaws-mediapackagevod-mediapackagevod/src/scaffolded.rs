@@ -397,6 +397,16 @@ pub const PACKAGING_GROUP_LABEL: &str = "PackagingGroup";
 /// one noun whichever operation answered.
 pub const PACKAGING_CONFIGURATION_LABEL: &str = "PackagingConfig";
 
+/// The resource type as the FIXED sentences of this API spell it out in full.
+///
+/// A refusal class whose recorded wording interpolates nothing from the request or
+/// from state — the packaging-settings exclusivity rule of a create, worded about the
+/// request as a whole — carries the type's full name rather than the abbreviated
+/// [`PACKAGING_CONFIGURATION_LABEL`] the id-bound messages (`… with id=<id> not
+/// found`, `… with id=<id> already exists`) are worded with. Each refusal class is
+/// worded as that class is recorded, so neither spelling is derived from the other.
+pub const PACKAGING_CONFIGURATION_TYPE: &str = "PackagingConfiguration";
+
 /// The message a `NotFoundException` carries for a resource the request named and
 /// this service holds none of: `<ResourceType> with id=<requested id> not found`.
 ///

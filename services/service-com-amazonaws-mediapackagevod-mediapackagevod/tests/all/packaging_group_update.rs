@@ -151,7 +151,7 @@ async fn create_asset(router: &MultiServiceRouter, id: &str, group_id: &str) {
     });
     let (status, asset) = call(router, "POST", "/assets", Some(body)).await;
     assert_eq!(
-        status, 200,
+        status, 202,
         "setup: CreateAsset {id:?} should succeed, got {status} body {asset}"
     );
 }

@@ -488,7 +488,7 @@ fn arn_members() -> Vec<ArnMember> {
             member: "sourceArn",
             message_member: "source_arn",
             kind: ArnKind::S3Object,
-            success: 200,
+            success: 202,
             probe: |id| format!("/assets/{id}"),
             after: AfterRefusal::NothingCreated,
         },
@@ -501,7 +501,7 @@ fn arn_members() -> Vec<ArnMember> {
             member: "sourceRoleArn",
             message_member: "source_role_arn",
             kind: ArnKind::IamRole,
-            success: 200,
+            success: 202,
             probe: |id| format!("/assets/{id}"),
             after: AfterRefusal::NothingCreated,
         },
@@ -868,7 +868,7 @@ async fn the_arn_rule_does_not_displace_the_other_parameter_refusals() {
     )
     .await;
     assert_eq!(
-        created.status, 200,
+        created.status, 202,
         "setup: CreateAsset {SUBJECT:?} should succeed, got {} body {}",
         created.status, created.body
     );

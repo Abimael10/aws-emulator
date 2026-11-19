@@ -173,7 +173,7 @@ async fn fixture() -> MultiServiceRouter {
     )
     .await;
     assert_eq!(
-        status, 200,
+        status, 202,
         "setup: CreateAsset must succeed, got {status} body {body}"
     );
 
@@ -305,7 +305,7 @@ async fn a_refused_arn_member_changes_no_listing() {
     )
     .await;
     assert_eq!(
-        status, 200,
+        status, 202,
         "a well-formed CreateAsset must be accepted, got {status} body {body}"
     );
     let after = listings(&router).await;

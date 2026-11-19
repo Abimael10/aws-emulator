@@ -429,7 +429,7 @@ async fn max_results_and_next_token_follow_their_modelled_constraints() {
             })),
         )
         .await;
-        assert_eq!(status, 200, "CreateAsset {id}: body {asset}");
+        assert_eq!(status, 202, "CreateAsset {id}: body {asset}");
     }
     let (status, asset_page) = call(&router, "GET", "/assets?maxResults=1", None).await;
     assert_eq!(status, 200, "ListAssets: body {asset_page}");

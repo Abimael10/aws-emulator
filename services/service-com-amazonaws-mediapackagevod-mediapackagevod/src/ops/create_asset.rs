@@ -10,8 +10,16 @@
 //! ([`crate::state::check_tags`]) with the same 422, establishes whether the source
 //! those two members name is one the packaging job could READ
 //! ([`crate::state::ingest_source`]), persists the
-//! asset, and answers with the record just stored plus the `EgressEndpoints` DERIVED
-//! from the packaging configurations attached to that group.
+//! asset, and answers HTTP 202 with the record just stored plus the `EgressEndpoints`
+//! DERIVED from the packaging configurations attached to that group.
+//!
+//! NOTE ON THE SUCCESS STATUS: the model declares `@http` code 200 for this operation
+//! (`POST /assets`, code 200), but AWS answers a successful create with 202 Accepted —
+//! the call SUBMITS the asset for ingest (`CreatedAt` is "The time the Asset was
+//! initially submitted for Ingest") and the packaging work finishes afterwards — as the
+//! recorded wire responses for this operation show. The recording is what this emulator
+//! follows: `SUCCESS_STATUS` below is 202, as it is for the sibling creates and deletes
+//! whose recordings disagree with the model the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -157,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreateAsset";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_ASSET_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_ASSET_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const SUCCESS_STATUS: u16 = 202u16;
 
     async fn handle(
         &self,

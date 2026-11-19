@@ -23,6 +23,8 @@
 //!   for a resource this service holds none of, `<ResourceType> with id=<id> already
 //!   exists` for one it already holds;
 //! * neither of those two is a validation refusal, so neither carries `errors`;
+//! * a refusal class whose wording is FIXED is worded as that class is worded by the
+//!   service, independently of the other classes about the same resource type;
 //! * none of this is a blanket answer: the same operations accept the inputs the
 //!   rules admit.
 
@@ -275,7 +277,7 @@ async fn an_unresolvable_id_in_a_create_body_is_refused_as_an_invalid_parameter(
     )
     .await;
     assert_eq!(
-        answer.status, 200,
+        answer.status, 202,
         "a resolvable packagingGroupId must not be refused, got {} body {}",
         answer.status, answer.body
     );
@@ -326,7 +328,7 @@ async fn a_whole_request_violation_is_attributed_to_base() {
         );
         assert_eq!(
             answer.message(),
-            "PackagingConfig must include one single type of packaging settings",
+            "PackagingConfiguration must include one single type of packaging settings",
             "case {case:?}: expected the resource-and-constraint message, got {:?}",
             answer.message()
         );
@@ -500,7 +502,7 @@ async fn a_duplicate_id_conflict_message_binds_the_requested_id() {
         let asset = asset_body(id, id);
         let created = call(&router, "POST", "/assets", Some(asset.clone())).await;
         assert_eq!(
-            created.status, 200,
+            created.status, 202,
             "setup: CreateAsset {id:?}: body {}",
             created.body
         );
@@ -549,6 +551,102 @@ async fn a_duplicate_id_conflict_message_binds_the_requested_id() {
             answer.body
         );
     }
+}
+
+/// Each refusal class is worded as THAT class is worded by the service: the fixed
+/// sentence of the packaging-settings exclusivity rule spells the resource type out in
+/// full, while the id-bound refusals about the same resource type keep this API's
+/// abbreviated noun. Asserted over a table, so neither spelling is derived from the
+/// other and neither depends on what the request carried.
+#[tokio::test]
+async fn each_refusal_class_words_the_resource_type_as_that_class_words_it() {
+    // The sentence the exclusivity refusal carries. FIXED text: it names no input
+    // member and interpolates no id, member name, count or limit, so every row below
+    // sees it byte for byte.
+    const EXCLUSIVITY_MESSAGE: &str =
+        "PackagingConfiguration must include one single type of packaging settings";
+
+    let router = router();
+    create_group(&router, "g").await;
+    create_group(&router, "second-group").await;
+
+    // Rows differ in the id, the parent group and which package blocks the body
+    // carries — none of which the sentence may depend on.
+    let blocks = package_blocks();
+    let mut cases: Vec<(String, Value)> = Vec::new();
+    for (index, (left_name, left)) in blocks.iter().enumerate() {
+        let (right_name, right) = &blocks[(index + 1) % blocks.len()];
+        let group = if index % 2 == 0 { "g" } else { "second-group" };
+        cases.push((
+            format!("{left_name} + {right_name} in {group:?}"),
+            config_body(
+                &format!("cfg-{index}"),
+                group,
+                &[left.clone(), right.clone()],
+            ),
+        ));
+    }
+    cases.push((
+        "no package block at all".to_string(),
+        config_body("cfg-none", "g", &[]),
+    ));
+    cases.push((
+        "all four package blocks, under a long id".to_string(),
+        config_body(
+            &"long-id-".repeat(8),
+            "second-group",
+            &blocks.iter().map(|(_, block)| block.clone()).collect::<Vec<_>>(),
+        ),
+    ));
+
+    for (case, body) in cases {
+        let answer = call(&router, "POST", "/packaging_configurations", Some(body)).await;
+        assert_shape(&answer, &case, UNPROCESSABLE);
+        assert_eq!(
+            answer.message(),
+            EXCLUSIVITY_MESSAGE,
+            "case {case:?}: expected the fixed exclusivity sentence, got {:?}",
+            answer.message()
+        );
+    }
+
+    // The abbreviated noun is still what the id-bound classes are worded with, so the
+    // full spelling above belongs to that one refusal class rather than to the service.
+    let one_block = config_body("solo", "g", &[blocks[0].1.clone()]);
+    let created = call(
+        &router,
+        "POST",
+        "/packaging_configurations",
+        Some(one_block.clone()),
+    )
+    .await;
+    assert_eq!(
+        created.status, 202,
+        "setup: one package block must be accepted, got {} body {}",
+        created.status, created.body
+    );
+    let duplicate = call(
+        &router,
+        "POST",
+        "/packaging_configurations",
+        Some(one_block),
+    )
+    .await;
+    assert_shape(&duplicate, "a duplicate configuration id", UNPROCESSABLE);
+    assert_eq!(
+        duplicate.message(),
+        "PackagingConfig with id=solo already exists",
+        "the conflict class keeps the abbreviated noun, got {:?}",
+        duplicate.message()
+    );
+    let absent = call(&router, "GET", "/packaging_configurations/absent", None).await;
+    assert_shape(&absent, "an unheld configuration id", NOT_FOUND);
+    assert_eq!(
+        absent.message(),
+        "PackagingConfig with id=absent not found",
+        "the not-found class keeps the abbreviated noun, got {:?}",
+        absent.message()
+    );
 }
 
 /// Every message this service builds about an identified resource binds the id the

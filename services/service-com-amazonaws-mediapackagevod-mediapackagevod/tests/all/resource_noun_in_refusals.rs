@@ -75,11 +75,12 @@ impl Kind {
     }
 
     /// The HTTP status a create of this type answers on success — the status this
-    /// emulator's recordings show for each (the configuration's 202 included).
+    /// emulator's recordings show for each (the configuration's and the asset's 202
+    /// included: each create is accepted and provisioned afterwards).
     fn created(self) -> u16 {
         match self {
-            Kind::Configuration => 202,
-            _ => 200,
+            Kind::Configuration | Kind::Asset => 202,
+            Kind::Group => 200,
         }
     }
 }

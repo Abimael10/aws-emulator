@@ -178,7 +178,7 @@ fn assumable() -> String {
 
 /// `CreateAsset` with the source the row names, asserting the submit itself succeeded: an
 /// unreadable source is not a bad REQUEST — AWS accepts the asset and the ingest fails
-/// afterwards — so every row here is an HTTP 200 that stores an asset.
+/// afterwards — so every row here is an HTTP 202 that stores an asset.
 async fn create_asset(
     router: &MultiServiceRouter,
     id: &str,
@@ -192,7 +192,7 @@ async fn create_asset(
         "sourceRoleArn": source_role_arn,
     });
     let (status, asset) = call(router, "POST", "/assets", Some(body)).await;
-    assert_eq!(status, 200, "CreateAsset {id}: body {asset}");
+    assert_eq!(status, 202, "CreateAsset {id}: body {asset}");
     asset
 }
 

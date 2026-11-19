@@ -68,7 +68,7 @@ pub(crate) struct Kind {
 }
 
 /// The three resource types an ARN of this service names. `CreatePackagingConfiguration`
-/// is the one create this service answers 202 rather than 200 with.
+/// and `CreateAsset` are the two creates this service answers 202 rather than 200 with.
 pub(crate) const KINDS: [Kind; 3] = [
     Kind {
         name: "PackagingGroup",
@@ -86,7 +86,7 @@ pub(crate) const KINDS: [Kind; 3] = [
         name: "Asset",
         arn_kind: vod::ARN_KIND_ASSETS,
         create_route: "/assets",
-        created_status: 200,
+        created_status: 202,
     },
 ];
 

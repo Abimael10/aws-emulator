@@ -169,8 +169,8 @@ async fn create_all(router: &MultiServiceRouter, region: &str, id: &str) {
     )
     .await;
     assert_eq!(
-        asset.status, 200,
-        "case {region:?}/{id:?}: CreateAsset: expected 200, got {} body {}",
+        asset.status, 202,
+        "case {region:?}/{id:?}: CreateAsset: expected 202, got {} body {}",
         asset.status, asset.body
     );
 }
