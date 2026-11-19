@@ -366,6 +366,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &context.role_arn,
                 unassumable,
+                Some(ctx.credential_store()),
             );
             // This attempt CONTINUES the execution, so each Distributed Map state it
             // re-enters is the Map Run that execution already has: it keeps that ARN,

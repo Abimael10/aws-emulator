@@ -47,7 +47,7 @@ use super::*;
 
 /// The units of interpretation work ONE run of a definition may do.
 ///
-/// Emulator quota, NOT an AWS one, and the companion of [`MAX_STATE_TRANSITIONS`]: it
+/// Emulator quota, NOT an AWS one, and the companion of [`MAX_HISTORY_EVENTS`]: it
 /// is the ceiling on the product the other ceilings bound factor by factor. It is wide
 /// enough for the heaviest run those factors allow — every transition carrying a
 /// document the size of a state's maximum through a template that rewrites it — and
@@ -64,6 +64,19 @@ pub const MAX_INTERPRET_WORK: u64 = 4_000_000_000;
 /// and a bound on a definition written to spend the engine's own per-expression
 /// ceiling over and over.
 pub const WORK_PER_EVALUATED_MILLISECOND: u64 = 2_000_000;
+
+/// The LEAST one state transition costs, whatever its state looked at.
+///
+/// The charges above are what a step looked AT — a document's bytes, a pattern's
+/// characters — so a transition over a tiny document costs almost nothing, and a
+/// definition made of such transitions would be bounded only by the events each
+/// execution's history holds ([`MAX_HISTORY_EVENTS`]). That is a bound per EXECUTION,
+/// and a Distributed Map's children each have one of their own, so this fixed charge is
+/// what bounds the transitions one interpretation makes at all:
+/// `MAX_INTERPRET_WORK / WORK_PER_TRANSITION` of them, however many items a state fans
+/// out over and however cheap each transition is. It is spent by the walk at every
+/// transition ([`Interpreter::walk_one`]).
+pub const WORK_PER_TRANSITION: u64 = 1_000;
 
 thread_local! {
     /// What is LEFT of the work the interpretation running on THIS thread may do.

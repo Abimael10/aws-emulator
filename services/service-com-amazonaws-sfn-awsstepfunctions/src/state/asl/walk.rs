@@ -253,17 +253,22 @@ impl Interpreter<'_> {
                 suspended: false,
             });
         }
-        if self.budget == 0 {
+        // Every transition costs the interpretation's work allowance at least this
+        // much, whatever its state looked at, so [`MAX_INTERPRET_WORK`] bounds how many
+        // transitions ONE interpretation makes however cheap each of them is. The
+        // per-execution event quotas do not give that bound on their own: a Distributed
+        // Map's children each have an allowance of their own, so the transitions one
+        // request can drive are the product of the items a state fans out over and what
+        // each child does, and this is what bounds that product. A charge past the
+        // allowance is reported at the next transition, by the check above.
+        spend_work(WORK_PER_TRANSITION);
+        if self.events_left == 0 {
             return Some(Branch {
-                outcome: Err(runtime(format!(
-                    "the execution made more than the {MAX_STATE_TRANSITIONS} state \
-                     transitions this emulator runs, so it was stopped"
-                ))),
+                outcome: Err(history_limit_exceeded()),
                 end: at,
                 suspended: false,
             });
         }
-        self.budget -= 1;
         let Some(state) = states.get(&cursor.name).and_then(Value::as_object) else {
             return Some(Branch {
                 outcome: Err(runtime(format!(
@@ -279,6 +284,9 @@ impl Interpreter<'_> {
         // with the data it saw ([`Run::stopped_at`]).
         let raw = cursor.value.clone();
         let current = std::mem::take(&mut cursor.value);
+        // What the execution's history held before this state's turn, so the turn can be
+        // charged for whatever it records ([`Interpreter::events_recorded`]).
+        let before = self.events_recorded();
         let step = match self.step(&cursor.name, state, current, at, scope) {
             Ok(step) => step,
             Err(fault) => {
@@ -302,6 +310,15 @@ impl Interpreter<'_> {
         };
         cursor.at = step.at;
         cursor.value = step.value;
+        // Every transition costs the execution's history. A state records its own
+        // events, which spend the allowance where they are recorded; one that recorded
+        // NONE — a state whose entry the preserved history already holds — is charged
+        // here, so the allowance strictly falls at every transition and a `Next` chain
+        // that forms a cycle is stopped by it rather than spinning on what a state
+        // happens to record.
+        if self.events_recorded() == before {
+            self.events_left = self.events_left.saturating_sub(1);
+        }
         // The document this state produced is measured HERE, at the state that
         // produced it: a definition that grows what it carries is stopped at the
         // first state past what a state's output may hold, rather than after the
@@ -415,6 +432,14 @@ impl Interpreter<'_> {
         fault: &Fault,
         from: usize,
     ) {
+        // The events of a Distributed Map's item are the child workflow execution's and
+        // are not kept ([`Interpreter::unheld`]), so there is no list of its own to
+        // record this on and the enclosing execution's is not it; the diagnosis travels
+        // with the failure itself, which is what the child's record reports.
+        if self.unheld.is_some() {
+            super::super::jsonata::clear_failed_field();
+            return;
+        }
         let expression_failure = match fault.failure.name() {
             QUERY_EVALUATION_ERROR => true,
             DATA_LIMIT_ERROR => self.language_of(state).ok() == Some(JSONATA),
@@ -459,6 +484,10 @@ impl Interpreter<'_> {
             .skip(from)
             .find(|(_, step)| records_a_failure(step.event_type))
             .map_or(self.steps.len(), |(index, _)| index);
+        if self.events_left == 0 {
+            return;
+        }
+        self.events_left -= 1;
         self.steps.insert(at, evaluation_failed);
     }
 
@@ -469,14 +498,32 @@ impl Interpreter<'_> {
     /// recorded before it. A walk that CONTINUES an execution from a reply reports
     /// only the steps that FOLLOW the point the reply was applied at
     /// ([`Resumed::index`]) — the ones before it were recorded by the call that
-    /// suspended the execution — so those are the steps counted here.
+    /// suspended the execution — so those are the steps counted here. For the walk of a
+    /// Distributed Map's item the count is the child execution's own
+    /// ([`Interpreter::unheld`]), because its events are counted rather than kept.
     pub(super) fn next_event_id(&self) -> i64 {
-        let recorded = self
-            .steps
-            .len()
-            .saturating_sub(self.resumed.map_or(0, |resumed| resumed.index));
+        let recorded = match self.unheld {
+            Some(counted) => counted,
+            None => self
+                .steps
+                .len()
+                .saturating_sub(self.resumed.map_or(0, |resumed| resumed.index)),
+        };
         self.first_event_id
             .saturating_add(i64::try_from(recorded).unwrap_or(i64::MAX))
+    }
+
+    /// How many history events this walk has recorded so far.
+    ///
+    /// The events it HOLDS, for the walk of an execution's own history, and the count a
+    /// child workflow execution's are kept as, for the walk of a Distributed Map's item
+    /// ([`Interpreter::unheld`]). It is what tells a transition that recorded something
+    /// from one that recorded nothing.
+    fn events_recorded(&self) -> usize {
+        match self.unheld {
+            Some(counted) => counted,
+            None => self.steps.len(),
+        }
     }
 
     /// [`Interpreter::step`]'s own work: `entered` is the id of the event this state
@@ -1267,6 +1314,18 @@ impl Interpreter<'_> {
     }
 
     /// One history event carrying what the walk knew about it.
+    ///
+    /// Every event spends one of the execution's own allowance
+    /// ([`Interpreter::events_left`]): the history one execution keeps is bounded, so a
+    /// run that has filled it records no further event and makes no further transition
+    /// — the next one ends it with [`history_limit_exceeded`], which is the event the
+    /// history ends on.
+    ///
+    /// An event the full history drops is therefore always followed by that failure and
+    /// never by an outcome of the definition's own: the walk makes no further
+    /// transition, so the last state's turn can be half-recorded (an entry whose exit
+    /// was dropped) but the run it ends is the quota's failure and not a `SUCCEEDED`
+    /// one.
     pub(super) fn push_detailed(
         &mut self,
         event_type: &'static str,
@@ -1274,6 +1333,17 @@ impl Interpreter<'_> {
         after: Duration,
         details: super::super::EventDetails,
     ) {
+        if self.events_left == 0 {
+            return;
+        }
+        self.events_left -= 1;
+        // What a child workflow execution records is counted and not held: the count is
+        // what numbers its next event, and the parent's list is not where its steps go
+        // ([`Interpreter::unheld`]).
+        if let Some(counted) = &mut self.unheld {
+            *counted = counted.saturating_add(1);
+            return;
+        }
         self.steps.push(Step {
             event_type,
             state_name: Some(state_name.to_string()),
@@ -1294,6 +1364,11 @@ impl Interpreter<'_> {
     /// never handed over, or one that handed it over and is waiting) carries no span at
     /// all.
     pub(super) fn stamp_work_span(&mut self, spent: Duration) {
+        // A child workflow execution's events are not kept, so the walk's last event is
+        // the enclosing execution's and not this work's ([`Interpreter::unheld`]).
+        if self.unheld.is_some() {
+            return;
+        }
         let Some(step) = self.steps.last_mut() else {
             return;
         };
@@ -3344,12 +3419,20 @@ impl Interpreter<'_> {
             if !retried {
                 return (Err(failure), at);
             }
-            // A retry re-runs the work, so it spends from the same step budget: a
-            // definition cannot ask for an unbounded number of attempts.
-            if self.budget == 0 {
-                return (Err(failure), at);
+            // A retry re-runs the work, and the attempt it re-runs records the events
+            // of that attempt: a definition cannot ask for more attempts than the
+            // execution's history carries, and a state whose retriers reach that quota
+            // ends on the quota's own failure — the same one the next transition would
+            // report — rather than on the attempt's. The attempt is charged HERE, and
+            // not only where it records something, because an attempt may fail before
+            // it reaches an event of its own — a `Map` state whose item source could not
+            // be read reaches none — and this loop makes progress towards its end on
+            // every iteration whatever the attempt did, however many attempts the
+            // retrier declares.
+            if self.events_left == 0 {
+                return (Err(history_limit_exceeded()), at);
             }
-            self.budget -= 1;
+            self.events_left -= 1;
             self.retry_count += 1;
         }
     }

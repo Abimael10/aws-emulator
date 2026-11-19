@@ -19,7 +19,11 @@
 //!    Run in `mapRunArn`;
 //! 4. a child is owed to the clock exactly as the Map Run around it is: it reports
 //!    `RUNNING` until the instant its own item finished, and an execution stopped
-//!    before then stops its children too.
+//!    before then stops its children too;
+//! 5. the steps of ONE item are that child execution's own history: the parent records
+//!    no event per item, so neither its history nor its outcome grows with how many
+//!    items the state fans out over — while the INLINE twin over the same items steps
+//!    through every one of them in its own history.
 //!
 //! The table below spans the dimensions rule 1 generalises over: how many items the
 //! state iterates (none, one, a few, more than its concurrency), where they come from
@@ -811,6 +815,212 @@ async fn stopping_the_execution_stops_its_child_executions() {
             ),
             (Some("ABORTED"), None),
             "a stopped child reached no outcome of its own, got {described:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 5: the steps of one item are its CHILD execution's, not the parent's
+// ---------------------------------------------------------------------------
+
+/// How long the rows below wait for an execution to leave `RUNNING`.
+///
+/// Generous: what they assert is the OUTCOME a run reached and what its history holds,
+/// never how fast the host got there, so the wait is for that condition and is bounded
+/// only so a run that never settles fails instead of hanging.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often such a wait looks again.
+const LOOK_AGAIN: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Poll one execution until it is no longer `RUNNING`, and report what it ended as.
+///
+/// `pub(crate)`, not private: `tests/all/definition_decides_the_outcome.rs` drives the
+/// same quota over an inline `Map` and `tests/all.rs` is one crate root, so the wait,
+/// the item counts and the definition builder below are stated here once.
+pub(crate) async fn settled(emulator: &Emulator, execution_arn: &str, case: &str) -> Value {
+    let began = std::time::Instant::now();
+    loop {
+        let described = describe_execution(emulator, execution_arn).await;
+        if described.get("status").and_then(Value::as_str) != Some("RUNNING") {
+            return described;
+        }
+        assert!(
+            began.elapsed() < PATIENCE,
+            "case {case:?}: expected a terminal status within {PATIENCE:?}, got {described:?}"
+        );
+        ::tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// How many `Pass` states each item of the rows below runs through: one iteration
+/// records the pair every `Pass` state writes, plus the pair the iteration itself writes
+/// when the EXECUTION around it is the one stepping through the items.
+pub(crate) const STATES_PER_ITEM: usize = 10;
+
+/// Enough items that recording every one of them into the PARENT's history would fill
+/// it: each item costs `2 * STATES_PER_ITEM + 2` of the events one execution's history
+/// holds.
+pub(crate) const ITEMS_PAST_ONE_HISTORY: usize =
+    service_com_amazonaws_sfn_awsstepfunctions::state::asl::MAX_HISTORY_EVENTS
+        / (2 * STATES_PER_ITEM + 2)
+        + 50;
+
+/// One row of the mode table: how many items the state iterates, the processor mode,
+/// and whether the PARENT's history steps through the items.
+struct ModeCase {
+    case: &'static str,
+    count: usize,
+    /// `None` for the inline processor, which declares no `ProcessorConfig`.
+    mode: Option<&'static str>,
+    records_items: bool,
+}
+
+/// A `Map` state iterating the execution's own input through `STATES_PER_ITEM` `Pass`
+/// states per item, in the processor mode `mode` names; `None` is the INLINE processor,
+/// which declares no `ProcessorConfig`.
+pub(crate) fn chained_mapping(mode: Option<&str>) -> String {
+    let mut states = Map::new();
+    for step in 0..STATES_PER_ITEM {
+        let declared = match step + 1 == STATES_PER_ITEM {
+            true => json!({ "Type": "Pass", "End": true }),
+            false => json!({ "Type": "Pass", "Next": format!("Step{}", step + 1) }),
+        };
+        states.insert(format!("Step{step}"), declared);
+    }
+    let mut processor = json!({ "StartAt": "Step0", "States": Value::Object(states) });
+    if let Some(mode) = mode {
+        processor
+            .as_object_mut()
+            .expect("the processor is an object")
+            .insert("ProcessorConfig".to_string(), json!({ "Mode": mode }));
+    }
+    json!({
+        "StartAt": "Fan",
+        "States": { "Fan": { "Type": "Map", "ItemProcessor": processor, "End": true } },
+    })
+    .to_string()
+}
+
+/// A DISTRIBUTED Map's items run as child workflow executions, so the steps of one item
+/// are that CHILD's history: the parent records no event per item, and neither its
+/// history nor its outcome grows with the item count — which is why it carries a run
+/// over more items than one history holds, while the INLINE twin over the same items
+/// records every one of them into its own history.
+///
+/// The rows differ along the item count and the processor MODE — the one member the rule
+/// turns on — up to the count whose events one history could not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_distributed_maps_items_record_into_their_own_executions() {
+    let rows: &[ModeCase] = &[
+        ModeCase {
+            case: "an inline Map over a few items",
+            count: 3,
+            mode: None,
+            records_items: true,
+        },
+        ModeCase {
+            case: "the distributed twin over the same few items",
+            count: 3,
+            mode: Some("DISTRIBUTED"),
+            records_items: false,
+        },
+        ModeCase {
+            case: "a distributed Map over more items than one history holds",
+            count: ITEMS_PAST_ONE_HISTORY,
+            mode: Some("DISTRIBUTED"),
+            records_items: false,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let machine = create_machine(
+            &emulator,
+            &format!("item-history-{index}"),
+            &chained_mapping(row.mode),
+        )
+        .await;
+        let items = Value::Array((0..row.count).map(|at| json!({ "n": at })).collect()).to_string();
+        let execution = start_execution(&emulator, &machine, "only", &items).await;
+        let described = settled(&emulator, &execution, case).await;
+        assert_eq!(
+            described.get("status").and_then(Value::as_str),
+            Some("SUCCEEDED"),
+            "case {case:?}: expected SUCCEEDED over {} items, got {described:?}",
+            row.count
+        );
+
+        // Whose history the items' own steps went into: the parent steps through an
+        // inline state's iterations and records nothing of a distributed one's.
+        let events = emulator
+            .ok(
+                "GetExecutionHistory",
+                &json!({ "executionArn": execution, "maxResults": 1000 }),
+            )
+            .await;
+        let events = events
+            .get("events")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a history, got {events:?}"))
+            .clone();
+        let per_item = events
+            .iter()
+            .filter(|event| {
+                event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|event_type| event_type.starts_with("MapIteration"))
+            })
+            .count();
+        assert_eq!(
+            per_item > 0,
+            row.records_items,
+            "case {case:?}: expected the parent to step through its items={}, got {per_item} \
+             iteration event(s)",
+            row.records_items
+        );
+        if !row.records_items {
+            // Nothing of the fan-out is in the parent's history, however many items it
+            // fanned out over: what it records is the Map state itself.
+            assert!(
+                events.len() < 2 * STATES_PER_ITEM,
+                "case {case:?}: expected a history that does not grow with the {} items, got \
+                 {} event(s)",
+                row.count,
+                events.len()
+            );
+        }
+        if row.mode.is_none() {
+            continue;
+        }
+        // And every item really ran as a child execution of the Map Run, which is what
+        // the run reports counting.
+        let runs = map_runs(&emulator, &execution).await;
+        assert_eq!(
+            runs.len(),
+            1,
+            "case {case:?}: one Distributed Map state starts one Map Run, got {runs:?}"
+        );
+        let map_run = emulator
+            .ok(
+                "DescribeMapRun",
+                &json!({ "mapRunArn": string(&runs[0], "mapRunArn") }),
+            )
+            .await;
+        let counts = map_run
+            .get("itemCounts")
+            .unwrap_or_else(|| panic!("case {case:?}: expected itemCounts in {map_run:?}"));
+        let expected = i64::try_from(row.count).expect("the item count fits");
+        assert_eq!(
+            (
+                map_run.get("status").and_then(Value::as_str),
+                counts.get("total").and_then(Value::as_i64),
+                counts.get("succeeded").and_then(Value::as_i64),
+            ),
+            (Some("SUCCEEDED"), Some(expected), Some(expected)),
+            "case {case:?}: expected the run to count every item it started, got {map_run:?}"
         );
     }
 }

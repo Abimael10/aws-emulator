@@ -453,6 +453,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             &role_arn,
             unassumable,
+            Some(ctx.credential_store()),
         );
         let interpreted = {
             let definition = definition.clone();

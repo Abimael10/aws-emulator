@@ -332,10 +332,11 @@ fn denied_answer(api: &Api, denied: Option<Denied>) -> (&'static str, u16) {
 /// what the ARN the access request is over is formed in
 /// ([`super::integration::TargetNaming`]).
 ///
-/// The session this service assumes the role under is minted HERE, once for the walk
-/// ([`new_session_name`]): every call of this walk is made as that session, so every
-/// refusal of its work blames the same identity, which is the principal a refusal of one
-/// of its calls names ([`assumed_role_session`]).
+/// The session this service assumes the role under is the one the credential of the
+/// walk was minted for ([`super::execution_role_session`]), so every refusal of its
+/// work blames the identity its calls were really made as; where no credential could be
+/// minted (see that module), a fresh name stands in for the assume this emulator could
+/// not record.
 ///
 /// `unassumable` is the refusal [`unassumable_role`] resolved for this walk's role: a
 /// role this service cannot assume fails EVERY call of the walk, whatever the call
@@ -351,6 +352,7 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
     region: &str,
     role_arn: &str,
     unassumable: Option<Failed>,
+    session_name: &str,
 ) -> Option<RoleGate> {
     if role_arn.is_empty() {
         return None;
@@ -361,7 +363,7 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
     let engine = Arc::clone(engine);
     let region = region.to_string();
     let role_arn = role_arn.to_string();
-    let session_name = new_session_name();
+    let session_name = session_name.to_string();
     Some(Arc::new(move |call: &Call, request: &::serde_json::Value| {
         if let Some(refused) = &unassumable {
             return Some(refused.clone());
@@ -461,6 +463,12 @@ pub struct Acting {
     /// rather than beginning one. `None` for every other call, whose Map states each
     /// start a Map Run of their own.
     pub map_runs: Option<MapRuns>,
+    /// The CREDENTIAL the walk's integration calls are signed with: a session of the
+    /// execution role ([`super::execution_role_session`]), so each call is made as that
+    /// role rather than as this emulator's own principal. `None` where no session could
+    /// be minted, which leaves the calls signed with the credential the framework hands
+    /// this emulator's handlers.
+    pub signing: Option<super::execution_role_session::RoleSession>,
 }
 
 /// Debug without disclosing anything either closure reads: a connection holds
@@ -473,6 +481,7 @@ impl ::std::fmt::Debug for Acting {
             .field("connections", &self.connections.is_some())
             .field("handovers", &self.handovers.is_some())
             .field("map_runs", &self.map_runs.is_some())
+            .field("signing", &self.signing.is_some())
             .finish()
     }
 }
@@ -480,20 +489,47 @@ impl ::std::fmt::Debug for Acting {
 /// What a walk of this execution acts as: see [`Acting`], [`role_gate`] and
 /// [`super::http_task::connections`], each of which answers nothing for an engine
 /// carrying no store to read.
+///
+/// `store` is where a minted session of the execution role is recorded, so the walk's
+/// calls are made AS that role ([`super::execution_role_session::role_session`]); a
+/// caller with none gets a session only where one is already held.
 pub fn acting<Eng: Send + Sync + 'static>(
     engine: &Arc<Eng>,
     region: &str,
     role_arn: &str,
     unassumable: Option<Failed>,
+    store: Option<&::emulator_server::CredentialStore>,
 ) -> Acting {
+    // The credential comes first: the session it speaks for is the identity the calls
+    // are really made as, so it is the one a refusal of one of them blames. A role this
+    // service cannot ACT AS vends none: the assume is what would have minted the
+    // credentials, so a role whose trust policy admits neither of this service's
+    // principals leaves nothing to sign with — and nothing of it recorded where a
+    // credential is resolved.
+    let signing = match unassumable {
+        Some(_) => None,
+        None => super::execution_role_session::role_session(
+            &**engine,
+            store,
+            role_arn,
+            // The WALL clock, and not the offsets the walk measures a definition's own
+            // spans by: what makes a credential unusable is the instant the token
+            // service minted it to last until, which it dates in real time.
+            ::std::time::SystemTime::now(),
+        ),
+    };
+    let session_name = signing
+        .as_ref()
+        .map_or_else(new_session_name, |session| session.session_name.clone());
     Acting {
-        role: role_gate(engine, region, role_arn, unassumable),
+        role: role_gate(engine, region, role_arn, unassumable, &session_name),
         connections: super::http_task::connections(engine),
         handovers: super::callbacks::handovers(engine),
         // A walk that BEGINS an attempt runs every item of every Map state it enters,
         // each under a Map Run of its own: only the call that continues an attempt
         // carries the Map Runs it is continuing ([`Acting::map_runs`]).
         map_runs: None,
+        signing,
     }
 }
 

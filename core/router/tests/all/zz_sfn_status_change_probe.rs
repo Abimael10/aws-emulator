@@ -264,6 +264,9 @@ async fn probe_role(router: &MultiServiceRouter, name: &str, resource: &str) -> 
         "Statement": [
             {"Effect": "Allow", "Action": "sqs:SendMessage", "Resource": resource},
             {"Effect": "Allow", "Action": "states:StartExecution", "Resource": "*"},
+            // A task of the probe publishes an event, and an execution's integration
+            // calls are made AS this role, so the publication is its to make.
+            {"Effect": "Allow", "Action": "events:PutEvents", "Resource": "*"},
         ],
     })
     .to_string();

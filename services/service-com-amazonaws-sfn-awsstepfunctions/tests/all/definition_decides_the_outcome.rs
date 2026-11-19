@@ -17,27 +17,36 @@
 //! The table spans the ways a run ENDS, with every row asking for interpretation work
 //! on the way: a long loop that reaches a `Succeed`, the same loop reaching a `Fail`,
 //! the same loop under a definition-level `TimeoutSeconds` (the one span that may cut a
-//! run short), and a loop that never ends, which the state-transition quota stops — a
-//! quota counted in transitions and not in seconds. The first row carries a document
-//! and a `StringMatches` pattern whose match is tens of millions of character steps,
-//! repeated on every turn: the case a wall-clock ceiling decides and a work quota does
-//! not.
+//! run short), and a loop that never ends, which the HISTORY-EVENT quota stops — a
+//! quota counted in the events one execution's history holds and not in seconds. The
+//! first row carries a document and a `StringMatches` pattern whose match is tens of
+//! millions of character steps, repeated on every turn: the case a wall-clock ceiling
+//! decides and a work quota does not.
+//!
+//! The last test pins that quota itself: whatever fills an execution's history, the run
+//! ends with the service's own sentence for it, and that failure is the last event the
+//! history holds.
 //!
 //! The harness (`Emulator`, `create_machine`, `start_execution`, `describe_execution`,
-//! `string`) is the one `state_machine_lifecycle` already builds; `tests/all.rs` is
-//! this binary's crate root, so it is reached through `crate::`.
+//! `string`) is the one `state_machine_lifecycle` already builds and the history reader
+//! is `execution_history`'s; `tests/all.rs` is this binary's crate root, so each is
+//! reached through `crate::`.
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_sfn_awsstepfunctions::state::asl::{MAX_HISTORY_EVENTS, RUNTIME_ERROR};
+
+use crate::distributed_map_children::{chained_mapping, settled, ITEMS_PAST_ONE_HISTORY};
+use crate::execution_history::history;
 use crate::state_machine_lifecycle::{
     create_machine, describe_execution, start_execution, string, Emulator,
     PAST_THE_EXECUTION_DELAY,
 };
 
 /// How many turns of its loop every row below runs: two transitions each, well inside
-/// the state-transition quota, and enough turns that the pattern of the heavy row is
+/// the history-event quota, and enough turns that the pattern of the heavy row is
 /// matched over and over.
 const TURNS: u64 = 150;
 
@@ -183,10 +192,11 @@ fn cases() -> Vec<OutcomeCase> {
             counts_every_turn: false,
         },
         OutcomeCase {
-            // The emulator's remaining ceiling on a run, and a quota in TRANSITIONS: a
-            // loop that goes round more times than one execution may is stopped by how
-            // much work it asked for, and the cause says so, naming no span of time.
-            case: "a loop whose exit its own data never reaches, which the state-transition \
+            // The service's own quota on the size of an execution's event history: a
+            // loop that goes round more times than that history holds is stopped by how
+            // much of it the run recorded, and the cause says so, naming no span of
+            // time.
+            case: "a loop whose exit its own data never reaches, which the history-event \
                    quota stops",
             definition: json!({
                 "StartAt": "Step",
@@ -212,7 +222,7 @@ fn cases() -> Vec<OutcomeCase> {
             input: document(LIGHT_DOCUMENT_CHARS),
             status: "FAILED",
             error: Some("States.Runtime"),
-            cause_names: Some("state transitions"),
+            cause_names: Some("maximum number of history events"),
             counts_every_turn: false,
         },
     ]
@@ -345,6 +355,108 @@ async fn the_same_definition_and_input_end_the_same_way_every_run() {
             outcome, &first,
             "case \"repeated runs\": expected run {index} to end exactly as the first did \
              ({first:?}), got {outcome:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The quota that stops a run the definition itself would carry on
+// ---------------------------------------------------------------------------
+
+/// What the service words the end of a run that filled its history with, literally:
+/// FIXED text with the quota in it, and nothing of the definition or of the request
+/// (the issue's own Evidence quotes this sentence).
+const HISTORY_LIMIT_CAUSE: &str =
+    "The execution reached the maximum number of history events (25000).";
+
+/// A run that fills its history ends `FAILED` with the quota's own sentence, and that
+/// failure is the LAST event the history holds — the quota is where the history ends
+/// rather than a count it went past.
+///
+/// The rows differ along WHAT fills the history: a cycle the definition's own data never
+/// leaves, and an inline `Map` over more items than one history carries. The wait, the
+/// item count and the `Map` definition are `distributed_map_children`'s, which holds the
+/// other half of this rule.
+#[tokio::test]
+async fn a_run_that_fills_its_history_is_stopped_with_the_quotas_own_cause() {
+    let cycle = json!({
+        "StartAt": "Step",
+        "States": {
+            // A turn count no run reaches inside the quota, so the terminal state this
+            // definition declares is never got to.
+            "Step": {
+                "Type": "Pass",
+                "Parameters": { "n.$": "States.MathAdd($.n, 1)" },
+                "Next": "Check",
+            },
+            "Check": {
+                "Type": "Choice",
+                "Choices": [{ "Variable": "$.n", "NumericLessThan": 1_000_000, "Next": "Step" }],
+                "Default": "Ending",
+            },
+            "Ending": { "Type": "Succeed" },
+        },
+    })
+    .to_string();
+    let items = Value::Array(
+        (0..ITEMS_PAST_ONE_HISTORY)
+            .map(|index| json!({ "n": index }))
+            .collect(),
+    )
+    .to_string();
+
+    let rows: &[(&str, String, String)] = &[
+        (
+            "a cycle the data never leaves",
+            cycle,
+            json!({ "n": 0 }).to_string(),
+        ),
+        (
+            "an inline Map over more items than one history carries",
+            chained_mapping(None),
+            items,
+        ),
+    ];
+
+    let emulator = Emulator::new();
+    for (index, (case, written, input)) in rows.iter().enumerate() {
+        let machine = create_machine(&emulator, &format!("filled-{index}"), written).await;
+        let execution = start_execution(&emulator, &machine, "only", input).await;
+        let described = settled(&emulator, &execution, case).await;
+        assert_eq!(
+            (
+                described.get("status").and_then(Value::as_str),
+                described.get("error").and_then(Value::as_str),
+                described.get("cause").and_then(Value::as_str),
+            ),
+            (
+                Some("FAILED"),
+                Some(RUNTIME_ERROR),
+                Some(HISTORY_LIMIT_CAUSE)
+            ),
+            "case {case:?}: expected the quota's own failure, got {described:?}"
+        );
+        // The events are numbered from one in order, so the id of the LAST one is the
+        // size of the history it ends.
+        let last = history(
+            &emulator,
+            &execution,
+            json!({ "reverseOrder": true, "maxResults": 1 }),
+        )
+        .await;
+        let last = last
+            .first()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a history, got none"));
+        assert_eq!(
+            (
+                last.get("id").and_then(Value::as_i64),
+                last.get("type").and_then(Value::as_str),
+            ),
+            (
+                Some(i64::try_from(MAX_HISTORY_EVENTS).expect("the quota fits")),
+                Some("ExecutionFailed"),
+            ),
+            "case {case:?}: expected the failure as event #{MAX_HISTORY_EVENTS}, got {last:?}"
         );
     }
 }

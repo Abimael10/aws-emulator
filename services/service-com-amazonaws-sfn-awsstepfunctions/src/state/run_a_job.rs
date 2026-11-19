@@ -284,6 +284,12 @@ async fn resolve<Eng: Send + Sync + 'static>(
             &region,
             &context.role_arn,
             unassumable,
+            // The continuation is run by the CLOCK rather than by a request, so there is
+            // no credential store to record a fresh assume in: it acts as the session
+            // this emulator already holds for the role, and as this emulator's own
+            // credential where it holds none
+            // ([`super::execution_role_session::role_session`]).
+            None,
         );
         integration::interpret_through(callback, depth, &region, acting, move |tasks| {
             super::plan_job_reply(

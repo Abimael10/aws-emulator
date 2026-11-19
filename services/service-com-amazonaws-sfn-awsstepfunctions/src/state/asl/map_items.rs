@@ -75,7 +75,42 @@ struct Iteration {
     started_at: Duration,
     /// Which [`Unit`] of the state's concurrent work this iteration's events belong to.
     unit: usize,
+    /// The history this iteration records into when it is a CHILD workflow execution's
+    /// own, for a Distributed Map's item; `None` for an inline `Map`'s iteration, whose
+    /// events are steps of the execution around it ([`ChildHistory`]).
+    history: Option<ChildHistory>,
 }
+
+/// The history ONE child workflow execution of a Distributed `Map` records, and the
+/// allowance it records it against.
+///
+/// "Step Functions starts a child workflow execution for each item": the states of one
+/// item are steps of THAT execution, so what they record is its history and not the
+/// parent's — which is why a Distributed Map's parent neither numbers nor keeps an
+/// event per item, and why the events one item records are bounded by its own
+/// execution's quota ([`MAX_HISTORY_EVENTS`]) rather than by what the parent has left.
+///
+/// What a child records is COUNTED and not HELD ([`Interpreter::unheld`]): the store
+/// records that execution's own start and outcome and nothing reports the steps between
+/// them, so holding them would make what one `Map` state's concurrent items keep in
+/// memory grow with the events they record. Two figures are all an iteration carries
+/// between its slices.
+pub(super) struct ChildHistory {
+    /// What is left of that execution's own allowance: a child whose `Next` chain forms
+    /// a cycle is stopped by its OWN history, with the same failure its parent would
+    /// end on ([`history_limit_exceeded`]).
+    events_left: usize,
+    /// The id the first event this child records carries: its history is its own,
+    /// numbered from the `ExecutionStarted` its record opens with.
+    first_event_id: i64,
+    /// How many events it has recorded, which is what numbers the next one
+    /// ([`Interpreter::next_event_id`]).
+    numbered: usize,
+}
+
+/// The events a child workflow execution's record carries besides the ones its states
+/// record: the `ExecutionStarted` it opens with and the terminal event it ends on.
+const CHILD_BRACKET_EVENTS: usize = 2;
 
 /// What the items of ONE `Map` attempt have done so far, as they are run.
 struct Tallied {
@@ -162,6 +197,12 @@ impl Interpreter<'_> {
 
     /// Every item of the state, chunk by chunk: `MaxConcurrency` of them run at once,
     /// and a chunk's span is its longest item's rather than the sum.
+    ///
+    /// A state that declares no `MaxConcurrency` asks for every item at once, and one
+    /// that declares a figure asks for that many: either way no more than
+    /// [`MAX_LIVE_MAP_ITERATIONS`] of them are LIVE together, so what the fan-out holds
+    /// in memory does not grow with the item count. The items past it are started as
+    /// the live ones finish, so every item still runs.
     fn run_item_chunks(
         &mut self,
         plan: &MapPlan<'_>,
@@ -170,10 +211,9 @@ impl Interpreter<'_> {
         at: Duration,
         tallied: &mut Tallied,
     ) -> Attempt {
-        let batch = if plan.concurrency == 0 {
-            plan.items.len().max(1)
-        } else {
-            plan.concurrency
+        let batch = match plan.concurrency {
+            0 => plan.items.len().clamp(1, MAX_LIVE_MAP_ITERATIONS),
+            declared => declared.min(MAX_LIVE_MAP_ITERATIONS),
         };
         // "ToleratedFailureCount" and "ToleratedFailurePercentage" are what lets a
         // state go on iterating past a failed item; a state that declares neither
@@ -310,13 +350,18 @@ impl Interpreter<'_> {
                 break;
             };
             Self::item_done(&mut iteration, &branch, tallied);
-            let outcome_event = match &branch.outcome {
-                Ok(_) => super::super::EVENT_MAP_ITERATION_SUCCEEDED,
-                Err(_) => super::super::EVENT_MAP_ITERATION_FAILED,
-            };
             let index = iteration.index;
             let from = self.steps.len();
-            self.push_detailed(outcome_event, plan.name, branch.end, iteration_details(index));
+            // The event the enclosing execution records for an iteration it stepped
+            // through; a DISTRIBUTED item's outcome is its CHILD execution's own, which
+            // the Map Run reports rather than the parent's history ([`ChildHistory`]).
+            if iteration.history.is_none() {
+                let outcome_event = match &branch.outcome {
+                    Ok(_) => super::super::EVENT_MAP_ITERATION_SUCCEEDED,
+                    Err(_) => super::super::EVENT_MAP_ITERATION_FAILED,
+                };
+                self.push_detailed(outcome_event, plan.name, branch.end, iteration_details(index));
+            }
             if let Some(unit) = tallied.units.get_mut(unit) {
                 unit.steps.extend(from..self.steps.len());
             }
@@ -384,10 +429,15 @@ impl Interpreter<'_> {
     /// workflow execution it runs as for a Distributed Map, and the event that records
     /// it as started.
     ///
-    /// The item's turn is charged to the step budget BEFORE the work it needs is done,
-    /// so the per-item work (the context the iteration reads, the `ItemSelector` it is
-    /// given) stops with the budget rather than being done for every remaining item of a
-    /// long array.
+    /// The allowance the enclosing execution has left is read BEFORE the work this item
+    /// needs is done, so the per-item work (the context the iteration reads, the
+    /// `ItemSelector` it is given) stops with the history the execution may still record
+    /// rather than being done for every remaining item of a long array.
+    ///
+    /// A DISTRIBUTED item is handed an allowance of its OWN ([`ChildHistory`]): it runs
+    /// as a child workflow execution, whose events and whose quota are that execution's,
+    /// so neither grows with how many items the state fans out over — which is what the
+    /// mode is for.
     fn start_item(
         &mut self,
         plan: &MapPlan<'_>,
@@ -400,11 +450,8 @@ impl Interpreter<'_> {
         if let Some(failure) = self.out_of_work() {
             return Err(failure);
         }
-        if self.budget == 0 {
-            return Err(runtime(format!(
-                "the execution made more than the {MAX_STATE_TRANSITIONS} state transitions this \
-                 emulator runs, so it was stopped"
-            )));
+        if self.events_left == 0 {
+            return Err(history_limit_exceeded());
         }
         let index = tallied.started;
         tallied.started += 1;
@@ -487,27 +534,48 @@ impl Interpreter<'_> {
         // the walk takes it: "the string that contains the JSON input data" of that
         // execution.
         let child_input = child.as_ref().map(|_| document);
-        // One iteration per item: it is STARTED here, carrying the index of the item it
-        // was handed, and records its own outcome once it ends — which is how a caller
-        // observes the fan-out, and how many items ran at once.
+        // The HISTORY this iteration records into: an inline `Map`'s iteration is a step
+        // of the execution around it, so its events are that execution's and are
+        // recorded here; a DISTRIBUTED item runs as a child workflow execution, so its
+        // events are the CHILD's, numbered from that execution's own start and bounded
+        // by that execution's own quota ([`ChildHistory`]).
+        let history = child.as_ref().map(|_| ChildHistory {
+            events_left: MAX_HISTORY_EVENTS.saturating_sub(CHILD_BRACKET_EVENTS),
+            first_event_id: FIRST_EVENT_ID + 1,
+            numbered: 0,
+        });
+        // One iteration per item: an INLINE one is STARTED here, carrying the index of
+        // the item it was handed, and records its own outcome once it ends — which is how
+        // a caller observes the fan-out, and how many items ran at once. A DISTRIBUTED
+        // state's own run is what the parent records: the iterations are child
+        // executions, which the parent's history does not step through.
         let from = self.steps.len();
-        self.push_detailed(
-            super::super::EVENT_MAP_ITERATION_STARTED,
-            plan.name,
-            batch_start,
-            iteration_details(index),
-        );
+        if history.is_none() {
+            self.push_detailed(
+                super::super::EVENT_MAP_ITERATION_STARTED,
+                plan.name,
+                batch_start,
+                iteration_details(index),
+            );
+        }
         let unit = tallied.units.len();
         tallied.units.push(Unit {
             steps: (from..self.steps.len()).collect(),
             map_runs_from: self.map_runs.len(),
-            aborted: Some(Step {
-                event_type: super::super::EVENT_MAP_ITERATION_ABORTED,
-                state_name: Some(plan.name.to_string()),
-                after: Duration::ZERO,
-                terminal: false,
-                details: iteration_details(index),
-            }),
+            // Only an iteration the enclosing execution's history steps through has an
+            // event of its own to be cut off at.
+            aborted: history.as_ref().map_or_else(
+                || {
+                    Some(Step {
+                        event_type: super::super::EVENT_MAP_ITERATION_ABORTED,
+                        state_name: Some(plan.name.to_string()),
+                        after: Duration::ZERO,
+                        terminal: false,
+                        details: iteration_details(index),
+                    })
+                },
+                |_| None,
+            ),
         });
         Ok(Started::Running(Box::new(Iteration {
             index,
@@ -537,6 +605,7 @@ impl Interpreter<'_> {
             },
             started_at: batch_start,
             unit,
+            history,
         })))
     }
 
@@ -552,7 +621,11 @@ impl Interpreter<'_> {
     /// `recorded` collects where this slice's own history events sit in the walk's list,
     /// so an iteration the state's failure aborts can be cut back to the instant it
     /// failed however its events are interleaved with its siblings'
-    /// ([`Interpreter::abort_units`]).
+    /// ([`Interpreter::abort_units`]). A DISTRIBUTED item records into its own
+    /// execution's history instead ([`ChildHistory`]), which is swapped in for as long
+    /// as the slice runs — so the events of one item, their numbering and the quota they
+    /// are held to are the CHILD execution's, none of them is kept, and nothing of them
+    /// sits in the parent's list for a cut to name.
     fn run_slice(
         &mut self,
         plan: &MapPlan<'_>,
@@ -580,6 +653,18 @@ impl Interpreter<'_> {
             &mut self.base_context,
             std::mem::take(&mut iteration.base_context),
         );
+        // The child execution's own history, for an item that runs as one: its
+        // allowance, its numbering and the count of what it has recorded are swapped in
+        // here and taken back below, exactly as the interpreter state above is. Its
+        // events are not HELD, so the enclosing execution's own list is left exactly as
+        // it stands and nothing of the item's steps is added to it.
+        let enclosing_history = iteration.history.as_mut().map(|history| {
+            (
+                self.unheld.replace(history.numbered),
+                std::mem::replace(&mut self.events_left, history.events_left),
+                std::mem::replace(&mut self.first_event_id, history.first_event_id),
+            )
+        });
         self.depth += 1;
         self.map_depth += 1;
         let from = self.steps.len();
@@ -592,7 +677,17 @@ impl Interpreter<'_> {
         };
         self.map_depth -= 1;
         self.depth -= 1;
-        recorded.extend(from..self.steps.len());
+        match (iteration.history.as_mut(), enclosing_history) {
+            (Some(history), Some((unheld, events_left, first_event_id))) => {
+                history.numbered = std::mem::replace(&mut self.unheld, unheld)
+                    .unwrap_or(history.numbered);
+                history.events_left = std::mem::replace(&mut self.events_left, events_left);
+                self.first_event_id = first_event_id;
+            }
+            // An inline iteration's events are the enclosing execution's, so where they
+            // sit in its list is what a cut of this unit names.
+            _ => recorded.extend(from..self.steps.len()),
+        }
         iteration.retry_count = std::mem::replace(&mut self.retry_count, enclosing_retry);
         iteration.variables = std::mem::replace(&mut self.variables, enclosing_variables);
         iteration.assigned = std::mem::replace(&mut self.assigned, enclosing_assigned);

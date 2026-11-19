@@ -928,10 +928,12 @@ async fn an_inline_map_is_not_run_for_a_result_writer() {
     );
 }
 
-/// A policy allowing every action of this service on every resource: what a role that
-/// is not what a row is about carries, so nothing it does is refused.
+/// A policy allowing every action on every resource: what a role that is not what a
+/// row is about carries, so nothing the execution does as that role is refused —
+/// neither a call this service decides for itself nor one the invoked service decides,
+/// since an execution's integration calls are made AS this role.
 pub(crate) fn every_action() -> Value {
-    json!({ "Version": "2012-10-17", "Statement": [allow("states:*", "*")] })
+    json!({ "Version": "2012-10-17", "Statement": [allow("*", "*")] })
 }
 
 // ---------------------------------------------------------------------------

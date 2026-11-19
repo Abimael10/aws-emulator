@@ -192,9 +192,9 @@
 //! call it asked for is in flight, so the resource to bound is not only the work but
 //! the threads a chain of calls can pin at once. Four bounds do it:
 //!
-//! * the walk charges every state transition to
-//!   [`super::asl::MAX_STATE_TRANSITIONS`], which bounds how many calls ONE
-//!   execution makes;
+//! * the walk records every state transition against the events one execution's
+//!   history may hold ([`super::asl::MAX_HISTORY_EVENTS`]), which bounds how many
+//!   calls ONE execution makes;
 //! * [`MAX_CALL_DURATION`] bounds ONE call, server-side, on the thread that is
 //!   waiting: a call that has not answered inside it fails the task instead of
 //!   pinning the thread, which is also what clamps a target that holds its answer on
@@ -3401,6 +3401,10 @@ where
     let connections = acting.connections;
     let handed = acting.handovers;
     let resumed_map_runs = acting.map_runs;
+    // WHO the calls of this walk are made as: a session of the state machine's
+    // execution role, which is the identity Step Functions does an execution's work as
+    // ([`super::execution_role_session`]).
+    let signing = acting.signing;
     let walk = ::tokio::task::spawn_blocking(move || {
         let dispatcher = Dispatcher {
             calls,
@@ -3446,7 +3450,14 @@ where
                         .await
                     }
                     false => {
-                        call_api(callback, region, &handover.call, &handover.request).await
+                        call_api_as(
+                            callback,
+                            region,
+                            &handover.call,
+                            &handover.request,
+                            signing.as_ref(),
+                        )
+                        .await
                     }
                 }
             };
@@ -4113,6 +4124,23 @@ pub async fn call_api(
     call: &Call,
     request: &Value,
 ) -> Answer {
+    call_api_as(callback, region, call, request, None).await
+}
+
+/// As [`call_api`], made AS the identity `signing` names: a SESSION of the state
+/// machine's execution role, which is who an execution's work is really done by
+/// ([`super::execution_role_session`]), so the service serving the call resolves that
+/// role's session as its caller.
+///
+/// `None` signs with this emulator's own credential, which is what a call made outside
+/// an execution's own work presents.
+pub async fn call_api_as(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    call: &Call,
+    request: &Value,
+    signing: Option<&super::execution_role_session::RoleSession>,
+) -> Answer {
     let api = call.api;
     // Parameters the invoked operation cannot be called with at all fail the task on its
     // own parameters, before a request is built out of them ([`unusable_parameters`]).
@@ -4134,7 +4162,7 @@ pub async fn call_api(
     // carries one ([`addressed_region`]), and to the caller's own Region otherwise.
     let addressed = addressed_region(call, request);
     let region = addressed.as_deref().unwrap_or(region);
-    match dispatch(callback, api, region, built).await {
+    match dispatch(callback, api, region, built, signing).await {
         Ok(answered) => {
             let read = match call.rest {
                 // A REST answer's members are spread over its status, its headers and
@@ -4691,265 +4719,15 @@ fn error_message(document: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Sign one request with the emulator's own credentials and hand it to the service
-/// its credential scope names, in process.
-///
-/// It is signed because the emulator verifies every request signature; the
-/// credential scope is also what routes it, so the service that owns the operation
-/// is the one that serves the call. The answer is its status, the error type it
-/// named in the header, and its body.
-async fn dispatch(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-    api: &Api,
-    region: &str,
-    built: Wired,
-) -> Result<Answered, String> {
-    let mut builder = ::http::Request::builder()
-        .method(built.method)
-        .uri(&built.uri)
-        .header("host", api.host(region));
-    // A media type describes a BODY: a request that carries none — a REST read bound
-    // to its path and its query alone — names none either.
-    if !built.body.is_empty() {
-        builder = builder.header("content-type", api.content_type());
-    }
-    if let Some(target) = &built.target {
-        builder = builder.header(TARGET_HEADER, target);
-    }
-    // A query-compatible service names a refusal by its legacy query code as well as
-    // by its shape, and only for a client that asks for it.
-    if api.query_compatible {
-        builder = builder.header(QUERY_MODE_HEADER, "true");
-    }
-    for (field, value) in &built.headers {
-        builder = builder.header(*field, value);
-    }
-    let mut request = builder
-        .body(built.body)
-        .map_err(|error| error.to_string())?;
-
-    let (access_key_id, secret_access_key) = credentials(callback).await?;
-    sign(
-        &mut request,
-        api.signing_name,
-        region,
-        &access_key_id,
-        &secret_access_key,
-    )?;
-
-    let (parts, body) = request.into_parts();
-    let request = ::http::Request::from_parts(
-        parts,
-        ::aws_smithy_types::body::SdkBody::from(::bytes::Bytes::from(body)),
-    );
-    let request = ::aws_smithy_runtime_api::http::Request::try_from(request)
-        .map_err(|error| error.to_string())?;
-    let response = ::aws_smithy_runtime_api::client::http::HttpConnector::call(
-        &callback.http_connector(),
-        request,
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    let status = response.status().as_u16();
-    let error_type = response
-        .headers()
-        .get(ERROR_TYPE_HEADER)
-        .map(str::to_string);
-    // Every header the answer carried, in the order it carried them: the task's own
-    // result reports them for an integration whose result is the literal SDK response
-    // ([`with_sdk_envelope`]), so they are read off the answer rather than invented.
-    let headers: Vec<(String, String)> = response
-        .headers()
-        .iter()
-        .map(|(name, value)| (name.to_string(), value.to_string()))
-        .collect();
-    let payload = response
-        .body()
-        .bytes()
-        .ok_or("the in-process answer carried a streaming body")?
-        .to_vec();
-    Ok(Answered {
-        status,
-        error_type,
-        headers,
-        payload,
-    })
-}
-
-/// Make one integration call and answer the RAW answer the invoked service gave: the
-/// status, the error shape it named and its body.
-///
-/// The seam for a caller that reports what a call came to in ITS OWN vocabulary rather
-/// than as a `Task` state's result: Amazon EventBridge Scheduler's universal target
-/// reports a failed invocation by the error code and the message the answer carries and
-/// decides from the status whether the invocation is retried
-/// ([`Target$RetryPolicy`](https://docs.aws.amazon.com/scheduler/latest/APIReference/API_RetryPolicy.html)),
-/// which the ASL error names [`call_api`] reads an answer into do not carry. The request
-/// is built and signed exactly as [`call_api`] builds and signs it, so both callers make
-/// the same call.
-pub async fn call_answered(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-    region: &str,
-    call: &Call,
-    request: &Value,
-) -> Result<Answered, String> {
-    let built = wired(call, request)?;
-    // Addressed exactly as [`call_api`] addresses it: the endpoint the request's own
-    // target names, where that target carries one.
-    let addressed = addressed_region(call, request);
-    let region = addressed.as_deref().unwrap_or(region);
-    dispatch(callback, call.api, region, built).await
-}
-
-/// What one in-process call came back with.
-pub struct Answered {
-    /// The HTTP status the service answered.
-    status: u16,
-    /// The error shape it named in [`ERROR_TYPE_HEADER`], for a refusal.
-    error_type: Option<String>,
-    /// Every header of the answer, as it carried them.
-    headers: Vec<(String, String)>,
-    /// Its body.
-    payload: Vec<u8>,
-}
-
-impl Answered {
-    /// The HTTP status the invoked service answered.
-    #[must_use]
-    pub fn status(&self) -> u16 {
-        self.status
-    }
-
-    /// The error shape it named in [`ERROR_TYPE_HEADER`]; `None` for an answer that
-    /// named none.
-    #[must_use]
-    pub fn error_type(&self) -> Option<&str> {
-        self.error_type.as_deref()
-    }
-
-    /// Its body, as it answered it.
-    #[must_use]
-    pub fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    /// The first value the answer carried `name` under, compared without regard to
-    /// case as HTTP field names are.
-    fn header(&self, name: &str) -> Option<String> {
-        self.headers
-            .iter()
-            .find(|(carried, _)| carried.eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.clone())
-    }
-
-    /// The LEGACY query code a query-compatible service named this refusal's class by,
-    /// out of [`QUERY_ERROR_HEADER`]'s `<code>;<fault>`; `None` for an answer that
-    /// carried none, which is every answer of a service that is not query-compatible
-    /// and every class such a service's model states no legacy code for.
-    fn query_error_code(&self) -> Option<String> {
-        let carried = self.header(QUERY_ERROR_HEADER)?;
-        let code = carried.split(';').next().unwrap_or_default().trim();
-        (!code.is_empty()).then(|| code.to_string())
-    }
-}
-
-/// The credentials a callback signs with: the emulator's own, through the provider
-/// the framework hands every handler — which falls back to its placeholder pair when
-/// the router vends none (request authentication off, where nothing verifies a
-/// signature). They sign this call and are never reported or logged.
-async fn credentials(
-    callback: &smithy_server_runtime::EmbeddedEmulator,
-) -> Result<(String, String), String> {
-    use ::aws_credential_types::provider::ProvideCredentials;
-
-    let credentials = callback
-        .aws_credentials_provider()
-        .provide_credentials()
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok((
-        credentials.access_key_id().to_string(),
-        credentials.secret_access_key().to_string(),
-    ))
-}
-
-/// SigV4-sign one in-process request to another emulated service, in place.
-///
-/// The settings are the ones the emulator's own verifier re-signs with
-/// (`vendor/server/src/request_authentication.rs`), so the signature this produces
-/// is the one that verifier computes over the same request — which is what lets a
-/// task's call be served with request authentication ON.
-///
-/// TO LIFT: this, [`dispatch`] and [`credentials`] are the SECOND copy of the
-/// signed in-process callback glue in this tree; the first is
-/// `services/service-com-amazonaws-cloudformation-cloudformation/src/state/provisioning.rs`
-/// (`sign_callback_request`, `dispatch`, `callback_credentials`), whose settings
-/// must stay identical to the verifier's. Their shared home is the vended framework
-/// beside that verifier, which cannot be edited from here, and `services/common`
-/// would put the signer on every service in the workspace. Whoever lifts it takes
-/// BOTH copies and CloudFormation's `tests/all/callback_signature.rs`, which pins
-/// the settings, together — and a third caller must lift rather than copy again.
-fn sign(
-    request: &mut ::http::Request<Vec<u8>>,
-    signing_name: &str,
-    region: &str,
-    access_key_id: &str,
-    secret_access_key: &str,
-) -> Result<(), String> {
-    use ::aws_sigv4::http_request::{
-        sign as sign_request, PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings,
-    };
-
-    let identity: ::aws_smithy_runtime_api::client::identity::Identity =
-        ::aws_credential_types::Credentials::builder()
-            .provider_name("aws-emulator-sfn")
-            .access_key_id(access_key_id)
-            .secret_access_key(secret_access_key)
-            .build()
-            .into();
-    let mut settings = SigningSettings::default();
-    settings.payload_checksum_kind = PayloadChecksumKind::NoHeader;
-    settings.excluded_headers = None;
-    let params = ::aws_sigv4::sign::v4::SigningParams::builder()
-        .identity(&identity)
-        .region(region)
-        .name(signing_name)
-        .settings(settings)
-        .time(SystemTime::now())
-        .build()
-        .map_err(|error| error.to_string())?;
-    let body = request.body().clone();
-    let signable_headers: Vec<(String, String)> = request
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                value.to_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
-    let signable = SignableRequest::new(
-        request.method().as_str(),
-        request.uri().to_string(),
-        signable_headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str())),
-        SignableBody::Bytes(&body),
-    )
-    .map_err(|error| error.to_string())?;
-    let (instructions, _signature) = sign_request(signable, &params.into())
-        .map_err(|error| error.to_string())?
-        .into_parts();
-    instructions.apply_to_request_http1x(request);
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests;
 
+/// The in-process CALL an integration is made as: the signed request and the credential
+/// it is signed with.
+mod dispatching;
 /// The catalogue of run-a-job (`.sync`) integrations, and the readings over it.
 mod jobs;
+pub use dispatching::*;
 pub use jobs::*;
 
 /// What a `Task` state's event publication carries, and what a rejected entry makes of it.

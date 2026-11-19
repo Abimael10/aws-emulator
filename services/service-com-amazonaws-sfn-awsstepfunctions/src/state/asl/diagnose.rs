@@ -1557,12 +1557,18 @@ const MAX_SCOPED_VARIABLES: usize = DEFAULT_MAX_DIAGNOSTICS;
 /// definition chooses both — as it chooses how many machines it nests. The product is
 /// therefore spent from ONE budget for the whole diagnosis
 /// ([`Diagnosis::spend_scope_visits`]) rather than bounded per machine: the budget is
-/// the diagnostics one call reports ([`DEFAULT_MAX_DIAGNOSTICS`]) times the
-/// transitions one execution may make ([`MAX_STATE_TRANSITIONS`]), which is the
-/// largest state graph this service walks at all. Past it no further variable is
-/// followed, and a variable that was not followed is taken to be in scope, so a spent
-/// budget can only leave a warning unsaid.
-const MAX_SCOPE_VISITS: usize = DEFAULT_MAX_DIAGNOSTICS * MAX_STATE_TRANSITIONS;
+/// the diagnostics one call reports ([`DEFAULT_MAX_DIAGNOSTICS`]) times
+/// [`MAX_ANALYSED_STATES`], which is the largest state graph this analysis walks at
+/// all. Past it no further variable is followed, and a variable that was not followed
+/// is taken to be in scope, so a spent budget can only leave a warning unsaid.
+const MAX_SCOPE_VISITS: usize = DEFAULT_MAX_DIAGNOSTICS * MAX_ANALYSED_STATES;
+
+/// The most states of one definition this create-time analysis walks.
+///
+/// Emulator bound on the ANALYSIS, not on a run: a definition is bounded only at the
+/// modelled 1 MiB, which is room for more states than following every variable through
+/// all of them is worth, so the walk stops here and says nothing further.
+const MAX_ANALYSED_STATES: usize = 1_000;
 
 /// Which of the variables one machine's analysis followed a state can count on: one
 /// BIT each, at the index [`Scopes::assigned`] records for the variable.

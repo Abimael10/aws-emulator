@@ -756,22 +756,12 @@ pub const TOO_MANY_TAGS_MESSAGE: &str = "Too many tags provided.";
 
 /// The most history events one execution keeps.
 ///
-/// This is the interpreter's own ceiling, not a separate guess: a transition emits
-/// the pair its state was entered and left with plus the lifecycle events of the work
-/// between them — the handover, start and outcome of a `Task`'s work, the start and
-/// outcome of a `Map`'s or a `Parallel`'s, the start and outcome of one `Map`
-/// iteration — which is at most [`EVENTS_PER_TRANSITION`] per transition;
-/// [`asl::MAX_STATE_TRANSITIONS`] bounds the transitions, and `ExecutionStarted` plus
-/// one terminal event bracket them. Each event carries a state name, which
+/// This is the interpreter's own ceiling, not a separate guess: the walk stops a run
+/// that has recorded as many events as one execution's history holds
+/// ([`asl::MAX_HISTORY_EVENTS`]), so a stored history cannot outgrow what the walk
+/// would write into it. Each event carries a state name, which
 /// [`asl::MAX_STATE_NAME_CHARS`] bounds, so the history's BYTES are bounded too.
-pub const MAX_HISTORY_EVENTS: usize = EVENTS_PER_TRANSITION * asl::MAX_STATE_TRANSITIONS + 2;
-
-/// The most history events one state transition writes: the `<Type>StateEntered` and
-/// `<Type>StateExited` pair, and the at most six lifecycle events the work between
-/// them can write — a `Map` iteration's start and outcome, and, for the attempt that
-/// iteration belongs to, the enclosing state's own start and outcome plus the
-/// handover and start of a `Task`'s work.
-const EVENTS_PER_TRANSITION: usize = 8;
+pub const MAX_HISTORY_EVENTS: usize = asl::MAX_HISTORY_EVENTS;
 
 /// What [`Execution::measure`] reserves for a stop that has not happened yet.
 ///
@@ -4694,6 +4684,7 @@ pub mod callback_timeout;
 pub mod callbacks;
 pub mod encryption;
 pub mod events;
+pub mod execution_role_session;
 pub mod http_task;
 pub mod integration;
 pub mod item_batcher;

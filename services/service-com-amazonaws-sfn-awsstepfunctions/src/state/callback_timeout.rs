@@ -264,8 +264,17 @@ async fn continue_one<Eng: Send + Sync + 'static>(
             &context.state_machine_arn,
         )
         .await;
-        let acting =
-            super::task_authorization::acting(engine, &region, &context.role_arn, unassumable);
+        // The continuation is run by the CLOCK rather than by a request, so there is no
+        // credential store to record a fresh assume in: it acts as the session this
+        // emulator already holds for the role
+        // ([`super::execution_role_session::role_session`]).
+        let acting = super::task_authorization::acting(
+            engine,
+            &region,
+            &context.role_arn,
+            unassumable,
+            None,
+        );
         // The continuation is work this service owes the clock rather than a step of
         // whatever call happened to drive it, so it opens a chain of in-process calls of
         // its own — bounded, as every chain is, by how deep the states it runs go.

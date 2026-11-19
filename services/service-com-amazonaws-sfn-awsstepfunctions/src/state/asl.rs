@@ -102,14 +102,19 @@
 //! ceiling and a run past one ends in a modelled failure rather than in the thread's
 //! stack or the process's memory:
 //!
-//! * [`MAX_STATE_TRANSITIONS`] — steps, spent by every nested iteration, every
-//!   branch and every retry, and charged BEFORE an iteration's own work is done;
+//! * [`MAX_HISTORY_EVENTS`] — the events ONE execution's history may hold, spent by
+//!   every state the execution itself runs, every nested iteration, every branch and
+//!   every retry, and checked BEFORE an iteration's own work is done. A DISTRIBUTED
+//!   `Map`'s item runs as a child workflow execution, so it is handed an allowance of
+//!   its own and the parent's is not spent on it;
 //! * [`MAX_PAYLOAD_BYTES`] and [`MAX_PAYLOAD_DEPTH`] — what one state may produce,
 //!   measured at EVERY state, as a `Map`'s result array grows, as a payload template
 //!   renders each member, and over an intrinsic's arguments and its result, so the
 //!   PRODUCT of a template's member count and each member's size is bounded as the
 //!   members are built rather than after;
-//! * [`MAX_NESTING_DEPTH`] — nested `Map`/`Parallel` levels;
+//! * [`MAX_NESTING_DEPTH`] — nested `Map`/`Parallel` levels, and
+//!   [`MAX_LIVE_MAP_ITERATIONS`] how many iterations of one `Map` state run AT ONCE,
+//!   so what a fan-out holds does not grow with the item count;
 //! * [`MAX_EXPRESSION_DEPTH`] and [`MAX_EXPRESSION_CHARS`] — one intrinsic
 //!   invocation, whose nesting lives inside a single JSON string, and one `Choice`
 //!   rule's `And`/`Or`/`Not` condition tree;
@@ -122,9 +127,11 @@
 //!   visit to a state may evaluate, and [`MAX_GLOB_CHARS`] what one `StringMatches`
 //!   may cost;
 //! * [`MAX_INTERPRET_WORK`] — the WORK the run may do, checked at every transition
-//!   and every `Map` item and charged by the primitives that spend it, which bounds
-//!   the PRODUCT of all of the above without putting a clock between a definition and
-//!   its own outcome ([`work_meter`]); the walk runs on a blocking thread, so a run
+//!   and every `Map` item and charged by the primitives that spend it — plus
+//!   [`WORK_PER_TRANSITION`] at every transition, whatever its state looked at, which
+//!   is what bounds how many transitions one interpretation makes at all. Together they
+//!   bound the PRODUCT of all of the above without putting a clock between a definition
+//!   and its own outcome ([`work_meter`]); the walk runs on a blocking thread, so a run
 //!   that reaches it never held an async worker;
 //! * [`MAX_STATE_NAME_CHARS`] — a state's name, which every history event of that
 //!   state carries, enforced by [`validate`] over every state list the definition
@@ -186,11 +193,15 @@ mod member_order;
 // of its own, whose names stay reachable unqualified from here and from the walk. They
 // are this module's own, so the import is not a re-export.
 mod members;
+// The single-state trial `TestState` runs: one concern in a file of its own, whose
+// names stay reachable unqualified from here.
+mod trial;
 mod walk;
 mod work_events;
 mod work_meter;
 use members::*;
 pub use diagnose::*;
+pub use trial::*;
 // The ceiling on the PRODUCT the ceilings below bound factor by factor, and the
 // primitives that spend it: one concern in a file of its own, whose names stay
 // reachable unqualified from here and from the walk, and which the OTHER query
@@ -724,13 +735,51 @@ fn wait_failure(name: &str, failure: Failure) -> Failure {
     }
 }
 
-/// The most state transitions one execution makes before the interpreter stops it.
+/// The most history events ONE execution's history may hold.
 ///
-/// Emulator step budget, NOT an AWS quota: it is what bounds a definition whose
-/// `Next` chain forms a cycle, and — because every `Map` iteration and `Parallel`
-/// branch spends from the same budget — what bounds the total work one execution
-/// does. An execution that exceeds it ends `FAILED` with [`RUNTIME_ERROR`].
-pub const MAX_STATE_TRANSITIONS: usize = 1_000;
+/// The service's own quota on the size of an execution's event history, which is what
+/// stops a definition whose `Next` chain forms a cycle and what stops a run that goes
+/// on recording work for longer than one execution's history carries. It is charged
+/// per EXECUTION, so a walk is held to the events ITS OWN execution records: the
+/// iterations of an inline `Map` and the branches of a `Parallel` are steps of the
+/// execution around them and spend from it, while each item of a DISTRIBUTED `Map`
+/// runs as a child workflow execution whose events are that child's and are charged
+/// to an allowance of its own — which is why a Distributed Map's parent is not bounded
+/// by how many items it fans out over.
+///
+/// An execution that reaches it ends `FAILED` with [`RUNTIME_ERROR`] and
+/// [`history_limit_exceeded`].
+///
+/// Because each child of a Distributed Map has an allowance of its own, this quota
+/// bounds ONE execution's history and not the total an interpretation records: what
+/// bounds the PRODUCT of the items a state fans out over and the steps each child takes
+/// is the work ceiling every walk is held to ([`MAX_INTERPRET_WORK`], which every
+/// transition spends [`WORK_PER_TRANSITION`] of), beside the items one state may iterate
+/// at all ([`MAX_ARRAY_ITEMS`]) and the iterations it runs at once
+/// ([`MAX_LIVE_MAP_ITERATIONS`]). What a run HOLDS is bounded by this quota alone: only
+/// the execution's own events are kept, at most `MAX_HISTORY_EVENTS` of them, because a
+/// child's are counted rather than held ([`Interpreter::unheld`]) however many items run
+/// at once.
+pub const MAX_HISTORY_EVENTS: usize = 25_000;
+
+/// What an execution that has recorded as many history events as it may carry fails
+/// with ([`MAX_HISTORY_EVENTS`]).
+///
+/// FIXED service text with the quota in it, which is how the service words the end of a
+/// run that reached the limit; nothing of the definition or of the request is in it.
+pub fn history_limit_exceeded() -> Failure {
+    runtime(format!(
+        "The execution reached the maximum number of history events ({MAX_HISTORY_EVENTS})."
+    ))
+}
+
+/// The room the walk leaves in an execution's history for the event that CLOSES it.
+///
+/// A history ends on ONE terminal event — the outcome the execution came to — so the
+/// events the walk itself records stop short of the quota by that one: a run the limit
+/// stops reports its failure as the last event the history HOLDS rather than as one
+/// past the limit, which is where a reader looks for it.
+const TERMINAL_EVENT_RESERVE: usize = 1;
 
 /// The most characters a state name may carry.
 ///
@@ -767,6 +816,23 @@ pub const MAX_PAYLOAD_DEPTH: usize = 128;
 /// definition can ask for is capped rather than left to the thread's stack. A
 /// definition past it ends `FAILED` with [`RUNTIME_ERROR`].
 pub const MAX_NESTING_DEPTH: usize = 16;
+
+/// The most iterations of one `Map` state this emulator runs AT ONCE.
+///
+/// Emulator bound, NOT an AWS quota: a LIVE iteration holds the scope its own states
+/// read — the variables in scope where the state was entered, its context object and
+/// the document it was handed — so what one state's fan-out holds in memory is this
+/// count times what one state's document may carry ([`MAX_PAYLOAD_BYTES`]) rather than
+/// the item count times it, however many items the state's source holds
+/// ([`MAX_ARRAY_ITEMS`]) and whatever `MaxConcurrency` the definition declares.
+///
+/// It bounds what runs TOGETHER and nothing else: the items past it are started as the
+/// live ones finish, so every item of the state still runs, and the Map Run goes on
+/// reporting the `MaxConcurrency` the state declared — the configuration is the state's
+/// own, and what `DescribeMapRun` answers is that configuration. Nothing this emulator
+/// serves reports how many items really ran at one instant, and no suite asserts more
+/// than this many of them running together.
+pub const MAX_LIVE_MAP_ITERATIONS: usize = 256;
 
 /// The most levels an intrinsic-function invocation may nest
 /// (`States.Array(States.Array(…))`).
@@ -825,7 +891,7 @@ pub const MAX_GLOB_CHARS: usize = 256;
 /// for its whole duration, including while a call it asked for is in flight, so what
 /// has to be bounded is the time that thread can be held.
 /// [`super::integration::MAX_CALL_DURATION`] bounds ONE call and
-/// [`MAX_STATE_TRANSITIONS`] bounds how many a run may make; this bounds their product,
+/// [`MAX_HISTORY_EVENTS`] bounds how many a run may make; this bounds their product,
 /// by CLAMPING what each call may still wait for to what is left of it
 /// ([`Interpreter::call_within`]), so the thread a run holds is held for at most this
 /// however many calls the definition asks for.
@@ -2542,7 +2608,18 @@ fn interpret(
     supplied.definition(definition, 0);
     supplied.supplied(input);
     let mut interpreter = Interpreter {
-        budget: MAX_STATE_TRANSITIONS,
+        // The quota is the EXECUTION's, so a walk that continues one is held to what
+        // its history has not recorded yet: the id the first event of this walk carries
+        // is one past the events already in it, and one more is kept for the event the
+        // history ENDS on ([`TERMINAL_EVENT_RESERVE`]).
+        events_left: MAX_HISTORY_EVENTS
+            .saturating_sub(
+                usize::try_from(first_event_id.saturating_sub(FIRST_EVENT_ID))
+                    .unwrap_or(usize::MAX),
+            )
+            .saturating_sub(TERMINAL_EVENT_RESERVE),
+        // This walk is the EXECUTION's own, so the events it records are its history.
+        unheld: None,
         depth: 0,
         call_wait_left: MAX_CALL_WAIT_DURATION,
         // What is left of a definition-level `TimeoutSeconds` for this walk: the span
@@ -3021,10 +3098,29 @@ fn quoted_bytes(text: &str) -> usize {
 
 /// One walk of one definition.
 struct Interpreter<'tasks> {
-    /// The state transitions still left in [`MAX_STATE_TRANSITIONS`]. Every nested
-    /// `Map` iteration and `Parallel` branch spends from the same budget, so the
-    /// total work one execution does is bounded however deeply it nests.
-    budget: usize,
+    /// The history events the execution this walk is recording for may still record,
+    /// out of [`MAX_HISTORY_EVENTS`]. Every event the walk writes spends one, and a
+    /// walk that has spent them all records no further event and makes no further
+    /// transition: the run ends with [`history_limit_exceeded`], which is also what
+    /// bounds a definition whose `Next` chain forms a cycle.
+    ///
+    /// It belongs to ONE execution: a nested `Map` iteration and a `Parallel` branch
+    /// are steps of the execution around them and spend from it, while each item of a
+    /// DISTRIBUTED `Map` runs as a child workflow execution and is handed an allowance
+    /// of its own ([`ChildHistory`]).
+    events_left: usize,
+    /// How many events the walk has recorded that it does NOT hold, for the walk of a
+    /// Distributed Map's item; `None` for an execution's own walk, whose events are its
+    /// history.
+    ///
+    /// An item of a DISTRIBUTED `Map` runs as a child workflow execution: the store
+    /// records that execution's start and its outcome, and nothing reports the steps
+    /// between them, so what the item's states record is counted — against that
+    /// execution's own allowance, and so its states name the event they were entered at
+    /// — and not kept. That is what makes the memory one `Map` state's concurrent items
+    /// hold independent of how many events they record: an iteration carries two
+    /// figures, not a list ([`ChildHistory`]).
+    unheld: Option<usize>,
     /// How deeply the walk is nested inside `Map` iterations and `Parallel` branches,
     /// against [`MAX_NESTING_DEPTH`]: each level is an interpreter frame, so the
     /// nesting a definition can ask for is capped rather than left to the stack.
@@ -3115,7 +3211,8 @@ struct Interpreter<'tasks> {
     /// order and read in entry order ([`plan_run`]) — a nested Distributed Map inside
     /// another's items finishes first, and two of them may be entered at the same
     /// offset, so the position is carried rather than derived from the instants.
-    /// Bounded by [`MAX_STATE_TRANSITIONS`], which every `Map` state spends from.
+    /// Bounded by [`MAX_HISTORY_EVENTS`], which every `Map` state this walk enters
+    /// records events against.
     map_runs: Vec<(usize, StartedMapRun)>,
     /// How many DISTRIBUTED `Map` states this walk has ENTERED, which is what numbers
     /// the Map Runs above in entry order. An inline `Map` starts no Map Run, so it
@@ -3124,7 +3221,8 @@ struct Interpreter<'tasks> {
     /// How many times this walk has entered a Distributed Map state of each LABEL,
     /// which is what the Map Run an attempt being CONTINUED already started is matched
     /// by ([`super::integration::Tasks::map_run`]). Bounded by the state count of the
-    /// definition, every entry of which spends from [`MAX_STATE_TRANSITIONS`].
+    /// definition, every entry of which records events against
+    /// [`MAX_HISTORY_EVENTS`].
     map_runs_entered_by_label: BTreeMap<String, usize>,
     /// The reply a worker made to the activity task this walk is CONTINUING from,
     /// when it is one: the state the reply names produces that result instead of
@@ -4146,548 +4244,6 @@ impl Trial {
             retry_backoff_seconds: None,
             catch_index: None,
         }
-    }
-}
-
-/// One `TestState` call: the state under test, and everything the request fixed
-/// about it.
-pub struct StateTest<'a> {
-    /// The state's name, which `$$.State.Name` reports. Empty for a `definition`
-    /// that is the state alone, which carries no name — only a `stateName` naming a
-    /// state of a full definition gives it one.
-    pub name: &'a str,
-    /// The state's own definition: the object the Amazon States Language declares it
-    /// as.
-    pub state: &'a Map<String, Value>,
-    /// "A string that contains the JSON input data for the state", as the caller
-    /// wrote it.
-    pub input: &'a str,
-    /// When the state is being tested, which `$$.State.EnteredTime` reports.
-    pub start: SystemTime,
-    /// What the context object reports about this test, for the members the request
-    /// fixes.
-    pub context: &'a Context,
-    /// "A JSON string representing a valid Context object for the state under test":
-    /// the whole `$$` document, which replaces the one built from `context`.
-    pub context_override: Option<&'a Value>,
-    pub mock: Option<&'a Mock>,
-    /// `stateConfiguration.retrierRetryCount`: "The number of retry attempts that
-    /// have occurred for the state's Retry that applies to the mocked error", which
-    /// is what decides whether the state's failure is still RETRIABLE.
-    pub retries_taken: u64,
-    /// "JSON object literal that sets variables used in the state under test. Object
-    /// keys are the variable names and values are the variable values": the scope the
-    /// state's own expressions read, before its `Assign` writes to it.
-    pub variables: Option<&'a Value>,
-}
-
-/// Run the ONE state `test` names over its input and report what it produced.
-///
-/// This is `TestState`'s walk: a single state, with no state machine around it, so
-/// nothing is transitioned to and nothing is persisted. The state's data flow, its
-/// `Choice` rules, its `Wait` members and its `Fail` members are evaluated by the
-/// same code an execution's walk uses; an invocation this process cannot make is
-/// answered by the request's `mock`, and without one the state fails with ASL's own
-/// [`RUNTIME_ERROR`] rather than with a fabricated result.
-pub fn test_state(test: &StateTest<'_>) -> Trial {
-    // The trial is a caller-sized walk too, so it runs under the same work allowance an
-    // execution's does ([`work_meter`]).
-    let _allowance = WorkAllowance::of(MAX_INTERPRET_WORK);
-    let inspection = Inspection {
-        input: Some(test.input.to_string()),
-        ..Inspection::default()
-    };
-    let raw: Value = match serde_json::from_str(test.input) {
-        Ok(value) => value,
-        Err(why) => {
-            return Trial::failed(
-                inspection,
-                runtime(format!(
-                    "the state input is not valid JSON: {}",
-                    crate::state::json_parse_diagnostic(test.input, &why)
-                )),
-            );
-        }
-    };
-    // The input is a caller's document too, so it is measured against the ceiling
-    // every document a state produces is measured against: an input larger than a
-    // state's output may carry is answered with ASL's own data-limit error rather
-    // than evaluated, which is also what bounds what one path or one `StringMatches`
-    // rule can be asked to walk.
-    if let Err(failure) = measure_payload(&raw, UNNAMED_PRODUCER) {
-        // The document measured here is the state's INPUT, which the request supplied:
-        // the quota sentence is about a result a state RETURNED, so an input past the
-        // ceiling says what it is instead.
-        return Trial::failed(
-            inspection,
-            Failure {
-                error: failure.error,
-                cause: Some(format!(
-                    "the state input is larger than the {MAX_PAYLOAD_BYTES} bytes a state's \
-                     document may carry"
-                )),
-            },
-        );
-    }
-    let base_context = match test.context_override {
-        Some(context) => context.clone(),
-        None => test.context.value(&raw, test.start),
-    };
-    let mut interpreter = Interpreter {
-        budget: MAX_STATE_TRANSITIONS,
-        depth: 0,
-        call_wait_left: MAX_CALL_WAIT_DURATION,
-        // `TestState` tests ONE state, with no execution and so no definition-level
-        // `TimeoutSeconds` around it: nothing here bounds the span the state runs in.
-        timeout_left: None,
-        timed_out: false,
-        // The state is tested as the attempt the request says it is on, which is what
-        // it reads through `$$.State.RetryCount`.
-        retry_count: test.retries_taken,
-        steps: Vec::new(),
-        // `TestState` keeps no history: the state under test is the first thing this
-        // walk would record, so a diagnosis it raises names the id the first event of
-        // a history carries.
-        first_event_id: FIRST_EVENT_ID,
-        start: test.start,
-        // `TestState` owes the clock nothing: it reports what one state computes in the
-        // call that asked, and the child executions a span like this would date belong
-        // to an execution.
-        settle: Duration::ZERO,
-        base_context,
-        // `TestState` tests ONE state, with no execution around it: a state whose
-        // work is an invocation is tested through its `mock`, so nothing is called
-        // for this walk and there is nowhere for it to wait.
-        tasks: &super::integration::Unserved,
-        waiting: None,
-        parked: None,
-        // `TestState` tests one state, so there is no concurrent state around it to
-        // park inside, no job of its own to abandon and no sibling branch whose
-        // failure could stop it.
-        abandoned: Vec::new(),
-        cancel_after: None,
-        resume_frames: Vec::new(),
-        map_depth: 0,
-        // `TestState` starts nothing: it reports what one state computes, and the
-        // Map Runs a Distributed Map starts — and the child executions its items run
-        // as — belong to an execution.
-        map_runs: Vec::new(),
-        map_runs_entered: 0,
-        map_runs_entered_by_label: BTreeMap::new(),
-        // `TestState` continues no execution: a state whose work is an invocation is
-        // answered by the request's own `mock`, not by a worker's reply.
-        reply: None,
-        job_reply: None,
-        callback_reply: None,
-        resumed_attempts: None,
-        attempts_spent: Vec::new(),
-        resumed: None,
-        machine_name: test.context.state_machine_name.clone(),
-        region: super::arn_region(&test.context.state_machine_arn),
-        execution_arn: test.context.execution_arn.clone(),
-        child_counter: 0,
-        // The state under test belongs to no state machine, so no workflow type
-        // refuses it: the context the request supplies says nothing of one.
-        express: test.context.express,
-        // `TestState` redrives nothing: the step a redrive would continue from
-        // belongs to an execution.
-        failed_at: None,
-        // The state under test is written in the language it declares; there is no
-        // definition around it to inherit one from, so the other language's default
-        // stands in for the absent member.
-        language: JSONPATH,
-        // "The set will include variables assigned in the state and variables set up
-        // as test state input": the request's own set is what the state's expressions
-        // read, and its `Assign` writes into it.
-        variables: test
-            .variables
-            .and_then(Value::as_object)
-            .map(|variables| {
-                variables
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        // Nothing has been assigned BY the state under test yet; what the request set
-        // up is the scope around it.
-        assigned: BTreeMap::new(),
-        // The request's own input is the caller's document here, so what the trial
-        // reports of it is the bytes the request carried. The state under test
-        // arrives PARSED, so the text the definition wrote its own documents in is
-        // not one this walk was given.
-        supplied: {
-            let mut supplied = Supplied::default();
-            supplied.supplied(test.input);
-            supplied
-        },
-        // `TestState` continues no execution either, so the state under test is entered
-        // by this walk and names the event this walk numbers for it.
-        continued_entry: None,
-        skipping_entry: false,
-    };
-    // And the same document for the diagnoses the trial's own expressions word, which
-    // quote the document they could not be applied to ([`GivenDocuments`]).
-    let _given = GivenDocuments::of(&interpreter.supplied);
-    interpreter.trial(test, &raw, inspection)
-}
-
-impl Interpreter<'_> {
-    /// [`test_state`]'s walk of the one state under test.
-    fn trial(&mut self, test: &StateTest<'_>, raw: &Value, mut inspection: Inspection) -> Trial {
-        let state = test.state;
-        let state_type = state.get("Type").and_then(Value::as_str).unwrap_or_default();
-        let context = self.context_for(&Scope::default(), test.name, Duration::ZERO);
-
-        if let Some(language) = state.get("QueryLanguage").and_then(Value::as_str) {
-            if !QUERY_LANGUAGES.contains(&language) {
-                return Trial::failed(
-                    inspection,
-                    runtime(format!(
-                        "{SINGLE_STATE_LABEL} declares the query language '{}', which is not one \
-                         of {}, so nothing was run for it",
-                        echoed(language),
-                        QUERY_LANGUAGES.join(", ")
-                    )),
-                );
-            }
-        }
-        let language = match self.language_of(state) {
-            Ok(language) => language,
-            Err(why) => return Trial::failed(inspection, runtime(why)),
-        };
-        // A member this emulator does not interpret changes what the state does, so
-        // the state is not run for it — the rule the walk applies at every state. A
-        // MOCKED state is exempt: the members that describe the invocation the mock
-        // stands in for are the mock's business, and nothing is invoked for them; a
-        // type this emulator does not run at all is reported by `produce` as the
-        // invocation it is, not as a member.
-        if test.mock.is_none() && EXECUTED_STATE_TYPES.contains(&state_type) {
-            if let Some(member) = unexecutable_member(state_type, state, language) {
-                return Trial::failed(
-                    inspection,
-                    runtime(format!(
-                        "{SINGLE_STATE_LABEL} carries the member '{member}', which this emulator \
-                         does not interpret, so nothing was run for it"
-                    )),
-                );
-            }
-        }
-        // The input side: `InputPath`, then the `Parameters` payload template — or, in
-        // JSONata, the `Arguments` the state hands its work. "Not populated when the
-        // QueryLanguage is JSONata" is why each stage is reported only for the
-        // language that has it.
-        let effective = match self.input_value(state, raw, &context) {
-            Ok(value) => value,
-            Err(failure) => return self.classify(test, language, raw, &context, failure, inspection),
-        };
-        if language != JSONATA {
-            inspection.after_input_path = Some(self.echo(&effective));
-        }
-        let templated = TEMPLATED_STATE_TYPES.contains(&state_type);
-        let after_parameters = match templated {
-            true => match self.task_request(state, language, &effective, &context) {
-                Ok(value) => value,
-                Err(failure) => {
-                    return self.classify(test, language, raw, &context, failure, inspection)
-                }
-            },
-            false => effective.clone(),
-        };
-        if templated {
-            match language {
-                JSONATA => inspection.after_arguments = Some(self.echo(&after_parameters)),
-                _ => inspection.after_parameters = Some(self.echo(&after_parameters)),
-            }
-        }
-
-        // A `Choice` state's transition is what the state DOES, and the walk decides
-        // it before the state's output is built, so a rule that cannot be evaluated
-        // is what such a state fails with.
-        let chosen = if state_type == "Choice" {
-            match self.choose(state, language, &effective, &context) {
-                Ok(chosen) => Some(chosen),
-                Err(failure) => {
-                    return self.classify(test, language, raw, &context, failure, inspection)
-                }
-            }
-        } else {
-            None
-        };
-
-        let produced = self.produce(
-            state,
-            state_type,
-            language,
-            &after_parameters,
-            &effective,
-            &context,
-            test.mock,
-        );
-        let placed = match produced {
-            Ok(result) => match language {
-                // A JSONata state's output is its `Output`, over the variables its
-                // own `Assign` has just written; there are no result-side filters to
-                // record stages for. A `Choice` state's own `Assign` and the SELECTED
-                // rule's decide it together, exactly as they do in the walk.
-                JSONATA => {
-                    if let Some(result) = result.as_ref() {
-                        inspection.result = Some(self.echo(result));
-                    }
-                    match chosen.as_ref() {
-                        Some(chosen) => {
-                            self.choice_output(state, chosen.rule.as_ref(), &effective, &context)
-                        }
-                        None => {
-                            self.jsonata_output(state, &effective, result.as_ref(), None, &context)
-                        }
-                    }
-                }
-                _ => match result {
-                    Some(result) => self.place_recorded(
-                        state,
-                        state_type,
-                        raw,
-                        result,
-                        &context,
-                        &mut inspection,
-                    ),
-                    None => self.output_value(state, effective.clone(), &context),
-                },
-            },
-            Err(failure) => Err(failure),
-        };
-        let output = match placed {
-            Ok(output) => output,
-            Err(failure) => return self.classify(test, language, raw, &context, failure, inspection),
-        };
-        // The document the state produced is measured here, at the state that
-        // produced it, against what a state's output may carry — as the walk measures
-        // every state's.
-        if let Err(failure) = measure_payload(&output, SINGLE_STATE_LABEL) {
-            return self.classify(test, language, raw, &context, failure, inspection);
-        }
-        inspection.variables = self.assigned_variables();
-
-        let next_state = match chosen {
-            // The rule that matched names the next state; a JSONata rule may also
-            // declare the state's own output.
-            Some(chosen) => Some(chosen.next),
-            None if TERMINAL_STATE_TYPES.contains(&state_type) => None,
-            None if state.get("End").and_then(Value::as_bool) == Some(true) => None,
-            // A single state's `Next` names a state no definition around it declares,
-            // so it is REPORTED rather than resolved; a state that names none has no
-            // next state at all.
-            None => state.get("Next").and_then(Value::as_str).map(str::to_string),
-        };
-        Trial::succeeded(Some(self.echo(&output)), next_state, inspection)
-    }
-
-    /// The variables this walk has assigned, as the one JSON document `TestState`
-    /// reports them through — `None` where nothing assigned any, so the member is
-    /// absent rather than an empty object.
-    fn assigned_variables(&self) -> Option<String> {
-        if self.variables.is_empty() {
-            return None;
-        }
-        let variables: Map<String, Value> = self
-            .variables
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-        Some(Value::Object(variables).to_string())
-    }
-
-    /// The RAW result the state's own work produced: the document the result-side
-    /// filters place, `None` for a state that produces no result of its own (its
-    /// effective input is what `OutputPath` reads), or the failure it ended in.
-    #[allow(clippy::too_many_arguments)]
-    fn produce(
-        &mut self,
-        state: &Map<String, Value>,
-        state_type: &str,
-        language: &'static str,
-        after_parameters: &Value,
-        effective: &Value,
-        context: &Value,
-        mock: Option<&Mock>,
-    ) -> Result<Option<Value>, Failure> {
-        // The mock IS the outcome of the invocation it stands in for, so nothing is
-        // invoked for it and the state's result is the one the request named.
-        match mock {
-            Some(Mock::Result(result)) => return Ok(Some(result.clone())),
-            Some(Mock::Error(failure)) => return Err(failure.clone()),
-            None => {}
-        }
-        match state_type {
-            // "Parameters ... Used to create a collection of key-value pairs that
-            // will be passed as input": it transforms the state's effective INPUT,
-            // while `Result` is the state's RESULT — the rule the walk applies. A
-            // JSONata `Pass` has no `Result`: what it puts out is its `Output`, so it
-            // produces no result of its own.
-            "Pass" => match language {
-                JSONATA => Ok(None),
-                _ => Ok(Some(
-                    state
-                        .get("Result")
-                        .cloned()
-                        .unwrap_or_else(|| after_parameters.clone()),
-                )),
-            },
-            // A `Wait` state produces no result of its own. Its members are still
-            // evaluated, so a malformed one is reported as the failure it is, but
-            // nothing sleeps for the span it declares.
-            "Wait" => {
-                self.wait_duration(state, language, effective, context, Duration::ZERO)
-                    .map_err(|failure| Failure {
-                        error: failure.error,
-                        // A diagnosis this module worded about the state's own
-                        // expression already names the field it is written in, so it
-                        // is carried exactly as raised — the rule the walk applies
-                        // around every such diagnosis ([`diagnosed`]). Every other
-                        // reason a `Wait`'s members could not be read names the state
-                        // under test, which is the only name this trial has for it.
-                        cause: failure.cause.map(|why| match names_its_state(&why) {
-                            true => why,
-                            false => format!("{SINGLE_STATE_LABEL}: {why}"),
-                        }),
-                    })?;
-                Ok(None)
-            }
-            "Choice" | "Succeed" => Ok(None),
-            // A `Fail` state ends with the error and cause it declares, either of
-            // which ASL may instead read from the state's input through a `*Path`.
-            "Fail" => {
-                let error =
-                    self.fail_member(state, language, "Error", "ErrorPath", effective, context)?;
-                let cause =
-                    self.fail_member(state, language, "Cause", "CausePath", effective, context)?;
-                Err(Failure { error, cause })
-            }
-            // Every remaining type's work is an invocation this process does not
-            // make: a service integration, an iteration over items, a set of
-            // branches. Without a mock to stand in for it, nothing ran — which is
-            // what the state fails with, rather than a synthesised result.
-            other => Err(runtime(format!(
-                "a '{other}' state's own work is an invocation this emulator does not make, and \
-                 the request names no mock to stand in for it, so nothing was run for it"
-            ))),
-        }
-    }
-
-    /// The result-side filters over a state's raw result — `ResultSelector`,
-    /// `ResultPath` against the state's own raw input, then `OutputPath` — recording
-    /// what the state carried after each one.
-    fn place_recorded(
-        &self,
-        state: &Map<String, Value>,
-        state_type: &str,
-        raw: &Value,
-        result: Value,
-        context: &Value,
-        inspection: &mut Inspection,
-    ) -> Result<Value, Failure> {
-        inspection.result = Some(self.echo(&result));
-        let with_selector = SELECTOR_STATE_TYPES.contains(&state_type);
-        let selected = select_result(state, result, context, with_selector)?;
-        // "The effective result after Step Functions applies the ResultSelector
-        // filter": the stage is the state's result as the result-side data flow
-        // RECEIVES it, so a state whose type has no such filter — or that declares
-        // none — reports its raw result there rather than nothing at all.
-        inspection.after_result_selector = Some(self.echo(&selected));
-        let placed = path_result(state, raw, selected)?;
-        inspection.after_result_path = Some(self.echo(&placed));
-        self.output_value(state, placed, context)
-    }
-
-    /// What `TestState` reports for a state whose work failed: the attempt one of its
-    /// `Retry` retriers still owes (RETRIABLE), the catcher that takes the failure
-    /// over (CAUGHT_ERROR), or the failure itself (FAILED).
-    ///
-    /// The two are the state's OWN error handling, read exactly as the walk reads it:
-    /// the first retrier whose `ErrorEquals` names the error decides, and `Catch` is
-    /// consulted only once no retrier has an attempt left.
-    fn classify(
-        &mut self,
-        test: &StateTest<'_>,
-        language: &'static str,
-        raw: &Value,
-        context: &Value,
-        failure: Failure,
-        inspection: Inspection,
-    ) -> Trial {
-        let state = test.state;
-        let name = failure.name().to_string();
-        // Which `Retry` entry answers for this error, whether or not it still has an
-        // attempt left: "the array index of the Retry which handled the exception" is
-        // what the trial reports for a failure the state's own error handling took
-        // over, and a state with no retrier for the error has none to name.
-        let retrier = retry_entries(state, "Retry")
-            .iter()
-            .enumerate()
-            .filter_map(|(index, retrier)| retrier.as_object().map(|retrier| (index, retrier)))
-            .find(|(_, retrier)| errors_match(retrier, &name));
-        let retry_index = Some(match retrier {
-            Some((index, _)) => i32::try_from(index).unwrap_or(i32::MAX),
-            None => NO_RETRIER_INDEX,
-        });
-        if let Some((_, retrier)) = retrier {
-            let max_attempts = retrier
-                .get("MaxAttempts")
-                .and_then(Value::as_u64)
-                .unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS);
-            if test.retries_taken < max_attempts {
-                let mut trial = Trial::failed(inspection, failure);
-                trial.status = TEST_STATUS_RETRIABLE;
-                trial.retry_index = retry_index;
-                trial.retry_backoff_seconds =
-                    Some(retry_delay_seconds(retrier, test.retries_taken).round() as i32);
-                return trial;
-            }
-        }
-        for (index, catcher) in retry_entries(state, "Catch").iter().enumerate() {
-            let Some(catcher) = catcher.as_object() else {
-                continue;
-            };
-            if !errors_match(catcher, &name) {
-                continue;
-            }
-            let Some(next) = catcher.get("Next").and_then(Value::as_str) else {
-                return Trial::failed(
-                    inspection,
-                    runtime("a 'Catch' catcher must carry a string 'Next'".to_string()),
-                );
-            };
-            // "When a state reports an error and it matches a catcher, the state's
-            // output is the error output", placed through the catcher's own
-            // `ResultPath` — or, in JSONata, through its own `Output`, which is one
-            // of the two places `$states.errorOutput` is in scope.
-            let error_output = failure.payload();
-            let effective = match self.input_value(state, raw, context) {
-                Ok(effective) => effective,
-                Err(failure) => return Trial::failed(inspection, failure),
-            };
-            let output = match language {
-                JSONATA => {
-                    self.jsonata_output(catcher, &effective, None, Some(&error_output), context)
-                }
-                _ => self.place_result(catcher, raw, error_output, context, true),
-            };
-            let output = match output {
-                Ok(output) => output,
-                Err(failure) => return Trial::failed(inspection, failure),
-            };
-            let mut trial = Trial::failed(inspection, failure);
-            trial.status = TEST_STATUS_CAUGHT_ERROR;
-            trial.output = Some(self.echo(&output));
-            trial.next_state = Some(next.to_string());
-            trial.catch_index = Some(i32::try_from(index).unwrap_or(i32::MAX));
-            // A caught failure reports both handler positions: the catcher that took it
-            // over, and the retrier whose attempts preceded it.
-            trial.retry_index = retry_index;
-            return trial;
-        }
-        Trial::failed(inspection, failure)
     }
 }
 

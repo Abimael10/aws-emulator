@@ -438,6 +438,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &context.role_arn,
                 unassumable,
+                Some(ctx.credential_store()),
             );
             crate::state::integration::interpret(ctx, &region, acting, move |tasks| match &reply {
                 Answered::Activity(reply) => crate::state::plan_reply(

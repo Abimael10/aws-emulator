@@ -107,12 +107,12 @@ const RAISED_CLASS: &str = "KeyError";
 /// may not end under it: a run abandoned by an interpreter would land exactly here.
 const RUNTIME_ERROR: &str = "States.Runtime";
 
-/// What the cause of a run the work quota stopped has to name: the work it asked too much of,
-/// which is counted in state transitions and in no span of time.
-const QUOTA_WORDING: &str = "state transitions";
+/// What the cause of a run the quota stopped has to name: the history it filled, which is
+/// counted in the events one execution's history holds and in no span of time.
+const QUOTA_WORDING: &str = "maximum number of history events";
 
 /// The turn count the spinning row's `Choice` waits for, which its loop reaches no sooner than
-/// the quota on one execution's transitions stops it: the definition declares a terminal state
+/// the quota on one execution's history stops it: the definition declares a terminal state
 /// its own data never gets to.
 const TURNS_NEVER_REACHED: u64 = 1_000_000;
 
@@ -742,9 +742,9 @@ async fn a_task_chain_is_driven_to_the_terminal_state_its_definition_decides() {
         }
 
         if row.error == Some(RUNTIME_ERROR) {
-            // The quota on the work one execution may do stopped a definition that does not
-            // terminate: the run is TERMINAL, and the cause names the work it asked too much
-            // of rather than any span of time.
+            // The quota on the history one execution keeps stopped a definition that does not
+            // terminate: the run is TERMINAL, and the cause names the history it filled rather
+            // than any span of time.
             assert!(
                 cause.contains(QUOTA_WORDING),
                 "case {case:?}: expected the cause to name the {QUOTA_WORDING} one execution \
