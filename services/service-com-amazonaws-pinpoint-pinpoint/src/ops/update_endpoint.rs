@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let Some(app) = store.apps.get(&application_id) else {
                 return Err(UpdateEndpointErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!("Application not found: {application_id}")),
+                    message: Some(crate::state::APPLICATION_NOT_FOUND_MESSAGE.to_string()),
                     request_id: None,
                 })
                 .into());

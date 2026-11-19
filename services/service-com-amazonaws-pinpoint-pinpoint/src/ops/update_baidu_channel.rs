@@ -184,9 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(app) = store.apps.get_mut(&application_id) else {
             return Err(UpdateBaiduChannelErrorModeled::NotFoundException(NotFoundException {
-                // The service's text for this class is fixed: it names the class of
-                // resource and carries no value out of the request.
-                message: Some("Application not found".to_string()),
+                message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
                 request_id: None,
             })
             .into());

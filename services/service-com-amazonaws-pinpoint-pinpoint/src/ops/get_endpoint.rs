@@ -160,12 +160,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
-        let endpoint = store
-            .apps
-            .get(&input.application_id)
-            .and_then(|app| app.endpoints.get(&input.endpoint_id));
+        // An unknown application is refused as an unknown APPLICATION: it is the
+        // application that is missing, so the refusal classifies that resource rather
+        // than reporting an endpoint of an application that does not exist.
+        let Some(app) = store.apps.get(&input.application_id) else {
+            return Err(GetEndpointErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::APPLICATION_NOT_FOUND_MESSAGE.to_string()),
+                request_id: None,
+            })
+            .into());
+        };
 
-        let Some(endpoint) = endpoint else {
+        let Some(endpoint) = app.endpoints.get(&input.endpoint_id) else {
             return Err(GetEndpointErrorModeled::NotFoundException(NotFoundException {
                 message: Some(format!(
                     "Endpoint not found: {} in application {}",

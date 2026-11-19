@@ -1196,3 +1196,136 @@ async fn state_is_shared_across_requests_not_per_request() {
         "a separate engine must not hold another emulator's application, got {status} with {body:?}"
     );
 }
+
+/// The text the service answers for a request that names an application it does not
+/// hold, written out here independently of the code under test: it classifies the
+/// missing resource as an application and carries nothing out of the request.
+const APPLICATION_NOT_FOUND: &str = "Application not found";
+
+#[tokio::test]
+async fn an_application_the_service_does_not_hold_reads_the_same_refusal_everywhere() {
+    let emulator = Emulator::new();
+
+    // A live application, so the endpoint-level row at the end has one to be missing
+    // FROM.
+    let (_, live) = emulator
+        .create_app("us-east-1", json!({ "Name": "live" }))
+        .await;
+    let live_id = live["Id"]
+        .as_str()
+        .expect("a minted application id")
+        .to_string();
+    let (status, body) = emulator
+        .update_endpoint(
+            "us-east-1",
+            &live_id,
+            "known",
+            json!({ "Address": "known@example.com", "ChannelType": "EMAIL" }),
+        )
+        .await;
+    assert_eq!(
+        status, 202,
+        "setup: the endpoint write must be accepted, got {status} with {body:?}"
+    );
+
+    // An id the service itself minted and a delete removed: that id was real, so no row
+    // can be answered off the SHAPE of the identifier.
+    let (_, gone) = emulator
+        .create_app("us-east-1", json!({ "Name": "deleted" }))
+        .await;
+    let deleted_id = gone["Id"]
+        .as_str()
+        .expect("a minted application id")
+        .to_string();
+    let (status, body) = emulator.delete_app("us-east-1", &deleted_id).await;
+    assert_eq!(
+        status, 200,
+        "setup: DeleteApp must succeed, got {status} with {body:?}"
+    );
+
+    // Rows along the form of the identifier the caller names: a well-formed id that was
+    // never minted, one the service minted and a delete removed, one shorter than a
+    // minted id, one outside its alphabet, and one longer than it.
+    let identifiers: Vec<(&str, String)> = vec![
+        (
+            "a well-formed id that was never minted",
+            "00000000000000000000000000000000".to_string(),
+        ),
+        ("an id minted and then deleted", deleted_id),
+        ("an id shorter than a minted one", "abc".to_string()),
+        (
+            "an id outside the minted alphabet",
+            "not-a-real-application".to_string(),
+        ),
+        ("an id longer than a minted one", "a".repeat(64)),
+    ];
+
+    for (case, id) in identifiers {
+        // And rows along the operation asked: every operation addressed at an
+        // application refuses an unknown one the same way.
+        let answers: Vec<(&str, (u16, Value))> = vec![
+            ("GetApp", emulator.get_app("us-east-1", &id).await),
+            ("DeleteApp", emulator.delete_app("us-east-1", &id).await),
+            (
+                "GetEndpoint",
+                emulator.get_endpoint("us-east-1", &id, "known").await,
+            ),
+            (
+                "UpdateEndpoint",
+                emulator
+                    .update_endpoint(
+                        "us-east-1",
+                        &id,
+                        "known",
+                        json!({ "Address": "x@example.com", "ChannelType": "EMAIL" }),
+                    )
+                    .await,
+            ),
+        ];
+
+        for (operation, (status, body)) in answers {
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (404, "NotFoundException"),
+                "case {case:?}/{operation}: expected a 404 NotFoundException, got {body:?}"
+            );
+            let message = body["Message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message, APPLICATION_NOT_FOUND,
+                "case {case:?}/{operation}: expected Message {APPLICATION_NOT_FOUND:?}, got {body:?}"
+            );
+            assert!(
+                !message.contains(&id),
+                "case {case:?}/{operation}: the refusal carries no identifier out of the request, got {message:?}"
+            );
+        }
+    }
+
+    // The application-level text is reserved for a missing APPLICATION: an endpoint
+    // missing from a live application classifies the endpoint instead.
+    let (status, body) = emulator
+        .get_endpoint("us-east-1", &live_id, "no-such-endpoint")
+        .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (404, "NotFoundException"),
+        "case \"an endpoint missing from a live application\": expected a 404 NotFoundException, got {body:?}"
+    );
+    assert_ne!(
+        body["Message"].as_str(),
+        Some(APPLICATION_NOT_FOUND),
+        "case \"an endpoint missing from a live application\": the application-level text names the wrong resource, got {body:?}"
+    );
+
+    // None of the refusals above disturbed the application that IS stored.
+    let (status, body) = emulator.get_app("us-east-1", &live_id).await;
+    assert_eq!(
+        status, 200,
+        "the stored application still reads back after every refusal, got {status} with {body:?}"
+    );
+    let (status, body) = emulator.get_endpoint("us-east-1", &live_id, "known").await;
+    assert_eq!(
+        status, 200,
+        "the stored endpoint still reads back after every refusal, got {status} with {body:?}"
+    );
+}

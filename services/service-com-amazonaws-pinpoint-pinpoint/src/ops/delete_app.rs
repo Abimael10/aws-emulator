@@ -162,10 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(deleted) = store.apps.remove(&input.application_id) else {
             return Err(DeleteAppErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Application not found: {}",
-                    input.application_id
-                )),
+                message: Some(crate::state::APPLICATION_NOT_FOUND_MESSAGE.to_string()),
                 request_id: None,
             })
             .into());

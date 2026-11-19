@@ -159,10 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         let Some(app) = store.apps.get(&input.application_id) else {
             return Err(GetAppErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Application not found: {}",
-                    input.application_id
-                )),
+                message: Some(crate::state::APPLICATION_NOT_FOUND_MESSAGE.to_string()),
                 request_id: None,
             })
             .into());

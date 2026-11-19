@@ -184,6 +184,27 @@ pub fn channel_not_found_message(channel_type: &str, application_id: &str) -> St
     )
 }
 
+/// The service's text for a request that names an application this service does not
+/// hold — the `NotFoundException` message of an operation addressed at the APPLICATION
+/// itself.
+///
+/// It classifies the missing resource as an application and carries nothing out of the
+/// request: the identifier the caller asked for is not part of the text, so the
+/// application-level refusal reads the same whichever operation was asked and whichever
+/// identifier it was asked for.
+pub const APPLICATION_NOT_FOUND_MESSAGE: &str = "Application not found";
+
+/// The service's generic text for a resource it does not hold — the
+/// `NotFoundException` message a request for a CHANNEL of an application answers with
+/// when the application that would hold it is not stored.
+///
+/// A channel is reached as a resource of an application, so a request for one of an
+/// application that does not exist resolves no resource at all and is refused as such:
+/// the refusal classifies neither the channel (there is no application to enable it on)
+/// nor the application (the caller addressed a channel), and carries nothing out of the
+/// request.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
+
 /// A stored Pinpoint application (a "project").
 #[derive(Debug, Clone, Default)]
 pub struct App {

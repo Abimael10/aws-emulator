@@ -20,7 +20,10 @@
 //!   answered with the service's channel-not-found text, which names the channel type
 //!   and the application the channel has to be enabled on — as the `NotFoundException`
 //!   message of a channel read or delete, and as the per-destination `StatusMessage` of
-//!   a direct send.
+//!   a direct send;
+//! * a request for a channel of an application the service does not hold resolves no
+//!   resource at all, so it is answered with the service's generic resource-not-found
+//!   text rather than with either the channel-level or the application-level one.
 
 use std::sync::Arc;
 
@@ -134,6 +137,14 @@ impl Emulator {
         self.call("POST", &format!("/v1/apps/{app}/messages"), Some(request))
             .await
     }
+
+    async fn get_app(&self, app: &str) -> (u16, Value) {
+        self.call("GET", &format!("/v1/apps/{app}"), None).await
+    }
+
+    async fn delete_app(&self, app: &str) -> (u16, Value) {
+        self.call("DELETE", &format!("/v1/apps/{app}"), None).await
+    }
 }
 
 /// The modelled error code carried by a restJson1 error body (`__type`).
@@ -168,6 +179,10 @@ fn message_configuration_for(channel: &str) -> Value {
         _ => json!({"DefaultMessage": {"Body": "default body"}}),
     }
 }
+
+/// The service's generic text for a resource it does not hold, written out here
+/// independently of the code under test.
+const EXPECTED_RESOURCE_NOT_FOUND: &str = "Resource not found";
 
 /// The text the service answers with for a channel `channel_type` that `app` has not
 /// enabled, written out here independently of the helper under test.
@@ -394,16 +409,55 @@ async fn a_channel_missing_on_a_live_application_is_the_channel_not_found_messag
         }
     }
 
-    // The application-level case is a different class and keeps its own text: it is
-    // the APPLICATION that is missing, so there is no channel to ask anyone to enable.
-    let (status, body) = emulator
-        .get_baidu_channel("00000000000000000000000000000000")
-        .await;
-    assert_eq!(
-        (status, error_code(&body).as_str(), body["Message"].as_str()),
-        (404, "NotFoundException", Some("Application not found")),
-        "an application that does not exist is the application-level text, got {body:?}"
-    );
+    // A channel of an application that does not exist is a different class: there is no
+    // application to enable the channel on, and the caller addressed a channel and not
+    // the application, so it is the generic resource text. Asserted over every channel
+    // operation and over the form of the identifier named, including the id of an
+    // application this run deleted.
+    let gone = emulator.create_app("deleted-application").await;
+    let (status, _) = emulator.delete_app(&gone).await;
+    assert_eq!(status, 200, "DeleteApp must answer 200");
+
+    for (case, app) in [
+        (
+            "an id that was never minted",
+            "00000000000000000000000000000000".to_string(),
+        ),
+        ("an id minted and then deleted", gone),
+        ("an id outside the minted alphabet", "not-an-app".to_string()),
+    ] {
+        for (operation, (status, body)) in [
+            ("GetBaiduChannel", emulator.get_baidu_channel(&app).await),
+            (
+                "DeleteBaiduChannel",
+                emulator.delete_baidu_channel(&app).await,
+            ),
+            (
+                "UpdateBaiduChannel",
+                emulator
+                    .update_baidu_channel(
+                        &app,
+                        json!({"ApiKey": "key", "SecretKey": "secret", "Enabled": true}),
+                    )
+                    .await,
+            ),
+        ] {
+            assert_eq!(
+                (status, error_code(&body).as_str(), body["Message"].as_str()),
+                (404, "NotFoundException", Some(EXPECTED_RESOURCE_NOT_FOUND)),
+                "case {case:?}/{operation}: expected the generic {EXPECTED_RESOURCE_NOT_FOUND:?}, got {body:?}"
+            );
+        }
+
+        // The application itself is a different class again: that refusal names the
+        // application, because the application is what the caller addressed.
+        let (status, body) = emulator.get_app(&app).await;
+        assert_eq!(
+            (status, error_code(&body).as_str(), body["Message"].as_str()),
+            (404, "NotFoundException", Some("Application not found")),
+            "case {case:?}/GetApp: an operation addressed at the application names it, got {body:?}"
+        );
+    }
 }
 
 #[tokio::test]
