@@ -138,43 +138,69 @@ pub fn run<Eng: Send + Sync + 'static>(
     input_node: &str,
     document: &Document,
 ) -> Result<Vec<FlowOutputValue>, FlowRefusal> {
-    // Decided BEFORE any flow store is read, from the caller's own identity and scope, so an
-    // identifier naming another account or another place is answered the same way whether or
-    // not a flow of that id exists here.
-    let caller = crate::state::caller(engine, ctx);
-    let account = crate::state::caller_account(&caller).unwrap_or_default();
-    if account != ::engine::emulator_account_id() {
-        return Err(FlowRefusal::NotFound);
-    }
-    let region = crate::state::request_region(ctx);
-    if !names_this_place(flow_identifier, &account, &region)
-        || !names_this_place(flow_alias_identifier, &account, &region)
-    {
-        return Err(FlowRefusal::NotFound);
-    }
+    run_resolved(
+        engine,
+        ctx,
+        flow_identifier,
+        flow_alias_identifier,
+        input_node,
+        document,
+    )
+    .and_then(|run| run.outcome.map_err(FlowRefusal::Unservable))
+}
+
+/// What one run of a flow really ran: the flow and the alias the identifiers named, the
+/// version that alias routed to at that instant, and what the walk of that version's
+/// definition came to.
+///
+/// An operation that PERSISTS a run (`StartFlowExecution`) records the three identities
+/// beside the outcome, so what it stored is the flow, the alias and the version the run was
+/// resolved against rather than the identifier forms the request happened to carry.
+#[derive(Debug)]
+pub struct FlowRun {
+    /// The flow the run resolved to, as the build-time plane identifies it.
+    pub flow_id: String,
+    /// The alias of that flow the run was addressed through.
+    pub alias_id: String,
+    /// The `flowVersion` the alias routed to when the run was resolved.
+    pub flow_version: String,
+    /// What the walk came to: the values it delivered, or the sentence saying which of the
+    /// flow's own nodes it could compute no value for.
+    ///
+    /// The two are a RUN's outcome rather than a refusal of the call, because the flow was
+    /// invocable and the request was well formed: a synchronous invocation has to deliver one
+    /// or the other inside its stream ([`run`]), while an EXECUTION records which of them the
+    /// run came to as its own status.
+    pub outcome: Result<Vec<FlowOutputValue>, String>,
+}
+
+/// [`run`], reporting the identities the run was resolved against beside its outcome.
+///
+/// The `Err` channel is for a call that cannot run the flow AT ALL — a flow, alias or
+/// version this plane does not hold, a version nothing has prepared, an input that addresses
+/// no input node of the flow — while a path the walk can compute no value for is the RUN's
+/// own outcome ([`FlowRun::outcome`]).
+pub fn run_resolved<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    flow_identifier: &str,
+    flow_alias_identifier: &str,
+    input_node: &str,
+    document: &Document,
+) -> Result<FlowRun, FlowRefusal> {
+    let placed = placement(engine, ctx, flow_identifier, flow_alias_identifier)?;
+    let (flow_id, alias_id) = (placed.flow_id, placed.alias_id);
     let Some(agents) = agent_state::service_state(engine) else {
         return Err(FlowRefusal::StoreUnavailable);
     };
     let mut store = agents.lock();
     store.materialise_due_transitions(SystemTime::now());
 
-    let Some(flow_id) = agent_state::flow_id_from_identifier(flow_identifier) else {
-        return Err(FlowRefusal::NotFound);
-    };
-    let Some((aliased_flow, alias_id)) =
-        agent_state::flow_alias_from_identifier(flow_alias_identifier)
-    else {
-        return Err(FlowRefusal::NotFound);
-    };
-    // An alias ARN carries the flow it belongs to: one naming another flow addresses a
-    // resource the flow in the path does not hold.
-    if aliased_flow.is_some_and(|named| named != flow_id) {
-        return Err(FlowRefusal::NotFound);
-    }
+    let flow_id = flow_id.as_str();
     let Some(flow) = store.flows.get(flow_id) else {
         return Err(FlowRefusal::NotFound);
     };
-    let Some(alias) = store.flow_alias_of(flow_id, alias_id) else {
+    let Some(alias) = store.flow_alias_of(flow_id, &alias_id) else {
         return Err(FlowRefusal::NotFound);
     };
     let Some(routed) = alias
@@ -210,7 +236,74 @@ pub fn run<Eng: Send + Sync + 'static>(
              is no node for the input to enter at"
         )));
     };
-    walk(definition, input_node, document)
+    let outcome = match walk(definition, input_node, document) {
+        Ok(outputs) => Ok(outputs),
+        // The walk could compute no value for a node of the flow's own definition: the run's
+        // outcome, not a refusal of the call (see [`FlowRun::outcome`]).
+        Err(FlowRefusal::Unservable(message)) => Err(message),
+        Err(refusal) => return Err(refusal),
+    };
+    Ok(FlowRun {
+        flow_id: flow_id.to_string(),
+        alias_id,
+        flow_version: routed,
+        outcome,
+    })
+}
+
+/// The flow and the alias a pair of modelled identifiers names, for a caller that may name
+/// them at all.
+///
+/// This is the half of the resolution that reads NO store: the account the caller acts in,
+/// the place an identifier in ARN form names, and the two ids the identifier forms carry. It
+/// is decided before any flow store is read, so an identifier naming another account or
+/// another place is answered the same way whether or not a flow of that id exists here, and
+/// an operation that only addresses a resource of this plane's OWN store (an execution of a
+/// flow alias) resolves its identifiers through it without reading the build-time plane at
+/// all.
+pub fn placement<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    flow_identifier: &str,
+    flow_alias_identifier: &str,
+) -> Result<FlowPlacement, FlowRefusal> {
+    let caller = crate::state::caller(engine, ctx);
+    let account = crate::state::caller_account(&caller).unwrap_or_default();
+    if account != ::engine::emulator_account_id() {
+        return Err(FlowRefusal::NotFound);
+    }
+    let region = crate::state::request_region(ctx);
+    if !names_this_place(flow_identifier, &account, &region)
+        || !names_this_place(flow_alias_identifier, &account, &region)
+    {
+        return Err(FlowRefusal::NotFound);
+    }
+    let Some(flow_id) = agent_state::flow_id_from_identifier(flow_identifier) else {
+        return Err(FlowRefusal::NotFound);
+    };
+    let Some((aliased_flow, alias_id)) =
+        agent_state::flow_alias_from_identifier(flow_alias_identifier)
+    else {
+        return Err(FlowRefusal::NotFound);
+    };
+    // An alias ARN carries the flow it belongs to: one naming another flow addresses a
+    // resource the flow in the path does not hold.
+    if aliased_flow.is_some_and(|named| named != flow_id) {
+        return Err(FlowRefusal::NotFound);
+    }
+    Ok(FlowPlacement {
+        flow_id: flow_id.to_string(),
+        alias_id: alias_id.to_string(),
+    })
+}
+
+/// The flow and the alias [`placement`] resolved a request's identifiers to.
+#[derive(Debug, Clone)]
+pub struct FlowPlacement {
+    /// The flow the `flowIdentifier` names, as the build-time plane identifies it.
+    pub flow_id: String,
+    /// The alias the `flowAliasIdentifier` names.
+    pub alias_id: String,
 }
 
 /// Whether `identifier` names a resource of THIS caller's place: a bare identifier always

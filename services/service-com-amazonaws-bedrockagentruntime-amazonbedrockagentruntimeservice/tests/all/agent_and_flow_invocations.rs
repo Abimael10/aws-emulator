@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the two AGENT-INVOCATION routes of this plane —
-//! `InvokeAgent` (`POST /agents/{agentId}/agentAliases/{agentAliasId}/sessions/{sessionId}/text`)
-//! and `InvokeFlow` (`POST /flows/{flowIdentifier}/aliases/{flowAliasIdentifier}`).
+//! End-to-end tests for the routes of this plane that RUN a flow or an agent:
+//! `InvokeAgent` (`POST /agents/{agentId}/agentAliases/{agentAliasId}/sessions/{sessionId}/text`),
+//! `InvokeFlow` (`POST /flows/{flowIdentifier}/aliases/{flowAliasIdentifier}`) and the FLOW
+//! EXECUTION lifecycle on the same pair of labels — `StartFlowExecution`,
+//! `GetFlowExecution` and `StopFlowExecution`.
 //!
 //! THE RULES UNDER TEST:
 //!
@@ -20,13 +22,17 @@
 //! * a flow that IS prepared runs its own stored definition: the request's document enters
 //!   at the flow's input node and leaves at the output nodes that node is connected to, one
 //!   `flowOutputEvent` each, then the `flowCompletionEvent`;
-//! * a leg of either request this emulator cannot compute is refused rather than ignored.
+//! * a leg of either request this emulator cannot compute is refused rather than ignored;
+//! * a flow EXECUTION is a resource of this plane: a start persists one, a read hands back
+//!   what the start wrote, the run finishes on the clock at the status it came to, and only
+//!   a running execution can be stopped.
 //!
 //! The tables span what those rules generalise over: which label is wrong and which
 //! constraint class it breaks, whether the agent exists and whether the alias is the draft
 //! one every agent carries, the FORM of a flow identifier (a bare id, a flow ARN, an alias
-//! ARN of another flow), the number of output nodes a flow's input reaches, and the status
-//! the flow stands in.
+//! ARN of another flow), the number of output nodes a flow's input reaches, the status
+//! the flow stands in, and — for an execution — the form of every identifier that addresses
+//! one, whether the caller named it, and what the run it stands for came to.
 
 use std::time::{Duration, SystemTime};
 
@@ -37,6 +43,7 @@ use aws_smithy_eventstream::frame::read_message_from;
 use aws_smithy_types::event_stream::HeaderValue;
 
 use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::state as agent_state;
+use service_com_amazonaws_bedrockagentruntime_amazonbedrockagentruntimeservice::state as runtime_state;
 
 use crate::agent_memory::{Emulator, Reply, ACCOUNT_KEY, REGION};
 
@@ -1706,6 +1713,485 @@ fn label(identifier: &str) -> String {
     identifier.replace(':', "%3A").replace('/', "%2F")
 }
 
+// ---------------------------------------------------------------------------
+// The FLOW EXECUTION lifecycle: `StartFlowExecution`, `GetFlowExecution`,
+// `StopFlowExecution`. The flow it runs is still the build-time plane's, created and
+// prepared through that plane's own operations above; the EXECUTION of one is this plane's.
+// ---------------------------------------------------------------------------
+
+/// The fixed text this plane states when the EXECUTION a request addresses is one it holds
+/// nothing for: the type of resource that did not resolve, and nothing else.
+const EXECUTION_NOT_FOUND: &str = "Resource not found, type: FlowExecution";
+
+impl Emulator {
+    /// One `StartFlowExecution` call over the modelled URI, entering the flow at `node` with
+    /// `document` and under `name` when one is given.
+    async fn start_flow_execution(
+        &self,
+        flow: &str,
+        alias: &str,
+        node: &str,
+        document: Value,
+        name: Option<&str>,
+    ) -> Reply {
+        let mut body = flow_request(node, document);
+        if let Some(name) = name {
+            body["flowExecutionName"] = json!(name);
+        }
+        self.bedrock(
+            ACCOUNT_KEY,
+            "POST",
+            &format!(
+                "/flows/{}/aliases/{}/executions",
+                label(flow),
+                label(alias)
+            ),
+            Some(body),
+        )
+        .await
+    }
+
+    /// One `GetFlowExecution` call over the modelled URI.
+    async fn get_flow_execution(&self, flow: &str, alias: &str, execution: &str) -> Reply {
+        self.bedrock(
+            ACCOUNT_KEY,
+            "GET",
+            &format!(
+                "/flows/{}/aliases/{}/executions/{}",
+                label(flow),
+                label(alias),
+                label(execution)
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// One `StopFlowExecution` call over the modelled URI.
+    async fn stop_flow_execution(&self, flow: &str, alias: &str, execution: &str) -> Reply {
+        self.bedrock(
+            ACCOUNT_KEY,
+            "POST",
+            &format!(
+                "/flows/{}/aliases/{}/executions/{}/stop",
+                label(flow),
+                label(alias),
+                label(execution)
+            ),
+            Some(json!({})),
+        )
+        .await
+    }
+
+    /// A flow created, prepared and aliased, ready to be executed: its
+    /// `(flowId, flowArn, aliasId, aliasArn)`.
+    async fn executable_flow(
+        &self,
+        case: &str,
+        name: &str,
+        definition: Value,
+    ) -> (String, String, String, String) {
+        let (flow_id, flow_arn) = self.create_flow(name, definition).await;
+        self.prepare_flow(case, &flow_id).await;
+        let (alias_id, alias_arn) = self.create_flow_alias(case, &flow_id, DRAFT_VERSION).await;
+        (flow_id, flow_arn, alias_id, alias_arn)
+    }
+
+    /// Move every running execution's completion into the past by exactly the span it was
+    /// given, so the status the clock owes is due and the run reads as having finished at
+    /// the instant it started — the test drives the clock rather than waiting for it.
+    fn finish_running_executions(&self) {
+        let state = runtime_state::service_state(&*self.engine)
+            .expect("this service's store is on the shared engine");
+        let mut store = state.lock();
+        for execution in store.flow_executions.values_mut() {
+            if execution.status == runtime_state::flow_execution::FlowExecutionStatus::Running {
+                execution.completes_at -= runtime_state::flow_execution::FLOW_EXECUTION_SPAN;
+            }
+        }
+    }
+}
+
+/// The execution ARN this emulator mints for `name` on `alias_id` of `flow_id`, as the
+/// modelled `FlowExecutionIdentifier` spells one.
+fn execution_arn(flow_id: &str, alias_id: &str, name: &str) -> String {
+    format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:flow/{flow_id}/alias/{alias_id}/execution/{name}")
+}
+
+/// The sentence a stop of an execution that has already finished earns: it names the
+/// execution and the terminal status it stands in.
+fn cannot_be_aborted(name: &str, status: &str) -> String {
+    format!("Flow execution {name} is in {status} status and cannot be aborted.")
+}
+
+/// The instant a member the model marks `@timestampFormat("date-time")` carries: on this
+/// service's restJson1 wire it travels as an RFC 3339 string, never as a bare epoch number
+/// (`tests/all/date_time_wire_form.rs` pins that rule for the session plane).
+fn flow_execution_instant(case: &str, member: &str, value: &Value) -> (i64, u32) {
+    let rendered = value.as_str().unwrap_or_else(|| {
+        panic!("case {case:?}: {member} must be an RFC 3339 string, got {value:?}")
+    });
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        rendered,
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .unwrap_or_else(|error| {
+        panic!("case {case:?}: {member} {rendered:?} must parse as RFC 3339: {error}")
+    });
+    (parsed.secs(), parsed.subsec_nanos())
+}
+
+/// A started execution is PERSISTED and handed back by a read, whichever form the request
+/// names the flow, the alias and the execution in, and whether or not the caller named the
+/// execution itself.
+#[tokio::test]
+async fn a_started_flow_execution_is_readable_back_under_every_identifier_form() {
+    /// One start, and how the read that follows it addresses what the start created.
+    struct Row {
+        case: &'static str,
+        /// The definition the alias routes to, so the rows differ in the flow's shape as
+        /// well as in the identifier forms.
+        definition: Value,
+        /// The `flowExecutionName` the request carries, or `None` for one this service mints.
+        name: Option<&'static str>,
+        /// Whether the calls address the flow and the alias by their ARNs rather than by
+        /// their bare ids.
+        by_arn: bool,
+        /// Whether the read addresses the execution by its whole ARN rather than by its name.
+        read_by_arn: bool,
+        /// Whether the alias is the reserved test alias every flow carries rather than one
+        /// created on it.
+        test_alias: bool,
+    }
+
+    let rows = [
+        Row {
+            case: "bare ids, a caller's name, read by name",
+            definition: passthrough_definition(),
+            name: Some("probe-execution-1"),
+            by_arn: false,
+            read_by_arn: false,
+            test_alias: false,
+        },
+        Row {
+            case: "flow and alias ARNs, a minted name, read by the execution ARN",
+            definition: passthrough_definition(),
+            name: None,
+            by_arn: true,
+            read_by_arn: true,
+            test_alias: false,
+        },
+        Row {
+            case: "the reserved test alias, a caller's name, read by the execution ARN",
+            definition: fan_out_definition(),
+            name: Some("probe-execution-2"),
+            by_arn: false,
+            read_by_arn: true,
+            test_alias: true,
+        },
+        Row {
+            case: "a fanned-out flow, a minted name, read by name",
+            definition: fan_out_definition(),
+            name: None,
+            by_arn: false,
+            read_by_arn: false,
+            test_alias: false,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let (flow_id, flow_arn, created_alias, created_alias_arn) = emulator
+            .executable_flow(
+                case,
+                &format!("execution-flow-{index}"),
+                row.definition.clone(),
+            )
+            .await;
+        let (alias_id, alias_arn) = if row.test_alias {
+            (
+                DRAFT_ALIAS.to_string(),
+                format!("{flow_arn}/alias/{DRAFT_ALIAS}"),
+            )
+        } else {
+            (created_alias, created_alias_arn)
+        };
+        let (flow_label, alias_label) = if row.by_arn {
+            (flow_arn.clone(), alias_arn.clone())
+        } else {
+            (flow_id.clone(), alias_id.clone())
+        };
+
+        let reply = emulator
+            .start_flow_execution(
+                &flow_label,
+                &alias_label,
+                "FlowInput",
+                json!({ "data": "the caller's own input" }),
+                row.name,
+            )
+            .await;
+        let started = reply.json(case);
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected the start to be served, got {} with {started}",
+            reply.status
+        );
+        let arn = started["executionArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected an executionArn, got {started}"))
+            .to_string();
+        let name = row.name.map(str::to_string).unwrap_or_else(|| {
+            arn.rsplit("/execution/")
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        assert_eq!(
+            arn,
+            execution_arn(&flow_id, &alias_id, &name),
+            "case {case:?}: expected the execution ARN this emulator mints, got {arn:?}"
+        );
+        // A minted name satisfies the modelled `FlowExecutionName` the caller could have
+        // sent: at most 36 characters, each one the pattern admits.
+        assert!(
+            (1..=36).contains(&name.chars().count())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "case {case:?}: expected a name inside the modelled FlowExecutionName, got {name:?}"
+        );
+
+        let identifier = if row.read_by_arn { arn.clone() } else { name };
+        let reply = emulator
+            .get_flow_execution(&flow_label, &alias_label, &identifier)
+            .await;
+        let read = reply.json(case);
+        assert_eq!(
+            reply.status, 200,
+            "case {case:?}: expected the execution to be readable back, got {} with {read}",
+            reply.status
+        );
+        assert_eq!(
+            (
+                read["executionArn"].as_str(),
+                read["status"].as_str(),
+                read["flowIdentifier"].as_str(),
+                read["flowAliasIdentifier"].as_str(),
+                read["flowVersion"].as_str(),
+            ),
+            (
+                Some(arn.as_str()),
+                Some("Running"),
+                Some(flow_id.as_str()),
+                Some(alias_id.as_str()),
+                Some(DRAFT_VERSION),
+            ),
+            "case {case:?}: expected the read to report the execution the start wrote, got \
+             {read}"
+        );
+        flow_execution_instant(case, "startedAt", &read["startedAt"]);
+        assert!(
+            read.get("endedAt").is_none_or(Value::is_null),
+            "case {case:?}: expected no end instant on a running execution, got {read}"
+        );
+    }
+}
+
+/// A `flowExecutionName` identifies an execution INSIDE its alias: a second start under a
+/// name in use conflicts rather than displacing the execution holding it, and the same name
+/// on another alias of the same flow is another execution.
+#[tokio::test]
+async fn a_flow_execution_name_is_unique_inside_its_alias() {
+    let case = "two starts under one name";
+    let emulator = Emulator::new();
+    let (flow_id, _, alias_id, _) = emulator
+        .executable_flow(case, "execution-name-flow", passthrough_definition())
+        .await;
+    let reply = emulator
+        .start_flow_execution(
+            &flow_id,
+            &alias_id,
+            "FlowInput",
+            json!({ "data": "once" }),
+            Some("shared-name"),
+        )
+        .await;
+    let first = reply.json(case);
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: expected the first start to be served, got {} with {first}",
+        reply.status
+    );
+    let reply = emulator
+        .start_flow_execution(
+            &flow_id,
+            &alias_id,
+            "FlowInput",
+            json!({ "data": "once" }),
+            Some("shared-name"),
+        )
+        .await;
+    let second = reply.json(case);
+    assert_eq!(
+        (reply.status, reply.error_code(case), reply.message(case)),
+        (
+            409,
+            "ConflictException".to_string(),
+            "Flow execution shared-name already exists and cannot be started again.".to_string()
+        ),
+        "case {case:?}: expected a name in use to conflict, got {second}"
+    );
+
+    let case = "the same name on another alias";
+    let reply = emulator
+        .start_flow_execution(
+            &flow_id,
+            DRAFT_ALIAS,
+            "FlowInput",
+            json!({ "data": "once" }),
+            Some("shared-name"),
+        )
+        .await;
+    let other = reply.json(case);
+    assert_eq!(
+        (reply.status, other["executionArn"].as_str()),
+        (
+            200,
+            Some(execution_arn(&flow_id, DRAFT_ALIAS, "shared-name").as_str())
+        ),
+        "case {case:?}: expected another alias to take the name, got {other}"
+    );
+    assert_eq!(
+        first["executionArn"].as_str(),
+        Some(execution_arn(&flow_id, &alias_id, "shared-name").as_str()),
+        "case {case:?}: expected the first execution to keep its own ARN, got {first}"
+    );
+}
+
+/// The run finishes on the clock, at the status that run came to: a path that reaches the
+/// flow's output nodes `Succeeded`, and one that reaches a node kind nothing here performs
+/// the work of `Failed`, carrying the error of that run. Reading an execution changes
+/// nothing a later reader sees.
+#[tokio::test]
+async fn a_flow_execution_reaches_the_status_its_run_came_to() {
+    /// One flow, and the status a run of it comes to once its span is up.
+    struct Row {
+        case: &'static str,
+        definition: Value,
+        /// The `FlowExecutionStatus` the finished run stands in.
+        then: &'static str,
+        /// Whether the read of the finished execution carries the error of its run.
+        errors: bool,
+    }
+
+    let rows = [
+        Row {
+            case: "a path that reaches the flow's output node",
+            definition: passthrough_definition(),
+            then: "Succeeded",
+            errors: false,
+        },
+        Row {
+            case: "a path that reaches a node nothing here runs",
+            definition: prompt_node_definition(),
+            then: "Failed",
+            errors: true,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let (flow_id, _, alias_id, _) = emulator
+            .executable_flow(
+                case,
+                &format!("execution-span-flow-{index}"),
+                row.definition.clone(),
+            )
+            .await;
+        let reply = emulator
+            .start_flow_execution(
+                &flow_id,
+                &alias_id,
+                "FlowInput",
+                json!({ "data": "runs to the end" }),
+                Some("spans"),
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case:?}: expected the start to be served, got {} with {}",
+            reply.status,
+            reply.json(case)
+        );
+
+        let reply = emulator.get_flow_execution(&flow_id, &alias_id, "spans").await;
+        let running = reply.json(case);
+        assert_eq!(
+            (reply.status, running["status"].as_str()),
+            (200, Some("Running")),
+            "case {case:?}: expected the execution to be Running inside its span, got {running}"
+        );
+        assert!(
+            running.get("errors").is_none_or(Value::is_null),
+            "case {case:?}: expected no error before the run finished, got {running}"
+        );
+
+        emulator.finish_running_executions();
+        let reply = emulator.get_flow_execution(&flow_id, &alias_id, "spans").await;
+        let finished = reply.json(case);
+        assert_eq!(
+            (reply.status, finished["status"].as_str()),
+            (200, Some(row.then)),
+            "case {case:?}: expected the run to have come to {:?}, got {finished}",
+            row.then
+        );
+        let (started_at, ended_at) = (
+            flow_execution_instant(case, "startedAt", &finished["startedAt"]),
+            flow_execution_instant(case, "endedAt", &finished["endedAt"]),
+        );
+        assert!(
+            ended_at >= started_at,
+            "case {case:?}: expected a run to end no earlier than it started, got \
+             {started_at:?} then {ended_at:?}"
+        );
+        assert_eq!(
+            finished["startedAt"], running["startedAt"],
+            "case {case:?}: expected the start instant to be unchanged, got {finished}"
+        );
+        // A failed run says which of the flow's own nodes nothing here computed a value
+        // for; a delivered one has no error to report at all.
+        let errors = finished["errors"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        assert_eq!(
+            !errors.is_empty(),
+            row.errors,
+            "case {case:?}: expected errors={}, got {finished}",
+            row.errors
+        );
+        if row.errors {
+            assert!(
+                errors[0]["message"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Prompt"),
+                "case {case:?}: expected the error to name the node kind nothing here runs, \
+                 got {finished}"
+            );
+        }
+
+        let reply = emulator.get_flow_execution(&flow_id, &alias_id, "spans").await;
+        assert_eq!(
+            (reply.status, reply.json(case)),
+            (200, finished.clone()),
+            "case {case:?}: expected a second read to report the same execution"
+        );
+    }
+}
+
 /// RULE: a flow invocation is served by the service whose own model binds the route, whatever
 /// signing name that service's family shares, and it runs the definition the version its
 /// alias routes to PACKAGES — so an alias on a published numbered version delivers what that
@@ -1965,4 +2451,405 @@ async fn an_alias_on_a_published_version_runs_the_version_it_packages() {
         executions.len(),
         "every invocation that named no execution runs as one of its own, got {executions:?}"
     );
+}
+
+/// A stop moves a RUNNING execution to `Aborted`, and a terminal execution never moves
+/// again: the second stop of one, and a stop of a run that had already finished, are both
+/// refused with the conflict that names the status it stands in.
+#[tokio::test]
+async fn only_a_running_flow_execution_can_be_stopped() {
+    /// One execution, and what a stop of it must answer.
+    struct Row {
+        case: &'static str,
+        /// Whether the run's span is moved into the past before the stop, so the execution
+        /// has already finished when it arrives.
+        finish_first: bool,
+        /// Whether a stop is sent before the one under test.
+        stop_first: bool,
+        /// The HTTP status the stop under test must answer.
+        status: u16,
+        /// The status the execution stands in afterwards.
+        then: &'static str,
+    }
+
+    let rows = [
+        Row {
+            case: "a stop inside the run's span",
+            finish_first: false,
+            stop_first: false,
+            status: 200,
+            then: "Aborted",
+        },
+        Row {
+            case: "a second stop of the same execution",
+            finish_first: false,
+            stop_first: true,
+            status: 409,
+            then: "Aborted",
+        },
+        Row {
+            case: "a stop of a run that had already finished",
+            finish_first: true,
+            stop_first: false,
+            status: 409,
+            then: "Succeeded",
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let (flow_id, _, alias_id, _) = emulator
+            .executable_flow(
+                case,
+                &format!("execution-stop-flow-{index}"),
+                passthrough_definition(),
+            )
+            .await;
+        let reply = emulator
+            .start_flow_execution(
+                &flow_id,
+                &alias_id,
+                "FlowInput",
+                json!({ "data": "stoppable" }),
+                Some("stoppable"),
+            )
+            .await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case:?}: expected the start to be served, got {} with {}",
+            reply.status,
+            reply.json(case)
+        );
+        if row.stop_first {
+            let reply = emulator
+                .stop_flow_execution(&flow_id, &alias_id, "stoppable")
+                .await;
+            let first = reply.json(case);
+            assert_eq!(
+                (reply.status, first["status"].as_str()),
+                (200, Some("Aborted")),
+                "case {case:?}: expected the first stop to abort the run, got {first}"
+            );
+        }
+        if row.finish_first {
+            emulator.finish_running_executions();
+        }
+
+        let reply = emulator
+            .stop_flow_execution(&flow_id, &alias_id, "stoppable")
+            .await;
+        let stopped = reply.json(case);
+        assert_eq!(
+            reply.status, row.status,
+            "case {case:?}: expected the stop to answer {}, got {} with {stopped}",
+            row.status, reply.status
+        );
+        if row.status == 200 {
+            assert_eq!(
+                (stopped["status"].as_str(), stopped["executionArn"].as_str()),
+                (
+                    Some(row.then),
+                    Some(execution_arn(&flow_id, &alias_id, "stoppable").as_str())
+                ),
+                "case {case:?}: expected the stop to report the execution it stopped, got \
+                 {stopped}"
+            );
+        } else {
+            assert_eq!(
+                (reply.error_code(case), reply.message(case)),
+                (
+                    "ConflictException".to_string(),
+                    cannot_be_aborted("stoppable", row.then)
+                ),
+                "case {case:?}: expected the conflict to name the status it stands in, got \
+                 {stopped}"
+            );
+        }
+
+        // Whatever the stop answered, the execution stands where the rule leaves it: a
+        // refused stop changes nothing, and a terminal status is immutable.
+        let reply = emulator.get_flow_execution(&flow_id, &alias_id, "stoppable").await;
+        let read = reply.json(case);
+        assert_eq!(
+            (reply.status, read["status"].as_str()),
+            (200, Some(row.then)),
+            "case {case:?}: expected the execution to stand at {:?}, got {read}",
+            row.then
+        );
+        assert!(
+            read["endedAt"].is_string(),
+            "case {case:?}: expected a terminal execution to carry its end instant, got {read}"
+        );
+    }
+}
+
+/// An execution nothing started is the modelled not-found, whichever way the request
+/// addresses it: a name nothing holds, an ARN of another alias, an ARN of another account,
+/// or a flow this plane holds nothing for.
+#[tokio::test]
+async fn a_flow_execution_nothing_started_is_not_found() {
+    let setup = "the executions of one alias";
+    let emulator = Emulator::new();
+    let (flow_id, _, alias_id, _) = emulator
+        .executable_flow(setup, "execution-lookup-flow", passthrough_definition())
+        .await;
+    let reply = emulator
+        .start_flow_execution(
+            &flow_id,
+            &alias_id,
+            "FlowInput",
+            json!({ "data": "held" }),
+            Some("held"),
+        )
+        .await;
+    assert_eq!(
+        reply.status,
+        200,
+        "case {setup:?}: expected the start to be served, got {} with {}",
+        reply.status,
+        reply.json(setup)
+    );
+    // A second executable flow, so an execution can be addressed through an alias that is
+    // not the one it runs on.
+    let (other_flow, _, other_alias, _) = emulator
+        .executable_flow(setup, "execution-other-flow", passthrough_definition())
+        .await;
+
+    // (case, flowIdentifier, flowAliasIdentifier, executionIdentifier)
+    let rows: Vec<(&str, String, String, String)> = vec![
+        (
+            "a name no execution of the alias holds",
+            flow_id.clone(),
+            alias_id.clone(),
+            "never-started".to_string(),
+        ),
+        (
+            "the ARN of an execution of another alias",
+            flow_id.clone(),
+            alias_id.clone(),
+            execution_arn(&other_flow, &other_alias, "held"),
+        ),
+        (
+            "the execution's name under another alias of the same flow",
+            flow_id.clone(),
+            DRAFT_ALIAS.to_string(),
+            "held".to_string(),
+        ),
+        (
+            "an execution ARN of another account",
+            flow_id.clone(),
+            alias_id.clone(),
+            execution_arn(&flow_id, &alias_id, "held").replace(ACCOUNT, "123456789012"),
+        ),
+        (
+            "an execution of a flow this plane holds nothing for",
+            "ABCDEFGHIJ".to_string(),
+            "ZYXWVUTSRQ".to_string(),
+            "held".to_string(),
+        ),
+    ];
+
+    for (case, flow, alias, execution) in rows {
+        for (operation, reply) in [
+            (
+                "GetFlowExecution",
+                emulator.get_flow_execution(&flow, &alias, &execution).await,
+            ),
+            (
+                "StopFlowExecution",
+                emulator.stop_flow_execution(&flow, &alias, &execution).await,
+            ),
+        ] {
+            assert_eq!(
+                (reply.status, reply.error_code(case), reply.message(case)),
+                (
+                    404,
+                    "ResourceNotFoundException".to_string(),
+                    EXECUTION_NOT_FOUND.to_string()
+                ),
+                "case {case:?}: expected {operation} to state the not-found of an execution, \
+                 got {}",
+                reply.json(case)
+            );
+        }
+    }
+}
+
+/// A start of a flow this plane cannot run AT ALL is refused, and persists NO execution: the
+/// refusal travels as the modelled error its class carries, and nothing is left behind for a
+/// later read to report. (A flow it CAN run whose path it cannot compute is started instead,
+/// and its run comes to `Failed`.)
+#[tokio::test]
+async fn a_start_of_a_flow_that_cannot_run_persists_nothing() {
+    /// One start that cannot be served, and the refusal it earns.
+    struct Row {
+        case: &'static str,
+        /// Whether the flow is prepared before the start: an unprepared flow runs nothing.
+        prepared: bool,
+        /// The flow and alias the start addresses instead of the created ones, for a pair
+        /// this plane holds nothing for.
+        unheld: Option<(&'static str, &'static str)>,
+        /// The node the input addresses.
+        node: &'static str,
+        status: u16,
+        code: &'static str,
+        /// The whole message, where this plane states fixed text for the class.
+        message: Option<&'static str>,
+    }
+
+    let rows = [
+        Row {
+            case: "a flow nothing has prepared",
+            prepared: false,
+            unheld: None,
+            node: "FlowInput",
+            status: 400,
+            code: "ValidationException",
+            message: None,
+        },
+        Row {
+            case: "an input addressing a node the flow does not enter at",
+            prepared: true,
+            unheld: None,
+            node: "NotTheInputNode",
+            status: 424,
+            code: "DependencyFailedException",
+            message: Some(
+                "There was an issue with a dependency. Check the resource configurations and \
+                 retry the request.",
+            ),
+        },
+        Row {
+            case: "a flow and alias the build-time plane holds nothing for",
+            prepared: true,
+            unheld: Some(("ABCDEFGHIJ", "ZYXWVUTSRQ")),
+            node: "FlowInput",
+            status: 404,
+            code: "ResourceNotFoundException",
+            message: Some(RESOURCE_NOT_FOUND),
+        },
+    ];
+
+    let emulator = Emulator::new();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let (created_flow, _) = emulator
+            .create_flow(
+                &format!("unservable-flow-{index}"),
+                passthrough_definition(),
+            )
+            .await;
+        if row.prepared {
+            emulator.prepare_flow(case, &created_flow).await;
+        }
+        let (created_alias, _) = emulator
+            .create_flow_alias(case, &created_flow, DRAFT_VERSION)
+            .await;
+        let (flow_id, alias_id) = match row.unheld {
+            Some((flow, alias)) => (flow.to_string(), alias.to_string()),
+            None => (created_flow, created_alias),
+        };
+
+        let reply = emulator
+            .start_flow_execution(
+                &flow_id,
+                &alias_id,
+                row.node,
+                json!({ "data": "unservable" }),
+                Some("unservable"),
+            )
+            .await;
+        let refused = reply.json(case);
+        assert_eq!(
+            (reply.status, reply.error_code(case)),
+            (row.status, row.code.to_string()),
+            "case {case:?}: expected the modelled {} of this class, got {refused}",
+            row.code
+        );
+        match row.message {
+            Some(stated) => assert_eq!(
+                reply.message(case),
+                stated,
+                "case {case:?}: expected the fixed text of this class, got {refused}"
+            ),
+            None => assert!(
+                !reply.message(case).is_empty(),
+                "case {case:?}: expected the refusal to say what it could not do, got {refused}"
+            ),
+        }
+
+        let reply = emulator
+            .get_flow_execution(&flow_id, &alias_id, "unservable")
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code(case)),
+            (404, "ResourceNotFoundException".to_string()),
+            "case {case:?}: expected the refused start to have persisted no execution, got {}",
+            reply.json(case)
+        );
+    }
+}
+
+/// A flow whose input node leads to a node kind nothing in this emulator performs the work
+/// of, so no value can be computed for the run that reaches it. The build-time plane PREPARES
+/// it like any other flow: it carries a starting node, an ending node, and a connection
+/// feeding every node input.
+fn prompt_node_definition() -> Value {
+    json!({
+        "nodes": [
+            {
+                "name": "FlowInput",
+                "type": "Input",
+                "configuration": { "input": {} },
+                "outputs": [{ "name": "document", "type": "String" }],
+            },
+            {
+                "name": "Rewrite",
+                "type": "Prompt",
+                "configuration": {
+                    "prompt": {
+                        "sourceConfiguration": {
+                            "inline": {
+                                "modelId": "anthropic.claude-v2",
+                                "templateType": "TEXT",
+                                "templateConfiguration": {
+                                    "text": { "text": "rewrite {{document}}" },
+                                },
+                            },
+                        },
+                    },
+                },
+                "inputs": [{ "name": "document", "type": "String", "expression": "$.data" }],
+                "outputs": [{ "name": "modelCompletion", "type": "String" }],
+            },
+            {
+                "name": "FlowOutput",
+                "type": "Output",
+                "configuration": { "output": {} },
+                "inputs": [{ "name": "document", "type": "String", "expression": "$.data" }],
+            },
+        ],
+        "connections": [
+            {
+                "name": "InputToPrompt",
+                "type": "Data",
+                "source": "FlowInput",
+                "target": "Rewrite",
+                "configuration": {
+                    "data": { "sourceOutput": "document", "targetInput": "document" },
+                },
+            },
+            {
+                "name": "PromptToOutput",
+                "type": "Data",
+                "source": "Rewrite",
+                "target": "FlowOutput",
+                "configuration": {
+                    "data": { "sourceOutput": "modelCompletion", "targetInput": "document" },
+                },
+            },
+        ],
+    })
 }

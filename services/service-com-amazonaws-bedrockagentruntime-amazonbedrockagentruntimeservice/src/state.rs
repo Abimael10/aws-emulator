@@ -55,6 +55,9 @@ pub mod agent_memory;
 pub mod agent_invocation;
 /// See the module docs: where the content of one ingested document lives.
 pub mod document_content;
+/// See the module docs: the asynchronous EXECUTION of a flow this plane owns, and the
+/// status machine a start, a read and a stop of one move.
+pub mod flow_execution;
 /// See the module docs: the flow an alias routes to, and the path a request's input
 /// travels through that flow's own definition.
 pub mod flow_invocation;
@@ -269,6 +272,16 @@ pub struct ComAmazonawsBedrockagentruntimeAmazonbedrockagentruntimeserviceState 
     /// ([`inline_agent::expire_idle_conversations`]), so a conversation nobody continues
     /// stops holding memory.
     pub inline_agent_sessions: BTreeMap<String, inline_agent::InlineAgentSession>,
+    /// Every flow execution a `StartFlowExecution` has started, keyed by the flow, the alias
+    /// and the execution's own name ([`flow_execution::FlowExecutionKey`]). The flow and the
+    /// alias are the build-time plane's resources; the EXECUTION of one is this plane's, so
+    /// this map is the whole flow-execution store, and `GetFlowExecution` and
+    /// `StopFlowExecution` read and move exactly what a start wrote here.
+    ///
+    /// BOUNDED like every other growable collection here (see [`MAX_SESSIONS`]): a start that
+    /// would hold one past [`flow_execution::MAX_FLOW_EXECUTIONS`] answers the modelled
+    /// `ServiceQuotaExceededException` instead of growing this map.
+    pub flow_executions: BTreeMap<flow_execution::FlowExecutionKey, flow_execution::FlowExecution>,
     /// Monotonic counter handing out [`InvocationStepRecord::order`] values.
     pub order_counter: u64,
     /// The secret the addresses this service hands out for the content of an ingested

@@ -19,7 +19,14 @@ pub struct GetFlowExecutionInput {
     pub execution_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#GetFlowExecutionResponse")]
+/// `GetFlowExecutionResponse`. Its schema and codec come from
+/// [`session_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `startedAt` and `endedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation",operation="GetFlowExecution")`), which the derive does
+/// not put on a member schema — see `types/date_time_wire.rs` for that whole story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetFlowExecutionOutput {
     pub execution_arn: String,
@@ -31,6 +38,36 @@ pub struct GetFlowExecutionOutput {
     pub flow_identifier: String,
     pub flow_version: String,
 }
+
+session_schema_and_codec!(
+    GetFlowExecutionOutput,
+    GET_FLOW_EXECUTION_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentruntime#GetFlowExecutionResponse",
+    "com.amazonaws.bedrockagentruntime",
+    "GetFlowExecutionResponse",
+    (M_EXECUTION_ARN, execution_arn, "executionArn", 0, req, string),
+    (M_STATUS, status, "status", 1, req, string),
+    (M_STARTED_AT, started_at, "startedAt", 2, req, date_time),
+    (M_ENDED_AT, ended_at, "endedAt", 3, opt, date_time),
+    (M_ERRORS, errors, "errors", 4, opt, list_of(FlowExecutionError)),
+    (
+        M_FLOW_ALIAS_IDENTIFIER,
+        flow_alias_identifier,
+        "flowAliasIdentifier",
+        5,
+        req,
+        string
+    ),
+    (
+        M_FLOW_IDENTIFIER,
+        flow_identifier,
+        "flowIdentifier",
+        6,
+        req,
+        string
+    ),
+    (M_FLOW_VERSION, flow_version, "flowVersion", 7, req, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentruntime#FlowExecutionError")]
 #[derive(Debug, Clone, Default)]
