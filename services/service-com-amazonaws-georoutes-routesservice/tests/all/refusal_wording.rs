@@ -189,6 +189,96 @@ async fn optimize_waypoints_requires_a_destination_or_a_waypoint() {
     }
 }
 
+/// The member names a mutually-sufficient-member refusal interpolates must read as
+/// IDENTIFIERS: a consumer that turns the sentence into field-level errors splits the list
+/// out of it and looks each name up against the request shape, so each name is spelled the
+/// way the model spells the member and is decorated with nothing — no quoting, bracketing
+/// or other punctuation around it. The list is the only variable part: the fixed text
+/// before and after it does not move with what else the request carries.
+#[tokio::test]
+async fn the_mutually_sufficient_members_are_named_as_the_model_spells_them() {
+    let router = routes_service();
+    // The fixed text this class of refusal opens with; the member list and a terminating
+    // "." are all that follow it.
+    const PREFIX: &str = "At least one of the following fields must be set: ";
+    // The members of OptimizeWaypointsRequest that each satisfy the rule on their own, in
+    // the order the model declares them — smithy_query(query="operation",
+    // operation="OptimizeWaypoints"): Origin is the only @required member, while
+    // Destination (Position) and Waypoints (WaypointOptimizationWaypointList) are the
+    // optional pair a journey needs one of.
+    const ALTERNATIVES: [&str; 2] = ["Destination", "Waypoints"];
+    // Rows differ along what ELSE a request setting neither alternative carries: nothing,
+    // an empty list, an option block for each end, a non-default travel mode and
+    // objective, and a departure time — none of which changes the sentence.
+    let cases: [(&str, Value); 5] = [
+        ("origin alone", json!({ "Origin": GOOD })),
+        (
+            "origin and an empty waypoint list",
+            json!({ "Origin": GOOD, "Waypoints": [] }),
+        ),
+        (
+            "origin with an id and a shortest-route objective",
+            json!({
+                "Origin": GOOD,
+                "OriginOptions": { "Id": "start" },
+                "OptimizeSequencingFor": "ShortestRoute"
+            }),
+        ),
+        (
+            "origin with a travel mode and a departure time",
+            json!({
+                "Origin": GOOD,
+                "TravelMode": "Truck",
+                "DepartureTime": "2024-05-01T09:30:00Z"
+            }),
+        ),
+        (
+            "destination options but no destination",
+            json!({
+                "Origin": GOOD,
+                "DestinationOptions": { "Id": "finish" },
+                "Waypoints": []
+            }),
+        ),
+    ];
+
+    for (case, body) in cases {
+        let (status, answer, _) = post(&router, OPTIMIZE, &body).await;
+        let read = refusal(case, status, &answer);
+        let listed = read
+            .message
+            .strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_suffix('.'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected {PREFIX:?} then the member list then \".\", got {:?}",
+                    read.message
+                )
+            });
+        let names: Vec<&str> = listed.split(", ").collect();
+        // Each token the list splits into is checked for decoration BEFORE it is compared
+        // to the member names: a name carrying a quote, bracket or any other punctuation
+        // is not an identifier a consumer can look up, whichever member it names.
+        for name in &names {
+            assert!(
+                name.chars().all(|character| character.is_ascii_alphanumeric()),
+                "case {case:?}: a member name is interpolated bare, so it reads back as an \
+                 identifier, got {name:?} out of {:?}",
+                read.message
+            );
+        }
+        assert_eq!(
+            names, ALTERNATIVES,
+            "case {case:?}: expected the alternative members as the model spells them, got {names:?}"
+        );
+        assert_eq!(
+            read.field_name, ALTERNATIVES[0],
+            "case {case:?}: the refusal names the first of the alternatives, got {:?}",
+            read.field_name
+        );
+    }
+}
+
 /// Two stops cannot share one id. The sentence names the `Id` member and the members an id
 /// can come from, quoting no id out of the request, and the `fieldList` names the offending
 /// stop's own `Id` — with the element's position where the duplicate sits in a list.
