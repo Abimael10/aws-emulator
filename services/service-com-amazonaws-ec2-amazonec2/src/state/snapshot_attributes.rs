@@ -17,7 +17,9 @@
 //!
 //! NOTHING here writes: every value is read off the stores or derived from them, so two
 //! attribute reads of one snapshot answer the same thing and neither changes what a later
-//! caller sees.
+//! caller sees. The one attribute a caller can CHANGE — who may create a volume from the
+//! snapshot — is recorded by [`super::snapshot_create_volume_permissions`], whose writers are
+//! `ModifySnapshotAttribute` and `ResetSnapshotAttribute`.
 
 use std::time::{Instant, SystemTime};
 
@@ -32,20 +34,26 @@ pub const SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION: &str = "createVolumePermi
 /// The other `SnapshotAttributeName` member: "the product codes" a snapshot carries.
 pub const SNAPSHOT_ATTRIBUTE_PRODUCT_CODES: &str = "productCodes";
 
-/// Is `snapshot` one EVERY account may create a volume from — a PUBLIC snapshot?
+/// Is `snapshot` one of the PUBLISHED snapshots every account may create a volume from?
 ///
 /// "`all` for public snapshots" and "public: … All Amazon Web Services accounts have create
 /// volume permissions for these snapshots" (`DescribeSnapshots`, `RestorableByUserIds`). The
-/// public snapshots of this inventory are the ones the calling account does NOT own: a
-/// snapshot of another account is visible to it only because every account may create a
+/// published public snapshots of this inventory are the ones the calling account does NOT own:
+/// a snapshot of another account is visible to it only because every account may create a
 /// volume from a public one, and the snapshots this emulator holds of another account are
-/// exactly the ones the AMI catalogue is published with
-/// ([`super::published_snapshots`]). Public and explicit permissions ON a snapshot of the
-/// account are granted through `ModifySnapshotAttribute`, which is still a scaffold, so no
-/// snapshot of the account carries one.
+/// exactly the ones the AMI catalogue is published with ([`super::published_snapshots`]).
 ///
-/// The ONE definition of that test, so the inventory's `RestorableByUserIds` narrowing and the
-/// permissions an attribute read reports cannot disagree about which snapshots are public.
+/// It is therefore also the test for whether a snapshot came from that catalogue, which is why
+/// [`ComAmazonawsEc2Amazonec2State::snapshot_product_codes`] asks it to decide which resource a
+/// snapshot's Marketplace codes travel with.
+///
+/// A snapshot OF THE ACCOUNT becomes public the other way — by being granted create volume
+/// permissions for the `all` group through `ModifySnapshotAttribute` — so the question "may
+/// every account create a volume from this snapshot?" is
+/// [`ComAmazonawsEc2Amazonec2State::snapshot_is_shared_with_all`], which asks this one and the
+/// grants beside it. That is the ONE test the inventory's `RestorableByUserIds` narrowing and
+/// the permissions an attribute read reports both ask, so they cannot disagree about which
+/// snapshots are public.
 pub fn snapshot_is_public(snapshot: &SnapshotView, account: &str) -> bool {
     snapshot.owner_id.as_deref() != Some(account)
 }
@@ -78,6 +86,68 @@ pub fn visible_snapshot<Eng: Send + Sync + 'static>(
         return Some(snapshot);
     }
     store.image_backing_snapshots().remove(snapshot_id)
+}
+
+/// The name EC2's parameter layer gives the `SnapshotId` member of a snapshot-attribute call
+/// when it refuses the value one carried: the resource the member names, in the case that layer
+/// spells it.
+///
+/// Neither the case nor the plurality is derivable from the member's own name — the same layer
+/// calls `DescribeSnapshots`' id LIST `snapshotId` ([`super::SNAPSHOT_IDS_PARAMETER`]) — so it
+/// is taken from the recorded refusal of a `DescribeSnapshotAttribute` call, and the operations
+/// that MODIFY and RESET the same attributes answer the same layer's sentence.
+pub const SNAPSHOT_PARAMETER: &str = "SNAPSHOT";
+
+/// Whether `id` is a snapshot id EC2 could have ISSUED, as the operations that WRITE a
+/// snapshot's attributes read one.
+///
+/// The stricter of the crate's two readings of a snapshot id: [`super::issued_id_is_well_formed`]
+/// — one of the two published id forms, not the all-zero placeholder, and, where it carries the
+/// LONG form, under a leading `0`, because that form carries 68 bits for a 64-bit identifier so
+/// every id this service's mint has issued reads `snap-0…`. A value inside the generic id form
+/// but outside the one EC2 issues — the `snap-1234567890abcdef0` shape documentation examples
+/// and hand-written probes reach for — is therefore no snapshot id at all rather than a snapshot
+/// that is not there, which is what the recorded `ResetSnapshotAttribute` call behind
+/// `issues/.../20261105T021000Z-ec2-modifysnapshotattribute-stub.md` was answered
+/// `InvalidSnapshotID.Malformed` for.
+///
+/// Which reading an operation takes is a fact of that operation, recorded by its caller: the
+/// describes keep the wider [`super::snapshot_id_is_well_formed`] on their own recorded
+/// evidence, where a short-form id the inventory holds nothing for is reported absent.
+pub fn issued_snapshot_id_is_well_formed(id: &str) -> bool {
+    issued_id_is_well_formed(SNAPSHOT_ID_PREFIX, id)
+}
+
+/// Refuse a value that is no snapshot id of the form EC2 ISSUES: HTTP 400
+/// [`super::INVALID_SNAPSHOT_ID_MALFORMED`], in the sentence the PARAMETER layer of a
+/// snapshot-attribute call words every value it rejects with.
+///
+/// The CODE is the snapshot's own malformed-id code, and the WORDING is that layer's: the fixed
+/// text `Value ( `, ` ) for parameter `, the name it gives the member that carried the value
+/// ([`SNAPSHOT_PARAMETER`]), and ` is invalid. ` around the value the request sent, which is the
+/// only part that varies. The layer appends a reason after the period, and a value it could not
+/// read as an id has none to add, so the message ends with the separating space and nothing
+/// after it — the same form [`crate::ops::create_snapshot`] carries for the volume id of a
+/// create, and the same spacing and member case as the recorded `DescribeSnapshotAttribute` call
+/// behind `issues/.../20261023T102725Z-ec2-describesnapshotattribute-stub.md`.
+///
+/// Shared by the three operations that address one snapshot's attributes, so they cannot word
+/// one refusal differently. It is NOT the crate's only wording for the code: EC2 answers an id
+/// it cannot read in the wording of the LAYER that read it, so `DescribeSnapshots` refuses an
+/// entry of its id LIST under `InvalidParameterValue` and a fast snapshot restore reports
+/// [`super::unresolvable_snapshot_id`]'s own sentence.
+///
+/// The echoed value is cut to length by [`super::echoed_resource_id`], the ceiling this crate
+/// holds every refusal that quotes a caller-chosen value to.
+pub fn snapshot_id_is_not_an_issued_id<E>(snapshot_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SNAPSHOT_ID_MALFORMED,
+        400,
+        format!(
+            "Value ( {} ) for parameter {SNAPSHOT_PARAMETER} is invalid. ",
+            echoed_resource_id(snapshot_id)
+        ),
+    )
 }
 
 impl ComAmazonawsEc2Amazonec2State {

@@ -41,7 +41,7 @@ use crate::scaffolded::Scaffolded;
 
 use super::{
     ComAmazonawsEc2Amazonec2State, INVALID_SNAPSHOT_ID_MALFORMED, MAX_STORED_RECORDS_PER_STORE,
-    STORED_RECORD_OVERHEAD_BYTES, SnapshotRecord, echoed_resource_id, snapshot_payload_bytes,
+    STORED_RECORD_OVERHEAD_BYTES, SnapshotRecord, snapshot_payload_bytes,
     system_time_to_date_time,
 };
 
@@ -255,15 +255,14 @@ impl RecycledSnapshotRecord {
 /// where a describe of the account's snapshots answers
 /// [`super::unresolvable_snapshot_id_error`]'s own two sentences instead. The message is
 /// built from the request — the id the caller sent is the only part of it that varies, held
-/// to the crate's one bound on an echoed caller value ([`echoed_resource_id`]), the same bound
-/// the sibling restore's wording keeps.
+/// to the crate's one bound on an echoed caller value ([`super::echoed_resource_id`]), the same bound
+/// the sibling restore's wording keeps — through the crate's one builder of that sentence
+/// ([`super::snapshot_id_malformed_resource_message`]), which `ResetSnapshotAttribute` answers
+/// on its own recorded evidence.
 pub fn snapshot_id_not_in_recycle_bin<E>(snapshot_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_SNAPSHOT_ID_MALFORMED,
         400,
-        format!(
-            "The snapshot ID '{}' is malformed",
-            echoed_resource_id(snapshot_id)
-        ),
+        super::snapshot_id_malformed_resource_message(snapshot_id),
     )
 }

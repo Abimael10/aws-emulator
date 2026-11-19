@@ -2404,6 +2404,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Empty for a fresh account: nothing in AWS makes a snapshot until a caller asks for
     /// one. [`Self::insert_snapshot`] is the one writer.
     pub snapshots: BTreeMap<String, SnapshotRecord>,
+    /// Who, beside the account that owns it, may create a volume from one snapshot of the
+    /// account-visible inventory, by `SnapshotId` — see
+    /// [`snapshot_create_volume_permissions`].
+    ///
+    /// Empty for a fresh account, and for every snapshot nobody has shared: the OWNER's
+    /// permission is implicit, so only the grants `ModifySnapshotAttribute` records live here.
+    /// [`Self::grant_snapshot_create_volume_permissions`] and
+    /// [`Self::revoke_snapshot_create_volume_permissions`] are the writers,
+    /// [`Self::forget_snapshot_create_volume_permissions`] the one way a whole entry goes.
+    pub snapshot_create_volume_permissions: BTreeMap<String, SnapshotCreateVolumePermissions>,
     /// Every EBS snapshot of the account that is currently in the Recycle Bin, by
     /// `SnapshotId`, as a [`RecycledSnapshotRecord`]: the modelled
     /// [`crate::ops::types::SnapshotRecycleBinInfo`] entry `ListSnapshotsInRecycleBin`
@@ -3886,6 +3896,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
             snapshots: BTreeMap::new(),
+            // A fresh account has shared no snapshot, so no snapshot carries a create volume
+            // permission beyond its owner's implicit one.
+            snapshot_create_volume_permissions: BTreeMap::new(),
             // A fresh account has deleted no snapshot, so the Recycle Bin is keeping none.
             snapshots_in_recycle_bin: BTreeMap::new(),
             import_snapshot_tasks: BTreeMap::new(),

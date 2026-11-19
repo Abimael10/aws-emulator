@@ -401,7 +401,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one — the SAME two tests for a snapshot of either side of this resource, so
         // neither side can be selected by a rule the other is not.
         let asked_about = |snapshot: &SnapshotView| {
-            narrowed_in(snapshot, requested_ids, owner_ids, restorable_by, account)
+            narrowed_in(&store, snapshot, requested_ids, owner_ids, restorable_by, account)
         };
         for record in store.snapshots.values() {
             if budget.exhausted() {
@@ -528,9 +528,11 @@ const RESTORABLE_BY_ALL: &str = "all";
 ///
 /// The ONE definition of that narrowing, so the snapshots of this service's own store and the
 /// snapshots of the EBS direct APIs are selected by the same test. It reads only members a
-/// stored record carries as it stands, so a caller may apply it before projecting a snapshot's
-/// age-derived members.
+/// stored record carries as it stands — and, for the create volume permissions a restorable-by
+/// term asks about, the grants `store` holds against that snapshot's id — so a caller may apply
+/// it before projecting a snapshot's age-derived members.
 fn narrowed_in(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
     snapshot: &SnapshotView,
     requested_ids: &[String],
     owner_ids: &[String],
@@ -554,7 +556,7 @@ fn narrowed_in(
     if !restorable_by.is_empty()
         && !restorable_by
             .iter()
-            .any(|user| restorable_by_matches(snapshot, user, account))
+            .any(|user| restorable_by_matches(store, snapshot, user, account))
     {
         return false;
     }
@@ -593,29 +595,36 @@ fn owner_matches(snapshot: &SnapshotView, term: &str, account: &str) -> bool {
 /// May the user `term` names create a volume from `snapshot`?
 ///
 /// "all for public snapshots" selects the snapshots whose create volume permissions were
-/// granted to the all group, which in this inventory are the ones the calling account does
-/// NOT own: a snapshot of another account is reported here only because every account has
-/// create volume permissions for a public snapshot ("public: … All Amazon Web Services
-/// accounts have create volume permissions for these snapshots"). For an account — `self`
-/// being the calling one — the only permission this slice models is the owner's own implicit
-/// one ("an Amazon Web Services account has implicit create volume permissions for all
-/// snapshots it owns"): public and explicit permissions on a snapshot of the account are
-/// granted through `ModifySnapshotAttribute`, which is still a scaffold, so no snapshot of
-/// the account carries one and none can be reported for one.
+/// granted to the all group: a snapshot of another account is reported here only because every
+/// account has create volume permissions for a public snapshot ("public: … All Amazon Web
+/// Services accounts have create volume permissions for these snapshots"), and a snapshot of
+/// the account is one whose `all` group permission `ModifySnapshotAttribute` has granted. For
+/// an account — `self` being the calling one — the permissions are the owner's own implicit one
+/// ("an Amazon Web Services account has implicit create volume permissions for all snapshots it
+/// owns") and the explicit per-account grants that same modify records: "if you specify a list
+/// of restorable users, only snapshots with create snapshot permissions for those users are
+/// returned".
 ///
-/// WHICH snapshots are public is the ONE test [`crate::state::snapshot_is_public`] holds, so
-/// this narrowing and the create volume permissions `DescribeSnapshotAttribute` reports for
-/// one snapshot cannot disagree about it.
-fn restorable_by_matches(snapshot: &SnapshotView, term: &str, account: &str) -> bool {
+/// Both questions are the ONE test the crate holds
+/// ([`crate::state::ComAmazonawsEc2Amazonec2State::snapshot_is_shared_with_all`] and
+/// [`crate::state::ComAmazonawsEc2Amazonec2State::snapshot_is_restorable_by`]), so this
+/// narrowing and the create volume permissions `DescribeSnapshotAttribute` reports for one
+/// snapshot cannot disagree.
+fn restorable_by_matches(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+    snapshot: &SnapshotView,
+    term: &str,
+    account: &str,
+) -> bool {
     if term == RESTORABLE_BY_ALL {
-        return crate::state::snapshot_is_public(snapshot, account);
+        return store.snapshot_is_shared_with_all(snapshot, account);
     }
     let user = if term == crate::state::OWNER_SELF {
         account
     } else {
         term
     };
-    snapshot.owner_id.as_deref() == Some(user)
+    store.snapshot_is_restorable_by(snapshot, user)
 }
 
 /// The filter names this operation documents, from `DescribeSnapshotsRequest$Filters`:

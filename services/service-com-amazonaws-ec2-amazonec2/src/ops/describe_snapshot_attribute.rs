@@ -4,8 +4,9 @@
 //!
 //! Reports ONE `SnapshotAttributeName` attribute of one EBS snapshot of the account-visible
 //! inventory, read off the stores that hold that snapshot: `createVolumePermission` is who may
-//! create a volume from it ([`crate::state::snapshot_is_public`]), and `productCodes` the
-//! Marketplace codes it is billed through
+//! create a volume from it
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::snapshot_create_volume_permissions_of`]), and
+//! `productCodes` the Marketplace codes it is billed through
 //! ([`crate::state::ComAmazonawsEc2Amazonec2State::snapshot_product_codes`]). A pure read: it
 //! writes nothing, so two calls in a row report the same thing.
 //!
@@ -72,11 +73,10 @@
 use super::types::*;
 
 use crate::state::{
-    EXECUTABLE_BY_ALL, INVALID_SNAPSHOT_ID_MALFORMED,
     SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION, SNAPSHOT_ATTRIBUTE_PRODUCT_CODES,
-    dry_run_operation, echoed_resource_id, invalid_snapshot_id_not_found, require_service_state,
-    snapshot_id_is_well_formed, snapshot_is_public, unknown_attribute_parameter_value,
-    visible_snapshot,
+    dry_run_operation, invalid_snapshot_id_not_found, require_service_state,
+    snapshot_id_is_not_an_issued_id, snapshot_id_is_well_formed,
+    unknown_attribute_parameter_value, visible_snapshot,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -164,7 +164,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A value that is no snapshot id EC2 could have ISSUED is refused BEFORE the inventory
         // is looked at — a request the service cannot read as an id at all is a different
         // cause from one naming a snapshot nobody holds, which is the ordering
-        // `DescribeVolumeAttribute` keeps for its own id.
+        // `DescribeVolumeAttribute` keeps for its own id. The refusal is the attribute family's
+        // one wording for it ([`snapshot_id_is_not_an_issued_id`]), so this read and the modify
+        // and reset beside it cannot word the cause differently.
         if !snapshot_id_is_well_formed(&input.snapshot_id) {
             return Err(snapshot_id_is_not_an_issued_id(&input.snapshot_id));
         }
@@ -206,87 +208,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // one whose create volume permissions are none, which is a different answer from
             // "this snapshot has no such attribute" — the way `DescribeVolumeAttribute`
             // reports a volume's product codes.
+            //
+            // "The users and groups that have the permissions for creating volumes from the
+            // snapshot" are read through the one derivation the crate holds
+            // ([`crate::state::snapshot_create_volume_permissions`]), which is also what
+            // `ModifySnapshotAttribute` writes and `DescribeSnapshots` narrows its
+            // `RestorableByUserIds` on — so a grant is reported exactly as it was recorded.
             create_volume_permissions: (attribute == SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION)
-                .then(|| create_volume_permissions(&snapshot, account)),
+                .then(|| store.snapshot_create_volume_permissions_of(&snapshot, account)),
             product_codes: (attribute == SNAPSHOT_ATTRIBUTE_PRODUCT_CODES)
                 .then(|| store.snapshot_product_codes(&snapshot, account)),
         })
     }
 }
 
-/// "The name of the group" a PUBLIC snapshot's create volume permission names
-/// (`CreateVolumePermission$Group`, "the group to be added or removed. The possible value is
-/// `all`"): the `PermissionGroup` enum's only member (the generated catalog
-/// [`PERMISSION_GROUP_VALUES`]), which is the same term `DescribeSnapshots` selects public
-/// snapshots with through its `RestorableByUserIds` member. DEFINED as that one
-/// ([`EXECUTABLE_BY_ALL`]), so the group a permission reports and the term that selects on it
-/// cannot drift apart — the same definition `DescribeImageAttribute` gives an AMI's public
-/// launch permission.
-const CREATE_VOLUME_PERMISSION_GROUP_ALL: &str = EXECUTABLE_BY_ALL;
-
-/// "The users and groups that have the permissions for creating volumes from the snapshot"
-/// (`DescribeSnapshotAttributeResult$CreateVolumePermissions`), out of what the stores hold
-/// about `snapshot`.
-///
-/// A PUBLIC snapshot ([`snapshot_is_public`]) is one every account may create a volume from,
-/// and that permission is the one AWS reports as a GROUP rather than as an account — the
-/// `PermissionGroup` enum's single member ([`CREATE_VOLUME_PERMISSION_GROUP_ALL`]). A snapshot
-/// of the calling account carries NONE: the owner's own permission is implicit ("an Amazon Web
-/// Services account has implicit create volume permissions for all snapshots it owns",
-/// `DescribeSnapshots`) and so is not one of the permissions this attribute lists, and an
-/// explicit per-account or public permission is granted through `ModifySnapshotAttribute`,
-/// which is still a scaffold, so no stored snapshot carries one — the same reading
-/// `DescribeSnapshots`' `RestorableByUserIds` matcher gives the same stores.
-fn create_volume_permissions(
-    snapshot: &crate::state::SnapshotView,
-    account: &str,
-) -> Vec<CreateVolumePermission> {
-    if !snapshot_is_public(snapshot, account) {
-        return Vec::new();
-    }
-    vec![CreateVolumePermission {
-        group: Some(CREATE_VOLUME_PERMISSION_GROUP_ALL.to_string()),
-        ..CreateVolumePermission::default()
-    }]
-}
-
-/// Refuse a value that is no snapshot id of the form EC2 ISSUES: HTTP 400
-/// [`INVALID_SNAPSHOT_ID_MALFORMED`], in the sentence this operation's PARAMETER layer words
-/// every value it rejects with.
-///
-/// The CODE is the snapshot's own malformed-id code, and the WORDING is this operation's: the
-/// fixed text `Value ( `, ` ) for parameter `, the name that layer gives the member that
-/// carried it ([`SNAPSHOT_PARAMETER`]), and ` is invalid. ` around the value the request sent,
-/// which is the only part that varies. That layer appends a reason after the period, and a
-/// value it could not read as an id has none to add, so the message ends with the separating
-/// space and nothing after it — the same form [`crate::ops::create_snapshot`] carries for the
-/// volume id of a create, and the same spacing and member case, as the recorded
-/// `DescribeSnapshotAttribute` call behind
-/// `issues/.../20261023T102725Z-ec2-describesnapshotattribute-stub.md` carries them.
-///
-/// It lives in this file rather than in `crate::state` because this is the only operation
-/// recorded answering a snapshot id in this class — EC2 answers an id it cannot read in the
-/// wording of the LAYER that read it, and the same crate's `DescribeSnapshots` refuses an
-/// entry of its id LIST at the parameter layer under `InvalidParameterValue`
-/// ([`crate::state::SNAPSHOT_IDS_PARAMETER`]) while a fast snapshot restore reports
-/// [`crate::state::unresolvable_snapshot_id`]'s own sentence.
-///
-/// The echoed value is cut to length by [`echoed_resource_id`], the ceiling this crate holds
-/// every refusal that quotes a caller-chosen value to.
-fn snapshot_id_is_not_an_issued_id<E>(snapshot_id: &str) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_error(
-        INVALID_SNAPSHOT_ID_MALFORMED,
-        400,
-        format!(
-            "Value ( {} ) for parameter {SNAPSHOT_PARAMETER} is invalid. ",
-            echoed_resource_id(snapshot_id)
-        ),
-    )
-}
-
-/// The name EC2's parameter layer gives `DescribeSnapshotAttributeRequest$SnapshotId` in the
-/// refusal above: the resource the member names, in the case that layer spells it — the same
-/// layer calls `DescribeSnapshots`' id LIST `snapshotId`
-/// ([`crate::state::SNAPSHOT_IDS_PARAMETER`]), so neither the case nor the plurality is
-/// derivable from the member's own name and each is taken from the recorded refusal.
-const SNAPSHOT_PARAMETER: &str = "SNAPSHOT";

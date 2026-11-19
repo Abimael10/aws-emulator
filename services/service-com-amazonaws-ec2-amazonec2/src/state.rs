@@ -2235,6 +2235,13 @@ pub use published_snapshots::*;
 pub mod snapshot_attributes;
 pub use snapshot_attributes::*;
 
+/// WHO MAY CREATE A VOLUME from one snapshot of the account beside its owner — the create
+/// volume permissions a modify grants, an attribute read reports and a reset clears — in a
+/// module of its own, re-exported so a handler reaches them as `crate::state::<item>` like
+/// every other primitive here.
+pub mod snapshot_create_volume_permissions;
+pub use snapshot_create_volume_permissions::*;
+
 /// The ACM certificates the account holds, as the EC2 operations that take a certificate ARN
 /// resolve one: the certificate is ACM's resource, so this ASKS that service over the
 /// emulator's in-process callback instead of keeping a second copy of it. In a module of its

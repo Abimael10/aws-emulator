@@ -623,6 +623,39 @@ pub fn invalid_snapshot_id_not_found<E>(snapshot_id: &str) -> crate::scaffolded:
     )
 }
 
+/// EC2's OTHER sentence for a value it cannot read as a snapshot id: `The snapshot ID '<id>' is
+/// malformed` — the one that names the RESOURCE the id was given for rather than the parameter
+/// that carried it.
+///
+/// It is what AWS answered the recorded `ResetSnapshotAttribute` call behind
+/// `issues/.../20261105T021000Z-ec2-modifysnapshotattribute-stub.md`, and the same sentence a
+/// Recycle Bin restore answers for every id it cannot resolve in the bin
+/// ([`snapshot_id_not_in_recycle_bin`], where that evidence is cited) — so it is built in ONE
+/// place and those two cannot word it differently. Which of the crate's sentences an operation
+/// answers is a fact of that operation, recorded by its caller: a fast snapshot restore answers
+/// [`snapshot_id_malformed_message`] and the attribute READ its own parameter layer's
+/// ([`snapshot_id_is_not_an_issued_id`]).
+///
+/// The one variable part is the value the request sent, held to the crate's one bound on an
+/// echoed caller value ([`echoed_resource_id`]).
+pub fn snapshot_id_malformed_resource_message(snapshot_id: &str) -> String {
+    format!(
+        "The snapshot ID '{}' is malformed",
+        echoed_resource_id(snapshot_id)
+    )
+}
+
+/// Refuse a value that is no snapshot id in the words that name the RESOURCE it was given for:
+/// HTTP 400 [`INVALID_SNAPSHOT_ID_MALFORMED`], the sentence
+/// [`snapshot_id_malformed_resource_message`] builds.
+pub fn invalid_snapshot_id_malformed<E>(snapshot_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_SNAPSHOT_ID_MALFORMED,
+        400,
+        snapshot_id_malformed_resource_message(snapshot_id),
+    )
+}
+
 /// Whether `id` is a well-formed EBS snapshot id — one EC2 could have ISSUED.
 ///
 /// A snapshot id is `snap-` followed by 8 or 17 lowercase hexadecimal digits — the short

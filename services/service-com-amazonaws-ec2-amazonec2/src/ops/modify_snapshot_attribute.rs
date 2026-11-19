@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifySnapshotAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifySnapshotAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifySnapshotAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds or removes CREATE VOLUME PERMISSIONS on one EBS snapshot of the account: "you may add
+//! or remove specified Amazon Web Services account IDs from a snapshot's list of create volume
+//! permissions, but you cannot do both in a single operation". The grants are recorded against
+//! the snapshot's id by [`crate::state::snapshot_create_volume_permissions`], which is what
+//! `DescribeSnapshotAttribute` reports, what `ResetSnapshotAttribute` clears and what
+//! `DescribeSnapshots` narrows its `RestorableByUserIds` on — so this is the writer and those
+//! the readers of one fact.
+//!
+//! The permissions arrive in either of the two forms EC2 publishes, and both mean the same
+//! thing here ([`RequestedModifications::read`]): the `CreateVolumePermission` structure's
+//! `Add`/`Remove` lists ("a JSON representation of the snapshot attribute modification"), and
+//! the flat `OperationType` + `UserIds` + `GroupNames` members beside it.
+//!
+//! Only `createVolumePermission` can be modified ("only volume creation permissions can be
+//! modified", `Attribute`), and a snapshot of another account is not this account's to share.
+//! Public sharing carries three further rules of its own, each checked before anything is
+//! written: "encrypted snapshots and snapshots with Amazon Web Services Marketplace product
+//! codes cannot be made public", and "after you enable block public access for snapshots in a
+//! Region, users can no longer request public sharing for snapshots in that Region"
+//! (`EnableSnapshotBlockPublicAccess`).
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +91,16 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::scaffolded::Scaffolded;
+use crate::state::{
+    CREATE_VOLUME_PERMISSION_GROUP_ALL, MAX_SNAPSHOT_ATTRIBUTE_MODIFICATIONS, MAX_STORED_BYTES,
+    SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION, SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
+    aws_account_id_is_well_formed, dry_run_operation, echoed_resource_id,
+    invalid_snapshot_id_malformed, invalid_snapshot_id_not_found, invalid_user_id_malformed,
+    issued_snapshot_id_is_well_formed, missing_wire_parameter_message, require_service_state,
+    resource_limit_exceeded, unrecognized_attribute, visible_snapshot,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -164,18 +188,368 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifySnapshotAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifySnapshotAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifySnapshotAttribute"))
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // snapshot is named by id and the setting that can block public sharing is an
+        // account-level field of the store. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // "The snapshot attribute to modify. Only volume creation permissions can be
+        // modified": the one attribute this operation acts on, whether the request named it
+        // or left it to the modification it carried.
+        let attribute = attribute_to_modify(input.attribute.as_deref())?;
+
+        // The permissions the request asks to add or to remove, read the one way out of
+        // either of the two forms EC2 publishes them in — and held to the published bounds
+        // on them before any snapshot is looked at, because they are facts of the REQUEST.
+        let requested = RequestedModifications::read(&input)?;
+
+        // A value that is no snapshot id EC2 could have ISSUED is refused BEFORE the
+        // inventory is looked at — a request the service cannot read as an id at all is a
+        // different cause from one naming a snapshot nobody holds, which is the ordering
+        // every operation of this crate that resolves a snapshot id keeps. The reading and the
+        // wording are the ones the operations that WRITE a snapshot's attributes take, on the
+        // recorded refusal of the reset beside this one: both name the resource the id was
+        // given for.
+        if !issued_snapshot_id_is_well_formed(&input.snapshot_id) {
+            return Err(invalid_snapshot_id_malformed(&input.snapshot_id));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // ONE instant per clock for the whole call, the way the inventory's own report reads
+        // them: the monotonic one the account's records measure their due transitions
+        // against, and the wall-clock one the direct-API side compares its timeouts against.
+        let now = ::std::time::Instant::now();
+        let observed = ::std::time::SystemTime::now();
+        let account = ::engine::emulator_account_id();
+
+        // The permissions are permissions OF A SNAPSHOT, so the snapshot is resolved first,
+        // against the whole account-visible inventory ([`visible_snapshot`]) — a well-formed
+        // id no side of it holds a snapshot for is the not-found cause, in the crate's one
+        // wording for it.
+        let snapshot = visible_snapshot(&store, &*self.engine, &input.snapshot_id, now, observed)
+            .ok_or_else(|| invalid_snapshot_id_not_found(&input.snapshot_id))?;
+
+        // "Adds or removes permission settings FOR THE SPECIFIED SNAPSHOT": the permissions of
+        // a snapshot are the owner's to give, so a snapshot the calling account does not own —
+        // one of the public snapshots the AMI catalogue is published with — cannot be shared
+        // by it, and nothing is recorded against it.
+        if snapshot.owner_id.as_deref() != Some(account) {
+            return Err(Scaffolded::operation_not_permitted(format!(
+                "You do not have permission to modify the {attribute} attribute for snapshot {}",
+                echoed_resource_id(&input.snapshot_id)
+            )));
+        }
+
+        // The three rules on PUBLIC sharing, each a fact of the snapshot or of the account
+        // rather than of the request, so each is checked before anything is written and only
+        // when the call actually asks for public sharing.
+        if requested.adds_group(CREATE_VOLUME_PERMISSION_GROUP_ALL) {
+            // "After you enable block public access for snapshots in a Region, users can no
+            // longer request public sharing for snapshots in that Region"
+            // (`EnableSnapshotBlockPublicAccess`) — in either blocking mode, both of which
+            // "prevent … new public sharing".
+            let blocking = store.snapshot_block_public_access_state();
+            if blocking != SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED {
+                return Err(Scaffolded::operation_not_permitted(format!(
+                    "Block public access for snapshots is set to {blocking}, so public \
+                     sharing cannot be requested for snapshot {}",
+                    echoed_resource_id(&input.snapshot_id)
+                )));
+            }
+            // "Encrypted snapshots … cannot be made public": a snapshot is encrypted because
+            // the volume it was taken of was ("snapshots that are taken from encrypted volumes
+            // are automatically encrypted", `Snapshot$Encrypted`), so the answer is read off
+            // the resolved record.
+            if snapshot.encrypted == Some(true) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Snapshot {} is encrypted and cannot be made public",
+                    echoed_resource_id(&input.snapshot_id)
+                )));
+            }
+            // "… and snapshots with Amazon Web Services Marketplace product codes cannot be
+            // made public", through the crate's one derivation of a snapshot's codes, which is
+            // also what `DescribeSnapshotAttribute` reports for it.
+            if !store.snapshot_product_codes(&snapshot, account).is_empty() {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Snapshot {} has Amazon Web Services Marketplace product codes and \
+                     cannot be made public",
+                    echoed_resource_id(&input.snapshot_id)
+                )));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation" (`DryRun`): it sits after every
+        // parameter has been validated and the snapshot resolved, and BEFORE the first write,
+        // so a request that would have been refused is refused with that reason instead and
+        // one that would have succeeded leaves the store untouched.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        if requested.adds() {
+            // Each grant the store does not hold yet retains a caller-chosen account id, so
+            // the bytes are asked about before the write: a request the budget has no room for
+            // is refused whole rather than half-applied.
+            let charge = store.snapshot_create_volume_permission_charge(
+                &input.snapshot_id,
+                &requested.user_ids,
+                &requested.groups,
+            );
+            if store.would_exceed_stored_bytes(charge) {
+                return Err(resource_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot record another create volume \
+                     permission",
+                    store.stored_bytes()
+                )));
+            }
+            store.grant_snapshot_create_volume_permissions(
+                &input.snapshot_id,
+                &requested.user_ids,
+                &requested.groups,
+            );
+        } else {
+            store.revoke_snapshot_create_volume_permissions(
+                &input.snapshot_id,
+                &requested.user_ids,
+                &requested.groups,
+            );
+        }
+
+        // "Adds or removes permission settings": the modification is the whole answer, which
+        // the model gives no members for — a caller reads the permissions back through
+        // `DescribeSnapshotAttribute`.
+        Ok(ModifySnapshotAttributeOutput)
     }
 }
+
+/// "The type of operation to perform to the attribute" (`OperationType`) that ADDS the
+/// permissions a request names: the `OperationType` enum's `add` member, the whole catalog being
+/// the generated [`OPERATION_TYPE_VALUES`].
+const OPERATION_TYPE_ADD: &str = "add";
+
+/// The `OperationType` member that REMOVES them.
+const OPERATION_TYPE_REMOVE: &str = "remove";
+
+/// The attribute this operation acts on, out of the one the request named.
+///
+/// "Only volume creation permissions can be modified" (`Attribute`): of the two members of the
+/// modelled `SnapshotAttributeName` catalog, `createVolumePermission` is the only one a modify
+/// can act on, so `productCodes` is refused as an attribute this action knows nothing to do
+/// with — in the sentence the operations that WRITE an attribute answer for that cause
+/// ([`unrecognized_attribute`]), which is what the recorded `ModifySnapshotAttribute` call
+/// behind this operation's issue carries.
+///
+/// `Attribute` is NOT `@required` here, unlike on the describe and the reset: a request may name
+/// the modification alone ("a JSON representation of the snapshot attribute modification",
+/// `CreateVolumePermission`), which says which attribute is meant by carrying it. An absent
+/// member therefore resolves to the one attribute this operation can modify rather than being
+/// refused. The modelled enum constraint is refused by the request walk before this handler
+/// runs; this is the narrowing to the subset the action serves.
+fn attribute_to_modify<E>(attribute: Option<&str>) -> Result<&'static str, Scaffolded<E>> {
+    let Some(attribute) = attribute else {
+        return Ok(SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION);
+    };
+    if attribute != SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION {
+        return Err(unrecognized_attribute());
+    }
+    Ok(SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION)
+}
+
+/// What ONE call asks of a snapshot's create volume permissions: which way they move, and the
+/// accounts and groups they move for.
+///
+/// "You may add OR remove … but you cannot do both in a single operation", so the direction is
+/// one word for the whole call rather than one per grantee, and the grantees are the union of
+/// the two forms the request may carry them in.
+#[derive(Debug)]
+struct RequestedModifications {
+    /// [`OPERATION_TYPE_ADD`] or [`OPERATION_TYPE_REMOVE`].
+    operation_type: &'static str,
+    /// "The account ID to modify for the snapshot" (`UserIds`), in the order the request
+    /// named them, each a well-formed account id.
+    user_ids: Vec<String>,
+    /// "The group to modify for the snapshot" (`GroupNames`), each a member of the modelled
+    /// `PermissionGroup` catalog.
+    groups: Vec<String>,
+}
+
+impl RequestedModifications {
+    /// The modifications `input` asks for, refused when the request does not describe exactly
+    /// one.
+    ///
+    /// The two forms are read into ONE pair of lists, because they modify the same attribute of
+    /// the same snapshot: `CreateVolumePermission`'s `Add` and `Remove` lists name their
+    /// direction per entry, while the flat `UserIds`/`GroupNames` lists take it from
+    /// `OperationType`. A request that names grantees both ways carries them both, and a
+    /// request that names them in neither direction has asked for nothing.
+    fn read<E>(input: &ModifySnapshotAttributeInput) -> Result<Self, Scaffolded<E>> {
+        let modifications = input.create_volume_permission.clone().unwrap_or_default();
+        let mut added = Grantees::read(modifications.add.as_deref())?;
+        let mut removed = Grantees::read(modifications.remove.as_deref())?;
+
+        // "The type of operation to perform to the attribute" is what gives the flat lists
+        // their direction, so a request that carries them without it has not said what to do
+        // with them.
+        let flat = Grantees {
+            user_ids: input.user_ids.clone().unwrap_or_default(),
+            groups: input.group_names.clone().unwrap_or_default(),
+        };
+        if !flat.is_empty() {
+            match input.operation_type.as_deref() {
+                Some(OPERATION_TYPE_ADD) => added.extend(flat),
+                Some(OPERATION_TYPE_REMOVE) => removed.extend(flat),
+                // The modelled enum constraint is refused by the request walk before this
+                // handler runs, so an operation type that is neither word is an ABSENT one
+                // here: the parameter the request has to contain for those lists to mean
+                // anything.
+                _ => {
+                    return Err(Scaffolded::missing_parameter(missing_wire_parameter_message(
+                        OPERATION_TYPE_PARAMETER,
+                    )));
+                }
+            }
+        }
+        for user_id in added.user_ids.iter().chain(removed.user_ids.iter()) {
+            // "The account ID to modify for the snapshot": a value that is no account id names
+            // no account in any partition, so it is refused as malformed rather than recorded
+            // as a permission nobody could ever use — the crate's one wording for a user id it
+            // cannot read.
+            if !aws_account_id_is_well_formed(user_id) {
+                return Err(invalid_user_id_malformed(user_id));
+            }
+        }
+        for group in added.groups.iter().chain(removed.groups.iter()) {
+            // "The possible value is `all`" (`CreateVolumePermission$Group`): the only member
+            // of the modelled `PermissionGroup` catalog, which the flat `GroupNames` list is
+            // not held to by the model — its member type is a plain string — so the catalog is
+            // enforced here.
+            if !PERMISSION_GROUP_VALUES.contains(&group.as_str()) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Value ({}) for parameter {GROUP_PARAMETER} is invalid. The only group \
+                     create volume permissions can be granted to is \
+                     {CREATE_VOLUME_PERMISSION_GROUP_ALL}.",
+                    echoed_resource_id(group)
+                )));
+            }
+        }
+
+        // "You can make up to 500 modifications to a snapshot in a single operation": every
+        // grantee the request names is one modification, whichever form and direction it
+        // arrived in.
+        let modifications = added.len().saturating_add(removed.len());
+        if modifications > MAX_SNAPSHOT_ATTRIBUTE_MODIFICATIONS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "This request makes {modifications} modifications to the snapshot, above the \
+                 {MAX_SNAPSHOT_ATTRIBUTE_MODIFICATIONS} a single operation may make"
+            )));
+        }
+
+        match (added.is_empty(), removed.is_empty()) {
+            // "If you need to both add and remove account IDs for a snapshot, you must use
+            // multiple operations": a call that asks for both is refused whole, so neither
+            // half of it is applied.
+            (false, false) => Err(Scaffolded::invalid_parameter_combination(
+                "Create volume permissions can be added or removed in one operation, but not \
+                 both; use a separate operation for each",
+            )),
+            (false, true) => Ok(Self {
+                operation_type: OPERATION_TYPE_ADD,
+                user_ids: added.user_ids,
+                groups: added.groups,
+            }),
+            (true, false) => Ok(Self {
+                operation_type: OPERATION_TYPE_REMOVE,
+                user_ids: removed.user_ids,
+                groups: removed.groups,
+            }),
+            // A modify that names no permission at all has not said what to modify: the
+            // attribute is a LIST of grants, so there is no such thing as modifying it to
+            // nothing, which is what `ResetSnapshotAttribute` is for.
+            (true, true) => Err(Scaffolded::missing_parameter(missing_wire_parameter_message(
+                CREATE_VOLUME_PERMISSION_PARAMETER,
+            ))),
+        }
+    }
+
+    /// Does this call ADD the permissions it names?
+    fn adds(&self) -> bool {
+        self.operation_type == OPERATION_TYPE_ADD
+    }
+
+    /// Does this call grant `group` create volume permissions — the question the rules on
+    /// PUBLIC sharing are asked about?
+    fn adds_group(&self, group: &str) -> bool {
+        self.adds() && self.groups.iter().any(|granted| granted == group)
+    }
+}
+
+/// The grantees one direction of a modification names: the accounts and the groups, kept apart
+/// because the store records each on its own and because a group is held to a catalog an
+/// account id is not.
+#[derive(Debug, Default)]
+struct Grantees {
+    user_ids: Vec<String>,
+    groups: Vec<String>,
+}
+
+impl Grantees {
+    /// The grantees a `CreateVolumePermission` list names.
+    ///
+    /// Each entry names "the ID of the Amazon Web Services account to be added or removed"
+    /// (`CreateVolumePermission$UserId`), "the group to be added or removed"
+    /// (`CreateVolumePermission$Group`), or both; one that names NEITHER describes no
+    /// permission at all, which is a modification the service cannot make.
+    fn read<E>(permissions: Option<&[CreateVolumePermission]>) -> Result<Self, Scaffolded<E>> {
+        let mut grantees = Self::default();
+        for permission in permissions.unwrap_or_default() {
+            match (permission.user_id.as_deref(), permission.group.as_deref()) {
+                (None, None) => {
+                    return Err(Scaffolded::missing_parameter(
+                        "Each create volume permission must name a user ID or a group",
+                    ));
+                }
+                (user_id, group) => {
+                    grantees.user_ids.extend(user_id.map(str::to_string));
+                    grantees.groups.extend(group.map(str::to_string));
+                }
+            }
+        }
+        Ok(grantees)
+    }
+
+    /// Does this direction name no grantee at all?
+    fn is_empty(&self) -> bool {
+        self.user_ids.is_empty() && self.groups.is_empty()
+    }
+
+    /// How many modifications these grantees make: one per grantee named.
+    fn len(&self) -> usize {
+        self.user_ids.len().saturating_add(self.groups.len())
+    }
+
+    /// Take on the grantees of `other`, which is how the flat form's lists join the structured
+    /// form's list for the same direction.
+    fn extend(&mut self, other: Self) {
+        self.user_ids.extend(other.user_ids);
+        self.groups.extend(other.groups);
+    }
+}
+
+/// The name the ec2Query wire gives `ModifySnapshotAttributeRequest$OperationType`, for the
+/// refusal that names the parameter a request has to contain: the member's own name, which is
+/// how the wire spells it for the original EC2 objects.
+const OPERATION_TYPE_PARAMETER: &str = "OperationType";
+
+/// The wire's name for `ModifySnapshotAttributeRequest$CreateVolumePermission`, named for the
+/// same refusal: the modification a modify that asked for nothing left out.
+const CREATE_VOLUME_PERMISSION_PARAMETER: &str = "CreateVolumePermission";
+
+/// The name EC2's parameter layer gives the group a permission names, in the refusal of a value
+/// outside the `PermissionGroup` catalog: the member's own name in the case that layer spells a
+/// parameter, the way [`crate::state::SNAPSHOT_IDS_PARAMETER`] is spelled for its own list.
+const GROUP_PARAMETER: &str = "group";

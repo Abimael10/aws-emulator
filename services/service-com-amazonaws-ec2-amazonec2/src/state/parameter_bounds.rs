@@ -576,6 +576,21 @@ pub fn unknown_attribute_parameter_value<E>(attribute: &str) -> crate::scaffolde
     ))
 }
 
+/// How EC2 refuses an `attribute` parameter naming a value the action cannot act on, where the
+/// answer names no value at all: the fixed sentence, end to end.
+///
+/// The OTHER of the two sentences EC2 carries for this cause, and the one the operations that
+/// WRITE an attribute answer: `ModifySnapshotAttribute` and `ResetSnapshotAttribute` were
+/// recorded answering exactly this for `productCodes` — "only volume creation permissions can
+/// be modified" — where the describe beside them quotes the value it was given
+/// ([`unknown_attribute_parameter_value`]). Which of the two an operation answers is a fact of
+/// that operation, recorded by its caller; both carry the same `InvalidParameterValue` code.
+///
+/// Nothing of the request reaches the message, so there is nothing to echo or to bound.
+pub fn unrecognized_attribute<E>() -> crate::scaffolded::Scaffolded<E> {
+    invalid_parameter_value("Unrecognized attribute.")
+}
+
 /// How EC2 refuses a request that names more than one attribute type at once: the fixed
 /// prefix and the attributes the REQUEST named, in the order the request's own members are
 /// declared.

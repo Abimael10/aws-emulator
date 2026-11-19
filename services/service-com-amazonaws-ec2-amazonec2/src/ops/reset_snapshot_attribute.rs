@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetSnapshotAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetSnapshotAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetSnapshotAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Clears the CREATE VOLUME PERMISSIONS of one EBS snapshot of the account: "resets permission
+//! settings for the specified snapshot", which leaves the snapshot with the permissions it was
+//! created with — none beyond its owner's implicit one. The grants it drops are the ones
+//! `ModifySnapshotAttribute` recorded against the snapshot's id
+//! ([`crate::state::snapshot_create_volume_permissions`]) and `DescribeSnapshotAttribute`
+//! reports, so this operation and those two read and write one fact.
+//!
+//! "Currently, only the attribute for permission to create volumes can be reset" (`Attribute`),
+//! and the permissions of a snapshot are the owner's to reset, so a snapshot of another account
+//! — one of the public snapshots the AMI catalogue is published with — is refused.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -65,6 +69,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::scaffolded::Scaffolded;
+use crate::state::{
+    SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION, dry_run_operation, echoed_resource_id,
+    invalid_snapshot_id_malformed, invalid_snapshot_id_not_found,
+    issued_snapshot_id_is_well_formed, require_service_state, unrecognized_attribute,
+    visible_snapshot,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -152,18 +164,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetSnapshotAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetSnapshotAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetSnapshotAttribute"))
+        // `ctx` carries request metadata only, and this operation reads none of it: the
+        // snapshot is named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The attribute to reset. Currently, only the attribute for permission to create
+        // volumes can be reset": of the two members of the modelled `SnapshotAttributeName`
+        // catalog, `productCodes` is not one this action knows anything to do with, so it is
+        // refused in the sentence the operations that WRITE an attribute answer for that cause.
+        // The modelled enum constraint itself is refused by the request walk before this
+        // handler runs.
+        let attribute = input.attribute.as_str();
+        if attribute != SNAPSHOT_ATTRIBUTE_CREATE_VOLUME_PERMISSION {
+            return Err(unrecognized_attribute());
+        }
+
+        // A value that is no snapshot id EC2 could have ISSUED is refused BEFORE the inventory
+        // is looked at — the ordering every operation of this crate that resolves a snapshot id
+        // keeps. The reading is the one the operations that WRITE a snapshot's attributes take,
+        // and the WORDING is this operation's own recorded one: it names the resource the id was
+        // given for ([`invalid_snapshot_id_malformed`]), where the attribute READ beside it
+        // answers its parameter layer's sentence instead.
+        if !issued_snapshot_id_is_well_formed(&input.snapshot_id) {
+            return Err(invalid_snapshot_id_malformed(&input.snapshot_id));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        // ONE instant per clock for the whole call, as the inventory's own report reads them.
+        let now = ::std::time::Instant::now();
+        let observed = ::std::time::SystemTime::now();
+        let account = ::engine::emulator_account_id();
+
+        // The permissions are permissions OF A SNAPSHOT, so the snapshot is resolved first,
+        // against the whole account-visible inventory ([`visible_snapshot`]).
+        let snapshot = visible_snapshot(&store, &*self.engine, &input.snapshot_id, now, observed)
+            .ok_or_else(|| invalid_snapshot_id_not_found(&input.snapshot_id))?;
+
+        // The permissions of a snapshot are the owner's to reset, exactly as they are the
+        // owner's to grant ([`crate::ops::modify_snapshot_attribute`]), so a snapshot the
+        // calling account does not own is refused and nothing of it changes.
+        if snapshot.owner_id.as_deref() != Some(account) {
+            return Err(Scaffolded::operation_not_permitted(format!(
+                "You do not have permission to modify the {attribute} attribute for snapshot {}",
+                echoed_resource_id(&input.snapshot_id)
+            )));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT actually
+        // making the request" (`DryRun`): after every parameter has been validated and the
+        // snapshot resolved, and BEFORE the write, so a dry run leaves the permissions as they
+        // stand.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        // "Resets permission settings for the specified snapshot": every grant goes, so the
+        // snapshot is shared with nobody again, through the crate's one way of dropping them all
+        // (which is also what a snapshot leaving the inventory goes through). A snapshot that was
+        // shared with nobody is already in that state, which is why this says nothing about
+        // whether anything was dropped — the operation models no output at all, and a caller
+        // reads the permissions back through `DescribeSnapshotAttribute`.
+        store.forget_snapshot_create_volume_permissions(&input.snapshot_id);
+
+        Ok(ResetSnapshotAttributeOutput)
     }
 }

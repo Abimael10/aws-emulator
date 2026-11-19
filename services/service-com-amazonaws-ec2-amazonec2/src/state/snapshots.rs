@@ -306,7 +306,9 @@ impl ComAmazonawsEc2Amazonec2State {
     /// snapshot the account no longer holds can have none. That last rule lives in ONE place
     /// ([`Self::forget_fast_snapshot_restores`]), because a snapshot the EBS direct APIs hold
     /// has its pairs in THIS store and its record in theirs, so the same delete has to apply
-    /// it from the handler too.
+    /// it from the handler too. The create volume permissions granted on the snapshot go the
+    /// same way and for the same reason ([`Self::forget_snapshot_create_volume_permissions`]):
+    /// a snapshot that has left the inventory can share nothing.
     pub fn remove_snapshot(&mut self, snapshot_id: &str) -> Option<SnapshotRecord> {
         let record = self.snapshots.remove(snapshot_id)?;
         self.release_stored_bytes(snapshot_payload_bytes(
@@ -314,6 +316,7 @@ impl ComAmazonawsEc2Amazonec2State {
             record.view.description.as_deref(),
         ));
         self.forget_fast_snapshot_restores(snapshot_id);
+        self.forget_snapshot_create_volume_permissions(snapshot_id);
         Some(record)
     }
 
