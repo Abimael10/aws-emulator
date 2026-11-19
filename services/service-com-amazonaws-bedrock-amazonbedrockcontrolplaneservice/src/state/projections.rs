@@ -374,16 +374,18 @@ pub fn automated_reasoning_policy_test_result(
 /// The `definitionHash` of an Automated Reasoning policy definition: 128 digits of
 /// `[0-9a-z]`, as `AutomatedReasoningPolicyHash` requires.
 ///
-/// A function of the DEFINITION alone, so two policies whose definitions agree report one
-/// hash and any change to a definition changes it — which is what the member documents it
-/// for ("used as a concurrency token for creating policy versions"). The digest is SHA-512
-/// hex, whose 128 lowercase hex digits are exactly the width and alphabet the shape
-/// admits, taken over a canonical rendering of the definition rather than over the request
-/// bytes, so the same definition written two ways hashes alike.
+/// A function of the definition's CONTENT alone, so two policies whose definitions agree
+/// report one hash and any change to a definition changes it — which is what the member
+/// documents it for ("used as a concurrency token for creating policy versions"). The
+/// digest is the SHA-512 of [`canonical_policy_definition`], hex-encoded: its 128
+/// lowercase hex digits are exactly the width and alphabet the shape admits, and taking it
+/// over that canonical document rather than over the request bytes is what makes the same
+/// definition written two ways hash alike.
 ///
-/// An ABSENT definition hashes as the empty definition the shape's own defaults spell: a
-/// policy created without one still reports a hash, and reports the same one until a
-/// definition is written to it.
+/// An ABSENT definition hashes as the canonical EMPTY document — the format version this
+/// service digests definitions under and three empty lists — so a policy created without a
+/// definition still reports a hash, and reports the same one until a definition is written
+/// to it.
 #[must_use]
 pub fn policy_definition_hash(definition: Option<&AutomatedReasoningPolicyDefinition>) -> String {
     use ::sha2::{Digest, Sha512};
@@ -392,28 +394,31 @@ pub fn policy_definition_hash(definition: Option<&AutomatedReasoningPolicyDefini
     ::hex::encode(Sha512::digest(canonical.as_bytes()))
 }
 
-/// A policy definition as its CONTENT: the format version this service writes definitions
-/// in ([`POLICY_DEFINITION_FORMAT_VERSION`]), and each of its three lists, an absent one
-/// read as the empty list.
+/// A policy definition as its CONTENT: the format version the document carries, and each
+/// of its three lists, an absent one read as the empty list.
 ///
 /// So a revision that holds NO definition, and one whose definition carries no types,
-/// variables or rules, are one definition — which is what makes [`policy_definition_hash`]
-/// a function of the definition's content alone, and what
+/// variables or rules, hold the same three empty lists — and this is what
 /// `ops/export_automated_reasoning_policy_version.rs` exports, so the definition that
 /// operation reports always hashes to the `definitionHash` the same revision reports.
 ///
 /// `version` names the FORMAT the definition document is written in rather than anything
-/// about the policy, so it is this service's own format version wherever a definition is
-/// reported: a format token a request carried is a statement about the document that
-/// request sent, not about the one read back, and this service writes exactly one format.
-/// A definition therefore reads back in the format it is stored in whatever token reached
-/// it, and two definitions differing only in that token are one definition to the hash.
+/// about the policy, so the token the document carries is the one its writer wrote into it
+/// (`AutomatedReasoningPolicyFormatVersion` is a plain string, and the member's own
+/// `@default` is what an absent one means:
+/// `smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`). A revision
+/// holding no document at all stands for the canonical EMPTY document, stamped
+/// [`POLICY_DEFINITION_FORMAT_VERSION`]. The token is not content: it is NOT what
+/// [`policy_definition_hash`] digests, so two definitions differing only in it are one
+/// definition to the hash.
 #[must_use]
 pub fn policy_definition_content(
     definition: Option<&AutomatedReasoningPolicyDefinition>,
 ) -> AutomatedReasoningPolicyDefinition {
     AutomatedReasoningPolicyDefinition {
-        version: POLICY_DEFINITION_FORMAT_VERSION.to_string(),
+        version: definition
+            .map(|definition| definition.version.clone())
+            .unwrap_or_else(|| POLICY_DEFINITION_FORMAT_VERSION.to_string()),
         types: Some(
             definition
                 .and_then(|definition| definition.types.clone())
@@ -432,9 +437,20 @@ pub fn policy_definition_content(
     }
 }
 
-/// A policy definition as the one JSON value [`policy_definition_hash`] digests: every
-/// member of every element of [`policy_definition_content`] in a fixed order, so the
-/// rendering depends on the definition's CONTENT and on nothing else.
+/// A policy definition as the one JSON document [`policy_definition_hash`] digests.
+///
+/// The CANONICAL form of a definition: every member of [`policy_definition_content`], and
+/// of every element of its three lists, in the order
+/// `smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")` declares them
+/// (`version`, `types`, `rules`, `variables`; a type as `name`, `description`, `values`; a
+/// rule as `id`, `expression`, `alternateExpression`; a variable as `name`, `type`,
+/// `description`), an absent list as the empty list, and the document stamped with the
+/// format version this service digests definitions under
+/// ([`POLICY_DEFINITION_FORMAT_VERSION`]) rather than with the token its writer spelled.
+///
+/// So the digest depends on the definition's CONTENT and on nothing else: not on the order
+/// the members reached the handler in, not on the format token the request carried, and
+/// not on the request's whitespace.
 pub(super) fn canonical_policy_definition(
     definition: Option<&AutomatedReasoningPolicyDefinition>,
 ) -> ::serde_json::Value {
@@ -458,18 +474,6 @@ pub(super) fn canonical_policy_definition(
             })
         })
         .collect();
-    let variables: Vec<::serde_json::Value> = content
-        .variables
-        .iter()
-        .flatten()
-        .map(|variable| {
-            ::serde_json::json!({
-                "name": variable.name,
-                "type": variable.r#type,
-                "description": variable.description,
-            })
-        })
-        .collect();
     let rules: Vec<::serde_json::Value> = content
         .rules
         .iter()
@@ -482,11 +486,23 @@ pub(super) fn canonical_policy_definition(
             })
         })
         .collect();
+    let variables: Vec<::serde_json::Value> = content
+        .variables
+        .iter()
+        .flatten()
+        .map(|variable| {
+            ::serde_json::json!({
+                "name": variable.name,
+                "type": variable.r#type,
+                "description": variable.description,
+            })
+        })
+        .collect();
     ::serde_json::json!({
-        "version": content.version,
+        "version": POLICY_DEFINITION_FORMAT_VERSION,
         "types": types,
-        "variables": variables,
         "rules": rules,
+        "variables": variables,
     })
 }
 

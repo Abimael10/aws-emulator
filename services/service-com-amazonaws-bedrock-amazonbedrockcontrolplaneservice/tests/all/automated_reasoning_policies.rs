@@ -25,6 +25,13 @@
 //! 6. **An ARN this account holds no policy under is 404**, including a well-formed ARN of
 //!    another region and a versioned ARN of a policy that has no versions.
 //! 7. **A resource carries at most 50 tags**, the bound `TooManyTagsException` documents.
+//! 8. **`definitionHash` is the digest of the canonical definition document**: the SHA-512
+//!    hex of the definition rendered with every member of the shape, and of every element
+//!    of its three lists, in the order the model declares them, an absent list read as
+//!    empty and the document stamped with the canonical format version — so the digest a
+//!    create, a read, a write and a version report is the one a client recomputing it
+//!    from the definition gets, and it is accepted back as the concurrency token a
+//!    version is cut on.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation",operation="CreateAutomatedReasoningPolicy,GetAutomatedReasoningPolicy")`
@@ -681,5 +688,278 @@ async fn more_tags_than_one_resource_may_hold_is_refused() {
                 created.error
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// 8. The hash is the digest of the canonical definition document.
+// ---------------------------------------------------------------------------------------
+
+/// The format the canonical definition document is written in, which is what a revision
+/// holding no definition at all stands for too.
+const CANONICAL_FORMAT_VERSION: &str = "1.0";
+
+/// The canonical document a `definitionHash` is the digest OF, built here beside the
+/// emulator rather than read out of it.
+///
+/// `AutomatedReasoningPolicyDefinition`'s members in the order the model declares them
+/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`: `version`,
+/// `types`, `rules`, `variables`), and every element of its three lists likewise (a type
+/// as `name`, `description`, `values`, each value as `value`, `description`; a rule as
+/// `id`, `expression`, `alternateExpression`; a variable as `name`, `type`,
+/// `description`), an absent list read as the empty list, an absent optional member as
+/// null, and the document stamped with the canonical format version rather than with the
+/// token the request spelled.
+fn canonical_document(definition: Option<&Value>) -> Value {
+    let list = |name: &str| -> Vec<Value> {
+        definition
+            .and_then(|definition| definition.get(name))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let member = |element: &Value, name: &str| element.get(name).cloned().unwrap_or(Value::Null);
+    let types: Vec<Value> = list("types")
+        .iter()
+        .map(|declared| {
+            let values: Vec<Value> = declared
+                .get("values")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|value| {
+                    json!({
+                        "value": member(value, "value"),
+                        "description": member(value, "description"),
+                    })
+                })
+                .collect();
+            json!({
+                "name": member(declared, "name"),
+                "description": member(declared, "description"),
+                "values": values,
+            })
+        })
+        .collect();
+    let rules: Vec<Value> = list("rules")
+        .iter()
+        .map(|rule| {
+            json!({
+                "id": member(rule, "id"),
+                "expression": member(rule, "expression"),
+                "alternateExpression": member(rule, "alternateExpression"),
+            })
+        })
+        .collect();
+    let variables: Vec<Value> = list("variables")
+        .iter()
+        .map(|variable| {
+            json!({
+                "name": member(variable, "name"),
+                "type": member(variable, "type"),
+                "description": member(variable, "description"),
+            })
+        })
+        .collect();
+    json!({
+        "version": CANONICAL_FORMAT_VERSION,
+        "types": types,
+        "rules": rules,
+        "variables": variables,
+    })
+}
+
+/// The `definitionHash` a document hashes to: the SHA-512 of its bytes, hex-encoded, whose
+/// 128 lowercase hex digits are exactly what `AutomatedReasoningPolicyHash` admits
+/// (`@length(128, 128)`, `^[0-9a-z]{128}$`).
+fn digest_of(document: &Value) -> String {
+    use sha2::{Digest, Sha512};
+
+    hex::encode(Sha512::digest(document.to_string().as_bytes()))
+}
+
+/// One type carrying every member a type may carry, the second of its values carrying no
+/// description (the one OPTIONAL member a type value has).
+fn full_type(index: usize) -> Value {
+    json!({
+        "name": format!("Type{index}"),
+        "description": format!("the type {index} a response is checked against"),
+        "values": [
+            { "value": format!("Value{index}A"), "description": "the first value" },
+            { "value": format!("Value{index}B") },
+        ],
+    })
+}
+
+/// One rule, carrying `alternateExpression` only when `alternate`.
+fn full_rule(index: usize, alternate: bool) -> Value {
+    let mut rule = json!({
+        "id": format!("R{index:011}"),
+        "expression": format!("variable{index} == Value{index}A"),
+    });
+    if alternate {
+        rule["alternateExpression"] = json!(format!("variable {index} is the first value"));
+    }
+    rule
+}
+
+/// One variable (every member of a variable is required).
+fn full_variable(index: usize) -> Value {
+    json!({
+        "name": format!("variable{index}"),
+        "type": format!("Type{index}"),
+        "description": format!("what variable {index} stands for"),
+    })
+}
+
+#[tokio::test]
+async fn the_definition_hash_is_the_digest_of_the_canonical_definition_document() {
+    // Rows span the definition's CONTENT and its spelling: no definition at all, the empty
+    // definition, each list on its own, optional members present and absent, text needing
+    // JSON escaping, and two rows whose content is one row's written differently — another
+    // format token and another member order — which must therefore hash alike.
+    let full = json!({
+        "version": "1",
+        "types": [full_type(0), full_type(1)],
+        "variables": [full_variable(0), full_variable(1)],
+        "rules": [full_rule(0, true), full_rule(1, false)],
+    });
+    let mut retokened = full.clone();
+    retokened["version"] = json!("1.0.0");
+    // The same three lists and the same entries, inserted in another order: the document
+    // digested is built from the content, not from the order the request spelled it in.
+    let reordered = json!({
+        "rules": full["rules"].clone(),
+        "variables": full["variables"].clone(),
+        "types": full["types"].clone(),
+    });
+
+    let rows: Vec<(&str, Option<Value>)> = vec![
+        ("no definition at all", None),
+        (
+            "the empty definition",
+            Some(json!({ "version": "1", "types": [], "variables": [], "rules": [] })),
+        ),
+        (
+            "a definition carrying no list at all",
+            Some(json!({ "version": "1" })),
+        ),
+        (
+            "one type only",
+            Some(json!({ "version": "1", "types": [full_type(0)] })),
+        ),
+        (
+            "one rule only, carrying no alternate expression",
+            Some(json!({ "version": "1", "rules": [full_rule(0, false)] })),
+        ),
+        (
+            "one variable only",
+            Some(json!({ "version": "1", "variables": [full_variable(0)] })),
+        ),
+        ("two of each", Some(full.clone())),
+        ("two of each under another format token", Some(retokened)),
+        ("two of each spelled in another order", Some(reordered)),
+        (
+            "text needing JSON escaping",
+            Some(json!({
+                "version": "1",
+                "variables": [{
+                    "name": "variable0",
+                    "type": "Type0",
+                    "description": "a \"quoted\" claim, a backslash \\ and a dash \u{2014} of prose",
+                }],
+            })),
+        ),
+    ];
+
+    let emu = emulator();
+    for (index, (case, definition)) in rows.iter().enumerate() {
+        let expected = digest_of(&canonical_document(definition.as_ref()));
+        assert_hash_shape(case, &expected);
+
+        let mut body = named(&format!("digested policy {index}"));
+        if let Some(definition) = definition {
+            body["policyDefinition"] = definition.clone();
+        }
+        // Nothing but the definition is digested, so each row carries its own name,
+        // description and tag.
+        body["description"] = json!(format!("row {index}"));
+        body["tags"] = json!([{ "key": "row", "value": format!("{index}") }]);
+
+        let created = create(&emu, body).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreateAutomatedReasoningPolicy must answer 200, got {} {:?}",
+            created.status, created.body
+        );
+        assert_eq!(
+            created.text("definitionHash"),
+            expected,
+            "case {case:?}: the create must report the digest of the canonical document, \
+             expected {expected:?}, got {:?}",
+            created.get("definitionHash")
+        );
+
+        // The read reports the hash the create did, so the token a client holds is the one
+        // the store carries.
+        let policy_arn = created.text("policyArn");
+        let read = get(&emu, &policy_arn).await;
+        assert_eq!(
+            read.text("definitionHash"),
+            expected,
+            "case {case:?}: the read must report the create's definitionHash {expected:?}, \
+             got {:?}",
+            read.get("definitionHash")
+        );
+
+        // And that token is what cutting a version is gated on, so the digest a read hands
+        // out is accepted back unchanged.
+        let cut = emu
+            .call(
+                "POST",
+                &format!(
+                    "/automated-reasoning-policies/{}/versions",
+                    label(&policy_arn)
+                ),
+                Some(json!({ "lastUpdatedDefinitionHash": expected.clone() })),
+            )
+            .await;
+        assert_eq!(
+            cut.status, 200,
+            "case {case:?}: the definitionHash a read reports must cut a version, got {} {:?}",
+            cut.status, cut.body
+        );
+        assert_eq!(
+            cut.text("definitionHash"),
+            expected,
+            "case {case:?}: the version must freeze the draft's definitionHash \
+             {expected:?}, got {:?}",
+            cut.get("definitionHash")
+        );
+
+        // A write moves the token to the digest of the definition it stored, which is what
+        // a read-modify-write loop reuses.
+        let written = json!({ "version": "1", "types": [full_type(index)] });
+        let updated = emu
+            .call(
+                "PATCH",
+                &format!("/automated-reasoning-policies/{}", label(&policy_arn)),
+                Some(json!({ "policyDefinition": written.clone() })),
+            )
+            .await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case:?}: UpdateAutomatedReasoningPolicy must answer 200, got {} {:?}",
+            updated.status, updated.body
+        );
+        let rewritten = digest_of(&canonical_document(Some(&written)));
+        assert_eq!(
+            updated.text("definitionHash"),
+            rewritten,
+            "case {case:?}: the update must report the digest of the definition it stored, \
+             expected {rewritten:?}, got {:?}",
+            updated.get("definitionHash")
+        );
     }
 }

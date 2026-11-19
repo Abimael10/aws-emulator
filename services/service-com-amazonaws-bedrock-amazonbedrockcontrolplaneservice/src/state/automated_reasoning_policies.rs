@@ -19,16 +19,20 @@ use super::*;
 /// fresh regions, which is why the bound is over the whole store rather than per region.
 pub const MAX_AUTOMATED_REASONING_POLICIES_PER_ACCOUNT: usize = 100;
 
-/// The policy-definition FORMAT version this service writes every
-/// `AutomatedReasoningPolicyDefinition` it reports in — the one version of that document
-/// format there is, which is why it is also the member's modelled `@default("1")`
-/// (`smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`).
+/// The policy-definition FORMAT version this service digests every
+/// `AutomatedReasoningPolicyDefinition` under — the canonical form of that document
+/// (`AutomatedReasoningPolicyDefinition$version`, a plain
+/// `AutomatedReasoningPolicyFormatVersion` string:
+/// `smithy_query(query="shape",shape="AutomatedReasoningPolicyDefinition")`).
 ///
-/// The member describes the document's own format rather than the policy, so a definition
-/// read back out of the store carries this token whatever token the request that wrote it
-/// carried: a single-component format token, not a dotted release number, and not the
-/// policy's own resource version (that one is the `:<version>` suffix of a versioned ARN).
-pub const POLICY_DEFINITION_FORMAT_VERSION: &str = "1";
+/// The member describes the document's own format rather than the policy, and the token a
+/// request wrote into a document is the one that document reads back with. This token is
+/// the CANONICAL one: it stamps the document [`super::policy_definition_hash`] digests,
+/// which is what keeps a `definitionHash` a function of the definition's content rather
+/// than of the format token its writer spelled, and it stamps the empty document a
+/// revision holding no definition at all stands for. It is NOT the policy's own resource
+/// version (that one is the `:<version>` suffix of a versioned ARN).
+pub const POLICY_DEFINITION_FORMAT_VERSION: &str = "1.0";
 
 /// The most build workflows ONE Automated Reasoning policy may hold at once, past which a
 /// start is refused with `ServiceQuotaExceededException`.

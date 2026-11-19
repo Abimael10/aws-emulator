@@ -55,6 +55,10 @@ service-com-amazonaws-bedrockdataautomation-amazonbedrockkeystonebuildtimeservic
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The suite that pins `definitionHash` recomputes the digest beside the emulator, over the
+# canonical document it spells out itself, with the same digest and hex rendering.
+sha2 = { workspace = true }
+hex = { workspace = true }
 # The execution suite mounts Amazon S3 beside this service on one engine: a batch
 # inference job reads its input records out of the object store and writes its result
 # records back into it, which is asserted end to end by staging the input through S3 and
