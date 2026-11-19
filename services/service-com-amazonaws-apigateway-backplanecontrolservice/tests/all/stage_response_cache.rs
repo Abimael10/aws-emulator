@@ -31,9 +31,14 @@
 //!   default;
 //! * the `methodSettings` key that enables caching is honoured in each spelling that names
 //!   the invoked method — its own path escaped, its own path with a literal separator, and
-//!   the whole-stage wildcard.
+//!   the whole-stage wildcard;
+//! * and the first rule again over a method whose integration is an `AWS` SERVICE integration
+//!   rather than a `MOCK`: what the cluster holds is the INTEGRATION's own answer, so the
+//!   entry, the span it is usable for and what evicts it are the same whatever produced that
+//!   answer — over a table of what ends it, the `cacheTtlInSeconds` each row's setting
+//!   carries, and the depth of the resource path its `methodSettings` key names.
 //!
-//! What makes a cache hit OBSERVABLE: every case serves a `MOCK` method whose own ANSWER —
+//! What makes a cache hit OBSERVABLE: every `MOCK` case serves a method whose own ANSWER —
 //! its rendered integration request, which is what a `MOCK` returns without invoking a
 //! backend, and so what the cluster holds — is then REWRITTEN through `UpdateIntegration` and
 //! redeployed, while the integration response maps that answer through one template that
@@ -42,18 +47,25 @@
 //! the two are told apart by what the client reads, not by anything the test knows about the
 //! store — and not by rewriting the response TEMPLATE, which is the MAPPING and is applied
 //! afresh to every request the entry answers (the `stage_cache_hit_mapping` suite pins that).
+//! The service-integration rows tell the two apart the same way without rewriting anything of
+//! the api: the TABLE their integration reads is moved on out of band through the service that
+//! owns it, so a request the integration answers reports the item that service now holds and
+//! one the cluster answers reports what it answered when the entry was filled.
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::CACHE_CLUSTER_AVAILABLE;
 
+use crate::dynamodb_service_integration::{dynamodb, given_role, given_table};
 use crate::execute_api_data_plane::{
     deploy, integration_response, invoke, json_template, method_response, put_integration,
     put_method,
 };
 use crate::flush_stage_cache::{cluster_status, flush_cache};
-use crate::rest_api_lifecycle::{create_api, resource_under, string_member, Answer, Gateway};
+use crate::rest_api_lifecycle::{
+    create_api, gateway_with_dynamodb_and_iam, resource_under, string_member, Answer, Gateway,
+};
 use crate::stage_lifecycle::get_stage;
 
 /// How long a poll for a transition the clock owes keeps looking, and how often it looks.
@@ -261,19 +273,7 @@ impl Deployed {
 
     /// `UpdateStage` with `operations`, asserting the modelled 200.
     async fn update_stage(&self, gateway: &Gateway, case: &str, operations: Value) -> Answer {
-        let updated = gateway
-            .call(
-                "PATCH",
-                &format!("/restapis/{api}/stages/{STAGE}", api = self.api),
-                Some(json!({ "patchOperations": operations })),
-            )
-            .await;
-        assert_eq!(
-            updated.status, 200,
-            "case {case}: expected 200 from UpdateStage, got {} with {:?}",
-            updated.status, updated.body
-        );
-        updated
+        patch_stage(gateway, &self.api, case, operations).await
     }
 
     /// `UpdateRestApi` attaching `document` as the api's resource policy, then redeploying
@@ -329,11 +329,7 @@ impl Deployed {
     }
 
     /// Invoke `GET /items` on the stage, carrying `headers`, until the body it answers is
-    /// `expected` — or the deadline passes with it never being.
-    ///
-    /// For the row whose held entry ends by its own `cacheTtlInSeconds` PASSING: that is a
-    /// transition the clock owes, so the test looks again for the condition rather than
-    /// sleeping a span out.
+    /// `expected` — or the deadline passes with it never being; see [`invoked_until_body`].
     async fn invoked_until(
         &self,
         gateway: &Gateway,
@@ -341,19 +337,15 @@ impl Deployed {
         headers: &[(&str, &str)],
         expected: &str,
     ) -> crate::execute_api_data_plane::Invoked {
-        let deadline = std::time::Instant::now() + WAIT;
-        loop {
-            let answered = self.invoke(gateway, headers).await;
-            if answered.body == expected {
-                return answered;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "case {case}: expected {expected} once the entry ended, last read {:?}",
-                answered.body
-            );
-            tokio::time::sleep(LOOK_AGAIN).await;
-        }
+        invoked_until_body(
+            gateway,
+            &self.api,
+            &format!("/{STAGE}/{RESOURCE}"),
+            case,
+            headers,
+            expected,
+        )
+        .await
     }
 
     /// One more `GET` resource under the root, on a `MOCK` integration answering `serial` and
@@ -402,6 +394,55 @@ impl Deployed {
     }
 }
 
+/// `UpdateStage` on `api`'s [`STAGE`] with `operations`, asserting the modelled 200.
+///
+/// The one place this suite patches a stage: [`Deployed::update_stage`] and the
+/// service-integration rows, which stand their api up without a [`Deployed`], both go through
+/// it.
+async fn patch_stage(gateway: &Gateway, api: &str, case: &str, operations: Value) -> Answer {
+    let updated = gateway
+        .call(
+            "PATCH",
+            &format!("/restapis/{api}/stages/{STAGE}"),
+            Some(json!({ "patchOperations": operations })),
+        )
+        .await;
+    assert_eq!(
+        updated.status, 200,
+        "case {case}: expected 200 from UpdateStage, got {} with {:?}",
+        updated.status, updated.body
+    );
+    updated
+}
+
+/// Invoke `path` on `api`'s stage, carrying `headers`, until the body it answers is `expected`
+/// — or the deadline passes with it never being.
+///
+/// For a row whose held entry ends by its own `cacheTtlInSeconds` PASSING: that is a transition
+/// the clock owes, so the row looks again for the condition rather than sleeping a span out.
+async fn invoked_until_body(
+    gateway: &Gateway,
+    api: &str,
+    path: &str,
+    case: &str,
+    headers: &[(&str, &str)],
+    expected: &str,
+) -> crate::execute_api_data_plane::Invoked {
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let answered = invoke(gateway, api, "GET", path, headers).await;
+        if answered.body == expected {
+            return answered;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case}: expected {expected} once the entry ended, last read {:?}",
+            answered.body
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
 /// The ops that turn caching on for the method path `method_path` with `ttl` seconds to
 /// live.
 fn caching_on_at(method_path: &str, ttl: i32) -> Vec<Value> {
@@ -424,13 +465,25 @@ fn caching_on(ttl: i32) -> Vec<Value> {
     caching_on_at("/*/*", ttl)
 }
 
-/// One op setting `/*/*/caching/requireAuthorizationForCacheControl`.
-fn require_authorization(required: bool) -> Value {
+/// One op setting `caching/requireAuthorizationForCacheControl` on the method path
+/// `method_path`.
+///
+/// It goes under the SAME key the caching itself was turned on under: the settings in force on
+/// a method are the entry that names it, else the whole-stage entry — one entry, not a merge of
+/// both — so a stage that enables caching under a method's own key says everything about that
+/// method's caching under that key.
+fn require_authorization_at(method_path: &str, required: bool) -> Value {
     json!({
         "op": "replace",
-        "path": "/*/*/caching/requireAuthorizationForCacheControl",
+        "path": format!("{method_path}/caching/requireAuthorizationForCacheControl"),
         "value": required.to_string()
     })
+}
+
+/// One op setting `/*/*/caching/requireAuthorizationForCacheControl`; see
+/// [`require_authorization_at`].
+fn require_authorization(required: bool) -> Value {
+    require_authorization_at("/*/*", required)
 }
 
 /// One op setting `/*/*/caching/unauthorizedCacheControlHeaderStrategy`.
@@ -956,6 +1009,273 @@ async fn an_unauthorized_cache_control_ask_is_answered_as_the_stages_strategy_sa
             "case {case}: expected warned={}, got {:?}",
             expected.warned,
             answered.header(WARNING_HEADER)
+        );
+    }
+}
+
+/// The table the service integration of the rows below READS, the item it reads, and the two
+/// counts that item carries: the one the entry is filled from, and the one written out of band
+/// afterwards — which only a request the integration ANSWERS can report.
+const SERVICE_TABLE: &str = "readings";
+const SERVICE_ITEM: &str = "reading-1";
+const FILLED_COUNT: i64 = 1;
+const WRITTEN_COUNT: i64 = 7;
+
+/// The role each such integration is made under, holding the one grant the call it makes needs.
+const SERVICE_ROLE: &str = "apigateway-cached-readings";
+
+/// The response template those methods carry: it renders the count read off what the TABLE
+/// answered, so what a client reads says which answer was mapped — the one the cluster holds,
+/// or one the integration has just been performed for.
+const COUNT_TEMPLATE: &str = "{\"count\":\"$input.path('$.Item.count.N')\"}";
+
+/// The body [`COUNT_TEMPLATE`] renders for an item carrying `count`.
+fn count_body(count: i64) -> String {
+    format!("{{\"count\":\"{count}\"}}")
+}
+
+/// Write `count` onto the item those integrations read, through the service that OWNS the
+/// table — so what the table holds is that service's own record and not something written into
+/// a store by hand.
+async fn put_reading(gateway: &Gateway, count: i64, case: &str) {
+    let (status, answered) = dynamodb(
+        gateway,
+        "PutItem",
+        json!({
+            "TableName": SERVICE_TABLE,
+            "Item": {"id": {"S": SERVICE_ITEM}, "count": {"N": count.to_string()}},
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected 200 from PutItem({count}), got {status} with {answered:?}"
+    );
+}
+
+/// Stand one row's api up: a `GET` on the resource the path `segments` name, over an `AWS`
+/// integration that reads [`SERVICE_ITEM`] out of [`SERVICE_TABLE`] under `role`, deployed to
+/// [`STAGE`] with a cache cluster waited out until it is up. Answers the api id.
+async fn given_cached_service_method(
+    gateway: &Gateway,
+    name: &str,
+    segments: &[&str],
+    role: &str,
+) -> String {
+    let (api, root) = create_api(gateway, name).await;
+    let mut resource = root;
+    for segment in segments {
+        resource = resource_under(gateway, &api, &resource, segment).await;
+    }
+    put_method(
+        gateway,
+        &api,
+        &resource,
+        "GET",
+        json!({ "authorizationType": "NONE" }),
+    )
+    .await;
+    put_integration(
+        gateway,
+        &api,
+        &resource,
+        "GET",
+        json!({
+            "type": "AWS",
+            "httpMethod": "POST",
+            "uri": format!("arn:aws:apigateway:{REGION}:dynamodb:action/GetItem"),
+            "credentials": role,
+            "requestTemplates": json_template(&format!(
+                "{{\"TableName\":\"{SERVICE_TABLE}\",\
+                 \"Key\":{{\"id\":{{\"S\":\"{SERVICE_ITEM}\"}}}}}}"
+            )),
+        }),
+    )
+    .await;
+    method_response(gateway, &api, &resource, "GET", "200", json!({})).await;
+    integration_response(
+        gateway,
+        &api,
+        &resource,
+        "GET",
+        "200",
+        json!({ "responseTemplates": json_template(COUNT_TEMPLATE) }),
+    )
+    .await;
+    let deployed = gateway
+        .call(
+            "POST",
+            &format!("/restapis/{api}/deployments"),
+            Some(json!({
+                "stageName": STAGE,
+                "cacheClusterEnabled": true,
+                "cacheClusterSize": "0.5"
+            })),
+        )
+        .await;
+    assert_eq!(
+        deployed.status, 201,
+        "case CreateDeployment({name}): expected 201, got {} with {:?}",
+        deployed.status, deployed.body
+    );
+    settled_cluster(gateway, &api, STAGE, name).await;
+    api
+}
+
+#[tokio::test]
+async fn a_cached_service_integration_is_performed_again_once_the_entry_it_filled_is_gone() {
+    // The rule the first table pins is about the ENTRY and not about what filled it: what a
+    // cluster holds is the integration's own ANSWER. So these rows run it over a method whose
+    // integration is an `AWS` service integration — the entry holds what another service
+    // answered to a call this one made — and differ along what ends the entry, the
+    // `cacheTtlInSeconds` the setting carries, and the depth of the resource path the
+    // `methodSettings` key names.
+    let rows: &[(&str, Ends, i32, &[&str])] = &[
+        ("nothing ends the entry", Ends::Nothing, 300, &["readings"]),
+        ("the entry's TTL passes", Ends::Ttl, 1, &["ttl", "short"]),
+        (
+            "a flush empties the cluster",
+            Ends::Flush,
+            300,
+            &["ttl", "long", "nested"],
+        ),
+        (
+            "the caller asks for a reload",
+            Ends::Ask,
+            300,
+            &["readings", "current"],
+        ),
+    ];
+
+    for (index, (case, ends, ttl, segments)) in rows.iter().enumerate() {
+        let gateway = gateway_with_dynamodb_and_iam();
+        given_table(&gateway, SERVICE_TABLE).await;
+        put_reading(&gateway, FILLED_COUNT, case).await;
+        let role = given_role(
+            &gateway,
+            SERVICE_ROLE,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "dynamodb:GetItem",
+                    "Resource": format!(
+                        "arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/{SERVICE_TABLE}"
+                    ),
+                }],
+            }),
+        )
+        .await;
+        let api = given_cached_service_method(
+            &gateway,
+            &format!("cached-service-{index}"),
+            segments,
+            &role,
+        )
+        .await;
+        // The method's OWN settings key, which is what makes the depth of the resource path a
+        // dimension these rows span: the path as one reference token with its separators
+        // escaped, the spelling `PatchOperation$path` requires.
+        let method_path = format!("/~1{}/GET", segments.join("~1"));
+        let mut operations = caching_on_at(&method_path, *ttl);
+        operations.push(require_authorization_at(&method_path, *ends != Ends::Ask));
+        patch_stage(&gateway, &api, case, Value::Array(operations)).await;
+
+        let path = format!("/{STAGE}/{}", segments.join("/"));
+        let asked: &[(&str, &str)] = if *ends == Ends::Ask {
+            &[INVALIDATION_ASK]
+        } else {
+            &[]
+        };
+
+        // The first request is a MISS, so the integration is PERFORMED: the call reaches the
+        // service that owns the table, and what that service answered is what the cluster now
+        // holds.
+        let filled = invoke(&gateway, &api, "GET", &path, &[]).await;
+        assert_eq!(
+            filled.status, 200,
+            "case {case}: expected 200 from the integration on the first request, got {} with \
+             {:?}",
+            filled.status, filled.body
+        );
+        assert_eq!(
+            filled.body,
+            count_body(FILLED_COUNT),
+            "case {case}: expected the count the table holds on a cache miss, got {:?}",
+            filled.body
+        );
+
+        // The TABLE moves on, out of band through the service that owns it: from here a
+        // request the cluster answers reports the count the entry holds, and one the
+        // integration answers reports the count the table holds now.
+        put_reading(&gateway, WRITTEN_COUNT, case).await;
+
+        let after = match ends {
+            // Nothing ends the entry, so the integration is not performed again and the
+            // count the table now holds is not reported.
+            Ends::Nothing => invoke(&gateway, &api, "GET", &path, asked).await,
+            Ends::Flush => {
+                let held = invoke(&gateway, &api, "GET", &path, asked).await;
+                assert_eq!(
+                    held.body,
+                    count_body(FILLED_COUNT),
+                    "case {case}: expected the held entry while it is held, got {:?}",
+                    held.body
+                );
+                let flushed = flush_cache(&gateway, &api, STAGE).await;
+                assert_eq!(
+                    flushed.status, 202,
+                    "case {case}: expected 202 from FlushStageCache, got {} with {:?}",
+                    flushed.status, flushed.body
+                );
+                // A cluster that is being emptied is not one that is up, so the row looks
+                // until it is settled again: what the next request reads is the EMPTIED
+                // cluster rather than one that is mid-flush.
+                settled_cluster(&gateway, &api, STAGE, case).await;
+                invoke(&gateway, &api, "GET", &path, asked).await
+            }
+            Ends::Ask => {
+                let held = invoke(&gateway, &api, "GET", &path, &[]).await;
+                assert_eq!(
+                    held.body,
+                    count_body(FILLED_COUNT),
+                    "case {case}: expected the held entry for a request that asks nothing of \
+                     it, got {:?}",
+                    held.body
+                );
+                invoke(&gateway, &api, "GET", &path, asked).await
+            }
+            // The expiry is a transition the clock owes, so the row looks again until the
+            // entry is no longer the one served rather than sleeping its span out. Nothing
+            // asserts a HIT on this row: at the shortest TTL a setting can carry, whether one
+            // is still held a moment later is the host's speed — the row above whose entry
+            // nothing ends is what pins the hit.
+            Ends::Ttl => {
+                invoked_until_body(
+                    &gateway,
+                    &api,
+                    &path,
+                    case,
+                    asked,
+                    &count_body(WRITTEN_COUNT),
+                )
+                .await
+            }
+        };
+
+        let expected = match ends {
+            Ends::Nothing => count_body(FILLED_COUNT),
+            _ => count_body(WRITTEN_COUNT),
+        };
+        assert_eq!(
+            after.status, 200,
+            "case {case}: expected 200 once the entry ended, got {} with {:?}",
+            after.status, after.body
+        );
+        assert_eq!(
+            after.body, expected,
+            "case {case}: expected {expected}, got {:?}",
+            after.body
         );
     }
 }
