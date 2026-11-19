@@ -1157,8 +1157,6 @@ pub struct CertificateAuthorityRecord {
     pub ca_type: String,
     /// `CertificateAuthorityStatus`.
     pub status: String,
-    /// Serial number of the private CA.
-    pub serial: String,
     /// When `CreateCertificateAuthority` accepted the request.
     pub created_at: SystemTime,
     /// When the CA last changed status.
@@ -1345,7 +1343,15 @@ impl CertificateAuthorityRecord {
             created_at: Some(to_date_time(self.created_at)),
             last_state_change_at: Some(to_date_time(self.last_state_change_at)),
             r#type: Some(self.ca_type.clone()),
-            serial: Some(self.serial.clone()),
+            // "Serial number of your private CA" (`CertificateAuthority$Serial`): the
+            // number is the one the certificate this CA was activated with carries, read
+            // off that certificate ([`own_certificate_serial`](Self::own_certificate_serial))
+            // and stated as the integer it is ([`serial_integer`]). A CA that holds no
+            // certificate has no serial number to report.
+            serial: self
+                .own_certificate_serial()
+                .as_deref()
+                .and_then(serial_integer),
             status: Some(self.status.clone()),
             not_before: self.not_before.map(to_date_time),
             not_after: self.not_after.map(to_date_time),
@@ -2717,6 +2723,26 @@ pub fn serial_octets(serial: &str) -> String {
         .join(":")
 }
 
+/// `serial` as the DECIMAL integer the number it names is, or `None` when `serial` is not a
+/// hexadecimal number at all.
+///
+/// Amazon Web Services Private CA states a serial number as the integer it is rather than as
+/// hexadecimal digits: the serial number in the certificate ARN its own documentation
+/// publishes is a 39-digit value (`GetCertificateRequest$CertificateArn`: "The ARN contains
+/// the certificate serial number and must be in the following form:
+/// …/certificate/286535153982981100925020015808220737245"), which no hexadecimal rendering of
+/// a serial number is.
+///
+/// A serial number is an integer of up to 20 octets (RFC 5280 section 4.1.2.2), wider than any
+/// machine integer, so the base change is done over a big integer.
+pub fn serial_integer(serial: &str) -> Option<String> {
+    let digits = normalized_serial(serial)?;
+    Some(
+        ::num_bigint::BigUint::parse_bytes(digits.as_bytes(), 16)?
+            .to_str_radix(10),
+    )
+}
+
 /// The character that separates the octets of a serial number rather than spelling its
 /// value: the colon `openssl x509 -text` prints between them, which is the listing
 /// `RevokeCertificateRequest$CertificateSerial`'s docs have the serial copied out of.
@@ -2797,9 +2823,10 @@ pub fn mint_resource_id() -> String {
     )
 }
 
-/// A serial number for a CA or for one of its certificates, minted from `seed`.
+/// A serial number for one of a CA's certificates, minted from `seed`.
 ///
-/// Private CA reports serials as hex, so this is 16 bytes of hex digits.
+/// Private CA names an issued certificate by the hexadecimal spelling of its serial — that is
+/// the form its certificate ARNs end in — so this is 16 bytes of hex digits.
 ///
 /// Never a leading ZERO byte: a certificate's serial is an INTEGER, so a leading zero is not
 /// part of its value, and a client reading the serial off the certificate would read one

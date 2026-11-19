@@ -316,11 +316,25 @@ pub(crate) fn certificate_over(
     key: &x509_cert::spki::SubjectPublicKeyInfoOwned,
     algorithm: &x509_cert::spki::AlgorithmIdentifierOwned,
 ) -> String {
+    certificate_over_with_serial(subject, key, algorithm, &next_test_serial())
+}
+
+/// The same certificate, carrying the serial number whose value is the octets `serial`.
+///
+/// The serial is the caller's to choose here, so a suite can present a certificate whose
+/// serial number is a value of any width — which is what a CA activated with it reports as
+/// its own serial number.
+pub(crate) fn certificate_over_with_serial(
+    subject: &Name,
+    key: &x509_cert::spki::SubjectPublicKeyInfoOwned,
+    algorithm: &x509_cert::spki::AlgorithmIdentifierOwned,
+    serial: &[u8],
+) -> String {
     let not_before = SystemTime::now() - Duration::from_secs(3600);
     let not_after = not_before + Duration::from_secs(100 * 365 * 24 * 3600);
     let tbs_certificate = x509_cert::TbsCertificate {
         version: x509_cert::Version::V3,
-        serial_number: x509_cert::serial_number::SerialNumber::new(&next_test_serial())
+        serial_number: x509_cert::serial_number::SerialNumber::new(serial)
             .expect("a serial number"),
         signature: algorithm.clone(),
         // A CA certificate for a root CA is self-signed, so the issuer is the subject.
@@ -410,6 +424,15 @@ pub(crate) fn subject_common_name(name: &Name) -> String {
 /// two encodings of one number compare equal only once they are stripped.
 fn serial_value(bytes: &[u8]) -> Vec<u8> {
     bytes.iter().copied().skip_while(|byte| *byte == 0).collect()
+}
+
+/// The serial number of `certificate` as the integer it is: a DER INTEGER's octets are a
+/// base-256 big-endian number (the leading zero octet that keeps it positive changes no
+/// value), so this is that number in base ten — which is how Amazon Web Services Private CA
+/// states the serial number of a private CA.
+pub(crate) fn serial_as_integer(certificate: &Certificate) -> String {
+    num_bigint::BigUint::from_bytes_be(certificate.tbs_certificate.serial_number.as_bytes())
+        .to_str_radix(10)
 }
 
 /// The serial a certificate ARN names, as the integer the certificate carries: a DER
@@ -560,8 +583,9 @@ async fn the_private_ca_lifecycle_runs_end_to_end() {
         "case {case:?}: the describe echoes the stored key algorithm, got {authority:?}"
     );
     assert!(
-        !string(authority, "Serial", case).is_empty(),
-        "case {case:?}: a CA carries a serial, got {authority:?}"
+        authority.get("Serial").is_none(),
+        "case {case:?}: a CA reports the serial number of the certificate it holds, and this \
+         one holds none yet, got {authority:?}"
     );
     assert!(
         authority.get("NotBefore").is_none() && authority.get("NotAfter").is_none(),
@@ -638,6 +662,13 @@ async fn the_private_ca_lifecycle_runs_end_to_end() {
         not_after > not_before && not_before > 0.0,
         "case {case:?}: an ACTIVE CA carries its certificate's validity window, \
          got {authority:?}"
+    );
+    let expected_serial = serial_as_integer(&certificate_of(&ca_certificate, case));
+    assert_eq!(
+        string(authority, "Serial", case),
+        expected_serial,
+        "case {case:?}: an activated CA reports the serial number of the certificate it \
+         holds, got {authority:?}"
     );
 
     // GetCertificateAuthorityCertificate is the read of exactly those bytes.
@@ -2140,6 +2171,230 @@ async fn a_described_ca_always_carries_both_revocation_configurations() {
             json!(ocsp),
             "case {case:?}: the describe must report OcspConfiguration.Enabled={ocsp}, \
              got {revocation:?}"
+        );
+    }
+}
+
+/// The octets of the serial numbers the certificates of the table below carry.
+///
+/// The rows span what the rule generalises over — the WIDTH and the OCTETS of the number a
+/// certificate carries, which is all a serial number is: `CertificateAuthority$Serial` is a
+/// plain string with no length, pattern or format trait
+/// (`smithy_query(query="shape",shape="CertificateAuthority")`), so nothing about the value
+/// is constrained and every width an X.509 serial number may hold has to read back as the
+/// number the certificate holds. One octet, a leading nibble of zero, a leading octet whose
+/// high bit is set (which DER prefixes with a zero octet that is no part of the value),
+/// interior zero octets, the sixteen octets this service allocates for the certificates it
+/// issues, and the twenty octets RFC 5280 section 4.1.2.2 sets as the widest a conforming CA
+/// may use.
+const SERIAL_OCTETS: &[(&str, &[u8])] = &[
+    ("a one-octet serial number", &[0x01]),
+    ("a leading nibble of zero", &[0x0f, 0xdb]),
+    ("a leading octet with its high bit set", &[0xc8, 0x5c, 0xfc]),
+    ("interior zero octets", &[0x10, 0x00, 0x00, 0x05]),
+    (
+        "sixteen octets, the width this service allocates",
+        &[
+            0x0f, 0xdb, 0xfb, 0x98, 0x3c, 0xc4, 0x8f, 0xca, 0xde, 0xbf, 0x03, 0xcf, 0x32, 0x83,
+            0xba, 0xac,
+        ],
+    ),
+    (
+        "twenty octets, the widest RFC 5280 section 4.1.2.2 allows",
+        &[
+            0x7f, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+        ],
+    ),
+];
+
+/// `octets` as the integer they are: the number a DER INTEGER of those octets denotes, in
+/// base ten, read out with the big-integer library rather than by this suite.
+fn as_integer(octets: &[u8]) -> String {
+    num_bigint::BigUint::from_bytes_be(octets).to_str_radix(10)
+}
+
+/// A catalog of hand-computed values, which is what pins the BASE the number is stated in: a
+/// rendering in any other base would satisfy every assertion below that only reads the number
+/// back out again. The widest is 2^128 - 1, the largest sixteen-octet serial number there is.
+const SERIAL_INTEGERS: &[(&[u8], &str)] = &[
+    (&[0x01], "1"),
+    (&[0x0f, 0xdb], "4059"),
+    (&[0xc8, 0x5c, 0xfc], "13131004"),
+    (&[0x10, 0x00, 0x00, 0x05], "268435461"),
+    (
+        &[0xff; 16],
+        "340282366920938463463374607431768211455",
+    ),
+];
+
+#[test]
+fn a_serial_number_is_stated_in_base_ten() {
+    for (octets, expected) in SERIAL_INTEGERS {
+        let stated = as_integer(octets);
+        assert_eq!(
+            &stated, expected,
+            "case {octets:02x?}: expected the number those octets are in base ten, \
+             got {stated:?}"
+        );
+    }
+}
+
+/// A private CA reports as its `Serial` the serial number of the X.509 certificate it was
+/// activated with, stated as the integer that number is — and reports none at all while it
+/// holds no certificate of its own.
+///
+/// Read through every projection of a `CertificateAuthority`: `DescribeCertificateAuthority`
+/// and `ListCertificateAuthorities` report the same structure, so both have to state the
+/// same number. The expectation of a row is the number the certificate the CA was activated
+/// with carries, read with the same X.509 library a client reads it with — including off the
+/// certificate this service hands back from `GetCertificateAuthorityCertificate`, which is
+/// what makes the value a client can join.
+#[tokio::test]
+async fn a_ca_reports_the_serial_number_of_the_certificate_it_holds() {
+    let emulator = Emulator::new();
+
+    // Every CA is created first, so one wait covers the transition all of them owe.
+    let mut authorities: Vec<String> = Vec::with_capacity(SERIAL_OCTETS.len());
+    for (index, (case, _)) in SERIAL_OCTETS.iter().enumerate() {
+        let created = emulator
+            .ok(
+                case,
+                "CreateCertificateAuthority",
+                &root_ca_request(&format!("serial-report-{index}")),
+            )
+            .await;
+        authorities.push(string(&created, "CertificateAuthorityArn", case));
+    }
+
+    // A CA that holds no certificate has no serial number to report — in CREATING, and
+    // still once it has settled into PENDING_CERTIFICATE.
+    for ((case, _), arn) in SERIAL_OCTETS.iter().zip(&authorities) {
+        let described = emulator
+            .ok(case, "DescribeCertificateAuthority", &json!({"CertificateAuthorityArn": arn}))
+            .await;
+        let authority = &described["CertificateAuthority"];
+        assert!(
+            authority.get("Serial").is_none(),
+            "case {case:?}: a CA holding no certificate has no serial number to report, \
+             got {authority:?}"
+        );
+    }
+    wait_for_the_clock();
+
+    for ((case, octets), arn) in SERIAL_OCTETS.iter().zip(&authorities) {
+        let described = emulator
+            .ok(case, "DescribeCertificateAuthority", &json!({"CertificateAuthorityArn": arn}))
+            .await;
+        let authority = &described["CertificateAuthority"];
+        assert!(
+            authority.get("Serial").is_none(),
+            "case {case:?}: a CA still waiting for its certificate has no serial number to \
+             report, got {authority:?}"
+        );
+
+        // The certificate the CA's own certification request asks for, carrying this row's
+        // serial number, built by the X.509 library rather than by this service.
+        let csr = string(
+            &emulator
+                .ok(case, "GetCertificateAuthorityCsr", &json!({"CertificateAuthorityArn": arn}))
+                .await,
+            "Csr",
+            case,
+        );
+        let request = request_of(&csr, case);
+        let ca_certificate = certificate_over_with_serial(
+            &request.info.subject,
+            &request.info.public_key,
+            &request.algorithm,
+            octets,
+        );
+        // The certificate really does carry this row's number: a DER INTEGER drops nothing
+        // and adds only the zero octet that keeps the value positive.
+        let expected = as_integer(octets);
+        assert_eq!(
+            serial_as_integer(&certificate_of(&ca_certificate, case)),
+            expected,
+            "case {case:?}: the certificate under test must carry the row's serial number"
+        );
+
+        emulator
+            .ok(
+                case,
+                "ImportCertificateAuthorityCertificate",
+                &json!({
+                    "CertificateAuthorityArn": arn,
+                    "Certificate": blob(&ca_certificate),
+                }),
+            )
+            .await;
+
+        let described = emulator
+            .ok(case, "DescribeCertificateAuthority", &json!({"CertificateAuthorityArn": arn}))
+            .await;
+        let authority = &described["CertificateAuthority"];
+        let reported = string(authority, "Serial", case);
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the serial number of the certificate the CA holds, \
+             got {reported:?}"
+        );
+        // And it is stated as a number: decimal digits, with no separator and no leading
+        // zero, which is the one spelling of a value in base ten.
+        assert!(
+            reported.chars().all(|digit| digit.is_ascii_digit())
+                && (reported == "0" || !reported.starts_with('0')),
+            "case {case:?}: expected the number in base ten, got {reported:?}"
+        );
+
+        // The same number the certificate this service hands back carries, which is the
+        // join a client makes.
+        let read_back = emulator
+            .ok(
+                case,
+                "GetCertificateAuthorityCertificate",
+                &json!({"CertificateAuthorityArn": arn}),
+            )
+            .await;
+        let held = certificate_of(&string(&read_back, "Certificate", case), case);
+        assert_eq!(
+            serial_as_integer(&held),
+            reported,
+            "case {case:?}: expected the serial number a client reads off the CA certificate, \
+             got {reported:?}"
+        );
+
+        // Reporting it changed nothing: a second read states the same number.
+        let again = emulator
+            .ok(case, "DescribeCertificateAuthority", &json!({"CertificateAuthorityArn": arn}))
+            .await;
+        assert_eq!(
+            string(&again["CertificateAuthority"], "Serial", case),
+            reported,
+            "case {case:?}: a serial number is stable across reads"
+        );
+    }
+
+    // Every projection of a `CertificateAuthority` states the same number: the listing
+    // reports the structure the describe does.
+    let listed = emulator
+        .ok("the listing", "ListCertificateAuthorities", &json!({}))
+        .await;
+    let reported = listed
+        .get("CertificateAuthorities")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("expected a CertificateAuthorities list, got {listed:?}"))
+        .clone();
+    for ((case, octets), arn) in SERIAL_OCTETS.iter().zip(&authorities) {
+        let authority = reported
+            .iter()
+            .find(|authority| string(authority, "Arn", case) == *arn)
+            .unwrap_or_else(|| panic!("case {case:?}: the listing omits {arn}"));
+        assert_eq!(
+            string(authority, "Serial", case),
+            as_integer(octets),
+            "case {case:?}: the listing must state the serial the describe states, \
+             got {authority:?}"
         );
     }
 }

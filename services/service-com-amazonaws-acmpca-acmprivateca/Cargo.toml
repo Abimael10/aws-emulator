@@ -26,6 +26,9 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex for those serials and digests.
 hex = { workspace = true }
+# States a certificate's serial number as the integer it is (CertificateAuthority.Serial): a
+# serial is up to 20 octets wide, which no machine integer holds.
+num-bigint = "0.4"
 # Reads and writes the DER X.509 certificates and PKCS#10 certification requests this
 # service accepts (ImportCertificateAuthorityCertificate, IssueCertificate) and hands
 # out (GetCertificateAuthorityCsr, GetCertificate).

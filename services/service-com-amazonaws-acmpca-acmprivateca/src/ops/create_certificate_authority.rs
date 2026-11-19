@@ -346,7 +346,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the clock, so a caller that reads it immediately still sees the transient
             // status in which its CSR is not available yet.
             status: crate::state::STATUS_CREATING.to_string(),
-            serial: crate::state::mint_serial(&arn),
             created_at: now,
             last_state_change_at: now,
             settles_at: now + crate::state::SETTLE_AFTER,

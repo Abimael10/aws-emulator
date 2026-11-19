@@ -9430,6 +9430,7 @@ dependencies = [
  "bytes",
  "hex",
  "http",
+ "num-bigint 0.4.8",
  "rcgen",
  "regex",
  "serde_json",
