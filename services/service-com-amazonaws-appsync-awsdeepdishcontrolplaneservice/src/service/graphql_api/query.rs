@@ -349,6 +349,10 @@ async fn served_request(
             .unwrap_or_default(),
         headers: request_fields(&parts.headers),
         identity,
+        // The principal the call signed as, carried into the execution because it is also
+        // what admits a call a resolver's data source makes under the CALLER's own
+        // credentials — the same answer the API's own fields are judged against.
+        caller: signed.clone(),
         unauthorized: Vec::new(),
     };
     let mut request = request;

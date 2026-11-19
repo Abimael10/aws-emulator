@@ -230,17 +230,28 @@ fn from_s3_object(value: Option<&Json>) -> Result<Json, String> {
 }
 
 /// The attribute names DynamoDB holds each type of value under, which is what every helper of
-/// this family writes.
-const STRING: &str = "S";
-const NUMBER: &str = "N";
-const BINARY: &str = "B";
-const BOOLEAN: &str = "BOOL";
-const NULL: &str = "NULL";
-const LIST: &str = "L";
-const MAP: &str = "M";
-const STRING_SET: &str = "SS";
-const NUMBER_SET: &str = "NS";
-const BINARY_SET: &str = "BS";
+/// this family writes — and what an ANSWER's own values are read back out of
+/// (`crate::service::graphql_api::dynamodb`), so the two halves of the one table cannot drift
+/// apart.
+pub const STRING: &str = "S";
+/// See [`STRING`].
+pub const NUMBER: &str = "N";
+/// See [`STRING`].
+pub const BINARY: &str = "B";
+/// See [`STRING`].
+pub const BOOLEAN: &str = "BOOL";
+/// See [`STRING`].
+pub const NULL: &str = "NULL";
+/// See [`STRING`].
+pub const LIST: &str = "L";
+/// See [`STRING`].
+pub const MAP: &str = "M";
+/// See [`STRING`].
+pub const STRING_SET: &str = "SS";
+/// See [`STRING`].
+pub const NUMBER_SET: &str = "NS";
+/// See [`STRING`].
+pub const BINARY_SET: &str = "BS";
 
 /// The members of the S3 object reference DynamoDB holds as text, and the one it is held
 /// under.

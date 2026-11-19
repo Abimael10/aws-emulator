@@ -239,7 +239,10 @@ fn reported_identity(
         "accountId".to_string(),
         Json::String(identity.account.clone()),
     );
-    reported.insert("userArn".to_string(), Json::String(identity.arn.clone()));
+    reported.insert(
+        USER_ARN_MEMBER.to_string(),
+        Json::String(identity.arn.clone()),
+    );
     // "In the case of AWS_IAM authorization, the value of username is the value of the AWS
     // user principal", which is the caller's own user id.
     reported.insert(
@@ -340,23 +343,53 @@ pub fn field_resource(api_arn: &str, type_name: &str, field_name: &str) -> Strin
 /// one field of it denies that field.
 #[must_use]
 pub fn permits(caller: &SignedCaller, resource: &str) -> bool {
-    let request = iam::Request::new(GRAPHQL_ACTION, resource, &caller.principals);
+    withholding(caller, GRAPHQL_ACTION, resource).is_none()
+}
+
+/// Which of IAM's rules withholds `action` on `resource` from this caller, as the reason
+/// clause an authorization refusal states — `None` when the account's policies permit it.
+///
+/// The ONE decision ladder this endpoint takes about the caller, over any action: the fields
+/// of the API itself ([`permits`]) and the call a resolver's data source makes UNDER THE
+/// CALLER's own credentials ([`super::dynamodb`]) are decided by it, so the two cannot
+/// disagree about what a principal may do. An explicit `Deny` refuses whatever else the
+/// principal carries, an `Allow` about the request grants it, neither falls to IAM's default
+/// deny, and a permissions boundary caps the grant — "a permissions boundary sets the maximum
+/// permissions that an identity-based policy can grant", so a grant the boundary does not
+/// also allow is not a permission.
+#[must_use]
+pub fn withholding(caller: &SignedCaller, action: &str, resource: &str) -> Option<String> {
+    let request = iam::Request::new(action, resource, &caller.principals);
     let identity_said = iam::identity_decision(&caller.documents, &request);
     if identity_said == Decision::Denied {
-        return false;
+        return Some(iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string());
     }
     if !(iam::is_allowed(identity_said, Decision::NotStated) || caller.unbounded) {
-        return false;
+        return Some(iam::no_identity_policy_allows(action));
     }
-    match &caller.boundary {
-        // "A permissions boundary sets the maximum permissions that an identity-based policy
-        // can grant": a grant the boundary does not also allow is not a permission.
-        Some(boundary) => {
-            iam::identity_decision(::std::slice::from_ref(boundary), &request) == Decision::Allowed
-        }
-        None => true,
+    let boundary = caller.boundary.as_ref()?;
+    match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
+        Decision::Allowed => None,
+        Decision::Denied => Some(iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string()),
+        _ => Some(iam::no_permissions_boundary_allows(action)),
     }
 }
+
+impl SignedCaller {
+    /// The principal an authorization refusal of this caller NAMES: the ARN the credential it
+    /// signed with speaks for, which is the value `$context.identity` reports as `userArn`.
+    #[must_use]
+    pub fn principal(&self) -> String {
+        self.identity
+            .get(USER_ARN_MEMBER)
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+}
+
+/// The member of `$context.identity` carrying the principal the call signed as.
+const USER_ARN_MEMBER: &str = "userArn";
 
 #[cfg(test)]
 mod tests {

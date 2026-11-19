@@ -314,85 +314,13 @@ fn member_path(index: usize, member: &str) -> String {
 /// source's role do not allow it on the configured bus, or `None` when nothing is known
 /// against it.
 ///
-/// Which answer counts is `::service_common::iam_role`'s own rule: a role that STATES
-/// identity-based policies is the authority on what it may do, so it has to be ALLOWED the
-/// publication; a role IAM holds no policy for says nothing about the action — a data source's
-/// service role is routinely provisioned out of band — so only a statement that DENIES it holds
-/// the publication back. Everything that is not an answer (no IAM to ask, a value naming no
-/// role of this account, a failed hop) withholds nothing.
+/// The question — and its answer's wording — belongs to every data-source type that CALLS
+/// something under the role the data source names, so it is asked in the one place that reads
+/// it ([`super::data_source_role`]); what this data source contributes is the action its own
+/// call performs and the resource it acts on.
 async fn withheld(context: &PlaneContext, role_arn: &str, bus_arn: &str) -> Option<String> {
-    let states_permissions = ::service_common::iam_role::role_states_permissions_through(
-        &context.callback,
-        &context.region,
-        role_arn,
-    )
-    .await;
-    let withheld = if states_permissions {
-        ::service_common::iam_role::role_withholds_action_through(
-            &context.callback,
-            &context.region,
-            role_arn,
-            PUT_EVENTS_ACTION,
-            bus_arn,
-        )
-        .await
-    } else {
-        ::service_common::iam_role::role_denies_action_through(
-            &context.callback,
-            &context.region,
-            role_arn,
-            PUT_EVENTS_ACTION,
-            bus_arn,
-        )
-        .await
-    };
-    withheld.then(|| {
-        let reason = if states_permissions {
-            ::service_common::iam_authorization::no_identity_policy_allows(PUT_EVENTS_ACTION)
-        } else {
-            ::service_common::iam_authorization::IDENTITY_POLICY_EXPLICIT_DENY.to_string()
-        };
-        ::service_common::iam_authorization::not_authorized_by_identity_policy(
-            &assumed_role_principal(role_arn),
-            PUT_EVENTS_ACTION,
-            bus_arn,
-            &reason,
-        )
-    })
+    super::data_source_role::withheld(context, role_arn, PUT_EVENTS_ACTION, bus_arn).await
 }
-
-/// The principal AppSync makes the publication as: a SESSION of the role the data source names
-/// (`arn:<partition>:sts::<account>:assumed-role/<role name>/<session name>`), which is the
-/// identity an authorization refusal is about — a role is never acted as directly.
-///
-/// The partition and the account are the role's own, read off its ARN through the tree's one
-/// ARN parse, so a role of another partition or account is named as that role's session rather
-/// than as this emulator's.
-fn assumed_role_principal(role_arn: &str) -> String {
-    let parsed = ::service_common::arn::parse(role_arn);
-    let partition = parsed.map_or(DEFAULT_PARTITION, |arn| arn.partition);
-    let account = parsed.map_or("", |arn| arn.account);
-    // The role's own name is the last segment of its resource, so a role held under a path
-    // (`role/service-role/<name>`) is named the way IAM holds it, and a value that names no
-    // role at all is named as it stands.
-    let role_name = parsed
-        .map(|arn| arn.resource)
-        .and_then(|resource| resource.strip_prefix(ROLE_RESOURCE_PREFIX))
-        .and_then(|name| name.rsplit('/').next())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(role_arn);
-    format!("arn:{partition}:sts::{account}:assumed-role/{role_name}/{ROLE_SESSION_NAME}")
-}
-
-/// The resource type an IAM role ARN carries, which its name follows.
-const ROLE_RESOURCE_PREFIX: &str = "role/";
-
-/// The name of the role SESSION AppSync publishes a data source's events under, which a
-/// refusal naming the session principal carries.
-const ROLE_SESSION_NAME: &str = "APPSYNC_ASSUME_ROLE";
-
-/// The partition a role ARN this emulator cannot parse is named under.
-const DEFAULT_PARTITION: &str = "aws";
 
 /// The IAM action a publication onto an event bus is authorized by ("Actions defined by Amazon
 /// EventBridge", `PutEvents`).
@@ -408,12 +336,14 @@ const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
 /// AppSync publishes no document stating these two strings, so they are this emulator's, chosen
 /// for the ONE thing a client branches on: WHOSE failure it is. A request the data source
 /// cannot act on is a failure of the resolver's own definition — the `code` or the template
-/// that produced it — so it is reported as one of that code; a refusal the OWNING service
+/// that produced it — so it is reported as one of that code
+/// ([`super::data_source_role::REQUEST_FAULT_ERROR_TYPE`], the one spelling every calling data
+/// source of this endpoint states it in); a refusal the OWNING service
 /// answered is reported as that service and that service's own error class, the
 /// `<service>:<error class>` form a downstream refusal is read by (`AccessDeniedException` for
 /// a publication no identity-based policy allows, which is how every AWS service words an
 /// authorization refusal).
-const REQUEST_ERROR_TYPE: &str = "Code";
+const REQUEST_ERROR_TYPE: &str = super::data_source_role::REQUEST_FAULT_ERROR_TYPE;
 const ANSWERED_ERROR_TYPE_PREFIX: &str = "EventBridge:";
 
 /// The one call an `AMAZON_EVENTBRIDGE` data source serves, as the request's own `operation`
@@ -613,35 +543,6 @@ mod tests {
             assert!(
                 refused.contains(located),
                 "case {case:?}: expected the refusal to locate {located}, got {refused:?}"
-            );
-        }
-    }
-
-    /// RULE: the refusal of a publication a role withholds names the role SESSION AppSync
-    /// publishes under, not the role itself — a role is acted as through a session.
-    #[test]
-    fn the_refusal_names_the_sessions_of_the_data_sources_role() {
-        for (case, role_arn, expected) in [
-            (
-                "a role of this account",
-                "arn:aws:iam::123456789012:role/appsync-eventbridge",
-                "arn:aws:sts::123456789012:assumed-role/appsync-eventbridge/APPSYNC_ASSUME_ROLE",
-            ),
-            (
-                "a role under a path",
-                "arn:aws:iam::123456789012:role/service-role/appsync-eb",
-                "arn:aws:sts::123456789012:assumed-role/appsync-eb/APPSYNC_ASSUME_ROLE",
-            ),
-            (
-                "a role of another partition",
-                "arn:aws-us-gov:iam::210987654321:role/published",
-                "arn:aws-us-gov:sts::210987654321:assumed-role/published/APPSYNC_ASSUME_ROLE",
-            ),
-        ] {
-            let named = assumed_role_principal(role_arn);
-            assert_eq!(
-                named, expected,
-                "case {case:?}: expected {expected:?}, got {named:?}"
             );
         }
     }

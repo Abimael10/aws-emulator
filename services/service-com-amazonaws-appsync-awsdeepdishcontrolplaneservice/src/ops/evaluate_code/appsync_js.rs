@@ -756,8 +756,37 @@ fn install_host(ctx: &Ctx<'_>, collected: &Arc<Mutex<Collected>>) -> Result<(), 
         .map_err(|error| format!("the sandbox error list could not be installed: {error}"))?;
     globals
         .set("__appsyncAutoId", Func::from(auto_id))
-        .map_err(|error| format!("the sandbox id mint could not be installed: {error}"))
+        .map_err(|error| format!("the sandbox id mint could not be installed: {error}"))?;
+    globals
+        .set("__appsyncDynamoDb", Func::from(dynamodb_helper))
+        .map_err(|error| {
+            format!("the sandbox DynamoDB helpers could not be installed: {error}")
+        })
 }
+
+/// What one `util.dynamodb.<helper>` call came to, as the JSON document the sandbox reads
+/// back: `value` for the representation it marshalled, or `error` for the fault it states.
+///
+/// The marshalling itself is the service's ONE reading of it
+/// (`crate::service::graphql_api::mapping_template::utilities::dynamodb`), so a value this
+/// runtime marshals and the same value marshalled by a VELOCITY template carry one
+/// representation. Nothing of the host is reachable through it: it is a pure transformation
+/// of the arguments the call was made with.
+fn dynamodb_helper(helper: String, arguments: String) -> String {
+    use crate::service::graphql_api::mapping_template::utilities::dynamodb;
+
+    let args: Vec<::serde_json::Value> =
+        ::serde_json::from_str(&arguments).unwrap_or_default();
+    let answered = match dynamodb::call(&helper, &args) {
+        Ok(Some(value)) => ::serde_json::json!({"value": value}),
+        Ok(None) => ::serde_json::json!({"error": format!("{NO_SUCH_DYNAMODB_HELPER}{helper}")}),
+        Err(fault) => ::serde_json::json!({"error": fault}),
+    };
+    answered.to_string()
+}
+
+/// How a call naming a `util.dynamodb` helper this runtime does not publish is stated.
+const NO_SUCH_DYNAMODB_HELPER: &str = "No such helper: util.dynamodb.";
 
 /// Bind the APPSYNC_JS runtime's own names in the GLOBAL scope: `util` and `runtime`.
 ///
@@ -925,13 +954,17 @@ const INVOKER_SOURCE: &str = r#"
 /// `util.error` and `util.unauthorized` RAISE, which is how a resolver refuses;
 /// `util.appendError` "adds an error to the response" without ending the run, which is what
 /// `outErrors` reports; `util.log.info` and `util.log.error` write the lines `logs` reports;
-/// `util.autoId` mints an identifier; and `util.time` reads the clock through the engine's
-/// own `Date`. Nothing else is offered, so code reaching for a helper this emulator does
-/// not implement fails loudly rather than silently doing nothing.
+/// `util.autoId` mints an identifier; `util.dynamodb` MARSHALS a value as the attribute value
+/// DynamoDB holds it as, through the service's one reading of that conversion
+/// ([`dynamodb_helper`]), which is what a resolver over a DynamoDB data source writes its
+/// request object with; and `util.time` reads the clock through the engine's own `Date`.
+/// Nothing else is offered, so code reaching for a helper this emulator does not implement
+/// fails loudly rather than silently doing nothing.
 const UTILS_MODULE_SOURCE: &str = r#"
 const hostLog = __appsyncLog;
 const hostAppendError = __appsyncAppendError;
 const hostAutoId = __appsyncAutoId;
+const hostDynamoDb = __appsyncDynamoDb;
 const rendered = function (value) {
     if (typeof value === "string") {
         return value;
@@ -960,8 +993,44 @@ const raise = function (message, errorType, data, errorInfo) {
     error.errorInfo = described.errorInfo;
     throw error;
 };
+// Each `util.dynamodb` helper is the host's own marshalling of the value it is handed, so
+// this runtime and a Velocity template write one representation of a value. A helper that
+// cannot convert what it was handed raises, as every other fault of a run does.
+const marshaller = function (name) {
+    return function () {
+        const answered = JSON.parse(
+            hostDynamoDb(name, JSON.stringify(Array.prototype.slice.call(arguments)))
+        );
+        if (answered.error !== undefined && answered.error !== null) {
+            throw new Error(answered.error);
+        }
+        return answered.value;
+    };
+};
+const dynamodb = { fromS3ObjectJson: marshaller("fromS3ObjectJson") };
+[
+    "toDynamoDB",
+    "toString",
+    "toNumber",
+    "toBinary",
+    "toBoolean",
+    "toNull",
+    "toList",
+    "toMap",
+    "toMapValues",
+    "toStringSet",
+    "toNumberSet",
+    "toBinarySet",
+    "toS3Object",
+].forEach(function (name) {
+    // Every converter has a sibling answering the same representation already serialized,
+    // which is what a template or a resolver inlines into the request it is writing.
+    dynamodb[name] = marshaller(name);
+    dynamodb[name + "Json"] = marshaller(name + "Json");
+});
 export const util = {
     error: raise,
+    dynamodb: dynamodb,
     appendError: function (message, errorType, data, errorInfo) {
         hostAppendError(JSON.stringify(detail(message, errorType, data, errorInfo)));
     },

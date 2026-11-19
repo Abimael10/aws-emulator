@@ -66,6 +66,11 @@ pub struct GraphqlRequest {
     /// `Json::Null` for a request whose authorization mode names no principal
     /// ([`super::query`] builds it).
     pub identity: Json,
+    /// WHO the request signed as, where it presented SigV4 material: the principal and the
+    /// policies in force on it, which is what admits a call a resolver's data source makes
+    /// under the CALLER's own credentials ([`super::dynamodb`]). `None` for a call of every
+    /// other authorization mode, which names no principal.
+    pub caller: Option<super::caller::SignedCaller>,
     /// The `(typeName, fieldName)` pairs the caller may NOT access: the fields the
     /// authorization in front of the API refused ([`super::query`]), which resolve to
     /// nothing and are reported as errors of their own path instead of being run.
@@ -304,6 +309,11 @@ const EVENT_BRIDGE_DATA_SOURCE: &str = "AMAZON_EVENTBRIDGE";
 /// is an Lambda function" (`DataSource$type`), which a resolver bound to it resolves against
 /// by INVOKING ([`super::lambda`]).
 const LAMBDA_DATA_SOURCE: &str = "AWS_LAMBDA";
+
+/// The `DataSourceType` of a data source whose resource is a DynamoDB TABLE: a step resolving
+/// against one makes the call its request half named against that table
+/// ([`super::dynamodb`]).
+const DYNAMODB_DATA_SOURCE: &str = "AMAZON_DYNAMODB";
 
 /// The member a request function returns the result of a local resolver in, and — for a data
 /// source that is a function — the event that function is invoked with: AppSync's Lambda
@@ -1477,6 +1487,29 @@ impl Execution<'_> {
                     ..Raised::default()
                 }))),
             },
+            DYNAMODB_DATA_SOURCE => match super::dynamodb::answered(
+                self.context,
+                &super::dynamodb::Configured {
+                    name: &data_source.name,
+                    table_name: data_source.table_name.as_deref(),
+                    table_region: data_source.table_region.as_deref(),
+                    use_caller_credentials: data_source.use_caller_credentials,
+                    service_role_arn: data_source.service_role_arn.as_deref(),
+                },
+                self.request.caller.as_ref(),
+                requested,
+            )
+            .await
+            {
+                Ok(result) => DataSourceOutcome::Result(result),
+                // Carried as a RAISED failure, so the step's own `ctx.error` states the type
+                // the refusal is of and an error of the field reports it as its `errorType`.
+                Err(refused) => DataSourceOutcome::Answered(Failure::Raised(Box::new(Raised {
+                    message: refused.message,
+                    error_type: Some(refused.error_type),
+                    ..Raised::default()
+                }))),
+            },
             other => DataSourceOutcome::NotCalled(
                 format!(
                     "{DATA_SOURCE_NOT_CALLED} {other} data source {}.",
@@ -2256,6 +2289,14 @@ struct StepDataSource {
     /// (`DataSource$serviceRoleArn`) — so it is the principal whose permissions admit the
     /// call a step makes.
     service_role_arn: Option<String>,
+    /// `dynamodbConfig.tableName` and `awsRegion` of an `AMAZON_DYNAMODB` data source: the
+    /// table a step resolving against it calls, and the Region it is in. `None` for every
+    /// other type, which configures no table.
+    table_name: Option<String>,
+    table_region: Option<String>,
+    /// `dynamodbConfig.useCallerCredentials` — whether such a call is made under the CALLER's
+    /// own credentials rather than under the data source's role.
+    use_caller_credentials: bool,
 }
 
 /// The data source `name` of `api`, or `None` when the API holds none under that name.
@@ -2278,6 +2319,18 @@ fn step_data_source(api: &GraphqlApiRecord, name: Option<&str>) -> Option<StepDa
                 .as_ref()
                 .map(|config| config.lambda_function_arn.clone()),
             service_role_arn: record.service_role_arn.clone(),
+            table_name: record
+                .dynamodb_config
+                .as_ref()
+                .map(|config| config.table_name.clone()),
+            table_region: record
+                .dynamodb_config
+                .as_ref()
+                .map(|config| config.aws_region.clone()),
+            use_caller_credentials: record
+                .dynamodb_config
+                .as_ref()
+                .is_some_and(|config| config.use_caller_credentials),
         })
 }
 

@@ -540,9 +540,8 @@ async fn a_data_source_this_endpoint_does_not_call_is_reported_to_the_caller() {
         &format!("/v1/apis/{}/datasources", api.api_id),
         Some(json!({
             "name": UNCALLED_DATA_SOURCE,
-            "type": "AMAZON_DYNAMODB",
+            "type": "AMAZON_BEDROCK_RUNTIME",
             "serviceRoleArn": role,
-            "dynamodbConfig": {"tableName": "orders", "awsRegion": REGION},
         })),
     )
     .await;
