@@ -9,12 +9,13 @@
 //! into ONE invocation of its function whose event is the bare LIST of the payloads those
 //! request halves rendered, as many of them as the resolver's maximum batching size
 //! (`Resolver$maxBatchSize`) and the resolutions past it in a further invocation; the returned
-//! list supplies each sibling its own element, in the order the siblings were merged. An
-//! element that reports an error of its own item — `errorMessage`, with `errorType` naming its
-//! class — is the one sibling that did not resolve: it is reported as exactly one error of
-//! that sibling's own path, carrying the element's own class and sentence, its value is the
-//! element's `data`, and every other sibling of the invocation resolves from its own element's
-//! `data` as though nothing had failed.
+//! list supplies each sibling its own element, in the order the siblings were merged, as the
+//! `ctx.result` that sibling's own response half renders its field from — so a definition
+//! reading the per-item envelope's `data` reads its own element's data. An element that reports
+//! an error of its own item — `errorMessage`, with `errorType` naming its class — is the one
+//! sibling that did not resolve: it is reported as exactly one error of that sibling's own path,
+//! carrying the element's own class and sentence, and every other sibling of the invocation
+//! resolves from its own element as though nothing had failed.
 //!
 //! Three services have to agree for the rule to hold — Lambda runs the function, IAM holds the
 //! data source's service role, and AppSync publishes the endpoint, renders the payloads, merges
@@ -114,14 +115,16 @@ def handler(event, context):
 /// reference.
 const BATCH_REQUEST_TEMPLATE: &str = r#"{"version": "2018-05-29", "operation": "BatchInvoke", "payload": {"id": $util.toJson($ctx.args.id), "fail": $util.toJson($ctx.args.fail)}}"#;
 
-/// Its response half: the value of the field is the item's own result.
-const BATCH_RESPONSE_TEMPLATE: &str = "$util.toJson($ctx.result)";
+/// Its response half: the element the invocation answered for this item IS this step's result,
+/// so the value of the field is the item's own value, which the per-item envelope carries under
+/// `data`.
+const BATCH_RESPONSE_TEMPLATE: &str = "$util.toJson($ctx.result.data)";
 
 /// The same definition written in APPSYNC_JS `code`, which is the other form a definition takes.
 const BATCH_CODE: &str = "export function request(ctx) {\n  \
                           return {operation: 'BatchInvoke', \
                           payload: {id: ctx.args.id, fail: ctx.args.fail}};\n}\n\
-                          export function response(ctx) {\n  return ctx.result;\n}\n";
+                          export function response(ctx) {\n  return ctx.result.data;\n}\n";
 
 /// The data source the parent list resolves against: `NONE` is "there is no data source", so
 /// the parents are the request half's own payload and no invocation stands between the parents
@@ -132,7 +135,8 @@ const LOCAL_DATA_SOURCE: &str = "local";
 /// so the error belongs to a sibling in the MIDDLE of the invocation rather than at its edge.
 const PARENT_IDS: [&str; 3] = ["p-one", "fail-me", "p-three"];
 
-/// The parent list's own definition, which carries no data source call of its own.
+/// The parent list's own definition, which carries no data source call of its own: its data
+/// source is "no data source", so the request half's own payload is this step's result.
 fn parents_code() -> String {
     let parents: Vec<String> = PARENT_IDS
         .iter()
@@ -152,7 +156,7 @@ const CHILD_CODE: &str = "export function request(ctx) {\n  \
                           return {operation: 'BatchInvoke', \
                           payload: {id: ctx.source.id, \
                           fail: ctx.source.id.indexOf('fail') === 0}};\n}\n\
-                          export function response(ctx) {\n  return ctx.result;\n}\n";
+                          export function response(ctx) {\n  return ctx.result.data;\n}\n";
 
 /// The trust policy a function's EXECUTION role carries, which `CreateFunction` checks: the
 /// role has to be assumable by the Lambda service principal. Written compactly and free of the

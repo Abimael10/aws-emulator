@@ -338,6 +338,32 @@ const ITEM_ERROR_TYPE_MEMBER: &str = "errorType";
 /// element is the per-item ENVELOPE rather than the value itself ([`batched_item`]).
 const ITEM_DATA_MEMBER: &str = "data";
 
+/// WHO reads one element of a batched answer onto the field of the sibling it belongs to.
+///
+/// The element IS that sibling's own answer from the data source, so a step carrying a
+/// DEFINITION is handed it as the `ctx.result` that definition renders the field from — which is
+/// what a definition reading the per-item envelope's own `data` reads. A step carrying NONE (the
+/// Direct Lambda resolver) has no definition to read it with, so there the ENVELOPE is read
+/// here: the field's value is the `data` it carries. Either way the `errorMessage` an element
+/// reports is the failure of that one sibling ([`batched_item`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemMapping {
+    /// The step's own definition renders the field from the element.
+    Definition,
+    /// The step carries no definition, so the per-item envelope is read here.
+    Envelope,
+}
+
+impl ItemMapping {
+    /// How the elements of a batched answer to `step` are read onto their siblings' fields.
+    fn of(step: &PipelineStep) -> Self {
+        match step.has_definition() {
+            true => Self::Definition,
+            false => Self::Envelope,
+        }
+    }
+}
+
 /// The members that envelope carries, and only those: an element whose members are all drawn
 /// from them is one item's envelope, and an element carrying anything else is one item's value
 /// as it stands.
@@ -1176,7 +1202,12 @@ impl Execution<'_> {
         let recorded = self.recorded_step(&step.name);
         self.record_request(recorded, &loggable_event(&context));
         let answered = self
-            .lambda_results(&data_source, vec![context], batches(step.max_batch_size))
+            .lambda_results(
+                &data_source,
+                vec![context],
+                batches(step.max_batch_size),
+                ItemMapping::Envelope,
+            )
             .await?
             .into_iter()
             .next()
@@ -1451,7 +1482,7 @@ impl Execution<'_> {
                     .is_some_and(|operation| operation == BATCH_INVOKE_OPERATION)
                     || batches(step.max_batch_size);
                 let invoked = match self
-                    .lambda_results(&data_source, vec![payload()], batched)
+                    .lambda_results(&data_source, vec![payload()], batched, ItemMapping::Definition)
                     .await
                 {
                     Ok(results) => results
@@ -1529,6 +1560,9 @@ impl Execution<'_> {
     /// answers anything but a list of exactly as many elements as it was given has answered
     /// nothing usable for the siblings it merged, which is reported rather than guessed at.
     ///
+    /// `mapping` says who reads one element onto the field of the sibling it belongs to
+    /// ([`ItemMapping`]).
+    ///
     /// The invocation is made only where the data source's own service role may make it
     /// ([`lambda::role_refusal`]) — "the system assumes this role when accessing the data
     /// source" — and a run whose handler RAISED is reported as the error that handler raised:
@@ -1538,6 +1572,7 @@ impl Execution<'_> {
         data_source: &StepDataSource,
         events: Vec<Json>,
         batched: bool,
+        mapping: ItemMapping,
     ) -> Result<Vec<Result<Json, Failure>>, Failure> {
         let Some(configured) = data_source.function_arn.as_deref() else {
             return Err(
@@ -1581,7 +1616,11 @@ impl Execution<'_> {
         let Some(elements) = answered.as_array().filter(|list| list.len() == events.len()) else {
             return Err(format!("{NOT_A_BATCHED_ANSWER} {}.", events.len()).into());
         };
-        Ok(elements.iter().cloned().map(batched_item).collect())
+        Ok(elements
+            .iter()
+            .cloned()
+            .map(|element| batched_item(element, mapping))
+            .collect())
     }
 
     /// The resolver of `field` where it BATCHES its siblings' resolutions with this one, or
@@ -1779,12 +1818,17 @@ impl Execution<'_> {
         let invoked = match (events.is_empty(), batched) {
             // Nothing to invoke for: no member produced an event at all.
             (true, _) => Ok(Vec::new()),
-            (false, true) => self.lambda_results(&data_source, events, true).await,
+            (false, true) => {
+                self.lambda_results(&data_source, events, true, ItemMapping::of(&step))
+                    .await
+            }
             // Not one invocation after all: each member's own event travels on its own.
             (false, false) => {
                 let mut answered = Vec::with_capacity(events.len());
                 for event in events {
-                    let one = self.lambda_results(&data_source, vec![event], false).await;
+                    let one = self
+                        .lambda_results(&data_source, vec![event], false, ItemMapping::of(&step))
+                        .await;
                     answered.push(match one {
                         Ok(results) => results
                             .into_iter()
@@ -1884,8 +1928,9 @@ impl Execution<'_> {
     }
 
     /// The RESPONSE half of one member, over the element of the batched answer that is its own:
-    /// what the step's definition makes of that element, or the element itself for a Direct
-    /// Lambda resolver, which has no response definition to map it through.
+    /// what the step's definition makes of that element, or — for a Direct Lambda resolver, which
+    /// has no response definition to map it through — the value AppSync itself read off the
+    /// element ([`batched_item`]).
     async fn batched_response(
         &mut self,
         step: &PipelineStep,
@@ -1894,9 +1939,11 @@ impl Execution<'_> {
         result: &Json,
         in_pipeline: bool,
     ) -> Result<Json, Failure> {
-        // The element this sibling is handed IS the data source's answer for it: a sibling
-        // whose own element reported an error is reported before its response half would run
-        // ([`batched_item`]), so nothing of a failure reaches this `ctx`.
+        // The element this sibling is handed IS the data source's answer for it, as the function
+        // returned it: a definition renders the field from that element, which is how one
+        // reading the per-item envelope's own `data` reads it. A sibling whose own element
+        // reported an error is reported before its response half would run ([`batched_item`]),
+        // so nothing of a failure reaches this `ctx`.
         let context = step_context(
             base,
             stash,
@@ -2220,17 +2267,21 @@ fn batches(max_batch_size: i32) -> bool {
 
 /// ONE element of a batched answer, as the result of the sibling it belongs to.
 ///
-/// An element is either the sibling's VALUE as it stands, or the per-item ENVELOPE the answer
-/// may report each item in: `data` carrying that item's own value, beside the `errorMessage`
-/// and `errorType` an item that failed is reported under ([`item_envelope`] tells the two
-/// apart). So an envelope resolves its sibling from the value `data` carries and nothing else
-/// of the envelope reaches the result.
+/// The element IS that sibling's own answer from the data source — the answer carries one per
+/// merged resolution — so it is what resolves that sibling and nothing else of the answer is.
+/// Where the step carries a DEFINITION, the element travels on as the `ctx.result` that
+/// definition renders the field from, envelope and all, because reading the per-item envelope
+/// (`$ctx.result.data`) is what such a definition is written to do. Where the step carries none
+/// — the Direct Lambda resolver, which has no definition to read it with — the ENVELOPE is read
+/// here: the value is the `data` it carries, and nothing else of the envelope reaches the
+/// result. An element that is no envelope at all is the item's value as it stands
+/// ([`item_envelope`] tells the two apart).
 ///
 /// An element that REPORTS AN ERROR OF ITS OWN ITEM — one carrying `errorMessage`, with
 /// `errorType` naming its class where the function named one — is the one sibling that did not
-/// resolve: it reports that error under its own path and resolves to nothing, and no other
-/// sibling of the invocation is affected.
-fn batched_item(element: Json) -> Result<Json, Failure> {
+/// resolve, whichever way the rest of the answer is read: it reports that error under its own
+/// path and resolves to nothing, and no other sibling of the invocation is affected.
+fn batched_item(element: Json, mapping: ItemMapping) -> Result<Json, Failure> {
     let member = |name: &str| {
         element
             .get(name)
@@ -2245,12 +2296,12 @@ fn batched_item(element: Json) -> Result<Json, Failure> {
             ..Raised::default()
         })));
     }
-    match item_envelope(&element) {
-        true => Ok(element
+    match (mapping, item_envelope(&element)) {
+        (ItemMapping::Envelope, true) => Ok(element
             .get(ITEM_DATA_MEMBER)
             .cloned()
             .unwrap_or(Json::Null)),
-        false => Ok(element),
+        _ => Ok(element),
     }
 }
 
@@ -3184,73 +3235,103 @@ mod tests {
         );
     }
 
-    /// One element of a batched answer is either the per-item ENVELOPE — whose `data` is the
-    /// item's own value, beside the error an item that failed is reported under — or that
-    /// item's value as it stands.
+    /// One element of a batched answer is the ANSWER of the sibling it belongs to: the per-item
+    /// envelope's own `data` where AppSync itself reads the element onto the field, the element
+    /// as the function returned it where the step's definition renders the field from it, and
+    /// either way the error an item that failed reports.
     #[test]
     fn one_element_of_a_batched_answer_is_read_as_the_envelope_or_as_the_value() {
-        /// One row: what a failing assertion calls it, the element read, and what the sibling
-        /// it belongs to resolved to — `Err` carrying `(errorType, message)` for the sibling
-        /// that did not resolve.
+        /// One row: what a failing assertion calls it, who reads the element onto the field, the
+        /// element read, and what the sibling it belongs to resolved to — `Err` carrying
+        /// `(errorType, message)` for the sibling that did not resolve.
         type Element = (
             &'static str,
+            ItemMapping,
             Json,
             Result<Json, (Option<&'static str>, &'static str)>,
         );
 
-        // The rows differ along the FORM of the element: the envelope carrying a value, the
+        // The rows differ along the FORM of the element — the envelope carrying a value, the
         // envelope reporting an error of its own item (with and without a class), an envelope
-        // whose value is nothing, and the values an answer carries as they stand — an object,
-        // a scalar, a list, an empty object and one that only looks like an envelope.
-        let cases: [Element; 9] = [
+        // whose value is nothing, and the values an answer carries as they stand (an object, a
+        // scalar, an empty object and one that only looks like an envelope) — and along WHO
+        // reads it onto the field.
+        let cases: [Element; 12] = [
             (
                 "an envelope carrying the item's value",
+                ItemMapping::Envelope,
                 json!({"data": {"id": "a"}}),
                 Ok(json!({"id": "a"})),
             ),
             (
+                "an envelope a definition renders the field from",
+                ItemMapping::Definition,
+                json!({"data": {"id": "a"}}),
+                Ok(json!({"data": {"id": "a"}})),
+            ),
+            (
                 "an envelope reporting an error of its own item",
+                ItemMapping::Envelope,
+                json!({"data": null, "errorMessage": "no such item", "errorType": "NotFound"}),
+                Err((Some("NotFound"), "no such item")),
+            ),
+            (
+                "an error of its own item a definition would have been handed",
+                ItemMapping::Definition,
                 json!({"data": null, "errorMessage": "no such item", "errorType": "NotFound"}),
                 Err((Some("NotFound"), "no such item")),
             ),
             (
                 "an error of its own item that named no class",
+                ItemMapping::Envelope,
                 json!({"errorMessage": "no such item"}),
                 Err((None, "no such item")),
             ),
             (
                 "an envelope whose value is nothing",
+                ItemMapping::Envelope,
                 json!({"data": null}),
                 Ok(Json::Null),
             ),
             (
                 "an envelope with no error and every member spelled out",
+                ItemMapping::Envelope,
                 json!({"data": 7, "errorMessage": null, "errorType": null}),
                 Ok(json!(7)),
             ),
             (
+                "the same envelope a definition renders the field from",
+                ItemMapping::Definition,
+                json!({"data": 7, "errorMessage": null, "errorType": null}),
+                Ok(json!({"data": 7, "errorMessage": null, "errorType": null})),
+            ),
+            (
                 "the item's value as it stands",
+                ItemMapping::Envelope,
                 json!({"id": "a", "title": "a post"}),
                 Ok(json!({"id": "a", "title": "a post"})),
             ),
             (
                 "a value carrying a member of its own beside the envelope's",
+                ItemMapping::Envelope,
                 json!({"data": {"id": "a"}, "id": "a"}),
                 Ok(json!({"data": {"id": "a"}, "id": "a"})),
             ),
             (
                 "a value that is not an object at all",
+                ItemMapping::Envelope,
                 json!("a scalar"),
                 Ok(json!("a scalar")),
             ),
             (
                 "an object with no members, which reports no item",
+                ItemMapping::Envelope,
                 json!({}),
                 Ok(json!({})),
             ),
         ];
-        for (case, element, expected) in cases {
-            let actual = batched_item(element);
+        for (case, mapping, element, expected) in cases {
+            let actual = batched_item(element, mapping);
             match (&actual, &expected) {
                 (Ok(value), Ok(wanted)) => assert_eq!(
                     value, wanted,
