@@ -891,17 +891,17 @@ fn update_item(
     }
     crate::state::canonicalize_item(&mut item).map_err(lift)?;
     // A statement states its change without an expression, so nothing is charged on top of
-    // the item it leaves ([`crate::state::update_size_exceeded`]).
-    if crate::state::update_size_exceeded(&item, 0) {
-        return Err(crate::scaffolded::Scaffolded::validation(
-            crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
-        ));
+    // the item it leaves ([`crate::state::update_size_exceeded`]) beyond what its key portion
+    // is charged.
+    {
+        let table = store.active_table(region, name, now).map_err(lift)?;
+        if crate::state::update_size_exceeded(table, &item, 0) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
+            ));
+        }
+        table.check_index_keys_of_update(&item).map_err(lift)?;
     }
-    store
-        .active_table(region, name, now)
-        .map_err(lift)?
-        .check_index_keys_of_update(&item)
-        .map_err(lift)?;
     store
         .put_item(region, name, now, key, item.clone())
         .map_err(lift)?;

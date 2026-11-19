@@ -782,15 +782,17 @@ fn update_item(
     }
     crate::state::canonicalize_item(&mut item)?;
     // A statement states its change without an expression, so nothing is charged on top of
-    // the item it leaves ([`crate::state::update_size_exceeded`]).
-    if crate::state::update_size_exceeded(&item, 0) {
-        return Err(SlotFailure::validation(
-            crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
-        ));
+    // the item it leaves ([`crate::state::update_size_exceeded`]) beyond what its key portion
+    // is charged.
+    {
+        let table = store.active_table(region, name, now)?;
+        if crate::state::update_size_exceeded(table, &item, 0) {
+            return Err(SlotFailure::validation(
+                crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
+            ));
+        }
+        table.check_index_keys_of_update(&item)?;
     }
-    store
-        .active_table(region, name, now)?
-        .check_index_keys_of_update(&item)?;
     let capacity = store
         .active_table(region, name, now)?
         .write_capacity(before.as_ref(), Some(&item));

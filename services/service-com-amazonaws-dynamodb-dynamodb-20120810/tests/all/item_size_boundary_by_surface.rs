@@ -2,22 +2,24 @@
 
 //! The item-size boundary a change to a stored item is held to, per SURFACE.
 //!
-//! The rule under test: a change is refused when the item it would leave behind crosses the
-//! documented 400 KB (409,600-byte) item ceiling, charged over the bytes the item stores —
-//! "the lengths of its attribute names and values" ("Item sizes and formats"), its key
-//! attributes among them, and nothing else. So the item exactly AT 409,600 stored bytes is
-//! written and read back whole, and the same change one byte longer is refused 400
-//! `ValidationException` with the sentence the update path words that quota with, leaving the
-//! stored item where it was.
+//! The rule under test: a change is refused when what the item it would leave behind is
+//! CHARGED crosses the documented 400 KB (409,600-byte) item ceiling, charged over the bytes
+//! the item stores — "the lengths of its attribute names and values" ("Item sizes and
+//! formats"), its key attributes among them — with the primary-key portion charged at a
+//! minimum of `state::KEY_PORTION_FLOOR_BYTES` whatever it actually holds. So the item charged
+//! exactly 409,600 bytes is written and read back whole, and the same change one byte longer is
+//! refused 400 `ValidationException` with the sentence the update path words that quota with,
+//! leaving the stored item where it was.
 //!
 //! The rows span what the rule generalises over: the SURFACE the change is stated through —
 //! an `UpdateExpression`, the legacy `AttributeUpdates` map, and a PartiQL `UPDATE` — crossed
-//! with how long the item's key portion is, which is what moves the boundary and the only
-//! thing that does. A PartiQL `INSERT`, which carries a whole item rather than a change to
-//! one, is driven at the same boundary beside them.
+//! with how long the item's key portion is, below the key floor and past it. A PartiQL
+//! `INSERT`, which carries a whole item rather than a change to one, is driven beside them at
+//! the FLAT ceiling a carried item is held to, which has no key floor of its own.
 //!
 //! Source of the ceiling: "Service, Account, and Table Quotas" in the Amazon DynamoDB
-//! Developer Guide ("The maximum item size in DynamoDB is 400 KB").
+//! Developer Guide ("The maximum item size in DynamoDB is 400 KB"); the key portion's floor on
+//! the update path is measured behavior (`state::KEY_PORTION_FLOOR_BYTES`).
 
 use serde_json::{json, Value};
 
@@ -26,6 +28,10 @@ use crate::table_items::create_active_table;
 
 /// The documented item ceiling, 400 KB.
 const MAX_ITEM_BYTES: usize = 400 * 1024;
+
+/// The least an item's primary-key portion is charged against that ceiling on the update
+/// path, as the service states it (`state::KEY_PORTION_FLOOR_BYTES`).
+const KEY_PORTION_FLOOR: usize = 22;
 
 /// AWS's fixed sentence for a CHANGE that would leave the item past the ceiling.
 const UPDATE_TOO_BIG: &str = "Item size to update has exceeded the maximum allowed size";
@@ -144,9 +150,9 @@ async fn stored_length(
     read["Item"][WRITTEN]["S"].as_str().map(str::len)
 }
 
-/// RULE: on every surface a change is stated through, the item at exactly the documented
-/// ceiling is stored and the same change one byte longer is refused, whatever the item's key
-/// portion is — the boundary moves with the bytes the item holds and with nothing else.
+/// RULE: on every surface a change is stated through, the item charged exactly the documented
+/// ceiling is stored and the same change one byte longer is refused — with the key portion
+/// charged at its floor, so a key below that floor buys no headroom.
 #[tokio::test]
 async fn a_change_tops_out_at_the_documented_item_ceiling_on_every_surface() {
     let router = emulator();
@@ -167,9 +173,11 @@ async fn a_change_tops_out_at_the_documented_item_ceiling_on_every_surface() {
             )
             .await;
 
-            // The bytes the item holds besides the operand: the key attribute's name and
-            // value, and the written attribute's name.
-            let fixed = shape.attribute.len() + key_value.len() + WRITTEN.len();
+            // The bytes the item is charged besides the operand: the written attribute's
+            // name, and what the key portion is charged — its own bytes once they fill the
+            // floor, and the floor while they do not.
+            let key_charge = (shape.attribute.len() + key_value.len()).max(KEY_PORTION_FLOOR);
+            let fixed = key_charge + WRITTEN.len();
             let at_the_ceiling = MAX_ITEM_BYTES - fixed;
 
             let (status, body) = call(
@@ -180,7 +188,7 @@ async fn a_change_tops_out_at_the_documented_item_ceiling_on_every_surface() {
             .await;
             assert_eq!(
                 status, 200,
-                "case {case:?}: expected the item at {MAX_ITEM_BYTES} stored bytes to be \
+                "case {case:?}: expected the item charged {MAX_ITEM_BYTES} bytes to be \
                  written, got {status} with {}",
                 message(&body)
             );

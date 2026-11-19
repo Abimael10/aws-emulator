@@ -2204,6 +2204,11 @@ const MAX_ITEM_BYTES: usize = 400 * 1024;
 /// The name of the partition key the rows address their items by.
 const CEILED_KEY: &str = "pk";
 
+/// The least an item's primary-key portion is charged against the item ceiling on the update
+/// path, as the service states it (`state::KEY_PORTION_FLOOR_BYTES`) — measured behavior, so a
+/// key portion shorter than this buys no headroom.
+const KEY_PORTION_FLOOR: usize = 22;
+
 /// One row of the ceiling table: which key it writes to, the attribute the update writes,
 /// an attribute the item already holds before the update, and whether the update travels in
 /// the legacy `AttributeUpdates` map rather than in an `UpdateExpression`.
@@ -2218,16 +2223,18 @@ struct Ceiling {
 }
 
 impl Ceiling {
-    /// The bytes the stored item is CHARGED besides the operand this row's update writes:
-    /// the partition key's own name and value, the written attribute's name, and anything the
-    /// item already holds — the sum "of the lengths of its attribute names and values" ("Item
-    /// sizes and formats") that the operand has to complete.
+    /// The bytes the stored item is CHARGED besides the operand this row's update writes: what
+    /// the partition key's name and value are charged (their own bytes once they fill
+    /// [`KEY_PORTION_FLOOR`], and that floor while they do not), the written attribute's name,
+    /// and anything the item already holds — the sum "of the lengths of its attribute names and
+    /// values" ("Item sizes and formats") that the operand has to complete.
     fn charged_besides_the_operand(&self) -> usize {
         let seeded = self
             .seeded
             .as_ref()
             .map_or(0, |(name, value)| name.len() + value.len());
-        CEILED_KEY.len() + self.key.len() + self.attribute.len() + seeded
+        let key_bytes = CEILED_KEY.len() + self.key.len();
+        key_bytes.max(KEY_PORTION_FLOOR) + self.attribute.len() + seeded
     }
 
     /// The `UpdateItem` body that writes an operand of `operand` bytes, in whichever member
@@ -2250,12 +2257,12 @@ impl Ceiling {
     }
 }
 
-/// RULE: a single-clause `UpdateItem` is sized against the documented item ceiling over the
-/// bytes the item it leaves behind stores — its key attribute's name and value among them,
-/// charged exactly as stored — and nothing else, and the ceiling is a BOUND: the item exactly
-/// AT it is stored and one byte more is refused with the update path's own sentence for that
-/// quota. The clause every update carries is the baseline the per-clause frames of RULE 10 are
-/// differences from, so it costs the operand nothing.
+/// RULE: a single-clause `UpdateItem` is sized against the documented item ceiling over what
+/// the item it leaves behind is CHARGED — its non-key bytes plus what its key portion is
+/// charged, which is at least [`KEY_PORTION_FLOOR`] — and nothing else, and the ceiling is a
+/// BOUND: the item charged exactly the ceiling is stored and one byte more is refused with the
+/// update path's own sentence for that quota. The clause every update carries is the baseline
+/// the per-clause frames of RULE 10 are differences from, so it costs the operand nothing.
 ///
 /// The rows differ along what the rule generalises over: the member the update travels in
 /// (`UpdateExpression` and the legacy `AttributeUpdates`), the length of the attribute name

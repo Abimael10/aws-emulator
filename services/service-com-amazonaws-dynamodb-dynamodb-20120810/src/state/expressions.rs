@@ -2763,10 +2763,10 @@ impl ParsedUpdate {
     /// The frames are DIFFERENCES, each read off the boundary of a write that already carries
     /// one assignment ([`super::request_shape`]), so the clause that write carries is the
     /// baseline and costs nothing: a single-clause update is sized against the item ceiling
-    /// over the bytes the item it leaves stores and nothing besides, which is where AWS stops
-    /// one — at the ceiling itself, the item exactly at it stored and one byte more refused.
-    /// What a frame says is how much SHORTER the operand gets when a further clause is
-    /// stated, which is what [`BASELINE_CLAUSE_CHARGE`] takes back out of the sum.
+    /// over what the item it leaves is charged and nothing besides
+    /// ([`super::update_charged_size`]). What a frame says is how much SHORTER the operand gets
+    /// when a further clause is stated, which is what [`BASELINE_CLAUSE_CHARGE`] takes back out
+    /// of the sum.
     pub fn request_shape_charge(&self) -> i64 {
         let mut charge: i64 = 0;
         for action in &self.actions {

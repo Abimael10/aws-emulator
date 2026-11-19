@@ -573,29 +573,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(lift)?;
         }
         crate::state::canonicalize_item(&mut item).map_err(lift)?;
-        // What the update ASKED FOR is sized, not only what it leaves behind: the stored
-        // item plus the frame each clause of the request costs
-        // ([`crate::state::ParsedUpdate::request_shape_charge`]), so the largest operand
-        // one write may carry moves with the clauses stated beside it. The item itself is
-        // charged the bytes it stores against the flat quota
-        // ([`crate::state::update_size_exceeded`]), so the boundary is the same whatever
-        // the item is keyed by.
-        if crate::state::update_size_exceeded(&item, update.request_shape_charge()) {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
-            ));
+        {
+            let table = store.active_table(&region, &name, now).map_err(lift)?;
+            // What the update ASKED FOR is sized, not only what it leaves behind: the
+            // stored item plus the frame each clause of the request costs
+            // ([`crate::state::ParsedUpdate::request_shape_charge`]), so the largest
+            // operand one write may carry moves with the clauses stated beside it. The item
+            // itself is charged its non-key bytes plus what its key portion is charged
+            // ([`crate::state::update_size_exceeded`]), whose floor is why the boundary
+            // does not move between two items keyed by different numbers of bytes.
+            if crate::state::update_size_exceeded(table, &item, update.request_shape_charge()) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
+                ));
+            }
+            // The item the update leaves is held to the declared type and the documented
+            // key-value limits for every index key it would be projected into, exactly as
+            // the same item written by a `PutItem` is: an update must not leave an item an
+            // index cannot represent. An EMPTY index key is the one of the three the update
+            // is told about as the update's own defect
+            // ([`crate::state::Table::check_index_keys_of_update`]).
+            table.check_index_keys_of_update(&item).map_err(lift)?;
         }
-        // The item the update leaves is held to the declared type and the documented
-        // key-value limits for every index key it would be projected into, exactly as
-        // the same item written by a `PutItem` is: an update must not leave an item an
-        // index cannot represent. An EMPTY index key is the one of the three the update
-        // is told about as the update's own defect
-        // ([`crate::state::Table::check_index_keys_of_update`]).
-        store
-            .active_table(&region, &name, now)
-            .map_err(lift)?
-            .check_index_keys_of_update(&item)
-            .map_err(lift)?;
 
         // The write is ADMITTED before it lands, against the capacity the table is
         // provisioned for and the per-partition-key ceiling beneath it: a write neither

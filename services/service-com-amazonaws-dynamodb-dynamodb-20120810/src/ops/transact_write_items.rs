@@ -541,19 +541,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .map_err(crate::state::unenveloped)
                         .map_err(lift)?;
                     // Sized over what this element ASKED FOR, exactly as the single-item
-                    // `UpdateItem` of the same expression is: the bytes the stored item
-                    // holds against the flat quota
+                    // `UpdateItem` of the same expression is: the item's non-key bytes plus
+                    // what its key portion is charged
                     // ([`crate::state::update_size_exceeded`]) plus the frame each clause
                     // of the update costs
                     // ([`crate::state::ParsedUpdate::request_shape_charge`]). The refusal is
                     // the CALL's, not one element's cancellation: the element states a write
                     // no item could hold.
-                    if crate::state::update_size_exceeded(&item, applied.request_shape_charge()) {
+                    if crate::state::update_size_exceeded(
+                        table,
+                        &item,
+                        applied.request_shape_charge(),
+                    ) {
                         return Err(crate::scaffolded::Scaffolded::validation(
                             crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
                         ));
                     }
-                    let table = store.active_table(&region, &name, now).map_err(lift)?;
                     table.check_index_key_types(&item).map_err(keying)?;
                     table
                         .check_index_key_values_of_update(&item)

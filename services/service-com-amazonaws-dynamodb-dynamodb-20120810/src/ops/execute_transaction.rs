@@ -835,13 +835,13 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                             .map_err(lift)?;
                     }
                     crate::state::canonicalize_item(&mut item).map_err(lift)?;
-                    if crate::state::update_size_exceeded(&item, 0) {
-                        return Err(crate::scaffolded::Scaffolded::validation(
-                            crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
-                        ));
-                    }
                     {
                         let table = store.active_table(region, &name, now).map_err(lift)?;
+                        if crate::state::update_size_exceeded(table, &item, 0) {
+                            return Err(crate::scaffolded::Scaffolded::validation(
+                                crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
+                            ));
+                        }
                         table.check_index_key_types(&item).map_err(keying)?;
                         table
                             .check_index_key_values_of_update(&item)
