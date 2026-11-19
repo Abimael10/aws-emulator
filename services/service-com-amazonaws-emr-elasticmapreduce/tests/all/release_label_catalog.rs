@@ -16,7 +16,9 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_emr_elasticmapreduce::state::catalog_release_labels;
+use service_com_amazonaws_emr_elasticmapreduce::state::{
+    catalog_release, catalog_release_labels, FIRST_AMAZON_LINUX_2_RELEASE,
+};
 use service_com_amazonaws_emr_elasticmapreduce::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -118,7 +120,13 @@ const OS_GENERATION_ROWS: &[(&str, &str)] = &[
     ("emr-6.15.0", "2.0."),
     ("emr-7.0.0", "2023."),
     ("emr-7.5.0", "2023."),
+    ("emr-7.14.0", "2023."),
 ];
+
+/// The releases the catalog publishes from BEFORE the Amazon Linux 2 generation, which
+/// offer no Amazon Linux release at all: the 4.x series and the 5.x releases before
+/// `emr-5.30.0`.
+const NO_OS_RELEASE_ROWS: &[&str] = &["emr-4.2.0", "emr-4.9.6", "emr-5.0.0", "emr-5.29.0"];
 
 /// `MaxResultsNumber`'s published range is 1..100 (`smithy_query(query="operation",
 /// operation="DescribeReleaseLabel")`), so both bounds are accepted and the value one
@@ -270,6 +278,19 @@ async fn every_offered_release_label_reports_its_applications_and_os_releases() 
         );
 
         let os_releases = os_release_labels(&payload);
+        // A release offers a CHOICE of Amazon Linux release only from the generation that
+        // publishes one: a release the catalog publishes from before Amazon Linux 2 offers
+        // none, and every release from that point on offers them in the documented form.
+        let release = catalog_release(label)
+            .unwrap_or_else(|| panic!("case {label:?}: the catalog resolves the label it offers"));
+        if release < FIRST_AMAZON_LINUX_2_RELEASE {
+            assert!(
+                os_releases.is_empty(),
+                "case {label:?}: a release published before Amazon Linux 2 offers no Amazon \
+                 Linux release to choose between, got {os_releases:?}"
+            );
+            continue;
+        }
         assert!(
             !os_releases.is_empty(),
             "case {label:?}: an Amazon EMR release offers Amazon Linux releases, got {payload}"
@@ -354,6 +375,15 @@ async fn os_releases_follow_the_amazon_linux_generation_of_the_release() {
                     .iter()
                     .all(|os_release| os_release.starts_with(prefix)),
             "case {label:?}: expected Amazon Linux releases starting {prefix:?}, got {os_releases:?}"
+        );
+    }
+
+    for label in NO_OS_RELEASE_ROWS {
+        let os_releases = os_release_labels(&emr.describe(label).await);
+        assert!(
+            os_releases.is_empty(),
+            "case {label:?}: a release published before Amazon Linux 2 offers none, got \
+             {os_releases:?}"
         );
     }
 }

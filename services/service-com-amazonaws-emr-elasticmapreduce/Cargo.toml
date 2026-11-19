@@ -106,6 +106,9 @@ hex = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Every `tests/all/<name>.rs` is compiled as a suite of the one integration-test target
+# rooted at `tests/all/main.rs`, which declares them through this crate.
+automod = { workspace = true }
 # A step's state changes are published onto the account's default EventBridge bus and routed
 # from there, so the suite that asserts them mounts EventBridge and Amazon SQS beside Amazon
 # EMR on ONE engine and reads each event back off the queue a rule delivered it to — the

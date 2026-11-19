@@ -87,8 +87,10 @@ pub fn effective_unhealthy_node_replacement(primary_nodes: i64, requested: Optio
 /// offers for that generation ([`os_releases_for`], the same catalog
 /// `DescribeReleaseLabel` publishes under `AvailableOSReleases`).
 ///
-/// A launch that named no Amazon EMR release at all names no generation to resolve, so such
-/// a cluster states no Amazon Linux release rather than one invented for it.
+/// A launch that named no Amazon EMR release at all names no generation to resolve, and a
+/// release published before the Amazon Linux 2 generation offers no Amazon Linux release to
+/// choose between, so such a cluster states no Amazon Linux release rather than one
+/// invented for it.
 pub fn effective_os_release_label(
     release_label: Option<&str>,
     requested: Option<String>,
@@ -96,8 +98,8 @@ pub fn effective_os_release_label(
     if let Some(named) = requested {
         return Some(named);
     }
-    let (major, _, _) = release_label.and_then(catalog_release)?;
-    os_releases_for(major)
+    let release = release_label.and_then(catalog_release)?;
+    os_releases_for(release)
         .iter()
         .next_back()
         .map(|&label| label.to_string())

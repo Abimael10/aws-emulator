@@ -590,7 +590,10 @@ pub const INSTANCE_FAMILIES: &[InstanceFamilySpec] = &[
         current_generation: false,
         architecture: architecture::X86_64,
         ebs_optimized_by_default: true,
-        introduced_in: &[(5, 0, 0)],
+        // The 4.x series offers this family too: it is the generation those releases were
+        // published alongside, so the oldest releases the catalog publishes provision from
+        // it.
+        introduced_in: &[(4, 2, 0), (5, 0, 0)],
     },
     InstanceFamilySpec {
         family: "r4",

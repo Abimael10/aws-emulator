@@ -183,9 +183,13 @@ fn assert_refused(case: &str, status: u16, payload: &Value) {
 /// over. SOURCE: the Amazon EMR Management Guide's "Supported instance types" table,
 /// mirrored by `crate::state::INSTANCE_FAMILIES`.
 const RELEASE_FILTER: &[(&str, &str, bool)] = &[
-    // The fifth generation is supported by every release the catalog offers (the
-    // oldest is emr-5.30.0, later than the emr-5.13.0/emr-5.20.0 releases that
-    // introduced those families).
+    // The fifth generation reaches emr-5.13.0, so the releases below that point do not
+    // report it however new the catalog's oldest release is, and the previous generation
+    // the 4.x series was published alongside is reported by those releases instead.
+    ("emr-5.12.0", "m5.xlarge", false),
+    ("emr-5.13.0", "m5.xlarge", true),
+    ("emr-4.9.5", "m5.xlarge", false),
+    ("emr-4.9.5", "m4.xlarge", true),
     ("emr-5.30.0", "m5.xlarge", true),
     ("emr-5.30.0", "c5.9xlarge", true),
     ("emr-5.30.0", "r5.xlarge", true),
@@ -552,11 +556,11 @@ async fn every_row_reports_its_family_and_generation_class() {
 /// its own copy.
 pub(crate) const BAD_RELEASE_LABELS: &[&str] = &[
     "emr-6.99.0",
-    "emr-5.13.0",
+    "emr-5.13.2",
     "emr-6.15.1",
     "emr-7.90.0",
     "emr-999.0.0",
-    "emr-4.9.5",
+    "emr-4.1.0",
     "emr-6.15",
     "emr-6.15.0.1",
     "6.15.0",
@@ -656,11 +660,14 @@ async fn reading_the_catalog_changes_nothing() {
 /// supported by every later release of that series.
 ///
 /// The cases are the WHOLE space of labels in a bounded box — every
-/// `emr-<major>.<minor>.<patch>` for `major 5..=7`, `minor 0..=40`, `patch 0..=3` — with
+/// `emr-<major>.<minor>.<patch>` for `major 5..=7`, `minor 0..=40`, `patch 0..=4` — with
 /// the expectation taken from the service's own release catalog
 /// (`state::catalog_release_labels`, the one `DescribeReleaseLabel` reads) rather than
 /// from a second hand-written list: a label the catalog offers must answer 200, every
-/// other label in the box must be refused 400 `InvalidRequestException`.
+/// other label in the box must be refused 400 `InvalidRequestException`. The catalog also
+/// publishes releases OUTSIDE the box — the 4.x series and the families whose labels are
+/// not of the `emr-<major>.<minor>.<patch>` form — so the count below is of the labels the
+/// box holds.
 #[tokio::test]
 async fn a_later_release_of_a_series_supports_at_least_as_much() {
     let emr = Emr::new();
@@ -670,12 +677,28 @@ async fn a_later_release_of_a_series_supports_at_least_as_much() {
         "the service's release catalog must offer the Amazon EMR releases, got {offered:?}"
     );
     let mut checked = 0usize;
+    // The labels of the catalog the walked box holds, read off the catalog itself: what the
+    // walk below must have checked by the time it ends.
+    let offered_in_box = offered
+        .iter()
+        .filter(|label| {
+            label
+                .strip_prefix("emr-")
+                .map(|version| version.split('.').collect::<Vec<&str>>())
+                .is_some_and(|parts| {
+                    parts.len() == 3
+                        && matches!(parts[0].parse::<u32>(), Ok(major) if (5..=7).contains(&major))
+                        && matches!(parts[1].parse::<u32>(), Ok(minor) if minor <= 40)
+                        && matches!(parts[2].parse::<u32>(), Ok(patch) if patch <= 4)
+                })
+        })
+        .count();
 
     for major in 5..=7u32 {
         let mut previous: Option<(String, BTreeSet<String>)> = None;
         let mut offered_in_series = 0usize;
         for minor in 0..=40u32 {
-            for patch in 0..=3u32 {
+            for patch in 0..=4u32 {
                 let label = format!("emr-{major}.{minor}.{patch}");
                 let (status, payload) = emr.page(&label, None).await;
                 if !offered.contains(&label) {
@@ -713,9 +736,14 @@ async fn a_later_release_of_a_series_supports_at_least_as_much() {
     }
 
     assert_eq!(
-        checked,
-        offered.len(),
-        "every offered release must fall inside the walked box, got {checked} of {}",
+        checked, offered_in_box,
+        "every offered release inside the walked box must have been checked, got {checked} of \
+         {offered_in_box}"
+    );
+    assert!(
+        offered_in_box < offered.len(),
+        "the catalog publishes releases outside the box too (the 4.x series and the families \
+         whose labels carry another form), got {offered_in_box} of {}",
         offered.len()
     );
 }

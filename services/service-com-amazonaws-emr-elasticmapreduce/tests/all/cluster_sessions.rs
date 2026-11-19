@@ -522,25 +522,29 @@ async fn a_session_enabled_cluster_starts_sessions_and_reports_them() {
 }
 
 /// The release family the session surface needs: a cluster launches on an Amazon EMR Spark
-/// release, and `DescribeReleaseLabel` reports what one bundles. The rows span the spellings
-/// around the one release the family offers, so a label the family does not publish is
-/// refused rather than launched.
+/// release, and `DescribeReleaseLabel` reports what one bundles. The rows span the releases
+/// the family publishes and the spellings around them, so a label the family does not
+/// publish is refused rather than launched.
 #[tokio::test]
 async fn a_cluster_launches_on_an_amazon_emr_spark_release() {
     let emr = Emr::new();
 
-    // `(the label, whether a launch may name it)`. The offered release comes from the
-    // service's own family (`state::spark_release_labels`), and the rows around it are the
-    // spellings next to it: another patch, another line, another case.
+    // `(the label, whether a launch may name it)`. The offered releases come from the
+    // service's own family (`state::spark_release_labels`), newest first, and the rows
+    // around them are the spellings next to them: another patch, another line, another
+    // case.
     let offered = spark_release_labels();
     assert_eq!(
         offered,
-        vec![SPARK_RELEASE.to_string()],
-        "the Spark family offers the release the session surface needs, got {offered:?}"
+        vec!["emr-spark-8.1.0".to_string(), SPARK_RELEASE.to_string()],
+        "the Spark family publishes its releases newest first, including the one the \
+         session surface needs, got {offered:?}"
     );
     let rows: Vec<(&str, bool)> = vec![
         (SPARK_RELEASE, true),
+        ("emr-spark-8.1.0", true),
         ("emr-spark-8.0.1", false),
+        ("emr-spark-8.2.0", false),
         ("emr-spark-7.0.0", false),
         ("emr-spark-8.0", false),
         ("emr-SPARK-8.0.0", false),

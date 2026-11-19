@@ -36,20 +36,23 @@ struct PrefixCase {
 }
 
 /// `Prefix` filters spanning the shape of the member — a whole series, a partial
-/// minor, the bare `emr-` stem, the empty prefix every label starts with, and
+/// minor, the bare `emr-` stem, the empty prefix every label starts with, the prefix of
+/// a family whose labels are not of the `emr-<major>.<minor>.<patch>` form, and
 /// prefixes outside the published releases. "Optional release label version prefix
 /// filter. For example, `emr-5`." (`ReleaseLabelFilter$Prefix` doc.)
 const PREFIX_FILTERS: &[PrefixCase] = &[
     PrefixCase { prefix: "", matches_something: true },
     PrefixCase { prefix: "emr", matches_something: true },
     PrefixCase { prefix: "emr-", matches_something: true },
+    PrefixCase { prefix: "emr-4", matches_something: true },
     PrefixCase { prefix: "emr-5", matches_something: true },
     PrefixCase { prefix: "emr-6", matches_something: true },
     PrefixCase { prefix: "emr-7", matches_something: true },
     PrefixCase { prefix: "emr-6.1", matches_something: true },
     PrefixCase { prefix: "emr-5.3", matches_something: true },
-    // No 4.x release is in the catalog, and neither is a label of another form.
-    PrefixCase { prefix: "emr-4", matches_something: false },
+    PrefixCase { prefix: "emr-spark", matches_something: true },
+    // No release is published under these prefixes, and neither is a label of another
+    // form.
     PrefixCase { prefix: "emr-99", matches_something: false },
     PrefixCase { prefix: "EMR-6", matches_something: false },
     PrefixCase { prefix: "not-a-release", matches_something: false },
@@ -106,36 +109,45 @@ async fn walk(emr: &Emr, case: &str, request: Value) -> (Vec<String>, Vec<Vec<St
     }
 }
 
-/// The whole catalog in the order the service reports it: one unfiltered call, which
-/// the `MaxResults` default of 100 serves in full.
+/// The whole catalog in the order the service reports it, followed to the end of the
+/// listing: the catalog is larger than one page, so the pages are rejoined here.
 async fn whole_catalog(emr: &Emr) -> Vec<String> {
-    let (labels, token) = page(emr, "no filters", json!({})).await;
-    assert!(
-        token.is_none(),
-        "case \"no filters\": the default page of 100 holds the whole catalog, \
-         so no NextToken is due, got {token:?}"
-    );
+    let (labels, pages) = walk(emr, "no filters", json!({})).await;
     assert!(
         !labels.is_empty(),
         "case \"no filters\": the Region publishes releases, got {labels:?}"
     );
+    for served in &pages {
+        assert!(
+            served.len() <= MAX_RESULTS_CEILING as usize,
+            "case \"no filters\": a page holds at most the default {MAX_RESULTS_CEILING} \
+             releases, got {} in {served:?}",
+            served.len()
+        );
+    }
     labels
 }
 
-/// The version a release label carries, as the numbers of its dotted components:
-/// labels are "in the format emr-x.x.x" (`ListSupportedInstanceTypes$ReleaseLabel`
-/// doc), and those components compare as numbers, not as text.
+/// The version a release label carries, as the numbers of its dotted components, or
+/// `None` when the label is not of that form: labels of the published series are "in the
+/// format emr-x.x.x" (`ListSupportedInstanceTypes$ReleaseLabel` doc), and those
+/// components compare as numbers, not as text, while the catalog also publishes families
+/// whose labels carry another form (a pre-GA qualifier, a prefix of their own).
+fn version_of_series(label: &str) -> Option<Vec<u32>> {
+    let body = label.strip_prefix("emr-")?;
+    let version: Option<Vec<u32>> = body
+        .split('.')
+        .map(|component| component.parse::<u32>().ok())
+        .collect();
+    version.filter(|version| version.len() == 3)
+}
+
+/// The version of a label of the published `emr-x.x.x` series, which the case must be
+/// about.
 fn version_of(case: &str, label: &str) -> Vec<u32> {
-    let body = label.strip_prefix("emr-").unwrap_or_else(|| {
-        panic!("case {case:?}: a release label is emr-x.x.x, got {label:?}")
-    });
-    body.split('.')
-        .map(|component| {
-            component.parse::<u32>().unwrap_or_else(|_| {
-                panic!("case {case:?}: every component of {label:?} is a number")
-            })
-        })
-        .collect()
+    version_of_series(label).unwrap_or_else(|| {
+        panic!("case {case:?}: a release label of the series is emr-x.x.x, got {label:?}")
+    })
 }
 
 #[tokio::test]
@@ -143,17 +155,20 @@ async fn the_catalog_is_reported_newest_release_first() {
     let emr = Emr::new();
     let labels = whole_catalog(&emr).await;
 
-    for label in &labels {
-        let version = version_of("no filters", label);
-        assert!(
-            version.len() == 3,
-            "case {label:?}: a release label carries three version components, got {version:?}"
-        );
-    }
-
-    // Strictly descending: the latest release leads, no release is reported twice.
-    for pair in labels.windows(2) {
-        let (newer, older) = (&pair[0], &pair[1]);
+    // The labels of the published `emr-x.x.x` series, in the order the listing reports
+    // them: strictly descending, so the latest release leads and no release is reported
+    // twice. The families whose labels carry another form are listed beside it and have
+    // their own ordering rule (`release_label_families.rs`).
+    let series: Vec<&String> = labels
+        .iter()
+        .filter(|label| version_of_series(label).is_some())
+        .collect();
+    assert!(
+        series.len() > 10,
+        "the catalog publishes the emr-x.x.x series, got {labels:?}"
+    );
+    for pair in series.windows(2) {
+        let (newer, older) = (pair[0], pair[1]);
         assert!(
             version_of("ordering", newer) > version_of("ordering", older),
             "case {newer:?} before {older:?}: the catalog is reported newest first, \
@@ -217,7 +232,7 @@ async fn the_prefix_filter_keeps_exactly_the_labels_that_start_with_it() {
             .filter(|release| release.starts_with(case.prefix))
             .cloned()
             .collect();
-        let (reported, token) = page(
+        let (reported, _) = walk(
             &emr,
             &label,
             json!({ "Filters": { "Prefix": case.prefix } }),
@@ -234,10 +249,6 @@ async fn the_prefix_filter_keeps_exactly_the_labels_that_start_with_it() {
             case.matches_something,
             "case {label}: expected matches_something={}, got {reported:?}",
             case.matches_something
-        );
-        assert!(
-            token.is_none(),
-            "case {label}: one page holds every match, so no NextToken is due, got {token:?}"
         );
     }
 }
@@ -273,17 +284,13 @@ async fn the_application_filter_keeps_the_releases_that_ship_it() {
 
     for case in &cases {
         let label = format!("Application={:?}", case.application);
-        let (reported, token) = page(
+        let (reported, _) = walk(
             &emr,
             &label,
             json!({ "Filters": { "Application": case.application } }),
         )
         .await;
 
-        assert!(
-            token.is_none(),
-            "case {label}: one page holds every match, so no NextToken is due, got {token:?}"
-        );
         assert_eq!(
             !reported.is_empty(),
             case.matches_something,
@@ -304,7 +311,7 @@ async fn the_application_filter_keeps_the_releases_that_ship_it() {
 
         // A version narrows: `name@version` keeps a subset of what `name` keeps.
         if let Some((name, _)) = case.application.split_once('@') {
-            let (unversioned, _) = page(
+            let (unversioned, _) = walk(
                 &emr,
                 &format!("Application={name:?}"),
                 json!({ "Filters": { "Application": name } }),
@@ -324,7 +331,7 @@ async fn the_application_filter_keeps_the_releases_that_ship_it() {
     // three ways is the same filter.
     let mut spellings = Vec::new();
     for spelling in ["hadoop", "HADOOP", "Hadoop"] {
-        let (reported, _) = page(
+        let (reported, _) = walk(
             &emr,
             &format!("Application={spelling:?}"),
             json!({ "Filters": { "Application": spelling } }),
@@ -332,17 +339,23 @@ async fn the_application_filter_keeps_the_releases_that_ship_it() {
         .await;
         spellings.push((spelling, reported));
     }
+    // Every release of the Hadoop ecosystem families ships Hadoop (the Release Guide's
+    // application tables), whatever form its label carries, so this filter drops exactly
+    // the releases of the Spark-only family — which bundles Spark alone.
+    let ships_hadoop: Vec<String> = catalog
+        .iter()
+        .filter(|release| !release.starts_with("emr-spark-"))
+        .cloned()
+        .collect();
     for (spelling, reported) in &spellings {
         assert_eq!(
             reported, &spellings[0].1,
             "case Application={spelling:?}: capitalisation must not change the match, \
              got {reported:?}"
         );
-        // Every Amazon EMR 5.x, 6.x and 7.x release ships Hadoop (the Release Guide's
-        // application tables), so this filter drops nothing.
         assert_eq!(
-            reported, &catalog,
-            "case Application={spelling:?}: every catalogued release ships Hadoop, \
+            reported, &ships_hadoop,
+            "case Application={spelling:?}: every release of the series ships Hadoop, \
              got {reported:?}"
         );
     }
@@ -420,7 +433,7 @@ async fn the_application_filter_agrees_with_describe_release_label() {
             })
             .map(|(label, _)| label.clone())
             .collect();
-        let (reported, _) = page(
+        let (reported, _) = walk(
             &emr,
             &format!("Application={application:?}"),
             json!({ "Filters": { "Application": application } }),
