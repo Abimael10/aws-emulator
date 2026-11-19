@@ -41,6 +41,14 @@
 //! failure the handler that deployed it already recorded — each failure is reported once, by
 //! whoever observed it.
 //!
+//! EVERY settle of the store runs it, and they do not all reach the same work: the rollback a
+//! stack's expired resource-signal wait owes the services that own its resources is made from
+//! the request path alone ([`super::provisioning::settle_expired_wait_failures`]), never from
+//! under the store lock. So a stack still working is reported as still working whichever call
+//! settled the store ([`progress_of`]), and the outcome a deployment concludes with is the
+//! same for a reader, for a background conclusion ([`super::stack_set_events::settle_when_due`])
+//! and for an event task — never the optimistic outcome the call that started it installed.
+//!
 //! ## Bounds
 //!
 //! One pass over the stack sets whose deployments are in flight, and one lookup per instance
@@ -56,13 +64,18 @@ use super::stack_sets::{
     detailed_status, instance_status, operation_action, operation_status, StoredStackSet,
     StoredStackSetOperation,
 };
-use super::{operation_carried_through, ComAmazonawsCloudformationCloudformationState, StoredStack};
+use super::{
+    operation_carried_through, ComAmazonawsCloudformationCloudformationState, StoredStack,
+    STATUS_TRANSITION_DELAY,
+};
 
 /// How far the stack of ONE stack instance has got with the deployment in flight.
 #[derive(Debug, Clone)]
 enum InstanceStack {
-    /// Still working, with the instant the CLOCK owes its terminal status at — the later of
-    /// the transition it is headed for and the resource-signal waits still holding it.
+    /// Still working, with the EARLIEST instant its terminal status can fall due at — the
+    /// later of the transition it is headed for and the resource-signal waits still holding
+    /// it, and never an instant already past, since a stack still working has not reached
+    /// anything yet ([`progress_of`]).
     SettlingAt(SystemTime),
     /// Still working, and what ends the wait is an owning service's own answer about a
     /// resource, which no read of this store can ask for
@@ -101,7 +114,7 @@ impl ComAmazonawsCloudformationCloudformationState {
             .stacks
             .iter()
             .filter(|stack| deploying.contains(&stack.stack_id))
-            .map(|stack| (stack.stack_id.clone(), progress_of(stack)))
+            .map(|stack| (stack.stack_id.clone(), progress_of(stack, now)))
             .collect();
         for stack_set in &mut self.stack_sets {
             apply_instance_outcomes(stack_set, &progress, now);
@@ -137,7 +150,7 @@ fn is_settling_deployment(operation: &StoredStackSetOperation) -> bool {
 }
 
 /// How far one instance's stack has got.
-fn progress_of(stack: &StoredStack) -> InstanceStack {
+fn progress_of(stack: &StoredStack, now: SystemTime) -> InstanceStack {
     let Some(pending) = stack.pending.as_ref() else {
         // Nothing is in flight on the stack, so what it is reporting is what its last
         // operation reached ([`operation_carried_through`]).
@@ -162,6 +175,27 @@ fn progress_of(stack: &StoredStack) -> InstanceStack {
         if !stack.barrier_satisfied(barrier) {
             settles_at = settles_at.max(barrier.deadline());
         }
+    }
+    // A stack still carrying the deployment whose own owed instant has ALREADY PASSED is one
+    // the clock alone will not move: what its terminal status waits for is work only a
+    // request can perform — the rollback a wait that RAN OUT owes the services that own the
+    // stack's resources ([`super::provisioning::settle_expired_wait_failures`] makes those
+    // calls, which cannot be made from under this lock). The deployment is still deploying
+    // that stack either way, so its conclusion is HELD rather than read as the success
+    // nothing reached: held to one transition span from here, the span the operation that
+    // stack's own failure opens takes, and re-read at every settle until the stack is
+    // terminal. Without this the conclusion would depend on WHICH call settles the store —
+    // a request, which materialises that failure first, or a settle that cannot.
+    //
+    // So the hold lasts as long as the work it waits for is unreachable: until the next
+    // request of the stack's own Region, which is the one call that performs it and then
+    // leaves the stack with a terminal status or a fresh due instant of its own. The
+    // deployment stays in the status it IS in meanwhile — reported RUNNING to every reader,
+    // never concluded — which is what a conclusion nothing has reached means.
+    if settles_at <= now {
+        settles_at = now
+            .checked_add(STATUS_TRANSITION_DELAY)
+            .unwrap_or(settles_at);
     }
     InstanceStack::SettlingAt(settles_at)
 }
@@ -236,7 +270,7 @@ fn apply_instance_outcomes(
         // flight for a caller that acts straight after the call.
         let not_before = operation
             .creation
-            .checked_add(crate::state::STATUS_TRANSITION_DELAY)
+            .checked_add(STATUS_TRANSITION_DELAY)
             .unwrap_or(operation.creation);
         let Some(owed) = operation.pending.as_mut() else {
             continue;
@@ -257,8 +291,8 @@ fn apply_instance_outcomes(
 /// What the stacks of the instances ONE deployment acts on have reached.
 #[derive(Debug, Default)]
 struct Reached {
-    /// The last instant a stack still being deployed is owed its terminal status at, or
-    /// `None` when every one of them is terminal.
+    /// The last instant a stack still being deployed can reach its terminal status at, at the
+    /// earliest ([`InstanceStack::SettlingAt`]), or `None` when every one of them is terminal.
     settling_at: Option<SystemTime>,
     /// One entry per instance whose stack failed: the account, the Region and the reason the
     /// instance reports.
