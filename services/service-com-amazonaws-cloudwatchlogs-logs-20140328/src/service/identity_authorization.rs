@@ -40,10 +40,14 @@
 //!    resource is read off the request alone here ([`addressed_resource`]) before anything
 //!    is looked up, so the decision cannot depend on whether that resource exists and a
 //!    refused caller learns nothing about what the account holds;
-//! 3. **where the decision is taken** — this module's [`IamAuthorized`], in front of the
-//!    dispatch [`crate::service::EmulatedService::override_operation`] hands the router.
-//!    Wrapping is what makes it ONE decision: every operation this service serves is judged
-//!    by the same rule before its handler, so no handler can forget it.
+//! 3. **where the decision is taken** — this module's [`IamAuthorized`], which every row of
+//!    the routing table this service serves its requests from is wrapped in
+//!    ([`crate::service::management_events::audited_table`]), in front of the operation that
+//!    serves the call. Wrapping is what makes it ONE decision: every operation this service
+//!    serves is judged by the same rule before its handler, so no handler can forget it.
+//!    The call this gate REFUSES is recorded as a management event of this service, because
+//!    it reaches no handler and the shared audit wrapper therefore never sees it (see
+//!    [`crate::service::management_events::record_refused_at_authorization`]).
 //!
 //! ## The resource a request is judged against
 //!
@@ -102,6 +106,7 @@ use ::std::sync::Arc;
 
 use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use ::aws_smithy_schema_server::protocol::ServerProtocol;
+use ::service_common::audited_operation::CallKind;
 use ::smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
 
 use crate::state::identity_authorization::refusal;
@@ -273,17 +278,39 @@ fn log_group_resource_wildcard(region: &str) -> String {
 /// validate -> handle -> serialize sequence and every status, code and message it answers
 /// with.
 pub struct IamAuthorized<Eng> {
+    /// The operation shape name, which is both this entry's routing key and the name of the
+    /// IAM action the request is judged under — and the `eventName` the record of a refused
+    /// call carries.
+    name: &'static str,
     /// The shared engine, so the principal's policies are read from the one store every
     /// service of this emulator shares.
     engine: Arc<Eng>,
+    /// What the wrapped operation's own semantics make of a call to it, for the record of a
+    /// call this gate REFUSES: the kind is the event's `readOnly`, so a refused read is
+    /// recorded as a read exactly as the read itself would have been. `None` for an operation
+    /// whose calls are no management events at all
+    /// ([`super::management_events::NOT_A_MANAGEMENT_EVENT`]), which has no record when it is
+    /// refused either.
+    kind: Option<CallKind>,
     /// Serves the request the decision admitted.
     served: Box<dyn ErasedOperation>,
 }
 
 impl<Eng> IamAuthorized<Eng> {
-    /// Put `served`, already constructed from the shared engine, behind the IAM decision.
-    pub fn new(engine: Arc<Eng>, served: Box<dyn ErasedOperation>) -> Self {
-        Self { engine, served }
+    /// Put `served`, already constructed from the shared engine, behind the IAM decision,
+    /// recording a refused call as a management event of `kind` where its calls are ones.
+    pub fn new(
+        name: &'static str,
+        engine: Arc<Eng>,
+        kind: Option<CallKind>,
+        served: Box<dyn ErasedOperation>,
+    ) -> Self {
+        Self {
+            name,
+            engine,
+            kind,
+            served,
+        }
     }
 
     /// The refusal as this endpoint puts it on the wire: the AWS-common
@@ -333,26 +360,35 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for IamAuthorized<Eng> {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            // WHICH operation this is, read off the routing key this protocol resolves — the
-            // same key the generated table is keyed by, so the action asked about cannot
-            // drift from the operation served. A request the key cannot be read from names
-            // no operation of this service and is left to the framework, which answers it as
-            // an unroutable request.
-            if let Ok(operation) =
-                ::aws_smithy_schema_server::rpc::routing_key_from_x_amz_target(req)
-            {
-                if !decided_by_the_operation(operation) {
-                    let resource = addressed_resource(ctx, operation, req);
-                    if let Some(message) =
-                        refusal(&*self.engine, ctx, operation, &resource)
-                    {
-                        ::tracing::info!(
-                            operation = %operation,
-                            resource = %resource,
-                            "iam does not allow this caller to perform this action"
+            // WHICH operation this is: the name this entry serves, which is the routing key
+            // the protocol resolves for it, so the action asked about cannot drift from the
+            // operation served.
+            let operation = self.name;
+            if !decided_by_the_operation(operation) {
+                let resource = addressed_resource(ctx, operation, req);
+                if let Some(message) = refusal(&*self.engine, ctx, operation, &resource) {
+                    ::tracing::info!(
+                        operation = %operation,
+                        resource = %resource,
+                        "iam does not allow this caller to perform this action"
+                    );
+                    if let Some(kind) = self.kind {
+                        // The refused call is a management event of this service too: event
+                        // history holds the calls this account's API answered, and a client
+                        // alarming on denied attempts reads exactly these. Recorded here
+                        // because the call reaches no handler, so the shared wrapper around
+                        // the operation never sees it (see [`super::management_events`]), and
+                        // as the LAST thing before the answer is rendered, with nothing
+                        // awaited in between.
+                        super::management_events::record_refused_at_authorization(
+                            &*self.engine,
+                            ctx,
+                            operation,
+                            kind,
+                            &message,
                         );
-                        return self.denied_response(&message);
                     }
+                    return self.denied_response(&message);
                 }
             }
             self.served.run(svc, req, ctx).await

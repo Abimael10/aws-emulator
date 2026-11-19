@@ -58,7 +58,12 @@ fn clause(stated: &str) -> String {
 /// text that closes it, so nothing else in the body can be rewritten: a value a caller stored,
 /// and the symbol a parser diagnostic quotes out of a submitted query string, are left as the
 /// handler wrote them even when they carry the marker's own text.
-fn substitute_request_id(body: &str, request_id: &str) -> Option<String> {
+///
+/// `pub(crate)` because the AUDIT leg states the same id in the same clause: the message a
+/// record of a failed call carries is the one the CALLER was answered with, so the record
+/// substitutes it through this same reading rather than a copy of it
+/// ([`crate::service::management_events`]).
+pub(crate) fn substitute_request_id(body: &str, request_id: &str) -> Option<String> {
     let marker = clause(crate::state::REQUEST_ID_PLACEHOLDER);
     body.contains(&marker)
         .then(|| body.replace(&marker, &clause(request_id)))

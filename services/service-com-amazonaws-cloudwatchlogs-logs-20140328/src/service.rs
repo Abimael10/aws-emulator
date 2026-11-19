@@ -184,6 +184,11 @@ pub mod stated_request_id;
 /// this service's model binds no operation for.
 pub mod http_ingestion;
 
+/// This front door's AUDIT leg: the routing table every request is served from, with each
+/// control-plane call recorded in the account's event history where CloudTrail's
+/// `LookupEvents` reads it.
+pub mod management_events;
+
 /// The operations the generated routing table cannot serve: each one's output member
 /// targets a `@streaming` union (`StartLiveTail$responseStream`,
 /// `GetLogObject$fieldStream`), so the generated shim declines the request and
@@ -641,16 +646,21 @@ pub(crate) fn constraint_envelope(violations: &[Violation]) -> Option<String> {
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    /// The generated entry, with its three framework-level error renderers wrapped so a
+    /// The generated entry, routing through this service's AUDITED table (see
+    /// [`management_events`]) and with its three framework-level error renderers wrapped so a
     /// response no operation produced still names the request it answers (see "Naming the
-    /// request a response answers"). Identity, the protocol and the operations are the
-    /// generated entry's untouched.
-    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// request a response answers"). Identity and the protocol are the generated entry's
+    /// untouched, and every operation in the audited table is the generated one behind the
+    /// IAM decision and the audit recorder.
+    entry: RequestIdEnvelopeDefinition<
+        ::service_common::audited_operation::AuditedDefinition<crate::ServiceDefinition<Eng>>,
+    >,
     /// The dispatch `override_operation` hands back, which carries the served
-    /// operation's refusal code into [`Service::override_refusal`] — behind the IAM
-    /// decision, and under the layer that names the request its response answers. Held on
-    /// the service because that seam returns a borrow of `self`.
-    refusal_scope: Dispatch<Eng>,
+    /// operation's refusal code into [`Service::override_refusal`] — under the layer that
+    /// names the request its response answers, and over the audited table whose every row is
+    /// served behind the IAM decision. Held on the service because that seam returns a borrow
+    /// of `self`.
+    refusal_scope: stated_request_id::StatedRequestIdOperation<OperationScopedRefusal>,
     /// One of this service's two event-stream operations, `StartLiveTail`. It is NOT in the
     /// entry's routing table in a servable form: the generated `ErasedOperation` shim of
     /// an operation whose output is a `@streaming` union declines the request (it cannot
@@ -669,11 +679,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     http_ingestion: http_ingestion::HttpIngestion<Eng>,
 }
 
-/// One dispatch this service hands the router: whatever serves the request, behind the IAM
-/// decision taken in front of every operation
-/// ([`identity_authorization::IamAuthorized`]) and under the layer that names the request
-/// its response answers ([`stated_request_id::StatedRequestIdOperation`]) — so neither can be
-/// forgotten for one route and taken for another.
+/// One dispatch this service hands the router for an operation the audited table cannot
+/// serve: whatever serves the request, behind the IAM decision taken in front of every
+/// operation ([`identity_authorization::IamAuthorized`]) and under the layer that names the
+/// request its response answers ([`stated_request_id::StatedRequestIdOperation`]) — so
+/// neither can be forgotten for one route and taken for another.
 type Dispatch<Eng> =
     stated_request_id::StatedRequestIdOperation<identity_authorization::IamAuthorized<Eng>>;
 
@@ -683,24 +693,47 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         // Each dispatch is built from the SAME shared engine, so the policies the decision
-        // reads and the state the operation serves from are the one store.
-        let authorized = |served: Box<dyn ErasedOperation>| {
+        // reads and the state the operation serves from are the one store. The two
+        // event-stream routes below are the operations the audited table cannot serve, so
+        // each one carries the IAM decision itself; neither is a management event
+        // ([`management_events::NOT_A_MANAGEMENT_EVENT`]), which is what `None` states.
+        let authorized = |name: &'static str, served: Box<dyn ErasedOperation>| {
             stated_request_id::StatedRequestIdOperation::new(
-                identity_authorization::IamAuthorized::new(Arc::clone(&engine), served),
+                identity_authorization::IamAuthorized::new(
+                    name,
+                    Arc::clone(&engine),
+                    None,
+                    served,
+                ),
             )
         };
+        // The table every request this service routes is served from: the generated
+        // operations, each behind the IAM decision and inside the audit recorder, so no
+        // request can be served by a path that records nothing (see [`management_events`]).
+        let audited = management_events::audited_table(&engine);
         Self {
             entry: RequestIdEnvelopeDefinition::reporting(
-                crate::ServiceDefinition::new(Arc::clone(&engine)),
+                ::service_common::audited_operation::AuditedDefinition::new(
+                    crate::ServiceDefinition::new(Arc::clone(&engine)),
+                    audited,
+                ),
                 stated_request_id::report,
             ),
-            refusal_scope: authorized(Box::new(OperationScopedRefusal)),
-            start_live_tail: authorized(Box::new(EventStreamRoute(
-                crate::ops::start_live_tail::StartLiveTail::new(Arc::clone(&engine)),
-            ))),
-            get_log_object: authorized(Box::new(EventStreamRoute(
-                crate::ops::get_log_object::GetLogObject::new(Arc::clone(&engine)),
-            ))),
+            refusal_scope: stated_request_id::StatedRequestIdOperation::new(
+                OperationScopedRefusal,
+            ),
+            start_live_tail: authorized(
+                START_LIVE_TAIL_OPERATION,
+                Box::new(EventStreamRoute(
+                    crate::ops::start_live_tail::StartLiveTail::new(Arc::clone(&engine)),
+                )),
+            ),
+            get_log_object: authorized(
+                GET_LOG_OBJECT_OPERATION,
+                Box::new(EventStreamRoute(
+                    crate::ops::get_log_object::GetLogObject::new(Arc::clone(&engine)),
+                )),
+            ),
             http_ingestion: http_ingestion::HttpIngestion::new(Arc::clone(&engine)),
         }
     }
@@ -750,10 +783,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             return Some(&self.http_ingestion as &dyn ErasedOperation);
         }
         let operation = self.definition().protocol().routing_key(req).ok()?;
-        self.definition().routing_table().get(operation)?;
-        // The exceptions are the event-stream operations, whose generated shims in that
-        // table decline the request: each is served by its hand-authored operation, which
-        // owns the whole request-to-response step and therefore words its own refusals
+        // The event-stream operations first: the generated shim of an operation whose output
+        // is a `@streaming` union declines the request, so neither is in the audited table at
+        // all and each is served by its hand-authored operation, which owns the whole
+        // request-to-response step and therefore words its own refusals
         // (`crate::ops::start_live_tail`, `crate::ops::get_log_object`) rather than
         // reaching `override_refusal`.
         if operation == START_LIVE_TAIL_OPERATION {
@@ -762,6 +795,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         if operation == GET_LOG_OBJECT_OPERATION {
             return Some(&self.get_log_object as &dyn ErasedOperation);
         }
+        self.definition().routing_table().get(operation)?;
         Some(&self.refusal_scope)
     }
 
