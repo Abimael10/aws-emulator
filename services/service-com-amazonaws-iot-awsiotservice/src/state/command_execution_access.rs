@@ -5,21 +5,27 @@
 //!
 //! `GetCommandExecution$targetArn` and `DeleteCommandExecution$targetArn` are "the ARN of
 //! the device on which the command execution is being performed" / "of the target device",
-//! i.e. `arn:<partition>:iot:<region>:<account>:thing/<name>`. The value is RESOLVED against
-//! the devices the account holds ([`ComAmazonawsIotAwsiotserviceState::command_execution_device`]),
-//! and what a value that resolves to none is refused as depends on what the value is:
+//! i.e. `arn:<partition>:iot:<region>:<account>:thing/<name>`. WHICH device such a request
+//! names is decided by the ARN ALONE ([`command_execution_target`]) — its form, its service,
+//! its partition, its account and its resource type — and what a value that names none is
+//! refused as depends on what the value is:
 //!
-//! * A value that is not an ARN at all carries no account to resolve it in, so it is a
+//! * A value that is not an ARN at all carries no account to read it in, so it is a
 //!   MALFORMED member: the modelled `ValidationException` (HTTP 400) with
 //!   [`INVALID_COMMAND_EXECUTION_TARGET_MESSAGE`].
-//! * A value that IS an ARN but names no device of the CALLER's own account — another
-//!   account's or another partition's ARN, another service's, another IoT resource type's, a
-//!   `thing/` ARN whose name no `/things/{thingName}` request could address, or one naming a
-//!   thing the account's registry does not hold — is looked for among the account's devices,
-//!   found to name none of them, and refused as an AUTHORIZATION failure: HTTP 403 with
-//!   [`TARGET_NOT_IN_ACCOUNT_MESSAGE`]. It is not a constraint violation, so a caller can
-//!   tell a permissions problem from a malformed request instead of retrying a "fixed" ARN
-//!   forever.
+//! * A value that IS an ARN but can name no device of the CALLER's own account — another
+//!   account's or another partition's ARN, another service's, another IoT resource type's, or
+//!   a `thing/` ARN whose name no `/things/{thingName}` request could address — is refused as
+//!   an AUTHORIZATION failure: HTTP 403 with [`TARGET_NOT_IN_ACCOUNT_MESSAGE`]. It is not a
+//!   constraint violation, so a caller can tell a permissions problem from a malformed request
+//!   instead of retrying a "fixed" ARN forever.
+//!
+//! What the ARN does NOT decide is whether that device HOLDS anything: the thing registry is
+//! not consulted here. A command execution can be started on a target the registry does not
+//! hold (`iot-jobs-data:StartCommandExecution` admits one), and the record it leaves is a
+//! record like any other — so whether the named device holds the named execution is the
+//! EXECUTION store's question, answered by the reader as the modelled not-found error rather
+//! than as a permissions problem the caller can never satisfy.
 
 /// How this service refuses a command-execution `targetArn` that is no ARN at all.
 ///
@@ -64,9 +70,11 @@ fn arn_account(value: &str) -> Option<&str> {
 /// caller-supplied IoT target ARN with, and the ACCOUNT field is then compared with this
 /// emulator's own account: only `arn:<partition>:iot:<region>:<this account>:thing/<name>`
 /// can name a device of the caller. Everything else is refused, as one of the two classes
-/// [`CommandExecutionTargetRefusal`] names. Whether the account's registry HOLDS that device
-/// is the registry's answer, and is added by
-/// [`super::ComAmazonawsIotAwsiotserviceState::command_execution_device`].
+/// [`CommandExecutionTargetRefusal`] names.
+///
+/// The WHOLE of the question, for every command-execution request: the thing registry is no
+/// part of it, because an execution exists for whatever device the start named, and the
+/// reader of one answers from the execution store.
 pub fn command_execution_target(
     target_arn: &str,
 ) -> Result<String, CommandExecutionTargetRefusal> {
@@ -80,28 +88,6 @@ pub fn command_execution_target(
             Ok(thing_name)
         }
         _ => Err(CommandExecutionTargetRefusal::NotInAccount),
-    }
-}
-
-impl super::ComAmazonawsIotAwsiotserviceState {
-    /// The DEVICE a command-execution request addresses, RESOLVED against the things this
-    /// account holds, or why the supplied `targetArn` names none of them.
-    ///
-    /// The whole of the question "which device is this?" in one place: the ARN has to be one
-    /// a device of this account is named by ([`command_execution_target`]) AND the registry
-    /// has to hold that device. A thing nobody created is not a device of the account, so a
-    /// request naming it is refused exactly like one naming another account's ARN — the
-    /// caller is told the target was not found in the account, and nothing of this account's
-    /// state is read, reported or removed.
-    pub fn command_execution_device(
-        &self,
-        target_arn: &str,
-    ) -> Result<String, CommandExecutionTargetRefusal> {
-        let thing_name = command_execution_target(target_arn)?;
-        if !self.things.contains_key(&thing_name) {
-            return Err(CommandExecutionTargetRefusal::NotInAccount);
-        }
-        Ok(thing_name)
     }
 }
 
@@ -129,6 +115,14 @@ mod tests {
                 "a thing ARN of this account in another region",
                 format!("arn:aws:iot:eu-west-1:{account}:thing/laser-1"),
                 Ok("laser-1".to_string()),
+            ),
+            (
+                // The registry is no part of this reading: a start admits a target the
+                // registry does not hold, so the execution it leaves has to be readable
+                // under the same ARN.
+                "a thing ARN of this account naming a device the registry does not hold",
+                format!("arn:aws:iot:us-east-1:{account}:thing/laser-never-created"),
+                Ok("laser-never-created".to_string()),
             ),
             (
                 "a thing ARN of another account",

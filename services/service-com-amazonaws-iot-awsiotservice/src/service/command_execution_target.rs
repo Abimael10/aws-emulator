@@ -4,16 +4,15 @@
 //! request's own shape, beside the IAM decision this service takes there.
 //!
 //! `GetCommandExecution` and `DeleteCommandExecution` bind `targetArn` as a query parameter,
-//! and the value is RESOLVED against the devices the account holds
-//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::command_execution_device`]). A value
-//! that names no device of this account is an AUTHORIZATION answer, and AWS answers one at the
-//! layer in front of the service — before the request's own members are constraint-checked —
-//! so a request that names a target outside the account is refused on THAT ground whatever
-//! else about it is malformed, rather than being told about a member it would also have to
-//! fix.
+//! and WHICH device the value names is read off the ARN
+//! ([`crate::state::command_execution_target`]). A value that can name no device of this
+//! account is an AUTHORIZATION answer, and AWS answers one at the layer in front of the
+//! service — before the request's own members are constraint-checked — so a request that names
+//! a target outside the account is refused on THAT ground whatever else about it is malformed,
+//! rather than being told about a member it would also have to fix.
 //!
-//! This decides nothing the operation does not decide for itself (each handler resolves the
-//! same `targetArn` through the same state before it reads or writes anything): what lives
+//! This decides nothing the operation does not decide for itself (each handler reads the same
+//! `targetArn` through the same rule before it reads or writes anything): what lives
 //! here is the ORDER, which is the only thing the centralized deserialize -> validate ->
 //! handle walk cannot express, since a handler runs only after modelled-constraint
 //! enforcement.
@@ -36,23 +35,18 @@ const TARGET_ARN_OPERATIONS: [&str; 2] = ["GetCommandExecution", "DeleteCommandE
 /// The media type this restJson1 service renders an error in.
 const JSON_CONTENT_TYPE: &str = "application/json";
 
-/// The refusal this request is answered with when its `targetArn` names no device of the
+/// The refusal this request is answered with when its `targetArn` can name no device of the
 /// account, or `None` for every request this decision does not refuse — one naming another
 /// operation, one carrying no `targetArn` at all (the framework answers the absent required
-/// member), one whose value is no ARN (the operation words that itself) and one naming a
-/// device this account holds.
-pub fn refusal<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    operation: &str,
-    req: &WireRequest,
-) -> Option<WireResponse> {
+/// member), one whose value is no ARN (the operation words that itself) and one whose ARN
+/// names a device of this account, held in the registry or not.
+pub fn refusal(operation: &str, req: &WireRequest) -> Option<WireResponse> {
     if !TARGET_ARN_OPERATIONS.contains(&operation) {
         return None;
     }
     let target_arn = super::request_query::value(req.uri(), TARGET_ARN_MEMBER)?;
-    let state = crate::state::service_state(engine)?;
     let refused = matches!(
-        state.lock().command_execution_device(&target_arn),
+        crate::state::command_execution_target(&target_arn),
         Err(crate::state::CommandExecutionTargetRefusal::NotInAccount)
     );
     refused.then(refusal_response)

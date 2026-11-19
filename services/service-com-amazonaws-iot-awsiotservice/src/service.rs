@@ -64,7 +64,7 @@
 //! `iot:<OperationName>` is refused `AccessDeniedException` (HTTP 403) and the call performs
 //! nothing ([`authorization`]). The same layer answers the one other refusal that is an
 //! authorization answer rather than a statement about a member — a command-execution
-//! `targetArn` that names no device of this account ([`command_execution_target`]).
+//! `targetArn` that can name no device of this account ([`command_execution_target`]).
 //! `override_operation` is the only seam that can run ahead of the
 //! framework's deserialize -> validate -> handle walk, which is why the gate is picked there;
 //! every request it does not refuse is served by the modelled operation the request's own
@@ -279,9 +279,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
             // constraint-checked, which is where AWS answers it
             // ([`command_execution_target`]). The operation decides the same thing for
             // itself; what is decided here is only the order.
-            if let Some(refused) =
-                command_execution_target::refusal(&*self.engine, operation, req)
-            {
+            if let Some(refused) = command_execution_target::refusal(operation, req) {
                 return refused;
             }
             match self
