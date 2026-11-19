@@ -734,6 +734,160 @@ async fn a_selector_set_outside_the_documented_rules_is_refused() {
     }
 }
 
+/// A request's selector kinds settle WHICH side of the exclusivity rule it broke, and
+/// each side carries CloudTrail's own fixed sentence for it: a request naming NEITHER
+/// kind is told it must select events with one of the two members and still cannot use
+/// both, a request naming BOTH that it may use either but not both. Both sentences are
+/// entirely fixed text for `InvalidEventSelectorsException` — neither interpolates the
+/// trail, the identifier's form, a member name or a count — so the rows vary the trail
+/// addressed, the identifier's form and what the lists carry, and every refusal leaves
+/// the trail's configured selectors alone.
+#[tokio::test]
+async fn a_request_naming_neither_or_both_selector_kinds_is_refused_in_aws_words() {
+    // The two sentences CloudTrail words these refusals with. Each is fixed text for
+    // this error class: there is no value from the request or from state in either.
+    const NEITHER_KIND: &str = "You must select events by using either EventSelectors or \
+                                AdvancedEventSelectors, but you cannot use both.";
+    const BOTH_KINDS: &str = "You can select events by using either EventSelectors or \
+                              AdvancedEventSelectors, but not both.";
+
+    let emulator = Emulator::new();
+    let arn = create_trail(
+        &emulator,
+        HOME_REGION,
+        &json!({"Name": "selector-kinds", "S3BucketName": "bucket-a"}),
+    )
+    .await;
+    let other_arn = create_trail(
+        &emulator,
+        HOME_REGION,
+        &json!({"Name": "selector-kinds-two", "S3BucketName": "bucket-b"}),
+    )
+    .await;
+    // Both trails start out carrying a selector set of their own, so a refusal that
+    // wrongly wrote would show up as a changed read.
+    let configured = json!([{
+        "ReadWriteType": "ReadOnly",
+        "IncludeManagementEvents": true,
+        "DataResources": [],
+        "ExcludeManagementEventSources": [],
+    }]);
+    for trail in ["selector-kinds", "selector-kinds-two"] {
+        emulator
+            .call(
+                "PutEventSelectors",
+                &json!({"TrailName": trail, "EventSelectors": [{"ReadWriteType": "ReadOnly"}]}),
+            )
+            .await
+            .expect_ok(&format!(
+                "PutEventSelectors on {trail}: the configuration the refusals must not disturb"
+            ));
+    }
+
+    // (case, the identifier the request addresses, the members it carries beside it,
+    //  the sentence the refusal must carry)
+    let rows: Vec<(&str, String, Value, &str)> = vec![
+        (
+            "neither kind, addressed by name",
+            "selector-kinds".to_string(),
+            json!({}),
+            NEITHER_KIND,
+        ),
+        (
+            "neither kind, addressed by trail ARN",
+            arn.clone(),
+            json!({}),
+            NEITHER_KIND,
+        ),
+        (
+            "neither kind, on another trail of the account",
+            other_arn.clone(),
+            json!({}),
+            NEITHER_KIND,
+        ),
+        (
+            "both kinds, one selector each",
+            "selector-kinds".to_string(),
+            json!({
+                "EventSelectors": selectors_with_data_resources(1, 0),
+                "AdvancedEventSelectors": advanced_selector_with_values(0, 1),
+            }),
+            BOTH_KINDS,
+        ),
+        (
+            "both kinds, the documented maximum of basic selectors beside an advanced one",
+            arn.clone(),
+            json!({
+                "EventSelectors": selectors_with_data_resources(EVENT_SELECTORS_PER_TRAIL_LIMIT, 2),
+                "AdvancedEventSelectors": advanced_selector_with_values(2, 3),
+            }),
+            BOTH_KINDS,
+        ),
+        (
+            // An empty list is a member the request CARRIES (it configures nothing),
+            // so naming both members empty names both kinds all the same.
+            "both kinds, both lists empty",
+            other_arn.clone(),
+            json!({"EventSelectors": [], "AdvancedEventSelectors": []}),
+            BOTH_KINDS,
+        ),
+        (
+            "both kinds, an empty basic list beside an advanced selector",
+            "selector-kinds-two".to_string(),
+            json!({
+                "EventSelectors": [],
+                "AdvancedEventSelectors": advanced_selector_with_values(1, 2),
+            }),
+            BOTH_KINDS,
+        ),
+    ];
+
+    for (case, trail_name, members, expected) in rows {
+        let mut request = json!({"TrailName": trail_name});
+        for (member, value) in members.as_object().expect("the row is an object") {
+            request[member] = value.clone();
+        }
+        let reply = emulator.call("PutEventSelectors", &request).await;
+        reply.expect_error(case, 400, "InvalidEventSelectorsException");
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {case}: expected {expected:?}, got {:?}",
+            reply.message()
+        );
+
+        let got = emulator
+            .call("GetEventSelectors", &json!({"TrailName": trail_name}))
+            .await;
+        assert_eq!(
+            selectors_of(got.expect_ok(case)),
+            (configured.clone(), Value::Null),
+            "case {case}: a refused request changed the configured selectors, got {got:?}"
+        );
+    }
+
+    // Exactly ONE kind is the served case, an empty list included: the refusals above
+    // are about which kinds the request names, not about what a list holds.
+    for (case, members) in [
+        ("only basic selectors", json!({"EventSelectors": selectors_with_data_resources(2, 1)})),
+        ("only an empty basic list", json!({"EventSelectors": []})),
+        (
+            "only advanced selectors",
+            json!({"AdvancedEventSelectors": advanced_selector_with_values(1, 2)}),
+        ),
+        ("only an empty advanced list", json!({"AdvancedEventSelectors": []})),
+    ] {
+        let mut request = json!({"TrailName": "selector-kinds"});
+        for (member, value) in members.as_object().expect("the row is an object") {
+            request[member] = value.clone();
+        }
+        emulator
+            .call("PutEventSelectors", &request)
+            .await
+            .expect_ok(&format!("PutEventSelectors with {case}"));
+    }
+}
+
 /// Both operations read `TrailName` as a bare name or a trail ARN: a malformed value is
 /// refused as the form it was written in, and a well-formed one naming no trail is
 /// `TrailNotFoundException`. The rows differ in the form and in which rule the value

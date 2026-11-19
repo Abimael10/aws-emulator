@@ -354,29 +354,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// How CloudTrail words the refusal of a request that names BOTH selector kinds, the
+/// rule the operation's own documentation states ("You can use either
+/// AdvancedEventSelectors or EventSelectors, but not both").
+///
+/// Entirely fixed text for this error class: it states the rule and interpolates no
+/// value from the request or from state (no trail name, ARN, member name or count).
+const BOTH_SELECTOR_KINDS_MESSAGE: &str = "You can select events by using either \
+     EventSelectors or AdvancedEventSelectors, but not both.";
+
+/// How CloudTrail words the refusal of a request that names NEITHER selector kind: the
+/// caller must select events with one of the two members, and still may not use both.
+///
+/// Fixed text for this error class in the same way
+/// [`BOTH_SELECTOR_KINDS_MESSAGE`] is — a sentence of the rule, with nothing taken from
+/// the request or from state.
+const NEITHER_SELECTOR_KIND_MESSAGE: &str = "You must select events by using either \
+     EventSelectors or AdvancedEventSelectors, but you cannot use both.";
+
 /// Read the selector set a request asks for, refusing one the documented rules do not
 /// allow. `Err` carries the refusal text for `InvalidEventSelectorsException`.
 ///
 /// "You can use either AdvancedEventSelectors or EventSelectors, but not both" — and a
-/// request naming neither configures nothing, so it is a contradiction too.
+/// request naming neither configures nothing, so it is a contradiction too. Each of the
+/// two sides of that exclusivity rule carries its own fixed sentence
+/// ([`NEITHER_SELECTOR_KIND_MESSAGE`], [`BOTH_SELECTOR_KINDS_MESSAGE`]).
 fn read_configuration(
     event_selectors: Option<Vec<EventSelector>>,
     advanced_event_selectors: Option<Vec<AdvancedEventSelector>>,
 ) -> Result<crate::state::EventSelectorConfig, String> {
     match (event_selectors, advanced_event_selectors) {
-        // The recorded refusal for a request carrying both members, which states the
+        // The refusal for a request carrying both members, which states the
         // documented rule itself ("You can use either AdvancedEventSelectors or
         // EventSelectors, but not both").
-        (Some(_), Some(_)) => Err(
-            "You can select events by using either EventSelectors or \
-             AdvancedEventSelectors, but not both."
-                .to_string(),
-        ),
-        (None, None) => Err(
-            "A PutEventSelectors request must carry either EventSelectors or \
-             AdvancedEventSelectors"
-                .to_string(),
-        ),
+        (Some(_), Some(_)) => Err(BOTH_SELECTOR_KINDS_MESSAGE.to_string()),
+        (None, None) => Err(NEITHER_SELECTOR_KIND_MESSAGE.to_string()),
         (Some(selectors), None) => Ok(crate::state::EventSelectorConfig::Basic(
             normalize_event_selectors(selectors)?,
         )),
