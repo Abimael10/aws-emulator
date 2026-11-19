@@ -20,19 +20,6 @@ pub const STATUS_SYNCHRONIZING: &str = "SYNCHRONIZING";
 /// the reason in `statusReasons`.
 pub const STATUS_FAILED: &str = "FAILED";
 
-/// Why an attempted fetch of a target's tool definitions left it [`STATUS_FAILED`]:
-/// the gateway could not read the endpoint the target names, and what the caller
-/// does about it.
-///
-/// This emulator opens no outbound connection, so no endpoint a target names can
-/// be read and every attempted fetch ends here. Nothing is invented in its place:
-/// a tool list reported for a fetch that never happened would name tools no
-/// target serves.
-pub const TOOL_DEFINITION_FETCH_FAILED: &str =
-    "Failed to fetch the tool definitions from the target endpoint. Verify that the \
-     endpoint is reachable and serves the Model Context Protocol, then synchronize the \
-     target again.";
-
 /// Whether this target's tool definitions live AT its endpoint, so a
 /// synchronization has something to fetch from there.
 ///
@@ -126,24 +113,24 @@ impl GatewayTargetRecord {
     /// instant the fetch was attempted, and the status the attempt puts the target
     /// in.
     ///
-    /// The fetch is a LIVE read of the target's own endpoint, and the outcome is
-    /// owed by the clock rather than by this call: the target reports
+    /// The fetch is a LIVE read of the target's own endpoint
+    /// ([`fetch_tool_definitions`], whose outcome `fetched` is), and that outcome
+    /// is owed by the clock rather than by this call: the target reports
     /// `SYNCHRONIZING` until the span passes, so a caller acting straight after
-    /// still sees the fetch under way. This emulator opens no outbound connection,
-    /// so no endpoint a target names can be read, and the attempt settles the way
-    /// a fetch that could not be completed does — `FAILED`, carrying the reason —
-    /// rather than reporting tool definitions nothing read.
+    /// still sees the fetch under way, and then reports what the fetch achieved —
+    /// `READY` for an endpoint that served its tool definitions, `FAILED` carrying
+    /// the reason for one that did not, never tool definitions nothing read.
     ///
     /// `lastSynchronizedAt` is the instant of the attempt itself, which is what
     /// the member reports ("The last synchronization time"), and `updatedAt` is
     /// untouched: a synchronization refreshes what the target serves rather than
     /// reconfiguring the target, which is why the shape carries the two instants
     /// separately.
-    pub fn synchronize(&mut self, now: SystemTime) {
+    pub fn synchronize(&mut self, now: SystemTime, fetched: ToolDefinitionFetch) {
         self.last_synchronized_at = Some(now);
         self.transient_status = STATUS_SYNCHRONIZING.to_string();
-        self.settled_status = STATUS_FAILED.to_string();
-        self.settled_status_reasons = vec![TOOL_DEFINITION_FETCH_FAILED.to_string()];
+        self.settled_status = fetched.settled_status.to_string();
+        self.settled_status_reasons = fetched.settled_status_reasons;
         self.settles_at = now + GATEWAY_SETTLE_DELAY;
     }
 }

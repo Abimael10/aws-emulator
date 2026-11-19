@@ -151,7 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             SynchronizeGatewayTargetsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -161,9 +160,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
+        // Everything that can be decided from stored state alone is decided under
+        // this guard, and the guard is DROPPED before the fetches below: a lock is
+        // not held across an await, and the endpoints are dialled only for a
+        // request every target of which can be synchronized.
+        //
+        // EVERY target the request names is resolved and judged before any one of
+        // them is written: a request naming a target that cannot be synchronized
+        // synchronizes none of them, so a caller never has to work out which half
+        // of its list took effect.
+        let requested = {
+            let mut store = state.lock();
+            // A gateway whose deletion the clock has already made due is gone
+            // before this call looks for it, and its targets with it.
+            store.expire_deleted_gateways_and_targets(now);
+            let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+                SynchronizeGatewayTargetsErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+                )
+            })?;
+            // A target is served BY the gateway, so the gateway has to be ready to
+            // serve it: while the clock still owes the gateway a transition
+            // (`CREATING`, `UPDATING`), or it is on its way out in `DELETING`, its
+            // targets are not synchronized, and the caller is told which status it
+            // found. The refusal is worded by the ONE helper every operation on a
+            // gateway's TARGETS shares, so they cannot drift.
+            let gateway_status = gateway.status_at(now).to_string();
+            if gateway_status != crate::state::STATUS_READY {
+                return Err(SynchronizeGatewayTargetsErrorModeled::ValidationException(
+                    crate::state::gateway_target_status_conflict(Self::NAME, &gateway_status),
+                )
+                .into());
+            }
+
+            let mut requested = Vec::new();
+            for target_id in &input.target_id_list {
+                // A target id naming no target OF THIS GATEWAY is the modelled 404:
+                // a target is addressed only through the gateway that serves it. A
+                // target whose deletion `DeleteGatewayTarget` has already accepted is
+                // on its way out and is no longer there to synchronize, so it is the
+                // same 404.
+                let target = gateway
+                    .targets
+                    .get(target_id)
+                    .filter(|target| !target.is_deleting())
+                    .ok_or_else(|| {
+                        SynchronizeGatewayTargetsErrorModeled::ResourceNotFoundException(
+                            crate::state::resource_not_found(
+                                crate::state::RESOURCE_GATEWAY_TARGET,
+                            ),
+                        )
+                    })?;
+                // This operation fetches tool definitions FROM the target's endpoint,
+                // so a target whose tools do not live there — one carrying them in its
+                // own configuration, or an MCP server pinned to a static tool schema —
+                // has nothing to fetch and is refused with the modelled validation
+                // error.
+                if !crate::state::target_discovers_tool_definitions(&target.target_configuration) {
+                    return Err(SynchronizeGatewayTargetsErrorModeled::ValidationException(
+                        crate::state::target_discovers_no_tool_definitions(
+                            &target.target_configuration,
+                        ),
+                    )
+                    .into());
+                }
+                // The endpoint the fetch is made against is read HERE, off the
+                // stored target, so the outcome written below can be matched to the
+                // configuration it was fetched for.
+                let endpoint =
+                    crate::state::discovered_tool_endpoint(&target.target_configuration)
+                        .unwrap_or_default()
+                        .to_string();
+                requested.push((
+                    target_id.clone(),
+                    endpoint,
+                    target.target_configuration.clone(),
+                ));
+            }
+            requested
+        };
+
+        // The fetch itself, made with no store guard held: an MCP session against the
+        // endpoint each target names, reaching only an endpoint this emulator
+        // publishes and serves, over the in-process transport — it opens no socket and
+        // resolves no name, so no address a stored configuration carries is reached
+        // over the network (`crate::state::fetch_tool_definitions`). What the target
+        // settles into is what its own endpoint answered rather than a status this call
+        // chose.
+        let mut fetched = Vec::with_capacity(requested.len());
+        for (target_id, endpoint, configuration) in requested {
+            let outcome = crate::state::fetch_tool_definitions(ctx, &configuration).await;
+            fetched.push((target_id, endpoint, outcome));
+        }
+
         let mut store = state.lock();
-        // A gateway whose deletion the clock has already made due is gone before
-        // this call looks for it, and its targets with it.
+        // The gateway is read again under the guard that WRITES: the guard was
+        // dropped for the fetches above, so nothing promises it is still there, nor
+        // that it is still in the status that admits the call — a `DeleteGateway` in
+        // between moves it to `DELETING`, and the clock may have made that deletion
+        // due.
         store.expire_deleted_gateways_and_targets(now);
         let gateway = store
             .gateways
@@ -174,12 +269,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         let gateway_arn = gateway.gateway_arn.clone();
-        // A target is served BY the gateway, so the gateway has to be ready to
-        // serve it: while the clock still owes the gateway a transition
-        // (`CREATING`, `UPDATING`), or it is on its way out in `DELETING`, its
-        // targets are not synchronized, and the caller is told which status it
-        // found. The refusal is worded by the ONE helper every operation on a
-        // gateway's TARGETS shares, so they cannot drift.
         let gateway_status = gateway.status_at(now).to_string();
         if gateway_status != crate::state::STATUS_READY {
             return Err(SynchronizeGatewayTargetsErrorModeled::ValidationException(
@@ -188,48 +277,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // EVERY target the request names is resolved and judged before any one of
-        // them is written: a request naming a target that cannot be synchronized
-        // synchronizes none of them, so a caller never has to work out which half
-        // of its list took effect.
-        for target_id in &input.target_id_list {
-            // A target id naming no target OF THIS GATEWAY is the modelled 404:
-            // a target is addressed only through the gateway that serves it. A
-            // target whose deletion `DeleteGatewayTarget` has already accepted is
-            // on its way out and is no longer there to synchronize, so it is the
-            // same 404.
-            let target = gateway
-                .targets
-                .get(target_id)
-                .filter(|target| !target.is_deleting())
-                .ok_or_else(|| {
-                    SynchronizeGatewayTargetsErrorModeled::ResourceNotFoundException(
-                        crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
-                    )
-                })?;
-            // This operation fetches tool definitions FROM the target's endpoint,
-            // so a target whose tools do not live there — one carrying them in its
-            // own configuration, or an MCP server pinned to a static tool schema —
-            // has nothing to fetch and is refused with the modelled validation
-            // error.
-            if !crate::state::target_discovers_tool_definitions(&target.target_configuration) {
-                return Err(SynchronizeGatewayTargetsErrorModeled::ValidationException(
-                    crate::state::target_discovers_no_tool_definitions(
-                        &target.target_configuration,
-                    ),
-                )
-                .into());
-            }
-        }
-
         let mut targets = Vec::new();
-        for target_id in &input.target_id_list {
-            // Every id was resolved against this same guard above, so each one
-            // still names a target of this gateway.
-            if let Some(target) = gateway.targets.get_mut(target_id) {
-                target.synchronize(now);
-                targets.push(target.gateway_target(&gateway_arn, now));
+        for (target_id, endpoint, outcome) in fetched {
+            // A target a `DeleteGatewayTarget` in between removed is no longer there
+            // to record a fetch on.
+            let Some(target) = gateway.targets.get_mut(&target_id) else {
+                continue;
+            };
+            // Nor is a target an `UpdateGatewayTarget` in between RECONFIGURED: the
+            // fetch was of the endpoint the target named then, so it is not the
+            // outcome of the endpoint it names now, and that update made its own
+            // fetch of it. The status it wrote stands rather than being overwritten
+            // with a report about a configuration the target no longer has.
+            if crate::state::discovered_tool_endpoint(&target.target_configuration)
+                != Some(endpoint.as_str())
+            {
+                continue;
             }
+            target.synchronize(now, outcome);
+            targets.push(target.gateway_target(&gateway_arn, now));
         }
 
         Ok(SynchronizeGatewayTargetsOutput {

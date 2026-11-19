@@ -53,12 +53,6 @@ const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/GatewayRole";
 /// plus slack, so a row can wait the clock out.
 const PAST_SETTLE: Duration = Duration::from_millis(900);
 
-/// How long a row waits for a clock-owed transition at the most, and how long it pauses
-/// between two reads while it waits: the wait is for the CONDITION, so a host slower than
-/// this one only reads again instead of failing.
-const POLL_DEADLINE: Duration = Duration::from_secs(30);
-const POLL_PAUSE: Duration = Duration::from_millis(20);
-
 /// A `gatewayIdentifier` inside `GatewayIdentifier`'s pattern
 /// `^([0-9a-z][-]?){1,100}-[0-9a-z]{10}$` that no row ever creates.
 const ABSENT_GATEWAY_ID: &str = "no-such-gateway-0123456789";
@@ -161,6 +155,20 @@ async fn get_target(router: &MultiServiceRouter, gateway: &str, target: &str) ->
     .await
 }
 
+/// The `TargetStatus` values a target settles into, and the polls that wait for one or
+/// for the removal a deletion owes, are the crate's one reading of a target's clock-owed
+/// transition (`tests/all/gateway_target_settling.rs`).
+use crate::gateway_target_settling::{
+    removed_target, settled_target as settled_target_answer, POLL_DEADLINE, POLL_PAUSE,
+};
+
+/// Read the target until the clock has made its transition out of the transient status
+/// due, as this suite's own answer type.
+async fn settled_target(router: &MultiServiceRouter, gateway: &str, target: &str) -> Answer {
+    let (status, body) = settled_target_answer(router, gateway, target).await;
+    Answer { status, body }
+}
+
 async fn delete_target(router: &MultiServiceRouter, gateway: &str, target: &str) -> Answer {
     send(
         router,
@@ -259,8 +267,14 @@ struct Row {
     targets: usize,
     /// Which of them is deleted (0-based, in creation order).
     deleted: usize,
-    /// Whether the targets are waited out to `READY` before the deletion.
+    /// Whether the targets are waited out to the status they settle into before the
+    /// deletion.
     settled_first: bool,
+    /// The status the deleted target settles into once the clock has made its transition
+    /// out of `CREATING` due: a target that DECLARES its tools settles `READY`, and one
+    /// whose tools are discovered from an endpoint nothing in this emulator serves settles
+    /// `FAILED` on the fetch the create attempted.
+    settled_status: &'static str,
 }
 
 fn rows() -> Vec<Row> {
@@ -271,6 +285,7 @@ fn rows() -> Vec<Row> {
             targets: 1,
             deleted: 0,
             settled_first: true,
+            settled_status: "READY",
         },
         Row {
             case: "the FIRST of three targets, an MCP server endpoint",
@@ -286,6 +301,7 @@ fn rows() -> Vec<Row> {
             targets: 3,
             deleted: 0,
             settled_first: true,
+            settled_status: "FAILED",
         },
         Row {
             case: "the LAST of three targets, an HTTP passthrough endpoint",
@@ -300,6 +316,7 @@ fn rows() -> Vec<Row> {
             targets: 3,
             deleted: 2,
             settled_first: true,
+            settled_status: "READY",
         },
         Row {
             // AWS refuses a deletion only for a target in a pending authorization state
@@ -312,6 +329,7 @@ fn rows() -> Vec<Row> {
             targets: 2,
             deleted: 1,
             settled_first: false,
+            settled_status: "READY",
         },
     ]
 }
@@ -351,12 +369,14 @@ async fn an_accepted_deletion_removes_only_that_target_when_the_clock_makes_it_d
         };
 
         if row.settled_first {
-            tokio::time::sleep(PAST_SETTLE).await;
-            let settled = get_target(&router, &gateway_id, &target_id).await;
+            // The transition is the clock's: the target is read again until it reports a
+            // status it settles into rather than waited on for a fixed time.
+            let settled = settled_target(&router, &gateway_id, &target_id).await;
             assert_eq!(
                 text(&settled.body, "status"),
-                "READY",
-                "case {case:?}: the target must settle to READY first, got {} ({})",
+                row.settled_status,
+                "case {case:?}: the target must settle to {} first, got {} ({})",
+                row.settled_status,
                 text(&settled.body, "status"),
                 settled.body
             );
@@ -401,9 +421,12 @@ async fn an_accepted_deletion_removes_only_that_target_when_the_clock_makes_it_d
             "case {case:?}: a target still DELETING is still listed, got {listed_during:?}"
         );
 
-        tokio::time::sleep(PAST_SETTLE).await;
-
-        let gone = get_target(&router, &gateway_id, &target_id).await;
+        // The removal is the clock's too: the target is read again until it is gone.
+        let (gone_status, gone_body) = removed_target(&router, &gateway_id, &target_id).await;
+        let gone = Answer {
+            status: gone_status,
+            body: gone_body,
+        };
         assert_eq!(
             (gone.status, error_code(&gone.body).as_str()),
             (404, "ResourceNotFoundException"),

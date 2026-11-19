@@ -82,7 +82,12 @@ const JSONRPC_VERSION: &str = "2.0";
 
 /// The MCP protocol revision this surface speaks, which `initialize` answers with and the
 /// recorded client declares in its `MCP-Protocol-Version` header.
-const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
+///
+/// Read by the gateway's own MCP CLIENT as well — the tool-definition fetch a target's
+/// status is decided by (`crate::state::fetch_tool_definitions`) declares the revision it
+/// asks for — so the two halves of the protocol this crate speaks cannot name two
+/// revisions.
+pub(crate) const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 
 /// The version reported in `initialize`'s `serverInfo`, which the MCP `Implementation`
 /// object requires beside the name. A gateway publishes no version of its own anywhere in

@@ -13,7 +13,7 @@
 //! most `maxResults` entries that resume exactly where the previous page ended.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -27,6 +27,11 @@ const REGION: &str = "us-east-1";
 /// The settle span `src/state.rs` gives a target's `CREATING` -> `READY` transition, plus
 /// slack, so a test can wait the clock out.
 const PAST_SETTLE: Duration = Duration::from_millis(900);
+
+/// The `TargetStatus` values a target settles into, and the poll that waits for one, are
+/// the crate's one reading of a target's clock-owed transition
+/// (`tests/all/gateway_target_settling.rs`).
+use crate::gateway_target_settling::{is_terminal, settled_target, POLL_DEADLINE, POLL_PAUSE};
 
 /// A role ARN inside `RoleArn`'s pattern `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/GatewayRole";
@@ -197,6 +202,11 @@ struct Shape {
     target_type: &'static str,
     resource_priority: Option<i64>,
     listing_mode: Option<&'static str>,
+    /// The status the target settles into once the clock has made its transition out of
+    /// `CREATING` due: a target that DECLARES its tools settles `READY`, and the one shape
+    /// whose tools are DISCOVERED from the endpoint it names settles on what that fetch
+    /// achieved — `FAILED` for an endpoint nothing in this emulator serves.
+    settled_status: &'static str,
 }
 
 /// Every target configuration shape the model admits, with the `TargetType` the summary
@@ -221,6 +231,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "OPEN_API_SCHEMA",
             resource_priority: None,
             listing_mode: None,
+            settled_status: "READY",
         },
         Shape {
             case: "an MCP target with an inline Smithy model",
@@ -230,6 +241,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "SMITHY_MODEL",
             resource_priority: None,
             listing_mode: None,
+            settled_status: "READY",
         },
         Shape {
             case: "an MCP Lambda target",
@@ -250,6 +262,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "LAMBDA",
             resource_priority: None,
             listing_mode: None,
+            settled_status: "READY",
         },
         Shape {
             case: "an MCP server target with neither listingMode nor resourcePriority",
@@ -260,6 +273,7 @@ fn shapes() -> Vec<Shape> {
             // The model: "Defaults to 1000 when not set."
             resource_priority: Some(1000),
             listing_mode: None,
+            settled_status: "FAILED",
         },
         Shape {
             case: "an MCP server target naming both of them",
@@ -275,6 +289,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "MCP_SERVER",
             resource_priority: Some(7),
             listing_mode: Some("DYNAMIC"),
+            settled_status: "FAILED",
         },
         Shape {
             case: "an API Gateway stage target",
@@ -292,6 +307,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "API_GATEWAY",
             resource_priority: None,
             listing_mode: None,
+            settled_status: "READY",
         },
         Shape {
             case: "an MCP connector target",
@@ -301,6 +317,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "CONNECTOR",
             resource_priority: None,
             listing_mode: None,
+            settled_status: "READY",
         },
         Shape {
             case: "an HTTP AgentCore Runtime target",
@@ -315,6 +332,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "AGENTCORE_RUNTIME",
             resource_priority: None,
             listing_mode: None,
+            settled_status: "READY",
         },
         Shape {
             case: "an HTTP passthrough target",
@@ -329,6 +347,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "PASSTHROUGH",
             resource_priority: None,
             listing_mode: None,
+            settled_status: "READY",
         },
         Shape {
             case: "an HTTP connector target",
@@ -338,6 +357,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "HTTP_CONNECTOR",
             resource_priority: None,
             listing_mode: None,
+            settled_status: "READY",
         },
         Shape {
             case: "an inference connector target",
@@ -347,6 +367,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "CONNECTOR",
             resource_priority: None,
             listing_mode: None,
+            settled_status: "READY",
         },
         Shape {
             case: "an inference provider target",
@@ -356,6 +377,7 @@ fn shapes() -> Vec<Shape> {
             target_type: "PROVIDER",
             resource_priority: None,
             listing_mode: None,
+            settled_status: "READY",
         },
     ]
 }
@@ -381,9 +403,13 @@ async fn every_target_shape_is_listed_as_its_own_summary() {
         target_ids.push(text(&target, "targetId"));
     }
 
-    // Past the settle span, so the status every read reports is the settled one and the
-    // listing and the single-target read cannot be compared across the transition.
-    tokio::time::sleep(PAST_SETTLE).await;
+    // Every target is read until the clock has made its transition out of the transient
+    // status due, so the status the listing reports is the settled one and the listing and
+    // the single-target read cannot be compared across the transition. The wait is for the
+    // CONDITION, so a slower host only reads again.
+    for target_id in &target_ids {
+        settled_target(&router, &gateway, target_id).await;
+    }
 
     let (status, listed) = list_targets(&router, &gateway, None, None).await;
     assert_eq!(
@@ -464,8 +490,10 @@ async fn every_target_shape_is_listed_as_its_own_summary() {
         }
         assert_eq!(
             text(summary, "status"),
-            "READY",
-            "case {case:?}: past the settle span a target is READY, got {}",
+            row.settled_status,
+            "case {case:?}: past the settle span a target reports the status its own \
+             tool-definition fetch settled it into, {}, got {}",
+            row.settled_status,
             text(summary, "status")
         );
     }
@@ -505,12 +533,25 @@ async fn a_listing_reports_the_status_the_clock_owes_and_writes_nothing() {
         items(&fresh)[0]["status"]
     );
 
-    tokio::time::sleep(PAST_SETTLE).await;
-    let (_, settled) = list_targets(&router, &gateway, None, None).await;
+    // The transition is the clock's, so the wait looks for the CONDITION: the listing is
+    // read again until the target is listed in the status it settles into.
+    let settled = {
+        let started = Instant::now();
+        loop {
+            let (_, listed) = list_targets(&router, &gateway, None, None).await;
+            let status = text(&items(&listed)[0], "status");
+            if is_terminal(&status) || started.elapsed() > POLL_DEADLINE {
+                break listed;
+            }
+            tokio::time::sleep(POLL_PAUSE).await;
+        }
+    };
     assert_eq!(
         text(&items(&settled)[0], "status"),
-        "READY",
-        "case \"past the settle span\": the target is listed as READY, got {}",
+        "FAILED",
+        "case \"past the settle span\": the target is listed as what its own tool-definition \
+         fetch achieved — FAILED for an MCP server endpoint nothing in this emulator serves \
+         — got {}",
         text(&items(&settled)[0], "status")
     );
     assert_eq!(

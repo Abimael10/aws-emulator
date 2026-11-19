@@ -30,10 +30,12 @@
 //!    carries the two instants separately.
 //! 3. The fetch's outcome is owed by the clock, not by the call: the call answers 202
 //!    reporting `SYNCHRONIZING`, a caller acting straight after still sees that status, and
-//!    the target then settles into what the fetch achieved. This emulator opens no outbound
-//!    connection, so no endpoint a target names can be read and the attempt settles the way
-//!    a fetch that could not be completed does — `FAILED`, reporting why in `statusReasons`
-//!    — rather than reporting tool definitions nothing read.
+//!    the target then settles into what the fetch achieved. An endpoint nothing in this
+//!    emulator serves answers nothing, so the attempt settles the way a fetch that could
+//!    not be completed does — `FAILED`, reporting why in `statusReasons` — rather than
+//!    reporting tool definitions nothing read. The same fetch is attempted by the CREATE
+//!    itself, which is why such a target is already `FAILED` before the first explicit
+//!    synchronization (the suite `gateway_target_tool_discovery` is about that rule).
 //! 4. A target is addressed only through its gateway: an identifier naming no stored
 //!    gateway, a target id naming no target of that gateway and a target whose deletion was
 //!    already accepted are each the modelled `ResourceNotFoundException` (404). The gateway
@@ -42,7 +44,7 @@
 //!    naming the operation and the status it found.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -55,16 +57,6 @@ const REGION: &str = "us-east-1";
 
 /// A role ARN inside `RoleArn`'s pattern `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/.+$`.
 const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/GatewayRole";
-
-/// The settle span `src/state.rs` gives a gateway's and a target's clock-owed
-/// transition to `READY`, plus slack, so a row can wait the clock out.
-const PAST_SETTLE: Duration = Duration::from_millis(900);
-
-/// How long a row waits for a clock-owed transition at the most, and how long it pauses
-/// between two reads while it waits: the wait is for the CONDITION, so a host slower than
-/// this one only reads again instead of failing.
-const POLL_DEADLINE: Duration = Duration::from_secs(30);
-const POLL_PAUSE: Duration = Duration::from_millis(20);
 
 /// A `gatewayIdentifier` inside `GatewayIdentifier`'s pattern
 /// `^([0-9a-z][-]?){1,100}-[0-9a-z]{10}$` that no row ever creates.
@@ -81,12 +73,36 @@ const STATIC_SCHEMA_REFUSAL: &str =
      configured. Remove the static schema through an UpdateGatewayTarget call to enable \
      dynamic tool synchronization.";
 
-/// Why an attempted fetch leaves the target `FAILED` in this emulator, which opens no
-/// outbound connection and so can read no endpoint a target names.
-const FETCH_FAILED_REASON: &str =
-    "Failed to fetch the tool definitions from the target endpoint. Verify that the \
-     endpoint is reachable and serves the Model Context Protocol, then synchronize the \
-     target again.";
+/// The reason an attempted fetch leaves the target `FAILED` with when NOTHING in this
+/// emulator answers the endpoint the target names: the fixed sentence, with that endpoint
+/// filled in from the target's own configuration.
+fn fetch_failure_reason(endpoint: &str) -> String {
+    format!(
+        "The MCP server at {endpoint} did not respond to the tool discovery request. Verify \
+         that the endpoint is reachable from the gateway and serves the Model Context \
+         Protocol, then synchronize the target again."
+    )
+}
+
+/// The one reason the settled status reports, asserted in full against the endpoint the
+/// target itself names, read off the same body.
+fn assert_fetch_failure(case: &str, body: &Value) {
+    let endpoint = body
+        .pointer("/targetConfiguration/mcp/mcpServer/endpoint")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        !endpoint.is_empty(),
+        "case {case:?}: this row's target names an MCP server endpoint, got {body}"
+    );
+    assert_eq!(
+        member(body, "statusReasons"),
+        json!([fetch_failure_reason(&endpoint)]),
+        "case {case:?}: expected the reason the failed fetch of {endpoint:?} is reported in, \
+         got {body}"
+    );
+}
 
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -179,6 +195,18 @@ async fn get_target(router: &MultiServiceRouter, gateway: &str, target: &str) ->
         None,
     )
     .await
+}
+
+/// The `TargetStatus` values a target settles into, and the poll that waits for one, are
+/// the crate's one reading of a target's clock-owed transition
+/// (`tests/all/gateway_target_settling.rs`).
+use crate::gateway_target_settling::{settled_target as settled_target_answer, POLL_DEADLINE, POLL_PAUSE};
+
+/// Read the target until the clock has made its transition out of the transient status
+/// due, as this suite's own answer type.
+async fn settled_target(router: &MultiServiceRouter, gateway: &str, target: &str) -> Answer {
+    let (status, body) = settled_target_answer(router, gateway, target).await;
+    Answer { status, body }
 }
 
 async fn list_targets(router: &MultiServiceRouter, gateway: &str) -> Answer {
@@ -417,16 +445,21 @@ async fn synchronization_applies_to_targets_that_discover_their_tool_definitions
         let updated_at = member(&answer.body, "updatedAt");
         created.push((row, target_id, created_at, updated_at));
     }
-    tokio::time::sleep(PAST_SETTLE).await;
 
     let mut synchronized: Vec<(&'static str, String, Value)> = Vec::new();
     for (row, target_id, created_at, updated_at) in &created {
-        let before = get_target(&router, &gateway, target_id).await;
+        // The create attempts the same fetch, so a target whose tools are DISCOVERED from
+        // an endpoint nothing serves has already settled `FAILED` on that attempt, and one
+        // whose tools its own configuration declares has settled `READY` with nothing
+        // fetched. The transition is the clock's, so the row reads the target again until
+        // it reports a status it settles into rather than waiting a fixed time for one.
+        let settled_before = if row.refusal.is_none() { "FAILED" } else { "READY" };
+        let before = settled_target(&router, &gateway, target_id).await;
         assert_eq!(
             (before.status, text(&before.body, "status").as_str()),
-            (200, "READY"),
-            "case {:?}: the target must settle to READY before it is synchronized, got {} \
-             {} ({})",
+            (200, settled_before),
+            "case {:?}: the target must settle to {settled_before} before it is \
+             synchronized, got {} {} ({})",
             row.case,
             before.status,
             text(&before.body, "status"),
@@ -556,12 +589,12 @@ async fn synchronization_applies_to_targets_that_discover_their_tool_definitions
         "the table must carry at least one configuration whose synchronization is accepted"
     );
 
-    // The clock owes every attempted fetch its outcome: no endpoint is reachable from this
-    // emulator, so each attempt settles FAILED with its reason, and the instant the attempt
-    // recorded stays put.
-    tokio::time::sleep(PAST_SETTLE).await;
+    // The clock owes every attempted fetch its outcome: an endpoint nothing in this
+    // emulator serves answers nothing, so each attempt settles FAILED with its reason, and
+    // the instant the attempt recorded stays put. Each row reads the target again until it
+    // reports a status it settles into.
     for (case, target_id, stamped) in &synchronized {
-        let settled = get_target(&router, &gateway, target_id).await;
+        let settled = settled_target(&router, &gateway, target_id).await;
         assert_eq!(
             (settled.status, text(&settled.body, "status").as_str()),
             (200, "FAILED"),
@@ -571,12 +604,7 @@ async fn synchronization_applies_to_targets_that_discover_their_tool_definitions
             text(&settled.body, "status"),
             settled.body
         );
-        assert_eq!(
-            member(&settled.body, "statusReasons"),
-            json!([FETCH_FAILED_REASON]),
-            "case {case:?}: the settled status reports why the fetch did not happen, got {}",
-            settled.body
-        );
+        assert_fetch_failure(case, &settled.body);
         assert_eq!(
             member(&settled.body, "lastSynchronizedAt"),
             *stamped,
@@ -608,9 +636,10 @@ async fn each_synchronization_advances_the_recorded_instant() {
         created.status, created.body
     );
     let target_id = text(&created.body, "targetId");
-    tokio::time::sleep(PAST_SETTLE).await;
 
-    let before = get_target(&router, &gateway, &target_id).await;
+    // The create's own fetch is the clock's too: the target is read again until it reports
+    // a status it settles into.
+    let before = settled_target(&router, &gateway, &target_id).await;
     assert_eq!(
         member(&before.body, "lastSynchronizedAt"),
         Value::Null,
@@ -673,20 +702,18 @@ async fn each_synchronization_advances_the_recorded_instant() {
         );
 
         previous = stamped;
-        // The clock owes each attempt its outcome before the next round starts, and the
-        // wait is also what makes the next attempt's instant a later one.
-        tokio::time::sleep(PAST_SETTLE).await;
-        let settled = get_target(&router, &gateway, &target_id).await;
+        // The clock owes each attempt its outcome before the next round starts: the target
+        // is read again until it reports a status it settles into, which is also what makes
+        // the next attempt's instant a later one.
+        let settled = settled_target(&router, &gateway, &target_id).await;
         assert_eq!(
-            (
-                text(&settled.body, "status"),
-                member(&settled.body, "statusReasons")
-            ),
-            ("FAILED".to_string(), json!([FETCH_FAILED_REASON])),
-            "case {case:?}: an attempt against an endpoint this emulator cannot read \
-             settles FAILED with its reason, got {}",
+            text(&settled.body, "status"),
+            "FAILED",
+            "case {case:?}: an attempt against an endpoint nothing in this emulator serves \
+             settles FAILED, got {}",
             settled.body
         );
+        assert_fetch_failure(&case, &settled.body);
     }
 }
 

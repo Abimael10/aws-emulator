@@ -315,6 +315,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The fetch `CreateGatewayTarget` makes, for the same reason: this call
+        // writes the target's whole configuration, so the endpoint a target whose
+        // tools are DISCOVERED names is read again and the reconfigured target
+        // settles into what that fetch achieved
+        // (`crate::state::fetch_tool_definitions`, which reaches only an MCP endpoint
+        // this emulator publishes and serves, over the in-process transport). Made
+        // with no store guard held, like the resolution above.
+        let fetched =
+            crate::state::fetch_tool_definitions(ctx, &input.target_configuration).await;
+
         let mut store = state.lock();
         // The gateway and the target are read again under the guard that WRITES:
         // the guard was dropped for the call above, so nothing promises either is
@@ -381,16 +391,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.name = name;
         }
         record.updated_at = now;
-        // An updated target is not ready again at once: the transition back to
-        // READY is owed by the clock, not by this call.
+        // An updated target is not ready again at once: the transition out of
+        // `UPDATING` is owed by the clock, not by this call, and what it
+        // transitions INTO is what this call's own fetch of the reconfigured
+        // target's tool definitions achieved.
         record.transient_status = crate::state::STATUS_UPDATING.to_string();
-        record.settled_status = crate::state::STATUS_READY.to_string();
+        record.settled_status = fetched.settled_status.to_string();
         record.settles_at = now + crate::state::GATEWAY_SETTLE_DELAY;
-        // The status the reconfigured target settles into has no reason to report:
-        // whatever an earlier operation left behind — the reason a failed
-        // synchronization of the previous configuration carried — is not a reason
-        // for the status THIS change settles into.
-        record.settled_status_reasons.clear();
+        // Why it settles there, for a fetch that did not complete; empty for a
+        // target that settles ready. Whatever an earlier operation left behind —
+        // the reason a failed fetch of the PREVIOUS configuration carried — is not
+        // a reason for the status THIS change settles into.
+        record.settled_status_reasons = fetched.settled_status_reasons;
         let output = record.update_output(&gateway_arn, now);
 
         // The gateway's configuration includes the targets it serves, so

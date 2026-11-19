@@ -10,6 +10,10 @@
 //! to serve a tool call — so a target naming a function that does not exist is refused
 //! the same way and nothing is stored.
 //!
+//! A target whose tool definitions are DISCOVERED from the endpoint it names has that
+//! fetch made by this call, and settles into what the fetch achieved rather than into
+//! `READY` regardless (`crate::state::fetch_tool_definitions`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -304,6 +308,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The target's tool definitions are fetched by the CREATE itself, for the
+        // one target shape whose tools are discovered from the endpoint it names
+        // rather than declared in its own configuration: that target is usable only
+        // once the gateway has read them from there, so the status it settles into
+        // is the outcome of that fetch and not of this call
+        // (`crate::state::fetch_tool_definitions`). A target whose tools its
+        // configuration declares has nothing to fetch and settles ready. The fetch
+        // reaches only an MCP endpoint THIS EMULATOR publishes and serves, over the
+        // in-process transport — it opens no socket and resolves no name, so no
+        // address a request body names is reached over the network — and it is made
+        // with no store guard held. Its outcome is stored on the record below, never
+        // slept on.
+        let fetched =
+            crate::state::fetch_tool_definitions(ctx, &input.target_configuration).await;
+
         let mut store = state.lock();
         // The gateway is read again under the guard that WRITES: the guard was
         // dropped for the call above, so nothing promises it is still there, nor
@@ -331,13 +350,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             created_at: now,
             updated_at: now,
-            // A new target is created, not ready: the transition to READY is owed
-            // by the clock, not by this call.
+            // A new target is created, not ready: the transition out of `CREATING`
+            // is owed by the clock, not by this call, and what it transitions INTO
+            // is what the create's own fetch of the target's tool definitions
+            // achieved.
             transient_status: crate::state::STATUS_CREATING.to_string(),
-            settled_status: crate::state::STATUS_READY.to_string(),
+            settled_status: fetched.settled_status.to_string(),
             settles_at: now + crate::state::GATEWAY_SETTLE_DELAY,
-            // The status a new target settles into has no reason to report.
-            settled_status_reasons: Vec::new(),
+            // Why it settles there, for a fetch that did not complete; empty for a
+            // target that settles ready.
+            settled_status_reasons: fetched.settled_status_reasons,
             target_configuration: input.target_configuration,
             credential_provider_configurations:
                 crate::state::effective_credential_provider_configurations(

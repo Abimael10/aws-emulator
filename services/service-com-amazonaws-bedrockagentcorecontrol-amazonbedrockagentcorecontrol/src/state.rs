@@ -2020,6 +2020,11 @@ pub mod api_key_credential_providers;
 /// synchronization reports a target in. Re-exported, so a handler names
 /// `crate::state::…` for it exactly as it does for the target record itself.
 pub mod gateway_target_synchronization;
+/// The tool-definition fetch a gateway target's reported status is decided by: the
+/// dial of the endpoint a target whose tools are discovered names, and the status
+/// that dial settles the target into. Re-exported, so a handler names
+/// `crate::state::…` for it exactly as it does for the target record itself.
+pub mod gateway_target_tool_discovery;
 /// The credential provider configuration a gateway target carries: what a
 /// request that defines none leaves the target with, and which target
 /// configurations have to be given one. Re-exported, so a handler names
@@ -2065,6 +2070,7 @@ pub use gateway_rate_limits::*;
 pub use gateway_rules::*;
 pub use gateway_target_credentials::*;
 pub use gateway_target_synchronization::*;
+pub use gateway_target_tool_discovery::*;
 pub use listings::*;
 pub use oauth2_credential_providers::*;
 pub use online_evaluation_configs::*;
