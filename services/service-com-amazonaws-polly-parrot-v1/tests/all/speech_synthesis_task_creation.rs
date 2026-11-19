@@ -24,13 +24,14 @@
 //! caller reached the emulator at, crossed with the output format, the key prefix and the
 //! Region.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use bytes::Bytes;
 use service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES;
 use smithy_server_runtime::UNSERVED_URL_BASE;
 
-use crate::lexicons_and_speech::{error_code, json, Polly};
+use crate::lexicons_and_speech::{error_code, json, pls, Polly};
 use crate::support::get_task;
 use crate::synthesis_tasks::{list, task_ids};
 use service_com_amazonaws_polly_parrot_v1::state::TASK_COMPLETION_DELAY;
@@ -836,5 +837,204 @@ async fn the_output_location_is_announced_on_the_endpoint_the_request_reached() 
                 body.len()
             );
         }
+    }
+}
+
+/// The member the task-CREATION response carries beside the modelled ones: the SDK
+/// feature toggles the service applied to the request.
+///
+/// Not a modelled member — `smithy_query(query="shape", shape="SynthesisTask")` lists
+/// fifteen and none of them is this one, and `smithy_query(query="shape",
+/// shape="SdkFeatureToggles")` finds no such shape — so the response Amazon Polly sends
+/// is its only authority.
+const TOGGLES_MEMBER: &str = "SdkFeatureToggles";
+
+/// The members of `com.amazonaws.polly#SynthesisTask`, from
+/// `smithy_query(query="shape", shape="SynthesisTask")`, that a start call resolves a
+/// value for on EVERY request.
+const ALWAYS_REPORTED_MEMBERS: &[&str] = &[
+    "Engine",
+    "TaskId",
+    "TaskStatus",
+    "OutputUri",
+    "CreationTime",
+    "RequestCharacters",
+    "OutputFormat",
+    "TextType",
+    "VoiceId",
+];
+
+/// The modelled members a task reports only where the REQUEST set them, each named by
+/// the input member it travels from — the same name on both shapes.
+const MEMBERS_FROM_THE_REQUEST: &[&str] = &[
+    "SampleRate",
+    "SnsTopicArn",
+    "LanguageCode",
+    "LexiconNames",
+    "SpeechMarkTypes",
+];
+
+/// Every member of the task object a creation response must carry for `request`: the
+/// ones every start call resolves, the optional modelled ones this request set, and the
+/// one member beyond the model. `TaskStatusReason` is in neither list: a just-created
+/// task has no reason to report.
+fn expected_members(request: &serde_json::Value) -> BTreeSet<&'static str> {
+    let mut expected: BTreeSet<&'static str> = ALWAYS_REPORTED_MEMBERS.iter().copied().collect();
+    for member in MEMBERS_FROM_THE_REQUEST {
+        if request.get(member).is_some() {
+            expected.insert(member);
+        }
+    }
+    expected.insert(TOGGLES_MEMBER);
+    expected
+}
+
+/// RULE: the task-creation response reports, BESIDE the task's modelled members, the SDK
+/// feature toggles the service applied to the request that started the task — a list
+/// member, serialized whether or not anything is in it, so a request that turns no
+/// toggle on still reports it as the empty list. The task READS report the modelled
+/// members alone.
+///
+/// The rows are the shared table — which spans the output format, the engine, the text
+/// type, the voice and its language, the key prefix, the speech marks and the Region —
+/// plus two that set the remaining optional members a task reports (the notification
+/// topic, and a lexicon the Region stores), so the member set is checked over a request
+/// that names every modelled member as well as over ones that name almost none.
+#[tokio::test]
+async fn a_created_task_reports_the_feature_toggles_the_service_applied() {
+    let polly = Polly::new();
+    let mut table: Vec<(String, &'static str, serde_json::Value)> = rows()
+        .into_iter()
+        .map(|(case, request, expected)| (case.to_string(), expected.region, request))
+        .collect();
+
+    let topic = format!(
+        "arn:aws:sns:us-east-1:{}:polly-task-updates",
+        engine::EMULATOR_ACCOUNT_ID
+    );
+    table.push((
+        "a task that asks for a status notification".to_string(),
+        "us-east-1",
+        serde_json::json!({
+            "Text": "Notify me.",
+            "VoiceId": "Joanna",
+            "OutputFormat": "mp3",
+            "SampleRate": "16000",
+            "SnsTopicArn": topic,
+            "OutputS3BucketName": OUTPUT_BUCKET,
+        }),
+    ));
+    // A task may name only a lexicon the Region it is started in stores, so the lexicon
+    // is put there first.
+    let stored = polly
+        .put_lexicon_in("us-east-1", "TaskLexicon", &pls("ipa", "en-US", 1))
+        .await;
+    assert_eq!(
+        stored.status(),
+        200,
+        "the lexicon the next row names must be stored, body {:?}",
+        json(&stored)
+    );
+    table.push((
+        "a task that names a stored lexicon and a language".to_string(),
+        "us-east-1",
+        serde_json::json!({
+            "Text": "With a lexicon.",
+            "VoiceId": "Aditi",
+            "LanguageCode": "en-IN",
+            "LexiconNames": ["TaskLexicon"],
+            "OutputFormat": "mp3",
+            "OutputS3BucketName": OUTPUT_BUCKET,
+        }),
+    ));
+
+    let mut started: Vec<String> = Vec::new();
+    for (case, region, request) in &table {
+        let response = start(&polly, region, request).await;
+        assert_eq!(
+            response.status(),
+            200,
+            "case {case:?}: the task must be created, body {:?}",
+            json(&response)
+        );
+        let body = json(&response);
+        let reported = body["SynthesisTask"]
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: no SynthesisTask object in {body}"))
+            .clone();
+
+        // The toggle list is there, and it is a LIST: empty, because nothing this
+        // request names turns a toggle on.
+        assert_eq!(
+            reported.get(TOGGLES_MEMBER),
+            Some(&serde_json::json!([])),
+            "case {case:?}: the created task must report an empty {TOGGLES_MEMBER} list, \
+             got {:?}",
+            reported.get(TOGGLES_MEMBER)
+        );
+        // ... beside the modelled members this request has values for, and nothing else:
+        // the extra member is added to the envelope, it does not displace or multiply
+        // anything.
+        let carried: BTreeSet<&str> = reported.keys().map(String::as_str).collect();
+        let expected = expected_members(request);
+        assert_eq!(
+            carried,
+            expected,
+            "case {case:?}: wrong member set, got {carried:?}, expected {expected:?}"
+        );
+
+        // The task READS report the modelled members alone — the same values, member for
+        // member, apart from the two the CLOCK owns (`TaskStatus` and its reason, which
+        // the completion moves on its own schedule).
+        let task_id = reported["TaskId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no TaskId in {reported:?}"))
+            .to_string();
+        let read = get_task(&polly, &task_id).await;
+        assert_eq!(
+            read.status(),
+            200,
+            "case {case:?}: the started task must read back, body {:?}",
+            json(&read)
+        );
+        let read_body = json(&read);
+        let read_task = &read_body["SynthesisTask"];
+        assert!(
+            read_task.get(TOGGLES_MEMBER).is_none(),
+            "case {case:?}: a task read must report no {TOGGLES_MEMBER}, got {:?}",
+            read_task.get(TOGGLES_MEMBER)
+        );
+        for member in ALWAYS_REPORTED_MEMBERS
+            .iter()
+            .chain(MEMBERS_FROM_THE_REQUEST)
+            .filter(|member| **member != "TaskStatus")
+        {
+            assert_eq!(
+                read_task.get(*member),
+                reported.get(*member),
+                "case {case:?}: member {member} differs between the creation response and \
+                 the read, got {:?} and {:?}",
+                read_task.get(*member),
+                reported.get(*member)
+            );
+        }
+        started.push(task_id);
+    }
+
+    // The listing is a task read too, so it reports the modelled members alone as well.
+    let page = json(&list(&polly, "").await);
+    let listed = page["SynthesisTasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the listing carries no page: {page}"))
+        .clone();
+    for task_id in &started {
+        let entry = listed
+            .iter()
+            .find(|task| task["TaskId"].as_str() == Some(task_id.as_str()))
+            .unwrap_or_else(|| panic!("the listing must report {task_id:?}: {page}"));
+        assert!(
+            entry.get(TOGGLES_MEMBER).is_none(),
+            "task {task_id:?}: a listed task must report no {TOGGLES_MEMBER}, got {entry}"
+        );
     }
 }

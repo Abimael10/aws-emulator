@@ -24,6 +24,10 @@ pub mod put_lexicon_types;
 pub mod shared_types;
 pub mod start_speech_synthesis_stream_types;
 pub mod start_speech_synthesis_task_types;
+// The task envelope the task-creation response carries, whose wire form has a member the
+// on-disk model does not declare — so its codec is written out rather than derived. See
+// that module's own note.
+pub mod started_task_wire;
 pub mod synthesize_speech_types;
 
 #[allow(ambiguous_glob_reexports, unused_imports)]
@@ -46,6 +50,8 @@ pub use shared_types::*;
 pub use start_speech_synthesis_stream_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use start_speech_synthesis_task_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use started_task_wire::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use synthesize_speech_types::*;
 

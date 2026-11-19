@@ -36,6 +36,13 @@
 //! `SynthesizeSpeech` uses so the synchronous and the asynchronous path cannot disagree
 //! about one request.
 //!
+//! THE CREATION RESPONSE CARRIES ONE MEMBER THE MODEL DOES NOT DECLARE. Beside the task's
+//! modelled members, this response reports the SDK feature toggles the service applied to
+//! the request, as a list serialized whether or not anything is in it. The envelope that
+//! writes it holds the model's own task and adds that member
+//! ([`super::types::StartedSynthesisTask`]); the task READS report the modelled members
+//! alone.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -520,7 +527,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         Ok(StartSpeechSynthesisTaskOutput {
-            synthesis_task: Some(reported),
+            // The creation response reports the task's modelled members and, beside
+            // them, the SDK feature toggles the service applied to the request that
+            // started it. Nothing this operation's input declares turns a toggle on, so
+            // this request enabled none — and the member is a LIST, so no toggle is
+            // reported as the empty list rather than as an absent member.
+            synthesis_task: Some(StartedSynthesisTask::reporting(reported, Vec::new())),
         })
     }
 }

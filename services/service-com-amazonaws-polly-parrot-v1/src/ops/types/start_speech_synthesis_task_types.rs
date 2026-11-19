@@ -31,7 +31,11 @@ pub struct StartSpeechSynthesisTaskInput {
 #[smithy_macros::smithy(shape = "com.amazonaws.polly#StartSpeechSynthesisTaskOutput")]
 #[derive(Debug, Clone, Default)]
 pub struct StartSpeechSynthesisTaskOutput {
-    pub synthesis_task: Option<SynthesisTask>,
+    /// The created task. Its wire form carries one member beyond the model's
+    /// `SynthesisTask` — see [`started_task_wire`](super::started_task_wire) — so this
+    /// member holds that envelope; the derived codec writes a structure member through
+    /// the value's own codec, so the member schema is the model's either way.
+    pub synthesis_task: Option<StartedSynthesisTask>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.polly#InvalidS3BucketException")]
