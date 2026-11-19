@@ -171,7 +171,8 @@ pub fn auto_scaling_service_linked_role_arn() -> String {
 /// ([`auto_scaling_service_linked_role_arn`]), which the service assumes on its own
 /// behalf and "creates if it does not yet exist" rather than taking per call. Scaling them
 /// through any OTHER role would mean PASSING that role to the scaling service, which the
-/// caller has to be authorized to do ([`auto_scaling_role_pass_denied`]).
+/// role that carries the call there has to be authorized to do
+/// ([`auto_scaling_role_pass_denied`]).
 pub fn unpassable_auto_scaling_role(input: &UpdateTableReplicaAutoScalingInput) -> Option<String> {
     let in_force = auto_scaling_service_linked_role_arn();
     named_auto_scaling_roles(input)
@@ -179,26 +180,82 @@ pub fn unpassable_auto_scaling_role(input: &UpdateTableReplicaAutoScalingInput) 
         .find(|named| named != &in_force)
 }
 
+/// The name of the service-linked role DynamoDB replicates a global table through, as the
+/// Developer Guide publishes it ("Using service-linked roles for DynamoDB": the role
+/// DynamoDB creates to manage a global table's replication,
+/// `AWSServiceRoleForDynamoDBReplication`). The scaling of a replica's capacity is carried
+/// to Application Auto Scaling under a session of THIS role, because it is the replication
+/// group that is being scaled.
+const REPLICATION_SERVICE_LINKED_ROLE: &str = "AWSServiceRoleForDynamoDBReplication";
+
+/// The bounds a session name is held to (`sts:AssumeRole`'s `RoleSessionName`, @length
+/// 2..64), so the session a long table name is named after is still one STS would mint.
+/// The lower bound is reached by no table name, the shortest a table may carry being three
+/// characters (`CreateTable`'s `TableName`, @length 3..255), so it is the upper bound this
+/// holds a name to.
+const SESSION_NAME_MAX: usize = 64;
+
+/// The principal that ATTEMPTS the pass of a caller-named role: the session of DynamoDB's
+/// replication service-linked role that carries the scaling call to Application Auto
+/// Scaling, spelled as STS reports an assumed-role session
+/// (`arn:aws:sts::<account>:assumed-role/<role>/<session>`) — which is the spelling an
+/// authorization refusal names a session by, never the role's own IAM ARN.
+///
+/// The session names the replication group the call was made for, which is what this one
+/// session is assumed to scale, held to the length a session name may carry
+/// ([`SESSION_NAME_MAX`]).
+fn replication_session_arn(session_name: &str) -> String {
+    let session: String = session_name.chars().take(SESSION_NAME_MAX).collect();
+    ::engine::emulator_arn(
+        "sts",
+        "",
+        &format!("assumed-role/{REPLICATION_SERVICE_LINKED_ROLE}/{session}"),
+    )
+}
+
+/// The name the Application Auto Scaling endpoint answers under in a relayed refusal, as
+/// the SDK layer that carried the call reports it.
+const AUTO_SCALING_RELAYED_SERVICE: &str = "AWSApplicationAutoScaling";
+
+/// The class, and the status, Application Auto Scaling refuses an unauthorized pass with.
+const PASS_DENIED_CODE: &str = "AccessDeniedException";
+const PASS_DENIED_STATUS: u16 = 400;
+
 /// The refusal a request that names a role of its own earns: the authorization failure the
 /// pass of that role answers, as the scaling service raised it.
 ///
-/// A role named in the request is passed to the service that would scale the capacity with
-/// it, which the calling principal must hold `iam:PassRole` on that role to do; nothing
-/// grants a caller of this emulator that permission over a role of its own, so the pass is
-/// refused and the refusal is what the request is answered with. Worded by the one
-/// statement of this refusal class in this crate
-/// ([`super::authorization::not_authorized`]), so it reads exactly as the data plane's own
-/// authorization refusals do.
-pub fn auto_scaling_role_pass_denied(caller_arn: &str, role_arn: &str) -> String {
+/// A role named in the request is passed to Application Auto Scaling, which would scale the
+/// capacity with it — and the principal that attempts the pass is the role DynamoDB carries
+/// the call under, its own replication service-linked role
+/// ([`replication_session_arn`]), not the client that asked. Nothing authorizes that role
+/// to pass a role of a customer's, so the scaling service refuses the call and its refusal
+/// is relayed here VERBATIM: the sentence it worded ([`super::authorization::not_authorized`],
+/// this crate's one statement of that wording) inside the envelope the SDK layer states
+/// around a caught service exception
+/// ([`::service_common::relayed_refusal::caught_exception_message`]), which is what names
+/// the service, the status, the class and the relayed call's own id. This surface states no
+/// opening and no exception class of its own, so the message BEGINS at the relayed
+/// sentence.
+///
+/// `scaled_resource` is the replication group the scaling was attempted for, which is what
+/// the relaying session is named after.
+pub fn auto_scaling_role_pass_denied(scaled_resource: &str, role_arn: &str) -> String {
     const PASS_ROLE: &str = "iam:PassRole";
-    format!(
-        "AccessDeniedException: {}",
-        super::authorization::not_authorized(
-            caller_arn,
+    ::service_common::relayed_refusal::caught_exception_message(
+        "",
+        "",
+        &super::authorization::not_authorized(
+            &replication_session_arn(scaled_resource),
             PASS_ROLE,
             role_arn,
             &format!("because no identity-based policy allows the {PASS_ROLE} action"),
-        )
+        ),
+        ::service_common::relayed_refusal::CaughtCall {
+            service: AUTO_SCALING_RELAYED_SERVICE,
+            status: PASS_DENIED_STATUS,
+            code: PASS_DENIED_CODE,
+            request_id: &::service_common::query_error_envelope::new_request_id(),
+        },
     )
 }
 

@@ -165,14 +165,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
         // A replica's capacities are scaled through this service's own service-linked role.
         // A request that names a role of its own asks for that role to be PASSED to the
-        // scaling service, which the calling principal must be authorized to do, so the
-        // authorization failure that pass earns is what the request is answered with
-        // ([`crate::state::unpassable_auto_scaling_role`]). The principal is resolved
-        // before the store is locked, as every reader of the caller is.
+        // scaling service, which the role carrying the call there must be authorized to do,
+        // so the authorization failure that pass earns is what the request is answered with
+        // ([`crate::state::unpassable_auto_scaling_role`]) — relayed as the scaling service
+        // worded it, naming the replication group it was attempted for.
         if let Some(role_arn) = crate::state::unpassable_auto_scaling_role(&input) {
-            let caller = crate::state::request_caller(&*self.engine, ctx);
+            // The audit record for the attempt that changed nothing, as the served call
+            // leaves one for what it changed: who asked, what was addressed and that the
+            // pass was refused. Never a credential — only the access key id presented.
+            ::tracing::info!(
+                operation = Self::NAME,
+                akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+                table_name = %name,
+                auto_scaling_role_arn = %role_arn,
+                "auto scaling role pass refused"
+            );
             return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::auto_scaling_role_pass_denied(&caller.arn, &role_arn),
+                crate::state::auto_scaling_role_pass_denied(&name, &role_arn),
             ));
         }
         // WHO this request speaks for, read before the store is locked for the same reason:
