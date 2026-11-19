@@ -12,12 +12,23 @@
 //! for, and the class of the sender — an address of no identity the account holds, an
 //! address whose domain identity is still unverified, and two different senders in one
 //! Region, which therefore produce two different messages.
+//!
+//! WHERE that gate sits among this operation's other refusals is the second rule here:
+//! what the REQUEST carries is checked first, then the sending identity, and only then is
+//! the resource the content NAMES resolved. So `Template$TemplateData` that is no set of
+//! key-value pairs is the caller's mistake (`BadRequestException`) whatever the sender and
+//! whatever template the content names; a sender that failed the verification check is
+//! refused `MessageRejected` before the template name is looked up, which is why such a
+//! sender cannot learn from the refusal whether the template exists; and a name the account
+//! holds no template under is the modelled 404 only once the gate has been passed.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sesv2_simpleemailservice_v2::state::ComAmazonawsSesv2SimpleemailserviceV2State;
+use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
+    ComAmazonawsSesv2SimpleemailserviceV2State, MAX_EMAIL_TEMPLATE_BYTES,
+};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -46,6 +57,15 @@ impl Reply {
         self.body
             .get("message")
             .or_else(|| self.body.get("Message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// A string at `pointer`, or `""` when the body carries nothing there.
+    fn text(&self, pointer: &str) -> String {
+        self.body
+            .pointer(pointer)
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string()
@@ -135,6 +155,68 @@ impl Ses {
         .await
     }
 
+    /// `CreateEmailTemplate`: save the one template the templated cases below name.
+    async fn create_template(&self, region: &str) -> Reply {
+        self.call(
+            region,
+            "POST",
+            "/v2/email/templates",
+            Some(json!({
+                "TemplateName": TEMPLATE,
+                "TemplateContent": {"Subject": SUBJECT, "Text": TEXT, "Html": HTML},
+            })),
+        )
+        .await
+    }
+
+    /// `TestRenderEmailTemplate`: the preview of the stored template against `data`.
+    async fn render(&self, region: &str, data: &str) -> Reply {
+        self.call(
+            region,
+            "POST",
+            &format!("/v2/email/templates/{TEMPLATE}/render"),
+            Some(json!({"TemplateData": data})),
+        )
+        .await
+    }
+
+    /// `SendEmail` with `content` as its `Content` member.
+    async fn send_content(&self, region: &str, from: &str, content: Value) -> Reply {
+        self.call(
+            region,
+            "POST",
+            "/v2/email/outbound-emails",
+            Some(json!({
+                "FromEmailAddress": from,
+                // The mailbox simulator's success address: a recipient that accepts
+                // whatever is addressed to it.
+                "Destination": {"ToAddresses": ["success@simulator.amazonses.com"]},
+                "Content": content,
+            })),
+        )
+        .await
+    }
+
+    /// `GetMessageInsights`: what the service reports about one accepted message.
+    async fn insights(&self, region: &str, message_id: &str) -> Reply {
+        self.call(
+            region,
+            "GET",
+            &format!("/v2/email/insights/{message_id}"),
+            None,
+        )
+        .await
+    }
+
+    /// How many messages the send log holds, and what the 24-hour counter was charged.
+    fn accepted(&self) -> (usize, f64) {
+        let state = self
+            .engine
+            .state::<ComAmazonawsSesv2SimpleemailserviceV2State>();
+        let store = state.lock();
+        (store.sent_messages.len(), store.send_counters.sent_last_24h)
+    }
+
     /// Bring every identity's verification transition into the past, so a case that
     /// sends from an identity the account holds does not race the span the clock owes
     /// it.
@@ -150,6 +232,35 @@ impl Ses {
             record.verification_due_at = past;
         }
     }
+}
+
+/// The template every templated case below names when it names a stored one.
+const TEMPLATE: &str = "receipt";
+
+/// Its subject, with the one message variable it personalises.
+const SUBJECT: &str = "Hello {{name}}";
+
+/// Its text part.
+const TEXT: &str = "Hi {{name}}, this is a probe.";
+
+/// Its HTML part.
+const HTML: &str = "<p>Hi {{name}}</p>";
+
+/// Well-formed template data for that template.
+const DATA: &str = "{\"name\":\"Ada\"}";
+
+/// The sentence this service answers for template data that is no set of key-value pairs,
+/// which `TestRenderEmailTemplate` answers the same data with.
+const INVALID_DATA: &str = "The template data is not a valid JSON object";
+
+/// The sentence this service answers for content whose `Template` identifies no template at
+/// all — naming neither a stored one nor carrying content of its own.
+const NO_TEMPLATE: &str = "The template does not exist";
+
+/// The sentence every operation over an `EmailTemplateName` answers for a template the
+/// account holds nothing under.
+fn no_such_template(name: &str) -> String {
+    format!("Template {name} does not exist.")
 }
 
 /// The sentence the service answers for a sender that failed the verification check:
@@ -278,5 +389,482 @@ async fn a_verified_sender_is_accepted_in_whatever_region_the_call_names() {
             "case {region:?}: expected a MessageId, got {:?}",
             sent.body
         );
+    }
+}
+
+/// How a templated case identifies the template to render the message from.
+#[derive(Debug, Clone, Copy)]
+enum Names {
+    /// The stored template, by `TemplateName`.
+    Stored,
+    /// A name the account holds nothing under, by `TemplateName`.
+    Absent(&'static str),
+    /// The ARN addressing such a name, by `TemplateArn`.
+    AbsentArn(&'static str),
+    /// Content the request carries inline, naming no stored template at all.
+    Inline,
+    /// A `Template` identifying no template at all: no name, no ARN, no content of its own.
+    Nothing,
+}
+
+/// What the send must answer.
+#[derive(Debug, Clone, Copy)]
+enum Expect {
+    /// 400 `MessageRejected`, with the not-verified sentence for the row's Region and
+    /// sender.
+    IdentityGate,
+    /// 400 `BadRequestException`, with this sentence.
+    BadRequest(&'static str),
+    /// 404 `NotFoundException`, for a template of this name.
+    NotFound(&'static str),
+    /// 200, with a `MessageId`.
+    Accepted,
+}
+
+/// One row of the ordering table: a templated send, and the one thing it must be refused
+/// (or accepted) for.
+struct TemplatedRow {
+    case: &'static str,
+    /// The Region the call is signed for.
+    region: &'static str,
+    /// An identity to create before the send, when the row has one.
+    identity: Option<&'static str>,
+    /// Whether the verification the clock owes that identity is through.
+    settled: bool,
+    sender: &'static str,
+    names: Names,
+    /// `Template$TemplateData` as the request carries it, or no member at all.
+    data: Option<&'static str>,
+    expect: Expect,
+}
+
+#[tokio::test]
+async fn template_data_is_refused_first_then_the_sender_then_the_template_name() {
+    // The rows span the Region, the class of the sender (no identity at all, an identity
+    // whose verification is not through, a verified domain identity), how the content
+    // identifies the template (a stored name, a name the account holds nothing under, the
+    // ARN addressing such a name, content carried inline, nothing at all) and the form of
+    // the template data (well-formed, truncated, a JSON value that is no object, no JSON at
+    // all, and the member left out entirely).
+    let rows = [
+        TemplatedRow {
+            case: "an unverified sender and a stored template: the identity gate",
+            region: "us-west-2",
+            identity: None,
+            settled: false,
+            sender: "stranger@example.com",
+            names: Names::Stored,
+            data: Some(DATA),
+            expect: Expect::IdentityGate,
+        },
+        TemplatedRow {
+            case: "an unverified sender and a template name that does not exist: the gate \
+                   masks the name",
+            region: "us-west-2",
+            identity: None,
+            settled: false,
+            sender: "stranger@example.com",
+            names: Names::Absent("absent"),
+            data: Some(DATA),
+            expect: Expect::IdentityGate,
+        },
+        TemplatedRow {
+            case: "the same, in another Region and naming the absent template by ARN",
+            region: "eu-central-1",
+            identity: None,
+            settled: false,
+            sender: "nobody@example.net",
+            names: Names::AbsentArn("absent"),
+            data: Some(DATA),
+            expect: Expect::IdentityGate,
+        },
+        TemplatedRow {
+            case: "an identity whose verification is not through yet, with no TemplateData \
+                   member at all",
+            region: "ap-southeast-2",
+            identity: Some("pending@example.com"),
+            settled: false,
+            sender: "pending@example.com",
+            names: Names::Stored,
+            data: None,
+            expect: Expect::IdentityGate,
+        },
+        TemplatedRow {
+            case: "an address inside a domain identity that is not verified yet, with the \
+                   template content carried inline",
+            region: "us-east-2",
+            identity: Some("example.net"),
+            settled: false,
+            sender: "sender@example.net",
+            names: Names::Inline,
+            data: Some(DATA),
+            expect: Expect::IdentityGate,
+        },
+        TemplatedRow {
+            case: "truncated template data, with an unverified sender: the data is refused \
+                   first",
+            region: "us-west-2",
+            identity: None,
+            settled: false,
+            sender: "stranger@example.com",
+            names: Names::Stored,
+            data: Some("{\"name\": "),
+            expect: Expect::BadRequest(INVALID_DATA),
+        },
+        TemplatedRow {
+            case: "a JSON list rather than a set of key-value pairs, with an unverified \
+                   sender",
+            region: "sa-east-1",
+            identity: None,
+            settled: false,
+            sender: "stranger@example.com",
+            names: Names::Stored,
+            data: Some("[1,2]"),
+            expect: Expect::BadRequest(INVALID_DATA),
+        },
+        TemplatedRow {
+            case: "no JSON at all, with an unverified sender and a template name that does \
+                   not exist",
+            region: "us-west-2",
+            identity: None,
+            settled: false,
+            sender: "stranger@example.com",
+            names: Names::Absent("absent"),
+            data: Some("name=Ada"),
+            expect: Expect::BadRequest(INVALID_DATA),
+        },
+        TemplatedRow {
+            case: "a JSON string rather than an object, with the content carried inline and \
+                   an unverified sender",
+            region: "eu-west-3",
+            identity: None,
+            settled: false,
+            sender: "stranger@example.com",
+            names: Names::Inline,
+            data: Some("\"Ada\""),
+            expect: Expect::BadRequest(INVALID_DATA),
+        },
+        TemplatedRow {
+            case: "content identifying no template at all, with an unverified sender: the \
+                   request states no message to render",
+            region: "us-west-2",
+            identity: None,
+            settled: false,
+            sender: "stranger@example.com",
+            names: Names::Nothing,
+            data: Some(DATA),
+            expect: Expect::BadRequest(NO_TEMPLATE),
+        },
+        TemplatedRow {
+            case: "the same from a VERIFIED sender",
+            region: "eu-central-1",
+            identity: Some("verified.example"),
+            settled: true,
+            sender: "ada@verified.example",
+            names: Names::Nothing,
+            data: None,
+            expect: Expect::BadRequest(NO_TEMPLATE),
+        },
+        TemplatedRow {
+            case: "malformed data from a VERIFIED sender: the same refusal",
+            region: "us-west-2",
+            identity: Some("verified.example"),
+            settled: true,
+            sender: "ada@verified.example",
+            names: Names::Stored,
+            data: Some("{\"name\": "),
+            expect: Expect::BadRequest(INVALID_DATA),
+        },
+        TemplatedRow {
+            case: "a verified sender and a template name that does not exist: the name is \
+                   resolved once the gate is passed",
+            region: "us-west-2",
+            identity: Some("verified.example"),
+            settled: true,
+            sender: "ada@verified.example",
+            names: Names::Absent("absent"),
+            data: Some(DATA),
+            expect: Expect::NotFound("absent"),
+        },
+        TemplatedRow {
+            case: "the same by ARN, in another Region, for a one-character name",
+            region: "ap-northeast-1",
+            identity: Some("verified.example"),
+            settled: true,
+            sender: "ada@verified.example",
+            names: Names::AbsentArn("x"),
+            data: Some(DATA),
+            expect: Expect::NotFound("x"),
+        },
+        TemplatedRow {
+            case: "a verified sender, the stored template and well-formed data",
+            region: "us-west-2",
+            identity: Some("verified.example"),
+            settled: true,
+            sender: "ada@verified.example",
+            names: Names::Stored,
+            data: Some(DATA),
+            expect: Expect::Accepted,
+        },
+        TemplatedRow {
+            case: "a verified sender and the stored template, with no TemplateData member \
+                   at all",
+            region: "eu-central-1",
+            identity: Some("verified.example"),
+            settled: true,
+            sender: "ada@verified.example",
+            names: Names::Stored,
+            data: None,
+            expect: Expect::Accepted,
+        },
+    ];
+
+    for row in rows {
+        let ses = Ses::new();
+        let created = ses.create_template(row.region).await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: the template must be saved first, got {} {:?}",
+            row.case, created.status, created.body
+        );
+        if let Some(identity) = row.identity {
+            let created = ses.create_identity(row.region, identity).await;
+            assert_eq!(
+                created.status, 200,
+                "case {:?}: the identity must be created first, got {} {:?}",
+                row.case, created.status, created.body
+            );
+        }
+        if row.settled {
+            ses.settle_identities();
+        }
+
+        let mut template = match row.names {
+            Names::Stored => json!({"TemplateName": TEMPLATE}),
+            Names::Absent(name) => json!({"TemplateName": name}),
+            Names::AbsentArn(name) => json!({
+                "TemplateArn": format!(
+                    "arn:aws:ses:{}:{}:template/{name}",
+                    row.region,
+                    engine::emulator_account_id()
+                ),
+            }),
+            Names::Inline => json!({
+                "TemplateContent": {"Subject": SUBJECT, "Text": TEXT, "Html": HTML},
+            }),
+            Names::Nothing => json!({}),
+        };
+        if let Some(data) = row.data {
+            template["TemplateData"] = json!(data);
+        }
+
+        let reply = ses
+            .send_content(row.region, row.sender, json!({"Template": template}))
+            .await;
+        let (status, code, message) = match row.expect {
+            Expect::IdentityGate => (400, "MessageRejected", refusal(row.region, row.sender)),
+            Expect::BadRequest(sentence) => (400, "BadRequestException", sentence.to_string()),
+            Expect::NotFound(name) => (404, "NotFoundException", no_such_template(name)),
+            Expect::Accepted => (200, "", String::new()),
+        };
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (status, code),
+            "case {:?}: expected {status} {code:?}, got {} {:?}",
+            row.case,
+            reply.status,
+            reply.body
+        );
+        if !message.is_empty() {
+            assert_eq!(
+                reply.message(),
+                message,
+                "case {:?}: expected the message {message:?}, got {:?}",
+                row.case,
+                reply.message()
+            );
+        }
+
+        // A refused send mints no id, appends nothing to the log and charges no quota; an
+        // accepted one does all three, for its one recipient.
+        let (logged, charged) = ses.accepted();
+        let expected_log = match row.expect {
+            Expect::Accepted => (1, 1.0),
+            _ => (0, 0.0),
+        };
+        assert_eq!(
+            (logged, charged),
+            expected_log,
+            "case {:?}: expected {expected_log:?} as (messages logged, quota charged), got \
+             ({logged}, {charged})",
+            row.case
+        );
+        assert_eq!(
+            !reply.text("/MessageId").is_empty(),
+            matches!(row.expect, Expect::Accepted),
+            "case {:?}: expected a MessageId only on an accepted send, got {:?}",
+            row.case,
+            reply.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn inline_template_content_past_the_bound_is_refused_before_the_gates() {
+    // The bound on the content a request carries INLINE is measured from the request
+    // alone — `crate::state::email_template_size` against `MAX_EMAIL_TEMPLATE_BYTES`, the
+    // same measure `CreateEmailTemplate` bounds a stored template by — so it is refused
+    // ahead of the sending-identity gate whatever state the sender is in. The rows differ
+    // along how far past the bound the content is and along the sender's state.
+    let region = "us-west-2";
+    let rows: &[(&str, usize, bool)] = &[
+        ("one byte past the bound, unverified sender", 1, false),
+        ("far past the bound, unverified sender", 4096, false),
+        ("one byte past the bound, verified sender", 1, true),
+    ];
+
+    for (case, over, settled) in rows {
+        let ses = Ses::new();
+        let sender = if *settled {
+            assert_eq!(
+                ses.create_identity(region, "verified.example").await.status,
+                200,
+                "case {case:?}: the identity must be created first"
+            );
+            ses.settle_identities();
+            "ada@verified.example"
+        } else {
+            "stranger@example.com"
+        };
+
+        let text = "x".repeat(MAX_EMAIL_TEMPLATE_BYTES + over - SUBJECT.len());
+        let size = SUBJECT.len() + text.len();
+        let reply = ses
+            .send_content(
+                region,
+                sender,
+                json!({"Template": {
+                    "TemplateContent": {"Subject": SUBJECT, "Text": text},
+                    "TemplateData": DATA,
+                }}),
+            )
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "BadRequestException"),
+            "case {case:?}: expected 400 BadRequestException, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+        let expected = format!(
+            "The template is {size} bytes, which is larger than the maximum template size \
+             of {MAX_EMAIL_TEMPLATE_BYTES} bytes."
+        );
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {case:?}: expected the message {expected:?}, got {:?}",
+            reply.message()
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_accepted_templated_send_carries_the_rendered_message() {
+    // Once the gates are passed, the message the send carries is the stored template with
+    // the request's values substituted into it — the same substitution
+    // `TestRenderEmailTemplate` previews, which is the positive control here. The rows
+    // differ along the value substituted, including a variable the data states nothing for;
+    // the last flag says whether the PREVIEW renders that data too, since
+    // `TestRenderEmailTemplate` requires a value for every variable the template
+    // references while a send renders one the data does not state as nothing.
+    let rows: &[(&str, Option<&str>, &str, bool)] = &[
+        (
+            "a value for the variable",
+            Some("{\"name\":\"Ada\"}"),
+            "Ada",
+            true,
+        ),
+        (
+            "another value, beside a key the template does not use",
+            Some("{\"name\":\"Grace\",\"unused\":\"x\"}"),
+            "Grace",
+            true,
+        ),
+        (
+            "data stating no value for the variable",
+            Some("{\"other\":\"x\"}"),
+            "",
+            false,
+        ),
+        ("no TemplateData member at all", None, "", false),
+    ];
+    let region = "us-west-2";
+
+    for (case, data, substituted, previews) in rows {
+        let ses = Ses::new();
+        assert_eq!(
+            ses.create_template(region).await.status,
+            200,
+            "case {case:?}: the template must be saved first"
+        );
+        assert_eq!(
+            ses.create_identity(region, "verified.example").await.status,
+            200,
+            "case {case:?}: the identity must be created first"
+        );
+        ses.settle_identities();
+
+        let mut template = json!({"TemplateName": TEMPLATE});
+        if let Some(data) = data {
+            template["TemplateData"] = json!(data);
+        }
+        let sent = ses
+            .send_content(region, "ada@verified.example", json!({"Template": template}))
+            .await;
+        assert_eq!(
+            sent.status, 200,
+            "case {case:?}: expected the send to be accepted, got {} {:?}",
+            sent.status, sent.body
+        );
+        let message_id = sent.text("/MessageId");
+        assert!(
+            !message_id.is_empty(),
+            "case {case:?}: expected a MessageId, got {:?}",
+            sent.body
+        );
+
+        // Read the accepted message back through an implemented reader: the subject it
+        // carries is the rendered one, with no reference left unresolved.
+        let expected_subject = format!("Hello {substituted}");
+        let read = ses.insights(region, &message_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected the accepted message to be readable back, got {} {:?}",
+            read.status, read.body
+        );
+        assert_eq!(
+            read.text("/Subject"),
+            expected_subject,
+            "case {case:?}: expected the rendered subject {expected_subject:?}, got {:?}",
+            read.body
+        );
+
+        // The positive control: the same template and data through
+        // `TestRenderEmailTemplate` render the same subject line into the preview.
+        if *previews {
+            let data = data.expect("a row whose preview renders states its data");
+            let preview = ses.render(region, data).await;
+            assert_eq!(
+                preview.status, 200,
+                "case {case:?}: expected the preview to render, got {} {:?}",
+                preview.status, preview.body
+            );
+            assert!(
+                preview.text("/RenderedTemplate").contains(&expected_subject),
+                "case {case:?}: expected the preview to carry {expected_subject:?}, got {:?}",
+                preview.body
+            );
+        }
     }
 }
