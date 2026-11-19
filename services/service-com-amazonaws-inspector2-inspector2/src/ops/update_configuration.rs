@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the Amazon Inspector scan configuration of the account the request
+//! names — the ECR automated re-scan setting and the Amazon EC2 scan mode — and can reset
+//! a member account's scan type to inherit the delegated administrator's again. Only a
+//! CHANGE of value starts the span the service applies it over, so a request asking for
+//! what is already in force leaves the setting terminal.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +156,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateConfigurationErrorModeled::InternalServerException(InternalServerException {
+                message: "Amazon Inspector scan configuration state is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // An inheritance reset asks for a member account's scan type to follow the
+        // delegated administrator's configuration again, and the model states what a
+        // request carrying it may also carry: no `ec2Configuration` and no
+        // `ecrConfiguration`, and an `accountId`. Both requirements are about which members
+        // are PRESENT TOGETHER rather than about one member's value, so the boundary cannot
+        // refuse them and they are refused here, before anything is written.
+        let inheritance = input.update_configuration_inheritance.as_ref();
+        if inheritance.is_some() {
+            let refusal = if input.ecr_configuration.is_some() || input.ec2_configuration.is_some()
+            {
+                Some(crate::state::INHERITANCE_WITH_CONFIGURATION_MESSAGE)
+            } else if input.account_id.is_none() {
+                Some(crate::state::INHERITANCE_WITHOUT_ACCOUNT_MESSAGE)
+            } else {
+                None
+            };
+            if let Some(message) = refusal {
+                return Err(UpdateConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: message.to_string(),
+                        reason: crate::state::VALIDATION_FIELD_FAILED.to_string(),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: crate::state::INHERITANCE_MEMBER.to_string(),
+                            message: message.to_string(),
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The scan configuration is held per account. A request naming no `accountId`
+        // writes the delegated administrator's own configuration, which every member
+        // account that has not been configured individually then reads; one naming an
+        // account writes that member account's. `accountId` is twelve digits here whatever
+        // the request carried: the modelled length and pattern are refused at the boundary
+        // before this handler runs.
+        let caller = ::engine::emulator_account_id();
+        let account_id = input
+            .account_id
+            .clone()
+            .unwrap_or_else(|| caller.to_string());
+
+        // What this call asks of that account's configuration. Each scan type's structure
+        // carries a required value — `rescanDuration`, `scanMode` — so a request that
+        // carries the structure names one; its optional members are absent when the request
+        // left them out, and leave that half of the setting as it was.
+        let update = crate::state::ScanConfigurationUpdate {
+            ecr: input
+                .ecr_configuration
+                .map(|ecr| crate::state::EcrRescanSettings {
+                    rescan_duration: ecr.rescan_duration,
+                    pull_date_rescan_duration: ecr.pull_date_rescan_duration,
+                    pull_date_rescan_mode: ecr.pull_date_rescan_mode,
+                }),
+            ec2: input
+                .ec2_configuration
+                .map(|ec2| crate::state::Ec2ScanSettings {
+                    scan_mode: ec2.scan_mode,
+                    vm_scanner_activated: ec2.activate_vm_scanner,
+                }),
+            // `InheritanceMode` admits exactly one token, so a member that carries it asks
+            // for the reset; the comparison is still written out, so a release adding a
+            // second token does not turn it into one.
+            inherit_ecr: inheritance
+                .and_then(|inheritance| inheritance.ecr_configuration.as_deref())
+                == Some(crate::state::INHERIT_FROM_ADMIN),
+            inherit_ec2: inheritance
+                .and_then(|inheritance| inheritance.ec2_configuration.as_deref())
+                == Some(crate::state::INHERIT_FROM_ADMIN),
+        };
+
+        let mut guard = state.lock();
+        // An account outside what the calling account administers is not the caller's to
+        // configure, so the request writes nothing at all for it — the same decision, from
+        // the same place, that this service's account-scoped reads take.
+        if !guard.administers_account(caller, &account_id) {
+            return Err(UpdateConfigurationErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::NO_ACCOUNT_ACCESS_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A request naming neither scan type's configuration nor an inheritance reset asks
+        // nothing of the account's configuration: nothing changes, and no record is written
+        // for an account that has none.
+        if update.asks_for_nothing() {
+            return Ok(UpdateConfigurationOutput {});
+        }
+
+        if !guard.update_scan_configuration(
+            &account_id,
+            caller,
+            update,
+            ::std::time::SystemTime::now(),
+        ) {
+            // The store already tracks as many accounts as this emulator keeps records
+            // for, so there is no room to record a configuration for this one: refused
+            // rather than reported as applied.
+            return Err(UpdateConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::too_many_accounts_message(),
+                    // No member of this request is at fault: the account map is full.
+                    reason: "OTHER".to_string(),
+                    fields: None,
+                },
+            )
+            .into());
+        }
+
+        // `UpdateConfigurationResponse` has no members: what the call changed is read back
+        // through `GetConfiguration`.
+        Ok(UpdateConfigurationOutput {})
     }
 }

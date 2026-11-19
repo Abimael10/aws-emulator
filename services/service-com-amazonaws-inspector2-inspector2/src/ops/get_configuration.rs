@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the Amazon Inspector scan configuration in force for the account
+//! the request names — its own ECR automated re-scan setting and Amazon EC2 scan mode where
+//! it has been configured individually, and the delegated administrator's where it has not.
+//! A reporting operation: every value is read from the shared state and every status is
+//! derived from the instant the last change falls due, so this handler writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +153,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetConfigurationErrorModeled::InternalServerException(InternalServerException {
+                message: "Amazon Inspector scan configuration state is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // The scan configuration is held per account. A request naming no `accountId` asks
+        // for the calling account's own configuration; one naming an account asks for that
+        // member account's, which only the account's delegated administrator may read.
+        // `accountId` is twelve digits here whatever the request carried: the modelled
+        // length and pattern are refused at the boundary before this handler runs.
+        let caller = ::engine::emulator_account_id();
+        let account_id = input.account_id.unwrap_or_else(|| caller.to_string());
+
+        let guard = state.lock();
+        // An account outside what the calling account administers is not the caller's to
+        // read, so no configuration is reported for it at all — the same decision, from the
+        // same place, that this service's account-scoped reads take.
+        if !guard.administers_account(caller, &account_id) {
+            return Err(GetConfigurationErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::NO_ACCOUNT_ACCESS_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The configuration in force: this account's own overrides where it has them, and
+        // the delegated administrator's where it does not. In this emulator the single
+        // account it presents is that administrator.
+        let configuration = guard.effective_scan_configuration(&account_id, caller);
+        let now = ::std::time::SystemTime::now();
+
+        Ok(GetConfigurationOutput {
+            ecr_configuration: Some(crate::state::ecr_configuration_state(
+                configuration.ecr.as_ref(),
+                now,
+            )),
+            ec2_configuration: Some(crate::state::ec2_configuration_state(
+                configuration.ec2.as_ref(),
+                now,
+            )),
+        })
     }
 }

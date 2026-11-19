@@ -2,15 +2,21 @@
 
 //! End-to-end tests for the Amazon Inspector account-activation and
 //! suppression-filter slice: `Enable`, `BatchGetAccountStatus`, `CreateFilter`,
-//! `ListFilters`, `UpdateFilter` and `DeleteFilter`.
+//! `ListFilters`, `UpdateFilter` and `DeleteFilter`, plus the per-account SCAN
+//! CONFIGURATION that activation carries — `UpdateConfiguration` and `GetConfiguration`.
 //!
 //! Every request goes through the real `MultiServiceRouter` — routing, restJson1
 //! deserialization, modelled-constraint validation, the handler, and restJson1
 //! serialization — so what is asserted here is the wire behaviour a client sees.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_inspector2_inspector2::state::{
+    CONFIGURATION_PENDING, CONFIGURATION_SUCCESS, CONFIGURATION_TRANSITION,
+    DEFAULT_EC2_SCAN_MODE, DEFAULT_ECR_RESCAN_DURATION, INHERIT_FROM_ADMIN,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The single account id every generated emulator presents
@@ -1065,4 +1071,986 @@ async fn filter_tags_round_trip_as_sent() {
              got {got})"
         );
     }
+}
+
+// --- the per-account scan configuration -------------------------------------------------
+//
+// The rule under test: an account's Amazon Inspector scan configuration is the one its last
+// `UpdateConfiguration` wrote for it — the ECR automated re-scan setting and the Amazon EC2
+// scan mode, each member the call named replacing the value in force and each member it
+// omitted leaving that value alone — reported as PENDING while a CHANGE is still being
+// applied and as applied once that span has fallen due; an account that was never
+// configured individually reports the delegated administrator's configuration, and the
+// administrator's own reports the values the service applies until it is asked for others.
+
+/// `GetConfiguration`'s route.
+/// Source: `smithy_query(query="operation", operation="GetConfiguration")` — `POST
+/// /configuration/get`.
+const CONFIGURATION_GET_URI: &str = "/configuration/get";
+
+/// `UpdateConfiguration`'s route.
+/// Source: `smithy_query(query="operation", operation="UpdateConfiguration")` — `POST
+/// /configuration/update`.
+const CONFIGURATION_UPDATE_URI: &str = "/configuration/update";
+
+/// A 12-digit account id other than the calling account's, which `Enable` brings into the
+/// organization this emulator presents.
+const MEMBER: &str = "222222222222";
+
+/// A 12-digit account id nothing ever recorded, so it is outside what the calling account
+/// administers.
+const OUTSIDE: &str = "333333333333";
+
+/// Every `EcrRescanDuration` token, in model order — the push-date windows an account may
+/// ask for.
+/// Source: `smithy_query(query="shape", shape="EcrRescanDuration")`.
+const ECR_RESCAN_DURATIONS: [&str; 8] = [
+    "LIFETIME",
+    "DAYS_30",
+    "DAYS_180",
+    "DAYS_14",
+    "DAYS_60",
+    "DAYS_90",
+    "DAYS_3",
+    "DAYS_7",
+];
+
+/// Every `Ec2ScanMode` token, in model order.
+/// Source: `smithy_query(query="shape", shape="Ec2ScanMode")`.
+const EC2_SCAN_MODES: [&str; 2] = ["EC2_SSM_AGENT_BASED", "EC2_HYBRID"];
+
+/// What a `GetConfiguration` read must report: the ECR push-date window, the two pull-date
+/// members (absent while no account in the inheritance chain has configured them), the EC2
+/// scan mode and the VM scanner activation (absent while none has asked either way).
+struct ExpectedConfiguration {
+    rescan_duration: &'static str,
+    pull_date_rescan_duration: Option<&'static str>,
+    pull_date_rescan_mode: Option<&'static str>,
+    scan_mode: &'static str,
+    vm_scanner_activated: Option<bool>,
+}
+
+/// One row of the scan-configuration table: an `UpdateConfiguration` body, and the
+/// configuration the account must report once it has been applied.
+struct ConfigurationRow {
+    case: &'static str,
+    request: Value,
+    expected: ExpectedConfiguration,
+}
+
+/// `GetConfiguration` — `POST /configuration/get`.
+async fn get_configuration(
+    router: &MultiServiceRouter,
+    body: &Value,
+) -> (u16, Option<String>, Value) {
+    post_in(router, "us-east-1", CONFIGURATION_GET_URI, body).await
+}
+
+/// `UpdateConfiguration` — `POST /configuration/update`.
+async fn update_configuration(
+    router: &MultiServiceRouter,
+    body: &Value,
+) -> (u16, Option<String>, Value) {
+    post_in(router, "us-east-1", CONFIGURATION_UPDATE_URI, body).await
+}
+
+/// `UpdateConfiguration`, asserting the call was accepted.
+async fn update_ok(router: &MultiServiceRouter, body: &Value, case: &str) {
+    let (status, error_type, response) = update_configuration(router, body).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: UpdateConfiguration: expected 200, got {status} / {response} \
+         ({error_type:?})"
+    );
+}
+
+/// The ECR member of a read, and the EC2 scan-mode member.
+fn ecr_state(body: &Value) -> &Value {
+    &body["ecrConfiguration"]["rescanDurationState"]
+}
+
+fn ec2_scan_mode_state(body: &Value) -> &Value {
+    &body["ec2Configuration"]["scanModeState"]
+}
+
+/// `Some(token)` rendered as the member it is reported in, and `Value::Null` for the member
+/// a read must leave out.
+fn member_or_absent(token: Option<&str>) -> Value {
+    token.map_or(Value::Null, |token| json!(token))
+}
+
+/// The status tokens a read may report `elapsed` after a change: a change is applied over a
+/// span, so while that span is open the setting is PENDING, and only a test slow enough to
+/// have passed the due instant may see it already applied. Recomputed before each
+/// assertion, so a stall between two calls cannot make a test flaky.
+fn owed_status(elapsed: Duration) -> Vec<&'static str> {
+    if elapsed < CONFIGURATION_TRANSITION {
+        vec![CONFIGURATION_PENDING]
+    } else {
+        vec![CONFIGURATION_PENDING, CONFIGURATION_SUCCESS]
+    }
+}
+
+/// Assert the configuration the account `request` names is exactly `expected`, read TWICE:
+/// the configuration is state, so reading it reports the same thing again and changes
+/// nothing a later caller sees.
+async fn assert_reports(
+    router: &MultiServiceRouter,
+    request: &Value,
+    case: &str,
+    expected: &ExpectedConfiguration,
+) {
+    for read in 1..=2 {
+        let (status, error_type, body) = get_configuration(router, request).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: read #{read}: GetConfiguration: expected 200, got {status} / {body} \
+             ({error_type:?})"
+        );
+        let ecr = ecr_state(&body);
+        assert_eq!(
+            ecr["rescanDuration"],
+            json!(expected.rescan_duration),
+            "case {case}: read #{read}: expected rescanDuration {:?}, got {body}",
+            expected.rescan_duration
+        );
+        assert_eq!(
+            ecr.get("pullDateRescanDuration")
+                .cloned()
+                .unwrap_or(Value::Null),
+            member_or_absent(expected.pull_date_rescan_duration),
+            "case {case}: read #{read}: expected pullDateRescanDuration {:?}, got {body}",
+            expected.pull_date_rescan_duration
+        );
+        assert_eq!(
+            ecr.get("pullDateRescanMode")
+                .cloned()
+                .unwrap_or(Value::Null),
+            member_or_absent(expected.pull_date_rescan_mode),
+            "case {case}: read #{read}: expected pullDateRescanMode {:?}, got {body}",
+            expected.pull_date_rescan_mode
+        );
+        let ec2 = ec2_scan_mode_state(&body);
+        assert_eq!(
+            ec2["scanMode"],
+            json!(expected.scan_mode),
+            "case {case}: read #{read}: expected scanMode {:?}, got {body}",
+            expected.scan_mode
+        );
+        let vm_scanner = body["ec2Configuration"]
+            .get("vmScannerState")
+            .cloned()
+            .unwrap_or(Value::Null);
+        match expected.vm_scanner_activated {
+            None => assert!(
+                vm_scanner.is_null(),
+                "case {case}: read #{read}: an account that never asked for the VM scanner \
+                 must report no vmScannerState, got {body}"
+            ),
+            Some(activated) => assert_eq!(
+                vm_scanner["activated"],
+                json!(activated),
+                "case {case}: read #{read}: expected the VM scanner activated={activated}, got \
+                 {body}"
+            ),
+        }
+        // Every status member reports one of the two tokens a setting passes through; which
+        // one at which instant is pinned by
+        // `a_changed_setting_is_pending_until_the_service_has_applied_it`.
+        for (member, reported) in [
+            ("ecrConfiguration", ecr["status"].as_str()),
+            ("ec2Configuration", ec2["scanModeStatus"].as_str()),
+        ] {
+            let reported = reported.unwrap_or_default();
+            assert!(
+                [CONFIGURATION_PENDING, CONFIGURATION_SUCCESS].contains(&reported),
+                "case {case}: read #{read}: {member} must report an applied or pending status, \
+                 got {reported:?} / {body}"
+            );
+        }
+    }
+}
+
+/// Poll `GetConfiguration` until both settings report themselves applied, or a generous
+/// deadline passes. Waits for the CONDITION rather than for a fixed time.
+async fn wait_until_applied(router: &MultiServiceRouter, case: &str) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let (status, _, body) = get_configuration(router, &json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: GetConfiguration while polling: expected 200, got {status} / {body}"
+        );
+        let applied = ecr_state(&body)["status"] == json!(CONFIGURATION_SUCCESS)
+            && ec2_scan_mode_state(&body)["scanModeStatus"] == json!(CONFIGURATION_SUCCESS);
+        if applied {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: the configuration never reported itself applied, last read {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// An account nothing has configured reports the configuration the service applies until it
+/// is asked for another: the window that never closes, the scan mode an account starts on,
+/// both already applied, and no instant of a change that never happened.
+#[tokio::test]
+async fn an_unconfigured_account_reports_the_configuration_the_service_applies() {
+    assert!(
+        ECR_RESCAN_DURATIONS.contains(&DEFAULT_ECR_RESCAN_DURATION)
+            && EC2_SCAN_MODES.contains(&DEFAULT_EC2_SCAN_MODE),
+        "the configuration the service applies must be made of published tokens, got \
+         {DEFAULT_ECR_RESCAN_DURATION:?} and {DEFAULT_EC2_SCAN_MODE:?}"
+    );
+
+    let router = router();
+    // Rows: the two ways a request names the calling account — not at all, and by its id.
+    for (case, request) in [
+        ("no accountId", json!({})),
+        ("its own accountId", json!({ "accountId": ACCOUNT })),
+    ] {
+        assert_reports(
+            &router,
+            &request,
+            case,
+            &ExpectedConfiguration {
+                rescan_duration: DEFAULT_ECR_RESCAN_DURATION,
+                pull_date_rescan_duration: None,
+                pull_date_rescan_mode: None,
+                scan_mode: DEFAULT_EC2_SCAN_MODE,
+                vm_scanner_activated: None,
+            },
+        )
+        .await;
+
+        let (_, _, body) = get_configuration(&router, &request).await;
+        assert!(
+            ecr_state(&body).get("updatedAt").is_none(),
+            "case {case}: a setting that never changed reports no updatedAt, got {body}"
+        );
+        assert_eq!(
+            ecr_state(&body)["status"],
+            json!(CONFIGURATION_SUCCESS),
+            "case {case}: with nothing being applied the ECR setting is applied, got {body}"
+        );
+        assert_eq!(
+            ec2_scan_mode_state(&body)["scanModeStatus"],
+            json!(CONFIGURATION_SUCCESS),
+            "case {case}: with nothing being applied the EC2 setting is applied, got {body}"
+        );
+    }
+}
+
+/// The configuration an account reports is the one its updates wrote: each member a call
+/// names replaces the value in force, each member it omits leaves that value alone, and a
+/// call naming nothing changes nothing.
+#[tokio::test]
+async fn the_scan_configuration_read_back_is_the_one_the_updates_wrote() {
+    // Rows differ along WHICH scan type is configured, which of that structure's optional
+    // members the call names, and the token asked for — over the whole published
+    // `EcrRescanDuration` set, both `Ec2ScanMode` tokens, both pull-date modes and the VM
+    // scanner either way.
+    let rows: Vec<ConfigurationRow> = vec![
+        ConfigurationRow {
+            case: "the window already in force",
+            request: json!({ "ecrConfiguration": { "rescanDuration": "LIFETIME" } }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "LIFETIME",
+                pull_date_rescan_duration: None,
+                pull_date_rescan_mode: None,
+                scan_mode: DEFAULT_EC2_SCAN_MODE,
+                vm_scanner_activated: None,
+            },
+        },
+        ConfigurationRow {
+            case: "a 30-day window",
+            request: json!({ "ecrConfiguration": { "rescanDuration": "DAYS_30" } }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_30",
+                pull_date_rescan_duration: None,
+                pull_date_rescan_mode: None,
+                scan_mode: DEFAULT_EC2_SCAN_MODE,
+                vm_scanner_activated: None,
+            },
+        },
+        ConfigurationRow {
+            case: "a 180-day window with a pull-date window beside it",
+            request: json!({
+                "ecrConfiguration": {
+                    "rescanDuration": "DAYS_180",
+                    "pullDateRescanDuration": "DAYS_90"
+                }
+            }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_180",
+                pull_date_rescan_duration: Some("DAYS_90"),
+                pull_date_rescan_mode: None,
+                scan_mode: DEFAULT_EC2_SCAN_MODE,
+                vm_scanner_activated: None,
+            },
+        },
+        ConfigurationRow {
+            case: "a 14-day window naming only the pull-date mode",
+            request: json!({
+                "ecrConfiguration": {
+                    "rescanDuration": "DAYS_14",
+                    "pullDateRescanMode": "LAST_IN_USE_AT"
+                }
+            }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_14",
+                // Omitted, so the pull-date window stays as the row before left it.
+                pull_date_rescan_duration: Some("DAYS_90"),
+                pull_date_rescan_mode: Some("LAST_IN_USE_AT"),
+                scan_mode: DEFAULT_EC2_SCAN_MODE,
+                vm_scanner_activated: None,
+            },
+        },
+        ConfigurationRow {
+            case: "a 60-day window with both pull-date members at once",
+            request: json!({
+                "ecrConfiguration": {
+                    "rescanDuration": "DAYS_60",
+                    "pullDateRescanDuration": "DAYS_3",
+                    "pullDateRescanMode": "LAST_PULL_DATE"
+                }
+            }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_60",
+                pull_date_rescan_duration: Some("DAYS_3"),
+                pull_date_rescan_mode: Some("LAST_PULL_DATE"),
+                scan_mode: DEFAULT_EC2_SCAN_MODE,
+                vm_scanner_activated: None,
+            },
+        },
+        ConfigurationRow {
+            case: "a 90-day window, the pull-date members left alone",
+            request: json!({ "ecrConfiguration": { "rescanDuration": "DAYS_90" } }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_90",
+                pull_date_rescan_duration: Some("DAYS_3"),
+                pull_date_rescan_mode: Some("LAST_PULL_DATE"),
+                scan_mode: DEFAULT_EC2_SCAN_MODE,
+                vm_scanner_activated: None,
+            },
+        },
+        ConfigurationRow {
+            case: "the shortest window",
+            request: json!({ "ecrConfiguration": { "rescanDuration": "DAYS_3" } }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_3",
+                pull_date_rescan_duration: Some("DAYS_3"),
+                pull_date_rescan_mode: Some("LAST_PULL_DATE"),
+                scan_mode: DEFAULT_EC2_SCAN_MODE,
+                vm_scanner_activated: None,
+            },
+        },
+        ConfigurationRow {
+            case: "a 7-day window with the longest pull-date window",
+            request: json!({
+                "ecrConfiguration": {
+                    "rescanDuration": "DAYS_7",
+                    "pullDateRescanDuration": "DAYS_180"
+                }
+            }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_7",
+                pull_date_rescan_duration: Some("DAYS_180"),
+                pull_date_rescan_mode: Some("LAST_PULL_DATE"),
+                scan_mode: DEFAULT_EC2_SCAN_MODE,
+                vm_scanner_activated: None,
+            },
+        },
+        ConfigurationRow {
+            case: "the agent-based scan mode, the ECR setting left alone",
+            request: json!({ "ec2Configuration": { "scanMode": "EC2_SSM_AGENT_BASED" } }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_7",
+                pull_date_rescan_duration: Some("DAYS_180"),
+                pull_date_rescan_mode: Some("LAST_PULL_DATE"),
+                scan_mode: "EC2_SSM_AGENT_BASED",
+                vm_scanner_activated: None,
+            },
+        },
+        ConfigurationRow {
+            case: "the hybrid scan mode with the VM scanner activated",
+            request: json!({
+                "ec2Configuration": { "scanMode": "EC2_HYBRID", "activateVMScanner": true }
+            }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_7",
+                pull_date_rescan_duration: Some("DAYS_180"),
+                pull_date_rescan_mode: Some("LAST_PULL_DATE"),
+                scan_mode: "EC2_HYBRID",
+                vm_scanner_activated: Some(true),
+            },
+        },
+        ConfigurationRow {
+            case: "the scan mode changed, the VM scanner left alone",
+            request: json!({ "ec2Configuration": { "scanMode": "EC2_SSM_AGENT_BASED" } }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_7",
+                pull_date_rescan_duration: Some("DAYS_180"),
+                pull_date_rescan_mode: Some("LAST_PULL_DATE"),
+                scan_mode: "EC2_SSM_AGENT_BASED",
+                vm_scanner_activated: Some(true),
+            },
+        },
+        ConfigurationRow {
+            case: "the VM scanner deactivated",
+            request: json!({
+                "ec2Configuration": {
+                    "scanMode": "EC2_SSM_AGENT_BASED",
+                    "activateVMScanner": false
+                }
+            }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "DAYS_7",
+                pull_date_rescan_duration: Some("DAYS_180"),
+                pull_date_rescan_mode: Some("LAST_PULL_DATE"),
+                scan_mode: "EC2_SSM_AGENT_BASED",
+                vm_scanner_activated: Some(false),
+            },
+        },
+        ConfigurationRow {
+            case: "both scan types in one call",
+            request: json!({
+                "ecrConfiguration": {
+                    "rescanDuration": "LIFETIME",
+                    "pullDateRescanDuration": "DAYS_14",
+                    "pullDateRescanMode": "LAST_IN_USE_AT"
+                },
+                "ec2Configuration": { "scanMode": "EC2_HYBRID", "activateVMScanner": true }
+            }),
+            expected: ExpectedConfiguration {
+                rescan_duration: "LIFETIME",
+                pull_date_rescan_duration: Some("DAYS_14"),
+                pull_date_rescan_mode: Some("LAST_IN_USE_AT"),
+                scan_mode: "EC2_HYBRID",
+                vm_scanner_activated: Some(true),
+            },
+        },
+        ConfigurationRow {
+            case: "a call asking for nothing at all",
+            request: json!({}),
+            expected: ExpectedConfiguration {
+                rescan_duration: "LIFETIME",
+                pull_date_rescan_duration: Some("DAYS_14"),
+                pull_date_rescan_mode: Some("LAST_IN_USE_AT"),
+                scan_mode: "EC2_HYBRID",
+                vm_scanner_activated: Some(true),
+            },
+        },
+    ];
+
+    // The table spans the published push-date window set and both scan modes, so a token
+    // the issue never cited is exercised here too.
+    for token in ECR_RESCAN_DURATIONS {
+        assert!(
+            rows.iter().any(|row| row.expected.rescan_duration == token),
+            "the table must cover the published EcrRescanDuration token {token:?}"
+        );
+    }
+    for token in EC2_SCAN_MODES {
+        assert!(
+            rows.iter().any(|row| row.expected.scan_mode == token),
+            "the table must cover the published Ec2ScanMode token {token:?}"
+        );
+    }
+
+    let router = router();
+    for row in &rows {
+        update_ok(&router, &row.request, row.case).await;
+        assert_reports(&router, &json!({}), row.case, &row.expected).await;
+    }
+}
+
+/// The ECR setting reports the instant it last CHANGED: nothing while it never has, the
+/// instant of a change once one has happened, and the same instant again for a call asking
+/// for the window already in force.
+#[tokio::test]
+async fn the_ecr_setting_reports_the_instant_it_last_changed() {
+    let router = router();
+    let reported_at = |body: &Value| {
+        ecr_state(body)
+            .get("updatedAt")
+            .and_then(Value::as_f64)
+    };
+
+    let (_, _, body) = get_configuration(&router, &json!({})).await;
+    assert!(
+        reported_at(&body).is_none(),
+        "an account that never configured the setting reports no updatedAt, got {body}"
+    );
+
+    update_ok(
+        &router,
+        &json!({ "ecrConfiguration": { "rescanDuration": DEFAULT_ECR_RESCAN_DURATION } }),
+        "the window already in force",
+    )
+    .await;
+    let (_, _, body) = get_configuration(&router, &json!({})).await;
+    assert!(
+        reported_at(&body).is_none(),
+        "a call asking for the window in force changes nothing, so there is still no \
+         updatedAt, got {body}"
+    );
+
+    update_ok(
+        &router,
+        &json!({ "ecrConfiguration": { "rescanDuration": "DAYS_30" } }),
+        "the first change",
+    )
+    .await;
+    let (_, _, body) = get_configuration(&router, &json!({})).await;
+    let first = reported_at(&body)
+        .unwrap_or_else(|| panic!("a changed setting must report when it changed, got {body}"));
+
+    update_ok(
+        &router,
+        &json!({ "ecrConfiguration": { "rescanDuration": "DAYS_30" } }),
+        "the same window again",
+    )
+    .await;
+    let (_, _, body) = get_configuration(&router, &json!({})).await;
+    assert_eq!(
+        reported_at(&body),
+        Some(first),
+        "a call asking for the window in force must not move updatedAt, got {body}"
+    );
+
+    update_ok(
+        &router,
+        &json!({ "ecrConfiguration": { "rescanDuration": "DAYS_180" } }),
+        "the later change",
+    )
+    .await;
+    let (_, _, body) = get_configuration(&router, &json!({})).await;
+    let later = reported_at(&body)
+        .unwrap_or_else(|| panic!("the later change must report when it changed, got {body}"));
+    assert!(
+        later >= first,
+        "the later change must be reported at or after the first, got {later} after {first}"
+    );
+}
+
+/// A change is reported as pending until the span the service applies it over has fallen
+/// due, and a call asking for the values already in force starts no span at all — a
+/// transition the CLOCK owes, so merely reading does not bring it forward.
+#[tokio::test]
+async fn a_changed_setting_is_pending_until_the_service_has_applied_it() {
+    let router = router();
+    // Rows differ along WHICH scan type changes, including both at once, and the last asks
+    // for the values already in force.
+    let rows: Vec<(&str, Value, bool)> = vec![
+        (
+            "the ECR window changes",
+            json!({ "ecrConfiguration": { "rescanDuration": "DAYS_30" } }),
+            true,
+        ),
+        (
+            "the EC2 scan mode changes",
+            json!({ "ec2Configuration": { "scanMode": "EC2_SSM_AGENT_BASED" } }),
+            true,
+        ),
+        (
+            "both change at once",
+            json!({
+                "ecrConfiguration": { "rescanDuration": "DAYS_7" },
+                "ec2Configuration": { "scanMode": "EC2_HYBRID" }
+            }),
+            true,
+        ),
+        (
+            "the ECR window is asked for again",
+            json!({ "ecrConfiguration": { "rescanDuration": "DAYS_7" } }),
+            false,
+        ),
+    ];
+
+    for (case, request, expect_pending) in rows {
+        let started = Instant::now();
+        update_ok(&router, &request, case).await;
+
+        let (status, _, body) = get_configuration(&router, &json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: GetConfiguration after the update: expected 200, got {status} / {body}"
+        );
+        // Only the scan types the call named have anything to apply.
+        let mut reported = Vec::new();
+        if request.get("ecrConfiguration").is_some() {
+            reported.push(("ecrConfiguration", ecr_state(&body)["status"].as_str()));
+        }
+        if request.get("ec2Configuration").is_some() {
+            reported.push((
+                "ec2Configuration",
+                ec2_scan_mode_state(&body)["scanModeStatus"].as_str(),
+            ));
+        }
+        for (member, status) in reported {
+            let status = status.unwrap_or_default();
+            if expect_pending {
+                let allowed = owed_status(started.elapsed());
+                assert!(
+                    allowed.contains(&status),
+                    "case {case}: {member} must report one of {allowed:?} inside the span, got \
+                     {status:?} / {body}"
+                );
+            } else {
+                assert_eq!(
+                    status, CONFIGURATION_SUCCESS,
+                    "case {case}: {member} has nothing to apply, so it stays applied, got \
+                     {status:?} / {body}"
+                );
+            }
+        }
+
+        wait_until_applied(&router, case).await;
+    }
+}
+
+/// A member account reports the delegated administrator's configuration until it is
+/// configured individually, holds its own once it is, and follows the administrator's again
+/// once an inheritance reset drops its own.
+#[tokio::test]
+async fn a_member_account_follows_the_administrator_until_it_is_configured_itself() {
+    let router = router();
+    // `Enable` is how an account enters the organization this emulator presents.
+    let (status, error_type, body) = post_in(
+        &router,
+        "us-east-1",
+        "/enable",
+        &json!({ "resourceTypes": ["ECR"], "accountIds": [MEMBER] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "Enable for the member account: expected 200, got {status} / {body} ({error_type:?})"
+    );
+
+    let member = json!({ "accountId": MEMBER });
+    let administrator = json!({});
+
+    update_ok(
+        &router,
+        &json!({
+            "ecrConfiguration": { "rescanDuration": "DAYS_30" },
+            "ec2Configuration": { "scanMode": "EC2_SSM_AGENT_BASED" }
+        }),
+        "the administrator's configuration",
+    )
+    .await;
+    // Propagated: the member has nothing of its own, so it reads the administrator's.
+    assert_reports(
+        &router,
+        &member,
+        "the member before it is configured",
+        &ExpectedConfiguration {
+            rescan_duration: "DAYS_30",
+            pull_date_rescan_duration: None,
+            pull_date_rescan_mode: None,
+            scan_mode: "EC2_SSM_AGENT_BASED",
+            vm_scanner_activated: None,
+        },
+    )
+    .await;
+
+    update_ok(
+        &router,
+        &json!({
+            "accountId": MEMBER,
+            "ecrConfiguration": { "rescanDuration": "DAYS_7" }
+        }),
+        "the member's own ECR configuration",
+    )
+    .await;
+    assert_reports(
+        &router,
+        &member,
+        "the member once its ECR setting is its own",
+        &ExpectedConfiguration {
+            rescan_duration: "DAYS_7",
+            pull_date_rescan_duration: None,
+            pull_date_rescan_mode: None,
+            scan_mode: "EC2_SSM_AGENT_BASED",
+            vm_scanner_activated: None,
+        },
+    )
+    .await;
+    assert_reports(
+        &router,
+        &administrator,
+        "the administrator after the member was configured",
+        &ExpectedConfiguration {
+            rescan_duration: "DAYS_30",
+            pull_date_rescan_duration: None,
+            pull_date_rescan_mode: None,
+            scan_mode: "EC2_SSM_AGENT_BASED",
+            vm_scanner_activated: None,
+        },
+    )
+    .await;
+
+    // A later administrator change reaches the setting the member does NOT hold of its own,
+    // and leaves the one it does alone.
+    update_ok(
+        &router,
+        &json!({
+            "ecrConfiguration": { "rescanDuration": "DAYS_14" },
+            "ec2Configuration": { "scanMode": "EC2_HYBRID" }
+        }),
+        "the administrator's later configuration",
+    )
+    .await;
+    assert_reports(
+        &router,
+        &member,
+        "the member with one setting of its own",
+        &ExpectedConfiguration {
+            rescan_duration: "DAYS_7",
+            pull_date_rescan_duration: None,
+            pull_date_rescan_mode: None,
+            scan_mode: "EC2_HYBRID",
+            vm_scanner_activated: None,
+        },
+    )
+    .await;
+
+    update_ok(
+        &router,
+        &json!({
+            "accountId": MEMBER,
+            "updateConfigurationInheritance": { "ecrConfiguration": INHERIT_FROM_ADMIN }
+        }),
+        "the ECR inheritance reset",
+    )
+    .await;
+    assert_reports(
+        &router,
+        &member,
+        "the member after its ECR setting is reset to inherit",
+        &ExpectedConfiguration {
+            rescan_duration: "DAYS_14",
+            pull_date_rescan_duration: None,
+            pull_date_rescan_mode: None,
+            scan_mode: "EC2_HYBRID",
+            vm_scanner_activated: None,
+        },
+    )
+    .await;
+
+    // The same holds for the EC2 setting, whose VM scanner state belongs to the override
+    // and goes with it.
+    update_ok(
+        &router,
+        &json!({
+            "accountId": MEMBER,
+            "ec2Configuration": { "scanMode": "EC2_SSM_AGENT_BASED", "activateVMScanner": true }
+        }),
+        "the member's own EC2 configuration",
+    )
+    .await;
+    assert_reports(
+        &router,
+        &member,
+        "the member once its EC2 setting is its own",
+        &ExpectedConfiguration {
+            rescan_duration: "DAYS_14",
+            pull_date_rescan_duration: None,
+            pull_date_rescan_mode: None,
+            scan_mode: "EC2_SSM_AGENT_BASED",
+            vm_scanner_activated: Some(true),
+        },
+    )
+    .await;
+    update_ok(
+        &router,
+        &json!({
+            "accountId": MEMBER,
+            "updateConfigurationInheritance": { "ec2Configuration": INHERIT_FROM_ADMIN }
+        }),
+        "the EC2 inheritance reset",
+    )
+    .await;
+    assert_reports(
+        &router,
+        &member,
+        "the member after its EC2 setting is reset to inherit",
+        &ExpectedConfiguration {
+            rescan_duration: "DAYS_14",
+            pull_date_rescan_duration: None,
+            pull_date_rescan_mode: None,
+            scan_mode: "EC2_HYBRID",
+            vm_scanner_activated: None,
+        },
+    )
+    .await;
+}
+
+/// An inheritance reset outside the combination the model documents for it — beside a
+/// scan-type configuration, or without the account to reset — is refused 400
+/// `ValidationException`, and the refused call changes nothing.
+#[tokio::test]
+async fn an_inheritance_reset_outside_its_documented_combination_is_refused() {
+    let router = router();
+    update_ok(
+        &router,
+        &json!({ "ecrConfiguration": { "rescanDuration": "DAYS_60" } }),
+        "the configuration in force",
+    )
+    .await;
+    let in_force = ExpectedConfiguration {
+        rescan_duration: "DAYS_60",
+        pull_date_rescan_duration: None,
+        pull_date_rescan_mode: None,
+        scan_mode: DEFAULT_EC2_SCAN_MODE,
+        vm_scanner_activated: None,
+    };
+
+    // Rows differ along WHICH half of the documented requirement is broken and along which
+    // scan type's member breaks it.
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "no accountId, the ECR member",
+            json!({
+                "updateConfigurationInheritance": { "ecrConfiguration": INHERIT_FROM_ADMIN }
+            }),
+        ),
+        (
+            "no accountId, the EC2 member",
+            json!({
+                "updateConfigurationInheritance": { "ec2Configuration": INHERIT_FROM_ADMIN }
+            }),
+        ),
+        (
+            "beside an ecrConfiguration",
+            json!({
+                "accountId": ACCOUNT,
+                "ecrConfiguration": { "rescanDuration": "DAYS_3" },
+                "updateConfigurationInheritance": { "ecrConfiguration": INHERIT_FROM_ADMIN }
+            }),
+        ),
+        (
+            "beside an ec2Configuration",
+            json!({
+                "accountId": ACCOUNT,
+                "ec2Configuration": { "scanMode": "EC2_SSM_AGENT_BASED" },
+                "updateConfigurationInheritance": { "ec2Configuration": INHERIT_FROM_ADMIN }
+            }),
+        ),
+        (
+            "beside both, and with no accountId",
+            json!({
+                "ecrConfiguration": { "rescanDuration": "DAYS_3" },
+                "ec2Configuration": { "scanMode": "EC2_SSM_AGENT_BASED" },
+                "updateConfigurationInheritance": {
+                    "ecrConfiguration": INHERIT_FROM_ADMIN,
+                    "ec2Configuration": INHERIT_FROM_ADMIN
+                }
+            }),
+        ),
+    ];
+
+    for (case, request) in rows {
+        let (status, error_type, body) = update_configuration(&router, &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case}: UpdateConfiguration: expected 400, got {status} / {body}"
+        );
+        assert_eq!(
+            error_type.as_deref(),
+            Some("ValidationException"),
+            "case {case}: expected ValidationException, got {error_type:?} / {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("updateConfigurationInheritance"),
+            "case {case}: the refusal must name the member it is about, got {message:?}"
+        );
+        assert_reports(&router, &json!({}), case, &in_force).await;
+    }
+}
+
+/// A configuration call for an account the caller does not administer is refused 403
+/// `AccessDeniedException` and changes nothing, while the accounts it does administer — its
+/// own, and one `Enable` brought into the organization — are served.
+#[tokio::test]
+async fn a_configuration_call_for_an_account_outside_the_organization_is_refused() {
+    let router = router();
+    update_ok(
+        &router,
+        &json!({ "ecrConfiguration": { "rescanDuration": "DAYS_90" } }),
+        "the caller's own configuration",
+    )
+    .await;
+    let in_force = ExpectedConfiguration {
+        rescan_duration: "DAYS_90",
+        pull_date_rescan_duration: None,
+        pull_date_rescan_mode: None,
+        scan_mode: DEFAULT_EC2_SCAN_MODE,
+        vm_scanner_activated: None,
+    };
+
+    // Rows: the read and the write, each naming an account nothing ever recorded, and a
+    // write that would change nothing even if it were served.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        ("the read", CONFIGURATION_GET_URI, json!({ "accountId": OUTSIDE })),
+        (
+            "the write",
+            CONFIGURATION_UPDATE_URI,
+            json!({
+                "accountId": OUTSIDE,
+                "ecrConfiguration": { "rescanDuration": "DAYS_3" }
+            }),
+        ),
+        (
+            "a write asking for nothing",
+            CONFIGURATION_UPDATE_URI,
+            json!({ "accountId": OUTSIDE }),
+        ),
+    ];
+
+    for (case, uri, request) in rows {
+        let (status, error_type, body) = post_in(&router, "us-east-1", uri, &request).await;
+        assert_eq!(
+            status, 403,
+            "case {case}: expected 403, got {status} / {body}"
+        );
+        assert_eq!(
+            error_type.as_deref(),
+            Some("AccessDeniedException"),
+            "case {case}: expected AccessDeniedException, got {error_type:?} / {body}"
+        );
+    }
+
+    assert_reports(
+        &router,
+        &json!({}),
+        "the caller's own account after the refusals",
+        &in_force,
+    )
+    .await;
+
+    let (status, _, body) = post_in(
+        &router,
+        "us-east-1",
+        "/enable",
+        &json!({ "resourceTypes": ["ECR"], "accountIds": [MEMBER] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "Enable for the member account: expected 200, got {status} / {body}"
+    );
+    assert_reports(
+        &router,
+        &json!({ "accountId": MEMBER }),
+        "an account of the organization the caller administers",
+        &in_force,
+    )
+    .await;
 }

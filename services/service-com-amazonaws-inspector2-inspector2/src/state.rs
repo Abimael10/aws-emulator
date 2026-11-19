@@ -8,9 +8,11 @@
 //! * `accounts` — per-account Amazon Inspector enablement, written by `Enable` and read
 //!   back by `BatchGetAccountStatus`, plus that account's EC2 deep inspection
 //!   configuration, written by `UpdateEc2DeepInspectionConfiguration` and read back by
-//!   `GetEc2DeepInspectionConfiguration`, and the instant each of its scan types' free
+//!   `GetEc2DeepInspectionConfiguration`, the instant each of its scan types' free
 //!   trial began, written where that scan type is switched on and read back by
-//!   `BatchGetFreeTrialInfo`.
+//!   `BatchGetFreeTrialInfo`, and that account's Amazon Inspector scan configuration —
+//!   the ECR automated re-scan setting and the Amazon EC2 scan mode — written by
+//!   `UpdateConfiguration` and read back by `GetConfiguration` ([`scan_configuration`]).
 //! * `filters` — the suppression/other findings filters, keyed by their own ARN so a
 //!   record and its ARN can never diverge. `BTreeMap` iteration is stable, which is what
 //!   makes a `ListFilters` page token meaningful across calls.
@@ -41,9 +43,11 @@
 //! calling identity alone and so reaches no store.
 
 mod cis_session;
+mod scan_configuration;
 mod vulnerability_catalog;
 
 pub use cis_session::*;
+pub use scan_configuration::*;
 pub use vulnerability_catalog::*;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -398,6 +402,11 @@ pub struct AccountEnablement {
     /// written by `UpdateEc2DeepInspectionConfiguration` and read back by
     /// `GetEc2DeepInspectionConfiguration`.
     pub deep_inspection: Ec2DeepInspection,
+    /// The account's OWN Amazon Inspector scan configuration, written by
+    /// `UpdateConfiguration` and read back by `GetConfiguration`. A scan type with no
+    /// record here was never configured individually for this account and follows the
+    /// delegated administrator's — see [`scan_configuration`].
+    pub scan_configuration: ScanConfiguration,
 }
 
 impl AccountEnablement {
