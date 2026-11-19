@@ -326,22 +326,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The RunJobFlow request can contain InstanceFleets parameters or
-        // InstanceGroups parameters, but not both." (RunJobFlow doc.) The model cannot
+        // InstanceGroups parameters, but not both." (RunJobFlow doc.) The uniform
+        // instance-count-and-node-types form is the THIRD way the same capacity is
+        // described, so a launch that mixes any two of the three describes one cluster
+        // twice ([`crate::state::multiple_capacity_forms_refusal`]). The model cannot
         // express the exclusion, so it is refused here rather than at the boundary.
-        let has_groups = input
-            .instances
-            .instance_groups
-            .as_ref()
-            .is_some_and(|groups| !groups.is_empty());
         let has_fleets = input
             .instances
             .instance_fleets
             .as_ref()
             .is_some_and(|fleets| !fleets.is_empty());
-        if has_groups && has_fleets {
-            return Err(refuse(
-                "Instances may carry InstanceGroups or InstanceFleets, but not both".to_string(),
-            ));
+        if let Some(message) = crate::state::multiple_capacity_forms_refusal(&input.instances) {
+            return Err(refuse(message.to_string()));
         }
 
         // One cluster carries a bounded number of instance fleets, whether they arrive
@@ -499,19 +495,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cluster is left holding capacity that can never materialise. A launch that names
         // no release label names no release to resolve against, the same way the check
         // above is skipped for it.
-        if let Some(release) = input
-            .release_label
-            .as_deref()
-            .and_then(crate::state::catalog_release)
-        {
-            if let Some(instance_type) = crate::state::unsupported_launch_instance_type(
-                release,
-                &input.instances,
-                &requested_group_configs,
-            ) {
-                return Err(refuse(crate::state::unsupported_instance_type_message(
-                    &instance_type,
-                )));
+        if let Some(release_label) = input.release_label.as_deref() {
+            if let Some(release) = crate::state::catalog_release(release_label) {
+                if let Some(instance_type) = crate::state::unsupported_launch_instance_type(
+                    release,
+                    &input.instances,
+                    &requested_group_configs,
+                ) {
+                    return Err(refuse(crate::state::unsupported_instance_type_message(
+                        &instance_type,
+                        release_label,
+                    )));
+                }
             }
         }
 

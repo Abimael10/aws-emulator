@@ -11,14 +11,16 @@
 //!
 //! * an instance fleet has to target capacity it can provision, and the fleet that runs
 //!   the primary nodes buys it in ONE market ([`instance_fleet_shape_refusal`]);
+//! * a launch describes its capacity in ONE of the three forms `JobFlowInstancesConfig`
+//!   offers ([`multiple_capacity_forms_refusal`]);
 //! * a placement group is a placement group of the PRIMARY nodes of a multi-primary
 //!   cluster, spread across the hardware ([`placement_group_refusal`]);
 //! * a cluster with more than one primary node keeps its file system on core nodes
 //!   ([`highly_available_core_group_refusal`]);
 //! * more than one primary node is a capability of the RELEASE the cluster runs
 //!   ([`multi_primary_release_refusal`]);
-//! * a configuration classification is nested only under a parent that holds it
-//!   ([`launch_classification_refusal`]).
+//! * a configuration classification is one its parent holds — the cluster at the top of a
+//!   tree, the enclosing configuration below it ([`launch_classification_refusal`]).
 //!
 //! The sentences are recorded behavior: `RunJobFlow` models only `InternalServerError`, so
 //! the class these refusals travel under is the request-validation envelope
@@ -89,6 +91,65 @@ pub fn empty_instance_fleet_capacity_message(instance_fleet_type: &str) -> Strin
 pub const MASTER_FLEET_SINGLE_MARKET_MESSAGE: &str =
     "Configure the master instance fleet using either targetOnDemandCapacity or \
      targetSpotCapacity, but not both.";
+
+/// How Amazon EMR refuses a launch that describes its capacity in more than one of the
+/// forms `JobFlowInstancesConfig` offers.
+///
+/// Recorded behavior for the text, which is entirely fixed and names the three forms
+/// themselves: nothing of the request is interpolated into it.
+pub const INSTANCE_CAPACITY_SINGLE_FORM_MESSAGE: &str =
+    "Please configure instances using one and only one of the following: instance groups; \
+     instance fleets; instance count, master and slave instance type.";
+
+/// How many of the three capacity forms `instances` describes the cluster with.
+///
+/// A `JobFlowInstancesConfig` states a cluster's capacity in one of three vocabularies:
+/// `InstanceGroups` ("configuration for the instance groups in a cluster"),
+/// `InstanceFleets` ("describes the Amazon EC2 instances and instance configurations for
+/// clusters that use the instance fleet configuration") and the uniform form, whose
+/// `MasterInstanceType` and `SlaveInstanceType` name "the Amazon EC2 instance type of the
+/// master node" and "of the core and task nodes" (`JobFlowInstancesConfig` member docs). A
+/// collection the request carried EMPTY describes no capacity in that vocabulary, and
+/// neither does an empty instance type, so neither counts as a form the launch used.
+///
+/// `InstanceCount` is not counted on its own: it is the number of instances of the uniform
+/// form, which names no node type to provision by itself.
+fn stated_capacity_forms(instances: &JobFlowInstancesConfig) -> usize {
+    let named = |instance_type: &Option<String>| {
+        instance_type
+            .as_deref()
+            .is_some_and(|instance_type| !instance_type.is_empty())
+    };
+    let forms = [
+        instances
+            .instance_groups
+            .as_ref()
+            .is_some_and(|groups| !groups.is_empty()),
+        instances
+            .instance_fleets
+            .as_ref()
+            .is_some_and(|fleets| !fleets.is_empty()),
+        named(&instances.master_instance_type) || named(&instances.slave_instance_type),
+    ];
+    forms.into_iter().filter(|stated| *stated).count()
+}
+
+/// The refusal a cluster launch earns for describing its capacity in more than one of the
+/// three forms ([`stated_capacity_forms`]), or `None` when it uses at most one of them.
+///
+/// "The `RunJobFlow` request can contain `InstanceFleets` parameters or `InstanceGroups`
+/// parameters, but not both" (`RunJobFlow` doc) is the rule for two of the three, and the
+/// third — the uniform instance-count-and-node-types form — describes the same capacity in
+/// its own vocabulary, so a request that mixes ANY two of them describes one cluster twice
+/// and Amazon EMR cannot tell which description to provision. A launch that uses exactly
+/// one form is then judged BY that form (a groups launch names one primary group,
+/// [`super::primary_instance_group_refusal`]; a fleets launch's fleets target capacity they
+/// can provision, [`instance_fleet_shape_refusal`]).
+pub fn multiple_capacity_forms_refusal(
+    instances: &JobFlowInstancesConfig,
+) -> Option<&'static str> {
+    (stated_capacity_forms(instances) > 1).then_some(INSTANCE_CAPACITY_SINGLE_FORM_MESSAGE)
+}
 
 /// The refusal one instance fleet of a cluster launch earns for the capacity it targets, or
 /// `None` when the fleet can be provisioned as configured.
@@ -213,9 +274,12 @@ pub const MULTI_PRIMARY_NODES: i64 = 3;
 /// reject, and still asks for a placement group. WHETHER THE CLUSTER HAS primaries to place
 /// is the cross-field reading: a placement group of the primary nodes exists to spread the
 /// primaries of a multi-primary cluster ([`MULTI_PRIMARY_NODES`]) over distinct hardware, so
-/// a cluster with any other primary count has nothing for it to spread. An entry asking for
-/// the `NONE` strategy asks for no placement group at all ([`created_placement_groups`]),
-/// so there is no group of it to place and the cluster's shape does not concern it.
+/// a cluster with any other primary count is offered the configuration at all — which is
+/// what the sentence states — and a launch that CARRIES one for it is refused whichever
+/// strategy the entry names, the `NONE` strategy included: placing the primary role is a
+/// capability of the cluster's topology rather than of the strategy asked for, and an entry
+/// asking for `NONE` still configures that role (it is only the GROUP that is then not
+/// created, [`created_placement_groups`]).
 ///
 /// A role configured more than once is read before the strategies those entries carry: the
 /// request has asked for two placements of one role, which is what a caller fixes, and no
@@ -244,10 +308,7 @@ pub fn placement_group_refusal(
     }) {
         return Some(MASTER_PLACEMENT_GROUP_STRATEGY_MESSAGE.to_string());
     }
-    let places_primaries = configs.iter().any(|config| {
-        config.placement_strategy.as_deref() != Some(PLACEMENT_GROUP_STRATEGY_NONE)
-    });
-    if places_primaries && primary_nodes != MULTI_PRIMARY_NODES {
+    if !configs.is_empty() && primary_nodes != MULTI_PRIMARY_NODES {
         return Some(MASTER_PLACEMENT_GROUP_MULTI_MASTER_MESSAGE.to_string());
     }
     None
@@ -386,14 +447,30 @@ fn parent_holds_classification(parent: &str, child: &str) -> bool {
 /// tree is judged to this depth and the levels below it are not read.
 const MAX_VALIDATED_CONFIGURATION_DEPTH: usize = 100;
 
-/// The refusal a configuration tree earns for a classification nested under a parent that
-/// does not hold it ([`parent_holds_classification`]), or `None` when every nesting in it is
-/// one Amazon EMR applies.
+/// The refusal a configuration tree earns for a classification its parent does not hold, or
+/// `None` when every classification in it is one Amazon EMR applies there.
 ///
-/// A configuration that names no classification names nothing to nest, so neither it nor
-/// its children are judged against a parent: the reading is of the classification PAIRS the
-/// tree states.
+/// Two readings of one rule — a classification is applied only where its parent holds it.
+/// At the TOP of a tree the parent is the cluster itself, which holds exactly the
+/// classifications Amazon EMR publishes ([`is_published_classification`]), and the refusal
+/// names that parent as [`super::ABSENT_VALUE`] because the configuration has none; BELOW
+/// the top the parent is the enclosing configuration ([`parent_holds_classification`]).
+///
+/// A configuration that names no classification names nothing to apply: neither it nor its
+/// children are judged against a parent, so the reading is of the classifications the tree
+/// states.
 pub fn nested_classification_refusal(configurations: &[Configuration]) -> Option<String> {
+    for configuration in configurations {
+        let Some(classification) = configuration.classification.as_deref() else {
+            continue;
+        };
+        if !is_published_classification(classification) {
+            return Some(invalid_nested_classification_message(
+                classification,
+                super::ABSENT_VALUE,
+            ));
+        }
+    }
     nested_classification_refusal_within(configurations, MAX_VALIDATED_CONFIGURATION_DEPTH)
 }
 
@@ -423,7 +500,7 @@ fn nested_classification_refusal_within(
 }
 
 /// The refusal a cluster launch earns for any configuration tree it carries, or `None` when
-/// every one of them nests only classifications their parents hold.
+/// every classification in them is one its parent holds.
 ///
 /// A launch states configurations in every place a cluster holds them — for the cluster
 /// itself (`RunJobFlow$Configurations`), for one instance group

@@ -11,9 +11,9 @@
 //! The rules these tables assert, one per suite below:
 //!
 //! * every refusal the backend behind EMR Studio and EMR Notebooks raises states its
-//!   class's own sentence and carries that backend's service detail — its name, the
-//!   status and error code of the refusal, and a request id of the response — with no
-//!   value of the request in it;
+//!   class's own sentence — with no value of the request in it — and carries that
+//!   backend's service detail: its name, the status and error code of the refusal, and the
+//!   request id of THAT response, which the response reports in its own header too;
 //! * a Studio that authenticates through IAM Identity Center is not created without the
 //!   `UserRole` its identities assume;
 //! * a cluster launch names ONE Amazon EMR release: not two ways of naming it, and not a
@@ -23,7 +23,11 @@
 //! * a release reports every application its line bundles, at the version that line
 //!   carries.
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
+use service_com_amazonaws_emr_elasticmapreduce::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
 
 use crate::emr_control_plane::studio_request;
 use crate::job_flow_lifecycle::{assert_refused, at, minimal_request, Emr};
@@ -99,12 +103,13 @@ struct CatalogRow {
 }
 
 /// THE RULE: every refusal the Studio/Notebooks backend raises states the fixed sentence
-/// of its class inside that backend's service detail, with a request id of its own and no
-/// value taken from the request.
+/// of its class inside that backend's service detail, with the request id of the response
+/// it is carried by.
 ///
 /// The rows span the operations and the input members the rule covers: both
 /// notebook-execution reads, each network member of a Studio create, and a Studio id the
-/// account holds no Studio for.
+/// account holds no Studio for — and none of those sentences echoes a value of the
+/// request.
 #[tokio::test]
 async fn the_studio_backend_wraps_every_refusal_it_raises() {
     let emr = Emr::new();
@@ -166,6 +171,8 @@ async fn the_studio_backend_wraps_every_refusal_it_raises() {
                 "SubnetIds",
                 json!(["subnet-0a1b2c3d", "subnet-zzzzzzzz"]),
             ),
+            // The entries are resolved in request order, and the sentence names the
+            // MEMBER rather than the entry that could not be used.
             sentence: "SubnetIds is not valid.",
             never_echoed: "subnet-zzzzzzzz",
         },
@@ -241,6 +248,137 @@ async fn the_studio_backend_wraps_every_refusal_it_raises() {
         Some(live.as_str()),
         "case {:?}: the live Studio must be the one listed, got {listed}",
         "after every refusal above"
+    );
+}
+
+/// The `x-amzn-RequestId` header this protocol names a request in; HTTP header names are
+/// case-insensitive and the wire carries this one lower-cased.
+const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
+
+/// One emulator whose RESPONSE HEADERS a case can read — the harness
+/// `tests/all/job_flow_lifecycle.rs` owns answers the status and the body alone, and the
+/// rule below is about the header beside them.
+struct HeaderReadingEmr {
+    router: MultiServiceRouter,
+}
+
+impl HeaderReadingEmr {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(engine));
+        Self { router }
+    }
+
+    /// `operation` with `body`, answering the status, the response's own request id as its
+    /// header reports it, and the payload.
+    async fn call(&self, operation: &str, body: Value) -> (u16, Option<String>, Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "elasticmapreduce.us-east-1.amazonaws.com")
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("ElasticMapReduce.{operation}"))
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(&body).expect("the request body serializes"),
+            ))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let reported = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .and_then(|reported| reported.to_str().ok())
+            .map(str::to_string);
+        let payload = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, reported, payload)
+    }
+}
+
+/// THE RULE: the request id a backend refusal states in its service detail is the request
+/// id of THAT RESPONSE — the one the response reports in its own header — so a caller
+/// correlating a failure by the id it read out of the message finds the call it was
+/// answered by, and two calls are never named by one id.
+///
+/// The rows span the refusal classes that carry the detail and the surfaces that raise
+/// them: a Studio create refused for a network reference, a Studio read of an id the
+/// account holds no Studio for, and a notebook-execution read — plus the same call made
+/// twice, which is answered under two ids.
+#[tokio::test]
+async fn a_backend_refusal_states_the_request_id_its_response_reports() {
+    let emr = HeaderReadingEmr::new();
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "a Studio create naming an unusable VpcId",
+            "CreateStudio",
+            studio_with("header vpc", "VpcId", json!("vpc-nope")),
+        ),
+        (
+            "a Studio create naming an unusable subnet",
+            "CreateStudio",
+            studio_with("header subnet", "SubnetIds", json!(["subnet-nope"])),
+        ),
+        (
+            "a Studio read of an id the account holds no Studio for",
+            "DescribeStudio",
+            json!({ "StudioId": "es-ZZZZZZZZZZZZZ" }),
+        ),
+        (
+            "a notebook-execution read of an id no execution carries",
+            "DescribeNotebookExecution",
+            json!({ "NotebookExecutionId": "ex-0000000000000000000000000000X" }),
+        ),
+        (
+            // The same call again: a response names its OWN request, so the id differs
+            // from the one above while the sentence does not.
+            "the same notebook-execution read again",
+            "DescribeNotebookExecution",
+            json!({ "NotebookExecutionId": "ex-0000000000000000000000000000X" }),
+        ),
+    ];
+
+    let mut reported_ids: Vec<String> = Vec::new();
+    for (case, operation, body) in rows {
+        let (status, reported, payload) = emr.call(operation, body).await;
+        assert_refused(case, status, &payload, "InvalidRequestException");
+        let said = message(case, &payload);
+        let stated = wrapped_request_id(case, &said);
+        let reported = reported.unwrap_or_else(|| {
+            panic!("case {case:?}: the response must report its request id, got {payload}")
+        });
+        assert_eq!(
+            stated, reported,
+            "case {case:?}: the id the message states must be the one the response \
+             reports, got {stated:?} in {said:?} beside {reported:?}"
+        );
+        assert!(
+            !reported_ids.contains(&reported),
+            "case {case:?}: each response names its own request, got the \
+             already-reported {reported:?}"
+        );
+        reported_ids.push(reported);
+    }
+
+    // And a SERVED call names its request too, under an id of its own.
+    let (status, reported, payload) = emr.call("ListStudios", json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: expected 200, got {status} with {payload}",
+        "a served listing"
+    );
+    let reported = reported.unwrap_or_else(|| {
+        panic!("case \"a served listing\": the response must report its request id")
+    });
+    assert!(
+        !reported_ids.contains(&reported),
+        "case {:?}: a served call names its own request too, got the already-reported \
+         {reported:?}",
+        "a served listing"
     );
 }
 

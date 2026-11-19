@@ -104,6 +104,7 @@ use crate::ops::types::InvalidRequestException;
 pub mod editors_plane;
 pub mod enum_value_sets;
 pub mod request_layer;
+pub mod stated_request_id;
 
 /// The wire error code of `com.amazonaws.emr#InvalidRequestException`, this
 /// service's modelled client-input error: "This exception occurs when there is
@@ -392,6 +393,22 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedRefusal<Eng>
         req: &'r aws_smithy_runtime_api::http::Request,
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        // Every answer of this service leaves through the layer that names the request it
+        // answers, so none can state an id in its message that the response does not report
+        // ([`stated_request_id`]).
+        Box::pin(async move { stated_request_id::report(self.serve(svc, req, ctx).await) })
+    }
+}
+
+impl<Eng: Send + Sync + 'static> OperationScopedRefusal<Eng> {
+    /// Serve the request as the operation the routing table names, in the order and the
+    /// envelopes this file's docs state.
+    fn serve<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r aws_smithy_runtime_api::http::Request,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
         Box::pin(async move {
             // `override_operation` returns this type only for a request the routing table
             // can serve, so the lookup below resolves; a request that cannot be routed
@@ -466,9 +483,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedRefusal<Eng>
             }
         })
     }
-}
 
-impl<Eng: Send + Sync + 'static> OperationScopedRefusal<Eng> {
     /// The refusal the served operation would have answered for the `ClusterId` the
     /// request carries, when that id is one it cannot use. `None` when the operation
     /// resolves no cluster id, when the request carries none — the absent member is its

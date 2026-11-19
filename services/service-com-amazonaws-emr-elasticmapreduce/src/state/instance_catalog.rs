@@ -697,14 +697,60 @@ pub fn release_offers_instance_type(release: (u32, u32, u32), instance_type: &st
     })
 }
 
-/// How Amazon EMR refuses an instance type the release the request names does not offer.
+/// Whether `instance_type` names an Amazon EC2 instance type at all: a size on the
+/// published ladder of a family this catalog carries, whatever release offers it.
 ///
-/// Recorded behavior for the text, whose fixed part is entirely fixed: the only variable
-/// part is the instance type, taken verbatim from the member of the request that named
-/// it, so a caller that mistyped a type or asked for one its release predates reads the
-/// value it has to change out of the sentence.
-pub fn unsupported_instance_type_message(instance_type: &str) -> String {
+/// An instance type is named `<family>.<size>`, so a value that is not that shape, names a
+/// family no ladder carries, or names a size its family's ladder does not step through,
+/// names no instance type — which is a different thing from a real instance type an Amazon
+/// EMR release predates ([`release_offers_instance_type`]), and the two are refused by
+/// different sentences ([`unknown_instance_type_message`],
+/// [`instance_type_unsupported_for_release_message`]).
+pub fn is_catalogued_instance_type(instance_type: &str) -> bool {
+    let Some((family, size)) = instance_type.split_once('.') else {
+        return false;
+    };
+    INSTANCE_FAMILIES
+        .iter()
+        .any(|spec| spec.family == family && spec.sizes.contains(&size))
+}
+
+/// How Amazon EMR refuses a value that names no instance type at all
+/// ([`is_catalogued_instance_type`]).
+///
+/// Recorded behavior for the text, whose fixed parts are `Instance type '` and
+/// `' is not supported.`: the one variable part is the value, quoted and verbatim from the
+/// member of the request that named it, so a caller that mistyped a type reads back exactly
+/// what it sent. The sentence names no release, because the value names no instance type
+/// any release could offer.
+pub fn unknown_instance_type_message(instance_type: &str) -> String {
     format!("Instance type '{instance_type}' is not supported.")
+}
+
+/// How Amazon EMR refuses a real instance type that the release the request names does not
+/// offer ([`release_offers_instance_type`]).
+///
+/// Recorded behavior for the text. Its fixed parts are `Instance type ` and
+/// ` not supported for release `; its two variable parts both come from the request — the
+/// instance type, verbatim and unquoted, and the release label it was resolved against — so
+/// a caller that asked for a type its release predates reads both the type and the release
+/// out of the sentence.
+pub fn instance_type_unsupported_for_release_message(
+    instance_type: &str,
+    release_label: &str,
+) -> String {
+    format!("Instance type {instance_type} not supported for release {release_label}.")
+}
+
+/// How Amazon EMR refuses an instance type a launch against the release `release_label`
+/// may not provision from: the sentence of the class the value falls in — a value that
+/// names no instance type at all ([`unknown_instance_type_message`]), or a real instance
+/// type that release does not offer ([`instance_type_unsupported_for_release_message`]).
+pub fn unsupported_instance_type_message(instance_type: &str, release_label: &str) -> String {
+    if is_catalogued_instance_type(instance_type) {
+        return instance_type_unsupported_for_release_message(instance_type, release_label);
+    }
+    unknown_instance_type_message(instance_type)
 }
 
 /// Every instance type a launch would provision capacity from, in request order.

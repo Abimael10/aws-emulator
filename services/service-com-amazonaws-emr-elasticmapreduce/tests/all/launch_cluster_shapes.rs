@@ -19,15 +19,21 @@
 //! * a placement group places the PRIMARY nodes of a multi-primary cluster, spread across
 //!   the hardware: "the only supported instance role is `MASTER`" and "the only supported
 //!   placement strategy is `SPREAD` for the `MASTER` instance role"
-//!   (`PlacementGroupConfig` member docs), and there are primaries to spread only on a
-//!   multi-primary cluster;
+//!   (`PlacementGroupConfig` member docs), and the configuration is offered only on a
+//!   multi-primary cluster — whichever strategy an entry names, the `NONE` that creates no
+//!   group included;
 //! * a cluster with more than one primary node keeps the file system its primaries
 //!   coordinate on CORE nodes, so it has a core instance group;
 //! * more than one primary node is a capability of the RELEASE the cluster runs, which the
 //!   `ReleaseLabel` names (`RunJobFlow$ReleaseLabel` doc);
-//! * a nested configuration is "a list of additional configurations to apply WITHIN a
-//!   configuration object" (`Configuration$Configurations` doc), so a classification is
-//!   nested only under a parent that holds it.
+//! * a configuration classification is one its parent holds — the CLUSTER at the top of a
+//!   tree, which holds the classifications Amazon EMR publishes, and the enclosing
+//!   configuration below it, since a nested one is "a list of additional configurations to
+//!   apply WITHIN a configuration object" (`Configuration$Configurations` doc);
+//! * a launch describes its capacity in ONE of the three forms `JobFlowInstancesConfig`
+//!   offers: "the `RunJobFlow` request can contain `InstanceFleets` parameters or
+//!   `InstanceGroups` parameters, but not both" (`RunJobFlow` doc), the third being the
+//!   uniform instance-count-and-node-types form.
 //!
 //! Each refusal is HTTP 400 `ValidationException` carrying Amazon EMR's own sentence —
 //! recorded behavior, since `RunJobFlow` models only `InternalServerError` — and every
@@ -155,6 +161,147 @@ fn empty_fleet_sentence(fleet_name: &str) -> String {
 const MASTER_FLEET_BOTH_MARKETS_SENTENCE: &str =
     "Configure the master instance fleet using either targetOnDemandCapacity or \
      targetSpotCapacity, but not both.";
+
+/// The sentence a launch describing its capacity in more than one of the three forms is
+/// refused with: entirely fixed, and it names the three forms themselves.
+const SINGLE_CAPACITY_FORM_SENTENCE: &str =
+    "Please configure instances using one and only one of the following: instance groups; \
+     instance fleets; instance count, master and slave instance type.";
+
+/// One row of the capacity-form rule: the `Instances` member of the launch, and whether the
+/// launch is refused for describing its capacity more than one way.
+struct CapacityFormCase {
+    label: &'static str,
+    instances: Value,
+    refused: bool,
+}
+
+fn capacity_form_cases() -> Vec<CapacityFormCase> {
+    vec![
+        // Two forms at once: every pair of the three.
+        CapacityFormCase {
+            label: "instance groups beside instance fleets",
+            instances: json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceGroups": [group("MASTER", 1)],
+                "InstanceFleets": [fleet("MASTER", Some(1), None)],
+            }),
+            refused: true,
+        },
+        CapacityFormCase {
+            label: "instance groups beside the uniform master instance type",
+            instances: json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceGroups": [group("MASTER", 1)],
+                "InstanceCount": 1,
+                "MasterInstanceType": "m5.xlarge",
+            }),
+            refused: true,
+        },
+        CapacityFormCase {
+            label: "instance groups beside the uniform slave instance type",
+            instances: json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceGroups": [group("MASTER", 1), group("CORE", 1)],
+                "SlaveInstanceType": "m5.xlarge",
+            }),
+            refused: true,
+        },
+        CapacityFormCase {
+            label: "instance fleets beside the uniform master instance type",
+            instances: json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceFleets": [fleet("MASTER", Some(1), None)],
+                "InstanceCount": 1,
+                "MasterInstanceType": "m5.xlarge",
+            }),
+            refused: true,
+        },
+        // One form alone: each of the three.
+        CapacityFormCase {
+            label: "instance groups alone",
+            instances: with_groups(json!([group("MASTER", 1)])),
+            refused: false,
+        },
+        CapacityFormCase {
+            label: "instance fleets alone",
+            instances: json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceFleets": [fleet("MASTER", Some(1), None)],
+            }),
+            refused: false,
+        },
+        CapacityFormCase {
+            label: "the uniform form alone",
+            instances: json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceCount": 2,
+                "MasterInstanceType": "m5.xlarge",
+                "SlaveInstanceType": "m5.xlarge",
+            }),
+            refused: false,
+        },
+        // A collection the request carried EMPTY describes no capacity in that
+        // vocabulary, so it is not a second form.
+        CapacityFormCase {
+            label: "an empty instance-group list beside the uniform form",
+            instances: json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceGroups": [],
+                "InstanceCount": 1,
+                "MasterInstanceType": "m5.xlarge",
+            }),
+            refused: false,
+        },
+        CapacityFormCase {
+            label: "an empty instance-fleet list beside instance groups",
+            instances: json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceFleets": [],
+                "InstanceGroups": [group("MASTER", 1)],
+            }),
+            refused: false,
+        },
+        // `InstanceCount` is the number of instances OF the uniform form: on its own it
+        // names no node type to provision, so it is not a form of its own. (An EMPTY
+        // instance type is no row of this table: the member's modelled minimum length
+        // refuses that at the boundary, before any handler sees it.)
+        CapacityFormCase {
+            label: "an instance count beside instance groups",
+            instances: json!({
+                "KeepJobFlowAliveWhenNoSteps": true,
+                "InstanceGroups": [group("MASTER", 1)],
+                "InstanceCount": 1,
+            }),
+            refused: false,
+        },
+    ]
+}
+
+/// THE RULE: a launch describes its capacity in ONE of the three forms
+/// `JobFlowInstancesConfig` offers — "the `RunJobFlow` request can contain `InstanceFleets`
+/// parameters or `InstanceGroups` parameters, but not both" (`RunJobFlow` doc), and the
+/// uniform instance-count-and-node-types form is the third way of describing the same
+/// capacity — so a request that mixes two of them is refused, with Amazon EMR's own
+/// sentence naming all three.
+#[tokio::test]
+async fn a_launch_describes_its_capacity_in_one_and_only_one_form() {
+    let emr = Emr::new();
+    for case in capacity_form_cases() {
+        let label = case.label;
+        let request = launch(label, json!({ "Instances": case.instances.clone() }));
+        if case.refused {
+            assert_launch_refused(&emr, label, request, SINGLE_CAPACITY_FORM_SENTENCE).await;
+        } else {
+            let cluster = assert_launch_served(&emr, label, request).await;
+            assert_eq!(
+                cluster["Name"].as_str(),
+                Some(label),
+                "case {label:?}: the launched cluster must be the one asked for, got {cluster}"
+            );
+        }
+    }
+}
 
 /// One row of the fleet-capacity rule.
 struct FleetCase {
@@ -451,6 +598,18 @@ fn placement_cases() -> Vec<PlacementCase> {
             label: "the NONE strategy, which asks for no placement group, on one primary",
             configs: json!([{ "InstanceRole": "MASTER", "PlacementStrategy": "NONE" }]),
             primaries: 1,
+            refusal: Some(PLACEMENT_GROUP_MULTI_MASTER_SENTENCE),
+        },
+        PlacementCase {
+            label: "the NONE strategy on a two-primary cluster",
+            configs: json!([{ "InstanceRole": "MASTER", "PlacementStrategy": "NONE" }]),
+            primaries: 2,
+            refusal: Some(PLACEMENT_GROUP_MULTI_MASTER_SENTENCE),
+        },
+        PlacementCase {
+            label: "the NONE strategy on a multi-primary cluster, which creates no group",
+            configs: json!([{ "InstanceRole": "MASTER", "PlacementStrategy": "NONE" }]),
+            primaries: 3,
             refusal: None,
         },
         PlacementCase {
@@ -835,6 +994,49 @@ fn nesting_cases() -> Vec<NestingCase> {
             ]),
             refusal: None,
         },
+        // The TOP of a tree is judged too: its parent is the cluster, which holds exactly
+        // the classifications Amazon EMR publishes, and a value that names no configuration
+        // file of an application is applied by nothing. The refusal states that parent as
+        // `null`, the way every sentence of this service renders a value the request did
+        // not carry.
+        NestingCase {
+            label: "a misspelled classification at the top of the tree",
+            configurations: json!([configuration("spark-default", json!([]))]),
+            refusal: Some(("spark-default", "null")),
+        },
+        NestingCase {
+            label: "another misspelling of the same file",
+            configurations: json!([configuration("spark-defaultz", json!([]))]),
+            refusal: Some(("spark-defaultz", "null")),
+        },
+        NestingCase {
+            label: "a classification of no application at all",
+            configurations: json!([configuration("nonsuch-site", json!([]))]),
+            refusal: Some(("nonsuch-site", "null")),
+        },
+        NestingCase {
+            label: "a published file the launch may name, beside a misspelling of another",
+            configurations: json!([
+                configuration("hive-site", json!([])),
+                configuration("yarn-sites", json!([])),
+            ]),
+            refusal: Some(("yarn-sites", "null")),
+        },
+        // And the published files of other applications are applied: two the issues above
+        // never named, read off the Release Guide's classification list.
+        NestingCase {
+            label: "the table formats' own configuration files",
+            configurations: json!([
+                configuration("hudi-defaults", json!([])),
+                configuration("iceberg-defaults", json!([])),
+            ]),
+            refusal: None,
+        },
+        NestingCase {
+            label: "an application's name, under which a cluster-wide property is set",
+            configurations: json!([configuration("hbase", json!([]))]),
+            refusal: None,
+        },
         NestingCase {
             label: "no configurations at all",
             configurations: json!([]),
@@ -843,8 +1045,9 @@ fn nesting_cases() -> Vec<NestingCase> {
     ]
 }
 
-/// THE RULE for a nested configuration: a classification is nested only under a parent that
-/// holds it, wherever the launch states the tree.
+/// THE RULE for a configuration: a classification is applied only where its parent holds
+/// it — the cluster at the top of a tree, the enclosing configuration below it — wherever
+/// the launch states the tree.
 #[tokio::test]
 async fn a_classification_is_launched_only_under_a_parent_that_holds_it() {
     let emr = Emr::new();

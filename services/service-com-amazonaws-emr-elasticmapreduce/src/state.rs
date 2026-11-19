@@ -48,6 +48,11 @@ use crate::ops::types::{
 mod instance_catalog;
 pub use instance_catalog::*;
 
+/// The configuration classifications Amazon EMR applies, split out of this root as its own
+/// concern and re-exported the same way.
+mod configuration_classifications;
+pub use configuration_classifications::*;
+
 /// The cluster's step runner — what a submitted step's work answered — split out of this
 /// root as its own concern; its names are re-exported so every caller keeps reaching them
 /// through `crate::state`.
@@ -927,10 +932,20 @@ pub fn editors_refusal_message(sentence: &str) -> String {
     backend_refusal_message(STUDIO_BACKEND_SERVICE, sentence)
 }
 
+/// What a refusal worded here writes where THIS RESPONSE's request id goes.
+///
+/// A refusal is worded where it is decided, and the id a response names its request by is
+/// reported where the response is finished ([`crate::service::stated_request_id`]). A
+/// response answers ONE request, so a message cannot mint a second id of its own: it writes
+/// this marker inside the service-detail clause, and that layer writes the id the response
+/// reports in its place — so the clause and the response's own header can never name two
+/// requests for one call, and nothing the request carries decides the value.
+pub const REQUEST_ID_PLACEHOLDER: &str = "{request-id}";
+
 /// How a BACKEND of Amazon EMR words a refusal it raises: the sentence, then the
 /// parenthesised detail of the error it raised — the backend's own service name, the
 /// status and error code of the refusal, and this response's own request id
-/// ([`::service_common::query_error_envelope::new_request_id`]).
+/// ([`REQUEST_ID_PLACEHOLDER`], substituted where the response is finished).
 ///
 /// Recorded behavior for the form, and ONE template for every backend that answers this
 /// way — the Studio and notebook surfaces ([`editors_refusal_message`]) and the
@@ -939,8 +954,7 @@ pub fn editors_refusal_message(sentence: &str) -> String {
 fn backend_refusal_message(backend: &str, sentence: &str) -> String {
     format!(
         "{sentence} (Service: {backend}; Status Code: 400; Error Code: \
-         InvalidRequestException; Request ID: {}; Proxy: null)",
-        ::service_common::query_error_envelope::new_request_id()
+         InvalidRequestException; Request ID: {REQUEST_ID_PLACEHOLDER}; Proxy: null)"
     )
 }
 

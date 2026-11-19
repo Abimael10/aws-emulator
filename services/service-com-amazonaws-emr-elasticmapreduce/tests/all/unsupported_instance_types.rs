@@ -16,8 +16,12 @@
 //! — "the list of instance types that the release specified … supports"
 //! (`ListSupportedInstanceTypesOutput$SupportedInstanceTypes` doc) — so `RunJobFlow`
 //! resolves EVERY instance type the launch names against that release's list and refuses
-//! the whole launch with HTTP 400 `ValidationException` carrying
-//! `Instance type '<type>' is not supported.`, writing no cluster. Every position that
+//! the whole launch with HTTP 400 `ValidationException`, writing no cluster. The sentence
+//! is the one of the CLASS the value falls in: a value that names no instance type of this
+//! service at all is refused `Instance type '<value>' is not supported.`, while a real
+//! instance type the named release does not offer is refused
+//! `Instance type <type> not supported for release <release label>.` — so a caller learns
+//! whether to fix the value or the release. Every position that
 //! names one is judged: each `InstanceTypeConfigs` entry of each instance fleet whatever
 //! role it fills, each instance group, and the uniform
 //! `MasterInstanceType`/`SlaveInstanceType` form. A launch that names no release label
@@ -202,8 +206,18 @@ async fn provisioned_types(emr: &Emr, cluster_id: &str) -> BTreeSet<String> {
     from_fleets.chain(from_groups).collect()
 }
 
-/// Assert the launch `body` is refused for `instance_type`, leaving no cluster behind.
-async fn assert_launch_refused(emr: &Emr, case: &str, body: Value, instance_type: &str) {
+/// The sentence a value that names no instance type of this service earns.
+fn unknown_sentence(instance_type: &str) -> String {
+    format!("Instance type '{instance_type}' is not supported.")
+}
+
+/// The sentence a real instance type the release `release` does not offer earns.
+fn unoffered_by_release_sentence(instance_type: &str, release: &str) -> String {
+    format!("Instance type {instance_type} not supported for release {release}.")
+}
+
+/// Assert the launch `body` is refused with `expected`, leaving no cluster behind.
+async fn assert_launch_refused(emr: &Emr, case: &str, body: Value, expected: &str) {
     let before = listed_clusters(emr).await;
     let (status, payload) = emr.call("RunJobFlow", body).await;
     assert_eq!(
@@ -220,7 +234,7 @@ async fn assert_launch_refused(emr: &Emr, case: &str, body: Value, instance_type
         at(&payload, &["message"])
             .as_str()
             .or_else(|| at(&payload, &["Message"]).as_str()),
-        Some(format!("Instance type '{instance_type}' is not supported.").as_str()),
+        Some(expected),
         "case {case:?}: expected the unsupported-instance-type sentence, got {payload}"
     );
     assert!(
@@ -292,7 +306,7 @@ async fn a_launch_naming_an_instance_type_the_release_does_not_offer_is_refused(
         for position in Position::ALL {
             let case = format!("{label} ({instance_type:?}) at {position:?}");
             let body = launch("unoffered", Some(RELEASE), position, instance_type);
-            assert_launch_refused(&emr, &case, body, instance_type).await;
+            assert_launch_refused(&emr, &case, body, &unknown_sentence(instance_type)).await;
         }
     }
 
@@ -307,11 +321,15 @@ async fn a_launch_naming_an_instance_type_the_release_does_not_offer_is_refused(
 }
 
 /// THE RULE's release half: the SAME instance type is unoffered by one release and
-/// offered by another, and the launch follows the release it names.
+/// offered by another, and the launch follows the release it names — refusing it with the
+/// sentence that NAMES the release, because the value is a real instance type.
 ///
 /// The rows differ along which side of a family's introduction point the release falls,
 /// and one is a `3xlarge` — a size `m5` has no entry for and `i3en` does — so the rule is
-/// per family ladder rather than a blanket judgement on a size.
+/// per family ladder rather than a blanket judgement on a size. Which CLASS each refusal
+/// falls in is read off the catalog too: a type some release in the table publishes is a
+/// real instance type, so the release names itself in its refusal, while one no release
+/// publishes names no instance type at all and earns the quoted sentence.
 #[tokio::test]
 async fn the_release_the_launch_names_decides_which_instance_types_it_may_name() {
     // (release, instance type): the expectation for each row is read off what the service
@@ -329,14 +347,40 @@ async fn the_release_the_launch_names_decides_which_instance_types_it_may_name()
     ];
 
     let emr = Emr::new();
+    // Which types in the table are real instance types of this service: the ones SOME row's
+    // release publishes. A refusal of one of those names the release; a value no release
+    // publishes is no instance type at all and is refused as that.
+    let mut catalogued: BTreeSet<String> = BTreeSet::new();
+    for (release, _) in ROWS {
+        catalogued.extend(published(release).await);
+    }
+    // The class boundary the table turns on, stated here rather than only derived: the two
+    // Graviton/AMD names ARE instance types of this service (a later release offers them),
+    // and the `m5.3xlarge` is no instance type at all (no release has that size on the `m5`
+    // ladder) — so a catalog regression cannot quietly flip which sentence a row expects.
+    for real in ["m7g.xlarge", "c7a.8xlarge", "i3en.3xlarge"] {
+        assert!(
+            catalogued.contains(real),
+            "case {real:?}: the table's real instance types must be published by some \
+             release of it, got {catalogued:?}"
+        );
+    }
+    assert!(
+        !catalogued.contains("m5.3xlarge"),
+        "case \"m5.3xlarge\": a size no family ladder carries is no instance type of any \
+         release"
+    );
     for (release, instance_type) in ROWS {
         let case = format!("{release} naming {instance_type:?}");
         let offered = published(release).await.contains(instance_type);
         let body = launch("release-gated", Some(release), Position::PrimaryFleet, instance_type);
         if offered {
             assert_launch_served(&emr, &case, body, instance_type).await;
+        } else if catalogued.contains(instance_type) {
+            let expected = unoffered_by_release_sentence(instance_type, release);
+            assert_launch_refused(&emr, &case, body, &expected).await;
         } else {
-            assert_launch_refused(&emr, &case, body, instance_type).await;
+            assert_launch_refused(&emr, &case, body, &unknown_sentence(instance_type)).await;
         }
     }
 }

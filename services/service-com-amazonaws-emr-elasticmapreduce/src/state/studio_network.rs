@@ -75,20 +75,21 @@ pub const VPC_ID_MEMBER: &str = "VpcId";
 /// The input member a Studio names the subnets its Workspaces run in under.
 pub const SUBNET_IDS_MEMBER: &str = "SubnetIds";
 
-/// What a network member of a Studio that resolves to nothing usable is refused with.
+/// What a network reference of a Studio that resolves to nothing usable is refused with.
 ///
-/// Recorded behavior for the text: the backend names the input MEMBER and states that it
-/// is not valid, and does NOT echo the identifier the request carried, inside the same
-/// service-detail wrapper every refusal it raises carries
-/// ([`super::editors_refusal_message`]). ONE template for every member, so what a caller
-/// reads off the sentence is which member of its request to fix — and that is all that
-/// differs between the members, whether the value is outside the form Amazon EC2 gives
-/// the resource, names nothing the account holds, or (a subnet) names a resource of
-/// another VPC than the Studio's.
+/// RECORDED behavior for the text: AWS names the input MEMBER and states that it is not
+/// valid, and does NOT echo the identifier the request carried, inside the same
+/// service-detail wrapper every refusal this backend raises carries
+/// ([`super::editors_refusal_message`]). The fixed text is the member name,
+/// ` is not valid.` and that wrapper; its ONE per-run part is the request id of the
+/// RESPONSE the sentence is carried by ([`super::REQUEST_ID_PLACEHOLDER`]), which the
+/// response reports in its own header too, so an operator correlating the failure by the
+/// id it read finds the call that was answered.
 ///
-/// `VpcId` is the member a recording states this sentence for; the other three members are
-/// worded by the same template because the template is the backend's, not that member's —
-/// a later recording of one of them can confirm its own instance.
+/// ONE template for every member, so what a caller reads off the sentence is which member
+/// of its request to fix — and that is all that differs between the members, whether the
+/// value is outside the form Amazon EC2 gives the resource, names nothing the account
+/// holds, or (a subnet) names a resource of another VPC than the Studio's.
 pub fn invalid_network_member_message(member: &str) -> String {
     super::editors_refusal_message(&format!("{member} is not valid."))
 }
