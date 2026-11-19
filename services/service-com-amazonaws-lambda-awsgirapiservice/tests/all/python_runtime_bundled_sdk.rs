@@ -103,7 +103,11 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// One DynamoDB call that must be served, over the shared wire helper.
-async fn dynamodb_ok(
+///
+/// `pub(crate)` for the reason [`given_table_arn`] is: a suite reading back what a handler's own
+/// SDK call left in the table (`tests/all/handler_item_store_and_bus_operations.rs`) makes the
+/// same read, and shares this one wrapper rather than keeping a copy of it.
+pub(crate) async fn dynamodb_ok(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
