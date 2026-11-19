@@ -56,14 +56,19 @@ use crate::rds_s3_integration::{create_bucket, emulator, put_object, role, s3};
 const ER_S3_API_ERROR: &str = "1871";
 
 /// The bucket every object below lives in.
-const BUCKET: &str = "emu-pg-aws-s3";
+///
+/// `pub(crate)` here and below so the sibling suite that drives the SAME endpoint under the
+/// trust-policy half of the decision (`crate::postgres_s3_import_role_trust`) stages its
+/// objects, stands its instance up and opens its session through these rather than growing a
+/// second copy of them.
+pub(crate) const BUCKET: &str = "emu-pg-aws-s3";
 
 /// The service principal a role Amazon RDS acts under for a DB instance feature must trust.
 const RDS_PRINCIPAL: &str = "rds.amazonaws.com";
 
 /// An identity policy granting the object READ an import performs on `BUCKET`'s objects —
 /// the `s3:GetObject` "Setting up access to an Amazon S3 bucket" asks for.
-fn get_object_policy() -> String {
+pub(crate) fn get_object_policy() -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:ListBucket"],"Resource":["arn:aws:s3:::{BUCKET}","arn:aws:s3:::{BUCKET}/*"]}}]}}"#
     )
@@ -88,7 +93,10 @@ macro_rules! params {
 ///
 /// The wait is for the CONDITION — the status the service's own clock owes — through the one
 /// poll loop this test target shares (`lifecycle_poll_loops::poll_until`).
-async fn available_postgres(router: &MultiServiceRouter, identifier: &str) -> (String, u16) {
+pub(crate) async fn available_postgres(
+    router: &MultiServiceRouter,
+    identifier: &str,
+) -> (String, u16) {
     let request: Vec<(&str, String)> = params![
         "DBInstanceIdentifier" => identifier,
         "Engine" => "postgres",
@@ -114,7 +122,7 @@ async fn available_postgres(router: &MultiServiceRouter, identifier: &str) -> (S
 
 /// Associate `role_arn` with the instance for `feature`, and poll the report until the
 /// association is `ACTIVE` — the state a client waits for before it uses the feature.
-async fn associate(
+pub(crate) async fn associate(
     router: &MultiServiceRouter,
     identifier: &str,
     role_arn: &str,
@@ -144,7 +152,7 @@ async fn associate(
 }
 
 /// Drop the association of `role_arn` for `feature`.
-async fn disassociate(
+pub(crate) async fn disassociate(
     router: &MultiServiceRouter,
     identifier: &str,
     role_arn: &str,
@@ -167,7 +175,7 @@ async fn disassociate(
 
 /// A session on the instance's own endpoint, as its master user, with the extension
 /// installed — which is what an S3-integrated instance's client does first.
-async fn session_with_the_extension(address: &str, port: u16) -> PostgresSession {
+pub(crate) async fn session_with_the_extension(address: &str, port: u16) -> PostgresSession {
     let mut session = postgres_login(
         address,
         port,
@@ -183,7 +191,7 @@ async fn session_with_the_extension(address: &str, port: u16) -> PostgresSession
 }
 
 /// Run `sql`, failing the case when the engine refuses it.
-async fn run(session: &mut PostgresSession, case: &str, sql: &str) {
+pub(crate) async fn run(session: &mut PostgresSession, case: &str, sql: &str) {
     session
         .query(sql)
         .await
@@ -191,7 +199,7 @@ async fn run(session: &mut PostgresSession, case: &str, sql: &str) {
 }
 
 /// The refusal `sql` is answered with, failing the case when it is served instead.
-async fn refusal(session: &mut PostgresSession, case: &str, sql: &str) -> Refusal {
+pub(crate) async fn refusal(session: &mut PostgresSession, case: &str, sql: &str) -> Refusal {
     match session.query(sql).await {
         Ok(rows) => panic!("case {case:?}: {sql:?} must be refused, got {rows:?}"),
         Err(refusal) => refusal,
@@ -199,7 +207,7 @@ async fn refusal(session: &mut PostgresSession, case: &str, sql: &str) -> Refusa
 }
 
 /// The rows `table` holds, as text, in the order the engine returns them.
-async fn rows_of(
+pub(crate) async fn rows_of(
     session: &mut PostgresSession,
     case: &str,
     table: &str,

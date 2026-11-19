@@ -249,10 +249,23 @@ pub(crate) async fn role(
     principal: &str,
     policy: Option<String>,
 ) -> String {
+    role_with_trust_document(router, name, &trust_policy(principal), policy).await
+}
+
+/// The same, with the trust policy given VERBATIM rather than built around one principal —
+/// for the suite whose subject is the trust document itself
+/// ([`crate::postgres_s3_import_role_trust`]), whose rows differ in how many principals the
+/// statement names, which action it grants and what effect it states.
+pub(crate) async fn role_with_trust_document(
+    router: &MultiServiceRouter,
+    name: &str,
+    document: &str,
+    policy: Option<String>,
+) -> String {
     let created = iam(router)
         .create_role()
         .role_name(name)
-        .assume_role_policy_document(trust_policy(principal))
+        .assume_role_policy_document(document)
         .send()
         .await
         .unwrap_or_else(|error| panic!("case {name:?}: IAM creates the role: {error}"));
@@ -344,6 +357,26 @@ pub(crate) fn associated_roles(envelope: &str) -> Vec<(String, String, String)> 
             )
         })
         .collect()
+}
+
+/// The `AssociatedRoles` the DB instance `identifier` reports right now, read through
+/// `DescribeDBInstances` — the one read of that list this fixture offers its suites, beside
+/// the parse above.
+pub(crate) async fn instance_associated_roles(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+) -> Vec<(String, String, String)> {
+    let described = expect_ok(
+        case,
+        call(
+            router,
+            "DescribeDBInstances",
+            &params!["DBInstanceIdentifier" => identifier],
+        )
+        .await,
+    );
+    associated_roles(&described)
 }
 
 /// One row of the feature-name table: the engine, the `FeatureName` the request names, and
