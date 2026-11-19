@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTableReplicationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTableReplicationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTableReplicationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -122,6 +113,49 @@ impl From<GetTableReplicationStatusErrorModeled> for GetTableReplicationStatusEr
     }
 }
 
+/// `NotFoundException` (HTTP 404) — the refusal this operation models for a
+/// table bucket this account does not hold, for a table the bucket holds none
+/// of, and for a table nothing replicates and which therefore has no
+/// destination to report a status for, each worded with the one sentence this
+/// service states that class with.
+fn not_found(message: &str) -> GetTableReplicationStatusError {
+    GetTableReplicationStatusErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The table bucket a `tableARN` names the table within: a table's ARN is its
+/// bucket's followed by `/table/<table id>`
+/// (`crate::state::table_arn`), and the modelled pattern — enforced at the
+/// boundary before this handler runs — is what guarantees the segment is
+/// there; a value without it is answered about as a whole rather than guessed
+/// at.
+fn bucket_of(table_arn: &str) -> &str {
+    table_arn
+        .split_once("/table/")
+        .map_or(table_arn, |(bucket, _)| bucket)
+}
+
+/// One destination's state, in the wire form the response's `destinations` list
+/// carries.
+fn wire_value(
+    status: &crate::state::ReplicationDestinationStatus,
+) -> ReplicationDestinationStatusModel {
+    ReplicationDestinationStatusModel {
+        replication_status: status.state.as_wire().to_string(),
+        destination_table_bucket_arn: status.destination_table_bucket_arn.clone(),
+        destination_table_arn: status.destination_table_arn.clone(),
+        last_successful_replicated_update: status.last_successful_update.as_ref().map(|update| {
+            LastSuccessfulReplicatedUpdate {
+                metadata_location: update.metadata_location.clone(),
+                timestamp: ::aws_smithy_types::DateTime::from(update.timestamp),
+            }
+        }),
+        failure_message: status.failure_message.map(str::to_string),
+    }
+}
+
 /// The `GetTableReplicationStatus` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -158,18 +192,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTableReplicationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTableReplicationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTableReplicationStatus"))
+        // This operation's model declares no `AccessDeniedException`, so the
+        // identity-based decision is not taken here: answering a caller an
+        // error its operation does not declare would be a divergence of its own
+        // (see `crate::state::authorization`). The resource-based half of the
+        // decision is taken for every operation of this service, in front of
+        // this handler (see `crate::service::authorization`).
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetTableReplicationStatusErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the S3 Tables table bucket store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A pure read: every destination's state is derived from the
+        // configuration that replicates the table, the destination table bucket
+        // and the clock, and nothing in the store is touched — so two reads of
+        // a table nobody reconfigured answer the same.
+        let at = ::std::time::SystemTime::now();
+        let store = state.lock();
+        let table = match store.table_by_arn(&input.table_arn) {
+            Some(table) => table,
+            // A `tableArn` names a table INSIDE a table bucket, so which of the
+            // two the store does not hold is which resource the refusal is
+            // about: an ARN whose table bucket this account holds no bucket for
+            // is stated with the bucket's own sentence, and one whose bucket
+            // holds no table under the id with the table's.
+            None => {
+                return Err(not_found(
+                    if store.table_buckets.contains_key(bucket_of(&input.table_arn)) {
+                        crate::state::TABLE_NOT_FOUND_MESSAGE
+                    } else {
+                        crate::state::BUCKET_NOT_FOUND_MESSAGE
+                    },
+                ))
+            }
+        };
+
+        // The response's `destinations` is required and the model bounds it at
+        // one destination at least (`@length(min: 1, max: 5)`): a table nothing
+        // replicates has no destination to report, so the read is refused with
+        // the modeled not-found rather than answered with an empty list, which
+        // is how a client observes that the table is not replicated.
+        let destinations = store
+            .table_replication_status(table, at)
+            .ok_or_else(|| not_found(crate::state::REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE))?;
+
+        Ok(GetTableReplicationStatusOutput {
+            // The table's OWN ARN, as the store holds it, rather than the one
+            // the request carried.
+            source_table_arn: table.table_arn.clone(),
+            destinations: destinations.iter().map(wire_value).collect(),
+        })
     }
 }

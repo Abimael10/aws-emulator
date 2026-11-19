@@ -237,8 +237,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holding the one this call answers with can tell a later write apart
         // from its own.
         let version_token = store.mint_replication_version_token();
+        let now = ::std::time::SystemTime::now();
         let stored = ReplicationConfiguration {
             role: input.configuration.role,
+            // The instant this write is served, which is when replication
+            // under this configuration starts and therefore what the status of
+            // each destination is derived from.
+            configured_at: now,
             rules: input
                 .configuration
                 .rules
@@ -253,6 +258,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect(),
             version_token: version_token.clone(),
         };
+        let destinations: Vec<String> = stored
+            .rules
+            .iter()
+            .flat_map(|rule| rule.destinations.iter().cloned())
+            .collect();
         let resource = match store.table_buckets.get_mut(&input.table_bucket_arn) {
             // The whole configuration is applied as ONE replacement, so a
             // bucket is never left carrying a mix of two callers' rules.
@@ -265,6 +275,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // between.
             None => return Err(not_found(crate::state::BUCKET_NOT_FOUND_MESSAGE)),
         };
+        // A configuration set on the bucket replicates the tables the bucket
+        // holds, so each of them is given its replica at every destination —
+        // the same provisioning the table-scoped put performs, and why this
+        // operation too takes permission to create a namespace and a table
+        // there (see this file's modeled contract above).
+        for table_arn in store.table_arns_in_bucket(&resource) {
+            store.provision_replicas(&table_arn, &destinations, now);
+        }
         // The lock covers the state change only; everything below is owned.
         drop(store);
 

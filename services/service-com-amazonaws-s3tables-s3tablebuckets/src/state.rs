@@ -27,6 +27,12 @@ pub use service_managed::*;
 mod maintenance_jobs;
 pub use maintenance_jobs::*;
 
+/// The state replication of a table reports for each of its destinations:
+/// which configuration replicates the table, and what the clock and the
+/// destination make of it.
+mod replication_status;
+pub use replication_status::*;
+
 /// Whether the calling principal's own identity-based IAM policies allow the
 /// action a request asks for. Named rather than glob-imported, so a handler
 /// reads `crate::state::authorization::refusal(..)` and the gate is visible at
@@ -915,6 +921,12 @@ pub struct ReplicationConfiguration {
     /// older token can tell its view is stale — the same rule a table's
     /// `versionToken` follows.
     pub version_token: String,
+    /// When the write that stored this configuration was served. Replication
+    /// of a table to a destination cannot have completed before the
+    /// configuration that replicates it was set, which is why the instant is
+    /// persisted here and the status a read reports is derived from it
+    /// ([`ComAmazonawsS3tablesS3tablebucketsState::table_replication_status`]).
+    pub configured_at: SystemTime,
 }
 
 /// One rule of a replication configuration: the destination table buckets the

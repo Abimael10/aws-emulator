@@ -527,6 +527,21 @@ impl Emulator {
         .await
     }
 
+    /// `GetTableReplicationStatus`, which addresses the table by a query member
+    /// on an endpoint of its own (`GET /replication-status`).
+    pub async fn get_table_replication_status(&self, region: &str, table_arn: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!(
+                "/replication-status{}",
+                query_string(&[("tableArn", table_arn.to_string())])
+            ),
+            region,
+            None,
+        )
+        .await
+    }
+
     /// `PutTableRecordExpirationConfiguration`: the table's ARN travels as a
     /// query member and the configuration as the body's `value`.
     pub async fn put_table_record_expiration_configuration(

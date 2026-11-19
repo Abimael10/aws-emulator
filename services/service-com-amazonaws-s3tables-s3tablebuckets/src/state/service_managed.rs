@@ -88,11 +88,11 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
         now: SystemTime,
     ) -> Result<String, ServiceManagedNamespaceRefusal> {
         let arn = table_bucket_arn(region, name);
-        let account = ::engine::emulator_account_id().to_string();
         if !self.table_buckets.contains_key(&arn) {
             if self.is_at_bucket_quota() {
                 return Err(ServiceManagedNamespaceRefusal::AccountFull);
             }
+            let account = ::engine::emulator_account_id().to_string();
             let bucket_id = self.mint_bucket_id();
             self.table_buckets.insert(
                 arn.clone(),
@@ -100,7 +100,7 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
                     name: name.to_string(),
                     arn: arn.clone(),
                     region: region.to_string(),
-                    owner_account_id: account.clone(),
+                    owner_account_id: account,
                     bucket_id,
                     // "A bucket Amazon Web Services created on the account's behalf", which
                     // is what a bucket a service provisions is.
@@ -124,19 +124,42 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
         if self.holds_namespace(&arn, namespace) {
             return Ok(arn);
         }
-        if self
+        self.ensure_namespace(&arn, namespace, now)?;
+        Ok(arn)
+    }
+
+    /// Ensure the table bucket `table_bucket_arn` holds a namespace called
+    /// `namespace`, creating one when it does not.
+    ///
+    /// IDEMPOTENT: a namespace already resident is left exactly as it is, including one a
+    /// CALLER created under that name. The bucket itself is NOT created here — a caller of
+    /// this is adding a namespace to a bucket that already stands — and the store stays
+    /// BOUNDED exactly as it is for a create that arrives on the wire
+    /// ([`NAMESPACES_PER_TABLE_BUCKET`]).
+    pub fn ensure_namespace(
+        &mut self,
+        table_bucket_arn: &str,
+        namespace: &str,
+        now: SystemTime,
+    ) -> Result<(), ServiceManagedNamespaceRefusal> {
+        if self.holds_namespace(table_bucket_arn, namespace) {
+            return Ok(());
+        }
+        let held = self
             .table_buckets
-            .get(&arn)
-            .is_some_and(|bucket| bucket.namespaces.len() >= NAMESPACES_PER_TABLE_BUCKET)
-        {
+            .get(table_bucket_arn)
+            .ok_or(ServiceManagedNamespaceRefusal::NoSuchTableBucket)?;
+        if held.namespaces.len() >= NAMESPACES_PER_TABLE_BUCKET {
             return Err(ServiceManagedNamespaceRefusal::TableBucketFull);
         }
+        let account = ::engine::emulator_account_id().to_string();
         // Minted only for a namespace this really creates, so an id is not spent on a call
         // that found one already there.
         let namespace_id = self.mint_namespace_id();
-        let Some(bucket) = self.table_buckets.get_mut(&arn) else {
-            // Unreachable: the bucket was inserted above or was already resident. The id
-            // minted just above goes unused, which costs nothing but the sequence number.
+        let Some(bucket) = self.table_buckets.get_mut(table_bucket_arn) else {
+            // Unreachable: the bucket was resident a few lines above and this call holds the
+            // store. The id minted just above goes unused, which costs nothing but the
+            // sequence number.
             return Err(ServiceManagedNamespaceRefusal::NoSuchTableBucket);
         };
         bucket.namespaces.insert(
@@ -147,11 +170,11 @@ impl ComAmazonawsS3tablesS3tablebucketsState {
                 created_at: now,
                 created_by: account.clone(),
                 owner_account_id: account,
-                // A fresh namespace holds no tables; the create below is what puts one in it.
+                // A fresh namespace holds no tables; a create is what puts one in it.
                 tables: BTreeMap::new(),
             },
         );
-        Ok(arn)
+        Ok(())
     }
 
     /// Whether the table bucket `table_bucket_arn` holds a namespace called `namespace` now.
