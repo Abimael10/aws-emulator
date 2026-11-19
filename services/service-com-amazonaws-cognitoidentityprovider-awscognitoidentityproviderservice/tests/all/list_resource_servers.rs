@@ -203,7 +203,7 @@ struct ListingCase {
 /// listing's own token
 /// (`smithy_query(query="operation",operation="ListResourceServers")`), so the
 /// page sizes below span that range and the stored counts span "fits in one
-/// page" and "needs several".
+/// page", "needs several" and the most resource servers one pool may hold.
 fn listing_cases() -> Vec<ListingCase> {
     vec![
         ListingCase {
@@ -243,16 +243,26 @@ fn listing_cases() -> Vec<ListingCase> {
             expected_requests: 1,
         },
         ListingCase {
-            case: "fifty-two resource servers, more than one page holds, no MaxResults",
-            stored: 52,
+            case: "the per-pool maximum of resource servers, ten at a time",
+            stored: 25,
+            max_results: Some(10),
+            expected_requests: 3,
+        },
+        // A pool holds at most as many resource servers as Amazon Cognito's quota for
+        // that count allows (25, below the page a listing serves when the request asks
+        // for no `MaxResults`), so the whole store of one pool fits in a single default
+        // page and a listing of it takes one request.
+        ListingCase {
+            case: "the per-pool maximum of resource servers, no MaxResults",
+            stored: 25,
             max_results: None,
-            expected_requests: 2,
+            expected_requests: 1,
         },
         ListingCase {
-            case: "fifty-two resource servers at the MaxResults maximum 50",
-            stored: 52,
+            case: "the per-pool maximum of resource servers at the MaxResults maximum 50",
+            stored: 25,
             max_results: Some(50),
-            expected_requests: 2,
+            expected_requests: 1,
         },
     ]
 }

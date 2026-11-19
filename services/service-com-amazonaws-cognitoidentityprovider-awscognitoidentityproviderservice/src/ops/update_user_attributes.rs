@@ -423,6 +423,12 @@ fn refused(refusal: crate::state::AttributeUpdateRefusal) -> UpdateUserAttribute
 fn token_rejected(rejection: crate::state::TokenRejection) -> UpdateUserAttributesError {
     match rejection {
         crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        // A token REWRITTEN after the pool signed it, or signed by a key the pool does
+        // not publish: the signature does not check out against the pool's published key
+        // set, which is told apart from a value that is no signed token of this service.
+        crate::state::TokenRejection::SignatureNotVerified => {
+            not_authorized(crate::state::ACCESS_TOKEN_SIGNATURE_UNVERIFIED_MESSAGE)
+        }
         // A token this emulator issued and a sign-out or a revocation has since
         // invalidated, which is told apart from a value that resolves to no access
         // token at all.

@@ -553,6 +553,12 @@ fn token_rejected(rejection: crate::state::TokenRejection) -> CompleteWebAuthnRe
         crate::state::TokenRejection::MissingRequiredScopes => {
             not_authorized(crate::state::MISSING_REQUIRED_SCOPES_MESSAGE)
         }
+        // A token REWRITTEN after the pool signed it, or signed by a key the pool does
+        // not publish: the signature does not check out against the pool's published key
+        // set, which is told apart from a value that is no signed token of this service.
+        crate::state::TokenRejection::SignatureNotVerified => {
+            not_authorized(crate::state::ACCESS_TOKEN_SIGNATURE_UNVERIFIED_MESSAGE)
+        }
         crate::state::TokenRejection::NotAnAccessToken
         | crate::state::TokenRejection::PoolGone
         | crate::state::TokenRejection::UserGone => not_authorized(INVALID_ACCESS_TOKEN),

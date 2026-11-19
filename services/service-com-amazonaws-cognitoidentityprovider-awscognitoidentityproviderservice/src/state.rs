@@ -78,6 +78,11 @@ mod new_password_challenge;
 /// answers it, and what satisfying it leaves behind.
 mod mfa_challenge;
 mod feature_plan;
+/// Why a value presented as an `AccessToken` that no issuance record resolves is
+/// refused: whether its signature fails to check out against the key set the pool it
+/// names publishes, or it is no signed token of this service at all.
+mod access_token_signature;
+pub use access_token_signature::*;
 pub use feature_plan::*;
 pub use attributes::*;
 pub use client_preconditions::*;
@@ -1441,8 +1446,17 @@ pub const MAX_DEVICES_PER_USER: usize = 200;
 /// longest ago is dropped past the cap.
 pub const MAX_PASSWORD_HISTORY_PER_USER: usize = 24;
 
-/// The most resource servers one user pool holds.
-pub const MAX_RESOURCE_SERVERS_PER_POOL: usize = 1_000;
+/// The most resource servers one user pool holds: Amazon Cognito's published quota
+/// "Resource servers per user pool", whose AWS default value is this number and which an
+/// account can ask to have raised (Service Quotas' `cognito-idp` catalog, quota code
+/// `L-7CDAF993`). It is the limit this service ENFORCES, so the value a caller discovers
+/// before provisioning is the one a create past it is refused against.
+///
+/// No cross-crate dependency links the two, so keep it in step with the value that
+/// catalog publishes for that quota code in
+/// `services/service-com-amazonaws-servicequotas-servicequotasv20190624/src/state/quota_rows/cognito_idp.rs`
+/// (each side has a test pinning it).
+pub const MAX_RESOURCE_SERVERS_PER_POOL: usize = 25;
 
 /// The most identity providers one user pool holds.
 pub const MAX_IDENTITY_PROVIDERS_PER_POOL: usize = 1_000;
@@ -1897,10 +1911,14 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         access_token: &str,
         now: SystemTime,
     ) -> Result<(&UserPool, &User), TokenRejection> {
+        // A value no record resolves is still checked against the key the pool it names
+        // publishes, so a token rewritten after it was signed is refused as the signature
+        // this service could not verify rather than as a value it never issued
+        // ([`Self::unissued_access_token_rejection`]).
         let record = self
             .issued_tokens
             .get(access_token)
-            .ok_or(TokenRejection::NotAnAccessToken)?;
+            .ok_or_else(|| self.unissued_access_token_rejection(access_token))?;
         if !record.is_access_token() {
             return Err(TokenRejection::NotAnAccessToken);
         }

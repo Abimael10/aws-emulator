@@ -253,6 +253,13 @@ fn caller_rejected(refusal: crate::state::SoftwareTokenRefusal) -> AssociateSoft
             crate::state::TokenRejection::NotAnAccessToken => {
                 not_authorized("Invalid Access Token")
             }
+            // A token REWRITTEN after the pool signed it, or signed by a key the pool
+            // does not publish: the signature does not check out against the pool's
+            // published key set, which is told apart from a value that is no signed
+            // token of this service.
+            crate::state::TokenRejection::SignatureNotVerified => {
+                not_authorized(crate::state::ACCESS_TOKEN_SIGNATURE_UNVERIFIED_MESSAGE)
+            }
             crate::state::TokenRejection::Revoked => {
                 not_authorized(crate::state::ACCESS_TOKEN_REVOKED_MESSAGE)
             }

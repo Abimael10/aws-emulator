@@ -181,8 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .pool_mut(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
         let pool_id = pool.id.clone();
-        // This emulator holds a pool's resource servers in memory, so the store
-        // is bounded; read before the slot is borrowed below.
+        // A pool holds at most as many resource servers as Amazon Cognito's published
+        // quota for that count allows ([`crate::state::MAX_RESOURCE_SERVERS_PER_POOL`]),
+        // which is the limit this operation is refused against; read before the slot is
+        // borrowed below.
         let stored_count = pool.resource_servers.len();
 
         match pool.resource_servers.entry(input.identifier.clone()) {
@@ -197,9 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))),
             ::std::collections::btree_map::Entry::Vacant(slot) => {
                 if stored_count >= crate::state::MAX_RESOURCE_SERVERS_PER_POOL {
+                    // The refusal states the LIMIT and names nothing of the request: the
+                    // caller is told the number its create was judged against, which is
+                    // the quota the published catalog carries for this count.
                     return Err(limit_exceeded(format!(
-                        "User pool {} holds at most {} resource servers.",
-                        input.user_pool_id,
+                        "The limit for user pool resource servers is: {}.",
                         crate::state::MAX_RESOURCE_SERVERS_PER_POOL
                     )));
                 }
@@ -240,7 +244,9 @@ fn invalid_parameter(message: String) -> CreateResourceServerError {
     .into()
 }
 
-/// This operation's `LimitExceededException` for a store at its bound.
+/// This operation's `LimitExceededException` for a pool already holding every resource
+/// server its quota allows — the error this operation declares for a caller that "exceeds
+/// the limit for a requested Amazon Web Services resource" (this service's model).
 fn limit_exceeded(message: String) -> CreateResourceServerError {
     CreateResourceServerErrorModeled::LimitExceededException(LimitExceededException {
         message: Some(message),

@@ -1095,6 +1095,11 @@ pub const DEVICE_REMEMBERED_STATUS: &str = "remembered";
 pub enum TokenRejection {
     /// Not a token this emulator issued, or not an ACCESS token.
     NotAnAccessToken,
+    /// A compact JWS naming a pool of this service as its issuer whose SIGNATURE does
+    /// not check out against the key set that pool publishes — a token rewritten after
+    /// it was signed, or one signed by a key the pool does not publish
+    /// ([`ACCESS_TOKEN_SIGNATURE_UNVERIFIED_MESSAGE`]).
+    SignatureNotVerified,
     /// An access token this emulator issued and has since revoked, which
     /// authorizes nothing ([`ACCESS_TOKEN_REVOKED_MESSAGE`]).
     Revoked,
