@@ -171,6 +171,30 @@ pub struct SettledArbitration {
     pub open_until: SystemTime,
 }
 
+/// The capacity movement a policy is still waiting for a previous scaling activity to take
+/// effect over: where that movement moved the target FROM, and where it moved it TO.
+///
+/// While that wait is in force the movement is still in flight, and the capacity it
+/// contributed is already part of the capacity the same policy's next action asks for rather
+/// than something that action adds to: an action raised inside the wait is computed from
+/// `from`, so what the in-flight movement already delivered is netted out of it and only the
+/// remainder is left to apply (see [`policy_execution`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InFlightMovement {
+    /// The capacity the target held when the movement was computed.
+    pub from: i32,
+    /// The capacity the movement moved the target to.
+    pub to: i32,
+}
+
+impl InFlightMovement {
+    /// Whether this movement ADDED capacity: the direction whose wait nets the next action
+    /// against what is already in flight, rather than holding it back.
+    pub fn scales_out(self) -> bool {
+        self.to > self.from
+    }
+}
+
 /// What `PutScheduledAction` persists: the action as `DescribeScheduledActions` reports
 /// it, plus the bookkeeping the clock needs.
 ///
@@ -206,6 +230,11 @@ pub struct ScalingPolicyRecord {
     /// When this policy last moved the capacity of the resource it scales, which is the
     /// instant its `Cooldown` is measured from.
     pub last_executed: Option<SystemTime>,
+    /// What the movement [`ScalingPolicyRecord::last_executed`] stands for DID, which is what
+    /// an action raised while the wait for it is still running is netted against. It is
+    /// meaningful only while that wait is: past `last_executed` plus the policy's cooldown the
+    /// movement is no longer in flight, so nothing consults it. See [`InFlightMovement`].
+    pub last_movement: Option<InFlightMovement>,
 }
 
 /// One entry of the scaling-activity log: a capacity movement this service performed,
@@ -449,6 +478,15 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
         // execution that settles one records it again itself, after this call.
         if let Some(record) = self.targets.get_mut(target) {
             record.settled_arbitration = None;
+        }
+        // And for the same reason no movement of a policy of this target is in flight any
+        // more: the capacity an in-flight movement is netted against is the capacity that
+        // movement set, which this one has just taken over. The policy execution that performs
+        // a movement records its own again itself, after this call.
+        for (key, record) in &mut self.policies {
+            if &key.target == target {
+                record.last_movement = None;
+            }
         }
         // This movement is what the target is driven to from here on, so a movement of the
         // same target that had not been fulfilled yet is displaced by it, and this capacity
@@ -3916,13 +3954,14 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
                     // What the policy has already been executed for survives a re-write of
                     // it too: this is the same policy, so a breach it has performed must not
                     // be performed again.
-                    let (executed_transitions, last_executed) = store
+                    let (executed_transitions, last_executed, last_movement) = store
                         .policies
                         .get(&policy_key)
                         .map(|existing| {
                             (
                                 existing.executed_transitions.clone(),
                                 existing.last_executed,
+                                existing.last_movement,
                             )
                         })
                         .unwrap_or_default();
@@ -3941,6 +3980,7 @@ pub fn apply_managed_target<Eng: Send + Sync + 'static>(
                                 creation_time,
                                 executed_transitions,
                                 last_executed,
+                                last_movement,
                             },
                         );
                     }

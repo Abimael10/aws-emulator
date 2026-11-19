@@ -438,6 +438,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|existing| existing.executed_transitions.clone())
                 .unwrap_or_default(),
             last_executed: stored.as_ref().and_then(|existing| existing.last_executed),
+            // And so does the movement it is still waiting for: a re-write of the policy is not
+            // a scaling activity, so what the wait in force is netted against is unchanged.
+            last_movement: stored.as_ref().and_then(|existing| existing.last_movement),
         };
         state.policies.insert(key.clone(), record);
         drop(state);

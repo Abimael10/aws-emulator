@@ -58,13 +58,21 @@
 //! not invoke its actions once and fall silent — it goes on invoking them for as long as it
 //! STAYS in `ALARM`, at the cadence it is evaluated at ([`invocation_interval_secs`]), so a
 //! breach that persists is executed again and again ([`invocation_secs`]). That is what a
-//! cooldown is a wait against: an invocation that arrives inside the span the policy asks to
-//! "wait for a previous scaling activity to take effect"
-//! (`StepScalingPolicyConfiguration$Cooldown`) is suppressed, and the FIRST invocation after
-//! that wait has elapsed applies the next adjustment — so a target under a breach that does
-//! not let up keeps being moved, one adjustment per wait, until the registered window is what
-//! stops it. Each invocation is decided as of ITS OWN instant rather than the instant a pass
-//! reads it, so a pass that comes late performs what the invocation it reads was owed.
+//! cooldown is a wait against: for the span the policy asks to "wait for a previous scaling
+//! activity to take effect" (`StepScalingPolicyConfiguration$Cooldown`) the movement that
+//! started it is still in flight ([`super::InFlightMovement`]), so an invocation that arrives
+//! inside that span is NOT discarded — it is decided against that movement rather than against
+//! the capacity the movement left behind. Its adjustment is computed from the capacity the
+//! in-flight movement started at, which NETS OUT the capacity that movement has already
+//! delivered: an invocation that asks for no more than it delivered adds nothing, and one that
+//! asks for more — a breach that has grown into a larger step adjustment, or a metric that has
+//! moved further from a tracked value — moves the capacity straight away, by the remainder
+//! alone. A scale in inside the wait is held back until it has elapsed, and the first
+//! invocation after it applies the next adjustment in full — so a target under a breach that
+//! does not let up keeps being moved, one adjustment per wait and sooner where the breach
+//! worsens, until the registered window is what stops it. Each invocation is decided as of ITS
+//! OWN instant rather than the instant a pass reads it, so a pass that comes late performs what
+//! the invocation it reads was owed.
 //!
 //! A breach a WITHHELD STATE of the target rather than a wait keeps from being performed is
 //! left unconsumed — the alarm is still breaching, so the first pass that may perform it does:
@@ -1186,18 +1194,23 @@ fn plan_breach(
         return Disposition::Hold;
     }
     // "The amount of time, in seconds, to wait for a previous scaling activity to take
-    // effect": an invocation that ARRIVES inside that span of this policy's own last
-    // execution is suppressed, and the alarm's NEXT invocation — the breach is still going
-    // on, so one is coming — is the one that applies the adjustment. Decided as of the
-    // instant the alarm invoked the policy and not as of the instant a pass reads it, so a
-    // pass that comes late performs exactly what the invocation it is reading was owed.
+    // effect": the movement this policy made last is still in flight for that span, so an
+    // invocation that ARRIVES inside it is decided against that movement rather than against
+    // the capacity it left behind. Decided as of the instant the alarm invoked the policy and
+    // not as of the instant a pass reads it, so a pass that comes late performs exactly what
+    // the invocation it is reading was owed.
     let waiting = record
         .last_executed
         .map(|last| epoch_secs(last) + cooldown_of(record, tracked_kind).as_secs_f64())
         .is_some_and(|due| breach.invoked_secs < due);
-    if waiting {
-        return Disposition::Consume;
-    }
+    // What that in-flight movement did, while the wait for it is still running. A wait this
+    // policy has no movement recorded for has nothing to net an invocation against, so it
+    // suppresses the invocation outright.
+    let in_flight = match (waiting, record.last_movement) {
+        (false, _) => None,
+        (true, Some(movement)) => Some(movement),
+        (true, None) => return Disposition::Consume,
+    };
     let Some(target) = store.targets.get(&policy.key.target) else {
         return Disposition::Hold;
     };
@@ -1228,7 +1241,17 @@ fn plan_breach(
     // taken still asks for a movement of the capacity that decision was taken from, and the
     // capacity the winner already moved is part of what it asked for rather than something to
     // add to.
-    let base = settled.map_or(current, |settled| settled.base_capacity);
+    let base = match in_flight {
+        // Inside the wait for a movement that ADDED capacity: the capacity that movement is
+        // still delivering is part of the capacity this action asks for rather than something
+        // it adds to, so the adjustment is computed from the capacity that movement started at
+        // and what it has already delivered is netted out of the result.
+        Some(in_flight) if in_flight.scales_out() => in_flight.from,
+        // Inside the wait for a movement that removed capacity, and outside any wait of this
+        // policy's own: the capacity the target holds as of the decision this trigger belongs
+        // to.
+        _ => settled.map_or(current, |settled| settled.base_capacity),
+    };
 
     // The capacity the policy asks for, as its OWN configuration states it.
     let wanted = match &policy.config {
@@ -1243,6 +1266,15 @@ fn plan_breach(
         return Disposition::Consume;
     };
     let capacity = wanted.max(min_capacity).min(max_capacity);
+    // Inside the wait for a movement of this policy's own, only an action that provides MORE
+    // capacity than the target already holds is performed. A larger scale out is performed for
+    // the REMAINDER the in-flight movement has not already delivered — which is what netting
+    // the adjustment against it leaves — while a scale out that movement has already delivered
+    // in full, and a scale in, which is the direction the wait for a previous scaling activity
+    // to take effect holds back, add nothing until the wait has elapsed.
+    if in_flight.is_some() && capacity <= current {
+        return Disposition::Consume;
+    }
     if capacity == current {
         // The decision asks for no movement at all: either the policy asked for the
         // capacity the target already holds, or it asked PAST a bound the target already
@@ -1339,6 +1371,13 @@ fn perform_movement(
     }
     if let Some(record) = store.policies.get_mut(&policy.key) {
         record.last_executed = Some(moved_at);
+        // What this movement did, which is what an invocation that arrives while the wait for
+        // it is still running is netted against: the capacity it was computed from and the
+        // capacity it moved the target to.
+        record.last_movement = Some(super::InFlightMovement {
+            from: base,
+            to: capacity,
+        });
     }
 }
 

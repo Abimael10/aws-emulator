@@ -821,12 +821,14 @@ const CONTINUING_CATALOG: &[ContinuingRow] = &[
     },
 ];
 
-/// Create the alarm a continuing breach is driven by: the same wiring a step scaling policy is
-/// attached by — the policy's ARN is the action the alarm executes — evaluated on
-/// [`CONTINUING_PERIOD_SECS`].
-async fn given_continuing_alarm(
+/// Create an alarm that drives a continuing breach of `metric_name`: the same wiring a step
+/// scaling policy is attached by — the policy's ARN is the action the alarm executes —
+/// evaluated on [`CONTINUING_PERIOD_SECS`], so the invocations it makes while it stays in
+/// `ALARM` are that far apart.
+async fn given_breaching_alarm_on(
     emulator: &Emulator,
     alarm_name: &str,
+    metric_name: &str,
     policy_arn: &str,
     comparison_operator: &str,
     case: &str,
@@ -837,7 +839,7 @@ async fn given_continuing_alarm(
             json!({
                 "AlarmName": alarm_name,
                 "Namespace": METRIC_NAMESPACE,
-                "MetricName": METRIC_NAME,
+                "MetricName": metric_name,
                 "Statistic": "Average",
                 "Period": CONTINUING_PERIOD_SECS,
                 "EvaluationPeriods": 1,
@@ -849,24 +851,45 @@ async fn given_continuing_alarm(
         .await;
     assert_eq!(
         status, 200,
-        "case {case:?}: expected PutMetricAlarm to answer 200, got {status} {body:?}"
+        "case {case:?}: expected PutMetricAlarm for {alarm_name:?} to answer 200, \
+         got {status} {body:?}"
     );
 }
 
-/// Publish one datapoint `offset` past the threshold, the way a client under a load that does
-/// not let up keeps publishing the series its alarm grades.
+/// Create the alarm a continuing breach of the suite's own metric is driven by
+/// ([`given_breaching_alarm_on`]).
+async fn given_continuing_alarm(
+    emulator: &Emulator,
+    alarm_name: &str,
+    policy_arn: &str,
+    comparison_operator: &str,
+    case: &str,
+) {
+    given_breaching_alarm_on(
+        emulator,
+        alarm_name,
+        METRIC_NAME,
+        policy_arn,
+        comparison_operator,
+        case,
+    )
+    .await;
+}
+
+/// Publish one datapoint `offset` past the threshold on `metric_name`, the way a client under a
+/// load that does not let up keeps publishing the series its alarm grades.
 ///
 /// High resolution, so the datapoint stands for the second it was taken at rather than for the
 /// whole minute, and stamped inside the newest period the evaluation grades
 /// ([`graded_window_stamp`]) — which is what keeps the alarm the policy is wired to IN `ALARM`.
-async fn publish_breach(emulator: &Emulator, offset: f64, case: &str) {
+async fn publish_breach_on(emulator: &Emulator, metric_name: &str, offset: f64, case: &str) {
     let (status, body) = emulator
         .call_cloudwatch(
             "PutMetricData",
             json!({
                 "Namespace": METRIC_NAMESPACE,
                 "MetricData": [{
-                    "MetricName": METRIC_NAME,
+                    "MetricName": metric_name,
                     "Value": THRESHOLD + offset,
                     "Timestamp": graded_window_stamp(f64::from(CONTINUING_PERIOD_SECS)),
                     "StorageResolution": 1,
@@ -876,8 +899,15 @@ async fn publish_breach(emulator: &Emulator, offset: f64, case: &str) {
         .await;
     assert_eq!(
         status, 200,
-        "case {case:?}: expected PutMetricData to answer 200, got {status} {body:?}"
+        "case {case:?}: expected PutMetricData for {metric_name:?} to answer 200, \
+         got {status} {body:?}"
     );
+}
+
+/// Publish one datapoint `offset` past the threshold on the suite's own metric
+/// ([`publish_breach_on`]).
+async fn publish_breach(emulator: &Emulator, offset: f64, case: &str) {
+    publish_breach_on(emulator, METRIC_NAME, offset, case).await;
 }
 
 /// Keep the breach alive and wait for the ECS service's `desiredCount` to reach `expected`,
@@ -1122,4 +1152,481 @@ async fn invocations_inside_the_cooldown_add_nothing() {
         vec!["Setting desired count to 2.".to_string()],
         "case {case:?}: expected the one movement the wait has not elapsed since, got {moved:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// An action raised while the wait for the previous one is still running
+// ---------------------------------------------------------------------------
+//
+// The wait a policy asks for — "the amount of time, in seconds, to wait for a previous scaling
+// activity to take effect" (`StepScalingPolicyConfiguration$Cooldown`) — is not a window that
+// discards what happens inside it. The movement it is a wait FOR is still in flight, so the
+// capacity that movement already contributes is part of the capacity the next action of the
+// same policy asks for rather than something that action adds to: an action raised inside the
+// wait is computed from the capacity the in-flight movement started at, which nets that
+// contribution out, and the REMAINDER alone is applied straight away. An action that asks for
+// no more than the in-flight movement already delivered adds nothing, and a scale in is held
+// back until the wait has elapsed.
+//
+// Each row raises the second action through a SECOND alarm of the same policy, on a metric of
+// its own: "The actions to execute when this alarm transitions to the ALARM state"
+// (`PutMetricAlarmInput$AlarmActions`) is the wiring, and a policy is the action of as many
+// alarms as a client wires it to — so the two breaches a row drives are two measurements, each
+// graded by its own alarm, rather than one alarm's state read twice.
+
+/// The metric the alarm that fires SECOND watches, inside [`METRIC_NAMESPACE`]: its own
+/// series, so the size of the breach it grades is independent of the one the first alarm
+/// graded.
+const SECOND_METRIC_NAME: &str = "LoadInsideTheWait";
+
+/// The wait every row of these two catalogues gives a previous scaling activity, in seconds:
+/// far longer than a row watches, so the second action of a row always lands INSIDE it.
+const LONG_COOLDOWN_SECS: i64 = 600;
+
+/// One action raised inside the wait for a previous one: the window the target is registered
+/// with, the capacity the ECS service starts at, the policy both alarms execute, the breach
+/// each of them grades, and where the capacity ends up.
+struct NettingRow {
+    case: &'static str,
+    /// The `desiredCount` the ECS service is created with.
+    starting: i64,
+    min: i64,
+    max: i64,
+    adjustment_type: &'static str,
+    steps: &'static [Step],
+    /// The `ComparisonOperator` of the alarm that fires first, which names the side of the
+    /// threshold its breach is on.
+    first_operator: &'static str,
+    /// How far past the threshold the first alarm's datapoint is, signed in the direction of
+    /// its breach.
+    first_breach: f64,
+    /// The capacity that first action lands the target on, which is the movement the wait is
+    /// then a wait for.
+    first_capacity: i64,
+    /// The `ComparisonOperator` of the alarm that fires while that wait is still running.
+    second_operator: &'static str,
+    /// How far past the threshold ITS datapoint is, signed in the direction of its breach.
+    second_breach: f64,
+    /// Where the capacity ends up: the netted remainder for an action that asks for more than
+    /// the in-flight movement delivered, and the capacity the first action set for one the
+    /// wait holds back.
+    netted_capacity: i64,
+}
+
+/// The rows an action inside the wait MOVES capacity for. They differ in how the adjustment is
+/// interpreted, in how far up the steps the second breach lands, in which bound of the
+/// registered window the remainder is clamped by, and in the direction each of the two actions
+/// is in.
+const NETTED_CATALOG: &[NettingRow] = &[
+    // The shape the rule is about: a breach that re-lands a step further up while the wait is
+    // still running. The second step asks for 5 tasks on top of the 4 the target held when the
+    // first step was computed, of which that step has already delivered 2 — so 3 are left.
+    NettingRow {
+        case: "a breach a step further up adds only what the first step has not delivered",
+        starting: 4,
+        min: 1,
+        max: 20,
+        adjustment_type: "ChangeInCapacity",
+        steps: &[
+            Step { lower: Some(0.0), upper: Some(10.0), adjustment: 1 },
+            Step { lower: Some(10.0), upper: Some(20.0), adjustment: 2 },
+            Step { lower: Some(20.0), upper: None, adjustment: 5 },
+        ],
+        first_operator: "GreaterThanThreshold",
+        first_breach: 15.0,
+        first_capacity: 6,
+        second_operator: "GreaterThanThreshold",
+        second_breach: 25.0,
+        netted_capacity: 9,
+    },
+    // Two steps further up, from the smallest step of the three: the whole remainder of the
+    // larger step is applied at once rather than one step at a time.
+    NettingRow {
+        case: "a breach two steps further up adds the whole remainder at once",
+        starting: 4,
+        min: 1,
+        max: 20,
+        adjustment_type: "ChangeInCapacity",
+        steps: &[
+            Step { lower: Some(0.0), upper: Some(10.0), adjustment: 1 },
+            Step { lower: Some(10.0), upper: Some(20.0), adjustment: 2 },
+            Step { lower: Some(20.0), upper: None, adjustment: 8 },
+        ],
+        first_operator: "GreaterThanThreshold",
+        first_breach: 5.0,
+        first_capacity: 5,
+        second_operator: "GreaterThanThreshold",
+        second_breach: 25.0,
+        netted_capacity: 12,
+    },
+    // The remainder is a capacity like any other, so the registered window is what bounds it:
+    // 4 plus 9 is above the ceiling, and the movement is performed AT the ceiling.
+    NettingRow {
+        case: "the remainder is clamped into the registered window",
+        starting: 4,
+        min: 1,
+        max: 7,
+        adjustment_type: "ChangeInCapacity",
+        steps: &[
+            Step { lower: Some(0.0), upper: Some(20.0), adjustment: 2 },
+            Step { lower: Some(20.0), upper: None, adjustment: 9 },
+        ],
+        first_operator: "GreaterThanThreshold",
+        first_breach: 10.0,
+        first_capacity: 6,
+        second_operator: "GreaterThanThreshold",
+        second_breach: 25.0,
+        netted_capacity: 7,
+    },
+    // "For exact capacity, you must specify a non-negative value": the step names the capacity
+    // itself, so what the in-flight movement delivered is already part of it and the action
+    // inside the wait lands on the capacity its own step names.
+    NettingRow {
+        case: "an exact capacity inside the wait is the capacity its step names",
+        starting: 4,
+        min: 1,
+        max: 20,
+        adjustment_type: "ExactCapacity",
+        steps: &[
+            Step { lower: Some(0.0), upper: Some(20.0), adjustment: 6 },
+            Step { lower: Some(20.0), upper: None, adjustment: 9 },
+        ],
+        first_operator: "GreaterThanThreshold",
+        first_breach: 10.0,
+        first_capacity: 6,
+        second_operator: "GreaterThanThreshold",
+        second_breach: 25.0,
+        netted_capacity: 9,
+    },
+    // A percentage is a percentage of the capacity the adjustment is computed from, which
+    // inside the wait is the capacity the in-flight movement started at: 100% of 4 is 4, of
+    // which the first step's 50% has already delivered 2.
+    NettingRow {
+        case: "a percentage of the capacity the in-flight movement started at",
+        starting: 4,
+        min: 1,
+        max: 20,
+        adjustment_type: "PercentChangeInCapacity",
+        steps: &[
+            Step { lower: Some(0.0), upper: Some(20.0), adjustment: 50 },
+            Step { lower: Some(20.0), upper: None, adjustment: 100 },
+        ],
+        first_operator: "GreaterThanThreshold",
+        first_breach: 10.0,
+        first_capacity: 6,
+        second_operator: "GreaterThanThreshold",
+        second_breach: 25.0,
+        netted_capacity: 8,
+    },
+    // The other direction: the movement in flight REMOVED capacity, so it contributes nothing
+    // to a scale out and there is nothing to net — the step is added to the capacity the target
+    // holds, in full, without waiting the wait out.
+    NettingRow {
+        case: "a scale out inside the wait for a scale in is performed in full",
+        starting: 8,
+        min: 1,
+        max: 20,
+        adjustment_type: "ChangeInCapacity",
+        steps: &[
+            Step { lower: None, upper: Some(0.0), adjustment: -3 },
+            Step { lower: Some(0.0), upper: None, adjustment: 5 },
+        ],
+        first_operator: "LessThanThreshold",
+        first_breach: -25.0,
+        first_capacity: 5,
+        second_operator: "GreaterThanThreshold",
+        second_breach: 25.0,
+        netted_capacity: 10,
+    },
+];
+
+/// The rows an action inside the wait moves NO capacity for: the capacity it asks for is one
+/// the in-flight movement has already delivered, or it is in the direction a wait holds back.
+const HELD_CATALOG: &[NettingRow] = &[
+    // The step the second breach lands in asks for exactly what the first one did, so netting
+    // the in-flight movement out of it leaves nothing to apply.
+    NettingRow {
+        case: "a step the in-flight movement has already delivered in full adds nothing",
+        starting: 4,
+        min: 1,
+        max: 20,
+        adjustment_type: "ChangeInCapacity",
+        steps: &[
+            Step { lower: Some(0.0), upper: Some(20.0), adjustment: 2 },
+            Step { lower: Some(20.0), upper: None, adjustment: 2 },
+        ],
+        first_operator: "GreaterThanThreshold",
+        first_breach: 10.0,
+        first_capacity: 6,
+        second_operator: "GreaterThanThreshold",
+        second_breach: 25.0,
+        netted_capacity: 6,
+    },
+    // And a step that asks for LESS than the in-flight movement delivered takes nothing back:
+    // the capacity the target holds stands until the wait has elapsed.
+    NettingRow {
+        case: "a smaller step inside the wait takes nothing back",
+        starting: 4,
+        min: 1,
+        max: 20,
+        adjustment_type: "ChangeInCapacity",
+        steps: &[
+            Step { lower: Some(0.0), upper: Some(20.0), adjustment: 5 },
+            Step { lower: Some(20.0), upper: None, adjustment: 2 },
+        ],
+        first_operator: "GreaterThanThreshold",
+        first_breach: 10.0,
+        first_capacity: 9,
+        second_operator: "GreaterThanThreshold",
+        second_breach: 25.0,
+        netted_capacity: 9,
+    },
+    // A deeper scale in inside the wait for a scale in: the direction a wait holds back, so it
+    // adds nothing however much further down the steps the breach lands.
+    NettingRow {
+        case: "a deeper scale in inside the wait is held back",
+        starting: 8,
+        min: 1,
+        max: 20,
+        adjustment_type: "ChangeInCapacity",
+        steps: &[
+            Step { lower: None, upper: Some(-10.0), adjustment: -4 },
+            Step { lower: Some(-10.0), upper: Some(0.0), adjustment: -1 },
+        ],
+        first_operator: "LessThanThreshold",
+        first_breach: -5.0,
+        first_capacity: 7,
+        second_operator: "LessThanThreshold",
+        second_breach: -25.0,
+        netted_capacity: 7,
+    },
+];
+
+/// Keep a row's FIRST breach alive and wait for the ECS service's `desiredCount` to reach
+/// `expected`, answering what it last read.
+async fn await_first_action(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    row: &NettingRow,
+    expected: i64,
+) -> i64 {
+    let deadline = std::time::Instant::now() + CONTINUING_WAIT;
+    loop {
+        publish_breach_on(emulator, METRIC_NAME, row.first_breach, row.case).await;
+        let last = emulator.ecs_desired_count(cluster, service).await;
+        if last == expected || std::time::Instant::now() >= deadline {
+            return last;
+        }
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// Keep BOTH of a row's breaches alive and wait for the ECS service's `desiredCount` to leave
+/// `held`, answering what it last read.
+///
+/// `wait` is what the row is waiting FOR: a row that expects the netted remainder waits for the
+/// capacity to move at all, and a row that expects nothing watches for the whole span and
+/// answers the capacity it still finds.
+async fn await_action_inside_the_wait(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    row: &NettingRow,
+    held: i64,
+    wait: Duration,
+) -> i64 {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        publish_breach_on(emulator, METRIC_NAME, row.first_breach, row.case).await;
+        publish_breach_on(emulator, SECOND_METRIC_NAME, row.second_breach, row.case).await;
+        let last = emulator.ecs_desired_count(cluster, service).await;
+        if last != held || std::time::Instant::now() >= deadline {
+            return last;
+        }
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// Keep a row's SECOND breach alive and wait for its alarm to report `ALARM`, answering the
+/// state it last reported.
+///
+/// What a row that expects no movement needs pinned: the action was raised — the alarm that
+/// executes the policy is breaching — and the wait is what left the capacity where it was.
+async fn await_second_alarm_breaching(
+    emulator: &Emulator,
+    alarm_name: &str,
+    row: &NettingRow,
+) -> String {
+    let deadline = std::time::Instant::now() + CONTINUING_WAIT;
+    loop {
+        publish_breach_on(emulator, SECOND_METRIC_NAME, row.second_breach, row.case).await;
+        let (status, body) = emulator
+            .call_cloudwatch("DescribeAlarms", json!({"AlarmNames": [alarm_name]}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected DescribeAlarms to answer 200, got {status} {body:?}",
+            row.case
+        );
+        let state = body["MetricAlarms"][0]["StateValue"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if state == "ALARM" || std::time::Instant::now() >= deadline {
+            return state;
+        }
+        tokio::time::sleep(CONTINUING_POLL).await;
+    }
+}
+
+/// Stand a row up: the ECS service, the registered target, the policy both alarms execute and
+/// the two alarms, answering the target's `ResourceId` and the name of the alarm that fires
+/// second.
+async fn given_netting_row(
+    emulator: &Emulator,
+    cluster: &str,
+    service: &str,
+    row: &NettingRow,
+) -> (String, String) {
+    let case = row.case;
+    let resource_id = emulator
+        .given_ecs_service(cluster, service, row.starting)
+        .await;
+    register(emulator, &resource_id, row.min, row.max, case).await;
+    let policy_arn = put_step_policy(
+        emulator,
+        &resource_id,
+        "step-policy",
+        json!({
+            "AdjustmentType": row.adjustment_type,
+            "StepAdjustments": step_adjustments(row.steps),
+            "Cooldown": LONG_COOLDOWN_SECS,
+        }),
+        case,
+    )
+    .await;
+    let second_alarm = "second-alarm".to_string();
+    given_breaching_alarm_on(
+        emulator,
+        "first-alarm",
+        METRIC_NAME,
+        &policy_arn,
+        row.first_operator,
+        case,
+    )
+    .await;
+    given_breaching_alarm_on(
+        emulator,
+        &second_alarm,
+        SECOND_METRIC_NAME,
+        &policy_arn,
+        row.second_operator,
+        case,
+    )
+    .await;
+    (resource_id, second_alarm)
+}
+
+#[tokio::test]
+async fn an_action_inside_the_wait_applies_the_remainder_the_movement_in_flight_has_not_delivered()
+{
+    for row in NETTED_CATALOG {
+        let case = row.case;
+        let emulator = Emulator::empty();
+        let cluster = "netting";
+        let service = "web";
+        let (resource_id, _) = given_netting_row(&emulator, cluster, service, row).await;
+
+        let first = await_first_action(&emulator, cluster, service, row, row.first_capacity).await;
+        assert_eq!(
+            first, row.first_capacity,
+            "case {case:?}: expected the first breach to move the ECS desiredCount to {}, \
+             got {first:?}",
+            row.first_capacity
+        );
+
+        // The second alarm breaches while the wait for that movement is still running — the
+        // policy asked for 600 seconds of it — so what the capacity does next is what the
+        // action raised inside the wait did.
+        let netted = await_action_inside_the_wait(
+            &emulator,
+            cluster,
+            service,
+            row,
+            row.first_capacity,
+            CONTINUING_WAIT,
+        )
+        .await;
+        assert_eq!(
+            netted, row.netted_capacity,
+            "case {case:?}: expected the action raised inside the wait to move the ECS \
+             desiredCount to {}, got {netted:?}",
+            row.netted_capacity
+        );
+
+        // Two movements, in the order they happened: the wait suppressed neither, and the
+        // second one landed on the netted capacity rather than on top of the first.
+        let expected = vec![
+            format!("Setting desired count to {}.", row.first_capacity),
+            format!("Setting desired count to {}.", row.netted_capacity),
+        ];
+        let moved = movement_descriptions(&emulator, &resource_id, case).await;
+        assert_eq!(
+            moved, expected,
+            "case {case:?}: expected the first movement and the netted one, got {moved:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_action_inside_the_wait_the_movement_in_flight_covers_moves_no_capacity() {
+    for row in HELD_CATALOG {
+        let case = row.case;
+        let emulator = Emulator::empty();
+        let cluster = "held";
+        let service = "web";
+        let (resource_id, second_alarm) = given_netting_row(&emulator, cluster, service, row).await;
+
+        let first = await_first_action(&emulator, cluster, service, row, row.first_capacity).await;
+        assert_eq!(
+            first, row.first_capacity,
+            "case {case:?}: expected the first breach to move the ECS desiredCount to {}, \
+             got {first:?}",
+            row.first_capacity
+        );
+
+        // The second action really is raised: its alarm is in `ALARM`, which is what executes
+        // the policy as one of its actions.
+        let state = await_second_alarm_breaching(&emulator, &second_alarm, row).await;
+        assert_eq!(
+            state, "ALARM",
+            "case {case:?}: expected the second alarm to be breaching, got {state:?}"
+        );
+
+        // And the capacity stays where the first movement left it for the whole watch, which
+        // is several of the invocation cadences that alarm goes on invoking the policy at.
+        let held = await_action_inside_the_wait(
+            &emulator,
+            cluster,
+            service,
+            row,
+            row.first_capacity,
+            QUIET_WATCH,
+        )
+        .await;
+        assert_eq!(
+            held, row.netted_capacity,
+            "case {case:?}: expected the action raised inside the wait to leave the ECS \
+             desiredCount at {}, got {held:?}",
+            row.netted_capacity
+        );
+        let moved = movement_descriptions(&emulator, &resource_id, case).await;
+        assert_eq!(
+            moved,
+            vec![format!("Setting desired count to {}.", row.first_capacity)],
+            "case {case:?}: expected the one movement the wait has not elapsed since, \
+             got {moved:?}"
+        );
+    }
 }
