@@ -26,17 +26,20 @@
 //! copy writes, the tags a tagging task sets, the generated manifest and the
 //! completion report are Amazon S3 objects, written by Amazon S3's own
 //! operations over the in-process callback
-//! ([`smithy_server_runtime::OperationContext::callback`]) — so a client that
-//! waits for the job's terminal status and then reads those objects through
-//! Amazon S3 finds exactly what the job did, and nothing here opens a socket or
-//! leaves the host. The one caller-supplied value that reaches the client's
-//! authority is the signing Region, narrowed before it gets there
+//! ([`smithy_server_runtime::OperationContext::callback`]), and a task of a
+//! `LambdaInvoke` job is one `Invoke` of the named function over that same
+//! callback, whose answer is the task's own verdict
+//! ([`super::batch_job_lambda`]) — so a client that waits for the job's terminal
+//! status and then reads those objects through Amazon S3 finds exactly what the
+//! job did, and nothing here opens a socket or leaves the host. The one
+//! caller-supplied value that reaches the client's authority is the signing
+//! Region, narrowed before it gets there
 //! ([`service_common::arn::region_label`]).
 //!
-//! The store's guard is never held across a call to Amazon S3: the submitted job
-//! is read under it, the tasks are run with it released, and it is taken again to
-//! record what each task did. A job a caller cancelled while the run was under
-//! way is left as the cancellation left it.
+//! The store's guard is never held across a call to another service: the
+//! submitted job is read under it, the tasks are run with it released, and it is
+//! taken again to record what each task did. A job a caller cancelled while the
+//! run was under way is left as the cancellation left it.
 //!
 //! The work one job does is BOUNDED: at most [`MAX_JOB_TASKS`] tasks, over a
 //! manifest of at most that many rows or a source bucket listing of at most
@@ -50,6 +53,9 @@ use ::aws_smithy_runtime_api::client::result::SdkError;
 use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use ::smithy_server_runtime::EmbeddedEmulator;
 
+use super::batch_job_lambda::{
+    error_document_message, invocation_payload, opaque_token, task_result, RESULT_PERMANENT_FAILURE,
+};
 use super::batch_job_plan::{
     arn_bucket, arn_bucket_and_key, generated_manifest_csv, generated_manifest_format,
     inventory_manifest_json, job_prefix, parse_csv_manifest, prefixed_key, report_manifest_json,
@@ -63,8 +69,8 @@ use super::*;
 use super::batch_job_role::engine_assume_refusal;
 
 use crate::ops::types::{
-    JobManifestGenerator, S3CopyObjectOperation, S3GeneratedManifestDescriptor,
-    S3JobManifestGenerator,
+    JobManifestGenerator, LambdaInvokeOperation, S3CopyObjectOperation,
+    S3GeneratedManifestDescriptor, S3JobManifestGenerator,
 };
 
 /// How many objects of a source bucket a manifest GENERATOR enumerates before
@@ -192,6 +198,7 @@ async fn run<Eng: Send + Sync + 'static>(
     }
 
     let client = s3_client(callback, region);
+    let functions = lambda_client(callback, region);
     let action = match action_of(&submitted.operation) {
         Ok(action) => action,
         Err(reason) => return fail(&state, account_id, job_id, &reason),
@@ -220,8 +227,8 @@ async fn run<Eng: Send + Sync + 'static>(
     }
 
     let mut outcomes = Vec::with_capacity(listed.entries.len());
-    for entry in &listed.entries {
-        let outcome = run_task(&client, &action, entry).await;
+    for (at, entry) in listed.entries.iter().enumerate() {
+        let outcome = run_task(&client, &functions, &action, job_id, at as u64, entry).await;
         let mut store = state.lock();
         let Some(job) = store.job_mut(account_id, job_id) else {
             return;
@@ -398,12 +405,19 @@ struct Listed {
 /// The one action `operation` names, or the reason a job naming it cannot be
 /// run.
 ///
-/// The actions this emulator carries out are the ones that ARE a request to
-/// Amazon S3 about one object, which it makes through Amazon S3's own API. An
-/// action it does not carry out fails the job naming that action, rather than
-/// leaving a job reported as having run work nothing did.
+/// The actions this emulator carries out are the ones that ARE a request about
+/// one object to the service that owns the work — Amazon S3 for an action it
+/// performs on the object, Lambda for an invocation of the function the job
+/// names — which it makes through that service's own API. An action it does not
+/// carry out fails the job naming that action, rather than leaving a job
+/// reported as having run work nothing did.
 #[derive(Debug, Clone)]
 enum Action {
+    /// `LambdaInvoke`: "directs the specified job to invoke an Lambda function
+    /// on every object in the manifest", so every task of the job is one
+    /// invocation of this function and the function's answer is that task's
+    /// verdict.
+    Invoke(Box<LambdaInvokeOperation>),
     /// `S3PutObjectCopy`: "S3 Batch Operations passes every object to the
     /// underlying `CopyObject` API operation."
     Copy(Box<S3CopyObjectOperation>),
@@ -416,6 +430,9 @@ enum Action {
 
 /// See [`Action`].
 fn action_of(operation: &JobOperation) -> Result<Action, String> {
+    if let Some(invoke) = operation.lambda_invoke.as_ref() {
+        return Ok(Action::Invoke(Box::new(invoke.clone())));
+    }
     if let Some(copy) = operation.s3_put_object_copy.as_ref() {
         return Ok(Action::Copy(Box::new(copy.clone())));
     }
@@ -486,7 +503,7 @@ async fn manifest_entries(
         .map_err(|error| {
             format!(
                 "The manifest object could not be read: {}",
-                refused_by_s3(&error).message
+                refused_by_service(&error).message
             )
         })?;
     let body = answer
@@ -534,7 +551,7 @@ async fn generated_list(
             .map_err(|error| {
                 format!(
                     "The generator's source bucket could not be listed: {}",
-                    refused_by_s3(&error).message
+                    refused_by_service(&error).message
                 )
             })?;
         for object in page.contents() {
@@ -608,7 +625,7 @@ async fn generated_list(
                 .map_err(|error| {
                     format!(
                         "The generated manifest could not be written: {}",
-                        refused_by_s3(&error).message
+                        refused_by_service(&error).message
                     )
                 })?;
             // A manifest in this format is READ from its own `manifest.json`,
@@ -636,7 +653,7 @@ async fn generated_list(
                 .map_err(|error| {
                     format!(
                         "The generated manifest could not be written: {}",
-                        refused_by_s3(&error).message
+                        refused_by_service(&error).message
                     )
                 })?;
             Some(S3GeneratedManifestDescriptor {
@@ -654,13 +671,24 @@ async fn generated_list(
 }
 
 /// Carry out one task — the job's action against one object of its list —
-/// through Amazon S3's own API, and report what that answered.
+/// through the owning service's own API, and report what that answered.
+///
+/// `sequence` is the task's position in the job's object list, which is what
+/// keeps the identifiers an invocation mints apart.
 async fn run_task(
     client: &::aws_sdk_s3::Client,
+    functions: &::aws_sdk_lambda::Client,
     action: &Action,
+    job_id: &str,
+    sequence: u64,
     entry: &ManifestEntry,
 ) -> TaskOutcome {
     let refusal = match action {
+        // An invocation's outcome is the FUNCTION's verdict on the task, not a
+        // refusal of a request, so it is reported as it stands.
+        Action::Invoke(invoke) => {
+            return invoked(functions, invoke, job_id, sequence, entry).await
+        }
         Action::Copy(copy) => copy_object(client, copy, entry).await.err(),
         Action::PutTagging(tag_set) => match tagging(tag_set) {
             Some(tagging) => client
@@ -672,7 +700,7 @@ async fn run_task(
                 .send()
                 .await
                 .err()
-                .map(|error| refused_by_s3(&error)),
+                .map(|error| refused_by_service(&error)),
             None => Some(Refusal {
                 code: REQUEST_INVALID_CODE.to_string(),
                 status: Some(REQUEST_INVALID_STATUS),
@@ -688,7 +716,7 @@ async fn run_task(
             .send()
             .await
             .err()
-            .map(|error| refused_by_s3(&error)),
+            .map(|error| refused_by_service(&error)),
     };
     match refusal {
         None => TaskOutcome {
@@ -710,6 +738,101 @@ async fn run_task(
 
 /// The HTTP status a task Amazon S3 carried out was answered with.
 const TASK_SERVED_STATUS: u16 = 200;
+
+/// Invoke the job's function once for the object of one task, and report the
+/// verdict the function answered for it.
+///
+/// "Directs the specified job to invoke an Lambda function on every object in
+/// the manifest" (`JobOperation$LambdaInvoke`): the function is handed the
+/// invocation document the job's schema version declares
+/// ([`invocation_payload`]) and answers a `resultCode` for the task, which is
+/// what the job's `ProgressSummary` accounts the task by and what its completion
+/// report records. The invocation is SYNCHRONOUS, because the task's outcome is
+/// the function's answer.
+///
+/// A function that raised rather than answered, one whose answer reports no
+/// verdict for the task, and an invocation the function's own service refused
+/// are each a task that was not carried out — never one reported as carried out
+/// by a run that saw no verdict.
+async fn invoked(
+    functions: &::aws_sdk_lambda::Client,
+    invoke: &LambdaInvokeOperation,
+    job_id: &str,
+    sequence: u64,
+    entry: &ManifestEntry,
+) -> TaskOutcome {
+    let failed = |code: String, status: Option<u16>, message: String| TaskOutcome {
+        entry: entry.clone(),
+        status: TASK_FAILED,
+        error_code: code,
+        http_status: status,
+        message,
+    };
+    let Some(function) = invoke
+        .function_arn
+        .as_deref()
+        .filter(|function| !function.is_empty())
+    else {
+        return failed(
+            REQUEST_INVALID_CODE.to_string(),
+            Some(REQUEST_INVALID_STATUS),
+            "The job's LambdaInvoke names no FunctionArn to invoke.".to_string(),
+        );
+    };
+    // Both identifiers are this invocation's own, minted per task: the function
+    // echoes the task's back in the result that answers it, which is how the
+    // verdict is matched to the task.
+    let invocation_id = opaque_token(sequence);
+    let task_id = opaque_token(sequence);
+    let answer = match functions
+        .invoke()
+        .function_name(function)
+        .invocation_type(::aws_sdk_lambda::types::InvocationType::RequestResponse)
+        .payload(::aws_sdk_lambda::primitives::Blob::new(
+            invocation_payload(invoke, job_id, &invocation_id, &task_id, entry),
+        ))
+        .send()
+        .await
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            let refusal = refused_by_service(&error);
+            return failed(refusal.code, refusal.status, refusal.message);
+        }
+    };
+    let body = answer
+        .payload()
+        .map(|payload| payload.as_ref().to_vec())
+        .unwrap_or_default();
+    let status = u16::try_from(answer.status_code()).ok();
+    // "If present, indicates that an error occurred during function execution.
+    // Details about the error are included in the response payload"
+    // (`Invoke$FunctionError`): the function raised, so it answered no verdict
+    // and the task was not carried out.
+    if let Some(raised) = answer
+        .function_error()
+        .filter(|signal| !signal.is_empty())
+    {
+        return failed(raised.to_string(), status, error_document_message(&body));
+    }
+    match task_result(&task_id, &body) {
+        Ok(result) if result.succeeded() => TaskOutcome {
+            entry: entry.clone(),
+            status: TASK_SUCCEEDED,
+            error_code: String::new(),
+            http_status: status,
+            message: match result.message.is_empty() {
+                true => TASK_SUCCEEDED_MESSAGE.to_string(),
+                false => result.message,
+            },
+        },
+        Ok(result) => failed(result.code, status, result.message),
+        // An answer carrying no verdict for the task is one no further
+        // invocation would turn into one, which is what a permanent failure of
+        // the task is.
+        Err(reason) => failed(RESULT_PERMANENT_FAILURE.to_string(), status, reason),
+    }
+}
 
 /// Copy one object of the list into the job's target bucket, under the target
 /// key prefix: "S3 Batch Operations passes every object to the underlying
@@ -747,7 +870,7 @@ async fn copy_object(
         )
         .send()
         .await
-        .map_err(|error| refused_by_s3(&error))?;
+        .map_err(|error| refused_by_service(&error))?;
     Ok(())
 }
 
@@ -822,7 +945,7 @@ async fn write_completion_report(
         .map_err(|error| {
             format!(
                 "The job-completion report could not be written: {}",
-                refused_by_s3(&error).message
+                refused_by_service(&error).message
             )
         })?;
     // The report's `MD5Checksum` is the digest of the result file, which is
@@ -849,13 +972,14 @@ async fn write_completion_report(
         .map_err(|error| {
             format!(
                 "The job-completion report could not be written: {}",
-                refused_by_s3(&error).message
+                refused_by_service(&error).message
             )
         })?;
     Ok(())
 }
 
-/// How Amazon S3 refused one request, as the completion report accounts for it.
+/// How the service a task addressed refused its request, as the completion
+/// report accounts for it.
 #[derive(Debug, Clone)]
 struct Refusal {
     /// The error code the answer carried.
@@ -867,10 +991,11 @@ struct Refusal {
     message: String,
 }
 
-/// What an Amazon S3 answer refused a request with: its own code, status and
+/// What the answering service refused a request with: its own code, status and
 /// message, read off the answer rather than restated here — so a task's row in
-/// the completion report says what the object store said.
-fn refused_by_s3<E: ProvideErrorMetadata>(
+/// the completion report says what the object store, or the function's own
+/// service, said.
+fn refused_by_service<E: ProvideErrorMetadata>(
     error: &SdkError<E, ::aws_smithy_runtime_api::http::Response>,
 ) -> Refusal {
     Refusal {
@@ -890,7 +1015,7 @@ fn refused_by_s3<E: ProvideErrorMetadata>(
 const UNKNOWN_REFUSAL_CODE: &str = "InternalError";
 
 /// See [`UNKNOWN_REFUSAL_CODE`].
-const UNKNOWN_REFUSAL_MESSAGE: &str = "The task's request was not answered by Amazon S3.";
+const UNKNOWN_REFUSAL_MESSAGE: &str = "The task's request was not answered.";
 
 /// An Amazon S3 client over the in-process callback into this same emulator.
 fn s3_client(callback: &EmbeddedEmulator, region: &str) -> ::aws_sdk_s3::Client {
@@ -918,4 +1043,29 @@ fn s3_client(callback: &EmbeddedEmulator, region: &str) -> ::aws_sdk_s3::Client 
         )
         .build();
     ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// A Lambda client over the in-process callback into this same emulator, for the
+/// invocations a `LambdaInvoke` job's tasks are.
+///
+/// Configured exactly as [`s3_client`] is, and for the same reasons: the
+/// transport is in-process, so there is nothing to retry, time out or watch for
+/// a stalled stream, and the credentials the callback hands over only sign these
+/// in-process calls.
+fn lambda_client(callback: &EmbeddedEmulator, region: &str) -> ::aws_sdk_lambda::Client {
+    let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
+    let config = ::aws_sdk_lambda::Config::builder()
+        .behavior_version(::aws_sdk_lambda::config::BehaviorVersion::latest())
+        .http_client(callback.http_client())
+        .credentials_provider(callback.aws_credentials_provider())
+        .region(::aws_sdk_lambda::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://lambda.{region}.amazonaws.com"))
+        .retry_config(::aws_sdk_lambda::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_lambda::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_lambda::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_lambda::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_lambda::Client::from_conf(config)
 }

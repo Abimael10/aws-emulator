@@ -43,6 +43,10 @@ pub mod access_grants_listing;
 /// derivations the worker below runs over, held apart from it because they are
 /// pure functions of a manifest, a filter and a set of task outcomes.
 pub mod batch_job_plan;
+/// The Lambda side of a `LambdaInvoke` job: the payload one task is handed to
+/// the function, and the verdict the function's answer carries back — pure
+/// functions of a manifest row and the bytes a function answered.
+pub mod batch_job_lambda;
 /// Whether S3 Batch Operations can assume the role a job's tasks run as, read
 /// from the account's own IAM records.
 pub mod batch_job_role;
@@ -1007,24 +1011,44 @@ pub fn create_job_fingerprint(input: &CreateJobInput) -> String {
 /// modelled `AccessGrantsLocationId` / `AccessGrantId` (len 1..64, pattern
 /// `^[a-zA-Z0-9\-]+$`) admit too.
 ///
-/// The 128 bits come from three sources hashed together with SHA-256: the
-/// OS-seeded randomness a `RandomState` draws, the system clock in nanoseconds,
-/// and `sequence` — a counter the store hands out, so two creates in the same
-/// nanosecond cannot collide. This names a resource; a credential would come
-/// from the credential store instead, never from here.
+/// The 128 bits come from the one recipe every identifier this crate MINTS is
+/// rendered from ([`minted_digest`]). This names a resource; a credential would
+/// come from the credential store instead, never from here.
 fn new_resource_uuid(sequence: u64) -> String {
+    uuid_from_digest(&minted_digest("", sequence, minting_nanos()))
+}
+
+/// The 32 digest bytes an identifier this crate MINTS is rendered from: the
+/// OS-seeded randomness a `RandomState` draws, the system clock in `nanos`,
+/// `sequence` — a counter the caller hands out, so two values minted in the same
+/// nanosecond cannot collide — and `label`, so two identifiers minted for one
+/// event are independent of each other.
+///
+/// The one place that recipe lives, so every minted identifier here draws on the
+/// same sources and each caller only RENDERS it in its own form: a resource id
+/// as a UUID ([`new_resource_uuid`]), a refusal's correlation ids as hex
+/// ([`correlation_hex`]), and a batch job's invocation and task identifiers as
+/// base64 ([`batch_job_lambda::opaque_token`]). None of them is a credential:
+/// a credential comes from the credential store instead.
+fn minted_digest(label: &str, sequence: u64, nanos: u128) -> [u8; 32] {
     use sha2::Digest;
     use std::collections::hash_map::RandomState;
     use std::hash::BuildHasher;
 
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
     let mut hasher = sha2::Sha256::new();
+    hasher.update(label.as_bytes());
     hasher.update(RandomState::new().hash_one(sequence).to_le_bytes());
     hasher.update(nanos.to_le_bytes());
     hasher.update(sequence.to_le_bytes());
-    uuid_from_digest(&hasher.finalize())
+    hasher.finalize().into()
+}
+
+/// The system clock in nanoseconds, the time source [`minted_digest`] mixes in —
+/// read here by every caller that has no instant of its own to pass.
+fn minting_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos())
 }
 
 /// The first 16 bytes of `digest` as the text of a version-4 UUID: `8-4-4-4-12`
@@ -4462,21 +4486,10 @@ pub fn new_error_correlation() -> (String, String) {
 }
 
 /// The hex digest one correlation id of [`new_error_correlation`] is rendered
-/// from: the OS-seeded randomness a `RandomState` draws, the system clock in
-/// nanoseconds, a counter so two responses in the same nanosecond cannot
-/// collide, and `label` so the two ids of one response are independent of each
-/// other.
+/// from — the one minting recipe ([`minted_digest`]), with `label` keeping the
+/// two ids of one response independent of each other.
 fn correlation_hex(label: &str, sequence: u64, nanos: u128) -> String {
-    use sha2::Digest;
-    use std::collections::hash_map::RandomState;
-    use std::hash::BuildHasher;
-
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(label.as_bytes());
-    hasher.update(RandomState::new().hash_one(sequence).to_le_bytes());
-    hasher.update(nanos.to_le_bytes());
-    hasher.update(sequence.to_le_bytes());
-    hex::encode(hasher.finalize())
+    hex::encode(minted_digest(label, sequence, nanos))
 }
 
 // The refusals the S3 Access Grants instance lifecycle shares.

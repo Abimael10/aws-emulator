@@ -73,6 +73,12 @@ pub const BOUND_OPERATIONS: &[&str] = &[
     "CopyObject",
     "DeleteObject",
     "ListObjectsV2",
+    // An object's own TAG SET, which is a subresource of the object rather than of its
+    // bytes: what a handler that classifies or marks the objects it is handed reads,
+    // replaces and removes.
+    "GetObjectTagging",
+    "PutObjectTagging",
+    "DeleteObjectTagging",
     // The bucket-wide half ([`bucket`]): what a handler administering a bucket calls —
     // probing whether the bucket is there and usable, listing the account's buckets,
     // reading and replacing the bucket's own notification and tagging subresources, listing
@@ -111,6 +117,9 @@ pub async fn call(
         "PutObject" => put_object(&client, &input, &observed).await,
         "CopyObject" => copy_object(&client, &input, &observed).await,
         "DeleteObject" => delete_object(&client, &input, &observed).await,
+        "GetObjectTagging" => get_object_tagging(&client, &input, &observed).await,
+        "PutObjectTagging" => put_object_tagging(&client, &input, &observed).await,
+        "DeleteObjectTagging" => delete_object_tagging(&client, &input, &observed).await,
         "ListObjectsV2" => list_objects_v2(&client, &input, &observed).await,
         "HeadBucket" => bucket::head_bucket(&client, &input, &observed).await,
         "ListBuckets" => bucket::list_buckets(&client, &input, &observed).await,
@@ -576,6 +585,137 @@ async fn delete_object(
     }
     insert_text(&mut document, "VersionId", deleted.version_id());
     observed.answer(document, Vec::new())
+}
+
+/// `GetObjectTagging`: the tag set the addressed version of the object carries.
+async fn get_object_tagging(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["Bucket", "Key", "VersionId", "ExpectedBucketOwner"])?;
+    let sent = client
+        .get_object_tagging()
+        .bucket(input.required_text("Bucket")?)
+        .key(input.required_text("Key")?)
+        .set_version_id(input.text("VersionId")?)
+        .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
+        .send()
+        .await;
+    let read = match sent {
+        Ok(read) => read,
+        Err(error) => return refused(&error, observed),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "VersionId", read.version_id());
+    // `TagSet` is a required output member, so it is reported whether or not the object
+    // carries any tags (`GetObjectTaggingOutput$TagSet`).
+    document.insert("TagSet".to_string(), tag_set_document(read.tag_set()));
+    observed.answer(document, Vec::new())
+}
+
+/// `PutObjectTagging`: the whole tag set, replacing what the object carried before.
+async fn put_object_tagging(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&[
+        "Bucket",
+        "Key",
+        "VersionId",
+        "Tagging",
+        "ExpectedBucketOwner",
+    ])?;
+    let sent = client
+        .put_object_tagging()
+        .bucket(input.required_text("Bucket")?)
+        .key(input.required_text("Key")?)
+        .set_version_id(input.text("VersionId")?)
+        .tagging(read_tagging(input)?)
+        .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
+        .send()
+        .await;
+    let written = match sent {
+        Ok(written) => written,
+        Err(error) => return refused(&error, observed),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "VersionId", written.version_id());
+    observed.answer(document, Vec::new())
+}
+
+/// `DeleteObjectTagging`: the whole tag set removed from the addressed version.
+async fn delete_object_tagging(
+    client: &Client,
+    input: &Input,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    input.only(&["Bucket", "Key", "VersionId", "ExpectedBucketOwner"])?;
+    let sent = client
+        .delete_object_tagging()
+        .bucket(input.required_text("Bucket")?)
+        .key(input.required_text("Key")?)
+        .set_version_id(input.text("VersionId")?)
+        .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
+        .send()
+        .await;
+    let removed = match sent {
+        Ok(removed) => removed,
+        Err(error) => return refused(&error, observed),
+    };
+    let mut document = Map::new();
+    insert_text(&mut document, "VersionId", removed.version_id());
+    observed.answer(document, Vec::new())
+}
+
+/// The `Tagging` document a tag-set write carries, read off the input the handler passed.
+///
+/// `TagSet` is required on the container (`smithy_query(query="shape",shape="Tagging")`), so
+/// a container carrying none of it stops the call rather than replacing the tag set it writes
+/// with nothing. Shared by the object's tag set and the bucket's, which carry the same
+/// document.
+fn read_tagging(input: &Input) -> Result<::aws_sdk_s3::types::Tagging, Refusal> {
+    let tagging = input.required_structure("Tagging")?;
+    tagging.only(&["TagSet"])?;
+    let mut tags = Vec::new();
+    for tag in tagging.required_structures("TagSet")? {
+        tag.only(&["Key", "Value"])?;
+        tags.push(
+            ::aws_sdk_s3::types::Tag::builder()
+                .key(tag.required_text("Key")?)
+                .value(tag.required_text("Value")?)
+                .build()
+                .map_err(not_made)?,
+        );
+    }
+    ::aws_sdk_s3::types::Tagging::builder()
+        .set_tag_set(Some(tags))
+        .build()
+        .map_err(not_made)
+}
+
+/// A container the handler's document could not be read into is a call that was NOT MADE,
+/// carrying what the client said was missing.
+fn not_made<E: ::std::fmt::Display>(error: E) -> Refusal {
+    Refusal::NotMade(format!(
+        "this Amazon S3 call could not be built from the parameters it was given: {error}"
+    ))
+}
+
+/// One tag set as the answer's `TagSet` member reports it.
+fn tag_set_document(tag_set: &[::aws_sdk_s3::types::Tag]) -> Value {
+    Value::Array(
+        tag_set
+            .iter()
+            .map(|tag| {
+                let mut entry = Map::new();
+                entry.insert("Key".to_string(), Value::String(tag.key().to_string()));
+                entry.insert("Value".to_string(), Value::String(tag.value().to_string()));
+                Value::Object(entry)
+            })
+            .collect(),
+    )
 }
 
 /// `ListObjectsV2`: one page of the bucket's current objects.

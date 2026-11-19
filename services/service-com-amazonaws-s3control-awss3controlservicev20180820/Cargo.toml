@@ -53,6 +53,12 @@ hex = { workspace = true }
 # the in-process callback (`OperationContext::callback`). Only the generated
 # client is needed; the emulator supplies the transport.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# `aws-sdk-lambda`: a task of an S3 Batch Operations `LambdaInvoke` job IS one
+# synchronous `Invoke` of the function the job names, made over the same
+# in-process callback as its Amazon S3 tasks, and the `resultCode` the function
+# answers is what the job's `ProgressSummary` accounts that task by. Only the
+# generated client is needed; the emulator supplies the transport.
+aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # Reads and writes the CSV a batch job's manifest and its completion report are
 # written in, as CSV defines quoting, embedded separators and embedded
 # newlines — a manifest is caller-supplied input.

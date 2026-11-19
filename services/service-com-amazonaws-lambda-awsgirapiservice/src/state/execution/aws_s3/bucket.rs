@@ -26,14 +26,14 @@ use ::serde_json::{Map, Value};
 use ::aws_sdk_s3::types::{
     Delete, Event, EventBridgeConfiguration, FilterRule, FilterRuleName, LambdaFunctionConfiguration,
     NotificationConfiguration, NotificationConfigurationFilter, ObjectIdentifier, Owner,
-    QueueConfiguration, S3KeyFilter, Tag, Tagging, TopicConfiguration,
+    QueueConfiguration, S3KeyFilter, TopicConfiguration,
 };
 use ::aws_sdk_s3::Client;
 
 use super::super::aws_api::{Answer, Refusal};
 use super::{
-    insert_flag, insert_number, insert_text, insert_timestamp, refused,
-    refused_without_a_document, Input, Observed,
+    insert_flag, insert_number, insert_text, insert_timestamp, not_made, read_tagging, refused,
+    refused_without_a_document, tag_set_document, Input, Observed,
 };
 
 /// `HeadBucket`: whether the bucket is there and whether this identity may use it.
@@ -261,22 +261,9 @@ pub(super) async fn get_bucket_tagging(
         Err(error) => return refused(&error, observed),
     };
     let mut document = Map::new();
-    // `TagSet` is a required output member, so it is reported whether or not it holds
-    // anything (`GetBucketTaggingOutput$TagSet`).
-    document.insert(
-        "TagSet".to_string(),
-        Value::Array(
-            read.tag_set()
-                .iter()
-                .map(|tag| {
-                    let mut entry = Map::new();
-                    entry.insert("Key".to_string(), Value::String(tag.key().to_string()));
-                    entry.insert("Value".to_string(), Value::String(tag.value().to_string()));
-                    Value::Object(entry)
-                })
-                .collect(),
-        ),
-    );
+    // `TagSet` is a required output member, so it is reported whether or not the bucket
+    // carries any tags (`GetBucketTaggingOutput$TagSet`).
+    document.insert("TagSet".to_string(), tag_set_document(read.tag_set()));
     observed.answer(document, Vec::new())
 }
 
@@ -287,31 +274,10 @@ pub(super) async fn put_bucket_tagging(
     observed: &Observed,
 ) -> Result<Answer, Refusal> {
     input.only(&["Bucket", "Tagging", "ExpectedBucketOwner"])?;
-    let tagging = input.required_structure("Tagging")?;
-    tagging.only(&["TagSet"])?;
-    let mut tags = Vec::new();
-    // `TagSet` is required on the container (`smithy_query(query="shape",shape="Tagging")`),
-    // so a container carrying none of it stops the call rather than replacing the bucket's
-    // tag set with nothing.
-    for tag in tagging.required_structures("TagSet")? {
-        tag.only(&["Key", "Value"])?;
-        tags.push(
-            Tag::builder()
-                .key(tag.required_text("Key")?)
-                .value(tag.required_text("Value")?)
-                .build()
-                .map_err(not_made)?,
-        );
-    }
     let sent = client
         .put_bucket_tagging()
         .bucket(input.required_text("Bucket")?)
-        .tagging(
-            Tagging::builder()
-                .set_tag_set(Some(tags))
-                .build()
-                .map_err(not_made)?,
-        )
+        .tagging(read_tagging(input)?)
         .set_expected_bucket_owner(input.text("ExpectedBucketOwner")?)
         .send()
         .await;
@@ -712,12 +678,4 @@ fn insert_owner(entry: &mut Map<String, Value>, owner: Option<&Owner>) {
     insert_text(&mut carried, "ID", owner.id());
     insert_text(&mut carried, "DisplayName", owner.display_name());
     entry.insert("Owner".to_string(), Value::Object(carried));
-}
-
-/// A container the handler's document could not be read into is a call that was NOT MADE,
-/// carrying what the client said was missing.
-fn not_made<E: ::std::fmt::Display>(error: E) -> Refusal {
-    Refusal::NotMade(format!(
-        "this Amazon S3 call could not be built from the parameters it was given: {error}"
-    ))
 }
