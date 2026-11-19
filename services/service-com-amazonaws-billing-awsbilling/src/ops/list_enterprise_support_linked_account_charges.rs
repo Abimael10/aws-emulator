@@ -107,7 +107,8 @@ use super::types::*;
 // (`crate::state::MINOR_UNITS_PER_UNIT`) and periods in whole seconds past the
 // epoch.
 use crate::state::{
-    amount, covered_seconds, month_index, month_period, parse_month, prorate, SupportEligibleSpend,
+    amount, covered_seconds, month_period, prorate, require_past_billing_month,
+    BillingMonthRefusal, SupportEligibleSpend,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -358,17 +359,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
         let payer_account_id = state.billing_family_management_account_id.clone();
 
-        let requested = parse_month(&input.billing_month)
-            .ok_or_else(|| invalid_field("billingMonth", "must name a calendar month"))?;
-        let current = crate::state::billing_period(::std::time::SystemTime::now())
-            .ok_or_else(|| unavailable("the current billing month"))?;
         // The `EnterpriseSupportBillingMonth` doc: "This must be a month in the
-        // past." The current month's billing period has not closed and a later
-        // one has not begun, so neither has a Support charge to break down and
-        // both are refused rather than answered with an empty month.
-        if month_index(requested) >= month_index(current) {
-            return Err(invalid_field("billingMonth", "must be a month in the past"));
-        }
+        // past." The gate lives in `crate::state`, where every read of the
+        // Enterprise Support profile applies it, so the months this report
+        // answers cannot drift from the months its siblings answer; what is
+        // this operation's own is only the modeled exception the shared
+        // decision is answered in.
+        require_past_billing_month(&input.billing_month, ::std::time::SystemTime::now()).map_err(
+            |refusal| match refusal {
+                BillingMonthRefusal::InvalidField { member, constraint } => {
+                    invalid_field(member, constraint)
+                }
+                BillingMonthRefusal::Unavailable { what } => unavailable(what),
+            },
+        )?;
         let (period_start, period_end) = month_period(&input.billing_month)
             .ok_or_else(|| unavailable("the requested billing period"))?;
         let (period_start_secs, period_end_secs) = (period_start.secs(), period_end.secs());

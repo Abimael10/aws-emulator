@@ -33,10 +33,23 @@
 //!    record, read when the decision is made, so one router answers differently
 //!    as that record changes.
 //!
+//! 4. Every read that takes a billing month places it against the month the
+//!    clock is in through ONE shared decision, so the reads that gate on that
+//!    placement cannot drift apart on which months they refuse or on the
+//!    sentence they refuse them with. The rows span the three reads of the
+//!    Enterprise Support profile crossed with months on both sides of the
+//!    clock's own — the current month, months after it and months before it —
+//!    and the Business Support read, whose own doc admits the current month, is
+//!    the control that the shared placement is a placement and not one
+//!    operation's gate.
+//!
 //! The harness (`call`, `error_code`, …) is the one `billing_views.rs` owns.
+
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_billing_awsbilling::ops::types::BILLING_VIEW_TYPE_VALUES;
+use service_com_amazonaws_billing_awsbilling::state::{billing_period, month_index};
 use service_com_amazonaws_billing_awsbilling::ComAmazonawsBillingAwsbillingState;
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
@@ -568,6 +581,203 @@ async fn the_view_lifecycle_writers_keep_their_own_wording() {
             disassociate,
             "case {case:?}: this writer words its own refusal, got {:?}",
             message(&body)
+        );
+    }
+}
+
+/// The request member every read of this service takes a billing month in.
+const BILLING_MONTH_MEMBER: &str = "billingMonth";
+
+/// The three reads of the Enterprise Support profile, each of which takes a
+/// modeled `EnterpriseSupportBillingMonth`: "The billing month in YYYY-MM
+/// format. This must be a month in the past."
+///
+/// Source: the `billingMonth` member of each operation's input, as
+/// `smithy_query(query="operation", operation="GetEnterpriseSupportCharge\
+/// Summary,GetEnterpriseSupportContractDetails,ListEnterpriseSupportLinked\
+/// AccountCharges")` reports it.
+const ENTERPRISE_SUPPORT_READS: &[&str] = &[
+    "GetEnterpriseSupportChargeSummary",
+    "GetEnterpriseSupportContractDetails",
+    "ListEnterpriseSupportLinkedAccountCharges",
+];
+
+/// The read whose `BusinessSupportBillingMonth` admits one month more: "You can
+/// request the current month (charges will be estimated) or a past month
+/// (charges will be finalized)."
+const BUSINESS_SUPPORT_READ: &str = "ListBusinessSupportAccountCharges";
+
+/// The constraint a month that is not in the past breaks, and the one a month
+/// that has not begun breaks: each continues the sentence the member name
+/// starts.
+const NOT_PAST_CONSTRAINT: &str = "must be a month in the past";
+const NOT_CURRENT_OR_EARLIER_CONSTRAINT: &str =
+    "must be the current billing month or an earlier one";
+
+/// The whole message a refused billing month serializes for `constraint`.
+fn month_refusal_message(constraint: &str) -> String {
+    format!(
+        "InvalidArgument: {BILLING_MONTH_MEMBER} \
+         (DetailedCode={BILLING_MONTH_MEMBER} {constraint})"
+    )
+}
+
+/// The one `ValidationExceptionField` a refused billing month reports: the
+/// member it names and that member's own sentence.
+fn refused_field(body: &Value) -> (Option<&str>, Option<&str>) {
+    (
+        body["fieldList"][0]["name"].as_str(),
+        body["fieldList"][0]["message"].as_str(),
+    )
+}
+
+/// The billing month `offset` whole calendar months from the one the clock is
+/// in, in the modeled `YYYY-MM` form — built from the service's own reading of
+/// the clock (`state::billing_period`) and its own month arithmetic
+/// (`state::month_index`), so a row names a month relative to today's rather
+/// than a month one recording happened in.
+fn month_from_now(offset: i32) -> String {
+    let current = billing_period(SystemTime::now()).expect("the clock names a billing month");
+    let index = month_index(current) + offset;
+    format!("{:04}-{:02}", index.div_euclid(12), index.rem_euclid(12) + 1)
+}
+
+/// Ask `operation` for one billing month.
+async fn for_month(router: &MultiServiceRouter, operation: &str, month: &str) -> (u16, Value) {
+    call(router, operation, &json!({ "billingMonth": month })).await
+}
+
+#[tokio::test]
+async fn every_enterprise_support_read_refuses_the_same_months_in_the_same_words() {
+    let (router, _engine) = standalone_emulator_with_engine();
+    let field_sentence = format!("Member {NOT_PAST_CONSTRAINT}");
+
+    // The months the modeled "a month in the past" excludes: the one the clock
+    // is in, the one after it, one later in the same year and one past the turn
+    // of the year — so the gate is shown to be about where a month sits, not
+    // about one month's digits.
+    for offset in [0_i32, 1, 2, 13, 121] {
+        let month = month_from_now(offset);
+        let mut answers: Vec<(u16, String, String)> = Vec::new();
+        for operation in ENTERPRISE_SUPPORT_READS {
+            let case = format!("{operation} on {month}, {offset} months from now");
+            let (status, body) = for_month(&router, operation, &month).await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: expected 400 ValidationException, got {status} {body:?}"
+            );
+            assert_eq!(
+                message(&body),
+                month_refusal_message(NOT_PAST_CONSTRAINT),
+                "case {case:?}: expected the shared past-month sentence, got {:?}",
+                message(&body)
+            );
+            assert_eq!(
+                refused_field(&body),
+                (Some(BILLING_MONTH_MEMBER), Some(field_sentence.as_str())),
+                "case {case:?}: expected the refusal to name the member and its constraint, \
+                 got {body:?}"
+            );
+            answers.push((status, error_code(&body), message(&body)));
+        }
+        // One rule decided once: the three reads answer the same month
+        // identically, so none of them can drift from the others.
+        assert!(
+            answers.windows(2).all(|pair| pair[0] == pair[1]),
+            "case {month:?}: expected one answer from every Enterprise Support read, \
+             got {answers:?}"
+        );
+    }
+
+    // ...and the months on the other side of the clock's own are answered by
+    // all three, so the gate refuses a CLASS of months rather than every month.
+    for offset in [-1_i32, -2, -13, -121] {
+        let month = month_from_now(offset);
+        for operation in ENTERPRISE_SUPPORT_READS {
+            let case = format!("{operation} on {month}, {offset} months from now");
+            let (status, body) = for_month(&router, operation, &month).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected a closed month to be answered, got {status} {body:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_business_support_read_gates_the_same_placement_by_its_own_doc() {
+    let (router, _engine) = standalone_emulator_with_engine();
+
+    // The placement is shared; what each operation's doc admits of it is not.
+    // This read admits the current month, and whether the month's charges are
+    // estimated is that same placement — so the current month is answered here
+    // and refused by the three reads above.
+    let current = month_from_now(0);
+    let (status, body) = for_month(&router, BUSINESS_SUPPORT_READ, &current).await;
+    assert_eq!(
+        status, 200,
+        "case \"the current month\": expected HTTP 200 for {current}, got {status} {body:?}"
+    );
+    // Guard against the calendar turning over mid-test: the month asked for is
+    // only the current one while it still is.
+    if month_from_now(0) == current {
+        assert_eq!(
+            body["isEstimated"].as_bool(),
+            Some(true),
+            "case \"the current month\": expected the open month's charges estimated, \
+             got {body:?}"
+        );
+        for operation in ENTERPRISE_SUPPORT_READS {
+            let case = format!("{operation} on the current month");
+            let (status, refused) = for_month(&router, operation, &current).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: expected the open month refused, got {status} {refused:?}"
+            );
+        }
+    }
+
+    // A closed month is finalized by the same placement.
+    for offset in [-1_i32, -12] {
+        let month = month_from_now(offset);
+        let case = format!("{offset} months from now");
+        let (status, body) = for_month(&router, BUSINESS_SUPPORT_READ, &month).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 for {month}, got {status} {body:?}"
+        );
+        assert_eq!(
+            body["isEstimated"].as_bool(),
+            Some(false),
+            "case {case:?}: expected a closed month's charges finalized, got {body:?}"
+        );
+    }
+
+    // A month that has not begun is neither, and it is refused in THIS
+    // operation's words rather than the Enterprise reads'.
+    let field_sentence = format!("Member {NOT_CURRENT_OR_EARLIER_CONSTRAINT}");
+    for offset in [1_i32, 2, 13, 121] {
+        let month = month_from_now(offset);
+        let case = format!("{offset} months from now");
+        let (status, body) = for_month(&router, BUSINESS_SUPPORT_READ, &month).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException for {month}, got {status} {body:?}"
+        );
+        assert_eq!(
+            message(&body),
+            month_refusal_message(NOT_CURRENT_OR_EARLIER_CONSTRAINT),
+            "case {case:?}: expected this read's own sentence, got {:?}",
+            message(&body)
+        );
+        assert_eq!(
+            refused_field(&body),
+            (Some(BILLING_MONTH_MEMBER), Some(field_sentence.as_str())),
+            "case {case:?}: expected the refusal to name the member and its constraint, \
+             got {body:?}"
         );
     }
 }

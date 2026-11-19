@@ -3,11 +3,13 @@
 //! The `YYYY-MM` billing-month arithmetic this service's monthly charge
 //! reports share.
 //!
-//! Both `ListBusinessSupportAccountCharges` and
-//! `GetEnterpriseSupportChargeSummary` take a modeled billing month
-//! (`^\d{4}-(0[1-9]|1[0-2])$`), compare it with the month the clock is in and
-//! report the UTC period its charges accrued in, so that reading of a month
-//! lives here rather than beside either handler.
+//! Every charge report of this service takes a modeled billing month
+//! (`^\d{4}-(0[1-9]|1[0-2])$`), compares it with the month the clock is in and
+//! reports the UTC period its charges accrued in, so that reading of a month —
+//! the parse, the clock's month and the comparison of the two
+//! ([`requested_month`]), and the past-month gate the Enterprise Support reads
+//! apply to it ([`require_past_billing_month`]) — lives here rather than beside
+//! each handler.
 //!
 //! The same civil-calendar arithmetic answers how wide "one calendar month" is
 //! from a given instant ([`one_calendar_month_after`]), which is the bound
@@ -132,6 +134,87 @@ pub fn one_calendar_month_after(at: &::aws_smithy_types::DateTime) -> Option<f64
     // The month addition keeps the time of day, so one calendar month on falls
     // on the start's own second and its own fraction of a second.
     Some(one_month_on.timestamp() as f64 + f64::from(at.subsec_nanos()) / NANOS_PER_SECOND)
+}
+
+/// The request member every read of this service takes a billing month in.
+pub const BILLING_MONTH_MEMBER: &str = "billingMonth";
+
+/// Why a requested billing month is not one the operation that took it reports
+/// charges for.
+///
+/// The DECISION is shared, the exception is not: each handler turns one of
+/// these into the modeled error its own operation declares, so one rule reaches
+/// the wire in one wording from every read that applies it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BillingMonthRefusal {
+    /// The request member `member` broke `constraint`, which continues the
+    /// sentence the member name starts — a request to refuse as invalid.
+    InvalidField {
+        member: &'static str,
+        constraint: &'static str,
+    },
+    /// `what` could not be read, which is a failure of this emulator rather
+    /// than of the request.
+    Unavailable { what: &'static str },
+}
+
+/// Where a requested billing month sits relative to the month the clock is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedMonth {
+    /// A month whose billing period has closed, so its charges are finalized.
+    Past,
+    /// The month the clock is in, whose billing period has not closed.
+    Current,
+    /// A month that has not begun.
+    Future,
+}
+
+/// Place a requested modeled `YYYY-MM` billing month against the month the
+/// clock is in at `at`.
+///
+/// Every operation that takes a billing month decides what it answers for one
+/// from this single placement — parse the value, read the clock's month,
+/// compare the two — so no handler re-derives the calendar and two reads cannot
+/// drift apart on which months they answer.
+pub fn requested_month(
+    billing_month: &str,
+    at: ::std::time::SystemTime,
+) -> Result<RequestedMonth, BillingMonthRefusal> {
+    let requested = parse_month(billing_month).ok_or(BillingMonthRefusal::InvalidField {
+        member: BILLING_MONTH_MEMBER,
+        constraint: "must name a calendar month",
+    })?;
+    let current = super::billing_period(at).ok_or(BillingMonthRefusal::Unavailable {
+        what: "the current billing month",
+    })?;
+    Ok(match month_index(requested).cmp(&month_index(current)) {
+        ::std::cmp::Ordering::Less => RequestedMonth::Past,
+        ::std::cmp::Ordering::Equal => RequestedMonth::Current,
+        ::std::cmp::Ordering::Greater => RequestedMonth::Future,
+    })
+}
+
+/// The gate the modeled `EnterpriseSupportBillingMonth` states: "This must be a
+/// month in the past."
+///
+/// The current month's billing period has not closed and a later one has not
+/// begun, so neither has an Enterprise Support charge to report and both are
+/// refused rather than answered with an empty month. Every read of the
+/// Enterprise Support profile applies the gate through here — the way those
+/// same reads decide their payer-account boundary through
+/// [`super::enterprise_support_read_refusal`] — so all of them refuse the same
+/// months, naming the same member and the same constraint.
+pub fn require_past_billing_month(
+    billing_month: &str,
+    at: ::std::time::SystemTime,
+) -> Result<(), BillingMonthRefusal> {
+    if requested_month(billing_month, at)? == RequestedMonth::Past {
+        return Ok(());
+    }
+    Err(BillingMonthRefusal::InvalidField {
+        member: BILLING_MONTH_MEMBER,
+        constraint: "must be a month in the past",
+    })
 }
 
 /// The half-open UTC period a billing month's charges accrue in: the first
