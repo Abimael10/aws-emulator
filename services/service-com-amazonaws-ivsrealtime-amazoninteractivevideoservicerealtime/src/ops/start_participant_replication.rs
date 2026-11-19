@@ -252,11 +252,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The participant has to be one of the SOURCE stage's, and it has to be a
         // publisher: this operation replicates "a publishing participant" (the model's
-        // own doc for it). A source stage that is publishing nothing under this id —
-        // because it holds no such participant, or holds one with no publish capability —
-        // has nothing to replicate YET, which is a state conflict about what that stage is
-        // doing rather than a lookup that failed: the modelled `ConflictException`
-        // (HTTP 409), stated in the words this service words that class with
+        // own doc for it). A participant of a stage is whatever that stage's own records
+        // hold — a participant of one of its sessions, including a replica another
+        // replication put there, as well as an identity this service issued against it —
+        // so the publisher is resolved through the one answer to "does this stage have
+        // this participant, and what is it doing there"
+        // (`crate::state::attached_participant`), the same relation the readers of that
+        // stage (`ListParticipants`, `GetParticipant`) report and the sibling mutator
+        // `DisconnectParticipant` acts on.
+        //
+        // A source stage that is publishing nothing under this id — because it holds no
+        // such participant, or holds one that is not publishing there — has nothing to
+        // replicate YET, which is a state conflict about what that stage is doing rather
+        // than a lookup that failed: the modelled `ConflictException` (HTTP 409), stated
+        // in the words this service words that class with
         // (`crate::state::participant_not_publishing_message`). The two stages the
         // request names are resolved above, and a missing one of those IS the modelled
         // not-found.
@@ -266,9 +275,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::participant_not_publishing_message(&input.participant_id),
             )
         };
-        let Some(participant) =
-            crate::state::stage_participant(&store, &input.source_stage_arn, &input.participant_id)
-        else {
+        let Some(participant) = crate::state::attached_participant(
+            &store,
+            &input.source_stage_arn,
+            &input.participant_id,
+        ) else {
             return Err(not_publishing());
         };
         if !participant.publishes {

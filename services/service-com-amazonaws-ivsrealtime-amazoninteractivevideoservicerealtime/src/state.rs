@@ -3684,9 +3684,10 @@ pub struct StageParticipant {
 /// stage, and may it publish there" — the capability a request to publish on its behalf
 /// turns on, and the name and attributes such a request carries over.
 ///
-/// This is NOT the question "is this participant in this stage": a stage holds whatever
-/// participant records its sessions hold, including one whose identity was issued against
-/// another stage, which is [`participant_attached_to_stage`].
+/// This is NOT the question "is this participant in this stage, and what is it doing
+/// there": a stage holds whatever participant records its sessions hold, including one
+/// whose identity was issued against another stage, which is [`attached_participant`] and
+/// its existence half [`participant_attached_to_stage`].
 pub fn stage_participant(
     state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     stage_arn: &str,
@@ -3730,36 +3731,98 @@ pub fn stage_participant(
         })
 }
 
+/// What the SESSIONS of the stage `stage_arn` hold for `participant_id` — the record a
+/// session of that stage joined for it, whatever put it there — or `None` when no session
+/// of that stage holds one.
+///
+/// A record is a participant of the stage in its own right, with no identity this service
+/// issued against that stage behind it: a replica a replication put into its destination
+/// stage carries an id issued against the SOURCE stage ([`record_replicated_participant`]),
+/// and it is the record that then says what that participant is named, what attributes it
+/// carries, and whether it is publishing in this stage — the "currently is publishing"
+/// question read off the session's own occurrences ([`StageSessionRecord::is_publishing`]),
+/// never [`ParticipantRecord::published`], which only says it ever did.
+///
+/// A publishing record is the one answered when a stage holds several, and otherwise the
+/// newest, so a participant that has been in a stage more than once is described by the
+/// record that is live there.
+fn recorded_stage_participant(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    participant_id: &str,
+) -> Option<StageParticipant> {
+    let mut held: Option<StageParticipant> = None;
+    for session in state.stage_sessions.get(stage_arn)?.iter() {
+        let Some(record) = session
+            .participants
+            .iter()
+            .find(|participant| participant.participant_id == participant_id)
+        else {
+            continue;
+        };
+        let publishes =
+            record.state == PARTICIPANT_STATE_CONNECTED && session.is_publishing(participant_id);
+        let view = StageParticipant {
+            publishes,
+            user_id: record.user_id.clone(),
+            attributes: record.attributes.clone(),
+        };
+        if publishes {
+            return Some(view);
+        }
+        // The sessions of a stage are held in the order they began, so the last record
+        // found is the newest one.
+        held = Some(view);
+    }
+    held
+}
+
+/// The participant `participant_id` the stage `stage_arn` HAS, as an operation acting on a
+/// participant of that stage needs it: whether it publishes there, and the name and
+/// attributes it carries.
+///
+/// A stage has the participants its own records hold — every participant record in a
+/// session of that stage, whatever opened it and whatever state it is now in
+/// ([`recorded_stage_participant`]) — together with the identities this service issued
+/// against the stage ([`stage_participant`]), which a holder can present to the stage
+/// whether or not it has joined yet. So it publishes there when the identity it holds
+/// carries [`PUBLISH_CAPABILITY`] (or is an ingest credential, which exists to broadcast)
+/// or when the record the stage holds for it is publishing media in that stage right now;
+/// what it is NAMED is the identity's where this service issued one, and the record's
+/// otherwise, which is all a replica of another stage's publisher has.
+///
+/// The ONE answer to "does this stage have this participant, and what is it doing there",
+/// so an operation that acts on a participant of a stage and the readers that report that
+/// stage's participants (`ListParticipants`, `GetParticipant`) cannot disagree about which
+/// participants the stage has. `None` for a stage this store holds nothing of, and for a
+/// participant whose records and identities all belong to other stages.
+pub fn attached_participant(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    stage_arn: &str,
+    participant_id: &str,
+) -> Option<StageParticipant> {
+    let issued = stage_participant(state, stage_arn, participant_id);
+    let recorded = recorded_stage_participant(state, stage_arn, participant_id);
+    let publishes = issued.as_ref().is_some_and(|issued| issued.publishes)
+        || recorded.as_ref().is_some_and(|recorded| recorded.publishes);
+    let mut participant = issued.or(recorded)?;
+    participant.publishes = publishes;
+    Some(participant)
+}
+
 /// Whether the participant `participant_id` is attached to the stage `stage_arn` — the
 /// relation `DisconnectParticipant$stageArn` names ("ARN of the stage to which the
 /// participant is attached").
 ///
-/// A stage has the participants its own records hold: every participant record in a
-/// session of that stage, whatever opened it and whatever state it is now in — a join over
-/// the stage's data plane, or a replication putting a replica of another stage's publisher
-/// into it ([`record_replicated_participant`]) — together with the identities this service
-/// issued against the stage ([`stage_participant`]), which a holder can present to the
-/// stage whether or not it has joined yet.
-///
-/// The ONE answer to "does this stage have this participant", so an operation that acts on
-/// a participant of a stage and the readers that report that stage's participants
-/// (`ListParticipants`, `GetParticipant`) cannot disagree about which participants the
-/// stage has. `false` for a stage this store holds nothing of, and for a participant whose
-/// records and identities all belong to other stages.
+/// The existence half of [`attached_participant`], which is where the relation itself is
+/// stated: an operation that only needs to know whether the stage has the participant asks
+/// here, one that acts on what it is doing there asks that.
 pub fn participant_attached_to_stage(
     state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     stage_arn: &str,
     participant_id: &str,
 ) -> bool {
-    let recorded = state.stage_sessions.get(stage_arn).is_some_and(|sessions| {
-        sessions.iter().any(|session| {
-            session
-                .participants
-                .iter()
-                .any(|participant| participant.participant_id == participant_id)
-        })
-    });
-    recorded || stage_participant(state, stage_arn, participant_id).is_some()
+    attached_participant(state, stage_arn, participant_id).is_some()
 }
 
 /// One publisher broadcasting with an ingest configuration right now: the session of

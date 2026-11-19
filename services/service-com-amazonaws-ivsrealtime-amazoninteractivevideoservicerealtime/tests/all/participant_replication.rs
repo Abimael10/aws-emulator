@@ -30,6 +30,10 @@
 //!    `ConflictException` (409).
 //! 6. A REPLICA DOES NOT OUTLIVE EITHER STAGE IT NAMES: deleting the source stage or the
 //!    destination stage ends that replication.
+//! 7. THE PUBLISHER IS A PARTICIPANT THE SOURCE STAGE HAS: whatever put it there — an
+//!    identity this service issued against that stage, or a replica another replication
+//!    put into it — so a replica is replicated onward out of the stage it was replicated
+//!    into, and a replica whose own replication has ended is not.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -189,6 +193,50 @@ impl RealTime {
             "case {case:?}: GetStage on {stage_arn} must answer HTTP 200, got {status} {response}"
         );
         member(&response["stage"], "activeSessionId")
+    }
+
+    /// Stop one replication, asserting the stop was accepted.
+    async fn stop_replication(
+        &self,
+        case: &str,
+        source_stage_arn: &str,
+        destination_stage_arn: &str,
+        participant_id: &str,
+    ) {
+        let request = json!({
+            "sourceStageArn": source_stage_arn,
+            "destinationStageArn": destination_stage_arn,
+            "participantId": participant_id,
+        });
+        let (status, response) = self.call("StopParticipantReplication", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: StopParticipantReplication {request} must answer HTTP 200, \
+             got {status} {response}"
+        );
+    }
+
+    /// The `Participant` `GetParticipant` reports for one participant of one session of
+    /// one stage — the stage's own view of who is in it.
+    async fn participant_view(
+        &self,
+        case: &str,
+        stage_arn: &str,
+        session_id: &str,
+        participant_id: &str,
+    ) -> Value {
+        let request = json!({
+            "stageArn": stage_arn,
+            "sessionId": session_id,
+            "participantId": participant_id,
+        });
+        let (status, response) = self.call("GetParticipant", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetParticipant {request} must answer HTTP 200, \
+             got {status} {response}"
+        );
+        response["participant"].clone()
     }
 
     /// Delete `stage_arn`, asserting the delete was accepted.
@@ -1030,6 +1078,388 @@ async fn deleting_either_stage_ends_that_replication() {
             destinations, expected,
             "case {case:?}: deleting {deleted} must end exactly the replications it is an \
              end of, got {listed}"
+        );
+    }
+}
+
+/// `ReplicationType`'s values, from
+/// `smithy_query(query="shape",shape="ReplicationType")`: the one a participant a
+/// replication runs INTO reports.
+const REPLICA_REPLICATION_TYPE: &str = "REPLICA";
+
+/// `ParticipantState`'s values, from
+/// `smithy_query(query="shape",shape="ParticipantState")`.
+const CONNECTED: &str = "CONNECTED";
+const DISCONNECTED: &str = "DISCONNECTED";
+
+/// The state of a replication the clock has ended, from
+/// `smithy_query(query="shape",shape="ReplicationState")` — the other of its two values.
+const ENDED_REPLICATION_STATE: &str = "STOPPED";
+
+/// The `attributes` map a participant view reports, read as empty when the wire omits it.
+fn attributes_of(participant: &Value) -> serde_json::Map<String, Value> {
+    participant
+        .get("attributes")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// One row of the class "the publisher a replication replicates is a participant the
+/// SOURCE stage HAS": how that participant came to be in the stage the start names as its
+/// source, and what it carries.
+struct OnwardCase {
+    case: &'static str,
+    /// How many replications the publisher is put through, one stage per hop. The LAST hop
+    /// is the start under test: `1` sources it from the stage that ISSUED its identity,
+    /// `2` from the replica the first hop put into that stage, and `3` from a replica of a
+    /// replica.
+    hops: usize,
+    /// The capabilities the publisher's token grants, or `None` for the modelled default
+    /// (`PUBLISH, SUBSCRIBE`).
+    capabilities: Option<&'static [&'static str]>,
+    /// The attributes the publisher's token carries.
+    token_attributes: Value,
+    /// The attributes each hop's own request sends, in hop order — one entry per hop.
+    hop_attributes: Vec<Value>,
+}
+
+/// The rows this spans the class with: each differs from the others in what the rule
+/// generalises over — how far the publisher is from the stage that issued its identity
+/// (one hop, two, three), which capabilities that identity grants, and whether attributes
+/// are carried, added or replaced along the way.
+fn onward_cases() -> Vec<OnwardCase> {
+    vec![
+        OnwardCase {
+            case: "the stage that issued the identity is the source",
+            hops: 1,
+            capabilities: None,
+            token_attributes: json!({}),
+            hop_attributes: vec![json!({})],
+        },
+        OnwardCase {
+            case: "a replica is the source of a further replication",
+            hops: 2,
+            capabilities: Some(&[PUBLISH_CAPABILITY]),
+            token_attributes: json!({ "seat": "left" }),
+            hop_attributes: vec![json!({}), json!({})],
+        },
+        OnwardCase {
+            case: "a replica of a replica is the source of a third replication",
+            hops: 3,
+            capabilities: None,
+            token_attributes: json!({ "seat": "left", "row": "1" }),
+            hop_attributes: vec![json!({ "seat": "right" }), json!({}), json!({ "row": "2" })],
+        },
+        OnwardCase {
+            case: "a replica of a publish-and-subscribe identity, attributes added per hop",
+            hops: 2,
+            capabilities: Some(&[PUBLISH_CAPABILITY, SUBSCRIBE_CAPABILITY]),
+            token_attributes: json!({}),
+            hop_attributes: vec![json!({ "hop": "one" }), json!({ "lane": "two" })],
+        },
+    ]
+}
+
+/// A replication replicates a publishing participant OF THE SOURCE STAGE, and a stage has
+/// the participants its own records hold — including the replica another replication put
+/// into it — so a replica is itself a publisher the stage it was replicated into can
+/// replicate onward, exactly as that stage's own readers report it.
+#[tokio::test]
+async fn a_participant_the_source_stage_holds_replicates_onward() {
+    for row in onward_cases() {
+        let case = row.case;
+        let emulator = RealTime::new();
+        // One stage per end of the chain: the publisher's own, then one per hop.
+        let mut stages: Vec<String> = Vec::new();
+        for hop in 0..=row.hops {
+            stages.push(emulator.stage(case, &format!("stage-{hop}")).await);
+        }
+        let participant = emulator
+            .participant(case, &stages[0], row.capabilities, &row.token_attributes)
+            .await;
+
+        // What the participant of the last destination must carry: the identity's own
+        // attributes, with each hop's request merged over them — the composition the
+        // `attributes` member documents, applied hop by hop.
+        let mut expected_attributes = row
+            .token_attributes
+            .as_object()
+            .expect("the token attributes of a row are an object")
+            .clone();
+        for hop in 0..row.hops {
+            let mut request = json!({
+                "sourceStageArn": stages[hop],
+                "destinationStageArn": stages[hop + 1],
+                "participantId": participant,
+            });
+            let sent = row.hop_attributes[hop]
+                .as_object()
+                .expect("the hop attributes of a row are an object");
+            if !sent.is_empty() {
+                request["attributes"] = row.hop_attributes[hop].clone();
+            }
+            let (status, response) = emulator.start(&request).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: hop {hop} out of {} must answer HTTP 200 — the source stage \
+                 has that participant — got {status} {response}",
+                stages[hop]
+            );
+            for (key, value) in sent {
+                expected_attributes.insert(key.clone(), value.clone());
+            }
+        }
+
+        // The last hop persisted a replica of that participant, reported for the stage it
+        // was sourced from.
+        let source = &stages[row.hops - 1];
+        let destination = &stages[row.hops];
+        let listed = emulator.list(case, source, &participant, &json!({})).await;
+        let replicas = listed["replicas"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: replicas must be a list, got {listed}"));
+        assert_eq!(
+            replicas.len(),
+            1,
+            "case {case:?}: the last hop must persist exactly one replica of {participant} \
+             for {source}, got {listed}"
+        );
+        let replica = &replicas[0];
+        assert_eq!(
+            member(replica, "destinationStageArn"),
+            *destination,
+            "case {case:?}: the replica must name the stage it was replicated into, \
+             got {listed}"
+        );
+        assert_eq!(
+            member(replica, "replicationState"),
+            STARTED_REPLICATION_STATE,
+            "case {case:?}: a started replication must be reported {STARTED_REPLICATION_STATE}, \
+             got {listed}"
+        );
+        assert_eq!(
+            member(replica, "sourceSessionId"),
+            emulator.active_session(case, source).await,
+            "case {case:?}: the replica must name the source stage's own session, got {listed}"
+        );
+        let destination_session = emulator.active_session(case, destination).await;
+        assert_eq!(
+            member(replica, "destinationSessionId"),
+            destination_session,
+            "case {case:?}: the replica must name the destination stage's own session, \
+             got {listed}"
+        );
+
+        // And the destination stage's own reader reports that participant as the replica
+        // it is, carrying the composed attributes.
+        let view = emulator
+            .participant_view(case, destination, &destination_session, &participant)
+            .await;
+        assert_eq!(
+            member(&view, "state"),
+            CONNECTED,
+            "case {case:?}: the replicated participant must be in {destination}, got {view}"
+        );
+        assert_eq!(
+            view["published"],
+            json!(true),
+            "case {case:?}: a replica carries the publisher's media into {destination}, \
+             got {view}"
+        );
+        assert_eq!(
+            member(&view, "replicationType"),
+            REPLICA_REPLICATION_TYPE,
+            "case {case:?}: the participant of {destination} must be reported a \
+             {REPLICA_REPLICATION_TYPE}, got {view}"
+        );
+        assert_eq!(
+            member(&view, "sourceStageArn"),
+            *source,
+            "case {case:?}: a replica names the stage it is replicated from, got {view}"
+        );
+        assert_eq!(
+            attributes_of(&view),
+            expected_attributes,
+            "case {case:?}: the replica must carry the token's attributes with each hop's \
+             merged over them, got {view}"
+        );
+
+        // Every stage along the chain has that participant, which is what made each hop
+        // possible: the readers of each one report it connected and publishing.
+        for stage in &stages[1..=row.hops] {
+            let session = emulator.active_session(case, stage).await;
+            let along = emulator
+                .participant_view(case, stage, &session, &participant)
+                .await;
+            assert_eq!(
+                member(&along, "state"),
+                CONNECTED,
+                "case {case:?}: {stage} must report {participant} connected, got {along}"
+            );
+            assert_eq!(
+                along["published"],
+                json!(true),
+                "case {case:?}: {stage} must report {participant} publishing, got {along}"
+            );
+        }
+    }
+}
+
+/// A participant a stage no longer holds as a publisher is not replicated onward from it:
+/// once the replication that put the replica there has ended, the replica has left, so the
+/// start is the modelled `ConflictException` (409) and persists nothing — whichever way
+/// that inbound replication ended.
+#[tokio::test]
+async fn a_released_replica_replicates_no_further() {
+    for case in [
+        "the inbound replication was stopped",
+        "the inbound replication's source stage was deleted",
+    ] {
+        let emulator = RealTime::new();
+        let origin = emulator.stage(case, "origin").await;
+        let middle = emulator.stage(case, "middle").await;
+        let onward = emulator.stage(case, "onward").await;
+        let participant = emulator.participant(case, &origin, None, &json!({})).await;
+        emulator
+            .replicate(
+                case,
+                &json!({
+                    "sourceStageArn": origin,
+                    "destinationStageArn": middle,
+                    "participantId": participant,
+                }),
+            )
+            .await;
+        let middle_session = emulator.active_session(case, &middle).await;
+
+        if case == "the inbound replication was stopped" {
+            emulator
+                .stop_replication(case, &origin, &middle, &participant)
+                .await;
+        } else {
+            emulator.delete_stage(case, &origin).await;
+        }
+
+        // The stage's own reader says the replica has left it.
+        let view = emulator
+            .participant_view(case, &middle, &middle_session, &participant)
+            .await;
+        assert_eq!(
+            member(&view, "state"),
+            DISCONNECTED,
+            "case {case:?}: an ended replication takes its replica out of {middle}, got {view}"
+        );
+
+        let request = json!({
+            "sourceStageArn": middle,
+            "destinationStageArn": onward,
+            "participantId": participant,
+        });
+        let (status, response) = emulator.start(&request).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: {request} must answer HTTP 409 — {middle} has nobody publishing \
+             under that id — got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ConflictException",
+            "case {case:?}: the refusal must carry the code ConflictException, got {response}"
+        );
+        assert_eq!(
+            error_message(&response),
+            format!("{participant} is not publishing"),
+            "case {case:?}: the conflict must name the participant, got {response}"
+        );
+        let listed = emulator
+            .list(case, &middle, &participant, &json!({}))
+            .await;
+        assert_eq!(
+            listed["replicas"].as_array().map(Vec::len),
+            Some(0),
+            "case {case:?}: a refused start must persist no replica, got {listed}"
+        );
+    }
+}
+
+/// The end of an inbound replication is the departure of its replica, and that replica can
+/// be the publisher of a FURTHER replication: so ending the inbound one puts the onward
+/// replication on the reconnect deadline its own window earns it, and the clock ends it at
+/// that deadline — immediately for a window of zero, not yet for the modelled maximum.
+#[tokio::test]
+async fn ending_an_inbound_replication_runs_out_the_window_of_the_one_its_replica_sources() {
+    // Each row differs in the onward replication's own `reconnectWindowSeconds`, which is
+    // what decides when its publisher's departure ends it: the two published bounds of the
+    // modelled range.
+    let rows = [
+        (
+            "no reconnect window",
+            RECONNECT_WINDOW_MIN,
+            ENDED_REPLICATION_STATE,
+            DISCONNECTED,
+        ),
+        (
+            "the longest reconnect window the model allows",
+            RECONNECT_WINDOW_MAX,
+            STARTED_REPLICATION_STATE,
+            CONNECTED,
+        ),
+    ];
+    for (case, window, expected_state, expected_participant_state) in rows {
+        let emulator = RealTime::new();
+        let origin = emulator.stage(case, "origin").await;
+        let middle = emulator.stage(case, "middle").await;
+        let onward = emulator.stage(case, "onward").await;
+        let participant = emulator.participant(case, &origin, None, &json!({})).await;
+        emulator
+            .replicate(
+                case,
+                &json!({
+                    "sourceStageArn": origin,
+                    "destinationStageArn": middle,
+                    "participantId": participant,
+                }),
+            )
+            .await;
+        emulator
+            .replicate(
+                case,
+                &json!({
+                    "sourceStageArn": middle,
+                    "destinationStageArn": onward,
+                    "participantId": participant,
+                    "reconnectWindowSeconds": window,
+                }),
+            )
+            .await;
+        let onward_session = emulator.active_session(case, &onward).await;
+
+        emulator
+            .stop_replication(case, &origin, &middle, &participant)
+            .await;
+
+        let listed = emulator.list(case, &middle, &participant, &json!({})).await;
+        let states: Vec<String> = listed["replicas"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: replicas must be a list, got {listed}"))
+            .iter()
+            .map(|replica| member(replica, "replicationState"))
+            .collect();
+        assert_eq!(
+            states,
+            vec![expected_state.to_string()],
+            "case {case:?}: a window of {window} second(s) must leave the onward replication \
+             {expected_state}, got {listed}"
+        );
+        let view = emulator
+            .participant_view(case, &onward, &onward_session, &participant)
+            .await;
+        assert_eq!(
+            member(&view, "state"),
+            expected_participant_state,
+            "case {case:?}: the replica in {onward} must be {expected_participant_state} \
+             while the onward replication is {expected_state}, got {view}"
         );
     }
 }
