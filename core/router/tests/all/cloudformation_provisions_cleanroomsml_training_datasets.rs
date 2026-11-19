@@ -61,32 +61,32 @@ const CREATE_COMPLETE: &str = "CREATE_COMPLETE";
 
 /// The fixed text CloudFormation refuses a template declaring a type it does NOT know with,
 /// which is what the defect this suite pins answered for a type AWS publishes.
-const UNRECOGNIZED_TYPES: &str = "Unrecognized resource types";
+pub(crate) const UNRECOGNIZED_TYPES: &str = "Unrecognized resource types";
 
 /// The logical ids every template below declares.
 const BUCKET: &str = "DataBucket";
-const DATABASE: &str = "TrainingCatalog";
-const TABLE: &str = "TrainingTable";
-const DATASET: &str = "TrainingDataset";
+pub(crate) const DATABASE: &str = "TrainingCatalog";
+pub(crate) const TABLE: &str = "TrainingTable";
+pub(crate) const DATASET: &str = "TrainingDataset";
 
 /// The outputs the deploy table reads the dataset's identity through, and the one it reads the
 /// status Clean Rooms ML reports for it through.
-const REF_OUTPUT: &str = "DatasetRef";
-const ARN_OUTPUT: &str = "DatasetArn";
-const STATUS_OUTPUT: &str = "DatasetStatus";
+pub(crate) const REF_OUTPUT: &str = "DatasetRef";
+pub(crate) const ARN_OUTPUT: &str = "DatasetArn";
+pub(crate) const STATUS_OUTPUT: &str = "DatasetStatus";
 
 /// The two `Fn::GetAtt` attributes the type publishes.
-const ARN_ATTRIBUTE: &str = "TrainingDatasetArn";
-const STATUS_ATTRIBUTE: &str = "Status";
+pub(crate) const ARN_ATTRIBUTE: &str = "TrainingDatasetArn";
+pub(crate) const STATUS_ATTRIBUTE: &str = "Status";
 
 /// The role every declaration names as the one Clean Rooms ML reads the data with. A literal,
 /// so what each row varies is the training data and not the role: the member is modelled
 /// `^arn:aws[-a-z]*:iam::[0-9]{12}:role/.+$`.
-const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/clean-rooms-ml-training";
+pub(crate) const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/clean-rooms-ml-training";
 
 /// The `HandlerErrorCode` class a refusal of the REQUEST falls in, a value of the
 /// CloudFormation model's own `HandlerErrorCode` enum.
-const INVALID_REQUEST: &str = "InvalidRequest";
+pub(crate) const INVALID_REQUEST: &str = "InvalidRequest";
 
 /// The SDK's own name for Clean Rooms ML, as the exception its SDK raises states it.
 const CLEANROOMSML_SERVICE: &str = "CleanRoomsMl";
@@ -103,19 +103,19 @@ const DATASET_ABSENT: (u16, &str) = (404, "ResourceNotFoundException");
 
 /// The status Clean Rooms ML reports a training dataset in: `TrainingDatasetStatus` models
 /// `ACTIVE` and nothing else.
-const ACTIVE: &str = "ACTIVE";
+pub(crate) const ACTIVE: &str = "ACTIVE";
 
 /// The bytes a row stages as the training data, and the key a staged object carries under a
 /// prefix. The content is never read by anything under test — what the rule turns on is that
 /// the object is NOT zero-sized.
-const RECORDS: &[u8] = b"user-1,item-1,2026-01-01T00:00:00Z\n";
+pub(crate) const RECORDS: &[u8] = b"user-1,item-1,2026-01-01T00:00:00Z\n";
 const PART_KEY: &str = "part-00000.csv";
 
 /// The services this suite exercises, mounted on ONE engine exactly as `core/router/src/lib.rs`
 /// mounts them: the stack's declared resources are really created in the services that own them,
 /// and Clean Rooms ML resolves the Glue table and the objects its location holds through those
 /// services' own state.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite exercises the services, not SigV4: every call carries a credential scope so the
@@ -142,7 +142,12 @@ fn build_router() -> MultiServiceRouter {
 
 /// Call one Amazon S3 operation over its REST surface, path-style — the addressing the emulated
 /// service routes on.
-async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &'static [u8]) -> Answered {
+pub(crate) async fn s3(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: &'static [u8],
+) -> Answered {
     dispatch(
         router,
         method,
@@ -158,7 +163,7 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &'stati
 }
 
 /// Stage `body` at `bucket`/`key`, asserting Amazon S3 took the write.
-async fn stage_object(
+pub(crate) async fn stage_object(
     router: &MultiServiceRouter,
     case: &str,
     bucket: &str,
@@ -194,13 +199,16 @@ async fn cleanroomsml(router: &MultiServiceRouter, method: &str, path: &str) -> 
 /// `GetTrainingDataset` for one ARN, as that service's model binds it:
 /// `GET /training-dataset/{trainingDatasetArn}`, the label escaped as a single path segment so
 /// the ARN's own `:` and `/` address one dataset rather than another path.
-async fn get_training_dataset(router: &MultiServiceRouter, arn: &str) -> Answered {
+pub(crate) async fn get_training_dataset(router: &MultiServiceRouter, arn: &str) -> Answered {
     cleanroomsml(router, "GET", &format!("/training-dataset/{}", form_encode(arn))).await
 }
 
 /// Every training dataset ARN `ListTrainingDatasets` reports, which is what tells a dataset that
 /// exists from one nothing created.
-async fn listed_training_datasets(router: &MultiServiceRouter, case: &str) -> Vec<String> {
+pub(crate) async fn listed_training_datasets(
+    router: &MultiServiceRouter,
+    case: &str,
+) -> Vec<String> {
     let answered = cleanroomsml(router, "GET", "/training-dataset").await;
     assert_eq!(
         answered.status,
@@ -224,7 +232,7 @@ async fn listed_training_datasets(router: &MultiServiceRouter, case: &str) -> Ve
 }
 
 /// The member Clean Rooms ML reports a training dataset's ARN in, on a summary as on a read.
-const ARN_ATTRIBUTE_MEMBER: &str = "trainingDatasetArn";
+pub(crate) const ARN_ATTRIBUTE_MEMBER: &str = "trainingDatasetArn";
 
 /// Where one row's Glue table stores its data, and what is staged in the bucket under it.
 #[derive(Clone, Copy)]
@@ -402,7 +410,7 @@ fn location(bucket: &str, data: &TrainingData) -> String {
 /// fixed text, with the location the Glue table states after it. Spelled out here rather than
 /// taken from the emulator's own constant, so the suite pins AWS's wording and not the
 /// implementation's.
-fn no_records_sentence(location: &str) -> String {
+pub(crate) fn no_records_sentence(location: &str) -> String {
     format!("Failed to find any non-zero sized objects in this S3 location {location}.")
 }
 
@@ -447,7 +455,7 @@ fn prerequisites(bucket: &str, database: &str, table: &str, data: &TrainingData)
 
 /// The declared `TrainingData` of one dataset: the one `Dataset` the modelled list admits
 /// (`DatasetList` is `@length(min: 1, max: 1)`), over the Glue table the prerequisites created.
-fn training_data(table: &str, states_catalog: bool, schema: &[(&str, &str)]) -> Value {
+pub(crate) fn training_data(table: &str, states_catalog: bool, schema: &[(&str, &str)]) -> Value {
     let mut glue = json!({ "DatabaseName": { "Ref": DATABASE }, "TableName": table });
     if states_catalog {
         glue["CatalogId"] = json!(ACCOUNT);
@@ -574,7 +582,7 @@ async fn updated_stack(
 
 /// Every `ResourceStatusReason` the stack recorded for a FAILED event of `logical_id`, in
 /// document order.
-async fn failure_reasons(
+pub(crate) async fn failure_reasons(
     router: &MultiServiceRouter,
     case: &str,
     stack: &str,
@@ -607,7 +615,7 @@ async fn failure_reasons(
 
 /// Split one failure reason into the exception the resource's handler quoted and the
 /// `HandlerErrorCode` class it reported the refusal under.
-fn quoted_and_class(case: &str, reason: &str) -> (String, String) {
+pub(crate) fn quoted_and_class(case: &str, reason: &str) -> (String, String) {
     const OPENS: &str = "Resource handler returned message: \"";
     const TOKEN: &str = "\" (RequestToken: ";
     const CLASS: &str = "HandlerErrorCode: ";
@@ -627,7 +635,7 @@ fn quoted_and_class(case: &str, reason: &str) -> (String, String) {
 /// Hold one quoted exception to the shape a Clean Rooms ML SDK raises — the service's own
 /// sentence, then the SDK's diagnostic of the refused call (its name for the service, the HTTP
 /// status, the id of the call and the attempts it made) — and answer the sentence.
-fn asserted_sentence(case: &str, quoted: &str) -> String {
+pub(crate) fn asserted_sentence(case: &str, quoted: &str) -> String {
     const DIAGNOSTIC: &str = " (Service: ";
     const ATTEMPTS: &str = ") (SDK Attempt Count: ";
     let (sentence, diagnostic) = quoted.rsplit_once(DIAGNOSTIC).unwrap_or_else(|| {
@@ -686,7 +694,7 @@ fn training_dataset_arn_prefix() -> String {
 }
 
 /// Hold `arn` to the form that pattern admits, and answer it.
-fn asserted_arn(case: &str, arn: &str) -> String {
+pub(crate) fn asserted_arn(case: &str, arn: &str) -> String {
     let prefix = training_dataset_arn_prefix();
     let resource = arn.strip_prefix(&prefix).unwrap_or_else(|| {
         panic!("case {case:?}: expected an ARN opening with {prefix:?}, got {arn:?}")
