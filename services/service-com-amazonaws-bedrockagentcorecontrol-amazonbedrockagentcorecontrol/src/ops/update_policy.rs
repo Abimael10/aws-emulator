@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies an accepted modification to a policy held by the engine the path names and
+//! persists it in [`crate::state`], reporting the policy `UPDATING` with the transition
+//! back to `ACTIVE` owed by the clock ("This is an asynchronous operation. Use the
+//! GetPolicy operation to poll the status field"). The engine and the policy the path
+//! names are each resolved before anything is written — an id this account does not
+//! hold is the modelled `ResourceNotFoundException` — and a policy whose own
+//! asynchronous work is still under way is refused the modelled `ConflictException`,
+//! exactly as `UpdatePolicyEngine` refuses a change to a busy engine.
 //!
 //! ## Shape of an operation
 //!
@@ -208,18 +208,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdatePolicyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the policy store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A policy, or the engine holding it, whose deletion the clock has already
+        // made due is gone before this update looks for it, so a change asked of it
+        // is the modelled 404 rather than a change to a retired resource.
+        store.expire_deleted_policy_engines_and_policies(now);
+
+        // A policy is addressed only THROUGH the engine that evaluates it, so an
+        // engine id this account does not hold is reported in its own sentence
+        // before the policy is looked at — the same order `GetPolicy` and
+        // `DeletePolicy` resolve the pair in.
+        let engine = store
+            .policy_engines
+            .get_mut(&input.policy_engine_id)
+            .ok_or_else(|| {
+                UpdatePolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::policy_engine_not_found(&input.policy_engine_id),
+                )
+            })?;
+        let record = engine.policies.get_mut(&input.policy_id).ok_or_else(|| {
+            UpdatePolicyErrorModeled::ResourceNotFoundException(crate::state::policy_not_found(
+                &input.policy_id,
+            ))
+        })?;
+
+        // A policy whose own asynchronous create, update or deletion is still under
+        // way cannot take another change: the request collides with the operation
+        // already running on it, so it is refused the modelled 409 and the stored
+        // policy is left exactly as it was. The engine holding it needs no status of
+        // its own here: an engine still creating holds no policy to address, and one
+        // whose deletion was accepted held none either, because `DeletePolicyEngine`
+        // refuses an engine that still contains policies.
+        if record.status_at(now) != crate::state::POLICY_STATUS_ACTIVE {
+            return Err(UpdatePolicyErrorModeled::ConflictException(
+                crate::state::policy_concurrent_modification(&input.policy_id),
+            )
+            .into());
+        }
+
+        // Accepted: the definition, the description and the enforcement mode each
+        // take the PATCH rule the model states for them, and the policy reports
+        // `UPDATING` until the clock owes it `ACTIVE` — "This is an asynchronous
+        // operation. Use the GetPolicy operation to poll the status field to track
+        // completion".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePolicy"))
+        // `validationMode` decides what to do with the analyzer's findings, and this
+        // emulator runs no policy-language analyzer, so there are none: both modes
+        // therefore accept the change alike, rather than one of them refusing a
+        // finding nothing produced.
+        record.accept_update(
+            input.description.as_ref(),
+            input.definition,
+            input.enforcement_mode.as_deref(),
+            now,
+        );
+
+        Ok(record.update_output(now))
     }
 }

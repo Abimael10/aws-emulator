@@ -18,7 +18,7 @@ use crate::ops::types::{
     ConflictException, CreatePolicyEngineInput, CreatePolicyEngineOutput, CreatePolicyInput,
     CreatePolicyOutput, DeletePolicyEngineOutput, DeletePolicyOutput, GetPolicyEngineOutput,
     GetPolicyOutput, PolicyDefinition, ResourceNotFoundException, UpdatePolicyEngineOutput,
-    UpdatedDescription,
+    UpdatePolicyOutput, UpdatedDescription,
 };
 
 use super::{sorted_map, timestamp};
@@ -100,6 +100,22 @@ pub fn policy_engine_concurrent_modification(policy_engine_id: &str) -> Conflict
         message: Some(format!(
             "Concurrent modification on policy engine with ID {policy_engine_id} detected, \
              please try again once the policy engine status is ACTIVE"
+        )),
+    }
+}
+
+/// The modelled conflict for a change asked of a policy whose own asynchronous
+/// work is still under way: the policy is not `ACTIVE`, so the request collides
+/// with the operation already running on it, exactly as a change asked of a busy
+/// engine does ([`policy_engine_concurrent_modification`]).
+///
+/// The text around the id is fixed and tells the caller what to wait for; the id
+/// is the one the request's path carried.
+pub fn policy_concurrent_modification(policy_id: &str) -> ConflictException {
+    ConflictException {
+        message: Some(format!(
+            "Concurrent modification on policy with ID {policy_id} detected, \
+             please try again once the policy status is ACTIVE"
         )),
     }
 }
@@ -482,6 +498,45 @@ impl PolicyRecord {
         status_reasons_for(self.status_at(now))
     }
 
+    /// Apply an accepted modification at `now`: the policy reports `UPDATING`
+    /// until the clock owes it `ACTIVE` one settle span later, as the create's
+    /// own transition is owed.
+    ///
+    /// Each member follows the PATCH rule the model states for it. `description`
+    /// is the request's `UpdatedDescription` wrapper: "When present in an update
+    /// request, the description is replaced with optionalValue. When absent, the
+    /// description is left unchanged. To unset the description, include the
+    /// wrapper with optionalValue not specified" (`smithy_query doc
+    /// shape=UpdatedDescription`). `definition` "replaces the existing policy
+    /// definition with new logic while maintaining the policy's identity", and
+    /// `enforcement_mode` is taken from the request when it carries one — "If you
+    /// omit this field, the policy's existing enforcement mode is unchanged"
+    /// (`smithy_query doc shape=UpdatePolicy member=definition,enforcementMode`).
+    /// Every other member — the policy's name, its id, its ARN, the engine that
+    /// holds it and its creation instant — is not modifiable by this operation
+    /// and is left as the create stored it.
+    pub fn accept_update(
+        &mut self,
+        description: Option<&UpdatedDescription>,
+        definition: Option<PolicyDefinition>,
+        enforcement_mode: Option<&str>,
+        now: SystemTime,
+    ) {
+        if let Some(wrapper) = description {
+            self.description = wrapper.optional_value.clone();
+        }
+        if let Some(definition) = definition {
+            self.definition = definition;
+        }
+        if let Some(enforcement_mode) = enforcement_mode {
+            self.enforcement_mode = enforcement_mode.to_string();
+        }
+        self.transient_status = POLICY_STATUS_UPDATING.to_string();
+        self.settled_status = POLICY_STATUS_ACTIVE.to_string();
+        self.settles_at = now + POLICY_SETTLE_DELAY;
+        self.updated_at = now;
+    }
+
     /// This policy as `CreatePolicy`'s response envelope.
     ///
     /// `CreatePolicyResponse` and `GetPolicyResponse` declare the SAME members,
@@ -514,6 +569,28 @@ impl PolicyRecord {
     pub fn delete_output(&self, now: SystemTime) -> DeletePolicyOutput {
         let created = self.create_output(now);
         DeletePolicyOutput {
+            policy_id: created.policy_id,
+            name: created.name,
+            policy_engine_id: created.policy_engine_id,
+            created_at: created.created_at,
+            updated_at: created.updated_at,
+            policy_arn: created.policy_arn,
+            status: created.status,
+            enforcement_mode: created.enforcement_mode,
+            definition: created.definition,
+            description: created.description,
+            status_reasons: created.status_reasons,
+        }
+    }
+
+    /// This policy as `UpdatePolicy`'s response envelope — `UpdatePolicyResponse`
+    /// declares the same members as `CreatePolicyResponse`, so it too is rendered
+    /// from the one stored record: what the update reports about the policy is the
+    /// policy, with the definition, the modes, the status and the timestamps the
+    /// accepted change left on it.
+    pub fn update_output(&self, now: SystemTime) -> UpdatePolicyOutput {
+        let created = self.create_output(now);
+        UpdatePolicyOutput {
             policy_id: created.policy_id,
             name: created.name,
             policy_engine_id: created.policy_engine_id,
