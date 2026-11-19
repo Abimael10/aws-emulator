@@ -40,8 +40,11 @@
 //! envelope, one clause per broken constraint, where
 //!
 //! * a member the request did not carry has no value to quote, and the clause states none;
-//! * a URI-LABEL member outside its `@pattern` is stated with no value either, and the
-//!   expression is quoted without the whole-value anchors the model wraps it in;
+//! * a member outside the `@pattern` of a THING-REGISTRY NAME is stated WITH that name,
+//!   single-quoted, and every OTHER member outside its `@pattern` with no value at all; the
+//!   expression is quoted without the whole-value anchors the model wraps it in. The child
+//!   suite [`clause_value_classes`] pins that split over the name types, the bindings and
+//!   the operations that rule covers;
 //! * a member outside either end of its `@length` is stated with no value either — the
 //!   clause names the bound it broke, not the text that broke it — which the child suite
 //!   [`length_constraint_clauses`] pins over the operations and bounds that rule covers;
@@ -53,10 +56,9 @@
 //!   in the order of the hash table the front door holds them in rather than in the model's
 //!   declaration order.
 //!
-//! What a clause states for a `@pattern` on a BODY member is not pinned here: the shared
-//! clause builder renders it like a label's, and whether that is AWS's wording for such a
-//! member is a divergence of its own that another report owns. The error SHAPE, which is
-//! what this suite's second table asserts, is the same for all of them.
+//! What a clause states for a `@pattern` on a member of another plane is pinned by the child
+//! suite as well. The error SHAPE, which is what this suite's second table asserts, is the
+//! same for all of them.
 //!
 //! Its tables span what the rule generalises over: five operations, four constraint classes
 //! (an absent `@required` member, a `@pattern` on a URI label on two operations, a
@@ -79,6 +81,13 @@ use smithy_server_runtime::MultiServiceRouter;
 /// module of a `#[path]`-declared file resolves next to that file unless it says otherwise.
 #[path = "not_found_wording/length_constraint_clauses.rs"]
 mod length_constraint_clauses;
+
+/// The `@pattern` class of that same envelope: which half of a clause it states — the
+/// rejected name for a registry name, the expression alone for every other member — over the
+/// name types, the bindings and the operations that rule covers. A child of THIS suite for
+/// the same reason as the one above.
+#[path = "not_found_wording/clause_value_classes.rs"]
+mod clause_value_classes;
 
 /// The `@range` class of that same envelope: a clause about a NUMERIC bound states the
 /// bound and not the value that broke it, over the operations, the bindings and both ends
