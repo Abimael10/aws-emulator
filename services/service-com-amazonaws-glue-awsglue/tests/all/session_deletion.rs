@@ -35,7 +35,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::job_runs::{already_past, far_future};
 use crate::statements::{
-    create_session, ready_session, reach_due_instant, rewind_session, run, set_session_due,
+    create_session, ready_session, rewind_session, run, set_session_due, statement_at_rest,
 };
 use crate::wire::{call, call_in_region, emulator_on, error_code, error_message, ok, REGION};
 
@@ -228,12 +228,13 @@ async fn deleting_a_settled_session_removes_the_record_stored_under_its_id() {
             }
         }
 
-        // The statements the session holds when the delete lands, each settled so the next
-        // run of the session is taken.
+        // The statements the session holds when the delete lands, each brought to rest so
+        // the next run of the session is taken.
         let mut statement_ids = Vec::new();
         for index in 0..row.statements {
-            statement_ids.push(run(&router, id, &format!("{index} + 1")).await);
-            reach_due_instant(&engine, id);
+            let statement = run(&router, id, &format!("{index} + 1")).await;
+            statement_ids.push(statement);
+            statement_at_rest(&router, &engine, id, statement).await;
         }
 
         // The status the delete lands on is the one the row means it to.

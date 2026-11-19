@@ -248,7 +248,11 @@ pub const MAX_JOBS_PER_SCRIPT_CALL: usize = 8;
 /// The stack a script's thread is given: well above the interpreter's clamped recursion
 /// limit, so deep recursion in a script ends that run with the interpreter's own
 /// `RecursionError` rather than touching the thread's guard page.
-const JOB_SCRIPT_STACK_BYTES: usize = 16 * 1024 * 1024;
+///
+/// Shared with the other runs of caller-supplied Python this crate performs
+/// ([`super::statement_execution`]): the thread one run needs is the same whichever work
+/// asked for it.
+pub(super) const JOB_SCRIPT_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// How many traced events one script may execute.
 ///
@@ -265,21 +269,24 @@ const JOB_SCRIPT_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// budget it ran past rather than on the clock.
 pub const MAX_JOB_SCRIPT_STEPS: u64 = 2_000_000;
 
-/// How much memory one script may add to this process. CHOSEN, for the same reason.
-const MAX_JOB_SCRIPT_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+/// How much memory one script may add to this process. CHOSEN, for the same reason, and
+/// shared with the other runs of caller-supplied Python this crate performs
+/// ([`super::statement_execution`]).
+pub(super) const MAX_JOB_SCRIPT_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// How deep one script may recurse. The interpreter's own default is below what the frozen
 /// standard library's import chain needs, so this is the limit a run is given; the call that
-/// would raise it is taken away by the engine before any script code runs.
-const MAX_JOB_SCRIPT_RECURSION: usize = 2_000;
+/// would raise it is taken away by the engine before any script code runs. Shared, as above.
+pub(super) const MAX_JOB_SCRIPT_RECURSION: usize = 2_000;
 
 /// How much of a script's output is kept, and how large a value it may answer with.
 ///
 /// Neither reaches the wire: a Glue job run reports no script output, so these only bound
 /// what one run holds in memory.
 const MAX_JOB_SCRIPT_LOG_BYTES: usize = 64 * 1024;
-/// See [`MAX_JOB_SCRIPT_LOG_BYTES`].
-const MAX_JOB_SCRIPT_ANSWER_BYTES: usize = 64 * 1024;
+/// See [`MAX_JOB_SCRIPT_LOG_BYTES`]. Shared with the other runs of caller-supplied Python
+/// this crate performs ([`super::statement_execution`]).
+pub(super) const MAX_JOB_SCRIPT_ANSWER_BYTES: usize = 64 * 1024;
 
 /// The job argument naming the LANGUAGE a job's script is written in: "`--job-language` …
 /// the script programming language. This value must be either `scala` or `python`. If this
@@ -756,7 +763,7 @@ pub async fn perform_owed_job_runs<Eng: ::std::marker::Send + ::std::marker::Syn
 /// they buffer grow with the number of runs an account starts. The permit is OWNED and travels
 /// with the execution into the thread its script runs on, so it is given back when that thread
 /// ends. The task's handle is kept on the store
-/// ([`ComAmazonawsGlueAwsglueState::record_handed_off_job_script`]), so an execution this
+/// ([`ComAmazonawsGlueAwsglueState::record_handed_off_execution`]), so an execution this
 /// service began stays reachable rather than detached.
 ///
 /// `false` where the execution was NOT handed off — no async runtime to run it on, or no free
@@ -793,7 +800,7 @@ fn hand_off_job_script(
         )
         .await;
     });
-    state.lock().record_handed_off_job_script(handle);
+    state.lock().record_handed_off_execution(handle);
     true
 }
 
@@ -875,13 +882,13 @@ impl ComAmazonawsGlueAwsglueState {
     ///
     /// An execution this service began stays reachable while it runs — so it can be abandoned
     /// deliberately rather than merely forgotten — and what is kept is bounded by the permits
-    /// a hand-off has to take first ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`]): the handles of
-    /// finished executions are dropped on every record, so the list holds the ones in flight
-    /// and nothing else.
-    pub fn record_handed_off_job_script(&mut self, handle: ::tokio::task::JoinHandle<()>) {
-        self.handed_off_job_scripts
+    /// a hand-off has to take first ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], and the statement
+    /// path's own): the handles of finished executions are dropped on every record, so the
+    /// list holds the ones in flight and nothing else.
+    pub fn record_handed_off_execution(&mut self, handle: ::tokio::task::JoinHandle<()>) {
+        self.handed_off_executions
             .retain(|running| !running.is_finished());
-        self.handed_off_job_scripts.push(handle);
+        self.handed_off_executions.push(handle);
     }
 }
 

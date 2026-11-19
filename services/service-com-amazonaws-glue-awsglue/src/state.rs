@@ -296,6 +296,7 @@ mod schema_compatibility;
 mod schema_registry;
 mod security_configurations;
 mod sessions;
+mod statement_execution;
 mod table_rows;
 mod triggers;
 mod workflow_runs;
@@ -338,6 +339,7 @@ pub use schema_compatibility::*;
 pub use schema_registry::*;
 pub use security_configurations::*;
 pub use sessions::*;
+pub use statement_execution::*;
 pub use table_rows::*;
 pub use triggers::*;
 pub use workflow_runs::*;
@@ -1373,15 +1375,15 @@ pub struct ComAmazonawsGlueAwsglueState {
     /// The running pump's task handle, kept so the pump it replaces is aborted rather than
     /// merely forgotten.
     pub clock_pump: Option<::tokio::task::JoinHandle<()>>,
-    /// The tasks the HANDED-OFF job script executions are running on
-    /// ([`hand_off_job_script`]), kept so an execution this service began is reachable — and
-    /// so abortable — rather than detached.
+    /// The tasks the HANDED-OFF executions of caller-supplied code are running on — a job
+    /// run's script ([`hand_off_job_script`]) and an interactive session's statement — kept so
+    /// an execution this service began is reachable, and so abortable, rather than detached.
     ///
-    /// Bounded by construction: a hand-off takes one of
-    /// [`MAX_CONCURRENT_JOB_SCRIPT_RUNS`]'s permits BEFORE it spawns, so at most that many
-    /// executions are ever in flight, and the handles of the ones that have ended are dropped
-    /// whenever another is recorded ([`Self::record_handed_off_job_script`]).
-    pub handed_off_job_scripts: Vec<::tokio::task::JoinHandle<()>>,
+    /// Bounded by construction: a hand-off takes one of its path's permits BEFORE it spawns
+    /// ([`MAX_CONCURRENT_JOB_SCRIPT_RUNS`], [`MAX_CONCURRENT_STATEMENT_RUNS`]), so at most that
+    /// many executions are ever in flight, and the handles of the ones that have ended are
+    /// dropped whenever another is recorded ([`Self::record_handed_off_execution`]).
+    pub handed_off_executions: Vec<::tokio::task::JoinHandle<()>>,
 }
 
 impl ComAmazonawsGlueAwsglueState {
@@ -3250,36 +3252,6 @@ impl ComAmazonawsGlueAwsglueState {
     /// [`MAX_INTEGRATION_TABLE_PROPERTIES`].
     pub fn can_store_integration_table_properties(&self) -> bool {
         self.integration_table_properties.len() < MAX_INTEGRATION_TABLE_PROPERTIES
-    }
-
-    /// Whether this account holds ANY integration table property record for `resource_arn`,
-    /// whatever table each one overrides.
-    ///
-    /// This is what tells the miss of ONE pair apart from a resource that carries no
-    /// integration table properties at all, which the two operations that address a record
-    /// report differently ([`Self::integration_table_properties_miss`]).
-    pub fn holds_integration_table_properties_of(&self, resource_arn: &str) -> bool {
-        self.integration_table_properties
-            .keys()
-            .any(|(arn, _)| arn == resource_arn)
-    }
-
-    /// The message an operation that addresses ONE integration table property record
-    /// (`GetIntegrationTableProperties`, `DeleteIntegrationTableProperties`) carries when it
-    /// reaches no record for the pair it was asked about.
-    ///
-    /// RECORDED behaviour: a resource carrying no integration table properties at all is
-    /// reported as the resource itself not being found ([`messages::target_resource_not_found`]),
-    /// while a resource that carries properties for other tables answers with the miss of the
-    /// pair the request addressed ([`messages::integration_table_properties_not_found`]). The
-    /// ONE reading of that rule, so the read and the delete cannot disagree about which miss
-    /// a request earns.
-    pub fn integration_table_properties_miss(&self, resource_arn: &str, table_name: &str) -> String {
-        if self.holds_integration_table_properties_of(resource_arn) {
-            messages::integration_table_properties_not_found(resource_arn, table_name)
-        } else {
-            messages::target_resource_not_found(resource_arn)
-        }
     }
 
     /// Whether this store holds the resource an integration table property call's

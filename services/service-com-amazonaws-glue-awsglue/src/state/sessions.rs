@@ -5,6 +5,9 @@
 
 use super::*;
 
+// The modelled shape the text a cell wrote is reported in, which only this file builds.
+use crate::ops::types::StatementOutputData;
+
 /// The `SessionStatus` a session is in the instant its create returns: the remote Spark
 /// environment is still being provisioned. One of the modelled `SessionStatus` values
 /// (`PROVISIONING`, `READY`, `FAILED`, `TIMEOUT`, `STOPPING`, `STOPPED`, from
@@ -353,8 +356,8 @@ impl SessionEntry {
         }
     }
 
-    /// Move every statement of this session into the terminal state the clock owed it at
-    /// `now`, if it owed one.
+    /// Move every statement of this session into the state the clock owed it at `now`, if it
+    /// owed one.
     ///
     /// This is the one write a reporting operation makes, for the reason
     /// [`Self::settle_if_due`] gives: a statement was due to leave the state its run put
@@ -371,6 +374,42 @@ impl SessionEntry {
     /// state it was in before the clock moved it.
     pub fn statement(&self, id: i32) -> Option<&StatementEntry> {
         self.statements.iter().find(|statement| statement.id == id)
+    }
+
+    /// The statement of this session under `id`, to record what its own execution came to on
+    /// ([`StatementEntry::record_execution`]).
+    pub fn statement_mut(&mut self, id: i32) -> Option<&mut StatementEntry> {
+        self.statements
+            .iter_mut()
+            .find(|statement| statement.id == id)
+    }
+
+    /// CLAIM the execution of the next statement of this session that is still awaiting one,
+    /// and answer its `Id`.
+    ///
+    /// A statement whose code nothing has run yet is marked
+    /// ([`StatementEntry::awaiting_execution`]), so this is what the execution path asks for
+    /// to find the work it owes ([`super::statement_execution`]). The claim is taken under the
+    /// store's guard and cleared here, so two calls that find the same statement owed an
+    /// execution cannot both run it; a claim nothing performs is given back
+    /// ([`Self::release_statement_claim`]).
+    pub fn claim_statement_awaiting_execution(&mut self) -> Option<i32> {
+        let statement = self
+            .statements
+            .iter_mut()
+            .find(|statement| statement.awaiting_execution)?;
+        statement.awaiting_execution = false;
+        Some(statement.id)
+    }
+
+    /// Give the claim on the execution of the statement `id` back, for an execution nothing
+    /// performed: it stays owed, so a later call hands it off.
+    pub fn release_statement_claim(&mut self, id: i32) {
+        if let Some(statement) = self.statement_mut(id) {
+            if !statement.is_terminal() {
+                statement.awaiting_execution = true;
+            }
+        }
     }
 
     /// Whether a statement of this session has not finished, which is what makes the
@@ -412,6 +451,10 @@ impl SessionEntry {
 /// `AVAILABLE`, `CANCELLING`, `CANCELLED`, `ERROR`).
 pub const STATEMENT_STATE_WAITING: &str = "WAITING";
 
+/// The `StatementState` of a statement whose code is being run on the session's runtime.
+/// See [`STATEMENT_STATE_WAITING`].
+pub const STATEMENT_STATE_RUNNING: &str = "RUNNING";
+
 /// The `StatementState` of a statement whose code ran and whose output is readable. See
 /// [`STATEMENT_STATE_WAITING`].
 pub const STATEMENT_STATE_AVAILABLE: &str = "AVAILABLE";
@@ -443,22 +486,6 @@ pub const TERMINAL_STATEMENT_STATES: [&str; 3] = [
 /// stored on the record and materialised by whichever later call reads it; nothing sleeps.
 pub const STATEMENT_SETTLES_AFTER: Duration = SESSION_SETTLES_AFTER;
 
-/// `StatementOutput$ErrorValue` for the terminal state the clock owes every statement.
-///
-/// This emulator is the Glue control plane: it records a statement faithfully, but it runs
-/// no Spark runtime, so a statement can never reach [`STATEMENT_STATE_AVAILABLE`] — it
-/// ends in the modelled error state carrying a reason that says exactly that, rather than
-/// reporting output nothing computed. A JOB RUN is not in that position: its script is
-/// really executed ([`super::job_script`]), so the state a run comes to rest in is the one
-/// its own execution came to.
-pub const STATEMENT_NOT_EXECUTED_MESSAGE: &str =
-    "This emulator records statements but runs no Spark runtime, so the statement ended \
-     without running.";
-
-/// `StatementOutput$ErrorName` for that state: the kind of the error above, which is that
-/// nothing was available to run the code on.
-pub const STATEMENT_NOT_EXECUTED_ERROR_NAME: &str = "RuntimeUnavailable";
-
 /// The `Id` the first statement of a session is given, which a session's ids then count
 /// up from.
 pub const FIRST_STATEMENT_ID: i32 = 1;
@@ -472,11 +499,12 @@ pub const FIRST_STATEMENT_ID: i32 = 1;
 pub const MAX_STATEMENTS_PER_SESSION: usize = 100;
 
 /// One statement run on a session: "the statement or request for a particular action to
-/// occur in a session" (`Statement`), as the run that submitted it recorded it.
+/// occur in a session" (`Statement`), as the run that submitted it recorded it and as its
+/// own execution left it.
 ///
 /// Everything a caller can observe through the modelled `Statement` shape is held here —
 /// the id the session minted for it, the code it was submitted with, the state it has
-/// reached and the instants it moved between.
+/// reached, the instants it moved between and what its execution came to.
 #[derive(Debug, Clone)]
 pub struct StatementEntry {
     /// `Statement$Id`: "The ID of the statement", minted by
@@ -497,11 +525,25 @@ pub struct StatementEntry {
     pub settles_at: Option<SystemTime>,
     /// The `StatementState` the clock owes this statement at [`Self::settles_at`].
     pub settles_to: String,
+    /// Whether this statement's code still owes an EXECUTION: nothing has run it yet.
+    ///
+    /// Set by the run that recorded the statement, so a statement nothing has run is found
+    /// by [`SessionEntry::claim_statement_awaiting_execution`] and performed by whichever
+    /// call finds it owed ([`super::statement_execution`]).
+    pub awaiting_execution: bool,
+    /// The instant the state this statement's own execution decided falls due, once that
+    /// execution has answered and the state the clock owed it first has not been reached yet
+    /// ([`Self::record_execution`]).
+    pub rests_at: Option<SystemTime>,
+    /// What this statement's own execution came to, which is what decides the state it comes
+    /// to REST in and the output it then reports; `None` while nothing has run it.
+    pub outcome: Option<StatementOutcome>,
 }
 
 impl StatementEntry {
     /// Record a statement submitted at `now` under `id`, in [`STATEMENT_STATE_WAITING`]
-    /// with its terminal state due [`STATEMENT_SETTLES_AFTER`] out.
+    /// with [`STATEMENT_STATE_RUNNING`] due [`STATEMENT_SETTLES_AFTER`] out and its code
+    /// owing an execution.
     pub fn run(id: i32, code: &str, now: SystemTime) -> Self {
         Self {
             id,
@@ -510,9 +552,13 @@ impl StatementEntry {
             started_on: now,
             completed_on: None,
             settles_at: Some(now.checked_add(STATEMENT_SETTLES_AFTER).unwrap_or(now)),
-            // Nothing runs the code here, so the state the clock owes a statement nobody
-            // cancels is the modelled error state.
-            settles_to: STATEMENT_STATE_ERROR.to_string(),
+            // The session takes the statement and then actions it, so the state the clock
+            // owes it next is the one it is in while its code runs; what it comes to REST in
+            // is its own execution's answer and nothing else's.
+            settles_to: STATEMENT_STATE_RUNNING.to_string(),
+            awaiting_execution: true,
+            rests_at: None,
+            outcome: None,
         }
     }
 
@@ -521,44 +567,126 @@ impl StatementEntry {
         TERMINAL_STATEMENT_STATES.contains(&self.state.as_str())
     }
 
+    /// Record what this statement's own EXECUTION came to, as of `now`.
+    ///
+    /// The statement does not go straight to the state that execution decided: it is
+    /// [`STATEMENT_STATE_WAITING`] until the span its run owes it passes,
+    /// [`STATEMENT_STATE_RUNNING`] from then until one further span after its code answered,
+    /// and only then the state that execution came to. So what is recorded here is the state
+    /// it comes to REST in and WHEN — one span after `RUNNING` begins, and never before one
+    /// span after the execution answered, so code that takes a while keeps its statement
+    /// running for as long as it takes — while the `RUNNING` transition the clock already
+    /// owed stands. A client polling the statement observes it running whether its code was
+    /// quick or slow.
+    ///
+    /// A statement that has already come to rest is not moved.
+    pub fn record_execution(&mut self, outcome: StatementOutcome, now: SystemTime) {
+        // Whatever happens below, this statement no longer owes its code an execution: it
+        // has had one.
+        self.awaiting_execution = false;
+        if self.is_terminal() {
+            return;
+        }
+        // When this statement is (or becomes) RUNNING: the instant the clock owes it that
+        // state, or the instant it entered it where that has already happened.
+        let running_from = self.settles_at.unwrap_or(self.started_on);
+        let rests_at = running_from
+            .max(now)
+            .checked_add(STATEMENT_SETTLES_AFTER)
+            .unwrap_or(now);
+        self.outcome = Some(outcome);
+        if self.settles_at.is_some() {
+            // The `RUNNING` transition is still owed, so the rest falls due after it.
+            self.rests_at = Some(rests_at);
+        } else {
+            // The statement is already running: the rest is the next state it is owed.
+            self.settles_at = Some(rests_at);
+            self.settles_to = self.rests_in().to_string();
+        }
+    }
+
+    /// The `StatementState` this statement comes to REST in: the one its own execution
+    /// decided ([`StatementOutcome::statement_state`]).
+    ///
+    /// A statement whose execution answered nothing at all has none to report, and the
+    /// modelled error state is what the service rests such a statement in.
+    fn rests_in(&self) -> &'static str {
+        self.outcome
+            .as_ref()
+            .map_or(STATEMENT_STATE_ERROR, StatementOutcome::statement_state)
+    }
+
     /// Move this statement into the state the clock owed it at `now`, if it owed one.
     ///
-    /// The instants recorded are the DUE instant, not the instant somebody read it, so
-    /// two reads of a settled statement report the same record.
+    /// A statement can be owed MORE than one state at once: one whose code has been executed
+    /// owes [`STATEMENT_STATE_RUNNING`] and then the state that execution came to. Every
+    /// state already due is materialised, which is the state the clock itself had reached; a
+    /// state not yet due stops the walk, so a caller reading inside the span the statement
+    /// spends running still sees it running. The instants recorded are the DUE instant, not
+    /// the instant somebody read it, so two reads of a settled statement report the same
+    /// record.
     pub fn settle_if_due(&mut self, now: SystemTime) {
-        let Some(due) = self.settles_at.filter(|due| *due <= now) else {
-            return;
-        };
-        self.settles_at = None;
-        self.state = self.settles_to.clone();
-        if self.is_terminal() {
-            self.completed_on = Some(due);
+        while let Some(due) = self.settles_at {
+            if due > now {
+                return;
+            }
+            self.settles_at = None;
+            self.state = self.settles_to.clone();
+            if self.is_terminal() {
+                self.completed_on = Some(due);
+            }
+            // The state this statement's own execution decided follows the one it has just
+            // reached, at the instant that execution made it due.
+            if let Some(rests_at) = self.rests_at.take() {
+                self.settles_at = Some(rests_at);
+                self.settles_to = self.rests_in().to_string();
+            }
         }
     }
 
     /// `Statement$Output`: "The output in JSON", which a statement has once it has
-    /// finished — and which, for one nothing ran, is the modelled error output carrying
-    /// [`STATEMENT_NOT_EXECUTED_MESSAGE`] rather than data nothing computed.
+    /// finished — and which is what its own execution came to: the text the code wrote, or
+    /// the error it raised.
     pub(super) fn output(&self) -> Option<StatementOutput> {
         if !self.is_terminal() {
             return None;
         }
-        let errored = self.state == STATEMENT_STATE_ERROR;
+        let (data, error_name, error_value, traceback) = match self.outcome.as_ref() {
+            Some(StatementOutcome::Available(text)) => (
+                // "The code execution output in text format": what the code itself wrote.
+                (!text.is_empty()).then(|| StatementOutputData {
+                    text_plain: Some(text.clone()),
+                }),
+                None,
+                None,
+                None,
+            ),
+            Some(StatementOutcome::Errored {
+                name,
+                value,
+                traceback,
+            }) => (
+                None,
+                Some(name.clone()),
+                Some(value.clone()),
+                (!traceback.is_empty()).then(|| traceback.clone()),
+            ),
+            // A statement nothing ran reports no output of its own: there is none, and none
+            // is invented for it.
+            None => (None, None, None, None),
+        };
         Some(StatementOutput {
-            // "The code execution output": there is none, from a statement that ran no
-            // code.
-            data: None,
-            // "The execution count of the output": nothing executed, so this is the
-            // model's own default.
-            execution_count: 0,
+            data,
+            // "The execution count of the output": which execution of this session's
+            // runtime produced it, which is the position of this statement in the sequence
+            // the session mints ([`SessionEntry::next_statement_id`]).
+            execution_count: self.id,
             // "The status of the code execution output", which is the state the statement
             // came to rest in.
             status: Some(self.state.clone()),
-            error_name: errored.then(|| STATEMENT_NOT_EXECUTED_ERROR_NAME.to_string()),
-            error_value: errored.then(|| STATEMENT_NOT_EXECUTED_MESSAGE.to_string()),
-            // "The traceback of the output": a Python traceback, which only code that ran
-            // has.
-            traceback: None,
+            error_name,
+            error_value,
+            traceback,
         })
     }
 

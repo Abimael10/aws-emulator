@@ -196,10 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removed and the caller is told so, rather than being answered as though a delete
         // had happened.
         //
-        // The miss is reported as the read reports it: the lookup is by the PAIR the request
-        // named, so what is missing is that pair's record — named by the two members it was
-        // addressed by, and saying nothing about the resource's own existence, which neither
-        // call resolves.
+        // The miss is reported as the read reports it, through the one reading of which
+        // sentence a missing record earns
+        // ([`crate::service::integration_properties::table_properties_miss`]): the resolved
+        // ARN kind chooses it, so a request addressing the integration's TARGET is told the
+        // target resource is not found and every other kind is told the record the pair
+        // addresses is.
         let removed = resource
             .is_integration_leg()
             .then(|| {
@@ -213,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DeleteIntegrationTablePropertiesErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
                         message: Some(
-                            crate::state::messages::integration_table_properties_not_found(
+                            crate::service::integration_properties::table_properties_miss(
                                 &input.resource_arn,
                                 &input.table_name,
                             ),

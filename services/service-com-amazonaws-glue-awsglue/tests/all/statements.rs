@@ -23,7 +23,6 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
     messages, ComAmazonawsGlueAwsglueState, FIRST_STATEMENT_ID,
-    STATEMENT_NOT_EXECUTED_ERROR_NAME, STATEMENT_NOT_EXECUTED_MESSAGE, STATEMENT_SETTLES_AFTER,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -38,7 +37,7 @@ const MAX_CODE_LENGTH: usize = 68_000;
 /// `RUNNING`, `AVAILABLE`, `CANCELLING`, `CANCELLED`, `ERROR`, from
 /// `smithy_query shape=StatementState`).
 const STATE_WAITING: &str = "WAITING";
-const STATE_ERROR: &str = "ERROR";
+pub(crate) const STATE_AVAILABLE: &str = "AVAILABLE";
 
 /// The `SessionStatus` values a run is refused in here, of the modelled enum
 /// (`PROVISIONING`, `READY`, `FAILED`, `TIMEOUT`, `STOPPING`, `STOPPED`, from
@@ -78,8 +77,8 @@ pub(crate) fn set_session_due(engine: &Arc<engine::InMemoryEngine>, id: &str, at
     entry.settles_at = Some(at);
 }
 
-/// Put the instant the clock owes every unsettled statement of the session `id` its
-/// terminal state at `at`.
+/// Put the instant the clock owes every unsettled statement of the session `id` its next
+/// state at `at`.
 pub(crate) fn set_statement_due(engine: &Arc<engine::InMemoryEngine>, id: &str, at: SystemTime) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
@@ -93,26 +92,76 @@ pub(crate) fn set_statement_due(engine: &Arc<engine::InMemoryEngine>, id: &str, 
     }
 }
 
-/// Bring every unsettled statement of the session `id` to the instant the clock owed it
-/// its terminal state, so a suite can observe that state without sleeping for the span:
-/// the record is pulled back by the span its run recorded, which leaves the span between
-/// a statement starting and finishing the one the run recorded.
-pub(crate) fn reach_due_instant(engine: &Arc<engine::InMemoryEngine>, id: &str) {
+/// Put EVERY state the clock still owes the statements of the session `id` at `at` — the one
+/// a statement is owed next, and the one its own execution decided where that execution has
+/// already answered.
+///
+/// A statement is owed `RUNNING` and then, once its code has answered, the state that
+/// execution came to, so this is what a suite makes due to observe a statement at rest
+/// without waiting for either span.
+pub(crate) fn make_owed_statement_states_due(
+    engine: &Arc<engine::InMemoryEngine>,
+    id: &str,
+    at: SystemTime,
+) {
     let state = engine.state::<ComAmazonawsGlueAwsglueState>();
     let mut store = state.lock();
-    let entry = store
-        .session_mut(REGION, id)
-        .unwrap_or_else(|| panic!("{id} was created"));
+    let Some(entry) = store.session_mut(REGION, id) else {
+        return;
+    };
     for statement in &mut entry.statements {
-        if statement.settles_at.is_none() {
-            continue;
+        if statement.settles_at.is_some() {
+            statement.settles_at = Some(at);
         }
-        let started_on = statement
-            .started_on
-            .checked_sub(STATEMENT_SETTLES_AFTER)
-            .expect("an instant in range");
-        statement.started_on = started_on;
-        statement.settles_at = started_on.checked_add(STATEMENT_SETTLES_AFTER);
+        if statement.rests_at.is_some() {
+            statement.rests_at = Some(at);
+        }
+    }
+}
+
+/// How long a poll of a session's statements waits for one to come to rest.
+///
+/// Deliberately generous, and nothing is asserted about how long anything took: what the poll
+/// waits for is the EXECUTION the service owes the statement, performed by whichever call
+/// finds it owed, plus the states the clock then owes the statement itself. A window far
+/// longer than both is what separates a statement that has not finished YET from one that
+/// never finishes, on a host of any speed.
+pub(crate) const STATEMENT_AT_REST_DEADLINE: Duration = Duration::from_secs(180);
+
+/// How long one turn of that poll waits before reading again — the gap between two reads of a
+/// client that polls, not a span anything is expected to finish inside.
+const STATEMENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The `StatementState` values a statement never leaves again, of the modelled enum.
+const TERMINAL_STATES: [&str; 3] = ["AVAILABLE", "CANCELLED", "ERROR"];
+
+/// Read the statement `statement` of the session `id` back until it has come to REST, and
+/// answer the `Statement` it then reports.
+///
+/// The state a statement comes to rest in is owed to it by its own code's EXECUTION — which
+/// whichever call finds that execution owed performs, the run or a later read — and then by
+/// the clock, one owed span later. So the statement is polled for that CONDITION rather than
+/// assumed to have reached it by the first read, which is what a client polling a cell does;
+/// the owed spans are made due through the store on every turn rather than slept out, and a
+/// statement still in flight when the window closes fails the case instead of hanging.
+pub(crate) async fn statement_at_rest(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    id: &str,
+    statement: i64,
+) -> Value {
+    let deadline = SystemTime::now() + STATEMENT_AT_REST_DEADLINE;
+    loop {
+        make_owed_statement_states_due(engine, id, already_past());
+        let read = get(router, id, statement).await;
+        if TERMINAL_STATES.contains(&read["State"].as_str().unwrap_or_default()) {
+            return read;
+        }
+        assert!(
+            SystemTime::now() < deadline,
+            "statement {statement} of {id:?} must come to rest, and it reports {read}"
+        );
+        tokio::time::sleep(STATEMENT_POLL_INTERVAL).await;
     }
 }
 
@@ -308,8 +357,9 @@ async fn one_session_mints_statement_ids_in_submission_order() {
             id, expected,
             "case statement {index}: expected the ids to count up to {expected}, got {minted:?}"
         );
-        // The session takes the next statement once the clock has finished this one.
-        set_statement_due(&engine, session, already_past());
+        // The session takes the next statement once this one has come to rest, which its
+        // own execution and then the clock decide.
+        statement_at_rest(&router, &engine, session, id).await;
     }
 
     for (index, (id, code)) in minted.iter().zip(submitted.iter()).enumerate() {
@@ -327,8 +377,8 @@ async fn one_session_mints_statement_ids_in_submission_order() {
 // ---------------------------------------------------------------------------
 
 /// A session still actioning a statement cannot take another: the run is refused, nothing
-/// is recorded for it, and the session takes a statement again once the clock has finished
-/// the one in flight.
+/// is recorded for it, and the session takes a statement again once the one in flight has
+/// come to rest.
 #[tokio::test]
 async fn a_run_on_a_session_still_actioning_a_statement_is_refused() {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -336,8 +386,9 @@ async fn a_run_on_a_session_still_actioning_a_statement_is_refused() {
     let session = "busy";
     ready_session(&router, &engine, session).await;
 
-    let in_flight = run(&router, session, "import time; time.sleep(60)").await;
-    // The statement stays in flight for the whole span, whatever a caller does next.
+    let in_flight = run(&router, session, "print('in flight')").await;
+    // The statement stays in flight for the whole span, whatever a caller does next: the
+    // state the clock owes it next is held open.
     set_statement_due(&engine, session, far_future());
 
     for (case, code) in [
@@ -380,13 +431,13 @@ async fn a_run_on_a_session_still_actioning_a_statement_is_refused() {
         "a refused run must record no statement, got {status} with {body}"
     );
 
-    set_statement_due(&engine, session, already_past());
+    statement_at_rest(&router, &engine, session, in_flight).await;
     let next = run(&router, session, "print('taken')").await;
     assert_eq!(
         next,
         in_flight + 1,
-        "a session takes a statement again once the clock has finished the one in flight, \
-         and mints the next id for it, got {next}"
+        "a session takes a statement again once the one in flight has come to rest, and \
+         mints the next id for it, got {next}"
     );
 }
 
@@ -575,17 +626,17 @@ async fn an_address_nothing_holds_is_a_miss() {
 // The state the clock owes
 // ---------------------------------------------------------------------------
 
-/// A statement leaves `WAITING` when the clock owes it its terminal state, and not before:
-/// while the due instant is ahead every read reports it still waiting, and once it is past
-/// every read reports the same terminal record, carrying the output of a statement nothing
-/// ran.
+/// A statement leaves `WAITING` when the clock owes it its next state, and not before: while
+/// the due instant is ahead every read reports it still waiting, and once every state it is
+/// owed has fallen due every read reports the same record — the state its own execution came
+/// to, with that execution's output on it.
 #[tokio::test]
-async fn the_clock_owes_every_statement_its_terminal_state() {
+async fn the_clock_owes_every_statement_the_state_its_execution_came_to() {
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(engine.clone());
     let session = "owed";
     ready_session(&router, &engine, session).await;
-    let id = run(&router, session, "spark.sql('SELECT 1').show()").await;
+    let id = run(&router, session, "print('owed')").await;
 
     // Before the due instant: reading does not move the statement, however often.
     set_statement_due(&engine, session, far_future());
@@ -599,14 +650,12 @@ async fn the_clock_owes_every_statement_its_terminal_state() {
         );
     }
 
-    // At the due instant: the state the clock owed it, which for a statement no runtime
-    // ran is the modelled error state carrying the reason.
-    reach_due_instant(&engine, session);
-    let settled = get(&router, session, id).await;
+    // Once every owed state has fallen due: the state the statement's own execution came to.
+    let settled = statement_at_rest(&router, &engine, session, id).await;
     assert_eq!(
         settled["State"].as_str(),
-        Some(STATE_ERROR),
-        "expected {STATE_ERROR} once the span has elapsed, got {settled}"
+        Some(STATE_AVAILABLE),
+        "expected {STATE_AVAILABLE} for code that ran to its end, got {settled}"
     );
     let output = settled
         .get("Output")
@@ -614,38 +663,35 @@ async fn the_clock_owes_every_statement_its_terminal_state() {
         .unwrap_or_else(|| panic!("a finished statement reports an Output, got {settled}"));
     assert_eq!(
         output["Status"].as_str(),
-        Some(STATE_ERROR),
+        Some(STATE_AVAILABLE),
         "the output status must be the state the statement came to rest in, got {output}"
     );
     assert_eq!(
-        output["ErrorName"].as_str(),
-        Some(STATEMENT_NOT_EXECUTED_ERROR_NAME),
-        "the output must name the error, got {output}"
-    );
-    assert_eq!(
-        output["ErrorValue"].as_str(),
-        Some(STATEMENT_NOT_EXECUTED_MESSAGE),
-        "the output must state why the statement produced nothing, got {output}"
+        output.pointer("/Data/TextPlain").and_then(Value::as_str),
+        Some("owed\n"),
+        "the output must carry what the code itself wrote, got {output}"
     );
     assert!(
-        output.get("Data").is_none_or(Value::is_null),
-        "a statement that ran no code reports no output data, got {output}"
+        output.get("ErrorName").is_none_or(Value::is_null),
+        "code that failed at nothing reports no error name, got {output}"
+    );
+    assert!(
+        output.get("ErrorValue").is_none_or(Value::is_null),
+        "code that failed at nothing reports no error value, got {output}"
     );
     let started_on = settled["StartedOn"].as_i64().unwrap_or_default();
     let completed_on = settled["CompletedOn"].as_i64().unwrap_or_default();
-    let span = i64::try_from(STATEMENT_SETTLES_AFTER.as_millis()).expect("a span in range");
     assert!(
         started_on > 0,
         "expected a StartedOn instant, got {settled}"
     );
-    assert_eq!(
-        completed_on - started_on,
-        span,
-        "expected the statement to complete the span after it started, got {started_on} \
-         then {completed_on}"
+    assert!(
+        completed_on > started_on,
+        "expected the statement to complete after it started, got {started_on} then \
+         {completed_on}"
     );
 
-    // The terminal state was owed by the CLOCK: reading again reports the same record.
+    // Both states were owed by the CLOCK: reading again reports the same record.
     for read_number in 1..=3 {
         let again = get(&router, session, id).await;
         assert_eq!(

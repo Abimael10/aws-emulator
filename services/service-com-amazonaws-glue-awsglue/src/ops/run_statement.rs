@@ -14,9 +14,21 @@
 //! `IllegalSessionStateException`), and when a statement of that session has not finished
 //! yet (its modelled `InvalidInputException`, which is the refusal this service is recorded
 //! answering a session still actioning a statement with). The statement itself is recorded
-//! in `WAITING` with its terminal state due [`crate::state::STATEMENT_SETTLES_AFTER`] out,
-//! so a caller that runs a second statement straight after this one still observes the
-//! session busy.
+//! in `WAITING` with `RUNNING` due [`crate::state::STATEMENT_SETTLES_AFTER`] out, so a
+//! caller that runs a second statement straight after this one still observes the session
+//! busy.
+//!
+//! Submitting a statement is also what STARTS it: the code is handed to a task of this
+//! process, which runs it on the session's Spark runtime and records what that execution came
+//! to ([`crate::state::perform_owed_session_statements`]) — so this call is not held for as
+//! long as the code takes, and a client polling `GetStatement` observes the statement while
+//! its code is in flight and then the state its own execution came to.
+//!
+//! `Code` is CALLER-SUPPLIED code and it never reaches this host: it is run only inside the
+//! contained, bounded interpreter this workspace embeds, whose containment and bounds that
+//! module states ([`crate::state::statement_execution`]). This handler decides whether a
+//! statement is TAKEN at all and hands it off; it applies no host capability to the code and
+//! gives it nothing of the request but the code itself.
 //!
 //! ## Shape of an operation
 //!
@@ -188,77 +200,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the id together are the whole address this run resolves.
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        let Some(session) = store.session_mut(&region, &input.session_id) else {
-            return Err(RunStatementErrorModeled::EntityNotFoundException(
-                EntityNotFoundException {
-                    // This operation words its session miss with the service's fixed,
-                    // generic entity sentence, which has no variable part: the id that
-                    // resolved to nothing is NOT named, where the session read and the
-                    // statement-listing surface each name it their own way.
-                    message: Some(
-                        crate::state::messages::RUN_STATEMENT_SESSION_NOT_FOUND.to_string(),
-                    ),
-                    from_federation_source: None,
-                },
-            )
-            .into());
+        // The whole decision is taken under ONE guard, in a scope of its own, so no guard is
+        // held across the hand-off below. What leaves the scope is the id the session minted.
+        let id = {
+            let mut store = state.lock();
+            let Some(session) = store.session_mut(&region, &input.session_id) else {
+                return Err(RunStatementErrorModeled::EntityNotFoundException(
+                    EntityNotFoundException {
+                        // This operation words its session miss with the service's fixed,
+                        // generic entity sentence, which has no variable part: the id that
+                        // resolved to nothing is NOT named, where the session read and the
+                        // statement-listing surface each name it their own way.
+                        message: Some(
+                            crate::state::messages::RUN_STATEMENT_SESSION_NOT_FOUND.to_string(),
+                        ),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            };
+            // The only writes made before a statement is recorded are the ones the clock had
+            // already made due: the session's own status, and the state of every statement it
+            // was owed. Both decide whether this run can be taken, so both are materialised
+            // first rather than judged from a stale record.
+            session.settle_if_due(now);
+            session.settle_due_statements(now);
+
+            // "The period in which a remote Spark runtime environment is running": a session
+            // still being provisioned, or one its own timeout has ended, has no runtime to
+            // take code, so the run is refused instead of recording a statement nothing could
+            // ever action.
+            if session.status != crate::state::SESSION_STATUS_READY {
+                return Err(RunStatementErrorModeled::IllegalSessionStateException(
+                    IllegalSessionStateException {
+                        message: Some(crate::state::messages::session_not_ready(
+                            &input.session_id,
+                            &session.status,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // One runtime actions one statement at a time, so a session still actioning one
+            // cannot take another. The recorded refusal for that is this operation's
+            // `InvalidInputException` rather than the `SessionBusyException` the model also
+            // declares for it, and it names the statement the caller is waiting on.
+            if let Some(in_flight) = session
+                .statements
+                .iter()
+                .find(|statement| !statement.is_terminal())
+                .map(|statement| statement.id)
+            {
+                return Err(RunStatementErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::messages::session_busy_with_statement(
+                            &input.session_id,
+                            in_flight,
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+
+            // "Returns the Id of the statement that was run": the id the session minted for
+            // the record just written, so this answer and every later read of that statement
+            // agree.
+            let id = session.run_statement(&input.code, now);
+            ::tracing::info!(
+                operation = "RunStatement",
+                region = %region,
+                session = %input.session_id,
+                statement = id,
+                "recorded a statement on a Glue interactive session"
+            );
+            id
         };
-        // The only writes made before a statement is recorded are the ones the clock had
-        // already made due: the session's own status, and the terminal state of every
-        // statement it was owed. Both decide whether this run can be taken, so both are
-        // materialised first rather than judged from a stale record.
-        session.settle_if_due(now);
-        session.settle_due_statements(now);
 
-        // "The period in which a remote Spark runtime environment is running": a session
-        // still being provisioned, or one its own timeout has ended, has no runtime to
-        // take code, so the run is refused instead of recording a statement nothing could
-        // ever action.
-        if session.status != crate::state::SESSION_STATUS_READY {
-            return Err(RunStatementErrorModeled::IllegalSessionStateException(
-                IllegalSessionStateException {
-                    message: Some(crate::state::messages::session_not_ready(
-                        &input.session_id,
-                        &session.status,
-                    )),
-                },
-            )
-            .into());
-        }
-        // One runtime actions one statement at a time, so a session still actioning one
-        // cannot take another. The recorded refusal for that is this operation's
-        // `InvalidInputException` rather than the `SessionBusyException` the model also
-        // declares for it, and it names the statement the caller is waiting on.
-        if let Some(in_flight) = session
-            .statements
-            .iter()
-            .find(|statement| !statement.is_terminal())
-            .map(|statement| statement.id)
-        {
-            return Err(RunStatementErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(crate::state::messages::session_busy_with_statement(
-                        &input.session_id,
-                        in_flight,
-                    )),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        }
-
-        // "Returns the Id of the statement that was run": the id the session minted for
-        // the record just written, so this answer and every later read of that statement
-        // agree.
-        let id = session.run_statement(&input.code, now);
-        ::tracing::info!(
-            operation = "RunStatement",
-            region = %region,
-            session = %input.session_id,
-            statement = id,
-            "recorded a statement on a Glue interactive session"
-        );
+        // The statement's own code is PERFORMED here, with no store guard held: it is handed
+        // to a task of this process and nothing of it is awaited, so this call answers while
+        // the code runs ([`crate::state::perform_owed_session_statements`]).
+        //
+        // `Code` is caller-supplied code, and it never reaches this host: it is run ONLY inside
+        // the contained interpreter this workspace embeds — host-reaching features compiled
+        // out, native modules an allow-list, every host call of the operating-system modules it
+        // supplies refused — and bounded there by a latched deadline and step budget, a memory,
+        // recursion and output ceiling, a ceiling on the host time one run may take and a
+        // permit on how many run at once (see that module's Containment and Bounds). The only
+        // way out of it is the AWS SDK seam, whose requests this emulator signs as a session of
+        // this session's `Role` and dispatches over its own in-process callback. Nothing of
+        // this handler's own is handed to the code.
+        crate::state::perform_owed_session_statements(
+            &*self.engine,
+            ctx,
+            &region,
+            &input.session_id,
+        )
+        .await;
 
         Ok(RunStatementOutput { id })
     }

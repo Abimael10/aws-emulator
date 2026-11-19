@@ -333,11 +333,10 @@ async fn a_target_table_name_must_be_a_table_identifier() {
         );
         assert_eq!(
             error_message(&read_body),
-            format!(
-                "Failed to find the sourceTableProperties with sourceArn {resource_arn} and \
-                 tableName {table}"
-            ),
-            "case {case}: expected the miss of the pair the request named, got {read_body}"
+            // The ARN here addresses the integration's TARGET — a Glue database — so the miss
+            // of the pair reports that target resource, as every miss on that leg does.
+            format!("The target resource {resource_arn} is not found."),
+            "case {case}: expected the miss the target leg earns, got {read_body}"
         );
     }
 }

@@ -36,15 +36,14 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::job_runs::{already_past, far_future};
-use crate::statements::{get, ready_session, reach_due_instant, run, set_statement_due};
+use crate::job_runs::far_future;
+use crate::statements::{get, ready_session, run, set_statement_due, statement_at_rest, STATE_AVAILABLE};
 use crate::wire::{call, call_in_region, emulator_on, error_code, error_message, ok, REGION};
 
 /// The `StatementState` values this suite observes, of the modelled enum (`WAITING`,
 /// `RUNNING`, `AVAILABLE`, `CANCELLING`, `CANCELLED`, `ERROR`, from
 /// `smithy_query shape=StatementState`).
 const STATE_WAITING: &str = "WAITING";
-const STATE_ERROR: &str = "ERROR";
 
 /// An emulator plus the engine it runs on, so a suite can write the instants and the hold
 /// order the rows turn on instead of waiting for them.
@@ -74,6 +73,9 @@ fn seed_statements(engine: &Arc<engine::InMemoryEngine>, session: &str, ids: &[i
         .map(|id| {
             let mut statement = StatementEntry::run(*id, &code_for(*id), now);
             statement.settles_at = Some(far_future());
+            // A SEEDED record is not a statement anybody submitted: this suite is about the
+            // order a listing reports, so no execution is owed for one.
+            statement.awaiting_execution = false;
             statement
         })
         .collect();
@@ -189,9 +191,10 @@ async fn runs_are_listed_oldest_first_with_the_single_statement_projection() {
 
         let mut minted = Vec::new();
         for index in 0..*count {
-            minted.push(run(&router, session, &format!("print({index})")).await);
-            // The session takes the next statement once the clock has finished this one.
-            set_statement_due(&engine, session, already_past());
+            let id = run(&router, session, &format!("print({index})")).await;
+            minted.push(id);
+            // The session takes the next statement once this one has come to rest.
+            statement_at_rest(&router, &engine, session, id).await;
         }
 
         let page = list(&router, session, None).await;
@@ -531,7 +534,7 @@ async fn listing_statements_reports_the_state_the_clock_owes_and_changes_nothing
     let (router, engine) = emulator_with_engine();
     let session = "settling";
     ready_session(&router, &engine, session).await;
-    let in_flight = run(&router, session, "spark.sql('SELECT 1').show()").await;
+    let in_flight = run(&router, session, "print('settling')").await;
     // The statement stays in flight for the whole span, whatever a caller reads.
     set_statement_due(&engine, session, far_future());
 
@@ -569,10 +572,10 @@ async fn listing_statements_reports_the_state_the_clock_owes_and_changes_nothing
         "case \"nothing due\": the refusal must still name the statement in flight, got {body}"
     );
 
-    // Once the clock owes the terminal state, the listing reports it — and keeps reporting
-    // the same thing, so the listing materialises what was due rather than moving a
-    // statement because it was read.
-    reach_due_instant(&engine, session);
+    // Once every state the statement is owed has fallen due, the listing reports the state
+    // its own execution came to — and keeps reporting the same thing, so the listing
+    // materialises what was due rather than moving a statement because it was read.
+    statement_at_rest(&router, &engine, session, in_flight).await;
     let settled = list(&router, session, None).await;
     let again = list(&router, session, None).await;
     assert_eq!(
@@ -583,9 +586,9 @@ async fn listing_statements_reports_the_state_the_clock_owes_and_changes_nothing
     for statement in listed_statements(&settled) {
         assert_eq!(
             statement["State"].as_str(),
-            Some(STATE_ERROR),
-            "case \"the terminal state fell due\": expected the state the clock owed, got \
-             {statement}"
+            Some(STATE_AVAILABLE),
+            "case \"the terminal state fell due\": expected the state the execution came to, \
+             got {statement}"
         );
         assert!(
             statement["CompletedOn"].as_i64().unwrap_or_default()

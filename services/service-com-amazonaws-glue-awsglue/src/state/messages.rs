@@ -1164,9 +1164,9 @@ pub fn registry_not_found_for_schema(name: &str) -> String {
 /// the resource it belongs to, for a `ResourceArn` this account holds no such record
 /// for — the integration resource property read
 /// (`GetIntegrationResourceProperty`), the resource miss of an integration table
-/// properties write, and the miss of a read or a delete of integration table properties
-/// whose resource carries none at all
-/// ([`ComAmazonawsGlueAwsglueState::integration_table_properties_miss`]). RECORDED template: the sentence is fixed around its one variable
+/// properties write, and the miss of any of them whose `ResourceArn` addresses the
+/// integration's TARGET — the Glue database it replicates into
+/// ([`crate::service::integration_properties::table_properties_miss`]). RECORDED template: the sentence is fixed around its one variable
 /// part, the ARN the request addressed, taken verbatim from `ResourceArn`; what is
 /// pinned is the behaviour — `EntityNotFoundException`.
 pub fn target_resource_not_found(resource_arn: &str) -> String {
@@ -1184,11 +1184,10 @@ pub const INTEGRATION_PROCESSING_PROPERTIES_REQUIRED: &str =
          in the request.";
 
 /// An operation that addresses ONE integration table property record
-/// (`GetIntegrationTableProperties`, `DeleteIntegrationTableProperties`) for a
-/// `TableName` whose `ResourceArn` carries integration table properties of OTHER tables
-/// but none of that pair; a resource carrying none at all earns
-/// [`target_resource_not_found`] instead
-/// ([`ComAmazonawsGlueAwsglueState::integration_table_properties_miss`]). Recorded
+/// (`GetIntegrationTableProperties`, `DeleteIntegrationTableProperties`) for a pair this
+/// account holds no record for, where the `ResourceArn` does NOT address the integration's
+/// target; one that does earns [`target_resource_not_found`] instead
+/// ([`crate::service::integration_properties::table_properties_miss`]). Recorded
 /// template: the fixed text around the two
 /// members the request addressed the record by, which the service names `sourceArn` and
 /// `tableName`, and no trailing period.

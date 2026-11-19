@@ -28,6 +28,16 @@
 //! the delete carries the sentence the integration table property operations carry — so the
 //! three sentences live beside each other here rather than one being borrowed for all three.
 //!
+//! A MISSING record is worded by the resolved ARN KIND, from a vocabulary of two sentences: the
+//! miss of the stored RECORD, and the miss of the integration's TARGET RESOURCE. Which kinds
+//! earn which is each SURFACE's own, because that is how each of them is recorded — the read of
+//! a resource property gives the record sentence to the connection of the source alone
+//! ([`read_resource_property_miss`]), while its delete and both table-property surfaces give the
+//! target sentence to the Glue database of the target alone
+//! ([`removed_resource_property_miss`], [`table_properties_miss`]). Within one surface nothing
+//! but the kind chooses, which is what makes the read after a delete and the repeat delete of
+//! one ARN agree.
+//!
 //! The file sits with the rest of this service's state; it is DECLARED from `src/service.rs`
 //! (hence its module path), for the reason the declaration of
 //! [`crate::service::partition_indexes`] gives there.
@@ -98,14 +108,19 @@ pub fn names_a_glue_resource(resource_arn: &str) -> bool {
 /// The miss a READ of an integration resource property answers for a `ResourceArn` this
 /// account holds no record for.
 ///
-/// RECORDED behaviour: two sentences, chosen by the LEG the ARN names. The SOURCE of an
+/// RECORDED behaviour: two sentences, chosen by the resolved ARN KIND. The SOURCE of an
 /// integration is addressed by its Glue connection's ARN, and that miss names the RECORD the
-/// lookup did not find ([`resource_property_not_found`]); every other value is read as the
-/// integration's TARGET — the Glue database it writes into — and that miss names the target
-/// RESOURCE ([`messages::target_resource_not_found`], the sentence this service answers
-/// wherever a target does not resolve), whether or not the value could name a target at all.
-/// Each is a template whose one variable part is the ARN the request addressed, taken from
-/// `ResourceArn`.
+/// lookup did not find ([`resource_property_not_found`]); EVERY OTHER kind this read resolves —
+/// the Glue database of the target, and a Data Catalog table's own ARN, which is recorded
+/// answering this sentence too — names the target RESOURCE
+/// ([`messages::target_resource_not_found`], the sentence this service answers wherever a
+/// target does not resolve). Each is a template whose one variable part is the ARN the request
+/// addressed, taken from `ResourceArn`.
+///
+/// The kind SET each sentence covers is this READ's own: the delete of the same record covers a
+/// table ARN with the other sentence ([`removed_resource_property_miss`]), which is what each of
+/// the two is recorded answering, so the split is per surface and deliberate rather than one of
+/// them being wrong.
 pub fn read_resource_property_miss(resource_arn: &str) -> String {
     let addresses_the_source = integration_resource_reference(resource_arn)
         .is_ok_and(|resource| matches!(resource.kind, TaggedResourceKind::Connection));
@@ -119,12 +134,57 @@ pub fn read_resource_property_miss(resource_arn: &str) -> String {
 /// The miss a DELETE of an integration resource property answers for a `ResourceArn` this
 /// account holds no record for.
 ///
-/// RECORDED behaviour: ONE sentence, whatever the ARN names — the delete is asked to remove a
-/// record, so what it reports is the record it did not find, and it resolves no target to
-/// report instead. That is what makes it word the same miss differently from the read above,
-/// which reports the target it resolved.
+/// RECORDED behaviour: the same two sentences the read above chooses between, chosen by the
+/// resolved ARN KIND, over a different kind set. The integration's TARGET is addressed by the
+/// Glue DATABASE ARN it writes into ([`addresses_the_integration_target`]), and that miss names
+/// the target RESOURCE ([`messages::target_resource_not_found`]); every other Glue ARN — the
+/// connection ARN of the source, and a Data Catalog table's own ARN, which this surface is
+/// recorded answering with the record sentence where the read answers with the target one —
+/// earns the miss of the RECORD the delete was asked to remove
+/// ([`resource_property_not_found`]). Each is a template whose one variable part is the ARN the
+/// request addressed, taken from `ResourceArn`.
+///
+/// So WITHIN one surface it is the kind and nothing else that chooses, which is what makes the
+/// read after a delete and the repeat delete of the same ARN agree; WHICH kinds earn which
+/// sentence is each surface's own, as recorded.
 pub fn removed_resource_property_miss(resource_arn: &str) -> String {
-    resource_property_not_found(resource_arn)
+    if addresses_the_integration_target(resource_arn) {
+        messages::target_resource_not_found(resource_arn)
+    } else {
+        resource_property_not_found(resource_arn)
+    }
+}
+
+/// Whether `resource_arn` addresses the integration's TARGET: the Glue database an
+/// integration replicates INTO.
+///
+/// "The connection ARN of the source, or the database ARN of the target"
+/// (`CreateIntegrationResourcePropertyRequest$ResourceArn`) — so of the ARN kinds these
+/// operations resolve, the Glue DATABASE is the target leg, and a refusal that reports the
+/// TARGET RESOURCE rather than the record is the one a request addressing that leg earns.
+fn addresses_the_integration_target(resource_arn: &str) -> bool {
+    integration_resource_reference(resource_arn)
+        .is_ok_and(|resource| matches!(resource.kind, TaggedResourceKind::Database))
+}
+
+/// The miss an operation that addresses ONE integration TABLE PROPERTY record answers for a
+/// `(ResourceArn, TableName)` pair this account holds no record for — the read
+/// (`GetIntegrationTableProperties`) and the delete (`DeleteIntegrationTableProperties`), which
+/// word it identically.
+///
+/// RECORDED behaviour: the same choice by resolved ARN kind
+/// ([`removed_resource_property_miss`]) — a request addressing the integration's TARGET, the
+/// Glue database it replicates into, is answered with the target RESOURCE not being found,
+/// while every other ARN kind earns the miss of the stored record, named by the two members
+/// the request addressed it by ([`messages::integration_table_properties_not_found`]). The ONE
+/// reading of that rule, so the read and the delete of one record cannot disagree about the
+/// miss a request earns.
+pub fn table_properties_miss(resource_arn: &str, table_name: &str) -> String {
+    if addresses_the_integration_target(resource_arn) {
+        messages::target_resource_not_found(resource_arn)
+    } else {
+        messages::integration_table_properties_not_found(resource_arn, table_name)
+    }
 }
 
 /// The sentence a miss of the RECORD carries: the lookup this surface makes in the

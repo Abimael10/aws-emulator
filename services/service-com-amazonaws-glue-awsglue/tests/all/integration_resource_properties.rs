@@ -52,12 +52,12 @@ pub(crate) fn connection_arn(name: &str) -> String {
 }
 
 /// The ARN of the Glue database `name`, the same way.
-fn database_arn(name: &str) -> String {
+pub(crate) fn database_arn(name: &str) -> String {
     format!("arn:aws:glue:{REGION}:{ACCOUNT_ID}:database/{name}")
 }
 
 /// Register a Glue connection, the resource a source's properties belong to.
-async fn create_connection(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_connection(router: &MultiServiceRouter, name: &str) {
     ok(
         router,
         "CreateConnection",
@@ -76,7 +76,7 @@ async fn create_connection(router: &MultiServiceRouter, name: &str) {
 }
 
 /// Register a Glue database, the resource a target's properties belong to.
-async fn create_database(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_database(router: &MultiServiceRouter, name: &str) {
     ok(
         router,
         "CreateDatabase",
@@ -437,15 +437,50 @@ fn read_miss_message(resource_arn: &str, names_the_source: bool) -> String {
     if names_the_source {
         record_miss_message(resource_arn)
     } else {
-        format!("The target resource {resource_arn} is not found.")
+        target_miss_message(resource_arn)
     }
+}
+
+/// The sentence a miss of the TARGET RESOURCE carries, around its one variable part — the ARN
+/// the request addressed. Written here independently of the handler, so the suite pins the
+/// wording and not the code.
+pub(crate) fn target_miss_message(resource_arn: &str) -> String {
+    format!("The target resource {resource_arn} is not found.")
+}
+
+/// The sentence a DELETE answers for a `ResourceArn` this account holds no record under.
+///
+/// RECORDED behaviour: the resolved ARN KIND chooses between the same two sentences the read
+/// chooses between. The integration's TARGET is addressed by a Glue DATABASE ARN — "the
+/// connection ARN of the source, or the database ARN of the target"
+/// (`smithy_query shape=CreateIntegrationResourcePropertyRequest member=ResourceArn`) — so a
+/// delete addressing that leg reports the target resource, while every other Glue ARN earns
+/// the miss of the RECORD the delete was asked to remove.
+pub(crate) fn delete_miss_message(resource_arn: &str) -> String {
+    if addresses_the_integration_target(resource_arn) {
+        target_miss_message(resource_arn)
+    } else {
+        record_miss_message(resource_arn)
+    }
+}
+
+/// Whether the value is a Glue ARN whose resource portion names a DATABASE, which is the leg
+/// an integration's TARGET is addressed by — read here from the value's own text, so the
+/// expectation does not go through the code under test.
+pub(crate) fn addresses_the_integration_target(resource_arn: &str) -> bool {
+    resource_arn.contains(":glue:")
+        && resource_arn.rsplit(':').next().is_some_and(|resource| {
+            resource
+                .strip_prefix("database/")
+                .is_some_and(|name| !name.is_empty())
+        })
 }
 
 /// The sentence a miss of the RECORD carries: the lookup this surface makes in the
 /// per-resource namespace it keeps, named as the service names it, around its one variable
-/// part — the ARN the request addressed the record by. It is the whole of what a DELETE
-/// answers for a `ResourceArn` this account holds no record under (the delete resolves no
-/// target to report instead), and the sentence a READ answers for the SOURCE leg.
+/// part — the ARN the request addressed the record by. It is what a READ answers for the
+/// SOURCE leg, and what a DELETE answers for every ARN kind but the Glue database the
+/// integration's target is addressed by ([`delete_miss_message`]).
 /// Written here independently of the handler, so the suites pin the wording and not the code,
 /// and shared with [`crate::integration_resource_property_delete_misses`] so they cannot
 /// disagree about it.
@@ -759,7 +794,7 @@ async fn a_resource_arn_naming_no_connection_or_database_is_refused() {
                     "ValidationException"
                 },
                 if in_glue_namespace {
-                    record_miss_message(&resource_arn)
+                    delete_miss_message(&resource_arn)
                 } else {
                     format!("Encountered invalid resource arn {resource_arn}")
                 },
@@ -1127,7 +1162,7 @@ async fn deleting_an_integration_resource_property_removes_only_the_record_it_na
         );
         let expected = match expected_message {
             Some(prefix) => format!("{prefix} {resource_arn}"),
-            None => record_miss_message(&resource_arn),
+            None => delete_miss_message(&resource_arn),
         };
         assert_eq!(
             error_message(&body),
@@ -1156,17 +1191,19 @@ fn local_glue_arn(resource: &str) -> String {
     crate::resource_tagging::glue_arn(REGION, ACCOUNT_ID, resource)
 }
 
-/// A delete of ONE record is answered from the record store alone: it resolves no target
-/// resource and rejects no resource KIND, so every value this service reads as an ARN of one
-/// of its own resources reaches the lookup, and one no record is keyed under is the modelled
-/// `EntityNotFoundException` carrying the delete's own record-miss sentence — whatever
-/// resource kind the ARN names, and whether or not this account holds that resource.
+/// A delete of ONE record is answered from the record store alone: it rejects no resource
+/// KIND, so every value this service reads as an ARN of one of its own resources reaches the
+/// lookup, and one no record is keyed under is the modelled `EntityNotFoundException` — whose
+/// SENTENCE is chosen by the resolved ARN kind ([`delete_miss_message`]): the Glue database
+/// ARN the integration's target is addressed by reports that target resource, and every other
+/// kind reports the record the delete was asked to remove, whether or not this account holds
+/// the resource.
 ///
 /// The rows differ along which Glue resource kind the ARN names, whether that resource is
 /// held, which account, Region and partition the ARN carries, and the form of its resource
 /// portion.
 #[tokio::test]
-async fn a_delete_of_any_glue_arn_with_no_record_is_the_record_miss() {
+async fn a_delete_of_any_glue_arn_with_no_record_is_refused_as_its_kind_is_worded() {
     let router = emulator();
 
     // Resources this account really holds, so the rows naming them are a missing RECORD and
@@ -1272,9 +1309,9 @@ async fn a_delete_of_any_glue_arn_with_no_record_is_the_record_miss() {
         );
         assert_eq!(
             error_message(&body),
-            record_miss_message(resource_arn),
+            delete_miss_message(resource_arn),
             "case {case}: expected {:?}, got {:?}",
-            record_miss_message(resource_arn),
+            delete_miss_message(resource_arn),
             error_message(&body)
         );
     }

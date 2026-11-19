@@ -161,10 +161,17 @@ async fn delete_properties(
 
 /// The refusal wording a read or a delete of ONE record carries when it reaches none.
 ///
-/// RECORDED template, and ONE sentence whatever the resource carries: the lookup is by the
-/// PAIR the request named, so what the refusal names is that pair's record — the two members
-/// it was addressed by — and not the resource, whose own existence neither call resolves.
+/// RECORDED behaviour: the sentence is chosen by the resolved ARN KIND. A Glue DATABASE ARN
+/// addresses the integration's TARGET — "the same API need to be invoked with the Glue
+/// connection ARN as ResourceArn with SourceTableConfig, and the Glue database ARN as
+/// ResourceArn with TargetTableConfig respectively" — and its miss reports that target
+/// resource; every other kind earns the miss of the stored record, named by the two members
+/// the request addressed it by. Written here independently of the handler, so the suite pins
+/// the wording and not the code.
 fn miss_message(resource_arn: &str, table: &str) -> String {
+    if crate::integration_resource_properties::addresses_the_integration_target(resource_arn) {
+        return crate::integration_resource_properties::target_miss_message(resource_arn);
+    }
     format!(
         "Failed to find the sourceTableProperties with sourceArn {resource_arn} and tableName \
          {table}"

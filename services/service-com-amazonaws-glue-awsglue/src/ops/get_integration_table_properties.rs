@@ -217,12 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetIntegrationTablePropertiesErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        // The lookup is by the PAIR the request named, so what is missing is
-                        // that pair's record: the miss names the two members it was addressed
-                        // by and reports nothing about the resource's own existence, which
-                        // this read never resolves.
+                        // The lookup is by the PAIR the request named, and which sentence its
+                        // miss carries is chosen by the resolved ARN kind, through the one
+                        // reading the delete of a record goes through too
+                        // ([`crate::service::integration_properties::table_properties_miss`]).
                         message: Some(
-                            crate::state::messages::integration_table_properties_not_found(
+                            crate::service::integration_properties::table_properties_miss(
                                 &input.resource_arn,
                                 &input.table_name,
                             ),

@@ -172,6 +172,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the session id and the statement id together are the whole address this read
         // resolves.
         let region = crate::state::request_region(ctx.parts());
+        // The EXECUTION a statement of this session is still owed was owed the instant that
+        // statement was submitted, whoever submitted it, so this read hands off what was
+        // already owed before it reports — exactly as a read of a job's runs performs the
+        // script a run was owed ([`crate::state::perform_owed_session_statements`]). The code
+        // is run only inside the contained, bounded interpreter that module states the
+        // containment and the bounds of; this read applies no host capability to it. Awaited
+        // with no store guard held; nothing of the code itself is waited for.
+        crate::state::perform_owed_session_statements(
+            &*self.engine,
+            ctx,
+            &region,
+            &input.session_id,
+        )
+        .await;
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(session) = store.session_mut(&region, &input.session_id) else {
