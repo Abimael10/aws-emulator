@@ -27,9 +27,10 @@
 //! The tables vary what the rules generalise over: every
 //! `ConfiguredTableAssociationAnalysisRuleType` the model declares, both forms a
 //! `configuredTableAssociationIdentifier` takes, how many associations the membership
-//! holds, which of them is addressed, and the operation reporting the ARN (the association
-//! create, its read, the list, and the analysis-rule create and read). Every request goes
-//! over the wire through the same `MultiServiceRouter` the production router uses.
+//! holds, how many rule types one association holds, which of them is addressed, and the
+//! operation reporting the ARN (the association create, its read, the list, and the
+//! analysis-rule create and read). Every request goes over the wire through the same
+//! `MultiServiceRouter` the production router uses.
 
 use serde_json::{json, Value};
 
@@ -561,4 +562,149 @@ async fn an_analysis_rule_delete_outside_the_membership_is_not_found() {
         status, 200,
         "expected the stored rule to survive every refused delete, got {status} with {kept}"
     );
+}
+
+#[tokio::test]
+async fn a_delete_drops_one_type_of_an_association_holding_several() {
+    // One association holds a rule of EVERY type the model's catalog declares, so the
+    // delete has siblings on the very resource it addresses to leave alone. The rows vary
+    // which type the delete addresses and which form of the identifier addresses it.
+    for deleted in ALL_RULE_TYPES {
+        for form in 0..2 {
+            let emulator = Emulator::new();
+            let held = fixture(&emulator, &format!("ruleset-{deleted}-{form}"), 2).await;
+            let association = &held.associations[1];
+            let (addressed_by, identifier) = identifier_forms(association)[form];
+            let case = format!("deleting {deleted}, addressed by {addressed_by}");
+
+            // Every type, created in catalog order, each with its own policy shape so a
+            // surviving rule cannot be mistaken for another.
+            let mut stored: Vec<(&str, Value)> = Vec::new();
+            for rule_type in ALL_RULE_TYPES {
+                let (status, created) = emulator
+                    .create_association_analysis_rule(
+                        &held.membership_id,
+                        identifier,
+                        rule_type,
+                        association_policy(rule_type, Some(&[OTHER_RESULT_RECEIVER]), None),
+                    )
+                    .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the {rule_type} create to be accepted, got \
+                     {status} with {created}"
+                );
+                stored.push((rule_type, created["analysisRule"].clone()));
+            }
+            let (status, before) = emulator
+                .read_association(&held.membership_id, &association.id)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected GetConfiguredTableAssociation 200, got {status} with \
+                 {before}"
+            );
+            assert_eq!(
+                before["configuredTableAssociation"]["analysisRuleTypes"],
+                json!(ALL_RULE_TYPES),
+                "case {case:?}: expected the association to hold every created type, got {}",
+                before["configuredTableAssociation"]["analysisRuleTypes"]
+            );
+
+            let (status, error_type, body) = emulator
+                .delete_association_analysis_rule(&held.membership_id, identifier, deleted)
+                .await;
+            assert_no_content(&case, status, &body);
+            assert_eq!(
+                error_type, "",
+                "case {case:?}: a no-content answer names no error type, got {error_type:?}"
+            );
+
+            // Exactly the addressed triple is gone: its read is the 404 of a triple holding
+            // no rule, and every sibling type still reports the record its create persisted.
+            let (status, error_type, body) = emulator
+                .get_association_analysis_rule_with_error_type(
+                    &held.membership_id,
+                    identifier,
+                    deleted,
+                )
+                .await;
+            assert_no_such_rule(
+                &case,
+                "GetConfiguredTableAssociationAnalysisRule after the delete",
+                status,
+                &error_type,
+                &body,
+                identifier,
+                deleted,
+            );
+            for (rule_type, rule) in stored.iter().filter(|(rule_type, _)| *rule_type != deleted) {
+                let (status, read) = emulator
+                    .get_association_analysis_rule(&held.membership_id, identifier, rule_type)
+                    .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the {rule_type} rule must survive, got {status} with {read}"
+                );
+                assert_eq!(
+                    read["analysisRule"], *rule,
+                    "case {case:?}: expected the {rule_type} rule to stay {rule}, got {}",
+                    read["analysisRule"]
+                );
+            }
+
+            // The deleted type — and only it — leaves `analysisRuleTypes`; the rest keep
+            // the order they were created in.
+            let remaining: Vec<&str> = ALL_RULE_TYPES
+                .iter()
+                .copied()
+                .filter(|rule_type| *rule_type != deleted)
+                .collect();
+            let (status, after) = emulator
+                .read_association(&held.membership_id, &association.id)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected GetConfiguredTableAssociation 200, got {status} with \
+                 {after}"
+            );
+            assert_eq!(
+                after["configuredTableAssociation"]["analysisRuleTypes"],
+                json!(remaining),
+                "case {case:?}: expected the surviving types {remaining:?}, got {}",
+                after["configuredTableAssociation"]["analysisRuleTypes"]
+            );
+
+            // The delete freed the triple rather than marking it taken: a create of the
+            // same type is accepted again — no 409 — and the read reports the NEW policy,
+            // which the dropped record did not carry.
+            let replacement = association_policy(deleted, None, None);
+            let (status, recreated) = emulator
+                .create_association_analysis_rule(
+                    &held.membership_id,
+                    identifier,
+                    deleted,
+                    replacement.clone(),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create after the delete to be accepted, got \
+                 {status} with {recreated}"
+            );
+            let (status, read) = emulator
+                .get_association_analysis_rule(&held.membership_id, identifier, deleted)
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the recreated rule to be readable, got {status} with \
+                 {read}"
+            );
+            assert_eq!(
+                read["analysisRule"]["policy"], replacement,
+                "case {case:?}: expected the recreated rule to carry {replacement}, got {}",
+                read["analysisRule"]["policy"]
+            );
+        }
+    }
 }
