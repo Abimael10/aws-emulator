@@ -39,13 +39,18 @@ const EGRESS_CHANNEL: &str = "pub-channel";
 
 /// One egress row: a manifest family, a container type that serves it, and the suffix the
 /// family's URL ends in.
-struct EgressRow {
-    label: &'static str,
-    endpoint: &'static str,
-    container: &'static str,
-    family: &'static str,
-    manifest: &'static str,
-    suffix: &'static str,
+///
+/// `pub(crate)` with [`EGRESS_ROWS`], because it is the ONE catalog of this service's
+/// manifest families in this crate's suites: `published_data_plane_addressing` sweeps the
+/// announced URL of every family over the same rows rather than carrying a second copy of
+/// them, so a change to the model's container/family pairings lands in one place.
+pub(crate) struct EgressRow {
+    pub(crate) label: &'static str,
+    pub(crate) endpoint: &'static str,
+    pub(crate) container: &'static str,
+    pub(crate) family: &'static str,
+    pub(crate) manifest: &'static str,
+    pub(crate) suffix: &'static str,
 }
 
 /// Every manifest family an origin endpoint publishes a URL for, each on a container type
@@ -61,7 +66,7 @@ struct EgressRow {
 /// `ISM_CONTAINER_TYPE_WITH_DASH_MANIFEST` — which leave exactly these pairings. The HLS
 /// row is the one a recording covers; the other three are what the rule also has to hold
 /// for.
-const EGRESS_ROWS: &[EgressRow] = &[
+pub(crate) const EGRESS_ROWS: &[EgressRow] = &[
     EgressRow {
         label: "HLS on a TS endpoint",
         endpoint: "ep-hls",

@@ -16,9 +16,20 @@
 //! literal, each with a port — plus the caller that addressed one of AWS's own hostnames,
 //! which is announced the hostname this service publishes there. The resource names are not
 //! what the rule generalises over; the ADDRESS is.
+//!
+//! The manifest half of the rule is asserted along the other axes it generalises over as
+//! well, since an origin endpoint publishes a URL per manifest rather than one per resource:
+//! the manifest FAMILY (and so the container type and the URL suffix), how MANY manifests
+//! one endpoint publishes, how many endpoints a channel holds, and which of the four
+//! origin-endpoint operations re-reports the URL — the create, the read, the update and the
+//! listing, whose item shape wraps the same members one level deeper.
 
 use serde_json::{json, Value};
 
+// The manifest families are the ONE catalog of them in this crate's suites, owned (and
+// sourced from the model) by `published_data_plane_urls`, so neither suite can drift from
+// the model's container/family pairings on its own.
+use crate::published_data_plane_urls::{manifest_url, EgressRow, EGRESS_ROWS};
 use crate::rejection_rule_and_negative_paths::{encoded, grant_policy, split_url, Answer, Emulator};
 
 /// The Region every request in this suite is signed for: it travels in the SigV4 credential
@@ -82,19 +93,10 @@ async fn control(
     emulator.send(method, path, body, authority, true, &[]).await
 }
 
-/// The first `Url` of a published list member (`IngestEndpoints`, `HlsManifests`).
+/// The first `Url` of a published list member (`IngestEndpoints`, `HlsManifests`), read
+/// through the crate's existing extractor of that member shape.
 fn published_url(answer: &Answer, member: &str) -> String {
-    answer
-        .json
-        .get(member)
-        .and_then(Value::as_array)
-        .and_then(|list| list.first())
-        .and_then(|first| first.get("Url"))
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| {
-            panic!("a published {member} entry must carry a Url, got {}", answer.body)
-        })
-        .to_string()
+    manifest_url(&answer.json, member)
 }
 
 /// Build the group, channel and origin endpoint for one row, and report what the creates
@@ -407,4 +409,485 @@ async fn the_announced_address_survives_a_tag_round_trip_on_the_group() {
         "the stored manifest URL must be the one the create published, got {}",
         endpoint.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// The manifest half of the rule, along the axes an origin endpoint adds to it: the
+// manifest family, the number of manifests, the number of endpoints, and the operation
+// re-reporting the URL.
+// ---------------------------------------------------------------------------
+
+/// The channel the family rows' endpoints hang under. Its input type is `CMAF`, which every
+/// container type below is servable by.
+const FAMILY_CHANNEL: &str = "addr-families";
+
+/// A second channel holding exactly ONE endpoint, so the list-wrapped form is asserted both
+/// with many items and with one.
+const SOLO_CHANNEL: &str = "addr-solo";
+
+/// How many manifests one endpoint publishes, per row: the single-manifest shape, the
+/// multiple-manifest shape, and one beyond it — every count within
+/// `MIN_MANIFESTS_PER_ORIGIN_ENDPOINT..=MAX_MANIFESTS_PER_ORIGIN_ENDPOINT` publishes a URL
+/// of its own.
+const MANIFEST_COUNTS: &[usize] = &[1, 2, 3];
+
+/// The create/update body of an endpoint publishing `manifests` of one family.
+fn endpoint_body(row: &EgressRow, manifests: &[String]) -> Value {
+    let mut body = json!({"ContainerType": row.container});
+    body[row.family] = Value::Array(
+        manifests
+            .iter()
+            .map(|name| json!({"ManifestName": name}))
+            .collect(),
+    );
+    body
+}
+
+/// Every `(ManifestName, Url)` pair a response — or one item of a listing — carries under
+/// `member`, in the order it serialized them.
+fn published_manifests(value: &Value, member: &str) -> Vec<(String, String)> {
+    value
+        .get(member)
+        .and_then(Value::as_array)
+        .map(|manifests| {
+            manifests
+                .iter()
+                .map(|manifest| {
+                    let text = |name: &str| {
+                        manifest
+                            .get(name)
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string()
+                    };
+                    (text("ManifestName"), text("Url"))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The URL one manifest must be announced at: this service's own egress path under the
+/// address the group's data plane is announced on — the emulator's own endpoint with
+/// everything the published hostname carried moved into the path, or, for a caller that
+/// resolves AWS's own hosts, the hostname published there.
+fn announced_manifest_url(
+    row: &Addressing,
+    egress_domain: &str,
+    channel: &str,
+    endpoint: &str,
+    manifest: &str,
+    suffix: &str,
+) -> String {
+    let path = format!("/out/v1/{GROUP}/{channel}/{endpoint}/{manifest}{suffix}");
+    if row.emulators_own {
+        format!("https://{}{LOCAL_PREFIX}/{REGION}{path}", row.authority)
+    } else {
+        format!("https://{egress_domain}{path}")
+    }
+}
+
+/// What one endpoint announced, for the listing to be judged against: the endpoint's name,
+/// the member its manifests travel in, and the `(ManifestName, Url)` pairs the create
+/// published.
+struct Announced {
+    endpoint: String,
+    member: &'static str,
+    manifests: Vec<(String, String)>,
+}
+
+/// Create the group and the two channels the family rows hang under, and report the group's
+/// published egress domain.
+async fn family_fixtures(emulator: &Emulator, row: &Addressing) -> String {
+    let label = row.label;
+    let group = control(
+        emulator,
+        row.authority,
+        "POST",
+        "/channelGroup",
+        Some(json!({"ChannelGroupName": GROUP})),
+    )
+    .await;
+    assert_eq!(
+        group.status, 200,
+        "case {label:?}: CreateChannelGroup expected 200, got {} with body {}",
+        group.status, group.body
+    );
+    for channel in [FAMILY_CHANNEL, SOLO_CHANNEL] {
+        let created = control(
+            emulator,
+            row.authority,
+            "POST",
+            &format!("/channelGroup/{GROUP}/channel"),
+            Some(json!({"ChannelName": channel, "InputType": "CMAF"})),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {label:?} / {channel}: CreateChannel expected 200, got {} with body {}",
+            created.status, created.body
+        );
+    }
+    group.string("EgressDomain").to_string()
+}
+
+#[tokio::test]
+async fn every_manifest_url_is_announced_on_the_address_the_group_was_created_through() {
+    for row in ADDRESSINGS {
+        let emulator = Emulator::new();
+        let egress_domain = family_fixtures(&emulator, row).await;
+        // The address every announced URL must be rooted on: the emulator's own endpoint for
+        // a caller that reached it there, and the published hostname for one that resolves
+        // AWS's own hosts — which that caller is owed in the form this service publishes
+        // there, asserted independently of the value the group reported so the row carries
+        // an expectation of its own.
+        let expected_host = if row.emulators_own {
+            row.authority.to_string()
+        } else {
+            assert!(
+                egress_domain.contains(".egress.") && egress_domain.ends_with(".amazonaws.com"),
+                "case {:?}: a caller that resolves AWS's own hosts must be given the hostname \
+                 this service publishes there, got {egress_domain:?}",
+                row.label
+            );
+            egress_domain.clone()
+        };
+        // What the listing must re-report, per endpoint.
+        let mut expected: Vec<Announced> = Vec::new();
+        let mut announced: Vec<String> = Vec::new();
+
+        for family in EGRESS_ROWS {
+            for &count in MANIFEST_COUNTS {
+                let endpoint = format!("{}-{count}", family.endpoint);
+                let manifests: Vec<String> = (1..=count)
+                    .map(|index| format!("{}-{count}-{index}", family.manifest))
+                    .collect();
+                let case = format!(
+                    "{} / {} / {count} manifest(s)",
+                    row.label, family.label
+                );
+                let body = endpoint_body(family, &manifests);
+                let want: Vec<(String, String)> = manifests
+                    .iter()
+                    .map(|manifest| {
+                        (
+                            manifest.clone(),
+                            announced_manifest_url(
+                                row,
+                                &egress_domain,
+                                FAMILY_CHANNEL,
+                                &endpoint,
+                                manifest,
+                                family.suffix,
+                            ),
+                        )
+                    })
+                    .collect();
+
+                let created = control(
+                    &emulator,
+                    row.authority,
+                    "POST",
+                    &format!("/channelGroup/{GROUP}/channel/{FAMILY_CHANNEL}/originEndpoint"),
+                    Some({
+                        let mut create = body.clone();
+                        create["OriginEndpointName"] = json!(endpoint);
+                        create
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    created.status, 200,
+                    "case {case:?}: CreateOriginEndpoint expected 200, got {} with body {}",
+                    created.status, created.body
+                );
+                let announced_by_create = published_manifests(&created.json, family.family);
+                assert_eq!(
+                    announced_by_create, want,
+                    "case {case:?}: every manifest must be announced at this service's \
+                     egress path on {expected_host:?}, got {announced_by_create:?}"
+                );
+
+                // Each URL is its own address and names the host the group's plane is
+                // announced on — not a host in a zone AWS publishes its own endpoints in.
+                for (manifest, url) in &want {
+                    let (host, path) = split_url(url);
+                    assert_eq!(
+                        host, expected_host,
+                        "case {case:?} / {manifest}: the announced host must be the one the \
+                         group's plane is announced on, got {url:?}"
+                    );
+                    assert!(
+                        path.contains(&format!("/out/v1/{GROUP}/{FAMILY_CHANNEL}/{endpoint}/")),
+                        "case {case:?} / {manifest}: the announced path must name the group, \
+                         the channel and the endpoint, got {url:?}"
+                    );
+                    assert!(
+                        !announced.iter().any(|seen| seen == url),
+                        "case {case:?} / {manifest}: every manifest's URL must be distinct, \
+                         got {url:?} twice"
+                    );
+                    announced.push(url.clone());
+                }
+
+                // The read re-reports exactly what the create announced.
+                let endpoint_path = format!(
+                    "/channelGroup/{GROUP}/channel/{FAMILY_CHANNEL}/originEndpoint/{endpoint}"
+                );
+                let read =
+                    control(&emulator, row.authority, "GET", &endpoint_path, None).await;
+                assert_eq!(
+                    read.status, 200,
+                    "case {case:?}: GetOriginEndpoint expected 200, got {} with body {}",
+                    read.status, read.body
+                );
+                let announced_by_read = published_manifests(&read.json, family.family);
+                assert_eq!(
+                    announced_by_read, want,
+                    "case {case:?}: GetOriginEndpoint must re-report the announced URLs, got \
+                     {announced_by_read:?}"
+                );
+
+                // So does an update that reconfigures the endpoint around the same
+                // manifests: the announced address survives the modify path.
+                let updated = control(
+                    &emulator,
+                    row.authority,
+                    "PUT",
+                    &endpoint_path,
+                    Some({
+                        let mut update = body.clone();
+                        update["Description"] = json!("reconfigured");
+                        update
+                    }),
+                )
+                .await;
+                assert_eq!(
+                    updated.status, 200,
+                    "case {case:?}: UpdateOriginEndpoint expected 200, got {} with body {}",
+                    updated.status, updated.body
+                );
+                let announced_by_update = published_manifests(&updated.json, family.family);
+                assert_eq!(
+                    announced_by_update, want,
+                    "case {case:?}: UpdateOriginEndpoint must re-report the announced URLs, \
+                     got {announced_by_update:?}"
+                );
+
+                expected.push(Announced {
+                    endpoint,
+                    member: family.family,
+                    manifests: want,
+                });
+            }
+        }
+
+        // The listing wraps the same members one level deeper, and every item keeps its own
+        // endpoint's URLs. `maxResults` is raised to one page so the whole channel is
+        // compared at once (`ListOriginEndpointsRequest$MaxResults`, range 1..=100).
+        let listed = control(
+            &emulator,
+            row.authority,
+            "GET",
+            &format!(
+                "/channelGroup/{GROUP}/channel/{FAMILY_CHANNEL}/originEndpoint?maxResults=100"
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(
+            listed.status, 200,
+            "case {:?}: ListOriginEndpoints expected 200, got {} with body {}",
+            row.label, listed.status, listed.body
+        );
+        let items = listed
+            .json
+            .get("Items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            items.len(),
+            expected.len(),
+            "case {:?}: the listing must report every endpoint of the channel on one page, \
+             got {}",
+            row.label,
+            listed.body
+        );
+        for want in &expected {
+            let case = format!("{} / listed {}", row.label, want.endpoint);
+            let item = items
+                .iter()
+                .find(|item| {
+                    item.get("OriginEndpointName").and_then(Value::as_str)
+                        == Some(want.endpoint.as_str())
+                })
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the listing must report it, got {}", listed.body)
+                });
+            let listed_manifests = published_manifests(item, want.member);
+            assert_eq!(
+                listed_manifests, want.manifests,
+                "case {case:?}: a listed endpoint must keep its own announced URLs, got \
+                 {listed_manifests:?}"
+            );
+        }
+
+        // The single-item listing is the same rule with one endpoint in the channel, which
+        // is how most clients meet it.
+        let solo = "solo-ep";
+        let created = control(
+            &emulator,
+            row.authority,
+            "POST",
+            &format!("/channelGroup/{GROUP}/channel/{SOLO_CHANNEL}/originEndpoint"),
+            Some(json!({
+                "OriginEndpointName": solo,
+                "ContainerType": "TS",
+                "HlsManifests": [{"ManifestName": "index"}],
+            })),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: CreateOriginEndpoint expected 200, got {} with body {}",
+            row.label, created.status, created.body
+        );
+        let want = vec![(
+            "index".to_string(),
+            announced_manifest_url(
+                row,
+                &egress_domain,
+                SOLO_CHANNEL,
+                solo,
+                "index",
+                ".m3u8",
+            ),
+        )];
+        let listed = control(
+            &emulator,
+            row.authority,
+            "GET",
+            &format!("/channelGroup/{GROUP}/channel/{SOLO_CHANNEL}/originEndpoint"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            listed.status, 200,
+            "case {:?}: ListOriginEndpoints expected 200, got {} with body {}",
+            row.label, listed.status, listed.body
+        );
+        let items = listed
+            .json
+            .get("Items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            items.len(),
+            1,
+            "case {:?}: a channel holding one endpoint must list one item, got {}",
+            row.label,
+            listed.body
+        );
+        let listed_manifests = published_manifests(&items[0], "HlsManifests");
+        assert_eq!(
+            listed_manifests, want,
+            "case {:?}: the single listed endpoint must keep its announced URL, got {}",
+            row.label, listed.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_familys_announced_manifest_url_is_answered_by_this_service() {
+    // The point of the rule: the announced address is one a player can fetch without
+    // leaving the emulator. Each family's URL is dialled exactly as published — host and
+    // path as they came back — and answered by this service's own authorization decision:
+    // refused until the endpoint's policy grants the read, and the object lookup once it
+    // does.
+    //
+    // Only the rows announced on the EMULATOR'S OWN endpoint are swept here: the hostname a
+    // caller that resolves AWS's own hosts is given is dialled per family already, by
+    // `published_data_plane_urls::every_published_manifest_url_is_gated_by_the_endpoints_resource_policy`.
+    for row in ADDRESSINGS.iter().filter(|row| row.emulators_own) {
+        let emulator = Emulator::new();
+        let egress_domain = family_fixtures(&emulator, row).await;
+        for family in EGRESS_ROWS {
+            let case = format!("{} / {}", row.label, family.label);
+            let endpoint = format!("{}-served", family.endpoint);
+            let manifest = format!("{}-served", family.manifest);
+            let mut body = endpoint_body(family, ::std::slice::from_ref(&manifest));
+            body["OriginEndpointName"] = json!(endpoint);
+            let created = control(
+                &emulator,
+                row.authority,
+                "POST",
+                &format!("/channelGroup/{GROUP}/channel/{FAMILY_CHANNEL}/originEndpoint"),
+                Some(body),
+            )
+            .await;
+            assert_eq!(
+                created.status, 200,
+                "case {case:?}: CreateOriginEndpoint expected 200, got {} with body {}",
+                created.status, created.body
+            );
+            let published = published_manifests(&created.json, family.family);
+            let url = published
+                .first()
+                .map(|(_name, url)| url.clone())
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: no URL was announced, got {}", created.body)
+                });
+            assert_eq!(
+                url,
+                announced_manifest_url(
+                    row,
+                    &egress_domain,
+                    FAMILY_CHANNEL,
+                    &endpoint,
+                    &manifest,
+                    family.suffix
+                ),
+                "case {case:?}: the announced URL must be this service's egress path on the \
+                 group's announced address"
+            );
+
+            let (host, path) = split_url(&url);
+            let denied = emulator.send("GET", &path, None, &host, false, &[]).await;
+            assert_eq!(
+                denied.status, 403,
+                "case {case:?}: a fetch of the announced URL with no read grant expected \
+                 HTTP 403, got {} with body {}",
+                denied.status, denied.body
+            );
+            assert!(
+                denied.body.to_lowercase().contains("access denied"),
+                "case {case:?}: the refusal must say access denied, got {}",
+                denied.body
+            );
+            let granted = control(
+                &emulator,
+                row.authority,
+                "POST",
+                &format!(
+                    "/channelGroup/{GROUP}/channel/{FAMILY_CHANNEL}/originEndpoint/{endpoint}/policy"
+                ),
+                Some(json!({"Policy": grant_policy("mediapackagev2:GetObject")})),
+            )
+            .await;
+            assert_eq!(
+                granted.status, 200,
+                "case {case:?}: PutOriginEndpointPolicy expected 200, got {} with body {}",
+                granted.status, granted.body
+            );
+            let authorized = emulator.send("GET", &path, None, &host, false, &[]).await;
+            assert_eq!(
+                authorized.status, 404,
+                "case {case:?}: an authorized fetch with nothing packaged expected HTTP 404, \
+                 got {} with body {}",
+                authorized.status, authorized.body
+            );
+        }
+    }
 }
