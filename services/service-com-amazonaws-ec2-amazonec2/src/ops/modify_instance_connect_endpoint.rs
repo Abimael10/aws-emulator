@@ -4,9 +4,11 @@
 //! IMPLEMENTED: replaces, on the EC2 Instance Connect Endpoint the request names in
 //! [`crate::state`], exactly the members the request carries — its `IpAddressType`, its
 //! `PreserveClientIp` and its security-group set — each validated against the endpoint's own
-//! subnet and VPC the way `CreateInstanceConnectEndpoint` validates them, so
-//! `DescribeInstanceConnectEndpoints` reads the modified endpoint back. This is the ONLY
-//! file to touch for this operation.
+//! subnet and VPC the way `CreateInstanceConnectEndpoint` validates them, and leaves the
+//! endpoint `update-in-progress` with the clock owing it `update-complete` one
+//! [`crate::state::TRANSITION_DELAY`] later, so `DescribeInstanceConnectEndpoints` reads both
+//! the modified endpoint and the state of the change back. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -300,6 +302,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(group_ids) = security_group_ids {
             stored.view.security_group_ids = Some(group_ids);
         }
+        // The change is applied ASYNCHRONOUSLY, so the endpoint's own state is what reports
+        // it: an accepted modify leaves the endpoint `update-in-progress` and the clock owes
+        // it `update-complete` one [`state::TRANSITION_DELAY`] later, which is what a caller
+        // waiting for its change to settle polls the describe for.
+        stored.begin_update(now + state::TRANSITION_DELAY);
 
         // "Is true if the request succeeds and an error otherwise"
         // (`ModifyInstanceConnectEndpointResult$Return`) — every way this request does not

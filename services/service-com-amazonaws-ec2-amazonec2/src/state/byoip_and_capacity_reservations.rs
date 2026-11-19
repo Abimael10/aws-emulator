@@ -1814,6 +1814,15 @@ pub const INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_IN_PROGRESS: &str = "delete-in-
 /// An endpoint AWS has finished deleting: that same enum's `delete-complete` member.
 pub const INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_COMPLETE: &str = "delete-complete";
 
+/// An endpoint whose accepted change AWS is still applying: that same enum's
+/// `update-in-progress` member, which an endpoint reports until the modify's own
+/// [`TRANSITION_DELAY`] has passed.
+pub const INSTANCE_CONNECT_ENDPOINT_STATE_UPDATE_IN_PROGRESS: &str = "update-in-progress";
+
+/// An endpoint whose change is in place: that same enum's `update-complete` member, the state
+/// the clock owes an `update-in-progress` one.
+pub const INSTANCE_CONNECT_ENDPOINT_STATE_UPDATE_COMPLETE: &str = "update-complete";
+
 /// The `ResourceType` a `CreateInstanceConnectEndpoint` tag specification may name: the
 /// endpoint it creates — "The tags to apply to the EC2 Instance Connect Endpoint during
 /// creation" (`CreateInstanceConnectEndpointRequest$TagSpecifications`), which is the
@@ -1868,8 +1877,9 @@ pub const INSTANCE_CONNECT_ENDPOINT_DNS_LABEL: &str = "ec2-instance-connect-endp
 pub const INSTANCE_CONNECT_ENDPOINT_FIPS_DNS_LABEL: &str = "ec2-instance-connect-endpoint-fips";
 
 /// One stored EC2 Instance Connect Endpoint: the modelled `Ec2InstanceConnectEndpoint`
-/// every operation that reports one answers with, plus the instant the clock owes it its
-/// `create-in-progress` -> `create-complete` move.
+/// every operation that reports one answers with, plus the instants the clock owes it its
+/// `create-in-progress` -> `create-complete`, `update-in-progress` -> `update-complete` and
+/// `delete-in-progress` -> `delete-complete` moves.
 ///
 /// The view holds no `State`: the state is a fact of the endpoint's age, so
 /// [`InstanceConnectEndpointRecord::view_at`] derives it rather than letting two writers
@@ -1889,6 +1899,11 @@ pub struct InstanceConnectEndpointRecord {
     /// ([`ComAmazonawsEc2Amazonec2State::begin_instance_connect_endpoint_deletion`]), and
     /// monotonic for the same reason as [`Self::create_complete_at`].
     pub delete_complete_at: Option<Instant>,
+    /// The instant from which this endpoint's `update-in-progress` -> `update-complete` move
+    /// is due, and `None` for an endpoint nobody has changed since it was created. Written by
+    /// every accepted change ([`Self::begin_update`]), and monotonic for the same reason as
+    /// [`Self::create_complete_at`].
+    pub update_complete_at: Option<Instant>,
 }
 
 impl InstanceConnectEndpointRecord {
@@ -1904,7 +1919,11 @@ impl InstanceConnectEndpointRecord {
     ///
     /// A deletion that has been asked for is the only move left, so it takes precedence: an
     /// endpoint asked to delete while it was still being created does not report
-    /// `create-complete` once the creation's own move falls due.
+    /// `create-complete` once the creation's own move falls due. A creation still under way
+    /// comes next, because an endpoint that is not there yet reports the creation rather than
+    /// a change to it; after it, the LAST accepted change is what the endpoint reports —
+    /// `update-in-progress` until that change's own instant falls due and `update-complete`
+    /// after it.
     pub fn state_at(&self, now: Instant) -> &'static str {
         if let Some(delete_complete_at) = self.delete_complete_at {
             return if now < delete_complete_at {
@@ -1914,10 +1933,31 @@ impl InstanceConnectEndpointRecord {
             };
         }
         if now < self.create_complete_at {
-            INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_IN_PROGRESS
-        } else {
-            INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_COMPLETE
+            return INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_IN_PROGRESS;
         }
+        if let Some(update_complete_at) = self.update_complete_at {
+            return if now < update_complete_at {
+                INSTANCE_CONNECT_ENDPOINT_STATE_UPDATE_IN_PROGRESS
+            } else {
+                INSTANCE_CONNECT_ENDPOINT_STATE_UPDATE_COMPLETE
+            };
+        }
+        INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_COMPLETE
+    }
+
+    /// Start this endpoint's clock-owed `update-in-progress` -> `update-complete` move,
+    /// due at `update_complete_at`.
+    ///
+    /// A change is applied ASYNCHRONOUSLY, so the state it leaves the endpoint in is the only
+    /// thing a caller can wait on: the endpoint reports `update-in-progress` until that
+    /// instant, which is STORED rather than slept for, and [`Self::state_at`] derives the
+    /// state from it on every read.
+    ///
+    /// Each accepted change starts its OWN span, overwriting whatever a previous change left:
+    /// an endpoint that has just been changed again is being changed again, so the instant a
+    /// settled change left behind must not keep reporting it as settled.
+    pub fn begin_update(&mut self, update_complete_at: Instant) {
+        self.update_complete_at = Some(update_complete_at);
     }
 }
 

@@ -408,6 +408,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             create_complete_at: now + TRANSITION_DELAY,
             // Nobody has asked to delete an endpoint that is being created.
             delete_complete_at: None,
+            // Nothing has changed an endpoint that is being created, so there is no update
+            // state to report for it yet.
+            update_complete_at: None,
         };
         if let Some(token) = input.client_token.clone() {
             store

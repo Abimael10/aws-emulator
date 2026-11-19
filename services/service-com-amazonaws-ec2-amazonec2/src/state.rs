@@ -295,8 +295,9 @@
 //! Instance Connect Endpoints as [`InstanceConnectEndpointRecord`]s, on exactly the terms
 //! the volume store holds a volume: the modelled `Ec2InstanceConnectEndpoint` every
 //! operation that reports one answers with, plus the instant the clock owes the endpoint
-//! its `create-in-progress` -> `create-complete` move, and the instant a delete that has
-//! been asked for owes it its `delete-in-progress` -> `delete-complete` move. Both are
+//! its `create-in-progress` -> `create-complete` move, the instant an accepted modify owes
+//! it its `update-in-progress` -> `update-complete` move, and the instant a delete that has
+//! been asked for owes it its `delete-in-progress` -> `delete-complete` move. All three are
 //! facts of the endpoint's age rather than of the request and so the state is derived on
 //! read
 //! ([`InstanceConnectEndpointRecord::view_at`]) instead of stored. Keyed by

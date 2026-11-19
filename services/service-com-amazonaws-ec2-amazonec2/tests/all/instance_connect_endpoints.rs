@@ -30,7 +30,12 @@
 //!    the endpoint it names — its `IpAddressType`, its `PreserveClientIp` and its
 //!    security-group set — each validated against that endpoint's own subnet and VPC, every
 //!    other member and every other endpoint left as it was, and the change read back through
-//!    the describe.
+//!    the describe;
+//! 8. an ACCEPTED CHANGE IS REPORTED BY THE ENDPOINT'S STATE: a modify is applied
+//!    asynchronously, so the endpoint it names is `update-in-progress` and the CLOCK settles
+//!    it at `update-complete`, with the changed members readable once it has; every modify
+//!    starts its own span, and the creation it follows and a deletion asked of it outrank a
+//!    change still in flight.
 //!
 //! Each table row is a distinct input along what the rule generalises over — which address
 //! family the subnet has, which address type the request asks for, which filter, how many
@@ -46,6 +51,8 @@ use ec2::state::{
     INSTANCE_CONNECT_ENDPOINT_STATE_CREATE_IN_PROGRESS as STATE_CREATE_IN_PROGRESS,
     INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_COMPLETE as STATE_DELETE_COMPLETE,
     INSTANCE_CONNECT_ENDPOINT_STATE_DELETE_IN_PROGRESS as STATE_DELETE_IN_PROGRESS,
+    INSTANCE_CONNECT_ENDPOINT_STATE_UPDATE_COMPLETE as STATE_UPDATE_COMPLETE,
+    INSTANCE_CONNECT_ENDPOINT_STATE_UPDATE_IN_PROGRESS as STATE_UPDATE_IN_PROGRESS,
     IP_ADDRESS_TYPE_DUALSTACK, IP_ADDRESS_TYPE_IPV4, IP_ADDRESS_TYPE_IPV6, SecurityGroupSpec,
     SubnetSpec, TRANSITION_DELAY, availability_zones_in_region,
     instance_connect_endpoint_dns_name, instance_connect_endpoint_fips_dns_name,
@@ -105,6 +112,36 @@ type PreserveRow = (
 /// Derived from the service's own span, not a literal, so the two cannot drift.
 async fn past_the_transition() {
     tokio::time::sleep(TRANSITION_DELAY + Duration::from_millis(200)).await;
+}
+
+/// How long a wait for a clock-owed transition looks again before it gives up: far more than
+/// the service's own span, so a loaded machine cannot turn the wait itself into a failure.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a wait for a clock-owed transition pauses between two looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// The endpoint `endpoint_id` as `DescribeInstanceConnectEndpoints` reports it once it is in
+/// `state` — the CONDITION is what is waited for, by looking again until it holds or
+/// [`POLL_DEADLINE`] passes, so nothing here depends on how fast the host runs.
+async fn awaiting_state(
+    router: &MultiServiceRouter,
+    case: &str,
+    endpoint_id: &str,
+    state: &str,
+) -> EndpointRow {
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let row = described_row(router, case, endpoint_id).await;
+        if row.state == state {
+            return row;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected {endpoint_id} to reach {state}, got {row:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 async fn create(router: &MultiServiceRouter, params: &[(String, String)]) -> (u16, String) {
@@ -2003,7 +2040,15 @@ async fn a_modify_replaces_exactly_the_members_the_request_carries() {
     let bystander = create_endpoint(&fixture.router, "the endpoint no row modifies", &baseline())
         .await
         .id;
-    past_the_transition().await;
+    for endpoint_id in endpoints.iter().chain(std::iter::once(&bystander)) {
+        awaiting_state(
+            &fixture.router,
+            "an endpoint waiting for its creation to complete",
+            endpoint_id,
+            STATE_CREATE_COMPLETE,
+        )
+        .await;
+    }
     let bystander_before =
         described_row(&fixture.router, "the endpoint no row modifies", &bystander).await;
 
@@ -2016,20 +2061,34 @@ async fn a_modify_replaces_exactly_the_members_the_request_carries() {
         modify_endpoint(&fixture.router, case, &params).await;
 
         // Exactly the three modifiable members move: the id, the ARN, the account, the DNS
-        // names, the VPC, the subnet, the zone, the create time, the tags and the state are
-        // all still what they were before the call.
+        // names, the VPC, the subnet, the zone, the create time and the tags are all still
+        // what they were before the call. The STATE reports the accepted change: the endpoint
+        // is `update-in-progress` until the clock settles it at `update-complete`.
         let mut expected_groups = group_ids.clone();
         expected_groups.sort();
         let expected = EndpointRow {
             ip_address_type: (*ip_address_type).to_string(),
             preserve_client_ip: (*preserve_client_ip).to_string(),
             security_group_ids: expected_groups,
+            state: STATE_UPDATE_IN_PROGRESS.to_string(),
             ..before
         };
         let after = normalized(&described_row(&fixture.router, case, endpoint_id).await);
         assert_eq!(
             after, expected,
             "case {case:?}: expected the endpoint to report {expected:?}, got {after:?}"
+        );
+        let settled = normalized(
+            &awaiting_state(&fixture.router, case, endpoint_id, STATE_UPDATE_COMPLETE).await,
+        );
+        let expected_settled = EndpointRow {
+            state: STATE_UPDATE_COMPLETE.to_string(),
+            ..expected.clone()
+        };
+        assert_eq!(
+            settled, expected_settled,
+            "case {case:?}: expected the settled endpoint to report {expected_settled:?}, \
+             got {settled:?}"
         );
 
         let bystander_now = described_row(&fixture.router, case, &bystander).await;
@@ -2608,8 +2667,13 @@ async fn a_modify_works_end_to_end_over_a_network_the_operations_created() {
         vec![group_id.clone()],
         "the create named no group, so it must not have picked the one made for the modify"
     );
-    past_the_transition().await;
-    let completed = described_row(&router, "the completed endpoint", &created.id).await;
+    let completed = awaiting_state(
+        &router,
+        "the completed endpoint",
+        &created.id,
+        STATE_CREATE_COMPLETE,
+    )
+    .await;
     assert_eq!(
         completed.state, STATE_CREATE_COMPLETE,
         "the clock must complete the creation, got {completed:?}"
@@ -2637,9 +2701,27 @@ async fn a_modify_works_end_to_end_over_a_network_the_operations_created() {
             "true",
             [group_id.clone()].as_slice(),
             IP_ADDRESS_TYPE_IPV4,
-            STATE_CREATE_COMPLETE,
+            STATE_UPDATE_IN_PROGRESS,
         ),
-        "the modify must replace the members it named and leave the rest, got {modified:?}"
+        "the modify must replace the members it named, leave the rest and report the \
+         change it accepted, got {modified:?}"
+    );
+    // What a client waiting on its own change polls for: the endpoint leaves
+    // `update-in-progress` on its own and the change is readable once it has settled.
+    let settled = awaiting_state(
+        &router,
+        "the settled endpoint",
+        &created.id,
+        STATE_UPDATE_COMPLETE,
+    )
+    .await;
+    assert_eq!(
+        (
+            settled.preserve_client_ip.as_str(),
+            settled.security_group_ids.as_slice(),
+        ),
+        ("true", [group_id.clone()].as_slice()),
+        "the settled endpoint must report the members the modify named, got {settled:?}"
     );
 
     // The endpoint the modify associated the group with is the one the delete tears down,
@@ -2666,5 +2748,361 @@ async fn a_modify_works_end_to_end_over_a_network_the_operations_created() {
         (status, error_code(&body).as_str()),
         (400, "IncorrectState"),
         "a modify of an endpoint being deleted must be refused, got {status} with body {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULE 8: an accepted change is reported by the endpoint's own update state
+// ---------------------------------------------------------------------------
+
+/// One row of the update-state table: `(the case, the subnet's families, what the create
+/// carries beside the subnet, what the modify carries beside the id, and the address type,
+/// the client-IP flag and the security groups the endpoint must report once its change has
+/// settled)`.
+type UpdateRow = (
+    &'static str,
+    &'static str,
+    Params,
+    Params,
+    &'static str,
+    &'static str,
+    Vec<String>,
+);
+
+/// RULE 8: a change is applied ASYNCHRONOUSLY, so an accepted
+/// `ModifyInstanceConnectEndpoint` leaves the endpoint `update-in-progress` and the CLOCK —
+/// nothing the caller does — settles it at `update-complete`, with the members the request
+/// named readable once it has. The `state` filter agrees with what each endpoint reports at
+/// the same instant, and a settled endpoint stays settled however often it is read.
+///
+/// The rows differ along what the rule generalises over: which of the modifiable members the
+/// request carries, how many values a list member carries, a request carrying none of them at
+/// all, and which address families the endpoint's subnet has — the state machine is a fact of
+/// the call being accepted, not of what it changed.
+#[tokio::test]
+async fn an_accepted_modify_moves_the_endpoint_from_update_in_progress_to_update_complete() {
+    let fixture = fixture();
+    let mut both_groups = vec![fixture.default_group.clone(), fixture.extra_group.clone()];
+    both_groups.sort();
+    let rows: Vec<UpdateRow> = vec![
+        (
+            "the address type alone",
+            "dual",
+            vec![p("IpAddressType", IP_ADDRESS_TYPE_IPV4)],
+            vec![p("IpAddressType", IP_ADDRESS_TYPE_DUALSTACK)],
+            IP_ADDRESS_TYPE_DUALSTACK,
+            "false",
+            vec![fixture.default_group.clone()],
+        ),
+        (
+            "the client-IP flag alone",
+            "ipv4",
+            Vec::new(),
+            vec![p("PreserveClientIp", "true")],
+            IP_ADDRESS_TYPE_IPV4,
+            "true",
+            vec![fixture.default_group.clone()],
+        ),
+        (
+            "one security group replacing the current set",
+            "dual",
+            Vec::new(),
+            indexed("SecurityGroupId", &[fixture.extra_group.as_str()]),
+            IP_ADDRESS_TYPE_DUALSTACK,
+            "false",
+            vec![fixture.extra_group.clone()],
+        ),
+        (
+            "two security groups replacing one",
+            "dual",
+            Vec::new(),
+            indexed(
+                "SecurityGroupId",
+                &[fixture.extra_group.as_str(), fixture.default_group.as_str()],
+            ),
+            IP_ADDRESS_TYPE_DUALSTACK,
+            "false",
+            both_groups.clone(),
+        ),
+        (
+            "a request carrying no modifiable member at all",
+            "ipv6",
+            Vec::new(),
+            Vec::new(),
+            IP_ADDRESS_TYPE_IPV6,
+            "false",
+            vec![fixture.default_group.clone()],
+        ),
+    ];
+
+    // One endpoint per row, every create first and every creation waited for before the first
+    // modify: what each row then observes is the span of its OWN change.
+    let mut endpoints = Vec::new();
+    for (case, families, created_with, ..) in &rows {
+        let mut params = vec![p("SubnetId", subnet_of(&fixture, families))];
+        params.extend(created_with.clone());
+        endpoints.push(create_endpoint(&fixture.router, case, &params).await.id);
+    }
+    for ((case, ..), endpoint_id) in rows.iter().zip(&endpoints) {
+        awaiting_state(&fixture.router, case, endpoint_id, STATE_CREATE_COMPLETE).await;
+    }
+
+    // Each row reads the endpoint straight after its OWN modify, never after the whole loop,
+    // so what it observes is that row's update span: the span is never zero, so a caller
+    // reading straight after its own modify still sees the transient state.
+    for ((case, _, _, modified_with, ..), endpoint_id) in rows.iter().zip(&endpoints) {
+        let mut params = vec![p("InstanceConnectEndpointId", endpoint_id.clone())];
+        params.extend(modified_with.clone());
+        modify_endpoint(&fixture.router, case, &params).await;
+        let row = described_row(&fixture.router, case, endpoint_id).await;
+        assert_eq!(
+            row.state, STATE_UPDATE_IN_PROGRESS,
+            "case {case:?}: expected an endpoint whose modify was just accepted to be \
+             {STATE_UPDATE_IN_PROGRESS}, got {row:?}"
+        );
+        let in_progress = described_ids(
+            &fixture.router,
+            &format!("{case}, state={STATE_UPDATE_IN_PROGRESS} inside its span"),
+            &filters(&[("state", &[STATE_UPDATE_IN_PROGRESS])]),
+        )
+        .await;
+        assert!(
+            in_progress.contains(endpoint_id),
+            "case {case:?}: expected {endpoint_id} among the endpoints the \
+             state={STATE_UPDATE_IN_PROGRESS} filter reports inside its span, got \
+             {in_progress:?}"
+        );
+        let complete = described_ids(
+            &fixture.router,
+            &format!("{case}, state={STATE_UPDATE_COMPLETE} inside its span"),
+            &filters(&[("state", &[STATE_UPDATE_COMPLETE])]),
+        )
+        .await;
+        assert!(
+            !complete.contains(endpoint_id),
+            "case {case:?}: expected {endpoint_id} not to be {STATE_UPDATE_COMPLETE} inside \
+             its span, got {complete:?}"
+        );
+    }
+
+    // The clock settles every one of them, and the members each modify named are what the
+    // settled endpoint reports.
+    for (
+        (case, _, _, _, ip_address_type, preserve_client_ip, group_ids),
+        endpoint_id,
+    ) in rows.iter().zip(&endpoints)
+    {
+        let settled = normalized(
+            &awaiting_state(&fixture.router, case, endpoint_id, STATE_UPDATE_COMPLETE).await,
+        );
+        let mut expected_groups = group_ids.clone();
+        expected_groups.sort();
+        assert_eq!(
+            (
+                settled.ip_address_type.as_str(),
+                settled.preserve_client_ip.as_str(),
+                settled.security_group_ids.as_slice(),
+            ),
+            (
+                *ip_address_type,
+                *preserve_client_ip,
+                expected_groups.as_slice(),
+            ),
+            "case {case:?}: expected the settled endpoint to report \
+             ({ip_address_type}, {preserve_client_ip}, {expected_groups:?}), got {settled:?}"
+        );
+        // Twice: the state the clock reached is stable, not consumed by the read.
+        for read in 1..=2 {
+            let row = described_row(&fixture.router, case, endpoint_id).await;
+            assert_eq!(
+                row.state, STATE_UPDATE_COMPLETE,
+                "case {case:?}, read {read}: expected {STATE_UPDATE_COMPLETE} to stay, \
+                 got {row:?}"
+            );
+        }
+    }
+
+    let mut settled_ids = endpoints.clone();
+    settled_ids.sort();
+    let reported = described_ids(
+        &fixture.router,
+        &format!("state={STATE_UPDATE_COMPLETE} after every span"),
+        &filters(&[("state", &[STATE_UPDATE_COMPLETE])]),
+    )
+    .await;
+    assert_eq!(
+        reported, settled_ids,
+        "case \"state={STATE_UPDATE_COMPLETE} after every span\": expected every modified \
+         endpoint, got {reported:?}"
+    );
+    assert!(
+        described_ids(
+            &fixture.router,
+            &format!("state={STATE_CREATE_COMPLETE} after every span"),
+            &filters(&[("state", &[STATE_CREATE_COMPLETE])]),
+        )
+        .await
+        .is_empty(),
+        "case \"state={STATE_CREATE_COMPLETE} after every span\": a modified endpoint reports \
+         its change, not its creation"
+    );
+}
+
+/// RULE 8: every accepted modify starts its OWN span, so an endpoint that has settled at
+/// `update-complete` and is then modified again is `update-in-progress` again — the state a
+/// previous change left behind can never report the next one as already applied.
+#[tokio::test]
+async fn each_accepted_modify_starts_its_own_update_span() {
+    let fixture = fixture();
+    let created = create_endpoint(
+        &fixture.router,
+        "the endpoint both modifies name",
+        &[
+            p("SubnetId", fixture.dual_subnet.clone()),
+            p("IpAddressType", IP_ADDRESS_TYPE_IPV4),
+        ],
+    )
+    .await;
+    awaiting_state(
+        &fixture.router,
+        "the created endpoint",
+        &created.id,
+        STATE_CREATE_COMPLETE,
+    )
+    .await;
+
+    // Three changes in a row, each a different member, so the rule is not a property of one
+    // request's shape.
+    for (case, change, expected) in [
+        (
+            "the first change",
+            vec![p("PreserveClientIp", "true")],
+            (IP_ADDRESS_TYPE_IPV4, "true"),
+        ),
+        (
+            "the second change, of another member",
+            vec![
+                p("IpAddressType", IP_ADDRESS_TYPE_DUALSTACK),
+                p("PreserveClientIp", "false"),
+            ],
+            (IP_ADDRESS_TYPE_DUALSTACK, "false"),
+        ),
+        (
+            "the third change, back again",
+            vec![p("IpAddressType", IP_ADDRESS_TYPE_IPV4)],
+            (IP_ADDRESS_TYPE_IPV4, "false"),
+        ),
+    ] {
+        let mut params = vec![p("InstanceConnectEndpointId", created.id.clone())];
+        params.extend(change);
+        modify_endpoint(&fixture.router, case, &params).await;
+        let row = described_row(&fixture.router, case, &created.id).await;
+        assert_eq!(
+            row.state, STATE_UPDATE_IN_PROGRESS,
+            "case {case:?}: expected {STATE_UPDATE_IN_PROGRESS} inside the span of this \
+             change, got {row:?}"
+        );
+        let settled = awaiting_state(
+            &fixture.router,
+            case,
+            &created.id,
+            STATE_UPDATE_COMPLETE,
+        )
+        .await;
+        assert_eq!(
+            (
+                settled.ip_address_type.as_str(),
+                settled.preserve_client_ip.as_str()
+            ),
+            expected,
+            "case {case:?}: expected the settled endpoint to report {expected:?}, \
+             got {settled:?}"
+        );
+    }
+}
+
+/// RULE 8 against the two milestones it sits between: an endpoint that is still being CREATED
+/// reports its creation until that move falls due and only then the change asked of it, and a
+/// DELETION that has been asked for outranks a change still in flight — the precedence the
+/// record's own state derivation gives the three milestones.
+#[tokio::test]
+async fn a_change_in_flight_outranks_neither_the_creation_nor_the_deletion() {
+    let fixture = fixture();
+
+    // A modify accepted inside the creation's own span: the endpoint is not there yet, so it
+    // keeps reporting the creation, and the change it accepted is reported after it.
+    let creating = create_endpoint(
+        &fixture.router,
+        "an endpoint modified while it is still being created",
+        &[
+            p("SubnetId", fixture.dual_subnet.clone()),
+            p("IpAddressType", IP_ADDRESS_TYPE_IPV4),
+        ],
+    )
+    .await;
+    let case = "a modify inside the creation's span";
+    modify_endpoint(
+        &fixture.router,
+        case,
+        &[
+            p("InstanceConnectEndpointId", creating.id.clone()),
+            p("IpAddressType", IP_ADDRESS_TYPE_DUALSTACK),
+        ],
+    )
+    .await;
+    let row = described_row(&fixture.router, case, &creating.id).await;
+    assert_eq!(
+        row.state, STATE_CREATE_IN_PROGRESS,
+        "case {case:?}: an endpoint that is still being created reports its creation, \
+         got {row:?}"
+    );
+    let settled = awaiting_state(&fixture.router, case, &creating.id, STATE_UPDATE_COMPLETE).await;
+    assert_eq!(
+        settled.ip_address_type, IP_ADDRESS_TYPE_DUALSTACK,
+        "case {case:?}: the change accepted during the creation must be readable once the \
+         endpoint has settled, got {settled:?}"
+    );
+
+    // A delete asked for while a change is still in flight: the teardown is the only move
+    // left, so it is what the endpoint reports.
+    let deleted = create_endpoint(
+        &fixture.router,
+        "an endpoint deleted while its change is in flight",
+        &[p("SubnetId", fixture.ipv4_subnet.clone())],
+    )
+    .await;
+    awaiting_state(
+        &fixture.router,
+        "the endpoint the delete names",
+        &deleted.id,
+        STATE_CREATE_COMPLETE,
+    )
+    .await;
+    let case = "a delete inside the change's span";
+    modify_endpoint(
+        &fixture.router,
+        case,
+        &[
+            p("InstanceConnectEndpointId", deleted.id.clone()),
+            p("PreserveClientIp", "true"),
+        ],
+    )
+    .await;
+    let row = delete_endpoint(
+        &fixture.router,
+        case,
+        &[p("InstanceConnectEndpointId", deleted.id.clone())],
+    )
+    .await;
+    assert_eq!(
+        row.state, STATE_DELETE_IN_PROGRESS,
+        "case {case:?}: a deletion that has been asked for outranks a change in flight, \
+         got {row:?}"
+    );
+    let gone = awaiting_state(&fixture.router, case, &deleted.id, STATE_DELETE_COMPLETE).await;
+    assert_eq!(
+        gone.state, STATE_DELETE_COMPLETE,
+        "case {case:?}: the clock must complete the deletion of a changed endpoint, \
+         got {gone:?}"
     );
 }
