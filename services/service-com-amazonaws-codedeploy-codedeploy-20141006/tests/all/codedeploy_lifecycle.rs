@@ -646,22 +646,42 @@ pub(crate) async fn terminal_deployment_within(
     case: &str,
     deadline: Duration,
 ) -> Value {
+    poll_deployment_until(emulator, deployment_id, case, deadline, |info| {
+        matches!(
+            info["status"].as_str(),
+            Some("Succeeded" | "Failed" | "Stopped")
+        )
+    })
+    .await
+}
+
+/// Poll `GetDeployment` until `ready` accepts the stored `deploymentInfo`,
+/// answering it.
+///
+/// The poll loop [`terminal_deployment_within`] is itself written in terms of, so
+/// a suite waiting for any other transition the clock owes a deployment — the
+/// instance-termination wait reported as started, a traffic shift, a rollback —
+/// waits the same way, for the CONDITION rather than for a span of time.
+pub(crate) async fn poll_deployment_until(
+    emulator: &Emulator,
+    deployment_id: &str,
+    case: &str,
+    deadline: Duration,
+    ready: impl Fn(&Value) -> bool,
+) -> Value {
     let deadline_at = Instant::now() + deadline;
     loop {
         let info = emulator
             .ok("GetDeployment", json!({"deploymentId": deployment_id}))
             .await["deploymentInfo"]
             .clone();
-        if matches!(
-            info["status"].as_str(),
-            Some("Succeeded" | "Failed" | "Stopped")
-        ) {
+        if ready(&info) {
             return info;
         }
         assert!(
             Instant::now() < deadline_at,
-            "case {case:?}: expected a terminal status within {deadline:?}, got {:?}",
-            info["status"]
+            "case {case:?}: the deployment never reached the state this case waits for within \
+             {deadline:?}, last read {info:?}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }

@@ -16,7 +16,9 @@
 //!   that raises the error on it. A second `StopDeployment` of a deployment a
 //!   stop ALREADY ended is not one of them: it asks for the state that deployment
 //!   is already in, so it is answered rather than refused (`stop_deployment`
-//!   holds that rule).
+//!   holds that rule). The same sentence is what a deployment one of those
+//!   operations ITSELF completed is refused with, and its fixed phrase is what a
+//!   client reads the state back out of.
 //! * `UnsupportedActionForDeploymentTypeException` says
 //!   `Operation is not supported for the deployment <deploymentId> of type <TYPE>.`
 //!   — the id and the `DeploymentType` the deployment runs as, so a caller
@@ -28,14 +30,24 @@
 //! is the lifecycle suite's, so every case goes through the same front door a
 //! client uses.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 
 use service_com_amazonaws_codedeploy_codedeploy_20141006::state::deployment_internal_state;
 
-use crate::codedeploy_lifecycle::{error_code, s3_revision, terminal_deployment, Emulator};
+use crate::codedeploy_lifecycle::{
+    error_code, poll_deployment_until, s3_revision, terminal_deployment,
+    terminal_deployment_within, Emulator,
+};
 
 /// The service role every deployment group here is created with.
 const SERVICE_ROLE: &str = "arn:aws:iam::123456789012:role/CodeDeployRole";
+
+/// The FIXED phrase of the already-completed sentence, between the deployment id
+/// the request named and the internal state the deployment settled in — the part
+/// a client splits the sentence on to read that state back.
+const ALREADY_COMPLETED_PHRASE: &str = " has already completed, current state ";
 
 /// Create an application and one deployment group on it carrying `style` and
 /// `blue_green` when those are not null, answering the group name.
@@ -404,6 +416,203 @@ async fn every_deployment_status_has_its_internal_state_name() {
         assert_eq!(
             actual, *expected,
             "case {status:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
+}
+
+/// A `blueGreenDeploymentConfiguration` that terminates the original instances
+/// after `minutes` of waiting, which is what holds such a deployment open and
+/// gives `SkipWaitTimeForInstanceTermination` a wait to drop.
+fn terminating_blue_green(minutes: i64) -> Value {
+    json!({
+        "terminateBlueInstancesOnDeploymentSuccess": {
+            "action": "TERMINATE",
+            "terminationWaitTimeInMinutes": minutes,
+        }
+    })
+}
+
+/// The tag key the group of [`terminating_blue_green_group`] selects its
+/// original-environment instances by.
+const FLEET_TAG_KEY: &str = "fleet";
+
+/// Create an application, register one on-premises instance for it and create a
+/// blue/green deployment group that terminates the original instances after
+/// `minutes`, selecting that instance only when `with_target`.
+///
+/// Whether the group selects an instance is what decides the outcome the clock
+/// settles its deployment in, so one helper serves both outcomes. The
+/// termination option is an EC2/on-premises one
+/// (`smithy_query(query="shape",shape="BlueInstanceTerminationOption")`: it
+/// "does not apply to Lambda deployments"), so every case here runs on `Server`.
+async fn terminating_blue_green_group(
+    emulator: &Emulator,
+    application: &str,
+    minutes: i64,
+    with_target: bool,
+) -> String {
+    emulator
+        .ok(
+            "CreateApplication",
+            json!({"applicationName": application, "computePlatform": "Server"}),
+        )
+        .await;
+    let instance = format!("{application}-host");
+    emulator
+        .ok(
+            "RegisterOnPremisesInstance",
+            json!({
+                "instanceName": instance,
+                "iamUserArn": format!("arn:aws:iam::123456789012:user/{instance}"),
+            }),
+        )
+        .await;
+    emulator
+        .ok(
+            "AddTagsToOnPremisesInstances",
+            json!({
+                "instanceNames": [instance],
+                "tags": [{"Key": FLEET_TAG_KEY, "Value": application}],
+            }),
+        )
+        .await;
+    // The value the group filters on: the instance's own tag value selects it, a
+    // value nothing carries selects nothing.
+    let selected = if with_target {
+        application.to_string()
+    } else {
+        format!("{application}-no-such-fleet")
+    };
+    let group = format!("{application}-dg");
+    emulator
+        .ok(
+            "CreateDeploymentGroup",
+            json!({
+                "applicationName": application,
+                "deploymentGroupName": group,
+                "serviceRoleArn": SERVICE_ROLE,
+                "deploymentStyle": blue_green_style(),
+                "blueGreenDeploymentConfiguration": terminating_blue_green(minutes),
+                "onPremisesInstanceTagFilters": [
+                    {"Key": FLEET_TAG_KEY, "Value": selected, "Type": "KEY_AND_VALUE"},
+                ],
+            }),
+        )
+        .await;
+    group
+}
+
+/// How long a case of [`a_deployment_the_skipped_wait_completed_is_refused_in_the_same_sentence`]
+/// is prepared to wait for a transition the clock owes it.
+///
+/// Deliberately generous: the span this emulator gives such a transition is a
+/// few seconds, and the only duration those cases are ABOUT is the
+/// minutes-long termination wait they configure, so nothing here is measured
+/// against this deadline — it only keeps a case that hangs from hanging forever.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// RULE: `DeploymentAlreadyCompletedException` carries the same sentence —
+/// `The deployment <deploymentId> has already completed, current state <STATE>.`
+/// — for a deployment that reached its outcome because this very operation
+/// dropped the wait holding it open, with the state token read off the status the
+/// service itself reports for that deployment.
+#[tokio::test]
+async fn a_deployment_the_skipped_wait_completed_is_refused_in_the_same_sentence() {
+    // Rows differ along the wait the group configured — an hour, and the maximum
+    // the member's own documentation gives
+    // (`smithy_query(query="doc",shape="BlueInstanceTerminationOption",member="terminationWaitTimeInMinutes")`:
+    // "The maximum setting is 2880 minutes (2 days)") — and along the outcome the
+    // clock settles the deployment in, which is what the refusal's state token
+    // reports: a group that selects an instance reaches its targets and succeeds,
+    // one that selects none reaches nothing and fails. Both waits are far longer
+    // than any run of this suite, so each case reaches its outcome only because
+    // the wait was SKIPPED, whatever speed the host runs at.
+    let rows: &[(&str, i64, bool, &str, &str)] = &[
+        (
+            "an hour long wait, no target",
+            60,
+            false,
+            "Failed",
+            "FAILED",
+        ),
+        (
+            "the documented maximum wait, one target",
+            2880,
+            true,
+            "Succeeded",
+            "SUCCEEDED",
+        ),
+    ];
+
+    for (case, minutes, with_target, status, state) in rows {
+        let emulator = Emulator::new();
+        let application = case.replace([' ', ',', '/'], "-");
+        let group =
+            terminating_blue_green_group(&emulator, &application, *minutes, *with_target).await;
+        let deployment_id = deploy(&emulator, &application, &group).await;
+
+        // The configured wait holds the deployment open once traffic routing is
+        // complete, so the call lands on a deployment IN FLIGHT and is answered.
+        let waiting = poll_deployment_until(
+            &emulator,
+            &deployment_id,
+            case,
+            SETTLE_DEADLINE,
+            |info| info["instanceTerminationWaitTimeStarted"].as_bool() == Some(true),
+        )
+        .await;
+        assert!(
+            waiting["completeTime"].is_null(),
+            "case {case:?}: expected the wait to still hold the deployment open, got {waiting:?}"
+        );
+        emulator
+            .ok(
+                "SkipWaitTimeForInstanceTermination",
+                json!({"deploymentId": deployment_id}),
+            )
+            .await;
+
+        // Dropping the wait lets the clock settle the deployment, and from there
+        // the SAME call is refused for its progress.
+        let settled =
+            terminal_deployment_within(&emulator, &deployment_id, case, SETTLE_DEADLINE).await;
+        let settled_status = settled["status"].as_str().unwrap_or_default().to_string();
+        assert_eq!(
+            settled_status, *status,
+            "case {case:?}: expected the skipped wait to settle the deployment as {status}, got \
+             {settled:?}"
+        );
+
+        // The state the sentence reports is the internal name of the status the
+        // service itself reports for the deployment, so the expectation is built
+        // from what `GetDeployment` just answered rather than from a token
+        // written out here.
+        let settled_state = deployment_internal_state(&settled_status);
+        assert_eq!(
+            settled_state, *state,
+            "case {case:?}: expected the internal state of {settled_status:?} to be {state:?}, \
+             got {settled_state:?}"
+        );
+        let expected =
+            format!("The deployment {deployment_id}{ALREADY_COMPLETED_PHRASE}{settled_state}.");
+        let actual = refused(
+            &emulator,
+            "SkipWaitTimeForInstanceTermination",
+            json!({"deploymentId": deployment_id}),
+            "DeploymentAlreadyCompletedException",
+            case,
+        )
+        .await;
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+
+        // The refusal left the settled record exactly as it stood.
+        let after = deployment_info(&emulator, &deployment_id).await;
+        assert_eq!(
+            after, settled,
+            "case {case:?}: expected the refusal to leave the record untouched, got {after:?}"
         );
     }
 }
