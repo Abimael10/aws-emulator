@@ -4,16 +4,18 @@
 //! schema into the Merged API it is associated with, and the refusal of a pair that
 //! names no such association.
 //!
-//! Two rules are asserted here, each over a TABLE or a class of inputs rather than over
+//! Three rules are asserted here, each over a TABLE or a class of inputs rather than over
 //! the single request that exposed the defect:
 //!
-//! 1. initiating a merge on an association of the addressed Merged API SCHEDULES that
-//!    merge and answers the non-terminal `SourceApiAssociationStatus` the association is
-//!    left in, which the clock then carries to `MERGE_SUCCESS` with no further call —
-//!    over a table spanning the `MergeType` the association was configured with, whether
-//!    a merge was still owed when the call came, and an association that had already
-//!    merged once (so the merge date MOVES, rather than being reported before the merge
-//!    ran);
+//! 1. initiating a merge on an association that has SETTLED schedules that merge and
+//!    answers the non-terminal `SourceApiAssociationStatus` the association is left in,
+//!    which the clock then carries to `MERGE_SUCCESS` with no further call — over a table
+//!    spanning the `MergeType` the association was configured with and an association that
+//!    had already merged once (so the merge date MOVES, rather than being reported before
+//!    the merge ran). While the association's own merge is still owed — straight after the
+//!    create, and straight after an accepted initiation — the same call is refused 409
+//!    `ConcurrentModificationException` with the service's fixed sentence, and the merge
+//!    the refusal left alone still comes due;
 //! 2. a `(mergedApiIdentifier, associationId)` pair that names no association of that
 //!    Merged API is refused 404 `NotFoundException`, and an identifier that cannot name
 //!    an API at all 400 `BadRequestException` — over a table spanning an unmintable
@@ -34,7 +36,8 @@ use service_com_amazonaws_appsync_awsdeepdishcontrolplaneservice::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::source_api_association::{
-    associate_path, call, create_api, create_pair, get_path, router, Answer, PAST_THE_MERGE,
+    associate_path, await_terminal_merge, call, create_api, create_pair, read_association, router,
+    Answer, MERGE_DEADLINE, POLL_SPACING,
 };
 
 /// `StartSchemaMerge`'s path.
@@ -60,24 +63,19 @@ const ASSOCIATION_STATUSES: &[&str] = &[
     "DELETION_FAILED",
 ];
 
-/// One row of the merge table: the association the call is made against, and when.
+/// One row of the merge table: the association the call is made against, and the
+/// `MergeType` it was configured with.
 #[derive(Debug)]
 struct Case {
     /// The row's label, used both in the API names and in every assertion message.
     label: &'static str,
     /// The `sourceApiAssociationConfig` the association was created with, if any.
     config: Option<Value>,
-    /// Whether the merge the CREATE scheduled is let come due before this row calls
-    /// `StartSchemaMerge`, i.e. whether the association has already merged once.
-    merged_once: bool,
-    /// How many times the row initiates the merge. More than one asserts that
-    /// re-initiating neither starves the transition nor leaves a second merge owed.
-    calls: usize,
 }
 
-/// The merge table: both `MergeType` values an association can carry, a call that
-/// arrives while the merge the create scheduled is still owed and one that arrives
-/// after it has been performed, and a repeated initiation.
+/// The merge table: an association configured with no `sourceApiAssociationConfig` at
+/// all, and one with each `MergeType` value an association can carry — the merge rule
+/// holds whichever of them the association merges under.
 ///
 /// Source for the `MergeType` value set: `smithy_query(query="shape",
 /// shape="SourceApiAssociationConfig")` — "Valid merge types are `MANUAL_MERGE`
@@ -85,28 +83,16 @@ struct Case {
 fn cases() -> Vec<Case> {
     vec![
         Case {
-            label: "no config, merge still owed",
+            label: "no config",
             config: None,
-            merged_once: false,
-            calls: 1,
         },
         Case {
-            label: "manual merge, already merged once",
+            label: "manual merge",
             config: Some(json!({"mergeType": "MANUAL_MERGE"})),
-            merged_once: true,
-            calls: 1,
         },
         Case {
-            label: "auto merge, already merged once",
+            label: "auto merge",
             config: Some(json!({"mergeType": "AUTO_MERGE"})),
-            merged_once: true,
-            calls: 1,
-        },
-        Case {
-            label: "auto merge, initiated twice while owed",
-            config: Some(json!({"mergeType": "AUTO_MERGE"})),
-            merged_once: false,
-            calls: 3,
         },
     ]
 }
@@ -131,158 +117,133 @@ async fn associate(router: &MultiServiceRouter, case: &Case) -> (String, String)
     (merged.id, association_id)
 }
 
-/// Read the association back, asserting the read itself succeeded.
-async fn read(
+/// The sentence a merge initiated on an association that is still carrying one out is
+/// refused with, written out here rather than read off the service's own constant, so a
+/// change of wording is caught rather than followed.
+const OPERATION_IN_PROGRESS: &str =
+    "This association currently has an operation in progress, please wait until that is \
+     complete";
+
+/// Initiate the merge of `association_id` under `merged_api_id`.
+async fn start_merge(
     router: &MultiServiceRouter,
-    label: &str,
     merged_api_id: &str,
     association_id: &str,
-) -> Value {
-    let answer = call(
+) -> Answer {
+    call(
         router,
-        "GET",
-        &get_path(merged_api_id, association_id),
+        "POST",
+        &merge_path(merged_api_id, association_id),
         None,
     )
-    .await;
-    assert_eq!(
-        answer.status, 200,
-        "case {label:?}: expected GetSourceApiAssociation 200, got {} {:?}",
-        answer.status, answer.body
-    );
-    answer.body["sourceApiAssociation"].clone()
+    .await
 }
 
 #[tokio::test]
-async fn initiating_a_merge_schedules_it_and_the_clock_performs_it() {
+async fn a_merge_is_refused_while_one_is_owed_and_scheduled_once_the_association_settled() {
     let router = router();
 
     for case in cases() {
         let (merged_api_id, association_id) = associate(&router, &case).await;
 
-        // The merge date the association carries BEFORE the call: null while it has
-        // never merged, the date of the create's merge once that has been performed.
-        let date_before = if case.merged_once {
-            tokio::time::sleep(state::MERGE_SPAN + PAST_THE_MERGE).await;
-            let settled = read(&router, case.label, &merged_api_id, &association_id).await;
-            assert_eq!(
-                settled["sourceApiAssociationStatus"].as_str(),
-                Some(state::MERGE_SUCCESS),
-                "case {:?}: expected the create's merge to have been performed, got {:?}",
-                case.label,
-                settled["sourceApiAssociationStatus"]
-            );
-            let date = settled["lastSuccessfulMergeDate"].clone();
-            assert!(
-                date.as_f64().is_some_and(|epoch| epoch > 0.0),
-                "case {:?}: expected a merge date once the create's merge ran, got {date:?}",
-                case.label
-            );
-            date
-        } else {
-            Value::Null
-        };
-
-        for attempt in 1..=case.calls {
-            let merged = call(
-                &router,
-                "POST",
-                &merge_path(&merged_api_id, &association_id),
-                None,
-            )
-            .await;
-            assert_eq!(
-                merged.status, 200,
-                "case {:?} attempt {attempt}: expected StartSchemaMerge 200, got {} {:?}",
-                case.label, merged.status, merged.body
-            );
-            let status = merged.body["sourceApiAssociationStatus"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            assert!(
-                ASSOCIATION_STATUSES.contains(&status.as_str()),
-                "case {:?} attempt {attempt}: expected a modelled SourceApiAssociationStatus out \
-                 of {ASSOCIATION_STATUSES:?}, got {status:?}",
-                case.label
-            );
-            assert_eq!(
-                status, state::MERGE_SCHEDULED,
-                "case {:?} attempt {attempt}: expected the initiated merge to be scheduled \
-                 ({:?}), got {status:?}",
-                case.label,
-                state::MERGE_SCHEDULED
-            );
-
-            // The answer is the association's own state, not a value the handler made
-            // up for the response. The reader reports a status this service's own state
-            // machine can be in: either the merge this call scheduled is still owed, in
-            // which case NO merge has run since and the date is the one the association
-            // carried before the call, or the clock made that merge due between the two
-            // calls, in which case the date has moved forward to it. Which of the two a
-            // run sees depends on how long the calls took, so both are accepted and
-            // each is pinned.
-            let association = read(&router, case.label, &merged_api_id, &association_id).await;
-            let stored_status = association["sourceApiAssociationStatus"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            let stored_date = association["lastSuccessfulMergeDate"].clone();
-            if stored_status == status {
-                assert_eq!(
-                    stored_date, date_before,
-                    "case {:?} attempt {attempt}: expected the merge date {date_before:?} while \
-                     the scheduled merge is still owed, got {stored_date:?}",
-                    case.label
-                );
-            } else {
-                assert_eq!(
-                    stored_status,
-                    state::MERGE_SUCCESS,
-                    "case {:?} attempt {attempt}: expected the scheduled status {status:?} or the \
-                     merged one once the clock made it due, got {stored_status:?}",
-                    case.label
-                );
-                assert!(
-                    stored_date
-                        .as_f64()
-                        .is_some_and(|after| date_before.as_f64().is_none_or(|before| after
-                            > before)),
-                    "case {:?} attempt {attempt}: expected a merge date past {date_before:?} once \
-                     the merge ran, got {stored_date:?}",
-                    case.label
-                );
-            }
-        }
-
-        // Nothing is called in between: the transition below is owed by the clock, and
-        // a repeated initiation did not push it out.
-        tokio::time::sleep(state::MERGE_SPAN + PAST_THE_MERGE).await;
-
-        let association = read(&router, case.label, &merged_api_id, &association_id).await;
+        // Creating the association SCHEDULED a merge, so the association has an
+        // operation in progress: a merge initiated now is refused with the status the
+        // model gives that error, carrying the service's fixed sentence — which states
+        // nothing of the request.
+        let refused = start_merge(&router, &merged_api_id, &association_id).await;
         assert_eq!(
-            association["sourceApiAssociationStatus"].as_str(),
-            Some(state::MERGE_SUCCESS),
-            "case {:?}: expected status {:?} past the due instant, got {:?}",
+            (refused.status, refused.error_type.as_str()),
+            (409, "ConcurrentModificationException"),
+            "case {:?}: expected a 409 ConcurrentModificationException while the create's merge \
+             is owed, got {} {} {:?}",
             case.label,
-            state::MERGE_SUCCESS,
-            association["sourceApiAssociationStatus"]
+            refused.status,
+            refused.error_type,
+            refused.body
         );
-        let date_after = association["lastSuccessfulMergeDate"].clone();
-        assert!(
-            date_after.as_f64().is_some_and(|epoch| epoch > 0.0),
-            "case {:?}: expected a merge date past the due instant, got {date_after:?}",
+        let message = refused.body["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message, OPERATION_IN_PROGRESS,
+            "case {:?}: expected the association's own in-progress sentence, got {message:?}",
             case.label
         );
-        // The merge the call initiated is a NEW merge, so an association that had
-        // already merged reports a later date than the one it carried before.
-        if let Some(before) = date_before.as_f64() {
-            assert!(
-                date_after.as_f64().is_some_and(|after| after > before),
-                "case {:?}: expected the merge date to move past {before:?}, got {date_after:?}",
-                case.label
-            );
-        }
+        assert!(
+            !message.contains(&association_id) && !message.contains(&merged_api_id),
+            "case {:?}: expected nothing of the addressed pair quoted, got {message:?}",
+            case.label
+        );
+
+        // The refusal left the create's merge where it was, so the clock still performs
+        // it with no further call.
+        let settled =
+            await_terminal_merge(&router, case.label, &merged_api_id, &association_id).await;
+        let date_before = settled["lastSuccessfulMergeDate"].clone();
+        assert!(
+            date_before.as_f64().is_some_and(|epoch| epoch > 0.0),
+            "case {:?}: expected a merge date once the create's merge ran, got {date_before:?}",
+            case.label
+        );
+
+        // Once the association has settled the very same call is accepted, and answers
+        // the non-terminal status it is left in.
+        let merged = start_merge(&router, &merged_api_id, &association_id).await;
+        assert_eq!(
+            merged.status, 200,
+            "case {:?}: expected StartSchemaMerge 200 on a settled association, got {} {:?}",
+            case.label, merged.status, merged.body
+        );
+        let status = merged.body["sourceApiAssociationStatus"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            ASSOCIATION_STATUSES.contains(&status.as_str()),
+            "case {:?}: expected a modelled SourceApiAssociationStatus out of \
+             {ASSOCIATION_STATUSES:?}, got {status:?}",
+            case.label
+        );
+        assert_eq!(
+            status,
+            state::MERGE_SCHEDULED,
+            "case {:?}: expected the initiated merge to be scheduled ({:?}), got {status:?}",
+            case.label,
+            state::MERGE_SCHEDULED
+        );
+
+        // That merge is now the operation in progress, so a second initiation is refused
+        // exactly as the first one was: the service serializes an association's merges.
+        let again = start_merge(&router, &merged_api_id, &association_id).await;
+        assert_eq!(
+            (
+                again.status,
+                again.error_type.as_str(),
+                again.body["message"].as_str()
+            ),
+            (
+                409,
+                "ConcurrentModificationException",
+                Some(OPERATION_IN_PROGRESS)
+            ),
+            "case {:?}: expected the second initiation to be refused while the first merge is \
+             owed, got {} {} {:?}",
+            case.label,
+            again.status,
+            again.error_type,
+            again.body
+        );
+
+        // The merge the accepted call initiated is a NEW merge: the clock performs it
+        // with no further call, and the date moves past the one the create's merge left.
+        let after =
+            await_terminal_merge(&router, case.label, &merged_api_id, &association_id).await;
+        let date_after = after["lastSuccessfulMergeDate"].clone();
+        assert!(
+            date_after.as_f64().is_some_and(|moved| date_before
+                .as_f64()
+                .is_some_and(|before| moved > before)),
+            "case {:?}: expected the merge date to move past {date_before:?}, got {date_after:?}",
+            case.label
+        );
     }
 }
 
@@ -298,8 +259,6 @@ async fn a_merge_on_an_association_being_deleted_is_refused() {
     let case = Case {
         label: "deleting",
         config: None,
-        merged_once: false,
-        calls: 0,
     };
     let (merged_api_id, association_id) = associate(&router, &case).await;
 
@@ -344,15 +303,26 @@ async fn a_merge_on_an_association_being_deleted_is_refused() {
     );
 
     // The refusal left the deletion where it was, so the clock still carries it out —
-    // and the association the merge could not touch stops existing.
-    tokio::time::sleep(state::DELETION_SPAN + PAST_THE_MERGE).await;
-    let gone = call(
-        &router,
-        "POST",
-        &merge_path(&merged_api_id, &association_id),
-        None,
-    )
-    .await;
+    // and the association the merge could not touch stops existing. A wait on the
+    // CONDITION: the merge is initiated again until the association is gone (404) or a
+    // generous deadline passes, and while it is still being destroyed the same conflict
+    // is the answer.
+    let deadline = tokio::time::Instant::now() + MERGE_DEADLINE;
+    let gone = loop {
+        let answer = start_merge(&router, &merged_api_id, &association_id).await;
+        if answer.status != 409 {
+            break answer;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "case deleted: expected the deletion the clock owes to have been carried out, got \
+             {} {} {:?}",
+            answer.status,
+            answer.error_type,
+            answer.body
+        );
+        tokio::time::sleep(POLL_SPACING).await;
+    };
     assert_eq!(
         (gone.status, gone.error_type.as_str()),
         (404, "NotFoundException"),
@@ -447,8 +417,6 @@ async fn a_pair_naming_no_association_is_refused_and_schedules_nothing() {
     let case = Case {
         label: "refuse",
         config: None,
-        merged_once: false,
-        calls: 0,
     };
     let (merged_api_id, association_id) = associate(&router, &case).await;
     // The fixtures the rows are written against: a second Merged API that holds no
@@ -457,15 +425,9 @@ async fn a_pair_naming_no_association_is_refused_and_schedules_nothing() {
     let graphql = create_api(&router, "refuse-standard", state::GRAPHQL_API_TYPE).await;
 
     // Let the merge the create scheduled come due first, so the association sits in a
-    // state a refused call could only change by scheduling something.
-    tokio::time::sleep(state::MERGE_SPAN + PAST_THE_MERGE).await;
-    let before = read(&router, case.label, &merged_api_id, &association_id).await;
-    assert_eq!(
-        before["sourceApiAssociationStatus"].as_str(),
-        Some(state::MERGE_SUCCESS),
-        "case refusal fixture: expected the create's merge to have been performed, got {:?}",
-        before["sourceApiAssociationStatus"]
-    );
+    // state a refused call could only change by scheduling something. A wait on the
+    // CONDITION, not on a fixed time.
+    let before = await_terminal_merge(&router, case.label, &merged_api_id, &association_id).await;
 
     let fill = |template: &str| {
         template
@@ -518,7 +480,7 @@ async fn a_pair_naming_no_association_is_refused_and_schedules_nothing() {
 
     // A refused call scheduled nothing: the association is where the clock left it,
     // merge date and all.
-    let after = read(&router, case.label, &merged_api_id, &association_id).await;
+    let after = read_association(&router, case.label, &merged_api_id, &association_id).await;
     assert_eq!(
         after, before,
         "case refused writes nothing: expected the association to be untouched ({before:?}), got \

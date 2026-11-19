@@ -190,6 +190,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `name` outside the form `ResourceName` declares is refused here rather than
+        // at the boundary (`skip_validation` on `UpdateDataSourceInput`), for the reason
+        // the create's own refusal states: the service answers it with ONE sentence
+        // naming the resource whose name it is (`crate::state::resource_name_refusal`),
+        // under the operation's own modelled `BadRequestException`.
+        if let Some(message) =
+            crate::state::resource_name_refusal(crate::state::DATA_SOURCE_RESOURCE, &input.name)
+        {
+            return Err(UpdateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         let mut guard = state.lock();
         let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
             return Err(UpdateDataSourceErrorModeled::NotFoundException(NotFoundException {

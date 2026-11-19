@@ -11,7 +11,15 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-appsync-awsdeepdishcontrolplaneservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appsync#CreateDataSourceRequest")]
+// `skip_validation = ["name"]`: a value outside `ResourceName`'s form is answered with
+// the service's own sentence NAMING the resource whose name was refused
+// (`crate::state::resource_name_refusal`), which only the operation that names that
+// resource can choose — the boundary's refusal seam is handed the broken clauses with no
+// operation to key on. The same split `CreateFunctionInput` carries for its `name`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.appsync#CreateDataSourceRequest",
+    skip_validation = ["name"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateDataSourceInput {
     pub api_id: String,

@@ -189,18 +189,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which association the pair names, by the rule the read follows too. The id is
         // the STORED record's key, so the write below reaches the record the lookup
         // resolved.
-        let association_id =
+        let (association_id, source_api_id) =
             match guard.resolve_association(&input.merged_api_identifier, &input.association_id) {
-                Ok(association) => association.association_id.clone(),
+                Ok(association) => (
+                    association.association_id.clone(),
+                    association.source_api_id.clone(),
+                ),
                 Err(refusal) => return Err(refuse(refusal.into())),
             };
+
+        // The merge carries the types the source API holds, so a schema creation that API
+        // still owes is what it waits for (`crate::state::merge_due_instant`): the
+        // dependency is read now, when the merge is scheduled.
+        let source_schema_due = guard.schema_creation_due(&source_api_id);
 
         // Initiating the merge SCHEDULES it; the clock owes its outcome, so nothing here
         // performs it or waits for it.
         let started = guard
             .source_api_associations
             .get_mut(&association_id)
-            .map(|association| association.start_merge(now));
+            .map(|association| association.start_merge(now, source_schema_due));
 
         match started {
             Some(Ok(status)) => Ok(StartSchemaMergeOutput {

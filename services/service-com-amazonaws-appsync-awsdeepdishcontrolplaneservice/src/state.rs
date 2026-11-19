@@ -1692,7 +1692,7 @@ impl SourceApiAssociationRecord {
         }
         self.merge_due_at = None;
         self.status = MERGE_SUCCESS.to_string();
-        self.status_detail = MERGE_SUCCESS_DETAIL.to_string();
+        self.status_detail = merge_success_detail(&self.source_api_id, &self.association_id);
         self.last_successful_merge_date = Some(due);
     }
 
@@ -1702,22 +1702,43 @@ impl SourceApiAssociationRecord {
     ///
     /// Scheduling is all this does: the merge itself comes due one [`MERGE_SPAN`] later
     /// and [`Self::settle`] materialises it, exactly as the create that first scheduled
-    /// one does. A merge the clock already owes IS the merge such a call initiates, so
-    /// its due instant is kept rather than pushed out — repeated calls can neither
-    /// starve the transition nor leave two merges owed for one association.
+    /// one does. One merge at a time: a call that arrives while the association still
+    /// owes one is refused below, so this never leaves two merges owed for one
+    /// association nor pushes an owed one out.
+    ///
+    /// The merge carries the types the source API holds, so it DEPENDS on a schema
+    /// creation that API still owes: `source_schema_due` is that creation's due instant
+    /// ([`merge_due_instant`] states how the two compose). The dependency is read HERE,
+    /// when the merge is scheduled, rather than when it comes due — what the merge waits
+    /// for is the schema the source API was creating at that moment, so later schema
+    /// activity on that API cannot postpone an owed merge and leave the association
+    /// non-terminal for as long as a caller keeps changing the source schema.
     ///
     /// An association whose DELETION the clock still owes is being destroyed and has no
     /// schema left to merge, and that deletion is a modification already in progress, so
     /// the call is refused rather than overwriting the status the deletion left behind.
-    pub fn start_merge(&mut self, now: SystemTime) -> Result<String, AssociationRefusal> {
+    ///
+    /// A merge the clock still owes is likewise an operation on this association that is
+    /// already in progress: AppSync serializes an association's merges, so the call is
+    /// refused ([`ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE`]) while the association's
+    /// status is non-terminal rather than scheduling a second one. Once the association
+    /// has settled the same call is accepted.
+    pub fn start_merge(
+        &mut self,
+        now: SystemTime,
+        source_schema_due: Option<SystemTime>,
+    ) -> Result<String, AssociationRefusal> {
         if self.deletion_pending() {
             return Err(AssociationRefusal::ConcurrentModification(
                 associations_being_updated_message(&self.merged_api_id),
             ));
         }
-        if self.merge_due_at.is_none() {
-            self.merge_due_at = Some(now + MERGE_SPAN);
+        if self.merge_pending() {
+            return Err(AssociationRefusal::ConcurrentModification(
+                ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE.to_string(),
+            ));
         }
+        self.merge_due_at = Some(merge_due_instant(now, source_schema_due));
         self.status = MERGE_SCHEDULED.to_string();
         self.status_detail = MERGE_SCHEDULED_DETAIL.to_string();
         Ok(self.status.clone())
@@ -1991,6 +2012,9 @@ pub fn create_source_api_association(
         association_id = state.mint_id();
     }
     let seq = state.next_seq();
+    // The merge this create schedules carries the types the source API holds, so it
+    // depends on a schema creation that API still owes ([`merge_due_instant`]).
+    let source_schema_due = state.schema_creation_due(&source_api_id);
 
     let record = SourceApiAssociationRecord {
         seq,
@@ -2013,7 +2037,7 @@ pub fn create_source_api_association(
         status: MERGE_SCHEDULED.to_string(),
         status_detail: MERGE_SCHEDULED_DETAIL.to_string(),
         last_successful_merge_date: None,
-        merge_due_at: Some(now + MERGE_SPAN),
+        merge_due_at: Some(merge_due_instant(now, source_schema_due)),
         deletion_due_at: None,
     };
     let association = record.to_source_api_association();
@@ -2979,17 +3003,62 @@ pub const MERGE_SUCCESS: &str = "MERGE_SUCCESS";
 pub const MERGE_SCHEDULED_DETAIL: &str =
     "The source API merge is scheduled and has not been performed yet.";
 
-/// The `sourceApiAssociationStatusDetail` that goes with [`MERGE_SUCCESS`].
-pub const MERGE_SUCCESS_DETAIL: &str = "The source API was merged into the Merged API.";
+/// The `sourceApiAssociationStatusDetail` that goes with [`MERGE_SUCCESS`], for the
+/// merge of the source API `source_api_id` under the association `association_id`.
+///
+/// "The detailed message related to the current state of the source API association"
+/// (`SourceApiAssociation$sourceApiAssociationStatusDetail`): what a merge that SUCCEEDED
+/// has to detail is which source API was merged and under which association, the only
+/// correlation handle a Merged API with several source APIs offers. Both values are read
+/// from the stored association, never from the request.
+pub fn merge_success_detail(source_api_id: &str, association_id: &str) -> String {
+    format!(
+        "Successfully merged source GraphQL API (API Id: {source_api_id}, Association Id: \
+         {association_id})"
+    )
+}
+
+/// The text `ConcurrentModificationException` (HTTP 409) carries for a merge initiated on
+/// an association that is still carrying one out.
+///
+/// Entirely fixed text: the sentence states that THIS association has an operation in
+/// progress, so it interpolates nothing of the request — which association is meant is
+/// what the caller addressed.
+pub const ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE: &str =
+    "This association currently has an operation in progress, please wait until that is \
+     complete";
 
 /// How long after an association is created the merge it scheduled comes due.
 ///
 /// A chosen span, inside the emulator's 250-750 ms band for a transition the clock
 /// owes: AppSync reports a new association in the non-terminal [`MERGE_SCHEDULED`]
-/// status, so the span is never zero and a caller reading straight after the create
-/// still observes it. Nothing sleeps for it — the due instant is stored on the record
-/// and [`SourceApiAssociationRecord::settle`] applies it.
+/// status, so the span is never zero — a caller reading or merging straight after the
+/// create still observes that status and the refusals that go with it
+/// ([`ASSOCIATION_OPERATION_IN_PROGRESS_MESSAGE`]). A merge that DEPENDS on a schema
+/// creation the source API still owes takes one such span after that creation comes due
+/// ([`merge_due_instant`]). Nothing sleeps for it — the due instant is stored on the
+/// record and [`SourceApiAssociationRecord::settle`] applies it.
 pub const MERGE_SPAN: Duration = Duration::from_millis(500);
+
+/// When a merge scheduled at `now` comes due, given the instant `source_schema_due` the
+/// source API's own schema creation comes due (`None` when it owes none).
+///
+/// A merge is a COMPOSITE transition: it carries the types the source API's schema
+/// creation installs, so it cannot be performed before that creation is — a composite
+/// reaches its terminal state one span after what it depends on is ready. With no
+/// creation owed the merge is due one [`MERGE_SPAN`] after the call that scheduled it,
+/// which is the only span a caller of an already-created source API waits.
+///
+/// The dependency is read when the merge is SCHEDULED, so the due instant a merge
+/// carries never moves afterwards: a schema creation started on the source API later has
+/// its own merge to drive and cannot postpone this one.
+pub fn merge_due_instant(now: SystemTime, source_schema_due: Option<SystemTime>) -> SystemTime {
+    let own = now + MERGE_SPAN;
+    match source_schema_due {
+        Some(dependency) => own.max(dependency + MERGE_SPAN),
+        None => own,
+    }
+}
 
 /// The `SourceApiAssociationStatus` an association whose deletion has been asked for
 /// carries until the deletion has been performed. Source: the

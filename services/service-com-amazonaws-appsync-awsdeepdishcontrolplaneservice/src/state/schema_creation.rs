@@ -32,6 +32,18 @@ pub const SCHEMA_SUCCESS: &str = "SUCCESS";
 /// document it carried defines no type system.
 pub const SCHEMA_FAILED: &str = "FAILED";
 
+/// The text `ConcurrentModificationException` (HTTP 409) carries for a call refused
+/// because this API's SCHEMA is already being altered.
+///
+/// AppSync words this conflict about the schema rather than about modifications in
+/// general, and the sentence is entirely fixed text: it interpolates nothing of the
+/// request. Every refusal whose ground is a schema creation the clock still owes
+/// ([`GraphqlApiRecord::schema_creation_in_progress`]) carries it, so the submitting
+/// call and the type operations that would change the same type system cannot word one
+/// conflict two ways.
+pub const SCHEMA_ALTERATION_IN_PROGRESS_MESSAGE: &str =
+    "Schema is currently being altered, please wait until that is complete.";
+
 /// The `SchemaStatus` of an API no schema creation has ever run for: none of the other
 /// states applies to it, which is what [`SCHEMA_NOT_APPLICABLE`] names.
 pub const SCHEMA_NOT_APPLICABLE: &str = "NOT_APPLICABLE";
@@ -206,15 +218,27 @@ impl GraphqlApiRecord {
 }
 
 impl super::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
+    /// The instant the schema creation the API `api_id` still owes comes due, or `None`
+    /// when it owes none (and for an API this account does not hold).
+    ///
+    /// What a merge of that API's schema DEPENDS on, read when the merge is scheduled
+    /// (`super::merge_due_instant`).
+    pub fn schema_creation_due(&self, api_id: &str) -> Option<SystemTime> {
+        self.graphql_apis
+            .get(api_id)
+            .and_then(|api| api.schema.as_ref())
+            .and_then(|schema| schema.due_at)
+    }
+
     /// Apply every schema creation the clock owes at `now`, so an API reports the same
     /// schema — and the same types — to every caller whether or not another call touched
     /// it first.
     ///
     /// The merges the clock owes are performed straight after, because a merge carries
-    /// the types the creations above install and is due only once the source API's
-    /// creation is ([`Self::settle_due_merges`]): the two dues are one schema transition
-    /// of the APIs they touch, so every caller that materialises one materialises both
-    /// and no two reads can disagree about a merged type.
+    /// the types the creations above install and is scheduled to come due only once the
+    /// source API's creation is (`super::merge_due_instant`): the two dues are one schema
+    /// transition of the APIs they touch, so every caller that materialises one
+    /// materialises both and no two reads can disagree about a merged type.
     pub fn settle_schema_creations(&mut self, now: SystemTime) {
         for api in self.graphql_apis.values_mut() {
             api.settle_schema_creation(now);

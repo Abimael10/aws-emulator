@@ -199,15 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A creation the clock still owes is a modification of this API's schema that is
-        // already in progress, and it "must complete before you can make your change":
-        // the second call is refused rather than replacing the document the first one is
-        // still creating.
+        // A creation the clock still owes is an alteration of this API's schema that is
+        // already in progress: the second call is refused rather than replacing the
+        // document the first one is still creating, with the sentence the service words a
+        // schema alteration already under way with.
         if api.schema_creation_in_progress() {
             return Err(
                 StartSchemaCreationErrorModeled::ConcurrentModificationException(
                     ConcurrentModificationException {
-                        message: Some(crate::state::CONCURRENT_MODIFICATION_MESSAGE.to_string()),
+                        message: Some(
+                            crate::state::SCHEMA_ALTERATION_IN_PROGRESS_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

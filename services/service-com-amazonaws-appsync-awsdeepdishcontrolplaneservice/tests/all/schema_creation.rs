@@ -410,15 +410,18 @@ async fn a_created_schema_is_the_types_its_document_declares() {
 
     for (row, api_id) in rows.iter().zip(&apis) {
         let settled = creation_status(&router, api_id).await;
+        // The detail counts the types the document declares, written out here rather
+        // than read off the service's own template.
+        let detail = format!(
+            "Successfully created schema with {} types.",
+            row.declared.len()
+        );
         assert_eq!(
             (
                 settled.body["status"].as_str(),
                 settled.body["details"].as_str()
             ),
-            (
-                Some(state::SCHEMA_SUCCESS),
-                Some(state::schema_success_detail(row.declared.len()).as_str())
-            ),
+            (Some(state::SCHEMA_SUCCESS), Some(detail.as_str())),
             "case {:?}: expected the creation to have been performed past the due instant, got \
              {:?}",
             row.label,
@@ -753,9 +756,10 @@ async fn a_creation_in_progress_refuses_another_modification() {
         started.body
     );
 
-    // While the creation the clock owes is in progress, the API's type system is being
-    // modified: another modification of it is refused with the status the model gives
-    // that error and the text the model gives the shape.
+    // While the creation the clock owes is in progress, the API's schema is being
+    // altered: another alteration of it is refused with the status the model gives that
+    // error and the sentence the service words a schema alteration already under way
+    // with.
     let second = start_creation(&router, &api.id, b"type Query {\n  other: String\n}\n").await;
     let added = create_type(&router, &api.id, "type Added {\n  id: ID\n}\n").await;
     for (label, refused) in [("a second creation", second), ("a created type", added)] {
@@ -770,18 +774,16 @@ async fn a_creation_in_progress_refuses_another_modification() {
         );
         assert_eq!(
             refused.body["message"].as_str(),
-            Some(
-                "Another modification is in progress at this time and it must complete before you \
-                 can make your change."
-            ),
-            "case {label:?}: expected the concurrent-modification text, got {:?}",
+            Some("Schema is currently being altered, please wait until that is complete."),
+            "case {label:?}: expected the schema-alteration text, got {:?}",
             refused.body["message"]
         );
     }
 
     // The refusals left the creation where it was, so the clock still performs it — and
-    // the document the first call carried is the one that was created.
-    tokio::time::sleep(state::SCHEMA_CREATION_SPAN + PAST_THE_CREATION).await;
+    // the document the first call carried is the one that was created. A wait on the
+    // CONDITION, not on a fixed time.
+    await_creation(&router, &api.id, "in progress").await;
     let settled = creation_status(&router, &api.id).await;
     assert_eq!(
         settled.body["status"].as_str(),

@@ -177,6 +177,68 @@ pub(crate) fn get_path(merged_api_identifier: &str, association_id: &str) -> Str
     format!("/v1/mergedApis/{merged_api_identifier}/sourceApiAssociations/{association_id}")
 }
 
+/// The `SourceApiAssociationStatus` values a merge can END in. Source:
+/// `smithy_query(query="shape", shape="SourceApiAssociationStatus")`.
+pub(crate) const TERMINAL_MERGE_STATUSES: &[&str] =
+    &["MERGE_SUCCESS", "MERGE_FAILED", "AUTO_MERGE_SCHEDULE_FAILED"];
+
+/// How long a wait for a clock-owed merge keeps looking before it gives up: the service's
+/// own spans (`state::MERGE_SPAN`, after `state::SCHEMA_CREATION_SPAN` when the merge
+/// waits for one) with room for a machine far slower than this one, so nothing that waits
+/// depends on how fast the host runs.
+pub(crate) const MERGE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// How long such a wait leaves between two looks at the association.
+pub(crate) const POLL_SPACING: Duration = Duration::from_millis(25);
+
+/// Read the association `(merged_api, association_id)` names, asserting the read itself
+/// succeeded, and answer the `sourceApiAssociation` it reports.
+pub(crate) async fn read_association(
+    router: &MultiServiceRouter,
+    label: &str,
+    merged_api: &str,
+    association_id: &str,
+) -> Value {
+    let answer = call(router, "GET", &get_path(merged_api, association_id), None).await;
+    assert_eq!(
+        answer.status, 200,
+        "case {label:?}: expected GetSourceApiAssociation 200 on {merged_api}, got {} {:?}",
+        answer.status, answer.body
+    );
+    answer.body["sourceApiAssociation"].clone()
+}
+
+/// Read the association until the merge the clock owes it has been PERFORMED, and answer
+/// the record it then reports.
+///
+/// A wait on the CONDITION rather than on a fixed time: the transition is one the clock
+/// owes, so the association is read again until it reports a terminal status or
+/// [`MERGE_DEADLINE`] passes, and a loaded machine and a fast one reach the same
+/// assertion. The one poll-until-merge every association suite uses.
+pub(crate) async fn await_terminal_merge(
+    router: &MultiServiceRouter,
+    label: &str,
+    merged_api: &str,
+    association_id: &str,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + MERGE_DEADLINE;
+    loop {
+        let association = read_association(router, label, merged_api, association_id).await;
+        let status = association["sourceApiAssociationStatus"]
+            .as_str()
+            .unwrap_or_default();
+        if TERMINAL_MERGE_STATUSES.contains(&status) {
+            return association;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "case {label:?}: expected the merge the clock owes to have been performed, got \
+             {association:?}"
+        );
+        tokio::time::sleep(POLL_SPACING).await;
+    }
+}
+
 /// One row of the association table: how the request names the Merged API and what it
 /// asks for, and what the stored association must then report.
 #[derive(Debug)]

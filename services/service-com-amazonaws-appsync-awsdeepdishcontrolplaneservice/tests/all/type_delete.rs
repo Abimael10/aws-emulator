@@ -56,11 +56,10 @@ const PAST_THE_CREATION: Duration = Duration::from_millis(250);
 /// a drift in the wording fails this suite.
 const TYPE_NOT_FOUND: &str = "Type not found.";
 
-/// The text a `ConcurrentModificationException` carries, as the model documents the
-/// shape. Pinned here for the same reason.
+/// The text a `ConcurrentModificationException` carries for a call refused because the
+/// API's schema is already being altered. Pinned here for the same reason.
 const CONCURRENT_MODIFICATION: &str =
-    "Another modification is in progress at this time and it must complete before you can \
-     make your change.";
+    "Schema is currently being altered, please wait until that is complete.";
 
 /// The non-terminal `SchemaStatus` a scheduled schema creation is in. Source:
 /// `smithy_query` shape `SchemaStatus`.

@@ -11,7 +11,13 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-appsync-awsdeepdishcontrolplaneservice.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.appsync#UpdateDataSourceRequest")]
+// `skip_validation = ["name"]`: the same member of the same shape as `CreateDataSource`
+// carries, refused the same way — by the handler's own sentence naming the resource
+// (`crate::state::resource_name_refusal`) rather than by the boundary's constraint walk.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.appsync#UpdateDataSourceRequest",
+    skip_validation = ["name"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UpdateDataSourceInput {
     pub api_id: String,

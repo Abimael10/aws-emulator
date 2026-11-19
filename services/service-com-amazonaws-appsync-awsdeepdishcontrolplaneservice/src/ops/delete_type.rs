@@ -180,14 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A schema creation the clock still owes is a modification of this API's type
-        // system that is already in progress, and it "must complete before you can make
-        // your change": the delete is refused rather than removing a type from a type
-        // system the creation is about to replace wholesale.
+        // A schema creation the clock still owes is an alteration of this API's schema
+        // that is already in progress, so the delete is refused rather than removing a
+        // type from a type system the creation is about to replace wholesale — with the
+        // sentence the service words a schema alteration already under way with.
         if api.schema_creation_in_progress() {
             return Err(DeleteTypeErrorModeled::ConcurrentModificationException(
                 ConcurrentModificationException {
-                    message: Some(crate::state::CONCURRENT_MODIFICATION_MESSAGE.to_string()),
+                    message: Some(
+                        crate::state::SCHEMA_ALTERATION_IN_PROGRESS_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());

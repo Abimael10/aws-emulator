@@ -10,10 +10,13 @@
 //! nothing.
 //!
 //! The merge DEPENDS on the source API's schema: a creation the clock still owes on the
-//! source API has not installed its types yet, so a merge that would come due before it
-//! is held until that creation is due — a composite reaches its terminal state only once
-//! what it depends on is itself ready. That is why the dues are applied together, in that
-//! order ([`super::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::settle_schema_creations`]).
+//! source API has not installed its types yet, so a merge scheduled while one is owed is
+//! scheduled to come due AFTER it — a composite reaches its terminal state only once what
+//! it depends on is itself ready. The dependency is read when the merge is scheduled
+//! ([`super::merge_due_instant`]), so the due instant never moves afterwards and schema
+//! activity that arrives later cannot leave an association non-terminal for as long as it
+//! keeps arriving. That is why the dues are applied together, creations first
+//! ([`super::ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState::settle_schema_creations`]).
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -24,36 +27,23 @@ use super::{
 };
 
 impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
-    /// Perform every merge the CLOCK already made due at `now`, and hold the ones whose
-    /// source API still owes a schema creation until that creation is due.
+    /// Perform every merge the CLOCK already made due at `now`.
     ///
     /// Owed by the clock alone: the due instant was recorded by the call that scheduled
-    /// the merge, so the same transition is applied whether or not anybody read either
-    /// API in between.
+    /// the merge — including the wait for the source API's own schema creation
+    /// ([`super::merge_due_instant`]) — so the same transition is applied whether or not
+    /// anybody read either API in between.
     pub(super) fn settle_due_merges(&mut self, now: SystemTime) {
         let mut due: Vec<(String, String)> = Vec::new();
         for association in self.source_api_associations.values_mut() {
             if association.merge_due_at.is_none_or(|at| now < at) {
                 continue;
             }
-            // The types this merge carries are the ones the source API's own creation
-            // installs, so a merge that would run first is pushed to that creation's due
-            // instant rather than merging a schema that is not there yet.
-            let creation_due = self
-                .graphql_apis
-                .get(&association.source_api_id)
-                .and_then(|api| api.schema.as_ref())
-                .and_then(|schema| schema.due_at);
-            match creation_due {
-                Some(creation_due) => association.merge_due_at = Some(creation_due),
-                None => {
-                    association.settle(now);
-                    due.push((
-                        association.source_api_id.clone(),
-                        association.merged_api_id.clone(),
-                    ));
-                }
-            }
+            association.settle(now);
+            due.push((
+                association.source_api_id.clone(),
+                association.merged_api_id.clone(),
+            ));
         }
         for (source_api_id, merged_api_id) in due {
             self.merge_types(&source_api_id, &merged_api_id);

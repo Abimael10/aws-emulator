@@ -33,6 +33,14 @@ pub const RESOURCE_NAME_PATTERN: &str = r"^[_A-Za-z][_0-9A-Za-z]*$";
 /// that name.
 pub const FUNCTION_RESOURCE: &str = "Function";
 
+/// The resource a data source's name belongs to, as the service names it in a refusal of
+/// that name.
+///
+/// The noun is the one AWS writes in the sentence for this resource — recorded behaviour
+/// for a `CreateDataSource` whose `name` breaks the expression — which is why each
+/// resource carries its own spelling rather than one derived from the shape's name.
+pub const DATA_SOURCE_RESOURCE: &str = "data source";
+
 /// [`RESOURCE_NAME_PATTERN`] compiled, which is how it is EVALUATED: see
 /// [`super::declared_pattern`] for the one reading of a `@pattern` a handler checks
 /// itself.

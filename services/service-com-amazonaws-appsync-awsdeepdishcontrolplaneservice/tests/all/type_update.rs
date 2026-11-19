@@ -65,11 +65,11 @@ fn mismatched_name_text(addressed: &str, declared: &str) -> String {
     format!("Provided type definition must declare the type {addressed}, not {declared}.")
 }
 
-/// The text a `ConcurrentModificationException` carries, as the model documents the
-/// shape.
+/// The text a `ConcurrentModificationException` carries for a call refused because the
+/// API's schema is already being altered. Spelled out here rather than read from the
+/// service, so a drift in the wording fails this suite instead of agreeing with itself.
 const CONCURRENT_MODIFICATION: &str =
-    "Another modification is in progress at this time and it must complete before you can \
-     make your change.";
+    "Schema is currently being altered, please wait until that is complete.";
 
 /// The non-terminal `SchemaStatus` a scheduled schema creation is in. Source:
 /// `smithy_query` shape `SchemaStatus`.

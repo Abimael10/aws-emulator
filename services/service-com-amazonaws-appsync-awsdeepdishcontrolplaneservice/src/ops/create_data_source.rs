@@ -187,6 +187,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A `name` outside the form `ResourceName` declares is refused here rather than
+        // at the boundary (`skip_validation` on `CreateDataSourceInput`): the service
+        // answers it with ONE sentence naming the resource whose name it is, which only
+        // the operation that names that resource can choose (see
+        // `crate::state::resource_name_refusal`), and with the operation's own modelled
+        // `BadRequestException` rather than a code this operation does not model.
+        if let Some(message) =
+            crate::state::resource_name_refusal(crate::state::DATA_SOURCE_RESOURCE, &input.name)
+        {
+            return Err(CreateDataSourceErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+                ..Default::default()
+            })
+            .into());
+        }
+
         // The data source is reported in the region the caller addressed, so its ARN
         // is built from that region rather than from a fixed one.
         let region = crate::state::request_region(ctx);
