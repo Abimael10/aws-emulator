@@ -777,7 +777,7 @@ async fn get_payment_manager_refuses_an_id_no_manager_is_stored_under() {
         if expected_status == 404 {
             assert_eq!(
                 text(&answered, "message"),
-                format!("Payment manager with ID {id} does not exist"),
+                format!("Payment manager not found: {id}"),
                 "case {case:?}: expected the missing manager worded in terms of the id the \
                  request named, got {}",
                 text(&answered, "message")

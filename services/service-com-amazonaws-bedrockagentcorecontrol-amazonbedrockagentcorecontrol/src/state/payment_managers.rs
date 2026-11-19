@@ -14,18 +14,24 @@ use crate::ops::types::{
     CreatePaymentManagerOutput, GetPaymentManagerOutput, UpdatePaymentManagerOutput,
 };
 
-/// The modelled not-found error for a payment manager this account does not hold.
+/// The modelled not-found error for a payment manager this account does not hold:
+/// the resource, then the id the request's path carried ("Payment manager not found:
+/// <paymentManagerId>").
 ///
-/// This control plane words a missing resource in terms of the id the request named —
-/// the sentence around the identifier is fixed, and the identifier itself is the
-/// caller's own value — exactly as [`browser_not_found`] words a sibling resource.
-/// Shared by the handlers rather than written per operation, so one payment manager
-/// cannot be reported missing in two different sentences by two operations.
+/// The payments plane words a missing resource this way rather than in the
+/// "<Resource> with ID <id> does not exist" sentence the browser plane uses
+/// ([`browser_not_found`]) — the same shape its sibling
+/// [`gateway_rate_limit_not_found`] carries: the text around the identifier is
+/// fixed and the identifier itself is the caller's own value, taken verbatim from
+/// the request. The model states no message text, so the wording is the recorded
+/// one.
+///
+/// Shared by every operation that resolves a manager rather than written per
+/// operation, so one payment manager cannot be reported missing in two different
+/// sentences by two operations.
 pub fn payment_manager_not_found(payment_manager_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!(
-            "Payment manager with ID {payment_manager_id} does not exist"
-        )),
+        message: Some(format!("Payment manager not found: {payment_manager_id}")),
     }
 }
 

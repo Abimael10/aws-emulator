@@ -480,7 +480,7 @@ async fn a_refused_update_changes_nothing() {
     );
     assert_eq!(
         text(&refused, "message"),
-        format!("Payment manager with ID {absent} does not exist"),
+        format!("Payment manager not found: {absent}"),
         "unexpected not-found message, got {refused}"
     );
     let (status, fetched) = get_manager(&router, absent).await;

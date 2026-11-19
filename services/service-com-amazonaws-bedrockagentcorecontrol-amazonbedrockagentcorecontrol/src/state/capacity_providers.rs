@@ -19,7 +19,7 @@ use crate::ops::types::{
 ///
 /// This control plane words a missing resource in terms of the id the request named — the
 /// sentence around the identifier is fixed, and the identifier itself is the caller's own
-/// value — exactly as [`payment_manager_not_found`] words a sibling resource. Shared by the
+/// value — exactly as [`browser_not_found`] words a sibling resource. Shared by the
 /// handlers rather than written per operation, so one provider cannot be reported missing in
 /// two different sentences by two operations.
 pub fn capacity_provider_not_found(capacity_provider_id: &str) -> ResourceNotFoundException {
