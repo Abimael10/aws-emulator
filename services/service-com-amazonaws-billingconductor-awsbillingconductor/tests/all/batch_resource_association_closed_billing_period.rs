@@ -241,10 +241,18 @@ async fn a_batch_association_whose_range_starts_in_a_closed_bill_is_refused_and_
     for row in rows {
         let emulator = Emulator::new();
         let group = emulator.billing_group("payer").await;
-        let target = emulator.percentage_item(&group, "target").await;
-        // A second resource in scope of the target's own billing group, so the only
-        // thing that can refuse the association of it is the range.
-        let child = emulator.percentage_item(&group, "child").await;
+        // The target applies from the PREVIOUS billing period on — the earliest period a
+        // write may name — so every range a row admits names periods it is there to hold
+        // an association in, and the only thing that can refuse the association is where
+        // the range BEGINS.
+        let target = emulator
+            .percentage_item_from(&group, "target", &period(-1))
+            .await;
+        // A second resource in scope of the target's own billing group, applying over the
+        // same periods for the same reason.
+        let child = emulator
+            .percentage_item_from(&group, "child", &period(-1))
+            .await;
         let requested = range(&row.inclusive_start, row.exclusive_end.as_deref());
         let case = format!(
             "{} ({}..{})",

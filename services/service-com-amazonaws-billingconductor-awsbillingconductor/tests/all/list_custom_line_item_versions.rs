@@ -893,8 +893,15 @@ async fn a_frozen_version_keeps_the_association_size_it_had() {
             }),
         )
         .await;
+    // The child applies over the same billing periods, because an association is in
+    // effect only in periods the resource it names applies in too: the frozen generation
+    // counts it in the previous period only if the child is there to be counted.
     let first = emulator
-        .custom_line_item(&group, "first_child", json!({}))
+        .custom_line_item(
+            &group,
+            "first_child",
+            json!({ "BillingPeriodRange": period_range(&period(-1), None) }),
+        )
         .await;
     let second = emulator
         .custom_line_item(&group, "second_child", json!({}))

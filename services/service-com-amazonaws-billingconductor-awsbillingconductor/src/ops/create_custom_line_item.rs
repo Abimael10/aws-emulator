@@ -371,7 +371,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // item it reports no version of. A resource that applies in none of the
             // periods the item being created applies in cannot be a child of it at all,
             // which is the fault `ValidationExceptionReason` enumerates by name.
-            let in_effect = state.associable_billing_periods(&arn, &item_periods);
+            let in_effect =
+                state.associable_billing_periods(&arn, std::slice::from_ref(&item_periods));
             if in_effect.is_empty() {
                 return Err(validation(
                     "ILLEGAL_CHILD_ASSOCIATE_RESOURCE",

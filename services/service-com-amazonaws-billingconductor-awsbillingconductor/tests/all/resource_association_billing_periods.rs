@@ -112,26 +112,46 @@ impl Emulator {
 
     /// A percentage custom line item: the only kind resources can be associated to.
     async fn percentage_item(&self, group_arn: &str, name: &str) -> String {
-        let (status, body) = self
-            .send(
-                "POST",
-                "/create-custom-line-item",
-                &json!({
-                    "Name": name,
-                    "Description": "a custom line item",
-                    "BillingGroupArn": group_arn,
-                    "ChargeDetails": {
-                        "Type": "FEE",
-                        "Percentage": { "PercentageValue": 10.0 },
-                    },
-                }),
-            )
-            .await;
+        self.item(group_arn, name, None).await
+    }
+
+    /// The same, applying from the billing period `inclusive_start` on rather than from
+    /// the one the create lands in.
+    ///
+    /// An association is in effect only in the billing periods the item HOLDING it and
+    /// the resource it names both apply in, so a case whose association reaches back to
+    /// the previous billing period needs items that apply there.
+    async fn percentage_item_from(
+        &self,
+        group_arn: &str,
+        name: &str,
+        inclusive_start: &str,
+    ) -> String {
+        self.item(group_arn, name, Some(inclusive_start)).await
+    }
+
+    /// A percentage custom line item, applying from `inclusive_start` when one is named.
+    async fn item(&self, group_arn: &str, name: &str, inclusive_start: Option<&str>) -> String {
+        let mut body = json!({
+            "Name": name,
+            "Description": "a custom line item",
+            "BillingGroupArn": group_arn,
+            "ChargeDetails": {
+                "Type": "FEE",
+                "Percentage": { "PercentageValue": 10.0 },
+            },
+        });
+        if let Some(inclusive_start) = inclusive_start {
+            body["BillingPeriodRange"] = json!({
+                "InclusiveStartBillingPeriod": inclusive_start,
+            });
+        }
+        let (status, answered) = self.send("POST", "/create-custom-line-item", &body).await;
         assert_eq!(
             status, 200,
-            "case custom line item {name:?}: expected HTTP 200, got {status} with {body}"
+            "case custom line item {name:?}: expected HTTP 200, got {status} with {answered}"
         );
-        arn_of(&body, &format!("custom line item {name:?}"))
+        arn_of(&answered, &format!("custom line item {name:?}"))
     }
 
     /// `BatchAssociateResourcesToCustomLineItem`, asserted to succeed for every
@@ -356,7 +376,13 @@ async fn the_default_read_is_scoped_to_the_current_billing_period() {
     for row in rows {
         let emulator = Emulator::new();
         let home = emulator.billing_group("home").await;
-        let target = emulator.percentage_item(&home, "target").await;
+        // The target applies from the PREVIOUS billing period on, the earliest period a
+        // write may name, because some rows associate over periods that end before the
+        // current one: an association is in effect only in the billing periods the item
+        // holding it applies in.
+        let target = emulator
+            .percentage_item_from(&home, "target", &period(-1))
+            .await;
         let resource = home.clone();
         emulator
             .associate(row.case, &target, &resource, row.associated.clone())
@@ -554,11 +580,17 @@ async fn a_period_before_the_association_does_not_report_it() {
 
     let emulator = Emulator::new();
     let home = emulator.billing_group("home").await;
-    let target = emulator.percentage_item(&home, "target").await;
+    let target = emulator
+        .percentage_item_from(&home, "target", &period(-1))
+        .await;
     // The association with no range names the billing group the target applies to; the
-    // backdated one names another custom line item of that same group.
+    // backdated one names another custom line item of that same group, applying from the
+    // previous billing period on as the target does — an association is in effect only in
+    // the periods both of them apply in.
     let open = home.clone();
-    let backdated = emulator.percentage_item(&home, "backdated").await;
+    let backdated = emulator
+        .percentage_item_from(&home, "backdated", &period(-1))
+        .await;
     emulator.associate("the open association", &target, &open, None).await;
     emulator
         .associate(

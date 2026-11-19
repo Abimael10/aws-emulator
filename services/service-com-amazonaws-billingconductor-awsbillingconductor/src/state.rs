@@ -11,10 +11,12 @@
 //! the maps and two spellings of one resource cannot become two records.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+mod association_periods;
 mod refusals;
 mod billing_period_checks;
 mod pagination;
 mod tagging;
+pub use association_periods::*;
 pub use tagging::*;
 pub use pagination::*;
 pub use billing_period_checks::*;
@@ -4045,6 +4047,12 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     /// associated in. Empty when the resource applies in none of them, so there is no
     /// association to store at all.
     ///
+    /// `requested` is the stretches the CALLER's range leaves — one for a range as it was
+    /// carried, several once another bound has already been applied to it (the periods the
+    /// item that will HOLD the association applies in, which a call writing an association
+    /// to a stored item bounds its range to first) — and the answer is what is left of
+    /// them, so one function states the rule for either end of the association.
+    ///
     /// A resource association is in effect only in billing periods the resource it names
     /// is there to be associated in — the rule the narrowing writer maintains from the
     /// other end ([`Self::remove_custom_line_item_periods`]): a period the named resource
@@ -4064,11 +4072,17 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
     pub fn associable_billing_periods(
         &self,
         resource_arn: &str,
-        requested: &BillingPeriodSpan,
+        requested: &[BillingPeriodSpan],
     ) -> Vec<BillingPeriodSpan> {
         match self.custom_line_items.get(resource_arn) {
-            Some(item) => intersect_billing_periods(&item.applied_periods(), requested),
-            None => vec![requested.clone()],
+            Some(item) => {
+                let applied = item.applied_periods();
+                requested
+                    .iter()
+                    .flat_map(|span| intersect_billing_periods(&applied, span))
+                    .collect()
+            }
+            None => requested.to_vec(),
         }
     }
 

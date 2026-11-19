@@ -22,6 +22,14 @@
 //! re-associating over periods already in effect changes nothing, so a retry (or a
 //! repeat inside one request) cannot double-count `AssociationSize`.
 //!
+//! What the range can put in effect is BOUNDED at both ends of the association: it is in
+//! effect only in billing periods the target item and the named resource are both there
+//! to be associated in, so the stored span is the range narrowed to the periods they
+//! share ([`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::associable_billing_periods`]).
+//! A range naming no period the TARGET applies in leaves nothing for any element to
+//! write, which is a fault of the request as a whole; a range sharing no period with ONE
+//! named resource is that element's `INVALID_BILLING_PERIOD_RANGE`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -157,9 +165,14 @@ fn validation(
 /// resource and why.
 type AssociationRefusal = (&'static str, String);
 
-/// One requested resource resolved against the store: what the caller named, and
-/// either the full ARN of the resource it names or the refusal its element reports.
-type ResolvedResource<'a> = (&'a String, Result<String, AssociationRefusal>);
+/// One requested resource resolved against the store: what the caller named, and either
+/// the resource its element associates — the full ARN of the resource it names, and the
+/// stretches of billing periods the association may be in effect over — or the refusal
+/// its element reports.
+type ResolvedResource<'a> = (
+    &'a String,
+    Result<(String, Vec<crate::state::BillingPeriodSpan>), AssociationRefusal>,
+);
 
 /// One element of `FailedAssociatedResources`: the resource as the CALLER named it,
 /// and why its association failed, classified by the `AssociateResourceErrorReason`
@@ -255,6 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The billing group the target applies to: the scope the resources it can be a
         // percentage of belong to.
         let target_billing_group = target.billing_group_arn.clone();
+        // The billing periods the TARGET applies in, in ANY generation of it — exactly
+        // the periods a read reports a version of it in, and so the periods it is there
+        // to hold an association in at all.
+        let target_periods = target.applied_periods();
 
         // The range the association applies in: the start is inclusive and the end
         // exclusive, so an end at or before the start would cover no billing period.
@@ -287,6 +304,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .billing_period_range
             .as_ref()
             .and_then(|range| range.exclusive_end_billing_period.clone());
+
+        // The billing periods this call may put an association in effect over: "the
+        // billing period range in which the custom line item request will be applied",
+        // beginning no earlier than the period the call was made in when it names no
+        // start of its own, BOUNDED to the periods the target item applies in. A resource
+        // association is in effect only in billing periods the resource it names is there
+        // to be associated in, and the item HOLDING it is one such resource — the rule the
+        // narrowing writer maintains from the other end
+        // ([`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::remove_custom_line_item_periods`])
+        // — so no read of a billing period can report an association to an item it
+        // reports no version of. Bounding one range to the periods the item applies in
+        // can leave SEVERAL stretches, because a bounded delete can have carved a hole in
+        // them.
+        let requested = crate::state::BillingPeriodSpan::started_now(
+            inclusive_start_billing_period,
+            exclusive_end_billing_period,
+        );
+        let within_target = crate::state::intersect_billing_periods(&target_periods, &requested);
+        // A range the target applies in no period of leaves nothing for ANY element to
+        // write, so it is a fault of the request as a whole rather than of one named
+        // resource — the answer this operation gives a range covering no period it may
+        // act over.
+        if within_target.is_empty() {
+            return Err(validation(
+                "ILLEGAL_BILLING_PERIOD_RANGE",
+                "BillingPeriodRange",
+                format!(
+                    "the billing period range names no billing period the custom line item \
+                     {target_arn} applies in"
+                ),
+            ));
+        }
 
         // EVERY requested resource is resolved against the store FIRST, so the
         // outcomes are decided on one consistent view and the stored item is borrowed
@@ -322,7 +371,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "ILLEGAL_CUSTOMLINEITEM",
                             fault.message(&target_billing_group, &arn),
                         )),
-                        None => Ok(arn),
+                        // The periods the association may be in effect over, bounded at
+                        // the OTHER end too: the ones the named resource is there to be
+                        // associated in. A resource that applies in none of the periods
+                        // left by the target's own bound has no association to write at
+                        // all, which `AssociateResourceErrorReason` enumerates for a range
+                        // this element cannot be associated over
+                        // (`smithy_query(query="shape",shape="AssociateResourceErrorReason")`:
+                        // `INVALID_BILLING_PERIOD_RANGE`).
+                        None => {
+                            let in_effect =
+                                state.associable_billing_periods(&arn, &within_target);
+                            if in_effect.is_empty() {
+                                Err((
+                                    "INVALID_BILLING_PERIOD_RANGE",
+                                    format!(
+                                        "the resource {arn} applies in none of the billing \
+                                         periods the request would associate it in"
+                                    ),
+                                ))
+                            } else {
+                                Ok((arn, in_effect))
+                            }
+                        }
                     },
                 };
                 (requested, outcome)
@@ -353,21 +424,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the audit record below reports is read off the writes, not off the successes.
         let mut changed = false;
         for (requested, outcome) in resolved {
-            let resource_arn = match outcome {
+            let (resource_arn, added) = match outcome {
                 Err((reason, message)) => {
                     failures.push(failed(requested, reason, message));
                     continue;
                 }
-                Ok(resource_arn) => resource_arn,
+                Ok(resolved) => resolved,
             };
-            // The billing periods this call puts the association in effect over: "the
-            // billing period range in which the custom line item request will be
-            // applied", beginning no earlier than the period the call was made in when
-            // it names no start of its own.
-            let added = crate::state::BillingPeriodSpan::started_now(
-                inclusive_start_billing_period.clone(),
-                exclusive_end_billing_period.clone(),
-            );
             // An item that already holds a record for the resource keeps that ONE
             // record and GAINS the periods this call names: the periods an association
             // is in effect over are the union of the ranges the associating calls named,
@@ -376,7 +439,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `AssociationSize` unable to double-count.
             if let Some(outcome) = target
                 .association_mut(&resource_arn)
-                .map(|association| association.add_periods(&added))
+                .map(|association| association.add_period_spans(&added))
             {
                 match outcome {
                     crate::state::PeriodsAddition::Changed => {
@@ -425,9 +488,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
                 continue;
             }
+            // One stretch of billing periods more than a stored association may be in
+            // effect over is the same bound for a record this call MINTS as for one it
+            // widens, and nothing of the element is written past it.
+            if added.len() > crate::state::MAX_BILLING_PERIOD_SPANS {
+                failures.push(failed(
+                    requested,
+                    "SERVICE_LIMIT_EXCEEDED",
+                    format!(
+                        "the association of {resource_arn} is in effect over at most {} \
+                         separate ranges of billing periods",
+                        crate::state::MAX_BILLING_PERIOD_SPANS
+                    ),
+                ));
+                continue;
+            }
             target
                 .associated_resources
-                .push(crate::state::ResourceAssociationRecord::new(
+                .push(crate::state::ResourceAssociationRecord::over(
                     resource_arn, added,
                 ));
             target.last_modified_time_millis = now;

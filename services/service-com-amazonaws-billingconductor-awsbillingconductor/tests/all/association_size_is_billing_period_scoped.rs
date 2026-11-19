@@ -43,6 +43,10 @@ pub(crate) fn range(inclusive_start: &str, exclusive_end: Option<&str>) -> Value
 /// A PERCENTAGE custom line item — the only kind resources can be associated to — in
 /// effect from the PREVIOUS billing period on, so that a read of that period reports it
 /// and the count it reports there can be asked about at all.
+///
+/// The resources an association NAMES are created this way too: an association is in
+/// effect only in the billing periods the resource it names applies in, so a child item
+/// has to apply in every period a row counts it in.
 pub(crate) async fn target_item(
     emulator: &Emulator,
     case: &str,
@@ -309,14 +313,15 @@ async fn association_size_counts_the_associations_in_effect_in_the_period_read()
         let target = target_item(&emulator, case, &group, "target").await;
 
         // The resources in scope of the billing group the target applies to: custom line
-        // items of that same group.
+        // items of that same group, applying over the same billing periods the target
+        // does — an association is in effect only in periods the resource it names
+        // applies in too, so a child that applies nowhere near a row's range could hold
+        // no association over it.
         let wanted: usize = row.associations.iter().map(|(count, _)| count).sum();
         let mut pool: Vec<String> = Vec::new();
         while pool.len() < wanted {
             pool.push(
-                emulator
-                    .percentage_item(&group, &format!("child{}", pool.len()))
-                    .await,
+                target_item(&emulator, case, &group, &format!("child{}", pool.len())).await,
             );
         }
 
@@ -393,8 +398,10 @@ async fn the_update_answer_and_the_version_history_count_their_own_billing_perio
     let emulator = Emulator::new();
     let group = emulator.billing_group("home").await;
     let target = target_item(&emulator, case, &group, "target").await;
-    let early = emulator.percentage_item(&group, "early").await;
-    let later = emulator.percentage_item(&group, "later").await;
+    // Both children apply from the previous billing period on, as the target does: an
+    // association is in effect only in periods the resource it names applies in too.
+    let early = target_item(&emulator, case, &group, "early").await;
+    let later = target_item(&emulator, case, &group, "later").await;
 
     // One resource in effect in the PREVIOUS billing period only, one from two periods
     // out on: so each billing period of the item has a different count, and no period

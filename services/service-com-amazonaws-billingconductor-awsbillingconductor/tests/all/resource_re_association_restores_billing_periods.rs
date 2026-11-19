@@ -248,7 +248,13 @@ async fn a_re_association_puts_the_billing_periods_it_names_in_effect() {
     for row in rows {
         let emulator = Emulator::new();
         let home = emulator.billing_group("home").await;
-        let target = emulator.percentage_item(&home, "target").await;
+        // The target applies from the PREVIOUS billing period on, the earliest period a
+        // write may name: an association is in effect only in periods the item holding it
+        // applies in, so the item has to apply in every period these rows re-associate
+        // over.
+        let target = emulator
+            .percentage_item_from(&home, "target", &period(-1))
+            .await;
         // The resource: the billing group the target applies to, which is in scope of it.
         let resource = home.clone();
 

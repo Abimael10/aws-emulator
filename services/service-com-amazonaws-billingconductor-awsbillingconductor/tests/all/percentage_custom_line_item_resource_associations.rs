@@ -20,7 +20,24 @@
 //! custom line item), the form the caller names it in (full ARN / bare id), the
 //! number of resources in one request, the way a resource fails, and the billing
 //! period a read asks for — never along a renaming.
+//!
+//! The last two suites here are about WHICH billing periods such a call may put an
+//! association in effect over. RULE: an association is in effect only in billing periods
+//! the custom line item HOLDING it and the resource it NAMES both apply in, so the stored
+//! span is the request's range narrowed to the periods the two share — a range naming no
+//! period the target applies in is the call's own modelled `ValidationException`, and a
+//! resource applying in none of the periods left is that element's
+//! `INVALID_BILLING_PERIOD_RANGE`. No read of a billing period can then report an
+//! association to an item it reports no version of, which is the same invariant a bounded
+//! delete maintains from the other end
+//! (`tests/all/bounded_delete_narrows_resource_associations.rs`) and the create applies to
+//! its own `AssociatedValues`
+//! (`tests/all/create_custom_line_item_association_periods.rs`), whose helpers those rows
+//! read the store through.
 
+use crate::bounded_delete_narrows_resource_associations::{
+    associated_arns, association_size, item_in, range,
+};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_billingconductor_awsbillingconductor::{
@@ -156,6 +173,47 @@ impl Emulator {
             json!({ "Type": "FEE", "Percentage": { "PercentageValue": 10.0 } }),
         )
         .await
+    }
+
+    /// A percentage custom line item applying from the billing period `inclusive_start`
+    /// on, rather than from the one the create lands in.
+    ///
+    /// An association is in effect only in billing periods the item HOLDING it and the
+    /// resource it names both apply in, so a case whose association reaches back to the
+    /// previous billing period needs an item that applies there to hold it — which is
+    /// what a create naming that period as its `InclusiveStartBillingPeriod` makes
+    /// (`tests/all/create_custom_line_item_billing_period_window.rs` pins the window such
+    /// a create may name).
+    pub(crate) async fn percentage_item_from(
+        &self,
+        group_arn: &str,
+        name: &str,
+        inclusive_start: &str,
+    ) -> String {
+        let (status, body) = self
+            .send(
+                "POST",
+                "/create-custom-line-item",
+                &json!({
+                    "Name": name,
+                    "Description": "a custom line item",
+                    "BillingGroupArn": group_arn,
+                    "ChargeDetails": {
+                        "Type": "FEE",
+                        "Percentage": { "PercentageValue": 10.0 },
+                    },
+                    "BillingPeriodRange": {
+                        "InclusiveStartBillingPeriod": inclusive_start,
+                    },
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case custom line item {name:?} from {inclusive_start}: expected HTTP 200, got \
+             {status} with {body}"
+        );
+        arn_of(&body, &format!("custom line item {name:?}"))
     }
 
     /// A flat custom line item: a fixed charge value, with no associated resources.
@@ -1023,4 +1081,647 @@ async fn creating_a_custom_line_item_refuses_what_it_cannot_persist() {
         "case a ClientToken replay: expected the ARN the first call minted, got {first} and \
          {second}"
     );
+}
+
+/// A PERCENTAGE custom line item of `group` applying over the billing periods
+/// `billing_period_range` names — `None` for the create that names none, which applies
+/// from the billing period it lands in on.
+async fn item_over(
+    emulator: &Emulator,
+    case: &str,
+    group: &str,
+    name: &str,
+    billing_period_range: Option<&Value>,
+) -> String {
+    let mut body = json!({
+        "Name": name,
+        "Description": "an item whose associations are bounded",
+        "BillingGroupArn": group,
+        "ChargeDetails": { "Type": "FEE", "Percentage": { "PercentageValue": 10.0 } },
+    });
+    if let Some(billing_period_range) = billing_period_range {
+        body["BillingPeriodRange"] = billing_period_range.clone();
+    }
+    let (status, answered) = emulator
+        .send("POST", "/create-custom-line-item", &body)
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the create of {name:?} to answer HTTP 200, got {status} with \
+         {answered}"
+    );
+    arn_of(&answered, &format!("custom line item {name:?}"))
+}
+
+/// A `DeleteCustomLineItem` bounded to `billing_period_range`, asserted to be applied:
+/// what carves a HOLE in the billing periods an item applies in, so that the periods it
+/// applies in are several separate stretches.
+async fn delete_periods(emulator: &Emulator, case: &str, arn: &str, billing_period_range: &Value) {
+    let (status, body) = emulator
+        .send(
+            "POST",
+            "/delete-custom-line-item",
+            &json!({ "Arn": arn, "BillingPeriodRange": billing_period_range }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the bounded delete to answer HTTP 200, got {status} with {body}"
+    );
+}
+
+/// The member a refusal names as at fault, or `None` when it names none.
+fn refused_member(body: &Value) -> Option<String> {
+    body.get("Fields")?
+        .as_array()?
+        .first()?
+        .get("Name")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The resource an association NAMES: the target's own billing group, which carries the
+/// charges of the accounts it bills in every period a write may land in, or another custom
+/// line item of that group, which applies only in the billing periods its own generations
+/// hold.
+enum Named {
+    BillingGroup,
+    Item {
+        /// The `BillingPeriodRange` the named item is created with.
+        range: Option<Value>,
+        /// A bounded delete applied to it BEFORE the association, carving a hole in the
+        /// periods it applies in; `None` where there is none.
+        hole: Option<Value>,
+    },
+}
+
+/// One row: how the TARGET and the NAMED resource were set up, the range the associating
+/// call carries, and whether the association is in effect in each probed billing period.
+struct PeriodRow {
+    case: &'static str,
+    /// The `BillingPeriodRange` the target is created with; `None` for the create that
+    /// names none.
+    target_range: Option<Value>,
+    /// A bounded delete applied to the TARGET before the association.
+    target_hole: Option<Value>,
+    named: Named,
+    /// The `BillingPeriodRange` the associating call names; `None` for the call that
+    /// names none.
+    requested: Option<Value>,
+    /// (the billing period a read asks about, is the association in effect there)
+    probes: Vec<(String, bool)>,
+}
+
+/// THE RULE: the association a batch associate stores is in effect in exactly the billing
+/// periods the request's range, the TARGET item's own periods and the NAMED resource's own
+/// periods all share — so a period reporting no version of either end reports no
+/// association between them, and every period all three cover does.
+#[tokio::test]
+async fn an_association_is_in_effect_only_where_the_item_and_the_resource_both_apply() {
+    let rows: Vec<PeriodRow> = vec![
+        PeriodRow {
+            case: "an item and a named item applying over the same periods",
+            target_range: Some(range(&period(-1), None)),
+            target_hole: None,
+            named: Named::Item {
+                range: Some(range(&period(-1), None)),
+                hole: None,
+            },
+            requested: Some(range(&period(-1), None)),
+            probes: vec![
+                (period(-2), false),
+                (period(-1), true),
+                (period(0), true),
+                (period(6), true),
+            ],
+        },
+        PeriodRow {
+            case: "a named item that stops applying before the range ends",
+            target_range: Some(range(&period(-1), None)),
+            target_hole: None,
+            named: Named::Item {
+                range: Some(range(&period(-1), Some(&period(0)))),
+                hole: None,
+            },
+            requested: Some(range(&period(-1), None)),
+            probes: vec![
+                (period(-1), true),
+                (period(0), false),
+                (period(3), false),
+            ],
+        },
+        PeriodRow {
+            case: "a target that stops applying before the range ends",
+            target_range: Some(range(&period(-1), Some(&period(0)))),
+            target_hole: None,
+            named: Named::Item {
+                range: Some(range(&period(-1), None)),
+                hole: None,
+            },
+            requested: Some(range(&period(-1), None)),
+            probes: vec![
+                (period(-1), true),
+                (period(0), false),
+                (period(1), false),
+            ],
+        },
+        PeriodRow {
+            case: "a named item that only starts applying later than the range does",
+            target_range: Some(range(&period(-1), None)),
+            target_hole: None,
+            named: Named::Item {
+                range: None,
+                hole: None,
+            },
+            requested: Some(range(&period(-1), None)),
+            probes: vec![
+                (period(-1), false),
+                (period(0), true),
+                (period(2), true),
+            ],
+        },
+        PeriodRow {
+            case: "a range bounded inside the periods both of them apply in",
+            target_range: Some(range(&period(-1), None)),
+            target_hole: None,
+            named: Named::Item {
+                range: Some(range(&period(-1), None)),
+                hole: None,
+            },
+            requested: Some(range(&period(-1), Some(&period(0)))),
+            probes: vec![
+                (period(-1), true),
+                (period(0), false),
+                (period(1), false),
+            ],
+        },
+        PeriodRow {
+            case: "a call naming no range at all",
+            target_range: Some(range(&period(-1), None)),
+            target_hole: None,
+            named: Named::Item {
+                range: Some(range(&period(-1), None)),
+                hole: None,
+            },
+            requested: None,
+            probes: vec![
+                (period(-1), false),
+                (period(0), true),
+                (period(2), true),
+            ],
+        },
+        PeriodRow {
+            case: "a named item with a hole carved out of the periods it applies in",
+            target_range: Some(range(&period(-1), None)),
+            target_hole: None,
+            named: Named::Item {
+                range: Some(range(&period(-1), None)),
+                hole: Some(range(&period(0), Some(&period(1)))),
+            },
+            requested: Some(range(&period(-1), None)),
+            probes: vec![
+                (period(-1), true),
+                (period(0), false),
+                (period(1), true),
+                (period(4), true),
+            ],
+        },
+        PeriodRow {
+            case: "a target with a hole carved out of the periods it applies in",
+            target_range: Some(range(&period(-1), None)),
+            target_hole: Some(range(&period(0), Some(&period(1)))),
+            named: Named::Item {
+                range: Some(range(&period(-1), None)),
+                hole: None,
+            },
+            requested: Some(range(&period(-1), None)),
+            probes: vec![
+                (period(-1), true),
+                (period(0), false),
+                (period(1), true),
+                (period(4), true),
+            ],
+        },
+        PeriodRow {
+            // A billing group is not bounded by periods of its own, so the TARGET's are
+            // the only bound on an association naming it.
+            case: "the billing group named by a target bounded to the previous period",
+            target_range: Some(range(&period(-1), Some(&period(0)))),
+            target_hole: None,
+            named: Named::BillingGroup,
+            requested: Some(range(&period(-1), None)),
+            probes: vec![
+                (period(-1), true),
+                (period(0), false),
+                (period(1), false),
+            ],
+        },
+        PeriodRow {
+            case: "the billing group named by a target created with no range at all",
+            target_range: None,
+            target_hole: None,
+            named: Named::BillingGroup,
+            requested: None,
+            probes: vec![
+                (period(-1), false),
+                (period(0), true),
+                (period(3), true),
+            ],
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let emulator = Emulator::new();
+        let group = emulator.billing_group("payer").await;
+        let target = item_over(&emulator, case, &group, "target", row.target_range.as_ref()).await;
+        if let Some(hole) = &row.target_hole {
+            delete_periods(&emulator, case, &target, hole).await;
+        }
+        let resource = match &row.named {
+            Named::BillingGroup => group.clone(),
+            Named::Item { range, hole } => {
+                let named = item_over(&emulator, case, &group, "named", range.as_ref()).await;
+                if let Some(hole) = hole {
+                    delete_periods(&emulator, case, &named, hole).await;
+                }
+                named
+            }
+        };
+
+        let (status, body) = emulator
+            .associate(
+                &target,
+                std::slice::from_ref(&resource),
+                row.requested.clone(),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the association to answer HTTP 200, got {status} with {body}"
+        );
+        assert_eq!(
+            reported(&body, "SuccessfullyAssociatedResources"),
+            vec![resource.clone()],
+            "case {case:?}: expected the resource reported associated, got {body}"
+        );
+
+        for (billing_period, expected) in &row.probes {
+            let listed = associated_arns(&emulator, case, &target, billing_period)
+                .await
+                .unwrap_or_default();
+            let holds = listed.contains(&resource);
+            assert_eq!(
+                holds, *expected,
+                "case {case:?}: expected the association to be in effect in {billing_period}: \
+                 {expected}, got {holds} from {listed:?}"
+            );
+
+            // THE RULE as the invariant two reads of one period have to agree on: a period
+            // reporting no version of the item holding the association — or none of the
+            // item it names — reports no association between them.
+            let target_reported = item_in(&emulator, case, &target, billing_period)
+                .await
+                .is_some();
+            let named_reported = match &row.named {
+                Named::BillingGroup => true,
+                Named::Item { .. } => item_in(&emulator, case, &resource, billing_period)
+                    .await
+                    .is_some(),
+            };
+            assert!(
+                !holds || (target_reported && named_reported),
+                "case {case:?}: {billing_period} reports a version of the target: \
+                 {target_reported} and of the named resource: {named_reported}, so it may \
+                 report no association between them, got {listed:?}"
+            );
+
+            // `AssociationSize` counts the associations in effect in the period it is read
+            // for, and a period reporting no version of the target reports no size at all,
+            // so the two period-scoped reads of the one association agree.
+            let size = association_size(&emulator, case, &target, billing_period).await;
+            assert_eq!(
+                size,
+                target_reported.then_some(i64::from(holds)),
+                "case {case:?}: expected the AssociationSize of {billing_period} to count the \
+                 one association only where it is in effect, got {size:?}"
+            );
+        }
+    }
+}
+
+/// THE RULE on a RE-association: a second call for a resource the item already holds adds
+/// the periods it names bounded exactly as the first one was, so the ONE record ends up in
+/// effect over the stretches the request's range and both resources share — several
+/// stretches when a bounded delete carved a hole in the periods one of them applies in.
+#[tokio::test]
+async fn a_re_association_adds_only_the_periods_the_item_and_the_resource_share() {
+    let case = "a named item with a hole, re-associated over every period of the item";
+    let emulator = Emulator::new();
+    let group = emulator.billing_group("payer").await;
+    let target = item_over(
+        &emulator,
+        case,
+        &group,
+        "target",
+        Some(&range(&period(-1), None)),
+    )
+    .await;
+    let named = item_over(
+        &emulator,
+        case,
+        &group,
+        "named",
+        Some(&range(&period(-1), None)),
+    )
+    .await;
+    // The named item applies in the previous billing period and from the next one on, but
+    // not in the current one.
+    delete_periods(
+        &emulator,
+        case,
+        &named,
+        &range(&period(0), Some(&period(1))),
+    )
+    .await;
+
+    // The first call puts only the later stretch in effect.
+    let (status, body) = emulator
+        .associate(
+            &target,
+            std::slice::from_ref(&named),
+            Some(range(&period(1), None)),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the first association to answer HTTP 200, got {status} with \
+         {body}"
+    );
+
+    // The second names every period the target applies in: the periods it adds are the
+    // ones the named item applies in and the association does not already cover.
+    let (status, body) = emulator
+        .associate(
+            &target,
+            std::slice::from_ref(&named),
+            Some(range(&period(-1), None)),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected the re-association to answer HTTP 200, got {status} with {body}"
+    );
+    assert_eq!(
+        reported(&body, "SuccessfullyAssociatedResources"),
+        vec![named.clone()],
+        "case {case:?}: expected the resource reported associated, got {body}"
+    );
+
+    for (billing_period, expected) in [
+        (period(-1), true),
+        (period(0), false),
+        (period(1), true),
+        (period(5), true),
+    ] {
+        let listed = associated_arns(&emulator, case, &target, &billing_period)
+            .await
+            .unwrap_or_default();
+        assert_eq!(
+            listed.contains(&named),
+            expected,
+            "case {case:?}: expected the association to be in effect in {billing_period}: \
+             {expected}, got {listed:?}"
+        );
+        // ONE record however many stretches it is in effect over, so the resource is
+        // counted once in every period it is in effect in.
+        let size = association_size(&emulator, case, &target, &billing_period).await;
+        assert_eq!(
+            size,
+            Some(i64::from(expected)),
+            "case {case:?}: expected the AssociationSize of {billing_period} to count the one \
+             record once, got {size:?}"
+        );
+    }
+}
+
+/// One row of the refused-range table: the case, the TARGET's own `BillingPeriodRange`,
+/// a bounded delete applied to it before the association, and the range the associating
+/// call names (`None` for the call that names none).
+type RefusedRangeRow = (
+    &'static str,
+    Option<Value>,
+    Option<Value>,
+    Option<Value>,
+);
+
+/// One row of the refused-element table: the case, the NAMED item's own
+/// `BillingPeriodRange`, a bounded delete applied to it before the association, and the
+/// range the associating call names.
+type RefusedElementRow = (&'static str, Option<Value>, Option<Value>, Value);
+
+/// THE RULE where the TARGET leaves nothing: a range naming no billing period the target
+/// applies in is a fault of the request as a whole — the modelled 400 `ValidationException`
+/// carrying the `ValidationExceptionReason` the model enumerates for an illegal billing
+/// period range and the member at fault — and NOTHING is written, rather than an
+/// association in effect in a period the item has no version in.
+#[tokio::test]
+async fn a_range_naming_no_period_the_target_applies_in_is_the_calls_own_refusal() {
+    // (case, the target's own range, a bounded delete applied to it first, the range the
+    // associating call names)
+    let rows: Vec<RefusedRangeRow> = vec![
+        (
+            "a target applying in the previous billing period only",
+            Some(range(&period(-1), Some(&period(0)))),
+            None,
+            Some(range(&period(0), None)),
+        ),
+        (
+            "a target applying in the previous period only, the call naming no range",
+            Some(range(&period(-1), Some(&period(0)))),
+            None,
+            None,
+        ),
+        (
+            "a target that only starts applying in the current billing period",
+            None,
+            None,
+            Some(range(&period(-1), Some(&period(0)))),
+        ),
+        (
+            "a target cut back to the previous period by a bounded delete",
+            Some(range(&period(-1), None)),
+            Some(range(&period(0), None)),
+            Some(range(&period(0), None)),
+        ),
+        (
+            "a range falling inside the hole a bounded delete carved",
+            Some(range(&period(-1), None)),
+            Some(range(&period(0), Some(&period(1)))),
+            Some(range(&period(0), Some(&period(1)))),
+        ),
+    ];
+
+    for (case, target_range, target_hole, requested) in rows {
+        let emulator = Emulator::new();
+        let group = emulator.billing_group("payer").await;
+        let target = item_over(&emulator, case, &group, "target", target_range.as_ref()).await;
+        if let Some(hole) = &target_hole {
+            delete_periods(&emulator, case, &target, hole).await;
+        }
+
+        // The billing group the target applies to is always in scope and has no periods of
+        // its own, so the only thing that can refuse this call is the range.
+        let (status, body) = emulator
+            .associate(&target, std::slice::from_ref(&group), requested)
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            body.get("__type").and_then(Value::as_str),
+            Some("ValidationException"),
+            "case {case:?}: expected the modelled ValidationException, got {body}"
+        );
+        assert_eq!(
+            body.get("Reason").and_then(Value::as_str),
+            Some("ILLEGAL_BILLING_PERIOD_RANGE"),
+            "case {case:?}: expected the modelled reason for an illegal billing period range, \
+             got {body}"
+        );
+        assert_eq!(
+            refused_member(&body).as_deref(),
+            Some("BillingPeriodRange"),
+            "case {case:?}: expected the member at fault named in Fields, got {body}"
+        );
+        let message = body
+            .get("Message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            message.contains(&target),
+            "case {case:?}: expected the refusal to name the item whose periods the range \
+             names none of, got {message:?}"
+        );
+
+        // Nothing was written: no billing period reports the association the refused call
+        // would have made.
+        for billing_period in [period(-2), period(-1), period(0), period(1), period(3)] {
+            let listed = associated_arns(&emulator, case, &target, &billing_period)
+                .await
+                .unwrap_or_default();
+            assert!(
+                !listed.contains(&group),
+                "case {case:?}: expected the refused call to write nothing, yet a read of \
+                 {billing_period} reports {listed:?}"
+            );
+        }
+    }
+}
+
+/// THE RULE where ONE named resource leaves nothing: a resource applying in none of the
+/// billing periods the call would associate it in is that element's own failure, carrying
+/// the `AssociateResourceErrorReason` the model enumerates for a billing period range this
+/// element cannot be associated over — while the other resources of the same request are
+/// associated.
+#[tokio::test]
+async fn a_resource_applying_in_none_of_the_requested_periods_fails_as_its_own_element() {
+    // (case, the named item's range, a bounded delete applied to it first, the range the
+    // associating call names)
+    let rows: Vec<RefusedElementRow> = vec![
+        (
+            "a named item applying in the previous billing period only",
+            Some(range(&period(-1), Some(&period(0)))),
+            None,
+            range(&period(0), None),
+        ),
+        (
+            "a named item that only starts applying in the current billing period",
+            None,
+            None,
+            range(&period(-1), Some(&period(0))),
+        ),
+        (
+            "a named item cut back to the previous period by a bounded delete",
+            Some(range(&period(-1), None)),
+            Some(range(&period(0), None)),
+            range(&period(0), None),
+        ),
+        (
+            "a named item with a hole the range falls inside",
+            Some(range(&period(-1), None)),
+            Some(range(&period(0), Some(&period(1)))),
+            range(&period(0), Some(&period(1))),
+        ),
+    ];
+
+    for (case, named_range, named_hole, requested) in rows {
+        let emulator = Emulator::new();
+        let group = emulator.billing_group("payer").await;
+        // The target applies from the previous billing period on, the widest window a
+        // write may name, so every range below names periods IT applies in: what is left
+        // to refuse is the named item alone.
+        let target = item_over(
+            &emulator,
+            case,
+            &group,
+            "target",
+            Some(&range(&period(-1), None)),
+        )
+        .await;
+        let named = item_over(&emulator, case, &group, "named", named_range.as_ref()).await;
+        if let Some(hole) = &named_hole {
+            delete_periods(&emulator, case, &named, hole).await;
+        }
+
+        // ONE request naming both the item that cannot hold the association and the
+        // billing group that can: the batch reports an outcome per resource.
+        let resources = vec![named.clone(), group.clone()];
+        let (status, body) = emulator
+            .associate(&target, &resources, Some(requested.clone()))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the call to answer HTTP 200, got {status} with {body}"
+        );
+        assert_eq!(
+            failures(&body),
+            vec![(named.clone(), "INVALID_BILLING_PERIOD_RANGE".to_string())],
+            "case {case:?}: expected the named item reported failed with the modelled reason, \
+             got {body}"
+        );
+        assert_eq!(
+            reported(&body, "SuccessfullyAssociatedResources"),
+            vec![group.clone()],
+            "case {case:?}: expected the other resource of the same request associated, got \
+             {body}"
+        );
+
+        // Nothing was written for the refused element, in any period, while the element
+        // that succeeded is in effect in the period the range begins in.
+        let start = requested
+            .get("InclusiveStartBillingPeriod")
+            .and_then(Value::as_str)
+            .expect("the range names its inclusive start")
+            .to_string();
+        for billing_period in [period(-1), period(0), period(1), period(3)] {
+            let listed = associated_arns(&emulator, case, &target, &billing_period)
+                .await
+                .unwrap_or_default();
+            assert!(
+                !listed.contains(&named),
+                "case {case:?}: expected the failed element to write nothing, yet a read of \
+                 {billing_period} reports {listed:?}"
+            );
+        }
+        let listed = associated_arns(&emulator, case, &target, &start)
+            .await
+            .unwrap_or_default();
+        assert!(
+            listed.contains(&group),
+            "case {case:?}: expected the associated resource to be readable back for {start}, \
+             got {listed:?}"
+        );
+    }
 }

@@ -150,6 +150,44 @@ impl Emulator {
         .await
     }
 
+    /// A percentage custom line item applying from the billing period `inclusive_start`
+    /// on, rather than from the one the create lands in.
+    ///
+    /// An association is in effect only in billing periods the item HOLDING it and the
+    /// resource it names both apply in, so a row whose association reaches back to the
+    /// previous billing period needs items that apply there.
+    async fn percentage_item_from(
+        &self,
+        group_arn: &str,
+        name: &str,
+        inclusive_start: &str,
+    ) -> String {
+        let (status, body) = self
+            .send(
+                "POST",
+                "/create-custom-line-item",
+                &json!({
+                    "Name": name,
+                    "Description": "a custom line item",
+                    "BillingGroupArn": group_arn,
+                    "ChargeDetails": {
+                        "Type": "FEE",
+                        "Percentage": { "PercentageValue": 10.0 },
+                    },
+                    "BillingPeriodRange": {
+                        "InclusiveStartBillingPeriod": inclusive_start,
+                    },
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case custom line item {name:?} from {inclusive_start}: expected HTTP 200, got \
+             {status} with {body}"
+        );
+        arn_of(&body, &format!("custom line item {name:?}"))
+    }
+
     /// A flat custom line item: a fixed charge value, with no associated resources.
     async fn flat_item(&self, group_arn: &str, name: &str) -> String {
         self.custom_line_item(
@@ -856,7 +894,12 @@ async fn a_ranged_disassociation_ends_the_association_at_its_inclusive_start() {
     for row in rows {
         let emulator = Emulator::new();
         let home = emulator.billing_group("home").await;
-        let target = emulator.percentage_item(&home, "target").await;
+        // The target applies from the previous billing period on, because these rows
+        // associate from there: an association is in effect only in periods the item
+        // holding it applies in.
+        let target = emulator
+            .percentage_item_from(&home, "target", &period(-1))
+            .await;
         let resource = home.clone();
         emulator
             .associate(
@@ -1179,11 +1222,17 @@ async fn a_bounded_disassociation_removes_only_the_periods_its_range_covers() {
     for row in rows {
         let emulator = Emulator::new();
         let home = emulator.billing_group("home").await;
-        let target = emulator.percentage_item(&home, "target").await;
+        let target = emulator
+            .percentage_item_from(&home, "target", &period(-1))
+            .await;
         // Both classes of resource an association can name, each in one of the two
-        // forms the member admits, disassociated in ONE request.
+        // forms the member admits, disassociated in ONE request. The named item applies
+        // over the same periods as the target, since an association is in effect only
+        // where both of them are.
         let group = home.clone();
-        let child = emulator.percentage_item(&home, "child").await;
+        let child = emulator
+            .percentage_item_from(&home, "child", &period(-1))
+            .await;
         let requested = vec![group.clone(), bare_id(&child)];
         emulator
             .associate(&target, &requested, row.associated.clone())
@@ -1407,11 +1456,17 @@ async fn an_unbounded_disassociation_ends_the_association_at_the_current_billing
     for row in rows {
         let emulator = Emulator::new();
         let home = emulator.billing_group("home").await;
-        let target = emulator.percentage_item(&home, "target").await;
+        let target = emulator
+            .percentage_item_from(&home, "target", &period(-1))
+            .await;
         // Both classes of resource an association can name, each in one of the two
-        // forms the member admits, disassociated in ONE request.
+        // forms the member admits, disassociated in ONE request. The named item applies
+        // over the same periods as the target, since an association is in effect only
+        // where both of them are.
         let group = home.clone();
-        let child = emulator.percentage_item(&home, "child").await;
+        let child = emulator
+            .percentage_item_from(&home, "child", &period(-1))
+            .await;
         let requested = vec![group.clone(), bare_id(&child)];
         emulator
             .associate(&target, &requested, row.associated.clone())
