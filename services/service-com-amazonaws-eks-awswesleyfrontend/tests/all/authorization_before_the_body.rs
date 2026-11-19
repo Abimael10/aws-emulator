@@ -26,8 +26,10 @@
 //! resource in the body), the member whose container the body does not carry (a list given
 //! a string, a structure given a string, a list given an object, a map given a list), and
 //! the caller (the account's own published credential, which the authorization gate does
-//! not bound, and an IAM user whose inline policy allows every action of this service on
-//! every resource).
+//! not bound, an IAM user whose inline policy allows every action of this service on every
+//! resource, and the callers no statement allows the action at all — none, another action
+//! of this service, another service's actions, these actions on another cluster — whose
+//! well-formed request is refused on the cluster it addressed instead).
 //!
 //! The wire harness (`Answer`, `call_as`, `emulator_with_identity`, `error_code`, `query`,
 //! `xml_element`) is the shared one in `tests/all/wire.rs`, and the accepted `CreateCluster`
@@ -80,6 +82,93 @@ async fn account_principal(router: &MultiServiceRouter) -> String {
 /// on: the principal and the action, and nothing more.
 fn no_resource_message(principal: &str, operation: &str) -> String {
     format!("User: {principal} is not authorized to perform: eks:{operation}")
+}
+
+/// The refusal this service words for a request whose body DID bind and whose caller no
+/// statement allows: the principal, the action and the resource the request addressed.
+fn default_deny_message(principal: &str, operation: &str, resource: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: eks:{operation} on resource: \
+         {resource} because no identity-based policy allows the eks:{operation} action"
+    )
+}
+
+/// The ARN of a cluster of this account in [`REGION`], as this service mints one — the
+/// resource a `CreateCluster` whose body bound is judged on.
+fn cluster_arn(name: &str) -> String {
+    engine::emulator_arn("eks", REGION, &format!("cluster/{name}"))
+}
+
+/// A document allowing `actions` on every resource.
+fn allow(actions: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{ "Effect": "Allow", "Action": actions, "Resource": "*" }],
+    })
+    .to_string()
+}
+
+/// Make an IAM user carrying `document` as its inline policy (when one is given) and an
+/// access key for it, the way a client makes them — `iam:CreateUser`, `iam:PutUserPolicy`
+/// and `iam:CreateAccessKey` over the wire against the same shared engine — and answer the
+/// access key id its requests are signed with beside the user ARN a refusal names it by.
+///
+/// One maker for every row of this suite, so the caller a row drives is built exactly like
+/// every other one.
+async fn user_with_policy(
+    router: &MultiServiceRouter,
+    user_name: &str,
+    document: Option<String>,
+) -> (String, String) {
+    let (status, body) = query(
+        router,
+        "iam",
+        "2010-05-08",
+        "CreateUser",
+        &[("UserName", user_name.to_string())],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "setup {user_name:?}: creating the user must succeed, got {status} {body}"
+    );
+    let user_arn = xml_element(&body, "Arn").unwrap_or_else(|| {
+        panic!("setup {user_name:?}: CreateUser must report the user Arn, got {body}")
+    });
+    if let Some(document) = document {
+        let (status, body) = query(
+            router,
+            "iam",
+            "2010-05-08",
+            "PutUserPolicy",
+            &[
+                ("UserName", user_name.to_string()),
+                ("PolicyName", "inline".to_string()),
+                ("PolicyDocument", document),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "setup {user_name:?}: putting the inline policy must succeed, got {status} {body}"
+        );
+    }
+    let (status, body) = query(
+        router,
+        "iam",
+        "2010-05-08",
+        "CreateAccessKey",
+        &[("UserName", user_name.to_string())],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "setup {user_name:?}: creating the access key must succeed, got {status} {body}"
+    );
+    let access_key_id = xml_element(&body, "AccessKeyId").unwrap_or_else(|| {
+        panic!("setup {user_name:?}: CreateAccessKey must report an AccessKeyId, got {body}")
+    });
+    (access_key_id, user_arn)
 }
 
 /// An accepted `RegisterCluster` body's `connectorConfig`, so a row that breaks ONE member
@@ -248,57 +337,8 @@ async fn a_body_that_cannot_be_bound_is_refused_before_it_is_read() {
 #[tokio::test]
 async fn a_caller_allowed_every_action_is_refused_the_same_way() {
     let router = emulator_with_identity();
-    let user_name = "eks-admin-probe";
-    let document = json!({
-        "Version": "2012-10-17",
-        "Statement": [{ "Effect": "Allow", "Action": "eks:*", "Resource": "*" }],
-    })
-    .to_string();
-
-    let (status, body) = query(
-        &router,
-        "iam",
-        "2010-05-08",
-        "CreateUser",
-        &[("UserName", user_name.to_string())],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "setup: creating the user must succeed, got {status} {body}"
-    );
-    let user_arn = xml_element(&body, "Arn")
-        .unwrap_or_else(|| panic!("setup: CreateUser must report the user Arn, got {body}"));
-    let (status, body) = query(
-        &router,
-        "iam",
-        "2010-05-08",
-        "PutUserPolicy",
-        &[
-            ("UserName", user_name.to_string()),
-            ("PolicyName", "allow-everything".to_string()),
-            ("PolicyDocument", document),
-        ],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "setup: putting the inline policy must succeed, got {status} {body}"
-    );
-    let (status, body) = query(
-        &router,
-        "iam",
-        "2010-05-08",
-        "CreateAccessKey",
-        &[("UserName", user_name.to_string())],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "setup: creating the access key must succeed, got {status} {body}"
-    );
-    let access_key_id = xml_element(&body, "AccessKeyId")
-        .unwrap_or_else(|| panic!("setup: CreateAccessKey must report an AccessKeyId, got {body}"));
+    let (access_key_id, user_arn) =
+        user_with_policy(&router, "eks-admin-probe", Some(allow("eks:*"))).await;
 
     // Every row of the same table, as the caller every statement allows.
     for row in unbindable_rows("admin-probe-cluster") {
@@ -320,6 +360,110 @@ async fn a_caller_allowed_every_action_is_refused_the_same_way() {
         "case \"the same caller's well-formed request\": expected the create to be served, \
          got {created:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: a caller no statement allows is answered the AUTHORIZATION decision and
+// never the codec's reading of its body — HTTP 403 `AccessDeniedException`
+// either way, which is the only error class this answer is stated in: a body
+// whose shape this service cannot bind determined no resource, so the refusal
+// names the principal and the action alone, while the same caller's well-formed
+// body IS bound and is judged on the cluster it addressed.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_unauthorized_caller_is_refused_the_authorization_answer_whatever_its_bodys_shape() {
+    let router = emulator_with_identity();
+
+    // (case, the only document in force on the caller) — rows differ along what the
+    // caller is granted, none of it the action it asks for.
+    let callers: Vec<(&str, Option<String>)> = vec![
+        ("a caller no policy covers at all", None),
+        (
+            "a caller granted another action of this service",
+            Some(allow("eks:ListClusters")),
+        ),
+        (
+            "a caller granted another service's actions",
+            Some(allow("ec2:*")),
+        ),
+        (
+            "a caller granted these actions on another cluster",
+            Some(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Action": "eks:*",
+                        "Resource": cluster_arn("another-cluster"),
+                    }],
+                })
+                .to_string(),
+            ),
+        ),
+    ];
+
+    for (index, (caller_case, document)) in callers.into_iter().enumerate() {
+        let cluster = format!("denied-cluster-{index}");
+        let (access_key_id, user_arn) =
+            user_with_policy(&router, &format!("eks-denied-{index}"), document).await;
+
+        // A body whose shape this service cannot bind determines nothing it carried, so
+        // the decision is taken with no resource at all: the principal and the action.
+        for row in unbindable_rows(&cluster) {
+            let answer = eks(&router, &access_key_id, row.uri, &row.body.to_string()).await;
+            assert_no_resource_refusal(
+                &format!("{caller_case}, {}", row.case),
+                row.operation,
+                &user_arn,
+                &answer,
+            );
+        }
+
+        // The same caller's WELL-FORMED body binds, so the same decision is taken on the
+        // cluster the request addressed — the refusal that names it, still 403 and still
+        // this one error class.
+        let answer = eks(
+            &router,
+            &access_key_id,
+            "/clusters",
+            &minimal_request(&cluster).to_string(),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 403,
+            "case {caller_case:?}, a well-formed body: expected HTTP 403, got {answer:?}"
+        );
+        assert_eq!(
+            error_code(&answer),
+            ACCESS_DENIED,
+            "case {caller_case:?}, a well-formed body: expected {ACCESS_DENIED}, got {answer:?}"
+        );
+        assert_eq!(
+            answer.message(),
+            default_deny_message(&user_arn, "CreateCluster", &cluster_arn(&cluster)),
+            "case {caller_case:?}, a well-formed body: expected the refusal to name the \
+             principal, the action and the cluster, got {:?}",
+            answer.message()
+        );
+
+        // And none of those refused calls wrote anything: the decision is taken before
+        // anything the request named is resolved or stored.
+        let described = call_as(
+            &router,
+            DEFAULT_ACCESS_KEY_ID,
+            REGION,
+            "GET",
+            &format!("/clusters/{cluster}"),
+            "",
+        )
+        .await;
+        assert_eq!(
+            error_code(&described),
+            "ResourceNotFoundException",
+            "case {caller_case:?}: expected no cluster to have been created, got {described:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
