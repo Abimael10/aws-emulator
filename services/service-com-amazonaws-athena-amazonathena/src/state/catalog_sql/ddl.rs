@@ -998,9 +998,12 @@ fn name_matcher(filter: &RelationFilter) -> Result<::regex::Regex, Failure> {
 }
 
 /// A result set of one character column, named `column`, carrying `values` in order.
+///
+/// Every statement answered this way is one the HIVE DDL engine performs, so its column is
+/// typed in that engine's own names (`super::super::query_engine::hive_string_column`).
 pub fn single_column_result(column: &str, values: Vec<String>) -> StoredResultSet {
     StoredResultSet {
-        column_info: vec![super::super::query_engine::varchar_column(column)],
+        column_info: vec![super::super::query_engine::hive_string_column(column)],
         rows: values
             .into_iter()
             .map(|value| Row {

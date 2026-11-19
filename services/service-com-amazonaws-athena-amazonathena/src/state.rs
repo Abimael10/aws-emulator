@@ -1575,6 +1575,33 @@ impl QueryExecutionRecord {
         }
     }
 
+    /// The statement's RESULT OUTPUT TEXT, as a read of this execution's results reports it
+    /// beside the result set: the text output the run wrote, rather than the rows the
+    /// statement returned.
+    ///
+    /// Only a statement whose result IS that text has one ([`Self::writes_text_output`]):
+    /// a run that reported it done wrote the rows of its answer as that text, one the
+    /// engine reported in error wrote its diagnostic for the failure (the same text the
+    /// execution reports as its `StateChangeReason`), and a statement whose results are
+    /// rows wrote no text output at all. Where there is none the answer is the EMPTY string:
+    /// a result output with no text in it is not the same answer as no result output.
+    pub fn result_output_text(&self, now: SystemTime) -> String {
+        if !self.writes_text_output() {
+            return String::new();
+        }
+        match self.state_at(now) {
+            QUERY_STATE_FAILED => self
+                .failure()
+                .map(|(message, reason, _)| reason.unwrap_or(message).to_string())
+                .unwrap_or_default(),
+            QUERY_STATE_SUCCEEDED => self
+                .result_set_at(now)
+                .map(query_results::text_output_lines)
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
     /// Whether this execution's statement writes its result as the engine's TEXT output:
     /// the statements Athena classifies as DDL and UTILITY return no result set, and what
     /// their run produces is the text the engine wrote about the task.

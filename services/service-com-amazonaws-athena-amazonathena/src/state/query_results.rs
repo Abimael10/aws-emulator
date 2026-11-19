@@ -237,21 +237,39 @@ pub fn returned_bytes(record: &QueryExecutionRecord) -> i64 {
     i64::try_from(rendered.len()).unwrap_or(i64::MAX)
 }
 
-/// The text a statement whose result is the engine's TEXT output saves: one line per row
-/// of what the run produced, with a row's values separated by [`TEXT_SEPARATOR`] and a
-/// NULL written as nothing. A statement that produced no rows saves an empty object.
+/// The text a statement whose result is the engine's TEXT output saves: the LINES of that
+/// output, with the last one terminated as well, because every line a line-oriented text
+/// object holds ends with its separator. A statement that produced no rows produced no
+/// lines, so it saves an empty object rather than a lone separator.
 fn text_output(result: &StoredResultSet) -> Vec<u8> {
+    let lines = text_output_lines(result);
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    format!("{lines}\n").into_bytes()
+}
+
+/// The LINES of that same output, joined by the separator between them: one line per row of
+/// what the run produced, with a row's values separated by [`TEXT_SEPARATOR`] and a NULL
+/// written as nothing.
+///
+/// This is the rendering a READ of the execution's results reports as the statement's result
+/// output, and the one the saved object is written from — so the text a client reads over the
+/// API and the object the run saved can never be two different renderings of one run.
+pub(crate) fn text_output_lines(result: &StoredResultSet) -> String {
     let mut text = String::new();
-    for row in &result.rows {
-        for (position, value) in values_of(row).enumerate() {
-            if position > 0 {
+    for (position, row) in result.rows.iter().enumerate() {
+        if position > 0 {
+            text.push('\n');
+        }
+        for (column, value) in values_of(row).enumerate() {
+            if column > 0 {
                 text.push(TEXT_SEPARATOR);
             }
             text.push_str(value.unwrap_or_default());
         }
-        text.push('\n');
     }
-    text.into_bytes()
+    text
 }
 
 /// The metadata object's document: the SCHEMA of the result set saved beside it, one entry
@@ -331,7 +349,7 @@ fn csv_field(value: Option<&str>) -> String {
 mod tests {
     use super::*;
     use crate::ops::types::Datum;
-    use crate::state::query_engine::varchar_column;
+    use crate::state::query_engine::hive_string_column;
 
     /// One stored row of `values`, a `None` standing for a NULL.
     fn row(values: &[Option<&str>]) -> Row {
@@ -360,7 +378,7 @@ mod tests {
             (
                 "one column of plain values",
                 StoredResultSet {
-                    column_info: vec![varchar_column("marker")],
+                    column_info: vec![hive_string_column("marker")],
                     rows: vec![row(&[Some("north")]), row(&[Some("south")])],
                 },
                 "\"marker\"\n\"north\"\n\"south\"\n",
@@ -368,7 +386,7 @@ mod tests {
             (
                 "a value carrying the field separator",
                 StoredResultSet {
-                    column_info: vec![varchar_column("place")],
+                    column_info: vec![hive_string_column("place")],
                     rows: vec![row(&[Some("Paris, France")])],
                 },
                 "\"place\"\n\"Paris, France\"\n",
@@ -376,7 +394,7 @@ mod tests {
             (
                 "a value carrying the quote character",
                 StoredResultSet {
-                    column_info: vec![varchar_column("quoted")],
+                    column_info: vec![hive_string_column("quoted")],
                     rows: vec![row(&[Some("a \"b\" c")])],
                 },
                 "\"quoted\"\n\"a \"\"b\"\" c\"\n",
@@ -384,7 +402,7 @@ mod tests {
             (
                 "a NULL beside the empty string",
                 StoredResultSet {
-                    column_info: vec![varchar_column("left"), varchar_column("right")],
+                    column_info: vec![hive_string_column("left"), hive_string_column("right")],
                     rows: vec![row(&[None, Some("")])],
                 },
                 "\"left\",\"right\"\n,\"\"\n",
@@ -392,7 +410,7 @@ mod tests {
             (
                 "a result set with no rows",
                 StoredResultSet {
-                    column_info: vec![varchar_column("empty")],
+                    column_info: vec![hive_string_column("empty")],
                     rows: Vec::new(),
                 },
                 "\"empty\"\n",

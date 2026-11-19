@@ -60,6 +60,10 @@ const TYPE_DOUBLE: (&str, i32) = ("double", 17);
 const TYPE_BOOLEAN: (&str, i32) = ("boolean", 0);
 /// Athena's type name for a character column; see [`TYPE_INTEGER`].
 const TYPE_VARCHAR: (&str, i32) = ("varchar", 2_147_483_647);
+/// HIVE's type name for a character column, which is what a statement Athena performs on
+/// its Hive DDL engine reports instead of [`TYPE_VARCHAR`]: the type declares no width at
+/// all, so the precision beside it is zero rather than a length.
+const TYPE_STRING: (&str, i32) = ("string", 0);
 /// Athena's type name for a binary column; see [`TYPE_INTEGER`].
 const TYPE_VARBINARY: (&str, i32) = ("varbinary", 1_073_741_824);
 /// The type name reported for a column the engine produced no typed value for — a
@@ -935,11 +939,16 @@ fn quoted_name(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// The `ColumnInfo` of a column of CHARACTER data the catalog itself projects — the one
-/// column a `SHOW` statement answers with, or a column of the catalog's own reporting
-/// tables.
-pub fn varchar_column(name: &str) -> ColumnInfo {
-    column_metadata(name, Some(ColumnType::VarChar))
+/// The `ColumnInfo` of a column of CHARACTER data the catalog itself projects: the one
+/// column a `SHOW` statement answers with.
+///
+/// A statement Athena performs on its HIVE DDL engine — the class whose result is that
+/// engine's text output — reports its columns in HIVE's own type names rather than in the
+/// query engine's, so a character column of such a result is Hive's `string`
+/// ([`TYPE_STRING`]): a type that declares no width, and whose values Hive compares without
+/// regard to case.
+pub fn hive_string_column(name: &str) -> ColumnInfo {
+    column_info(name, TYPE_STRING, false)
 }
 
 /// Prepare and run one statement, keeping no more of its result than the bounds above
@@ -1283,9 +1292,21 @@ impl ColumnType {
     }
 }
 
-/// The `ColumnInfo` one column reports.
+/// The `ColumnInfo` one column the QUERY ENGINE computed reports, typed in that engine's
+/// own type names.
 fn column_metadata(name: &str, column_type: Option<ColumnType>) -> ColumnInfo {
-    let (type_name, precision) = column_type.map_or(TYPE_UNKNOWN, ColumnType::named);
+    column_info(
+        name,
+        column_type.map_or(TYPE_UNKNOWN, ColumnType::named),
+        // Only character data compares case-sensitively.
+        column_type == Some(ColumnType::VarChar),
+    )
+}
+
+/// The `ColumnInfo` one column reports: its name, the `(type name, precision)` pair the
+/// engine that served it names its type by, and whether its values compare case-sensitively.
+fn column_info(name: &str, named: (&str, i32), case_sensitive: bool) -> ColumnInfo {
+    let (type_name, precision) = named;
     ColumnInfo {
         // "The catalog to which the query results belong": every statement here is served
         // by the one engine this service runs, so the catalog a result column belongs to
@@ -1307,8 +1328,7 @@ fn column_metadata(name: &str, column_type: Option<ColumnType>) -> ColumnInfo {
         // after a decimal point.
         scale: 0,
         nullable: Some(COLUMN_NULLABLE_UNKNOWN.to_string()),
-        // Only character data compares case-sensitively.
-        case_sensitive: column_type == Some(ColumnType::VarChar),
+        case_sensitive,
     }
 }
 

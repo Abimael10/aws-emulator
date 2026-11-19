@@ -20,13 +20,39 @@ pub struct GetQueryResultsInput {
     pub query_result_type: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.athena#GetQueryResultsOutput")]
+/// What `GetQueryResults` reports: the modelled row count, result set and page token, plus
+/// the statement's RESULT OUTPUT TEXT the service publishes beside them.
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="GetQueryResultsOutput")`, which models `UpdateCount`,
+/// `ResultSet` and `NextToken`, plus `Output` — RECORDED BEHAVIOUR rather than modelled; see
+/// `types::recorded_member_wire` for why the shape is hand-written.
 #[derive(Debug, Clone, Default)]
 pub struct GetQueryResultsOutput {
     pub update_count: Option<i64>,
     pub result_set: Option<ResultSet>,
     pub next_token: Option<String>,
+    pub output: Option<String>,
 }
+
+ath_schema_and_codec!(
+    GetQueryResultsOutput,
+    GET_QUERY_RESULTS_OUTPUT_SCHEMA,
+    "com.amazonaws.athena#GetQueryResultsOutput",
+    "com.amazonaws.athena",
+    "GetQueryResultsOutput",
+    (M_UPDATE_COUNT, update_count, "UpdateCount", 0, opt, long),
+    (
+        M_RESULT_SET,
+        result_set,
+        "ResultSet",
+        1,
+        opt,
+        struct_of(ResultSet)
+    ),
+    (M_NEXT_TOKEN, next_token, "NextToken", 2, opt, string),
+    (M_OUTPUT, output, "Output", 3, out, recorded(string)),
+);
 
 /// The result set of a query execution: the modelled rows and column metadata, plus the
 /// FLATTENED view of the same result set the service publishes beside them.

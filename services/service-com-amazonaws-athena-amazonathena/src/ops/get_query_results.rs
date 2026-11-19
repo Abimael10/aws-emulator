@@ -3,8 +3,9 @@
 //! @op GetQueryResults
 //! IMPLEMENTED: pages the output the named execution's run wrote — the column labels
 //! first for a DML query, then the rows, with the flattened view of the same page beside
-//! the modelled one, and the empty result set of a statement whose result is the engine's
-//! text output — and refuses an execution that wrote no output at all.
+//! the modelled one, the statement's result output text beside both, and the empty result
+//! set of a statement whose result is the engine's text output — and refuses an execution
+//! that wrote no output at all.
 //!
 //! ## Shape of an operation
 //!
@@ -208,11 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that is still running, one a caller cancelled and one that produced no output at
         // all has nothing to read.
         //
-        // The text of that output is served by no member here: the modelled
-        // `GetQueryResultsOutput` declares `UpdateCount`, `ResultSet` and `NextToken` and
-        // nothing that carries it, so the empty result set is the whole of what this
-        // operation reports for it, and the diagnostic of a failed statement is read from
-        // the execution's `StateChangeReason` and `AthenaError`.
+        // The TEXT of that output is reported beside the result set, as the `Output` member
+        // the modelled `GetQueryResultsOutput` does not declare but the service publishes:
+        // the text output the run wrote, which for a statement the engine reported in error
+        // is its diagnostic, and which is empty for one whose results are the rows.
         let Some(result) = record.readable_result_at(now) else {
             // The refusal's cause is the STATE the execution is in rather than anything
             // the request got wrong, which is the class the code reports.
@@ -278,6 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A token only where rows remain: the last page of a result set ends the
             // pagination rather than handing back a token that pages nothing.
             next_token: (end < total).then(|| store.results_page_token(&input.query_execution_id, end)),
+            // The result output's TEXT belongs to the whole output rather than to one page
+            // of it, so every page of one read reports the same text — present and empty
+            // where the statement wrote none.
+            output: Some(record.result_output_text(now)),
         })
     }
 }
