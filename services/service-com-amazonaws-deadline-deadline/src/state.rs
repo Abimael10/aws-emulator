@@ -43,6 +43,10 @@ pub use sessions::*;
 mod scheduling;
 pub use scheduling::*;
 
+/// Which resource a `resourceArn` names, and the tags that resource carries.
+mod tags;
+pub use tags::*;
+
 /// `QueueStatus` value a freshly created queue carries.
 ///
 /// From `smithy_query(query="shape", shape="QueueStatus")`: `IDLE`, `SCHEDULING`,
@@ -740,6 +744,10 @@ pub struct Budget {
     pub approximate_dollar_limit: f32,
     pub actions: Vec<crate::ops::types::ResponseBudgetAction>,
     pub schedule: crate::ops::types::BudgetSchedule,
+    /// The tags the budget carries. `CreateBudget` takes a `tags` map and the tagging
+    /// operations address a budget by its own ARN, so a budget holds its tags exactly as
+    /// every other taggable resource of this store does.
+    pub tags: HashMap<String, String>,
     /// What the budget has spent so far. Nothing in this emulator meters rendering usage,
     /// so a budget that has never had usage reported against it has consumed nothing.
     pub approximate_dollar_usage: f32,

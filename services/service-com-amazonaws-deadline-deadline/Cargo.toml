@@ -44,6 +44,10 @@ emulator-core-build-support = { workspace = true }
 # Declares one module per `tests/all/<name>.rs`, so the crate's one integration-test
 # target needs no hand-written list of its suites.
 automod = { workspace = true }
+# RFC 3986 percent-encoding, which is what an AWS SDK applies to a NON-greedy
+# `@httpLabel`: the tagging suite puts a whole ARN in the single path segment
+# `/2023-10-12/tags/{resourceArn}` is, rather than escaping it by hand.
+percent-encoding = "2.3"
 # The account's IAM records, for the one suite that arranges the user an access key is held
 # for — the record this service's `createdBy` resolution reads a long-term key against.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +137,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // A write about one resource's tags only: `ctx` carries nothing this call needs,
+        // because the resource is named by the ARN the request carries.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // Which resource this ARN names is the store's reading, shared with the tag read
+        // and the tag removal, so all three agree about an ARN and about how one that
+        // names nothing is refused.
+        let resource = store
+            .resolve_tagged_resource(&input.resource_arn)
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    TagResourceErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    TagResourceErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
+
+        // A request carrying no `tags` at all asks for no pair to be stored, which leaves
+        // the resource's tags as they were; the member is optional in the model.
+        let requested = input.tags.unwrap_or_default();
+        // The resolution and this write share one lock, so the record the ARN resolved to
+        // is still here; a state that disagreed is reported rather than passed off as a
+        // tag write that stored nothing.
+        let Some(stored) = store.tags_mut(&resource) else {
+            return Err(TagResourceErrorModeled::InternalServerErrorException(
+                crate::ops::types::InternalServerErrorException {
+                    message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // Tagging adds the pairs the request carries and replaces the value of a key the
+        // resource already holds; nothing of the resource itself changes, so neither its
+        // `updatedAt` nor its `updatedBy` moves — those report the last update of the
+        // resource, and this call updated none of it.
+        crate::state::apply_tags(stored, requested)
+            .map_err(TagResourceErrorModeled::ValidationException)?;
+
+        Ok(TagResourceOutput {})
     }
 }

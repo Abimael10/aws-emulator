@@ -260,6 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .collect(),
             schedule: input.schedule,
+            tags: input.tags.unwrap_or_default(),
             // Nothing in this emulator meters rendering usage, so a new budget has
             // consumed nothing.
             approximate_dollar_usage: 0.0,
