@@ -93,6 +93,10 @@ pub(super) struct Wired {
     /// request carries.
     pub(super) headers: Vec<(&'static str, String)>,
     pub(super) body: Vec<u8>,
+    /// The media type the BODY carries, where it is not the one this service's protocol
+    /// names for a request ([`Api::content_type`]): the XML document a REST-XML payload
+    /// member is ([`Body::XmlMember`]). `None` leaves the protocol's own.
+    pub(super) media_type: Option<&'static str>,
 }
 
 /// The request `call` makes with `request` as the operation's input, or why it could
@@ -114,6 +118,7 @@ pub(super) fn wired(call: &Call, request: &Value) -> Result<Wired, String> {
                     headers: Vec::new(),
                     body: form_body(&call.operation, version, &document, call.form_maps)?
                         .into_bytes(),
+                    media_type: None,
                 })
             }
             // A service whose protocol is a REST one reaches this only for a call
@@ -133,6 +138,7 @@ pub(super) fn wired(call: &Call, request: &Value) -> Result<Wired, String> {
             target: Some(target),
             headers: Vec::new(),
             body,
+            media_type: None,
         });
     };
     rest.wired(&document, call.payload_document)
@@ -353,6 +359,18 @@ impl Rest {
                         .map_err(|error| error.to_string())?,
                 }
             }
+            // The payload member is the body here too, and what this protocol carries it
+            // AS is an XML document whose root element is that member
+            // ([`super::xml_body`]). A request naming the member nothing at all sends no
+            // body, exactly as the JSON binding above does.
+            Body::XmlMember {
+                member,
+                namespace,
+                lists,
+            } => match document.get(member) {
+                None | Some(Value::Null) => Vec::new(),
+                Some(value) => super::xml_body::request(member, namespace, value, lists)?,
+            },
         };
         Ok(Wired {
             method: self.method,
@@ -360,6 +378,12 @@ impl Rest {
             target: None,
             headers,
             body,
+            // The media type is the one the BODY is: an XML document, for a payload
+            // member this protocol carries as one.
+            media_type: match self.request_body {
+                Body::XmlMember { .. } => Some(REST_XML_CONTENT_TYPE),
+                Body::Document | Body::Member(_) | Body::Text(_) | Body::Empty => None,
+            },
         })
     }
 
@@ -415,6 +439,15 @@ impl Rest {
                 // An operation that binds no body reports none, whatever bytes the
                 // answer happened to carry.
                 Body::Empty => {}
+                // The same binding read for a protocol that carries that member as an
+                // XML DOCUMENT: the member is the document the answer's body describes
+                // ([`super::xml_body::answered`]). A body that is no XML document at all
+                // carries no member of this operation's, and nothing is invented for one.
+                Body::XmlMember { member, lists, .. } => {
+                    if let Some(document) = super::xml_body::answered(&answered.payload, lists) {
+                        members.insert(member.to_string(), document);
+                    }
+                }
             }
         }
         Value::Object(members)
@@ -458,7 +491,9 @@ impl Rest {
     /// itself or the answer carries none.
     pub(super) fn response_member(&self) -> Option<&'static str> {
         match self.response_body {
-            Body::Member(member) | Body::Text(member) => Some(member),
+            Body::Member(member) | Body::Text(member) | Body::XmlMember { member, .. } => {
+                Some(member)
+            }
             Body::Document | Body::Empty => None,
         }
     }

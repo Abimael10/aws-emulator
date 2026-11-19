@@ -29,9 +29,14 @@ pub(super) async fn dispatch(
         .uri(&built.uri)
         .header("host", api.host(region));
     // A media type describes a BODY: a request that carries none — a REST read bound
-    // to its path and its query alone — names none either.
+    // to its path and its query alone — names none either. What type it is, is the
+    // body's own where the binding says so ([`Wired::media_type`]) and this service's
+    // protocol's otherwise.
     if !built.body.is_empty() {
-        builder = builder.header("content-type", api.content_type());
+        let media_type = built
+            .media_type
+            .map_or_else(|| api.content_type(), str::to_string);
+        builder = builder.header("content-type", media_type);
     }
     if let Some(target) = &built.target {
         builder = builder.header(TARGET_HEADER, target);

@@ -934,7 +934,17 @@ async fn perform(
         Called::Universal(call) => call.access_request(region),
     };
     if let Some((action, resource)) = access {
-        if let Some(failure) = withheld_action(callback, pending, &action, &resource).await {
+        // The code the refusal carries is the one the ANSWERING service names such a
+        // refusal by: for a universal target that is the invoked OPERATION's own, where
+        // its model declares one ([`UniversalCall::withholding_code`]), and otherwise the
+        // code the refused service's authorization layer answers with.
+        let code = match &called {
+            Called::Universal(call) => call
+                .withholding_code()
+                .unwrap_or_else(|| authorization_refusal_code(&action)),
+            Called::Templated(_) => authorization_refusal_code(&action),
+        };
+        if let Some(failure) = withheld_action(callback, pending, code, &action, &resource).await {
             return Attempt::Failed(failure);
         }
     }
@@ -1052,9 +1062,14 @@ fn authorization_refusal_message(pending: &Pending, action: &str, resource: &str
 /// ([`::service_common::iam_role::role_withholds_action_through`]), which withholds
 /// nothing unless IAM answered that the role's policies do — so an emulator with no
 /// IAM to ask invokes the target, nothing having been established about the role.
+///
+/// `code` is the code the service that WOULD have answered the call names such a refusal
+/// by, which the caller reads off that service ([`authorization_refusal_code`]) or off the
+/// invoked operation's own model.
 async fn withheld_action(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
     pending: &Pending,
+    code: &str,
     action: &str,
     resource: &str,
 ) -> Option<Failure> {
@@ -1071,7 +1086,7 @@ async fn withheld_action(
         return None;
     }
     Some(withheld(
-        authorization_refusal_code(action),
+        code,
         authorization_refusal_message(pending, action, resource),
     ))
 }
@@ -1268,7 +1283,11 @@ async fn dead_letter(
         );
         return;
     };
-    if let Some(withheld) = withheld_action(callback, pending, SEND_MESSAGE_ACTION, queue_arn).await
+    // The dead-letter write is Amazon SQS's own call, so a refusal of IT is the code that
+    // service answers one with.
+    let send_refusal = authorization_refusal_code(SEND_MESSAGE_ACTION);
+    if let Some(withheld) =
+        withheld_action(callback, pending, send_refusal, SEND_MESSAGE_ACTION, queue_arn).await
     {
         ::tracing::warn!(
             schedule = %pending.schedule_arn,

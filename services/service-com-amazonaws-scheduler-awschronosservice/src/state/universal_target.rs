@@ -245,6 +245,24 @@ impl UniversalCall {
         integration::access_request(&self.call, &self.request, region)
     }
 
+    /// The error code the invoked service answers a call this invocation's own
+    /// permissions WITHHOLD with, for an operation whose model declares that error;
+    /// `None` for one that declares none.
+    ///
+    /// A withheld call is never made, so what the schedule reports for it is the refusal
+    /// that service WOULD have answered — and where the invoked operation models an
+    /// access-denied error of its own, that error's code is what its answer names the
+    /// class by (Amazon CloudFront's `AccessDenied`, Amazon SNS's `AuthorizationError`)
+    /// rather than the code AWS's authorization layer uses for a service that models
+    /// none. The error is the invoked operation's own fact, read where this tree states
+    /// those facts ([`integration::Denied`]), so no second reading of them lives here.
+    pub(crate) fn withholding_code(&self) -> Option<&'static str> {
+        self.call
+            .targets
+            .and_then(|targets| targets.denied)
+            .map(|denied| denied.code)
+    }
+
     /// Make the call, and answer what it came to.
     ///
     /// The answer is read as EventBridge Scheduler reads a delivery: a status the
@@ -352,7 +370,7 @@ mod tests {
     #[test]
     fn a_universal_target_names_a_service_by_its_sdk_id() {
         // (case, the target ARN, the request, the operation the call names)
-        let rows: [(&str, &str, &str, Option<&str>); 8] = [
+        let rows: [(&str, &str, &str, Option<&str>); 10] = [
             (
                 "Step Functions by its SDK service id",
                 "arn:aws:scheduler:::aws-sdk:sfn:startExecution",
@@ -395,6 +413,22 @@ mod tests {
                 "arn:aws:scheduler:::aws-sdk:sns:publish",
                 r#"{"TopicArn":"arn:aws:sns:eu-west-2:000000000000:orders","Message":"hi"}"#,
                 Some("Publish"),
+            ),
+            (
+                // A service whose protocol carries that payload as an XML document, and
+                // which no templated target of this service reaches at all.
+                "a distribution's invalidation",
+                "arn:aws:scheduler:::aws-sdk:cloudfront:createInvalidation",
+                r#"{"DistributionId":"E1EXAMPLE","InvalidationBatch":{"Paths":{"Quantity":1,"Items":["/a"]},"CallerReference":"r"}}"#,
+                Some("CreateInvalidation"),
+            ),
+            (
+                // One operation of that same service whose request this emulator does not
+                // bind: a service makes the calls its bindings carry and no others.
+                "an operation of that service with no binding",
+                "arn:aws:scheduler:::aws-sdk:cloudfront:createDistribution",
+                r#"{"DistributionConfig":{}}"#,
+                None,
             ),
             (
                 "a service nothing here serves",
@@ -460,7 +494,7 @@ mod tests {
 
         let region = "eu-west-2";
         let machine = "arn:aws:states:eu-west-2:000000000000:stateMachine:nightly";
-        let rows: [AccessRow; 4] = [
+        let rows: [AccessRow; 5] = [
             (
                 "a state machine named by its ARN",
                 "arn:aws:scheduler:::aws-sdk:sfn:startExecution",
@@ -488,6 +522,18 @@ mod tests {
                     ::engine::emulator_arn("dynamodb", region, "table/orders"),
                 )),
             ),
+            (
+                // A resource of a GLOBAL service: its ARN carries no Region label, so
+                // the Region the call is made in is no part of what the access request
+                // is taken on.
+                "a distribution named by its id, whose ARN carries no Region",
+                "arn:aws:scheduler:::aws-sdk:cloudfront:createInvalidation",
+                "{\"DistributionId\":\"E1EXAMPLE\",\"InvalidationBatch\":{}}".to_string(),
+                Some((
+                    "cloudfront:CreateInvalidation",
+                    ::engine::emulator_arn("cloudfront", "", "distribution/E1EXAMPLE"),
+                )),
+            ),
         ];
         for (case, arn, input, expected) in rows {
             let call = universal_call(&parsed(arn), &input)
@@ -497,6 +543,56 @@ mod tests {
             assert_eq!(
                 access, expected,
                 "case {case:?}: expected the access request {expected:?}, got {access:?}"
+            );
+        }
+    }
+
+    /// A call this invocation's permissions WITHHOLD is reported under the code the
+    /// invoked service would have answered it with: the operation's own modelled
+    /// access-denied error where its model declares one, and nothing of the operation's
+    /// where it declares none — which is what leaves the refusing service's own
+    /// authorization-layer code to answer for it. The rows differ along the invoked
+    /// service and along whether that operation models such an error.
+    #[test]
+    fn a_withheld_call_is_reported_under_the_operations_own_access_error() {
+        // (case, the target ARN, the request, the code the refusal carries)
+        let rows: [(&str, &str, &str, Option<&str>); 4] = [
+            (
+                // CloudFront's own model declares `AccessDenied` for every one of these
+                // operations.
+                "an invalidation of a distribution",
+                "arn:aws:scheduler:::aws-sdk:cloudfront:createInvalidation",
+                r#"{"DistributionId":"E1EXAMPLE","InvalidationBatch":{}}"#,
+                Some("AccessDenied"),
+            ),
+            (
+                // `Publish` models `AuthorizationErrorException`, whose query code — the
+                // one that service's answer names the class by — is this.
+                "a publish to a topic",
+                "arn:aws:scheduler:::aws-sdk:sns:publish",
+                r#"{"TopicArn":"arn:aws:sns:eu-west-2:000000000000:orders","Message":"hi"}"#,
+                Some("AuthorizationError"),
+            ),
+            (
+                "a send to a queue, whose operation models no access error",
+                "arn:aws:scheduler:::aws-sdk:sqs:sendMessage",
+                r#"{"QueueUrl":"https://sqs.eu-west-2.amazonaws.com/000000000000/q","MessageBody":"hi"}"#,
+                None,
+            ),
+            (
+                "a state machine execution, whose operation models none either",
+                "arn:aws:scheduler:::aws-sdk:sfn:startExecution",
+                r#"{"StateMachineArn":"arn:aws:states:eu-west-2:000000000000:stateMachine:n"}"#,
+                None,
+            ),
+        ];
+        for (case, arn, input, expected) in rows {
+            let call = universal_call(&parsed(arn), input)
+                .unwrap_or_else(|why| panic!("case {case:?}: the ARN names a call: {why}"));
+            let code = call.withholding_code();
+            assert_eq!(
+                code, expected,
+                "case {case:?}: expected the withholding code {expected:?}, got {code:?}"
             );
         }
     }
@@ -511,15 +607,23 @@ mod tests {
     #[test]
     fn a_universal_target_is_held_to_its_own_two_fields_when_written() {
         // (case, the Target.Arn, whether the write is refused)
-        let rows: [(&str, &str, bool); 14] = [
+        let rows: [(&str, &str, bool); 15] = [
             (
                 "the SDK service id and a lowerCamelCase operation",
                 "arn:aws:scheduler:::aws-sdk:sfn:startExecution",
                 false,
             ),
             (
-                "an SDK service id of a service this emulator makes no call for",
+                "the SDK service id of a service no templated target names",
                 "arn:aws:scheduler:::aws-sdk:cloudfront:createInvalidation",
+                false,
+            ),
+            (
+                // The write is held to the ARN's own two fields and nothing else: WHICH
+                // of a service's operations this emulator calls is the occurrence's to
+                // report, so a schedule naming one it does not is still written.
+                "an SDK service id of a service this emulator makes no call for",
+                "arn:aws:scheduler:::aws-sdk:polly:synthesizeSpeech",
                 false,
             ),
             (
