@@ -211,14 +211,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored, so a placement that resolves to nothing leaves no endpoint behind. The
         // lists are already held to their bounds above, so the resolving call is not sized by
         // the request, and it is made BEFORE the store is locked.
-        if let Some(refusal) = crate::state::ec2_network::unresolved_network(
+        let placement = crate::state::ec2_network::placement(
             ctx,
             &crate::state::request_region(ctx),
             Some(input.vpc_id.as_str()),
             &input.subnet_ids,
         )
-        .await
-        {
+        .await;
+        if let Some(refusal) = placement.refusal {
             return Err(CreateVpcEndpointErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(refusal),
@@ -286,6 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             id: id.clone(),
             name: input.name,
             vpc_id: input.vpc_id,
+            // What EC2 answered about that VPC when the endpoint was placed in it: whether it
+            // is the account's own default network, which is where a client that built no
+            // network of its own is (`crate::state::network_access`).
+            in_default_vpc: placement.in_default_vpc,
             subnet_ids: input.subnet_ids,
             security_group_ids: input.security_group_ids.unwrap_or_default(),
             // Overwritten by `begin_transition` below, which is what owes the move to

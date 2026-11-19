@@ -446,6 +446,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCollection<
         };
         let mut record = CollectionRecord {
             id: id.clone(),
+            // Which managed interface endpoints this collection's own `network` statements
+            // state as their sources at the instant its endpoint is published: the
+            // attachment a client that dials that address is behind
+            // (`crate::state::network_access`).
+            published_behind: store.network_statement_source_endpoints(&input.name),
             name: input.name,
             // Overwritten by `begin_transition` below, which is what owes the move to
             // `ACTIVE`.

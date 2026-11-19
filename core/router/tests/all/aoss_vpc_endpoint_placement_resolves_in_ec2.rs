@@ -65,7 +65,11 @@ const POLL_ATTEMPTS: usize = 200;
 /// One emulator carrying Amazon EC2 and OpenSearch Serverless over ONE shared engine, as
 /// the production router mounts them, plus the engine itself so a case can assert on what a
 /// refused create did NOT write.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+///
+/// `pub(crate)` because it is the service PAIR this suite and
+/// `aoss_network_source_boundary.rs` beside it both stand up: one builder, so neither suite
+/// can mount a different estate than the other.
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -137,7 +141,15 @@ async fn aoss(router: &MultiServiceRouter, operation: &str, body: Value) -> Repl
 }
 
 /// One ec2Query action that must succeed, answered with its XML body.
-async fn ec2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)]) -> String {
+///
+/// `pub(crate)` for the reason [`emulator`] is: the suite beside this one asks EC2 for the
+/// same account's networks, and one caller of this wire is what keeps the two asking it the
+/// same way.
+pub(crate) async fn ec2(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> String {
     let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
     for (name, value) in params {
         body.push('&');
@@ -164,13 +176,17 @@ async fn ec2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// One VPC of the account with the subnets EC2 minted in it.
-struct Vpc {
-    id: String,
-    subnets: Vec<String>,
+pub(crate) struct Vpc {
+    pub(crate) id: String,
+    pub(crate) subnets: Vec<String>,
 }
 
 /// Create one VPC carrying one subnet per entry of `zones`, through EC2's own operations.
-async fn ec2_vpc(router: &MultiServiceRouter, second_octet: u8, zones: &[&str]) -> Vpc {
+pub(crate) async fn ec2_vpc(
+    router: &MultiServiceRouter,
+    second_octet: u8,
+    zones: &[&str],
+) -> Vpc {
     let cidr = format!("10.{second_octet}.0.0/16");
     let id = element(&ec2(router, "CreateVpc", &[("CidrBlock", &cidr)]).await, "vpcId");
     let mut subnets = Vec::new();

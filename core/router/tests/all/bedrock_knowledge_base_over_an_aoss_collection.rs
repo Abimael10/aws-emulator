@@ -147,10 +147,8 @@ pub async fn aoss(router: &MultiServiceRouter, operation: &str, body: Value) -> 
     dispatch(router, request).await
 }
 
-/// One OpenSearch REST request a client sends to a collection's published endpoint, as
-/// `opensearch-py`'s `indices.create` / `indices.get` send it: addressed to the authority
-/// the endpoint names, signed for the `aoss` signing name, and carrying NO `x-amz-target`,
-/// because the OpenSearch REST API has no RPC target.
+/// One OpenSearch REST request a client sends to a collection's published endpoint
+/// ([`rest_bytes`]), whose answer is read as the JSON document it carries.
 pub async fn rest(
     router: &MultiServiceRouter,
     endpoint: &str,
@@ -158,6 +156,25 @@ pub async fn rest(
     path: &str,
     body: Option<&Value>,
 ) -> (u16, Value) {
+    let (status, payload) = rest_bytes(router, endpoint, method, path, body).await;
+    let parsed: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
+    (status, parsed)
+}
+
+/// One OpenSearch REST request a client sends to a collection's published endpoint, as
+/// `opensearch-py`'s `indices.create` / `indices.get` send it: addressed to the authority
+/// the endpoint names, signed for the `aoss` signing name, and carrying NO `x-amz-target`,
+/// because the OpenSearch REST API has no RPC target.
+///
+/// The answer comes back as the BYTES the wire carried, so a suite can tell a refusal
+/// carrying no body at all from an answer carrying a document ([`rest`] parses it).
+pub async fn rest_bytes(
+    router: &MultiServiceRouter,
+    endpoint: &str,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> (u16, Vec<u8>) {
     let (authority, prefix) = addressed(endpoint);
     let request = http::Request::builder()
         .method(method)
@@ -169,7 +186,8 @@ pub async fn rest(
             body.map(|body| body.to_string()).unwrap_or_default(),
         ))
         .expect("a well-formed data-plane request");
-    dispatch(router, request).await
+    let response = router.dispatch(request).await;
+    (response.status().as_u16(), response.body().to_vec())
 }
 
 /// The authority a published endpoint is dialled at and the path prefix it carries, so a

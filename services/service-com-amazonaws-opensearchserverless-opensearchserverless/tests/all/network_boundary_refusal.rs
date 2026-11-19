@@ -22,8 +22,21 @@
 //! one naming another collection, one whose only rule is about another resource type), and —
 //! for the second suite — the control-plane writer that takes the policy away and puts it
 //! back while the collection stays live.
+//!
+//! The last two suites are about the other half of the same decision: the SOURCES a covering
+//! statement states. A collection answers only a request from a source one of its covering
+//! statements states, and a stated source refuses a request only on evidence that it comes
+//! from somewhere else — so the first spans the source forms a statement has (public, named
+//! endpoints, a named AWS service, an empty list, no source member at all) with endpoints
+//! that place nobody on this emulator, and the second publishes a collection's address BEHIND
+//! one stated endpoint and then rewrites that statement: narrowed to another endpoint of the
+//! account the address stops answering, and widened back it answers again, out of the
+//! document it held throughout. What the account's own DEFAULT network places instead is
+//! pinned where both services stand up
+//! (`core/router/tests/all/aoss_network_source_boundary.rs`).
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
 use crate::collection_endpoint_authorization::{
     active_collection, create_access_policy, create_security_policy, data_policy, emulator,
@@ -119,6 +132,101 @@ fn routes() -> Vec<Route> {
             body: None,
         },
     ]
+}
+
+/// The name every suite below gives the collection's `network` security policy.
+const NETWORK_POLICY: &str = "net-policy";
+
+/// A VPC id of the form `CreateVpcEndpoint` takes (`VpcId`, pattern `^vpc-[0-9a-z]*$`).
+const A_VPC: &str = "vpc-1a2b3c4d";
+
+/// A second VPC id, so the endpoints a case names sit in two different networks.
+const ANOTHER_VPC: &str = "vpc-9f8e7d6c";
+
+/// A subnet id of the form `CreateVpcEndpoint` takes (`SubnetIds`, pattern
+/// `^subnet-([0-9a-f]{8}|[0-9a-f]{17})$`).
+const SUBNET: &str = "subnet-1a2b3c4d";
+
+/// A well-formed `VpcEndpointId` the account holds NO endpoint for, which is what a policy
+/// names when it was written against an endpoint of another account or a deleted one.
+const UNHELD_ENDPOINT: &str = "vpce-0123456789abcdef0";
+
+/// An AWS service a statement admits the traffic of, spelled as a `SourceServices` entry is.
+const SOURCE_SERVICE: &str = "bedrock.amazonaws.com";
+
+/// Create one managed interface endpoint in `vpc_id`, answering its minted `VpcEndpointId`.
+async fn attach_vpc_endpoint(router: &MultiServiceRouter, name: &str, vpc_id: &str) -> String {
+    let (status, code, created) = call(
+        router,
+        "CreateVpcEndpoint",
+        json!({ "name": name, "vpcId": vpc_id, "subnetIds": [SUBNET] }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case CreateVpcEndpoint({name}): got {status} {code} with {created}"
+    );
+    let id = text(&created, "createVpcEndpointDetail.id");
+    assert!(
+        !id.is_empty(),
+        "case CreateVpcEndpoint({name}): expected a minted id, got {created}"
+    );
+    id
+}
+
+/// A `network` policy STATEMENT covering [`COLLECTION`] that states `sources` — the members
+/// a statement states its sources with, as the case wrote them.
+fn statement_with_sources(sources: &Value) -> Value {
+    let mut statement = json!({
+        "Rules": [{ "ResourceType": "collection", "Resource": [format!("collection/{COLLECTION}")] }],
+    });
+    let (Some(statement_members), Some(sources)) =
+        (statement.as_object_mut(), sources.as_object())
+    else {
+        panic!("a statement and its sources are both JSON objects");
+    };
+    for (member, value) in sources {
+        statement_members.insert(member.clone(), value.clone());
+    }
+    statement
+}
+
+/// A `network` security policy document of ONE statement stating `sources`
+/// ([`statement_with_sources`]), written as the list of statements such a document is.
+fn policy_with_sources(sources: &Value) -> Value {
+    json!([statement_with_sources(sources)])
+}
+
+/// REPLACE the collection's network policy with `policy`, through the control-plane writer
+/// that replaces a policy document — which reads the current `policyVersion` first, the way
+/// a client of `UpdateSecurityPolicy` does.
+async fn replace_network_policy(router: &MultiServiceRouter, policy: &Value) {
+    let (status, code, read) = call(
+        router,
+        "GetSecurityPolicy",
+        json!({ "type": "network", "name": NETWORK_POLICY }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case GetSecurityPolicy(network/{NETWORK_POLICY}): got {status} {code} with {read}"
+    );
+    let version = text(&read, "securityPolicyDetail.policyVersion");
+    let (status, code, updated) = call(
+        router,
+        "UpdateSecurityPolicy",
+        json!({
+            "type": "network",
+            "name": NETWORK_POLICY,
+            "policyVersion": version,
+            "policy": policy.to_string(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case UpdateSecurityPolicy(network/{NETWORK_POLICY}): got {status} {code} with {updated}"
+    );
 }
 
 /// A `network` security policy document whose only rule is about DASHBOARDS of this
@@ -485,5 +593,309 @@ async fn the_two_refusal_classes_are_told_apart_by_their_body() {
                 route.case
             );
         }
+    }
+}
+
+/// Assert that every route of the surface is answered by the collection itself rather than
+/// refused at the endpoint's network front door.
+async fn assert_every_route_is_answered(router: &MultiServiceRouter, case: &str, host: &str) {
+    for route in routes() {
+        let (status, payload) = rest_bytes(
+            router,
+            host,
+            AMBIENT_ACCESS_KEY_ID,
+            route.method,
+            &route.path,
+            route.body.as_ref(),
+        )
+        .await;
+        let served = String::from_utf8_lossy(&payload).to_string();
+        assert_ne!(
+            status, NETWORK_REFUSAL,
+            "case {case} / {}: expected the collection to answer rather than refuse, got \
+             {status} with {served:?}",
+            route.case
+        );
+        // A `HEAD` answers a status alone by definition; every other admitted route is
+        // answered with the document the collection computed.
+        if route.method != "HEAD" {
+            assert!(
+                !payload.is_empty(),
+                "case {case} / {}: expected the collection's own answer, got no bytes",
+                route.case
+            );
+        }
+    }
+}
+
+/// RULE: a collection answers only a request from a source one of its covering `network`
+/// statements states — but a stated source refuses a request only on EVIDENCE that it comes
+/// from somewhere else. Public access and an admitted AWS service state a source outright,
+/// and a `SourceVPCEs` entry that places nobody states nothing about where a request comes
+/// from: an id the account holds no endpoint for, an endpoint whose own placement nothing
+/// answered about, an empty list, and a statement stating no source at all each refuse
+/// nothing.
+///
+/// No EC2 is mounted on this emulator, so nothing answered about where ANY of the endpoints
+/// created here are placed — which is what makes every row below the no-evidence case. What
+/// the same statements refuse once EC2 has placed those endpoints is pinned in
+/// `core/router/tests/all/aoss_network_source_boundary.rs`, where both services stand up.
+///
+/// The rows span the source forms a statement states and which endpoints it names; every row
+/// rewrites the SAME policy through the control-plane writer, so each decision is read off
+/// the document the service holds at that instant.
+#[tokio::test]
+async fn a_stated_source_that_places_nobody_refuses_nothing() {
+    /// One case: the source members the statement states.
+    struct Row {
+        case: String,
+        sources: Value,
+    }
+    let router = emulator();
+    // Two endpoints of the account, in two different VPCs — neither placed by anything,
+    // because this emulator has no EC2 to place them.
+    let one = attach_vpc_endpoint(&router, "one-endpoint", A_VPC).await;
+    let another = attach_vpc_endpoint(&router, "another-endpoint", ANOTHER_VPC).await;
+    let rows: Vec<Row> = vec![
+        Row {
+            case: "public access, whatever endpoints it names beside it".to_string(),
+            sources: json!({ "AllowFromPublic": true, "SourceVPCEs": [&another] }),
+        },
+        Row {
+            case: "one endpoint of the account, placed by nothing".to_string(),
+            sources: json!({ "AllowFromPublic": false, "SourceVPCEs": [&one] }),
+        },
+        Row {
+            case: "two endpoints of the account in two VPCs, placed by nothing".to_string(),
+            sources: json!({ "AllowFromPublic": false, "SourceVPCEs": [&one, &another] }),
+        },
+        Row {
+            case: "an id the account holds no endpoint for".to_string(),
+            sources: json!({ "AllowFromPublic": false, "SourceVPCEs": [UNHELD_ENDPOINT] }),
+        },
+        Row {
+            case: "an unheld id beside an endpoint of the account".to_string(),
+            sources: json!({
+                "AllowFromPublic": false,
+                "SourceVPCEs": [&another, UNHELD_ENDPOINT],
+            }),
+        },
+        Row {
+            case: "an AWS service's own traffic beside an endpoint".to_string(),
+            sources: json!({
+                "AllowFromPublic": false,
+                "SourceVPCEs": [&another],
+                "SourceServices": [SOURCE_SERVICE],
+            }),
+        },
+        Row {
+            case: "an empty endpoint list".to_string(),
+            sources: json!({ "AllowFromPublic": false, "SourceVPCEs": [] }),
+        },
+        Row {
+            case: "no source member at all".to_string(),
+            sources: json!({}),
+        },
+        Row {
+            case: "two statements, each stating one endpoint".to_string(),
+            sources: Value::Null,
+        },
+    ];
+
+    // The collection is made live under a policy that covers it, which every row then
+    // replaces: the same collection, the same published address, one decision per document.
+    create_security_policy(
+        &router,
+        "network",
+        NETWORK_POLICY,
+        &network_policy(&[format!("collection/{COLLECTION}").as_str()]),
+    )
+    .await;
+    let collection = active_collection(&router, COLLECTION).await;
+    let host = endpoint_host(&collection);
+    for Row { case, sources } in &rows {
+        // A document is a LIST of statements, and a collection two of them cover is admitted
+        // by either: the row that states no sources of its own is that document.
+        let policy = match sources {
+            Value::Null => json!([
+                statement_with_sources(&json!({ "SourceVPCEs": [&one] })),
+                statement_with_sources(&json!({ "SourceVPCEs": [&another] })),
+            ]),
+            sources => policy_with_sources(sources),
+        };
+        replace_network_policy(&router, &policy).await;
+        assert_every_route_is_answered(&router, case, &host).await;
+    }
+}
+
+/// RULE: a collection answers only a request from a source one of its covering `network`
+/// statements states — and a request dialling the address that collection PUBLISHED comes
+/// through the interface endpoints its own statements stated when that address was opened, so
+/// a statement later narrowed to another endpoint of the account states no source that
+/// request is from and the endpoint stops answering, with the front door's empty refusal.
+/// Widening it back makes the identical request answer again, out of the documents the
+/// collection held throughout, and the collection stays ACTIVE under both.
+///
+/// The rows span which endpoints the narrowed statement names and in which source form —
+/// the one the address was published behind, another endpoint of the account, both, an id the
+/// account holds no endpoint for, public access, and an admitted AWS service.
+#[tokio::test]
+async fn an_endpoint_published_behind_one_source_stops_answering_when_it_is_narrowed_away() {
+    /// One case: the source members the statement is rewritten with, and whether the
+    /// published address then answers.
+    struct Row {
+        case: String,
+        sources: Value,
+        admitted: bool,
+    }
+    let router = emulator();
+    let behind = attach_vpc_endpoint(&router, "behind-endpoint", A_VPC).await;
+    let another = attach_vpc_endpoint(&router, "another-endpoint", ANOTHER_VPC).await;
+    let admitting = policy_with_sources(&json!({
+        "AllowFromPublic": false,
+        "SourceVPCEs": [&behind],
+    }));
+    // The statement stating that one endpoint is in force BEFORE the collection is created,
+    // so the address it publishes is published behind that endpoint.
+    create_security_policy(&router, "network", NETWORK_POLICY, &admitting).await;
+    let collection = active_collection(&router, COLLECTION).await;
+    let collection_id = text(&collection, "id");
+    let endpoint = text(&collection, "collectionEndpoint");
+    let host = endpoint_host(&collection);
+
+    // Live: the index is created and a document written through the published address.
+    let document = json!({ "vector": [1.0, 0.0, 0.0, 0.0], "label": "written-from-behind" });
+    let read_path = format!("/{INDEX}/_doc/{DOCUMENT}");
+    for (case, method, path, body) in [
+        (
+            "the index create",
+            "PUT",
+            format!("/{INDEX}"),
+            Some(knn_index_body(4)),
+        ),
+        (
+            "the document write",
+            "PUT",
+            read_path.clone(),
+            Some(document.clone()),
+        ),
+    ] {
+        let (status, answer) = rest(
+            &router,
+            &host,
+            AMBIENT_ACCESS_KEY_ID,
+            method,
+            &path,
+            body.as_ref(),
+        )
+        .await;
+        assert!(
+            (200..300).contains(&status),
+            "case {case} under the stated source: expected the endpoint to serve \
+             {method} {path}, got {status} with {answer}"
+        );
+    }
+
+    let rows: Vec<Row> = vec![
+        Row {
+            case: "narrowed to another endpoint of the account".to_string(),
+            sources: json!({ "AllowFromPublic": false, "SourceVPCEs": [&another] }),
+            admitted: false,
+        },
+        Row {
+            case: "that other endpoint beside the one it was published behind".to_string(),
+            sources: json!({ "AllowFromPublic": false, "SourceVPCEs": [&another, &behind] }),
+            admitted: true,
+        },
+        Row {
+            case: "narrowed to another endpoint, with public access added".to_string(),
+            sources: json!({ "AllowFromPublic": true, "SourceVPCEs": [&another] }),
+            admitted: true,
+        },
+        Row {
+            case: "narrowed to another endpoint, with an AWS service admitted".to_string(),
+            sources: json!({
+                "AllowFromPublic": false,
+                "SourceVPCEs": [&another],
+                "SourceServices": [SOURCE_SERVICE],
+            }),
+            admitted: true,
+        },
+        Row {
+            case: "narrowed to an id the account holds no endpoint for".to_string(),
+            sources: json!({ "AllowFromPublic": false, "SourceVPCEs": [UNHELD_ENDPOINT] }),
+            admitted: true,
+        },
+        Row {
+            case: "widened back to the endpoint it was published behind".to_string(),
+            sources: json!({ "AllowFromPublic": false, "SourceVPCEs": [&behind] }),
+            admitted: true,
+        },
+    ];
+    for Row {
+        case,
+        sources,
+        admitted,
+    } in &rows
+    {
+        replace_network_policy(&router, &policy_with_sources(sources)).await;
+        if *admitted {
+            // The identical read answers, out of the document written before any rewrite.
+            let (status, answer) = rest(
+                &router,
+                &host,
+                AMBIENT_ACCESS_KEY_ID,
+                "GET",
+                &read_path,
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, at(&answer, "_source").clone()),
+                (200, document.clone()),
+                "case {case}: expected the stored source unchanged, got {status} with {answer}"
+            );
+            continue;
+        }
+        // Both the read and the write are refused at the front door, with no bytes to parse.
+        for (probe, method, body) in [
+            ("the document read", "GET", None),
+            ("the document write", "PUT", Some(document.clone())),
+        ] {
+            let (status, payload) = rest_bytes(
+                &router,
+                &host,
+                AMBIENT_ACCESS_KEY_ID,
+                method,
+                &read_path,
+                body.as_ref(),
+            )
+            .await;
+            let served = String::from_utf8_lossy(&payload).to_string();
+            assert_eq!(
+                (status, payload.is_empty()),
+                (NETWORK_REFUSAL, true),
+                "case {case} / {probe}: expected {NETWORK_REFUSAL} and no bytes, got \
+                 {status} with {served:?}"
+            );
+        }
+        // The collection behind the refusing endpoint is untouched: same status, same
+        // published address.
+        let (status, code, read) =
+            call(&router, "BatchGetCollection", json!({ "ids": [&collection_id] })).await;
+        let detail = at(&read, "collectionDetails")
+            .as_array()
+            .and_then(|details| details.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            (
+                status,
+                text(&detail, "status"),
+                text(&detail, "collectionEndpoint")
+            ),
+            (200, "ACTIVE".to_string(), endpoint.clone()),
+            "case {case}: the collection itself is untouched, got {status} {code} with {read}"
+        );
     }
 }

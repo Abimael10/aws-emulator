@@ -931,6 +931,14 @@ pub struct CollectionRecord {
     pub indexes: BTreeMap<String, IndexRecord>,
     /// The transition the clock owes this collection, while one is outstanding.
     pub pending_status: Option<PendingStatus>,
+    /// The managed interface endpoints the `network` statements covering this collection
+    /// stated as their sources when its endpoint was published — the attachment a client
+    /// that dials that address is behind, which is one of the two things that place a
+    /// request to this collection at all ([`network_access`]).
+    ///
+    /// Empty for a collection published behind no stated endpoint, which is behind nothing in
+    /// particular.
+    pub published_behind: Vec<String>,
     /// When this collection's accepted deletion is due to be PURGED — the instant from
     /// which it stops being a collection any read reports at all. Set by
     /// [`Self::begin_deletion`], which is also what moves it to `DELETING`.
@@ -3283,6 +3291,15 @@ pub struct VpcEndpointRecord {
     pub name: String,
     /// The `VpcId` the create request named.
     pub vpc_id: String,
+    /// Whether EC2 reported the VPC this endpoint is placed in as the ACCOUNT'S DEFAULT one,
+    /// read when the endpoint was created ([`ec2_network::placement`]).
+    ///
+    /// `None` for an endpoint nothing answered about — an emulator with no EC2 mounted, or a
+    /// read that did not resolve — which is no statement about its placement either way.
+    /// What reads it is the network boundary of a collection's data plane, where the default
+    /// network is what places a client that built no network of its own
+    /// ([`network_access`]).
+    pub in_default_vpc: Option<bool>,
     /// The subnets the endpoint reaches OpenSearch Serverless through, in the order the
     /// request listed them.
     pub subnet_ids: Vec<String>,

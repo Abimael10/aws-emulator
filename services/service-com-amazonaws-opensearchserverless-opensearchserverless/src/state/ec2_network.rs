@@ -22,9 +22,11 @@
 //! the caller.
 //!
 //! This service only GATES on existence — it keeps nothing of the VPC or the subnet beyond
-//! the ids the request carried — so an emulator with no EC2 mounted learns nothing to refuse
-//! a request on and refuses nothing: a refusal is grounded in what EC2 reported, never
-//! assumed from silence, and an attempt that answered nothing is reported at `warn`.
+//! the ids the request carried, and the one thing EC2 ANSWERED about the VPC that outlives
+//! the call ([`Placement::in_default_vpc`], which is where a client that built no network of
+//! its own is) — so an emulator with no EC2 mounted learns nothing to refuse a request on and
+//! refuses nothing: a refusal is grounded in what EC2 reported, never assumed from silence,
+//! and an attempt that answered nothing is reported at `warn`.
 
 /// An AWS SDK client for EC2 over the in-process callback into this same emulator, or `None`
 /// when `region` is not a Region LABEL.
@@ -102,38 +104,73 @@ pub fn subnet_absent_message(subnet_id: &str) -> String {
     format!("The Subnet with Id '{subnet_id}' does not exist.")
 }
 
+/// What a request's network placement resolved to against EC2.
+#[derive(Debug, Default)]
+pub struct Placement {
+    /// Why the network a request names cannot be placed in, as the MESSAGE a
+    /// `ValidationException` states — `None` when EC2 resolved every id the request carried,
+    /// and also when there is no EC2 to ask.
+    pub refusal: Option<String>,
+    /// Whether EC2 reports the named VPC as the ACCOUNT'S DEFAULT one — the network AWS gives
+    /// an account that created none of its own.
+    ///
+    /// `None` when nothing answered about it: no VPC was named, there was no EC2 to ask, or
+    /// the read did not resolve. Reported because a refusal elsewhere in this crate is
+    /// grounded in what EC2 said, never assumed from silence, and so is what this value is
+    /// read for ([`super::network_access`]).
+    pub in_default_vpc: Option<bool>,
+}
+
 /// Why the network a request names cannot be placed in, as the MESSAGE a
 /// `ValidationException` states — or `None` when EC2 resolved every id the request carried,
-/// and also when there is no EC2 to ask.
-///
-/// The VPC is resolved first, since a subnet exists only inside one: a request whose VPC
-/// names nothing is answered about that VPC rather than about the subnets beside it.
-///
-/// The caller-sized subnet list is the one the handler has already held to its own bound, so
-/// the resolving reads below are not sized by the request.
+/// and also when there is no EC2 to ask ([`Placement::refusal`]).
 pub async fn unresolved_network(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
     vpc_id: Option<&str>,
     subnet_ids: &[String],
 ) -> Option<String> {
-    let names_a_vpc = vpc_id.is_some_and(|id| !id.is_empty());
-    if !names_a_vpc && subnet_ids.is_empty() {
-        return None;
-    }
-    // No Region label, so no endpoint to ask EC2 at: the same answer an unreachable EC2
-    // gets, which grounds no refusal.
-    let ec2 = ec2_client(ctx, region)?;
-    if let Some(vpc_id) = vpc_id.filter(|id| !id.is_empty()) {
-        if let Some(refusal) = unresolved_vpc(&ec2, vpc_id).await {
-            return Some(refusal);
-        }
-    }
-    unresolved_subnets(&ec2, subnet_ids).await
+    placement(ctx, region, vpc_id, subnet_ids).await.refusal
 }
 
-/// What EC2 answers about the VPC `vpc_id` names.
-async fn unresolved_vpc(ec2: &::aws_sdk_ec2::Client, vpc_id: &str) -> Option<String> {
+/// What EC2 answers about the placement a request names: whether it can be placed there at
+/// all, and which network that is.
+///
+/// The VPC is resolved first, since a subnet exists only inside one: a request whose VPC
+/// names nothing is answered about that VPC rather than about the subnets beside it.
+///
+/// The caller-sized subnet list is the one the handler has already held to its own bound, so
+/// the resolving reads below are not sized by the request.
+pub async fn placement(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: Option<&str>,
+    subnet_ids: &[String],
+) -> Placement {
+    let names_a_vpc = vpc_id.is_some_and(|id| !id.is_empty());
+    if !names_a_vpc && subnet_ids.is_empty() {
+        return Placement::default();
+    }
+    // No Region label, so no endpoint to ask EC2 at: the same answer an unreachable EC2
+    // gets, which grounds no refusal and places nothing.
+    let Some(ec2) = ec2_client(ctx, region) else {
+        return Placement::default();
+    };
+    let mut placement = Placement::default();
+    if let Some(vpc_id) = vpc_id.filter(|id| !id.is_empty()) {
+        let resolved = resolved_vpc(&ec2, vpc_id).await;
+        placement.in_default_vpc = resolved.in_default_vpc;
+        if resolved.refusal.is_some() {
+            return resolved;
+        }
+    }
+    placement.refusal = unresolved_subnets(&ec2, subnet_ids).await;
+    placement
+}
+
+/// What EC2 answers about the VPC `vpc_id` names: why a request cannot be placed in it, and
+/// whether it is the account's default network.
+async fn resolved_vpc(ec2: &::aws_sdk_ec2::Client, vpc_id: &str) -> Placement {
     let by_id = ::aws_sdk_ec2::types::Filter::builder()
         .name(VPC_ID_FILTER)
         .values(vpc_id.to_string())
@@ -142,14 +179,30 @@ async fn unresolved_vpc(ec2: &::aws_sdk_ec2::Client, vpc_id: &str) -> Option<Str
         Ok(output) => {
             // A read that resolved but reports no VPC for the id the request named says the
             // same thing a refusal does, and about the same id.
-            if output.vpcs().iter().any(|vpc| vpc.vpc_id() == Some(vpc_id)) {
-                return None;
-            }
-            return Some(vpc_absent_message(vpc_id));
+            let Some(vpc) = output
+                .vpcs()
+                .iter()
+                .find(|vpc| vpc.vpc_id() == Some(vpc_id))
+            else {
+                return Placement {
+                    refusal: Some(vpc_absent_message(vpc_id)),
+                    in_default_vpc: None,
+                };
+            };
+            // EC2's own report of whether this is the account's default network; a read that
+            // resolved the VPC without stating it states nothing about it.
+            return Placement {
+                refusal: None,
+                in_default_vpc: vpc.is_default(),
+            };
         }
         Err(error) => error,
     };
-    grounds_a_refusal(&error, VPC_REFUSAL_PREFIX, "the VPC").then(|| vpc_absent_message(vpc_id))
+    Placement {
+        refusal: grounds_a_refusal(&error, VPC_REFUSAL_PREFIX, "the VPC")
+            .then(|| vpc_absent_message(vpc_id)),
+        in_default_vpc: None,
+    }
 }
 
 /// What EC2 answers about the subnets `subnet_ids` names: ONE read filtered by id, so an id
