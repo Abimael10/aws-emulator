@@ -293,23 +293,39 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 .fargate_platform_configuration
                 .as_ref()
                 .and_then(|configuration| configuration.platform_version.clone()),
-            // "For tags with the same name, job tags are given priority over job definitions
-            // tags" (`JobDetail$propagateTags`): the job's own tags are what this record holds,
-            // the submit having merged them already. A job that asked for no propagation
-            // propagates none.
+            // What a job propagating its tags puts on the task is BOTH sets merged
+            // ([`Self::propagated_task_tags`]). A job that asked for no propagation propagates
+            // none.
             tags: if job.propagate_tags.unwrap_or(false) {
-                job.tags
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect::<BTreeMap<String, String>>()
-                    .into_iter()
-                    .collect()
+                self.propagated_task_tags(job)
             } else {
                 Vec::new()
             },
             container,
         })
+    }
+
+    /// The tags a job propagating them puts on the Amazon ECS task it runs as: the tags of the
+    /// job definition revision it runs under, with the job's OWN tags over them.
+    ///
+    /// `JobDetail$propagateTags` is "whether to propagate the tags from the job OR JOB
+    /// DEFINITION to the corresponding Amazon ECS task", and it names the tie-break for the two
+    /// sets it merges: "for tags with the same name, job tags are given priority over job
+    /// definitions tags". So both sets travel, the job's value winning on a key they share —
+    /// and the tags a reader sees on each resource are unchanged by that, since the merge is
+    /// made for the TASK and written nowhere else.
+    ///
+    /// Held in a [`BTreeMap`], so the merge decides each key once and the list the dispatch
+    /// carries is in key order whatever order either set was written in.
+    fn propagated_task_tags(&self, job: &Job) -> Vec<(String, String)> {
+        let mut merged: BTreeMap<String, String> = self
+            .job_definition(&job.job_definition_arn)
+            .and_then(|definition| definition.tags.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        merged.extend(job.tags.clone().unwrap_or_default());
+        merged.into_iter().collect()
     }
 
     /// Owe Amazon ECS the task `id`'s container runs as, and take the job out of the clock's
