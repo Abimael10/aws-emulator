@@ -12,7 +12,9 @@
 //! `create_training_job.rs` and [`crate::state::run_training_job`]); a run that has not
 //! reported yet has none of them. This read also makes the appearance of the artifact the
 //! clock has already made due ([`crate::state::publish_due_artifact`]) — the stage that
-//! uploads it — so the object is there for the read that reports that stage. The debugger and
+//! uploads it — so the object is there for the read that reports that stage; the publication
+//! and the status move are materialised as of the SAME instant, so a read that reports the
+//! job's terminal status reports an artifact that is already readable. The debugger and
 //! profiler rule evaluations stay absent: no rule container is evaluated against the run.
 //!
 //! Beside the modelled members, the response carries the ones the recorded service answers

@@ -34,7 +34,7 @@
 //! the model directory, how many input objects and records a transform job is given, and which
 //! leg of a job's work authorization stops.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
@@ -215,20 +215,34 @@ fn channel(name: &str, bucket: &str, prefix: &str) -> Value {
     })
 }
 
+/// An instant as the epoch seconds the wire carries a timestamp in, so an instant this caller
+/// held can be weighed against one a response reports.
+fn epoch_seconds(at: SystemTime) -> f64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .expect("a host clock at or after the epoch")
+        .as_secs_f64()
+}
+
 /// Poll `DescribeTrainingJob` until the job leaves `InProgress`, answering the read that saw a
-/// terminal status together with every `SecondaryStatus` observed on the way and the keys the
-/// output prefix held the first time the artifact was listable.
+/// terminal status together with every `SecondaryStatus` observed on the way and an upper bound
+/// on when the artifact became listable under the output prefix.
 struct Observed {
     terminal: Value,
     statuses: Vec<String>,
-    /// The `SecondaryStatus` the job reported the first time its artifact was listable.
-    status_when_published: Option<String>,
+    /// The epoch seconds this caller held just AFTER the listing that first showed the
+    /// artifact, and `None` while no listing has shown one.
+    ///
+    /// It is an UPPER bound on the instant the artifact appeared — the object was already
+    /// there when that listing answered — which is what makes a claim about when it may appear
+    /// independent of how fast this host ran anything: a host the poller is delayed on can
+    /// only push this instant LATER, i.e. loosen every comparison made against it.
+    artifact_listable_by: Option<f64>,
 }
 
 async fn observed(emulator: &Emulator, case: &str, job: &str, bucket: &str) -> Observed {
     let deadline = Instant::now() + SETTLE_BUDGET;
     let mut statuses: Vec<String> = Vec::new();
-    let mut status_when_published: Option<String> = None;
+    let mut artifact_listable_by: Option<f64> = None;
     loop {
         let read = emulator
             .sagemaker_ok(case, "DescribeTrainingJob", &json!({ "TrainingJobName": job }))
@@ -241,20 +255,20 @@ async fn observed(emulator: &Emulator, case: &str, job: &str, bucket: &str) -> O
         if statuses.last() != Some(&secondary) {
             statuses.push(secondary.clone());
         }
-        if status_when_published.is_none() {
+        if artifact_listable_by.is_none() {
             let published = listed_keys(emulator, bucket, &format!("out/{job}/"))
                 .await
                 .iter()
                 .any(|key| key.ends_with("model.tar.gz"));
             if published {
-                status_when_published = Some(secondary);
+                artifact_listable_by = Some(epoch_seconds(SystemTime::now()));
             }
         }
         if str_field(&read, "TrainingJobStatus") != "InProgress" {
             return Observed {
                 terminal: read,
                 statuses,
-                status_when_published,
+                artifact_listable_by,
             };
         }
         assert!(
@@ -263,6 +277,50 @@ async fn observed(emulator: &Emulator, case: &str, job: &str, bucket: &str) -> O
         );
         tokio::time::sleep(SETTLE_POLL).await;
     }
+}
+
+/// The `SecondaryStatusTransitions` a read reports: the job's OWN account of the stages its
+/// work went through, so a claim weighed against it holds however coarsely a poller looked.
+fn history(described: &Value, case: &str) -> Vec<Value> {
+    described
+        .get("SecondaryStatusTransitions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected SecondaryStatusTransitions in {described}")
+        })
+        .clone()
+}
+
+/// The `SecondaryStatus` values that history names, in the order the job was in them.
+fn history_statuses(described: &Value, case: &str) -> Vec<String> {
+    history(described, case)
+        .iter()
+        .map(|entry| str_field(entry, "Status"))
+        .collect()
+}
+
+/// The instant a read's own history says the job ENTERED `status`, as epoch seconds.
+fn history_entered(described: &Value, status: &str, case: &str) -> f64 {
+    history(described, case)
+        .iter()
+        .find(|entry| str_field(entry, "Status") == status)
+        .and_then(|entry| entry.get("StartTime").and_then(Value::as_f64))
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected a {status} entry with a StartTime in {described}")
+        })
+}
+
+/// Whether `observed` appears inside `history` in order, i.e. every status a poller reported is
+/// one the job's own history names, and never before a status the poller reported earlier.
+///
+/// A poller only ever samples the history, so the statuses it reports are a SUBSEQUENCE of it,
+/// whatever the host's speed let it catch: the claim holds on an idle host that sees every
+/// stage and on a loaded one that skips some.
+fn is_subsequence_of(observed: &[String], history: &[String]) -> bool {
+    let mut entries = history.iter();
+    observed
+        .iter()
+        .all(|status| entries.any(|entry| entry == status))
 }
 
 /// The metric names a describe reports, sorted.
@@ -706,21 +764,44 @@ async fn the_artifact_and_the_metrics_come_from_the_job_that_produced_them() {
         }
 
         // RULE FIVE's ordering half: the artifact must never be listable before the job
-        // reported the stage that uploads it, which is over once the work ends.
-        let when = seen.status_when_published.clone().unwrap_or_default();
+        // reported the stage that uploads it, which is over once the work ends. It is weighed
+        // against the job's OWN account of when it entered that stage and against the instant
+        // this caller held the artifact already listable at — never against two separate
+        // observations paired by how fast this host made them, which a host delayed between
+        // them could pair wrongly.
+        let entered_uploading = history_entered(&seen.terminal, "Uploading", case);
+        let listable_by = seen.artifact_listable_by.unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: the artifact must be listable under the output prefix by the \
+                 time the job is {}, got {}",
+                str_field(&seen.terminal, "TrainingJobStatus"),
+                seen.terminal
+            )
+        });
         assert!(
-            when == "Uploading" || when == "Completed",
+            listable_by >= entered_uploading,
             "case {case:?}: the artifact must appear no earlier than the stage that uploads it, \
-             got {when:?} over {:?}",
+             which the job entered at {entered_uploading}, but it was already listable by \
+             {listable_by} over {:?}",
             seen.statuses
         );
+        // The stages the job went through are read from the history it reports, which names
+        // every stage the clock put it in whether or not a poller happened to look inside that
+        // stage's window; what the poller did report is held to that same history.
+        let history = history_statuses(&seen.terminal, case);
         for stage in ["Starting", "Downloading", "Training", "Uploading"] {
             assert!(
-                seen.statuses.iter().any(|seen| seen == stage),
-                "case {case:?}: the job must pass through {stage}, got {:?}",
+                history.iter().any(|entry| entry == stage),
+                "case {case:?}: the job must pass through {stage}, got {history:?} over {:?}",
                 seen.statuses
             );
         }
+        assert!(
+            is_subsequence_of(&seen.statuses, &history),
+            "case {case:?}: every status the poller reported must be one the job's history \
+             names, and in that order, got {:?} over {history:?}",
+            seen.statuses
+        );
     }
 }
 
