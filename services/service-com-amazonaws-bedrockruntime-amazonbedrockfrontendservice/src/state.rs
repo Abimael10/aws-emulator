@@ -2425,11 +2425,11 @@ pub fn requestable_tool_names(config: &ToolConfiguration) -> Vec<&str> {
 /// `toolUseId` that request was issued under, so a `toolUseId` no `toolUse`
 /// block of the conversation was issued with addresses nothing.
 ///
-/// `Err` carries the refusal sentence, which names the member path of the
-/// offending block, the id it supplied and the id (or ids) the tool requests it
-/// could answer were issued under; the caller answers it with the operation's
-/// modelled `ValidationException` (400). `Converse` and `ConverseStream` share
-/// this, so the same conversation is accepted or refused identically by both.
+/// `Err` carries the refusal sentence
+/// ([`unaddressed_tool_results_message`]); the caller answers it with the
+/// operation's modelled `ValidationException` (400). `Converse` and
+/// `ConverseStream` share this, so the same conversation is accepted or refused
+/// identically by both.
 pub fn validate_tool_results(messages: &[Message]) -> Result<(), String> {
     // The ids issued so far, in the order the conversation issued them, plus
     // those of the most recent tool request, which is the one a tool result is
@@ -2438,7 +2438,7 @@ pub fn validate_tool_results(messages: &[Message]) -> Result<(), String> {
     let mut latest: Vec<&str> = Vec::new();
     for (turn, message) in messages.iter().enumerate() {
         let mut issued_here: Vec<&str> = Vec::new();
-        for (index, block) in message.content.iter().enumerate() {
+        for block in &message.content {
             match block {
                 ContentBlock::toolUse(tool_use) => {
                     issued.insert(tool_use.tool_use_id.as_str());
@@ -2448,19 +2448,10 @@ pub fn validate_tool_results(messages: &[Message]) -> Result<(), String> {
                     if issued.contains(result.tool_use_id.as_str()) {
                         continue;
                     }
-                    let addressed = if latest.is_empty() {
-                        "the conversation carries no tool request for it to answer".to_string()
-                    } else {
-                        format!(
-                            "the tool request it can answer was issued with toolUseId {}",
-                            latest.join(", ")
-                        )
-                    };
-                    return Err(format!(
-                        "The toolResult block at messages.{turn}.content.{index} has \
-                         toolUseId {}, but {addressed}. Try again with a toolResult whose \
-                         toolUseId is the one of the toolUse block it answers.",
-                        result.tool_use_id
+                    return Err(unaddressed_tool_results_message(
+                        turn,
+                        &latest,
+                        &addressed_tool_use_ids(message),
                     ));
                 }
                 _ => {}
@@ -2471,6 +2462,41 @@ pub fn validate_tool_results(messages: &[Message]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The `toolUseId`s one turn's `toolResult` blocks address, in the order that
+/// turn's `content` list carries them — the ids the refusal below reports as
+/// FOUND, which is what the submitted turn supplied.
+fn addressed_tool_use_ids(message: &Message) -> Vec<&str> {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::toolResult(result) => Some(result.tool_use_id.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The sentence a turn whose `toolResult` blocks do not answer the tool requests
+/// of the turn before them is refused in.
+///
+/// The text is entirely FIXED and its three slots are filled from the submitted
+/// request and the state this service minted into it: the path of the offending
+/// `content` LIST (the turn's own index in `messages`, so the refusal names the
+/// list whose blocks are reconciled against the preceding turn rather than one
+/// block inside it), the ids the preceding turn's tool requests were issued
+/// under, and the ids that turn's `toolResult` blocks address. Each list is
+/// rendered in request order, comma separated; a conversation carrying no tool
+/// request at all leaves the expected list empty, since no id was ever issued
+/// for a result to answer.
+fn unaddressed_tool_results_message(turn: usize, expected: &[&str], found: &[&str]) -> String {
+    format!(
+        "Expected toolResult blocks at messages.{turn}.content for the following Ids: {}, \
+         but found: {}",
+        expected.join(", "),
+        found.join(", ")
+    )
 }
 
 /// The tokens ONE content block is, by the same text rule

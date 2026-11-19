@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The tool-calling half of the Converse envelope, end to end over HTTP: which tool
-//! a turn requests for a request that offers one, and how a later turn's `toolResult`
-//! is addressed to the tool request it answers.
+//! a turn requests for a request that offers one, how a later turn's `toolResult`
+//! is addressed to the tool request it answers, and the sentence a turn whose
+//! `toolResult` blocks answer no request of the turn before them is refused in.
 //!
 //! Every case drives the real router through the harness the other suites of this
 //! target use, so what is asserted is the wire behaviour a client sees.
@@ -552,6 +553,316 @@ async fn a_tool_result_must_address_a_tool_request_the_conversation_carries() {
          ValidationException, got {:?}",
         unaddressed.error_code()
     );
+}
+
+/// An assistant turn carrying text, for a history written out rather than served.
+fn assistant_text(text: &str) -> Value {
+    json!({"role": "assistant", "content": [{"text": text}]})
+}
+
+/// A user turn carrying text, for a history written out rather than served.
+fn user_text(text: &str) -> Value {
+    json!({"role": "user", "content": [{"text": text}]})
+}
+
+/// An assistant turn issuing one tool request per id.
+fn assistant_tool_uses(ids: &[&str]) -> Value {
+    let blocks: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({"toolUse": {
+                "toolUseId": id,
+                "name": "get_stock_price",
+                "input": {"symbol": "AMZN"},
+            }})
+        })
+        .collect();
+    json!({"role": "assistant", "content": blocks})
+}
+
+/// A user turn answering one tool request per id.
+fn user_tool_results(ids: &[&str]) -> Value {
+    let blocks: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({"toolResult": {
+                "toolUseId": id,
+                "content": [{"json": {"price": 231.4}}],
+                "status": "success",
+            }})
+        })
+        .collect();
+    json!({"role": "user", "content": blocks})
+}
+
+/// The sentence the addressing rule owes, built from the service's template written
+/// out here rather than read off the handler's own constant: the FIXED text, the path
+/// of the offending `content` LIST, the ids the preceding turn's requests were issued
+/// under and the ids the submitted `toolResult` blocks address.
+fn expected_addressing_message(turn: usize, expected: &[&str], found: &[&str]) -> String {
+    format!(
+        "Expected toolResult blocks at messages.{turn}.content for the following Ids: {}, \
+         but found: {}",
+        expected.join(", "),
+        found.join(", ")
+    )
+}
+
+/// One conversation whose tool results do not address the requests of the turn before
+/// them, and the slots the refusal must fill.
+struct AddressingMessageRow {
+    case: &'static str,
+    messages: Value,
+    /// The index of the `content` list the refusal points at.
+    turn: usize,
+    /// The ids the preceding turn's tool requests were issued under.
+    expected: Vec<&'static str>,
+    /// The ids the offending turn's `toolResult` blocks address.
+    found: Vec<&'static str>,
+}
+
+/// The rows the refusal's wording is asserted over: they differ in how many ids the
+/// preceding turn issued, how many `toolResult` blocks the offending turn carries and
+/// which of them is unaddressed, where in `messages` that turn sits, whether an EARLIER
+/// exchange of the same conversation issued other ids, whether the conversation issued
+/// any id at all, and the form the supplied id takes.
+fn addressing_message_rows() -> Vec<AddressingMessageRow> {
+    vec![
+        AddressingMessageRow {
+            case: "one request, the id mutated in its last character",
+            messages: json!([
+                user_text("What does AMZN trade at?"),
+                assistant_tool_uses(&["tooluse_oneissued0001"]),
+                user_tool_results(&["tooluse_oneissued0002"]),
+            ]),
+            turn: 2,
+            expected: vec!["tooluse_oneissued0001"],
+            found: vec!["tooluse_oneissued0002"],
+        },
+        AddressingMessageRow {
+            case: "two requests, the second result unaddressed",
+            messages: json!([
+                user_text("What do AMZN and AAPL trade at?"),
+                assistant_tool_uses(&["tooluse_pair0001", "tooluse_pair0002"]),
+                user_tool_results(&["tooluse_pair0001", "tooluse_pair0009"]),
+            ]),
+            turn: 2,
+            expected: vec!["tooluse_pair0001", "tooluse_pair0002"],
+            found: vec!["tooluse_pair0001", "tooluse_pair0009"],
+        },
+        AddressingMessageRow {
+            case: "three requests, one result naming none of them",
+            messages: json!([
+                user_text("Quote three symbols."),
+                assistant_tool_uses(&[
+                    "tooluse_trio0001",
+                    "tooluse_trio0002",
+                    "tooluse_trio0003",
+                ]),
+                user_tool_results(&["tooluse-client-invented"]),
+            ]),
+            turn: 2,
+            expected: vec!["tooluse_trio0001", "tooluse_trio0002", "tooluse_trio0003"],
+            found: vec!["tooluse-client-invented"],
+        },
+        AddressingMessageRow {
+            case: "the offending turn deeper in the conversation",
+            messages: json!([
+                user_text("Hello."),
+                assistant_text("Hello, which symbol?"),
+                user_text("AMZN."),
+                assistant_tool_uses(&["tooluse_deep0001"]),
+                user_tool_results(&["tooluse_deep0001x"]),
+            ]),
+            turn: 4,
+            expected: vec!["tooluse_deep0001"],
+            found: vec!["tooluse_deep0001x"],
+        },
+        AddressingMessageRow {
+            case: "an earlier exchange answered, the latest one misaddressed",
+            messages: json!([
+                user_text("AMZN?"),
+                assistant_tool_uses(&["tooluse_first0001"]),
+                user_tool_results(&["tooluse_first0001"]),
+                assistant_tool_uses(&["tooluse_second0001"]),
+                user_tool_results(&["tooluse_second0002"]),
+            ]),
+            turn: 4,
+            expected: vec!["tooluse_second0001"],
+            found: vec!["tooluse_second0002"],
+        },
+        AddressingMessageRow {
+            case: "an id of one character",
+            messages: json!([
+                user_text("AMZN?"),
+                assistant_tool_uses(&["tooluse_short0001"]),
+                user_tool_results(&["a"]),
+            ]),
+            turn: 2,
+            expected: vec!["tooluse_short0001"],
+            found: vec!["a"],
+        },
+        AddressingMessageRow {
+            case: "a conversation that carries no tool request at all",
+            messages: json!([user_tool_results(&["tooluse_nothingissued"])]),
+            turn: 0,
+            expected: vec![],
+            found: vec!["tooluse_nothingissued"],
+        },
+    ]
+}
+
+/// RULE: a turn whose `toolResult` blocks do not answer the tool requests of the turn
+/// before them is refused 400 `ValidationException` in the service's own FIXED sentence
+/// — "Expected toolResult blocks at " + the path of the offending `content` list + " for
+/// the following Ids: " + the ids those requests were issued under + ", but found: " +
+/// the ids the submitted blocks address — so a client matching on that sentence, and
+/// parsing the expected ids out of it to re-issue the turn, reads the same text here as
+/// on the service.
+#[tokio::test]
+async fn an_unaddressed_tool_result_is_refused_in_the_services_own_sentence() {
+    let router = emulator();
+    let tools = json!({"tools": [tool_spec("get_stock_price")]});
+
+    for row in addressing_message_rows() {
+        for surface in ["converse", "converse-stream"] {
+            let case = format!("{} on {surface}", row.case);
+            let call = post_json(
+                &router,
+                &format!("/model/amazon.nova-lite-v1:0/{surface}"),
+                &json!({"messages": row.messages, "toolConfig": tools}),
+            )
+            .await;
+            assert_eq!(
+                call.status,
+                400,
+                "case {case:?}: expected HTTP 400, got {} / {}",
+                call.status,
+                String::from_utf8_lossy(&call.body)
+            );
+            assert_eq!(
+                call.error_code(),
+                "ValidationException",
+                "case {case:?}: expected ValidationException, got {:?}",
+                call.error_code()
+            );
+            let expected = expected_addressing_message(row.turn, &row.expected, &row.found);
+            let stated = call.json()["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(
+                stated, expected,
+                "case {case:?}: expected message {expected:?}, got {stated:?}"
+            );
+        }
+    }
+}
+
+/// RULE (the same rule's served side): a turn whose `toolResult` blocks DO address the
+/// requests of the turn before them is served, so the refusal above is the misaddressing
+/// and not the presence of tool results.
+#[tokio::test]
+async fn a_tool_result_addressing_the_requests_of_the_preceding_turn_is_served() {
+    let router = emulator();
+    let tools = json!({"tools": [tool_spec("get_stock_price")]});
+
+    let rows = [
+        (
+            "one request answered",
+            json!([
+                user_text("AMZN?"),
+                assistant_tool_uses(&["tooluse_served0001"]),
+                user_tool_results(&["tooluse_served0001"]),
+            ]),
+        ),
+        (
+            "two requests answered in order",
+            json!([
+                user_text("AMZN and AAPL?"),
+                assistant_tool_uses(&["tooluse_served0002", "tooluse_served0003"]),
+                user_tool_results(&["tooluse_served0002", "tooluse_served0003"]),
+            ]),
+        ),
+    ];
+
+    for (row, messages) in rows {
+        for surface in ["converse", "converse-stream"] {
+            let case = format!("{row} on {surface}");
+            let call = post_json(
+                &router,
+                &format!("/model/amazon.nova-lite-v1:0/{surface}"),
+                &json!({"messages": messages, "toolConfig": tools}),
+            )
+            .await;
+            assert_eq!(
+                call.status,
+                200,
+                "case {case:?}: expected HTTP 200, got {} / {}",
+                call.status,
+                String::from_utf8_lossy(&call.body)
+            );
+        }
+    }
+}
+
+/// RULE (where the expected ids come from): the expected-id slot carries the id the
+/// SERVICE issued, so a forced `toolChoice` turn's minted id — not one written out by the
+/// test — is what a history replaying it mutated is refused against.
+#[tokio::test]
+async fn the_expected_ids_of_the_refusal_are_the_ones_the_service_minted() {
+    let router = emulator();
+    let model_id = "amazon.nova-lite-v1:0";
+    let (assistant, minted) = mint_tool_request(
+        &router,
+        model_id,
+        &json!({
+            "tools": [tool_spec("get_stock_price")],
+            "toolChoice": {"any": {}},
+        }),
+    )
+    .await;
+    // The minted id with its last character replaced: the id sent back addresses no
+    // request the conversation carries.
+    let last = minted.chars().next_back().unwrap_or('0');
+    let mut supplied = minted[..minted.len() - 1].to_string();
+    supplied.push(if last == '0' { '1' } else { '0' });
+
+    for surface in ["converse", "converse-stream"] {
+        let case = format!("a minted id mutated, on {surface}");
+        let call = post_json(
+            &router,
+            &format!("/model/{model_id}/{surface}"),
+            &json!({
+                "messages": follow_up(&assistant, &supplied),
+                "toolConfig": {"tools": [tool_spec("get_stock_price")]},
+            }),
+        )
+        .await;
+        assert_eq!(
+            call.status,
+            400,
+            "case {case:?}: expected HTTP 400, got {} / {}",
+            call.status,
+            String::from_utf8_lossy(&call.body)
+        );
+        assert_eq!(
+            call.error_code(),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            call.error_code()
+        );
+        let expected =
+            expected_addressing_message(2, &[minted.as_str()], &[supplied.as_str()]);
+        let stated = call.json()["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: expected message {expected:?}, got {stated:?}"
+        );
+    }
 }
 
 /// The payload of every frame of `name`, in order.
