@@ -66,6 +66,16 @@
 //! is the only seam that can run ahead of the framework's deserialize -> validate ->
 //! handle walk, which is why the gate is picked there; every request it does not refuse
 //! is served by the modelled operation the request's own routing key names.
+//!
+//! ## How a request the front door refuses is worded
+//!
+//! A request the framework refuses before any handler runs — a value outside a modelled
+//! bound, a `@required` member that is absent — is worded by this plane itself, and the
+//! whole of that is [`input_validation`]: the error class and the sentence are chosen at
+//! `override_refusal` and the body and status are completed over the rendered response,
+//! because that seam is handed the violations alone. The names this plane addresses a
+//! resource by each have their own fixed sentence there, and every failure body it answers
+//! carries the `traceId` member beside `message`.
 
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, OperationContext, Refusal, Refused, Service,
@@ -76,18 +86,16 @@ use std::sync::Arc;
 /// in front of every operation of this service ([`AuthorizationGate`]).
 pub mod authorization;
 
+/// How this plane words a request the framework refused before any handler ran, and the
+/// envelope every failure it answers is completed in ([`input_validation`]).
+pub mod input_validation;
+
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
 use aws_smithy_schema::{Schema, ShapeType};
 use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
 
 /// The media type the data plane announces for a shadow state document.
 const JSON_DOCUMENT_MEDIA_TYPE: &str = "application/json";
-
-/// The error code this service refuses a bad request with, which is the error its model
-/// binds to every operation for one — see [`EmulatedService::override_refusal`]. Named
-/// here as the wire code because a boundary refusal is rendered before any operation's
-/// error enum is reached.
-const INVALID_REQUEST_EXCEPTION: &str = "InvalidRequestException";
 
 /// Every output shape of this service whose `@httpPayload` member targets the
 /// `JsonDocument` shape.
@@ -145,10 +153,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
 /// The order is AWS's: authorization is decided by the IAM layer in FRONT of the service, so it
 /// is answered before anything about the request's own resource is resolved, let alone
 /// deserialized or constraint-checked. A request it does not refuse is handed to the modelled
-/// operation the request named, read off this service's own routing table, so it is served by
-/// exactly the centralized deserialize -> validate -> handle walk every other request takes:
-/// the gate changes WHICH refusal comes first, not whether the modelled constraints are
-/// enforced.
+/// operation the request named, through the envelope wrapper that completes what the walk
+/// renders ([`input_validation::REFUSAL_ENVELOPE`], which resolves the same routing table), so
+/// it is served by exactly the centralized deserialize -> validate -> handle walk every other
+/// request takes: the gate changes WHICH refusal comes first, not whether the modelled
+/// constraints are enforced.
 ///
 /// It names no operation of its own, because the operation is the routing key the request
 /// carries: ONE gate stands in front of all of this service's operations, and the action it
@@ -205,13 +214,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizationGate<Eng> {
                 );
                 return authorization::refusal_response();
             }
-            match svc.definition().routing_table().get(operation) {
-                Some(modelled) => modelled.run(svc, req, ctx).await,
-                // Unreachable in practice: the key came from this service's own protocol.
-                // Answer the framework's own no-such-operation response rather than inventing
-                // one.
-                None => svc.definition().routing_error_response(req),
-            }
+            // The modelled operation the request named, served through the wrapper that
+            // completes the envelope this plane writes every failure in: it resolves the
+            // same routing table this gate would, so the whole deserialize -> validate ->
+            // handle walk, every handler's answer and every modelled status stay the
+            // framework's ([`input_validation`]).
+            input_validation::REFUSAL_ENVELOPE.run(svc, req, ctx).await
         })
     }
 
@@ -366,43 +374,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this service
-        // reword it.
-        //
-        // This service's client-input error is `InvalidRequestException` — one of the
-        // three errors its model binds to EVERY operation
-        // (`smithy_query(query="digest")`: `common_errors` is InternalFailureException /
-        // InvalidRequestException / ThrottlingException). `ValidationException`, which
-        // the framework names by default on the JSON protocols, is not a shape this
-        // service models at all, so a client's modelled-error dispatch cannot match it
-        // and the refusal surfaces as an unknown failure. Every refusal the framework
-        // describes structurally therefore carries this service's code — whichever
-        // operation and whichever member it was, since the model binds the error to all
-        // of them — and the status stays the 400 the protocol renders a constraint
-        // refusal with.
-        //
-        // The MESSAGE is this service's too, and it is the one terse sentence this data
-        // plane answers every front-door refusal with (`crate::state::BAD_REQUEST`) —
-        // whichever member of whichever operation was at fault, and whether the value was
-        // outside a bound or the member was absent. It carries NOTHING of the request:
-        // not the member's name, not the bound it crossed, and not the value the caller
-        // sent. The framework's structural envelope, which states all three, describes a
-        // constraint walk rather than this service's contract, and a client matching the
-        // refusal would not recognise it.
+        // reword it. WHAT this plane states for each class of refusal, and the envelope
+        // it completes the rendered answer in, are [`input_validation`] — the one place
+        // that wording lives, because the body it chooses here is finished at the other
+        // seam.
         //
         // The conditions a HANDLER reports are a different thing and keep their own
         // specific text (`crate::state` holds that catalog): they are the service's own
         // rules, not the front door's.
-        //
-        // An unauthenticated caller is not a constraint refusal and keeps the
-        // framework's 403 wording: this service models `ForbiddenException` with that
-        // status for exactly that case.
-        match refusal {
-            Refusal::Invalid(_) => Some(Refused {
-                code: INVALID_REQUEST_EXCEPTION.to_string(),
-                message: crate::state::BAD_REQUEST.to_string(),
-            }),
-            _ => None,
-        }
+        input_validation::stated_refusal(refusal)
     }
 
     fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {

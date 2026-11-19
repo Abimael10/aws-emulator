@@ -664,6 +664,31 @@ pub struct RetainedMessage {
 pub const CLIENT_NOT_FOUND: &str =
     "The client ID is not found. Verify that the client is connected and try again";
 
+/// The service's fixed refusal of a client id it will not address: the two rules a client
+/// id has to satisfy, and what the caller must do about it.
+///
+/// Those rules are the ones the model declares on the `ClientId` shape the connection
+/// operations bind as their `@httpLabel` — `length 1..128` and `pattern ^[^$]`, which
+/// admits every character but a leading `$`
+/// (`smithy_query(query="shape", shape="ClientId")`) — so one sentence covers a client id
+/// that is too long and one in the reserved `$` namespace alike. Entirely fixed text: it
+/// names neither the value the caller sent, nor the member it sat at, nor the expression
+/// the member had to match.
+pub const CLIENT_ID_NOT_VALID: &str = "This client ID isn't valid. Client IDs must not \
+     exceed 128 characters and can't start with a dollar sign ($). Enter a different \
+     client ID";
+
+/// The service's fixed answer when a request names a thing this plane cannot resolve a
+/// thing name from at all — one outside the bounds the model declares on `ThingName`
+/// (`length 1..128`, `pattern ^[a-zA-Z0-9:_-]+$`,
+/// `smithy_query(query="shape", shape="ThingName")`).
+///
+/// A shadow request resolves the thing before it looks at the shadow, so a name that
+/// resolves to no thing is reported as the ABSENT resource it addresses rather than as a
+/// malformed request — see `crate::service::input_validation`. Fixed text: nothing of the
+/// request is in it.
+pub const INVALID_THING_NAME: &str = "Invalid thing name specified in request";
+
 /// The service's answer when a `SendDirectMessage` asked for delivery confirmation.
 ///
 /// `confirmation=true` means the service delivers at QoS 1 and answers only once the

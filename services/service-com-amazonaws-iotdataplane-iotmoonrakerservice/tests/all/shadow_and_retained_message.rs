@@ -42,6 +42,9 @@ pub(crate) struct Answer {
     /// The response's `content-type`, which the shadow operations report as
     /// `application/json` because their body IS a JSON document.
     pub(crate) content_type: Option<String>,
+    /// The `x-amzn-errortype` header, which is where a restJson1 client resolves the
+    /// error SHAPE of a failure from.
+    pub(crate) error_type: Option<String>,
 }
 
 impl Answer {
@@ -113,6 +116,11 @@ impl Harness {
             content_type: response
                 .headers()
                 .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            error_type: response
+                .headers()
+                .get("x-amzn-errortype")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
             body: response.into_body().to_vec(),
