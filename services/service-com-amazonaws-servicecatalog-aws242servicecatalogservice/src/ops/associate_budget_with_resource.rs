@@ -142,7 +142,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // product-id", so the stored resource under that id is what takes the
         // association — either kind, through the one lookup both live behind. An id no
         // portfolio and no product answers to names no resource that can carry a
-        // budget, and nothing is stored for it.
+        // budget, and the refusal names the kind that id identifies.
         //
         // The BUDGET itself is named, not looked up: a budget lives in AWS Budgets,
         // which this operation's model gives this service no read of, so the
@@ -153,8 +153,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 AssociateBudgetWithResourceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::not_found_message(
-                            crate::state::KIND_RESOURCE,
+                        message: Some(crate::state::resource_not_found_message(
                             &input.resource_id,
                         )),
                     },
@@ -165,13 +164,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An association IS the (resource, budget) pair, so a pair already stored is
         // what `DuplicateResourceException` ("The specified resource is a duplicate")
-        // refuses; the association already made stands unchanged.
+        // refuses; the association already made stands unchanged. The duplicate is the
+        // ASSOCIATION, which is what the refusal names, on the resource that holds it.
         if associated.contains(&budget_name) {
             return Err(
                 AssociateBudgetWithResourceErrorModeled::DuplicateResourceException(
                     DuplicateResourceException {
                         message: Some(format!(
-                            "Budget {budget_name} is already associated with resource {}",
+                            "BudgetAssociation already exists on resource {}",
                             input.resource_id
                         )),
                     },
@@ -197,6 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // What is stored here is the ASSOCIATION, which a `BudgetDetail` reports by
+        // name and nothing else. `InvalidParametersException` has nothing left to
+        // refuse — every modelled constraint on `BudgetName` and `ResourceId` is
+        // already enforced before this handler runs.
         associated.insert(budget_name);
 
         Ok(AssociateBudgetWithResourceOutput {})

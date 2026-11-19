@@ -129,16 +129,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
         let mut state = state.lock();
 
-        // The resource the association hangs off has to exist before anything can be
-        // removed from it: an id no portfolio and no product answers to is the
-        // modelled not-found, the same lookup the association itself was stored
-        // through.
+        // `ResourceId` is "the resource identifier you want to disassociate from.
+        // Either a portfolio-id or a product-id", so both kinds resolve through the one
+        // lookup the association was stored behind. The resource the association hangs
+        // off has to exist before anything can be removed from it: an id no portfolio
+        // and no product answers to is the modelled not-found, naming the kind that id
+        // identifies.
         let Some(associated) = state.resource_budget_names_mut(&input.resource_id) else {
             return Err(
                 DisassociateBudgetFromResourceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::not_found_message(
-                            crate::state::KIND_RESOURCE,
+                        message: Some(crate::state::resource_not_found_message(
                             &input.resource_id,
                         )),
                     },
@@ -147,9 +148,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // Removing an association that is not there is not an error: the request's
-        // outcome — this resource not carrying that budget — already holds.
-        associated.remove(&input.budget_name);
+        // What this call removes is the (resource, budget) PAIR, so a pair the store
+        // does not hold is the not-found: there is no association to disassociate,
+        // whether the budget was never associated with this resource or has already
+        // been disassociated from it.
+        if !associated.remove(&input.budget_name) {
+            return Err(
+                DisassociateBudgetFromResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Budget with name {} is not associated with resource {}",
+                            input.budget_name, input.resource_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
 
         Ok(DisassociateBudgetFromResourceOutput {})
     }

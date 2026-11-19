@@ -6,10 +6,12 @@
 //! The rule under test: associating a budget with a resource stores the (resource, budget)
 //! pair, so every later read of that resource — `ListBudgetsForResource` and the
 //! `Budgets` member of each reader of a portfolio or a product — reports exactly the
-//! stored set and nothing else, a disassociation removes exactly that pair, a pair already
+//! stored set and nothing else, a disassociation removes exactly that pair and a pair the
+//! store does not hold is `ResourceNotFoundException` naming it, a pair already
 //! stored is the modelled `DuplicateResourceException`, a resource identifier naming
-//! neither a portfolio nor a product is `ResourceNotFoundException`, and a resource past
-//! the per-resource quota is `LimitExceededException`.
+//! neither a portfolio nor a product is `ResourceNotFoundException` naming the kind that
+//! identifier carries, and a resource past the per-resource quota is
+//! `LimitExceededException`.
 //!
 //! Each row varies what the rule generalises over: the KIND of resource, how many budgets
 //! one resource carries, how many resources one budget reaches, the SHAPE of the budget
@@ -364,6 +366,14 @@ async fn associating_a_stored_pair_again_is_the_duplicate() {
             "DuplicateResourceException",
             "case {case:?}: expected DuplicateResourceException, got {refused}"
         );
+        // The duplicate is the ASSOCIATION, and the refusal names it on the resource
+        // that already holds it — the one variable part is that resource's identifier,
+        // taken from the request.
+        assert_eq!(
+            message(&refused),
+            format!("BudgetAssociation already exists on resource {resource_id}"),
+            "case {case:?}: expected the duplicate association's own wording, got {refused}"
+        );
 
         // The refusal changed nothing, and another budget still associates.
         associate(&router, case, resource_id, other).await;
@@ -382,14 +392,17 @@ async fn a_resource_identifier_nothing_stored_carries_is_not_found() {
     let portfolio_id = create_portfolio(&router, "nf-portfolio", "acme", &[], "nf-p").await;
     let product_id = create_product(&router, "nf-product", "nf-r").await;
 
-    // Rows: an id of each resource prefix nothing minted, and a well-formed id of a kind
-    // that carries no budget (a provisioned product), so the lookup cannot be reading one
-    // map for another. Each row is driven through all three operations that take "the
-    // resource identifier".
-    let unknown: [(&str, &str); 3] = [
-        ("unminted portfolio id", "port-zzzzzzzzzzzz"),
-        ("unminted product id", "prod-zzzzzzzzzzzz"),
-        ("a provisioned product id", "pp-zzzzzzzzzzzz"),
+    // Rows: an id of each resource prefix nothing minted, a well-formed id of a kind
+    // that carries no budget (a provisioned product), and an id carrying neither
+    // resource prefix, so the lookup cannot be reading one map for another. Each row is
+    // driven through all three operations that take "the resource identifier", and each
+    // carries the KIND its identifier names: a `port-` id is a portfolio and every other
+    // id a product, which is what the refusal reports.
+    let unknown: [(&str, &str, &str); 4] = [
+        ("unminted portfolio id", "port-zzzzzzzzzzzz", "Portfolio"),
+        ("unminted product id", "prod-zzzzzzzzzzzz", "Product"),
+        ("a provisioned product id", "pp-zzzzzzzzzzzz", "Product"),
+        ("an id of neither kind", "no-such-resource", "Product"),
     ];
     let operations: [(&str, Value); 3] = [
         (
@@ -403,7 +416,7 @@ async fn a_resource_identifier_nothing_stored_carries_is_not_found() {
         ("ListBudgetsForResource", json!({})),
     ];
 
-    for (row, resource_id) in unknown {
+    for (row, resource_id, kind) in unknown {
         for (operation, extra) in &operations {
             let mut request = extra.clone();
             request["ResourceId"] = json!(resource_id);
@@ -418,11 +431,11 @@ async fn a_resource_identifier_nothing_stored_carries_is_not_found() {
                 "ResourceNotFoundException",
                 "case {case:?}: expected ResourceNotFoundException, got {refused}"
             );
-            let reported = message(&refused);
-            assert!(
-                reported.contains(resource_id),
-                "case {case:?}: the refusal must name the identifier {resource_id}, got \
-                 {reported:?}"
+            assert_eq!(
+                message(&refused),
+                format!("{kind} {resource_id} not found."),
+                "case {case:?}: the refusal must name the kind the identifier carries and the \
+                 identifier itself, got {refused}"
             );
         }
     }
@@ -605,6 +618,7 @@ async fn disassociating_removes_exactly_that_pair() {
     let router = emulator();
     let kept = "monthly-cloud-spend";
     let dropped = "quarterly-cloud-spend";
+    let unknown = "never-associated-budget";
     let portfolio_id = create_portfolio(&router, "dis-portfolio", "acme", &[], "dis-p").await;
     let product_id = create_product(&router, "dis-product", "dis-r").await;
 
@@ -631,14 +645,38 @@ async fn disassociating_removes_exactly_that_pair() {
             "case {case:?}: only the disassociated pair is removed, got {listed:?}"
         );
 
-        // Removing a pair that is not stored is served and removes nothing more: the
-        // outcome the request asks for already holds.
-        disassociate(&router, case, resource_id, dropped).await;
+        // What this call removes is the PAIR, so a pair the store does not hold is the
+        // modelled not-found: the one just removed and a budget never associated with
+        // this resource are the same refusal, named by the pair it could not find.
+        for (row, budget) in [("already disassociated", dropped), ("never associated", unknown)] {
+            let (status, refused) = call(
+                &router,
+                "DisassociateBudgetFromResource",
+                &json!({"ResourceId": resource_id, "BudgetName": budget}),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?} ({row}): a pair the store does not hold must be refused, got \
+                 {status} with {refused}"
+            );
+            assert_eq!(
+                error_code(&refused),
+                "ResourceNotFoundException",
+                "case {case:?} ({row}): expected ResourceNotFoundException, got {refused}"
+            );
+            assert_eq!(
+                message(&refused),
+                format!("Budget with name {budget} is not associated with resource {resource_id}"),
+                "case {case:?} ({row}): the refusal must name the pair it could not find, got \
+                 {refused}"
+            );
+        }
         let listed = listed_budgets(&router, case, resource_id).await;
         assert_eq!(
             reported_names(case, &listed),
             BTreeSet::from([kept.to_string()]),
-            "case {case:?}: a repeated disassociation changes nothing, got {listed:?}"
+            "case {case:?}: a refused disassociation changes nothing, got {listed:?}"
         );
 
         // The last association removed leaves both readers reporting nothing.

@@ -51,6 +51,35 @@ pub const RESOURCE_TYPE_PORTFOLIO: &str = "Portfolio";
 /// The `ResourceType` naming a product; see [`RESOURCE_TYPE_PORTFOLIO`].
 pub const RESOURCE_TYPE_PRODUCT: &str = "Product";
 
+/// The prefix every portfolio id carries, which is what tells a member that takes
+/// "either a portfolio-id or a product-id" which of the two kinds it was handed.
+pub const PORTFOLIO_ID_PREFIX: &str = "port-";
+
+/// The kind of resource a `ResourceId` identifies, read from the prefix a Service
+/// Catalog id carries: a portfolio id names a portfolio ([`RESOURCE_TYPE_PORTFOLIO`])
+/// and every other id names a product ([`RESOURCE_TYPE_PRODUCT`]).
+///
+/// What a resource-addressing operation needs to say WHICH resource it could not find,
+/// for an id no stored resource of either kind answers to: the id itself is all the
+/// request carries, and its prefix is what names the kind.
+pub fn addressed_resource_kind(resource_id: &str) -> &'static str {
+    if resource_id.starts_with(PORTFOLIO_ID_PREFIX) {
+        RESOURCE_TYPE_PORTFOLIO
+    } else {
+        RESOURCE_TYPE_PRODUCT
+    }
+}
+
+/// The sentence an operation that takes a `ResourceId` of either kind refuses an id
+/// that resolves to no stored resource with: the kind that id identifies, the id, and
+/// nothing else.
+pub fn resource_not_found_message(resource_id: &str) -> String {
+    format!(
+        "{} {resource_id} not found.",
+        addressed_resource_kind(resource_id)
+    )
+}
+
 /// A persisted portfolio — the record every portfolio operation reads and writes.
 ///
 /// Tags are a map rather than a list because the API addresses them by key:
@@ -2002,6 +2031,11 @@ impl ComAmazonawsServicecatalogAws242servicecatalogserviceState {
     /// association the same way and `ListBudgetsForResource` pages over that same
     /// order. Empty for a resource this account does not hold, which is a not-found
     /// for the caller to answer.
+    ///
+    /// A `BudgetDetail` carries the budget's name and nothing else
+    /// (`smithy_query query="shape" shape="BudgetDetail"`), so the stored association
+    /// is the whole of what a read reports: the budget itself is AWS Budgets' record,
+    /// not this service's.
     pub fn resource_budget_details(&self, resource_id: &str) -> Vec<BudgetDetail> {
         self.resource_budget_names(resource_id)
             .into_iter()

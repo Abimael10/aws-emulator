@@ -151,19 +151,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceId` is "the resource identifier" of the portfolio or product whose
         // associations are reported, so the account has to hold such a resource before
         // there is anything to report: an id neither kind answers to is the modelled
-        // not-found, not an empty page.
+        // not-found naming the kind that id identifies, not an empty page.
         let Some(names) = state.resource_budget_names(&input.resource_id) else {
-            return Err(
-                ListBudgetsForResourceErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::not_found_message(
-                            crate::state::KIND_RESOURCE,
-                            &input.resource_id,
-                        )),
-                    },
-                )
-                .into(),
-            );
+            return Err(ListBudgetsForResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(&input.resource_id)),
+                },
+            )
+            .into());
         };
 
         // A page token is this service's own opaque cursor — encoded and decoded by the
@@ -202,10 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one budget-name order the cursor below walks.
         let mut budgets = Vec::new();
         let mut next_page_token = None;
-        for name in names
-            .iter()
-            .filter(|name| resume_at.as_deref().is_none_or(|resume| name.as_str() >= resume))
-        {
+        for name in names.iter().filter(|name| {
+            resume_at
+                .as_deref()
+                .is_none_or(|resume| name.as_str() >= resume)
+        }) {
             if budgets.len() == page_size {
                 // More remain: hand back a cursor that resumes at this budget.
                 next_page_token = Some(crate::state::encode_page_cursor(name));
