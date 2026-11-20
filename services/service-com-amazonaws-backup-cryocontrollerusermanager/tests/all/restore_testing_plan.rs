@@ -33,13 +33,14 @@ use crate::vault_and_backup_job::{call, error_code, router, string_at, ACCOUNT, 
 
 /// The sentence this service states for "the restore testing plan asked about is
 /// not one this account holds" — fixed text, naming no part of the request.
-const NOT_FOUND: &str = "Cannot find restore testing plan";
+const NOT_FOUND: &str = "Restore testing plan does not exist.";
 
 /// The sentence this service states for a create naming a plan the account
-/// already holds — fixed text, naming no part of the request, as this service
-/// states the same condition for a vault, a backup plan, one of its selections
-/// and a tiering configuration.
-const ALREADY_EXISTS: &str = "Restore testing plan with the same name already exists";
+/// already holds: the name the request carried and the account the call was made
+/// in.
+fn already_exists(name: &str) -> String {
+    format!("Restore testing plan [{name}] already exists in account [{ACCOUNT}].")
+}
 
 /// The windows a stored plan carries when its create states neither:
 /// "Defaults to 24 hours" (model doc for `StartWindowHours`) and "If not
@@ -326,7 +327,11 @@ async fn concurrent_creates_of_one_name_have_exactly_one_winner() {
                     error_code(answer).as_str(),
                     string_at(answer, "Message").as_str()
                 ),
-                (400, "AlreadyExistsException", ALREADY_EXISTS),
+                (
+                    400,
+                    "AlreadyExistsException",
+                    already_exists("plan_contended").as_str()
+                ),
                 "case {racers} racers: expected every loser refused as already existing, got \
                  {status} {answer:?}"
             );

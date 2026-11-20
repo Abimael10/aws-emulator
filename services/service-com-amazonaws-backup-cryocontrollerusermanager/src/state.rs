@@ -1308,18 +1308,49 @@ pub const ERROR_CODE_RESTORE_JOB_NOT_FOUND: &str = "ERROR_2801";
 /// this account holds" — fixed, and worded as the not-found conditions above
 /// are: it names no part of the request, so the name asked about does not appear
 /// in it. It answers every call that addresses a restore testing plan by name.
-/// No `Code`: this condition has no observed token.
-pub const MESSAGE_RESTORE_TESTING_PLAN_NOT_FOUND: &str = "Cannot find restore testing plan";
+/// Its token is [`ERROR_CODE_RESTORE_TESTING_PLAN_NOT_FOUND`].
+pub const MESSAGE_RESTORE_TESTING_PLAN_NOT_FOUND: &str = "Restore testing plan does not exist.";
+
+/// `Code` for "the restore testing plan asked about is not one this account
+/// holds" — one token for the condition, stated the same way by every call that
+/// addresses a restore testing plan by name, and distinct from the token the
+/// SELECTION's own not-found condition states
+/// ([`ERROR_CODE_RESTORE_TESTING_SELECTION_NOT_FOUND`]), so a client can tell
+/// "no such plan" from "no such selection of this plan".
+pub const ERROR_CODE_RESTORE_TESTING_PLAN_NOT_FOUND: &str = "ERROR_RT_5000";
+
+/// The FIXED text AWS states for "a restore testing plan of this name already
+/// exists", up to and between its two variable parts: the name the create asked
+/// for and the account it was made in. Composed by
+/// [`restore_testing_plan_already_exists_message`], the one place the sentence
+/// is built, so the collision can be attributed to a name and an account rather
+/// than only to a class. Its token is
+/// [`ERROR_CODE_RESTORE_TESTING_PLAN_ALREADY_EXISTS`].
+pub const MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS_PREFIX: &str = "Restore testing plan [";
+/// The text between the plan name and the account id in that sentence.
+pub const MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS_IN_ACCOUNT: &str =
+    "] already exists in account [";
+/// The text that closes that sentence, after the account id.
+pub const MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS_SUFFIX: &str = "].";
+
+/// `Code` for "a restore testing plan of this name already exists" — the create
+/// conflict's own token, distinct from the one a duplicate SELECTION of a plan
+/// states ([`ERROR_CODE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS`]), which
+/// shares its modelled class and status.
+pub const ERROR_CODE_RESTORE_TESTING_PLAN_ALREADY_EXISTS: &str = "ERROR_RT_3000";
 
 /// The sentence AWS states for "a restore testing plan of this name already
-/// exists", worded as this service words the one RECORDED instance of that
-/// condition — a backup vault's ([`MESSAGE_VAULT_ALREADY_EXISTS`]), which every
-/// other create of a named resource in this service follows (a backup plan's,
-/// one of its selections', a tiering configuration's): fixed text that names no
-/// part of the request, so the name the create asked for does not appear in it.
-/// No `Code`: this condition has no observed token.
-pub const MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS: &str =
-    "Restore testing plan with the same name already exists";
+/// exists": the fixed text above around the name the request carried and the
+/// account this emulator presents, as the account-naming refusals of this
+/// service state it ([`framework_not_found_message`]).
+pub fn restore_testing_plan_already_exists_message(name: &str) -> String {
+    format!(
+        "{MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS_PREFIX}{name}\
+         {MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS_IN_ACCOUNT}{}\
+         {MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS_SUFFIX}",
+        ::engine::emulator_account_id()
+    )
+}
 
 /// The sentence AWS states for "the tiering configuration asked about is not
 /// one this account holds" — fixed, and worded as the conditions above are: it
@@ -1944,22 +1975,25 @@ pub fn restore_job_not_found() -> ResourceNotFoundException {
 
 /// The modelled refusal for a `RestoreTestingPlanName` this account holds no
 /// restore testing plan under — see
-/// [`MESSAGE_RESTORE_TESTING_PLAN_NOT_FOUND`].
+/// [`MESSAGE_RESTORE_TESTING_PLAN_NOT_FOUND`], with the condition's own token.
 pub fn restore_testing_plan_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
+        code: Some(ERROR_CODE_RESTORE_TESTING_PLAN_NOT_FOUND.to_string()),
         message: Some(MESSAGE_RESTORE_TESTING_PLAN_NOT_FOUND.to_string()),
         ..Default::default()
     }
 }
 
 /// The modelled refusal for a create naming a restore testing plan that already
-/// exists.
+/// exists, with the condition's own token and the sentence built from the name
+/// the create asked for.
 ///
 /// `Arn` and `CreatorRequestId` are left UNSET for the reason given on
 /// [`vault_already_exists`].
-pub fn restore_testing_plan_already_exists() -> AlreadyExistsException {
+pub fn restore_testing_plan_already_exists(name: &str) -> AlreadyExistsException {
     AlreadyExistsException {
-        message: Some(MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS.to_string()),
+        code: Some(ERROR_CODE_RESTORE_TESTING_PLAN_ALREADY_EXISTS.to_string()),
+        message: Some(restore_testing_plan_already_exists_message(name)),
         ..Default::default()
     }
 }

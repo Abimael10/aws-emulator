@@ -77,21 +77,59 @@ pub const MAX_RESTORE_TESTING_SELECTION_NAME_LENGTH: usize = 50;
 /// one the named plan holds" — fixed, and worded as this service words the same
 /// condition for the plan that holds it
 /// ([`super::MESSAGE_RESTORE_TESTING_PLAN_NOT_FOUND`]): it names no part of the
-/// request, so the name asked about does not appear in it. No `Code`: this
-/// condition has no observed token.
+/// request, so the name asked about does not appear in it. Its token is
+/// [`ERROR_CODE_RESTORE_TESTING_SELECTION_NOT_FOUND`].
 pub const MESSAGE_RESTORE_TESTING_SELECTION_NOT_FOUND: &str =
-    "Cannot find restore testing selection";
+    "Restore testing selection does not exist.";
+
+/// `Code` for "the restore testing selection asked about is not one the named
+/// plan holds" — one token for the condition, stated the same way by every call
+/// that addresses a selection by name, and distinct from the token the PLAN's
+/// own not-found condition states
+/// ([`super::ERROR_CODE_RESTORE_TESTING_PLAN_NOT_FOUND`]), so a client that
+/// branches on it tells "no such selection of this plan" from "no such plan".
+pub const ERROR_CODE_RESTORE_TESTING_SELECTION_NOT_FOUND: &str = "ERROR_RT_5001";
+
+/// The FIXED text AWS states for "a restore testing selection of this name
+/// already exists in this plan", up to and between its three variable parts: the
+/// plan the create addressed, the account it was made in and the selection name
+/// it asked for. Composed by
+/// [`restore_testing_selection_already_exists_message`], the one place the
+/// sentence is built — so the collision can be attributed to a plan, an account
+/// and a name rather than only to a class.
+pub const MESSAGE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS_PREFIX: &str = "Restore testing plan [";
+/// The text between the plan name and the account id in that sentence.
+pub const MESSAGE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS_IN_ACCOUNT: &str = "] in account [";
+/// The text between the account id and the selection name in that sentence.
+pub const MESSAGE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS_CONTAINS: &str =
+    "] already contains selection [";
+/// The text that closes that sentence, after the selection name.
+pub const MESSAGE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS_SUFFIX: &str = "].";
+
+/// `Code` for "a restore testing selection of this name already exists in this
+/// plan" — the create conflict's own token, as the vault's create conflict has
+/// its own ([`super::ERROR_CODE_VAULT_ALREADY_EXISTS`]). A client branching on
+/// it tells a duplicate SELECTION from a duplicate PLAN, which share the
+/// modelled class and status.
+pub const ERROR_CODE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS: &str = "ERROR_RT_3001";
 
 /// The sentence AWS states for "a restore testing selection of this name already
-/// exists in this plan", worded as this service words that condition for every
-/// create of a named resource — a backup vault's
-/// ([`super::MESSAGE_VAULT_ALREADY_EXISTS`]), a backup plan's, one of its
-/// selections', a restore testing plan's
-/// ([`super::MESSAGE_RESTORE_TESTING_PLAN_ALREADY_EXISTS`]): fixed text that
-/// names no part of the request. No `Code`: this condition has no observed
-/// token.
-pub const MESSAGE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS: &str =
-    "Restore testing selection with the same name already exists";
+/// exists in this plan": the fixed text above around its three variable parts —
+/// the plan name and the selection name the request carried, and the account
+/// this emulator presents ([`engine::emulator_account_id`]), as the account-naming
+/// refusals of this service state it ([`super::framework_not_found_message`]).
+pub fn restore_testing_selection_already_exists_message(
+    plan_name: &str,
+    selection_name: &str,
+) -> String {
+    format!(
+        "{MESSAGE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS_PREFIX}{plan_name}\
+         {MESSAGE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS_IN_ACCOUNT}{}\
+         {MESSAGE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS_CONTAINS}{selection_name}\
+         {MESSAGE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS_SUFFIX}",
+        ::engine::emulator_account_id()
+    )
+}
 
 /// A restore testing selection: what `CreateRestoreTestingSelection` stores and
 /// `GetRestoreTestingSelection` reports.
@@ -155,19 +193,28 @@ impl RestoreTestingSelectionRecord {
 /// selection of this plan" from "no such plan".
 pub fn restore_testing_selection_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
+        code: Some(ERROR_CODE_RESTORE_TESTING_SELECTION_NOT_FOUND.to_string()),
         message: Some(MESSAGE_RESTORE_TESTING_SELECTION_NOT_FOUND.to_string()),
         ..Default::default()
     }
 }
 
 /// The modelled refusal for a create naming a restore testing selection the
-/// named plan already holds.
+/// named plan already holds, with the condition's own token and the sentence
+/// built from the plan and selection the create named.
 ///
 /// `Arn` and `CreatorRequestId` are left UNSET for the reason given on
 /// [`super::vault_already_exists`].
-pub fn restore_testing_selection_already_exists() -> AlreadyExistsException {
+pub fn restore_testing_selection_already_exists(
+    plan_name: &str,
+    selection_name: &str,
+) -> AlreadyExistsException {
     AlreadyExistsException {
-        message: Some(MESSAGE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS.to_string()),
+        code: Some(ERROR_CODE_RESTORE_TESTING_SELECTION_ALREADY_EXISTS.to_string()),
+        message: Some(restore_testing_selection_already_exists_message(
+            plan_name,
+            selection_name,
+        )),
         ..Default::default()
     }
 }
@@ -367,6 +414,31 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         self.restore_testing_selections
             .get(&(plan_name.to_string(), selection_name.to_string()))
             .ok_or_else(restore_testing_selection_not_found)
+    }
+
+    /// Take the restore testing selection a (`RestoreTestingPlanName`,
+    /// `RestoreTestingSelectionName`) pair addresses OUT of the store, or answer
+    /// the modelled refusal for a plan this account does not hold.
+    ///
+    /// The ONE removal step, so the resource a delete reports gone is gone from
+    /// the store every later read and mutation of that pair resolves against:
+    /// after it, the pair answers the selection's not-found condition
+    /// ([`restore_testing_selection_not_found`]) and the name is free for a
+    /// create again. The plan is resolved FIRST, for the same reason
+    /// [`Self::stored_restore_testing_selection`] resolves it first.
+    ///
+    /// Once the plan is resolved the removal is IDEMPOTENT: `None` says the
+    /// named plan held no such selection, which is the state the caller asked
+    /// for, so a repeat of the call is not a different answer.
+    pub fn remove_restore_testing_selection(
+        &mut self,
+        plan_name: &str,
+        selection_name: &str,
+    ) -> Result<Option<RestoreTestingSelectionRecord>, ResourceNotFoundException> {
+        self.stored_restore_testing_plan(plan_name)?;
+        Ok(self
+            .restore_testing_selections
+            .remove(&restore_testing_selection_key(plan_name, selection_name)))
     }
 
     /// Every selection the named plan holds, in name order — the one traversal

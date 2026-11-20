@@ -212,16 +212,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The name is the resource's identity, and the store is keyed by it: a
-        // create naming one the account already holds is refused, and the
-        // refusal discloses nothing about the stored plan. Decided under the
-        // same lock the insert below takes, so concurrent creates of one name
-        // have exactly one winner.
+        // create naming one the account already holds is refused, named by the
+        // name the REQUEST carried and the account the call was made in, so the
+        // collision can be attributed — and the refusal discloses nothing of the
+        // stored plan itself. Decided under the same lock the insert below takes,
+        // so concurrent creates of one name have exactly one winner.
         if store
             .restore_testing_plans
             .contains_key(&plan.restore_testing_plan_name)
         {
             return Err(CreateRestoreTestingPlanErrorModeled::AlreadyExistsException(
-                crate::state::restore_testing_plan_already_exists(),
+                crate::state::restore_testing_plan_already_exists(
+                    &plan.restore_testing_plan_name,
+                ),
             )
             .into());
         }

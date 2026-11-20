@@ -7,10 +7,11 @@
 //! SAME record `GetRestoreTestingSelection` reports.
 //!
 //! "This request can be sent after CreateRestoreTestingPlan request returns
-//! successfully" (the model doc below), so the plan is resolved first and a name
-//! this account holds no plan under is refused the plan's own not-found
-//! condition ([`crate::state::restore_testing_plan_not_found`]) with nothing
-//! stored.
+//! successfully" (the model doc below), so the plan is resolved FIRST — before
+//! the body is read — and a name this account holds no plan under is refused the
+//! plan's own not-found condition
+//! ([`crate::state::restore_testing_plan_not_found`]) with nothing stored,
+//! whatever the body carries.
 //!
 //! A selection is addressed by NAME within its plan, and that name "cannot be
 //! changed after creation" (model doc for `RestoreTestingSelectionName`), so the
@@ -188,10 +189,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let selection = input.restore_testing_selection;
+        let plan_name = input.restore_testing_plan_name;
+        let mut store = state.lock();
+
+        // The plan this selection would belong to, resolved BEFORE the body is
+        // read: "this request can be sent after CreateRestoreTestingPlan request
+        // returns successfully" (the model's doc), so a name holding no plan has
+        // nothing to store a selection in whatever the body says, and the
+        // refusal tells the caller which of the two it is — the resource it
+        // addressed is absent, not a member of its request. Its ARN is what this
+        // answer reports, so the selection and the plan can never report
+        // different plan identifiers.
+        let plan_arn = store
+            .stored_restore_testing_plan(&plan_name)
+            .map_err(CreateRestoreTestingSelectionErrorModeled::ResourceNotFoundException)?
+            .arn
+            .clone();
 
         // The documented rules on a selection body are `crate::state`'s, shared
         // with every other operation that stores one, so the two cannot drift.
-        // Applied before the store is reached: a body this service cannot store
+        // Applied before the store is written: a body this service cannot store
         // is refused whatever the account already holds.
         if let Some(refusal) = crate::state::rejected_restore_testing_selection_body(
             &selection.restore_testing_selection_name,
@@ -219,20 +236,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let plan_name = input.restore_testing_plan_name;
-        let mut store = state.lock();
-
-        // The plan this selection would belong to: "this request can be sent
-        // after CreateRestoreTestingPlan request returns successfully" (the
-        // model's doc), so a name holding no plan has nothing to store a
-        // selection in. Its ARN is what this answer reports, so the selection
-        // and the plan can never report different plan identifiers.
-        let plan_arn = store
-            .stored_restore_testing_plan(&plan_name)
-            .map_err(CreateRestoreTestingSelectionErrorModeled::ResourceNotFoundException)?
-            .arn
-            .clone();
-
         // The replay first: a retry carrying the token of the create that
         // already stored a selection takes no second action, so it is resolved
         // before the name check that such a retry would otherwise trip.
@@ -246,9 +249,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The name is the resource's identity within its plan, and the store is
         // keyed by the pair: a create naming one the plan already holds is
-        // refused, and the refusal discloses nothing about the stored selection.
-        // Decided under the same lock the insert below takes, so concurrent
-        // creates of one name have exactly one winner.
+        // refused, named by the pair the REQUEST carried and the account the
+        // call was made in, so the collision can be attributed — and the refusal
+        // discloses nothing of the stored selection itself. Decided under the
+        // same lock the insert below takes, so concurrent creates of one name
+        // have exactly one winner.
         let key = crate::state::restore_testing_selection_key(
             &plan_name,
             &selection.restore_testing_selection_name,
@@ -256,7 +261,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.restore_testing_selections.contains_key(&key) {
             return Err(
                 CreateRestoreTestingSelectionErrorModeled::AlreadyExistsException(
-                    crate::state::restore_testing_selection_already_exists(),
+                    crate::state::restore_testing_selection_already_exists(
+                        &plan_name,
+                        &selection.restore_testing_selection_name,
+                    ),
                 )
                 .into(),
             );

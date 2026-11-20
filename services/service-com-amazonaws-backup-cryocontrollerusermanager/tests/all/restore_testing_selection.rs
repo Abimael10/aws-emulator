@@ -39,17 +39,19 @@ use crate::vault_and_backup_job::{call, error_code, router, string_at, ACCOUNT, 
 
 /// The sentence this service states for "the restore testing plan asked about is
 /// not one this account holds" — fixed text, naming no part of the request.
-const PLAN_NOT_FOUND: &str = "Cannot find restore testing plan";
+const PLAN_NOT_FOUND: &str = "Restore testing plan does not exist.";
 
 /// The sentence this service states for "the restore testing selection asked
 /// about is not one the named plan holds" — fixed text, naming no part of the
 /// request, as the plan's own not-found sentence is.
-const SELECTION_NOT_FOUND: &str = "Cannot find restore testing selection";
+const SELECTION_NOT_FOUND: &str = "Restore testing selection does not exist.";
 
 /// The sentence this service states for a create naming a selection the plan
-/// already holds — fixed text, as this service states the same condition for a
-/// vault, a backup plan, one of its selections and a restore testing plan.
-const SELECTION_ALREADY_EXISTS: &str = "Restore testing selection with the same name already exists";
+/// already holds: the plan and the selection the request named, and the account
+/// the call was made in.
+fn selection_already_exists(plan: &str, selection: &str) -> String {
+    format!("Restore testing plan [{plan}] in account [{ACCOUNT}] already contains selection [{selection}].")
+}
 
 /// The sentence this service states for a create whose selection selects no
 /// resource at all.
@@ -73,7 +75,10 @@ const MAX_NAME_LENGTH: usize = 50;
 
 /// `PUT /restore-testing/plans/{RestoreTestingPlanName}/selections`, as the
 /// model binds the create.
-async fn create_selection(
+///
+/// Shared with the sibling suite that drives this surface's refusals, so there
+/// is ONE spelling of each selection route in this test crate.
+pub(crate) async fn create_selection(
     router: &MultiServiceRouter,
     plan: &str,
     body: &Value,
@@ -88,7 +93,7 @@ async fn create_selection(
 }
 
 /// `GET /restore-testing/plans/{RestoreTestingPlanName}/selections/{RestoreTestingSelectionName}`.
-async fn get_selection(router: &MultiServiceRouter, plan: &str, name: &str) -> (u16, Value) {
+pub(crate) async fn get_selection(router: &MultiServiceRouter, plan: &str, name: &str) -> (u16, Value) {
     call(
         router,
         "GET",
@@ -99,13 +104,13 @@ async fn get_selection(router: &MultiServiceRouter, plan: &str, name: &str) -> (
 }
 
 /// A create body carrying `selection` as its `RestoreTestingSelection`.
-fn create_body(selection: Value) -> Value {
+pub(crate) fn create_body(selection: Value) -> Value {
     json!({ "RestoreTestingSelection": selection })
 }
 
 /// The selection body a read reports (`RestoreTestingSelection`), or
 /// `Value::Null`.
-fn read_selection(body: &Value) -> Value {
+pub(crate) fn read_selection(body: &Value) -> Value {
     body.get("RestoreTestingSelection")
         .cloned()
         .unwrap_or(Value::Null)
@@ -119,7 +124,7 @@ fn int_or(body: &Value, member: &str, default: i64) -> i64 {
 
 /// The role a restore test runs as, in the form the model documents ("for
 /// example: `arn:aws:iam::123456789012:role/S3Access`").
-fn role_arn(name: &str) -> String {
+pub(crate) fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/{name}")
 }
 
@@ -132,7 +137,7 @@ fn protected_resource_arn(index: usize) -> String {
 /// A name of `length` characters from the alphabet the model documents for a
 /// `RestoreTestingSelectionName` ("only alphanumeric characters and
 /// underscores"), so the length bound is exercised across that whole alphabet.
-fn name_of_length(length: usize) -> String {
+pub(crate) fn name_of_length(length: usize) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
     (0..length)
         .map(|i| char::from(ALPHABET[(i * 7 + length) % ALPHABET.len()]))
@@ -141,7 +146,7 @@ fn name_of_length(length: usize) -> String {
 
 /// The smallest selection body the documented rules admit: a name, a role, a
 /// protected resource type and a wildcard naming the resources it restores.
-fn minimal_selection(name: &str) -> Value {
+pub(crate) fn minimal_selection(name: &str) -> Value {
     json!({
         "RestoreTestingSelectionName": name,
         "IamRoleArn": role_arn("AWSBackupRestoreTesting"),
@@ -152,7 +157,7 @@ fn minimal_selection(name: &str) -> Value {
 
 /// The smallest plan body the model admits, under which the selections below are
 /// stored.
-fn minimal_plan(name: &str) -> Value {
+pub(crate) fn minimal_plan(name: &str) -> Value {
     json!({
         "RestoreTestingPlan": {
             "RestoreTestingPlanName": name,
@@ -167,7 +172,7 @@ fn minimal_plan(name: &str) -> Value {
 }
 
 /// Store a plan and return the ARN the service reports for it.
-async fn stored_plan(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn stored_plan(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = call(
         router,
         "PUT",
@@ -427,7 +432,11 @@ async fn a_selection_name_identifies_one_selection_of_one_plan() {
             error_code(&refused).as_str(),
             string_at(&refused, "Message").as_str()
         ),
-        (400, "AlreadyExistsException", SELECTION_ALREADY_EXISTS),
+        (
+            400,
+            "AlreadyExistsException",
+            selection_already_exists("plan_one", "shared").as_str()
+        ),
         "a second create of one (plan, name) pair is refused, got {status} {refused:?}"
     );
 
