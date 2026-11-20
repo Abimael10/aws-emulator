@@ -9,8 +9,9 @@
 //! running only once the tasks it declared as dependencies have finished — and the status
 //! the run finishes in is the one that execution produced: the modelled `SUCCESS` with no
 //! `ErrorMessage` when every task instance succeeded ("This value is null if the run
-//! completed successfully"), and the modelled `FAILED` with the reason when the
-//! definition's graph is one no run of it can execute.
+//! completed successfully"), the modelled `FAILED` with the reason when the definition's
+//! graph is one no run of it can execute, and the modelled `FAILED` with the task named
+//! when a task's own declared program answered failure (the last suite).
 //!
 //! Every test drives the real wire path through the same router the emulator boots, with
 //! the Amazon S3 service mounted beside this one on ONE shared engine, because a
@@ -34,7 +35,8 @@ use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::workflow_d
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
     RUN_ADMITTED_AFTER, RUN_DEQUEUED_AFTER, RUN_STATUS_FAILED, RUN_STATUS_STOPPED,
     RUN_STATUS_SUCCESS, RUN_STOPPED_AFTER, TASK_INSTANCE_STATUS_CANCELLED,
-    TASK_INSTANCE_STATUS_RUNNING, TASK_INSTANCE_STATUS_SCHEDULED, TASK_LEVEL_RUNS_FOR,
+    TASK_INSTANCE_STATUS_FAILED, TASK_INSTANCE_STATUS_RUNNING, TASK_INSTANCE_STATUS_SCHEDULED,
+    TASK_INSTANCE_STATUS_UPSTREAM_FAILED, TASK_LEVEL_RUNS_FOR,
 };
 
 /// The modelled length of the `GenericString` a run's `ErrorMessage` targets
@@ -45,6 +47,13 @@ const MAX_ERROR_MESSAGE_CHARS: usize = 255;
 /// The `TaskInstanceStatus` a task that ran to completion reports
 /// (`smithy_query(query="shape", shape="TaskInstanceStatus")`).
 const TASK_SUCCESS: &str = "SUCCESS";
+
+/// The `TaskInstanceStatus` a task whose own work answered FAILURE reports, and the one a
+/// task that never ran because a task it waits for failed reports — both from the same
+/// value set as [`TASK_SUCCESS`], read off this service's own constants so the suite and
+/// the emulator cannot spell them differently.
+const TASK_FAILED: &str = TASK_INSTANCE_STATUS_FAILED;
+const TASK_UPSTREAM_FAILED: &str = TASK_INSTANCE_STATUS_UPSTREAM_FAILED;
 
 /// How closely two timestamps must agree to be the same instant on the wire, in seconds.
 const TIMESTAMP_TOLERANCE: f64 = 0.002;
@@ -764,4 +773,347 @@ async fn stopping_a_run_ends_the_tasks_it_was_executing() {
         "case stop: a run the caller stopped finishes in the modelled stopped state, got {:?}",
         read["RunDetail"]["RunState"]
     );
+}
+
+// === The OUTCOME each task declares, and the outcome the run therefore reports ===
+//
+// A task's declaration states the work it performs, and a declared command line is a
+// shell program: a program the workspace's one bounded POSIX/bash session performs to a
+// non-zero status is work that did not succeed. So such a task's instance ends `FAILED`
+// with a reason, the tasks waiting on it are never executed (`UPSTREAM_FAILED`), and the
+// run reports the modelled `FAILED` with a non-null `ErrorMessage` naming the task it
+// failed on — "The error message if the workflow run failed. This value is null if the run
+// completed successfully" (`smithy_query(query="shape", shape="WorkflowRunDetail")`).
+//
+// A declaration whose program that session does NOT perform states no outcome, so the task
+// it declares is not failed on that ground: what an operator does to the resources it
+// names is the worker's work, not this emulator's.
+
+/// What a row's run must report for one task instance.
+struct ExpectedOutcome {
+    /// `TaskId`, which is also the `TaskInstanceId`.
+    task_id: &'static str,
+    /// The `TaskInstanceStatus` the instance must report.
+    status: &'static str,
+}
+
+/// One row of the outcome table: a definition, the state its run must settle in, the task
+/// its `ErrorMessage` must name (for a run that fails), and the instances it must hold.
+struct OutcomeRow {
+    case: &'static str,
+    definition: &'static str,
+    expected_state: &'static str,
+    names_in_error: Option<&'static str>,
+    expected: &'static [ExpectedOutcome],
+}
+
+/// The table. Rows differ along the FORM the declaration states its outcome in (the
+/// utility that answers failure, an explicit non-zero exit, a non-zero exit after a wait,
+/// a command list whose last command decides, a question about a file that is not there),
+/// the GRAPH position of the failing task (the only task, one of two at the same level,
+/// upstream of a waiting task), and the two controls: a program that answers success, and
+/// a command this session has no program for, which states no outcome at all.
+const OUTCOME_ROWS: &[OutcomeRow] = &[
+    OutcomeRow {
+        case: "the only task, answering failure through the utility for it",
+        definition: "tasks:\n  only_task:\n    operator: BashOperator\n    bash_command: false\n",
+        expected_state: RUN_STATUS_FAILED,
+        names_in_error: Some("only_task"),
+        expected: &[ExpectedOutcome {
+            task_id: "only_task",
+            status: TASK_FAILED,
+        }],
+    },
+    OutcomeRow {
+        // The Apache Airflow YAML shape: the DAG's own id, its tasks one mapping in.
+        case: "the only task, exiting non-zero explicitly",
+        definition: "failing_dag:\n  schedule: null\n  tasks:\n    only_task:\n      operator: \
+                     airflow.providers.standard.operators.bash.BashOperator\n      \
+                     bash_command: \"exit 1\"\n",
+        expected_state: RUN_STATUS_FAILED,
+        names_in_error: Some("only_task"),
+        expected: &[ExpectedOutcome {
+            task_id: "only_task",
+            status: TASK_FAILED,
+        }],
+    },
+    OutcomeRow {
+        case: "a non-zero status other than one, reached after a declared wait",
+        definition: "tasks:\n  - id: late_failure\n    bash_command: \"sleep 0.2 && exit 3\"\n",
+        expected_state: RUN_STATUS_FAILED,
+        names_in_error: Some("late_failure"),
+        expected: &[ExpectedOutcome {
+            task_id: "late_failure",
+            status: TASK_FAILED,
+        }],
+    },
+    OutcomeRow {
+        // The status of a program is the status of its LAST command, so a list whose
+        // last command answers failure is a program that answered failure.
+        case: "a command list whose last command answers failure",
+        definition: "tasks:\n  - id: listed\n    bash_command: \"echo started; false\"\n",
+        expected_state: RUN_STATUS_FAILED,
+        names_in_error: Some("listed"),
+        expected: &[ExpectedOutcome {
+            task_id: "listed",
+            status: TASK_FAILED,
+        }],
+    },
+    OutcomeRow {
+        // A question the session can answer about its own tree: the file is not there, so
+        // the utility answers failure.
+        case: "a question about a file the task's own tree does not hold",
+        definition: "tasks:\n  - id: asks\n    bash_command: \"test -f absent.txt\"\n",
+        expected_state: RUN_STATUS_FAILED,
+        names_in_error: Some("asks"),
+        expected: &[ExpectedOutcome {
+            task_id: "asks",
+            status: TASK_FAILED,
+        }],
+    },
+    OutcomeRow {
+        // One of two tasks at the SAME level: the level still ends, and the task beside
+        // the failing one keeps the outcome its own program answered.
+        case: "one of two tasks at the same level",
+        definition: "tasks:\n  - id: fine\n    bash_command: \"echo ok\"\n  - id: broken\n    \
+                     bash_command: \"exit 1\"\n",
+        expected_state: RUN_STATUS_FAILED,
+        names_in_error: Some("broken"),
+        expected: &[
+            ExpectedOutcome {
+                task_id: "fine",
+                status: TASK_SUCCESS,
+            },
+            ExpectedOutcome {
+                task_id: "broken",
+                status: TASK_FAILED,
+            },
+        ],
+    },
+    OutcomeRow {
+        // A failing task upstream of two waiting ones: the work they waited for never
+        // finished, so neither of them is executed at all.
+        case: "a failing task upstream of the tasks that wait for it",
+        definition: "tasks:\n  - id: extract\n    bash_command: \"exit 1\"\n  - id: transform\n    \
+                     dependencies: [extract]\n    bash_command: \"echo ok\"\n  - id: load\n    \
+                     dependencies: [transform]\n",
+        expected_state: RUN_STATUS_FAILED,
+        names_in_error: Some("extract"),
+        expected: &[
+            ExpectedOutcome {
+                task_id: "extract",
+                status: TASK_FAILED,
+            },
+            ExpectedOutcome {
+                task_id: "transform",
+                status: TASK_UPSTREAM_FAILED,
+            },
+            ExpectedOutcome {
+                task_id: "load",
+                status: TASK_UPSTREAM_FAILED,
+            },
+        ],
+    },
+    OutcomeRow {
+        case: "a program that answers success",
+        definition: "tasks:\n  - id: succeeds\n    bash_command: \"echo done\"\n",
+        expected_state: RUN_STATUS_SUCCESS,
+        names_in_error: None,
+        expected: &[ExpectedOutcome {
+            task_id: "succeeds",
+            status: TASK_SUCCESS,
+        }],
+    },
+    OutcomeRow {
+        // What the operator DOES to the resources it names is the worker's work, which
+        // this emulator does not perform: such a declaration states no outcome, so the
+        // task is not failed on that ground.
+        case: "a command this session has no program for, which states no outcome",
+        definition: "tasks:\n  - id: operates\n    operator: BashOperator\n    \
+                     bash_command: \"aws s3 cp s3://bucket/key ./local\"\n",
+        expected_state: RUN_STATUS_SUCCESS,
+        names_in_error: None,
+        expected: &[ExpectedOutcome {
+            task_id: "operates",
+            status: TASK_SUCCESS,
+        }],
+    },
+];
+
+#[tokio::test]
+async fn a_task_whose_declared_program_cannot_succeed_fails_the_run_it_belongs_to() {
+    let router = definition_router();
+    create_bucket(&router).await;
+
+    // Every run is started FIRST and polled afterwards, so the rows' executions overlap
+    // on the one clock they all run on rather than being waited for one after another.
+    let mut started = Vec::with_capacity(OUTCOME_ROWS.len());
+    for (index, row) in OUTCOME_ROWS.iter().enumerate() {
+        let key = format!("dags/outcome-declared-{index}.yaml");
+        stage(&router, &key, row.definition.as_bytes()).await;
+        let arn = create_workflow(&router, &format!("declaredOutcome{index}"), &key).await;
+        let (status, run) = call(&router, "StartWorkflowRun", json!({"WorkflowArn": arn})).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected StartWorkflowRun to succeed, got {status} {run:?}",
+            row.case
+        );
+        let run_id = run["RunId"]
+            .as_str()
+            .expect("a started run has a RunId")
+            .to_string();
+        started.push((row, arn, run_id));
+    }
+
+    for (row, arn, run_id) in started {
+        let case = row.case;
+        let report = run_to_completion(&router, &arn, &run_id, case).await;
+        let detail = &report["RunDetail"];
+
+        assert_eq!(
+            detail["RunState"].as_str(),
+            Some(row.expected_state),
+            "case {case:?}: expected RunState {:?}, got {:?}",
+            row.expected_state,
+            detail["RunState"]
+        );
+        // A finished run carries its window whichever outcome it finished with.
+        assert!(
+            crate::workflow_lifecycle::is_date_time(&detail["CompletedOn"])
+                && detail["Duration"].as_i64().is_some(),
+            "case {case:?}: a finished run carries CompletedOn and Duration, got {:?} and {:?}",
+            detail["CompletedOn"],
+            detail["Duration"]
+        );
+        match row.names_in_error {
+            None => assert!(
+                detail["ErrorMessage"].is_null(),
+                "case {case:?}: a run that completed successfully reports no ErrorMessage, \
+                 got {:?}",
+                detail["ErrorMessage"]
+            ),
+            Some(task_id) => {
+                let reported = detail["ErrorMessage"].as_str().unwrap_or_default();
+                assert!(
+                    reported.contains(task_id),
+                    "case {case:?}: the reason the run failed must name {task_id:?}, got \
+                     {reported:?}"
+                );
+                assert!(
+                    (1..=MAX_ERROR_MESSAGE_CHARS).contains(&reported.chars().count()),
+                    "case {case:?}: the reported reason must fit the modelled \
+                     1..{MAX_ERROR_MESSAGE_CHARS} characters, got {} in {reported:?}",
+                    reported.chars().count()
+                );
+            }
+        }
+
+        // The instances the run reports are exactly the tasks the definition declared,
+        // whatever each of them ended as.
+        let mut expected_ids: Vec<&str> = row.expected.iter().map(|task| task.task_id).collect();
+        expected_ids.sort_unstable();
+        let reported_ids: Vec<&str> = detail["TaskInstances"]
+            .as_array()
+            .map(|entries| entries.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            reported_ids, expected_ids,
+            "case {case:?}: expected the run to hold task instances {expected_ids:?}, got {:?}",
+            detail["TaskInstances"]
+        );
+
+        for task in row.expected {
+            let read = read_task_instance(&router, &arn, &run_id, task.task_id, case).await;
+            assert_eq!(
+                read["Status"].as_str(),
+                Some(task.status),
+                "case {case:?}: expected task {:?} to report {:?}, got {:?}",
+                task.task_id,
+                task.status,
+                read["Status"]
+            );
+            // A task whose own work answered failure reports a reason; one that never ran
+            // reports neither a reason nor a window, because no execution of it happened.
+            match task.status {
+                TASK_FAILED => {
+                    assert!(
+                        read["ErrorMessage"].as_str().is_some_and(|reason| {
+                            !reason.is_empty() && reason.chars().count() <= MAX_ERROR_MESSAGE_CHARS
+                        }),
+                        "case {case:?}: a failed instance reports a reason, got {:?}",
+                        read["ErrorMessage"]
+                    );
+                    assert!(
+                        epoch_seconds(&read["StartedAt"]).is_some()
+                            && epoch_seconds(&read["EndedAt"]).is_some(),
+                        "case {case:?}: a task that ran and failed carries StartedAt and \
+                         EndedAt, got {:?} and {:?}",
+                        read["StartedAt"],
+                        read["EndedAt"]
+                    );
+                }
+                TASK_UPSTREAM_FAILED => {
+                    assert!(
+                        read["StartedAt"].is_null() && read["EndedAt"].is_null(),
+                        "case {case:?}: a task that never ran carries neither StartedAt nor \
+                         EndedAt, got {:?} and {:?}",
+                        read["StartedAt"],
+                        read["EndedAt"]
+                    );
+                }
+                _ => assert!(
+                    read["ErrorMessage"].is_null(),
+                    "case {case:?}: an instance that succeeded reports no ErrorMessage, got {:?}",
+                    read["ErrorMessage"]
+                ),
+            }
+        }
+
+        // No instance of a task whose program answered failure reports success, through
+        // the listing as well as through the read above.
+        let (status, listed) = call(
+            &router,
+            "ListTaskInstances",
+            json!({"WorkflowArn": arn, "RunId": run_id}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListTaskInstances to succeed, got {status} {listed:?}"
+        );
+        for task in row.expected.iter().filter(|task| task.status == TASK_FAILED) {
+            let listed_status = listed["TaskInstances"]
+                .as_array()
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|summary| summary["TaskInstanceId"].as_str() == Some(task.task_id))
+                })
+                .and_then(|summary| summary["Status"].as_str())
+                .unwrap_or_default();
+            assert_eq!(
+                listed_status, TASK_FAILED,
+                "case {case:?}: the listing must report task {:?} as {TASK_FAILED}, got \
+                 {listed_status:?}",
+                task.task_id
+            );
+        }
+
+        // A read changes nothing a later caller sees: the finished run answers the same.
+        let (status, again) = call(
+            &router,
+            "GetWorkflowRun",
+            json!({"WorkflowArn": arn, "RunId": run_id}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the repeated read to succeed, got {status} {again:?}"
+        );
+        assert_eq!(
+            again["RunDetail"], report["RunDetail"],
+            "case {case:?}: a finished run must not move again, got {:?} after {:?}",
+            again["RunDetail"], report["RunDetail"]
+        );
+    }
 }

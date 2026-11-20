@@ -43,8 +43,8 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # group NAME may be, which is what `LoggingConfiguration.LogGroupName` has to satisfy to
 # name a group this service can export a run's output to; and `posix_shell_session`, the
 # tree's one bounded session-local POSIX/bash session, which performs the command line a
-# definition's task declares and states how long that program took
-# (`state::declared_runtime`).
+# definition's task declares and states how long that program took and whether it
+# succeeded (`state::declared_runtime`).
 service-common = { path = "../common" }
 
 [build-dependencies]

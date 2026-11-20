@@ -24,7 +24,17 @@
 //!   the tasks that wait for nothing run first, and a task runs once the tasks it
 //!   declared as dependencies have finished. The run finishes in the modelled `SUCCESS`
 //!   status with no `ErrorMessage`, which is the outcome `WorkflowRunDetail$ErrorMessage`
-//!   documents ("This value is null if the run completed successfully").
+//!   documents ("This value is null if the run completed successfully") — unless one of
+//!   its tasks declares work that cannot succeed, see below.
+//! * WHETHER each task succeeds: a task's declaration states the work it performs, and a
+//!   declared program the session performs to a non-zero status is work that did not
+//!   succeed ([`super::declared_runtime`]). Such a task's instance ends `FAILED`, the
+//!   tasks waiting on it never run (`UPSTREAM_FAILED`), and the run reaches the modelled
+//!   `FAILED` status with an `ErrorMessage` naming the task it failed on
+//!   ([`PlannedTask::failure`]). A declaration whose program this session does not perform
+//!   states no outcome, so the task it declares is not failed on that ground: the
+//!   operator's own work against the resources it names is the worker's, not this
+//!   emulator's.
 //! * How LONG each task occupies, and so how long the run is executing: the span a task
 //!   runs for is the one its own declaration states ([`super::declared_runtime`]), and the
 //!   default span for a task that declares none ([`super::TASK_LEVEL_RUNS_FOR`]). The
@@ -48,8 +58,9 @@
 //! against another service, performed by the worker the real service runs it on; this
 //! emulator serves the orchestration — admitting the run, building the graph, ordering it
 //! and recording an instance per task through the modelled statuses — and carries out no
-//! operator's side effect. Nothing here invents a failure for a task either: a task
-//! instance reports the outcome of the orchestration it took part in.
+//! operator's side effect. Nothing here invents an outcome for a task either: an instance
+//! reports the outcome of the orchestration it took part in and the outcome the task's own
+//! declaration states.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -81,9 +92,14 @@ pub struct PlannedTask {
     /// run together, because nothing between them has to wait.
     pub level: usize,
     /// How long this task's instance is `RUNNING` for: the wait its own declaration
-    /// states ([`super::declared_runtime::declared_runtime`]), and the run's default span
+    /// states ([`super::declared_runtime::declared_program`]), and the run's default span
     /// ([`super::TASK_LEVEL_RUNS_FOR`]) for a task whose declaration states none.
     pub runs_for: Duration,
+    /// Why an execution of this task cannot succeed, when its own declaration says so:
+    /// the reason the run reports for failing on it ([`clipped`] to what the modelled
+    /// `ErrorMessage` can carry). `None` for a task whose declaration states no failing
+    /// outcome, which is every task whose declared work this emulator does not perform.
+    pub failure: Option<String>,
 }
 
 /// What a run executes: the plan built from its version's definition.
@@ -244,21 +260,40 @@ fn plan_tasks(declared: &[TaskDeclaration]) -> Result<Vec<PlannedTask>, String> 
     Ok(named
         .iter()
         .zip(levels)
-        .map(|((task_id, task), level)| PlannedTask {
-            task_instance_id: (*task_id).to_string(),
-            task_id: (*task_id).to_string(),
-            operator_name: task
-                .operator_name
-                .as_deref()
-                .and_then(reported_operator_name),
-            level: level.unwrap_or_default(),
-            runs_for: task
+        .map(|((task_id, task), level)| {
+            // What the task's own declaration states about the work it performs: the time
+            // it takes, and whether it answers failure ([`super::declared_runtime`]). One
+            // reading, because one performance of the program states both.
+            let declared = task
                 .command
                 .as_deref()
-                .and_then(declared_runtime::declared_runtime)
-                .unwrap_or(super::TASK_LEVEL_RUNS_FOR),
+                .map(declared_runtime::declared_program)
+                .unwrap_or_default();
+            PlannedTask {
+                task_instance_id: (*task_id).to_string(),
+                task_id: (*task_id).to_string(),
+                operator_name: task
+                    .operator_name
+                    .as_deref()
+                    .and_then(reported_operator_name),
+                level: level.unwrap_or_default(),
+                runs_for: declared.runs_for.unwrap_or(super::TASK_LEVEL_RUNS_FOR),
+                failure: declared.failed.then(|| task_failure_reason(task_id)),
+            }
         })
         .collect())
+}
+
+/// The `ErrorMessage` a run reports for failing on the task `task_id`: the task it failed
+/// on, named, and nothing of the work itself, because the reason a program answered
+/// failure is the program's and not this service's to state.
+///
+/// Cut to what the modelled member can carry ([`clipped`]), so a long declared identifier
+/// cannot push the reported reason past its declared length.
+fn task_failure_reason(task_id: &str) -> String {
+    clipped(format!(
+        "Task {task_id:?} of this workflow definition did not complete successfully."
+    ))
 }
 
 /// Whether a declared task identifier is one this service can REPORT: `TaskInstanceId`

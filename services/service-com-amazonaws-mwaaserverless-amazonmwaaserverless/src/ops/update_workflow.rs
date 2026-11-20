@@ -519,5 +519,10 @@ fn validate_input(input: &UpdateWorkflowInput) -> Result<(), ValidationException
     // the version this update appends produces (`crate::state::run_logs`), so it has to be
     // a name CloudWatch Logs can hold a group under — a rule the member declares no
     // constraint for. Judged exactly as `CreateWorkflow` judges it.
-    crate::state::check_logging_configuration(input.logging_configuration.as_ref())
+    crate::state::check_logging_configuration(input.logging_configuration.as_ref())?;
+    // `EngineVersion` targets an `intEnum` no declared constraint judges, so its
+    // membership of the values the model defines is the shared service rule
+    // (`crate::state::check_engine_version`), judged exactly as `CreateWorkflow`
+    // judges it and before any version is appended.
+    crate::state::check_engine_version(input.engine_version)
 }

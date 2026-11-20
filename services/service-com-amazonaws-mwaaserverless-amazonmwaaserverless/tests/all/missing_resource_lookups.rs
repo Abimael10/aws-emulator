@@ -40,10 +40,12 @@ pub(crate) const WORKFLOW_MISSING: &str = "Resource not found";
 /// Recorded example from the same fixture (StartWorkflowRun, which names no version).
 const LATEST_VERSION_MISSING: &str = "Unable to find latest version";
 
-/// The entity-level message for a `WorkflowVersion` the workflow does not hold. Not
-/// in the recording (its request named no version); it is the version-level message
-/// for a named version, kept distinct from the workflow- and run-level ones.
-const NAMED_VERSION_MISSING: &str = "Unable to find the requested version";
+/// The entity-level message for a `WorkflowVersion` the workflow does not hold.
+/// Recorded example: a `StartWorkflowRun` pinned to a well-formed version that was never
+/// created answers this, fixed text with no part of the request in it (the version asked
+/// for is carried by `ResourceId`). Kept distinct from the workflow-, latest-version- and
+/// run-level ones, which the same service words differently.
+const NAMED_VERSION_MISSING: &str = "Workflow version not found";
 
 /// The entity-level message for an absent run. Recorded example from the same
 /// fixture (GetWorkflowRun).

@@ -41,6 +41,12 @@
 //! refusals, wherever a version is appended; `UpdateWorkflow` asks it. A refused request
 //! writes nothing, so the workflow is left exactly as it was — with the version history,
 //! and the latest version, it already had.
+//!
+//! Freezing a configuration and EXECUTING it are two moments, and the execution role is
+//! resolved at each of them: a trust policy is IAM's to change at any time after a version
+//! froze the role, so `StartWorkflowRun` asks the same question of the role its version
+//! names before it admits a run ([`unassumable_execution_role`]) — with the error that
+//! operation models for a run it may not carry out, and no run recorded.
 
 use ::smithy_server_runtime::OperationContext;
 
@@ -148,6 +154,54 @@ fn object_address(location: &DefinitionS3Location) -> String {
         None => address,
     }
 }
+
+/// The wire path of the execution-role member a refusal is keyed by.
+pub const EXECUTION_ROLE_MEMBER: &str = "RoleArn";
+
+/// Whether the execution role a workflow version froze is one this service cannot assume
+/// to EXECUTE that workflow — asked of IAM, and answered with the refusal to report when
+/// it is.
+///
+/// Freezing a configuration and EXECUTING it are two different moments, and the role is
+/// resolved at each of them: a version is appended only if IAM answered about the role
+/// then ([`unmet_dependency`]), and a run is started only if IAM answers about it now,
+/// because a trust policy is IAM's to change at any time after the version was frozen and
+/// a run that could not take the role on would execute nothing. `ValidationException` is
+/// what the model documents for exactly this ("This can occur … when required IAM
+/// permissions are missing": `smithy_query(query="shape", shape="ValidationException")`),
+/// at HTTP 400.
+///
+/// The grounds are [`unmet_dependency`]'s: only what IAM SAID refuses a request, so a role
+/// it was not asked about or could not answer for refuses nothing.
+///
+/// Called with NO store guard held: resolving the role is a call into another emulated
+/// service.
+pub async fn unassumable_execution_role(
+    ctx: &OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> Option<ValidationException> {
+    if !::service_common::iam_role::role_is_unassumable(ctx, region, role_arn, SERVICE_PRINCIPAL)
+        .await
+    {
+        return None;
+    }
+    Some(ValidationException {
+        message: UNASSUMABLE_EXECUTION_ROLE_MESSAGE.to_string(),
+        reason: crate::state::REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![crate::ops::types::ValidationExceptionField {
+            name: EXECUTION_ROLE_MEMBER.to_string(),
+            message: UNASSUMABLE_EXECUTION_ROLE_MESSAGE.to_string(),
+        }]),
+    })
+}
+
+/// The sentence a run of a workflow whose execution role this service cannot assume is
+/// refused with: fixed text naming nothing of the request — neither the role nor the
+/// workflow — and naming the service by the name it has in IAM, which is this service's
+/// own ARN namespace and signing name ([`crate::state::ARN_NAMESPACE`]).
+pub const UNASSUMABLE_EXECUTION_ROLE_MESSAGE: &str =
+    "Workflow execution role could not be assumed by the airflow-serverless service";
 
 #[cfg(test)]
 mod tests {

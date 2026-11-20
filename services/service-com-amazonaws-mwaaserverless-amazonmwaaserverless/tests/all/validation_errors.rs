@@ -998,3 +998,224 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
         );
     }
 }
+
+/// RULE: a member whose shape ENUMERATES the values it may carry admits only those
+/// values, so a request naming another one is refused with the modelled
+/// `ValidationException` and nothing is created or appended.
+///
+/// `EngineVersion` is the member this suite drives it through: it targets an `intEnum`
+/// whose only defined value is `1`
+/// (`smithy_query(query="shape", shape="EngineVersion")` — member `ONE`), and it reaches
+/// a handler as a plain integer no `@length`, `@pattern` or `@range` judges, so the
+/// membership is the service's own check. The rows differ along the VALUE: the one value
+/// the shape defines, the member omitted altogether, each neighbour of the defined value,
+/// zero, a negative, and each end of the modelled `Integer`.
+#[tokio::test]
+async fn an_engine_version_outside_the_values_the_model_defines_is_refused() {
+    use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
+        ENGINE_VERSION_MEMBER, ENGINE_VERSION_VALUES, INVALID_ENGINE_VERSION_MESSAGE,
+    };
+
+    let harness = Harness::new(REGION);
+
+    // `None` is the member omitted entirely; every other row names a value.
+    let rows: Vec<(&str, Option<i64>)> = vec![
+        ("the one value the shape defines", Some(1)),
+        ("the member omitted altogether", None),
+        ("one past the defined value", Some(2)),
+        ("one below the defined value", Some(0)),
+        ("a version far past the defined one", Some(999)),
+        ("a negative version", Some(-1)),
+        ("the largest value the modelled Integer holds", Some(i64::from(i32::MAX))),
+        ("the smallest value the modelled Integer holds", Some(i64::from(i32::MIN))),
+    ];
+
+    for (index, (case, engine_version)) in rows.iter().enumerate() {
+        let defined = engine_version
+            .is_none_or(|version| ENGINE_VERSION_VALUES.iter().any(|&one| i64::from(one) == version));
+        let name = format!("engineVersion{index}");
+        let mut body = serde_json::json!({
+            "Name": name,
+            "DefinitionS3Location": good_definition(),
+            "RoleArn": role_arn(),
+        });
+        if let Some(version) = engine_version {
+            body[ENGINE_VERSION_MEMBER] = serde_json::json!(version);
+        }
+        let (status, answered) = harness.call("CreateWorkflow", body.clone()).await;
+
+        if defined {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a value the shape defines must be accepted, got {status} \
+                 {answered:?}"
+            );
+            // ROUND TRIP: the created workflow is ready and reports the member it was
+            // created with.
+            let arn = answered["WorkflowArn"].as_str().unwrap_or_default();
+            let (status, reported) = harness
+                .call("GetWorkflow", serde_json::json!({"WorkflowArn": arn}))
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected GetWorkflow to succeed, got {status} {reported:?}"
+            );
+            assert_eq!(
+                reported["WorkflowStatus"].as_str(),
+                Some("READY"),
+                "case {case:?}: expected the created workflow to be READY, got {:?}",
+                reported["WorkflowStatus"]
+            );
+            assert_eq!(
+                reported[ENGINE_VERSION_MEMBER].as_i64(),
+                *engine_version,
+                "case {case:?}: expected the stored engine version to be {engine_version:?}, \
+                 got {:?}",
+                reported[ENGINE_VERSION_MEMBER]
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the refusal at 400, got {status} {answered:?}"
+        );
+        assert!(
+            answered["__type"]
+                .as_str()
+                .is_some_and(|kind| kind.contains("ValidationException")),
+            "case {case:?}: expected a ValidationException, got {:?}",
+            answered["__type"]
+        );
+        assert_eq!(
+            answered["Message"].as_str(),
+            Some(INVALID_ENGINE_VERSION_MESSAGE),
+            "case {case:?}: expected the fixed sentence for an engine version the service \
+             has no engine for, got {:?}",
+            answered["Message"]
+        );
+        assert_eq!(
+            answered["Reason"].as_str(),
+            Some("fieldValidationFailed"),
+            "case {case:?}: expected the field-validation reason, got {:?}",
+            answered["Reason"]
+        );
+        let named: Vec<&str> = answered["FieldList"]
+            .as_array()
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(|field| field["Name"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            named,
+            vec![ENGINE_VERSION_MEMBER],
+            "case {case:?}: expected the member at fault to be named, got {named:?}"
+        );
+
+        // Nothing was minted: the name the refused create asked for is held by no
+        // workflow, so a later create may still use it.
+        let (status, listed) = harness
+            .call("ListWorkflows", serde_json::json!({"MaxResults": 100}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListWorkflows to succeed, got {status} {listed:?}"
+        );
+        let held: Vec<&str> = listed["Workflows"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|summary| summary["Name"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            !held.contains(&name.as_str()),
+            "case {case:?}: a refused create must mint no workflow, got {held:?}"
+        );
+    }
+}
+
+/// RULE, at the other operation that accepts the member: an `UpdateWorkflow` naming an
+/// engine version the model does not define is refused the same way, and appends no
+/// version.
+#[tokio::test]
+async fn an_update_naming_an_undefined_engine_version_appends_no_version() {
+    use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
+        ENGINE_VERSION_MEMBER, INVALID_ENGINE_VERSION_MESSAGE,
+    };
+
+    let harness = Harness::new(REGION);
+    let (status, created) = harness
+        .call(
+            "CreateWorkflow",
+            serde_json::json!({
+                "Name": "updatedEngineVersion",
+                "DefinitionS3Location": good_definition(),
+                "RoleArn": role_arn(),
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "setup: expected CreateWorkflow to succeed, got {status} {created:?}"
+    );
+    let arn = created["WorkflowArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let before = harness.stored_versions(&arn);
+
+    // Rows differ along the value, as above; the one defined value is the control that
+    // DOES append a version.
+    for (case, engine_version, refused) in [
+        ("a version the model does not define", 7, true),
+        ("a negative version", -2, true),
+        ("the one value the shape defines", 1, false),
+    ] {
+        let (status, answered) = harness
+            .call(
+                "UpdateWorkflow",
+                serde_json::json!({
+                    "WorkflowArn": arn.clone(),
+                    "DefinitionS3Location": good_definition(),
+                    "RoleArn": role_arn(),
+                    ENGINE_VERSION_MEMBER: engine_version,
+                }),
+            )
+            .await;
+        if !refused {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a value the shape defines must be accepted, got {status} \
+                 {answered:?}"
+            );
+            assert_eq!(
+                harness.stored_versions(&arn).len(),
+                before.len() + 1,
+                "case {case:?}: an accepted update appends one version"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the refusal at 400, got {status} {answered:?}"
+        );
+        assert_eq!(
+            answered["Message"].as_str(),
+            Some(INVALID_ENGINE_VERSION_MESSAGE),
+            "case {case:?}: expected the same fixed sentence the create is refused with, \
+             got {:?}",
+            answered["Message"]
+        );
+        assert_eq!(
+            harness.stored_versions(&arn),
+            before,
+            "case {case:?}: a refused update must append no version"
+        );
+    }
+}

@@ -27,11 +27,20 @@
 //! Amazon S3's own `PutObject` and every role created with IAM's own `CreateRole`, so a
 //! dependency exists only because its owner answered for it, and the resolution under test
 //! runs over the same in-process callback as in production.
+//!
+//! The last suite carries the other moment the SAME role question is asked: freezing a
+//! configuration and EXECUTING it are two moments, and a trust policy is IAM's to change
+//! between them, so `StartWorkflowRun` resolves the role its version froze before it
+//! admits a run — with the error that operation models for a run it may not carry out
+//! (`ValidationException`, HTTP 400, documented for "when required IAM permissions are
+//! missing") and with no run recorded.
 
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::configuration_dependencies::SERVICE_PRINCIPAL;
+use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::configuration_dependencies::{
+    SERVICE_PRINCIPAL, UNASSUMABLE_EXECUTION_ROLE_MESSAGE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::workflow_definition_snapshot::{
@@ -743,5 +752,210 @@ async fn an_update_resolves_the_workflow_it_addresses_before_its_configuration()
                 "case {case:?}: expected the workflow's own identifier, got {reported:?}"
             );
         }
+    }
+}
+
+/// The status a role this service cannot assume to EXECUTE a workflow is refused with:
+/// `ValidationException`'s own `@httpError`.
+const RUN_REFUSAL_STATUS: u16 = 400;
+
+/// `ListWorkflowRuns` for `arn`: the `RunId`s the store holds for it, which is how a row
+/// shows that a refused start recorded nothing.
+async fn listed_runs(router: &MultiServiceRouter, arn: &str) -> Vec<String> {
+    let (status, page) = call(
+        router,
+        "ListWorkflowRuns",
+        json!({"WorkflowArn": arn, "MaxResults": 100}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected ListWorkflowRuns({arn}) to succeed, got {status} {page:?}"
+    );
+    page["WorkflowRuns"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|summary| summary["RunId"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// RULE: a run EXECUTES the workflow as the IAM role its version froze, so that role is
+/// resolved against this account's IAM before the run is admitted — a role IAM answers
+/// this service cannot assume is the modelled `ValidationException` (HTTP 400) with the
+/// fixed sentence for that condition, and the refusal records NO run. The question is
+/// asked at RUN time, not at create time: the create that froze the role is served and
+/// leaves the workflow `READY` whatever IAM says about it.
+///
+/// The rows differ along what IAM answers about the role the version froze — exactly the
+/// class [`an_update_resolves_its_execution_role_before_it_appends_a_version`] spans: a
+/// role of this account that trusts this service, one it holds that withholds the assume
+/// (trusting another service, denying this one explicitly), a well-formed ARN it holds no
+/// role under, and a role of ANOTHER account, which this emulator's IAM is not the
+/// authority on.
+#[tokio::test]
+async fn a_run_resolves_the_execution_role_its_version_froze_before_it_admits_the_run() {
+    let router = emulator();
+    create_bucket(&router).await;
+    stage(&router, CREATED_KEY, DEFINITION.as_bytes()).await;
+    stage(&router, UPDATED_KEY, DEFINITION.as_bytes()).await;
+
+    let trusted = assumable_role(&router, "mwaa-serverless-run-trusted").await;
+    let other_service = create_role(
+        &router,
+        "/",
+        "mwaa-serverless-run-other",
+        &trust(json!([statement(
+            "Allow",
+            json!(OTHER_PRINCIPAL),
+            "sts:AssumeRole"
+        )])),
+    )
+    .await;
+    let denied = create_role(
+        &router,
+        "/",
+        "mwaa-serverless-run-denied",
+        &trust(json!([
+            statement("Allow", json!(SERVICE_PRINCIPAL), "sts:AssumeRole"),
+            statement("Deny", json!(SERVICE_PRINCIPAL), "sts:AssumeRole"),
+        ])),
+    )
+    .await;
+
+    let rows: Vec<(&str, String, bool)> = vec![
+        (
+            "a role of this account that trusts this service",
+            trusted.clone(),
+            true,
+        ),
+        (
+            "a role IAM holds that trusts another service",
+            other_service,
+            false,
+        ),
+        (
+            "a role whose trust policy denies this service explicitly",
+            denied,
+            false,
+        ),
+        (
+            "a well-formed ARN this account's IAM holds no role under",
+            "arn:aws:iam::000000000000:role/run-never-created".to_string(),
+            false,
+        ),
+        (
+            // IAM is partition-global and this emulator holds one account's records, so
+            // a role of another account is one it was not asked about: nothing it said
+            // grounds a refusal.
+            "a role of another account, which this IAM is not the authority on",
+            "arn:aws:iam::210987654321:role/elsewhere".to_string(),
+            true,
+        ),
+    ];
+
+    for (index, (case, role_arn, admitted)) in rows.iter().enumerate() {
+        // The create freezes the role whatever IAM says about it, and the workflow it
+        // created is READY: this is the control for the rule's own claim that the
+        // question is asked at RUN time.
+        let (arn, _) = seed_workflow(&router, &format!("run.role.row{index}"), role_arn).await;
+        let reported = get_workflow(&router, &arn, None).await;
+        assert_eq!(
+            reported["WorkflowStatus"].as_str(),
+            Some("READY"),
+            "case {case:?}: the create that froze the role must leave the workflow READY, \
+             got {:?}",
+            reported["WorkflowStatus"]
+        );
+
+        let (status, body) = call(&router, "StartWorkflowRun", json!({"WorkflowArn": arn})).await;
+        if *admitted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the run to be admitted, got {status} {body:?}"
+            );
+            let run_id = body["RunId"].as_str().unwrap_or_default().to_string();
+            let recorded = listed_runs(&router, &arn).await;
+            assert_eq!(
+                recorded,
+                vec![run_id.clone()],
+                "case {case:?}: expected the admitted run {run_id:?} to be recorded, got \
+                 {recorded:?}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, RUN_REFUSAL_STATUS,
+            "case {case:?}: expected the refusal at {RUN_REFUSAL_STATUS}, got {status} {body:?}"
+        );
+        assert!(
+            body["__type"]
+                .as_str()
+                .is_some_and(|kind| kind.contains("ValidationException")),
+            "case {case:?}: expected a ValidationException, got {:?}",
+            body["__type"]
+        );
+        assert_eq!(
+            body["Message"].as_str(),
+            Some(UNASSUMABLE_EXECUTION_ROLE_MESSAGE),
+            "case {case:?}: expected the fixed sentence for a role this service cannot \
+             assume, got {:?}",
+            body["Message"]
+        );
+        let message = body["Message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains(role_arn.as_str()) && !message.contains(arn.as_str()),
+            "case {case:?}: the sentence carries nothing of the request, got {message:?}"
+        );
+        let named: Vec<&str> = body["FieldList"]
+            .as_array()
+            .map(|fields| {
+                fields
+                    .iter()
+                    .filter_map(|field| field["Name"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            named,
+            vec!["RoleArn"],
+            "case {case:?}: expected the member at fault to be named, got {named:?}"
+        );
+        let recorded = listed_runs(&router, &arn).await;
+        assert!(
+            recorded.is_empty(),
+            "case {case:?}: a refused start must record no run, got {recorded:?}"
+        );
+
+        // And the refusal is about the role IN FORCE, not about the workflow: once an
+        // update repoints the same workflow at a role IAM answers this service can
+        // assume, the very same start is served and the run is recorded.
+        let (status, updated) = update(
+            &router,
+            &arn,
+            &json!({"Bucket": BUCKET, "ObjectKey": UPDATED_KEY}),
+            &trusted,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the update to a trusted role to be served, got {status} \
+             {updated:?}"
+        );
+        let (status, started) = call(&router, "StartWorkflowRun", json!({"WorkflowArn": arn})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the start to be served once the role is trusted, got \
+             {status} {started:?}"
+        );
+        let run_id = started["RunId"].as_str().unwrap_or_default().to_string();
+        let recorded = listed_runs(&router, &arn).await;
+        assert_eq!(
+            recorded,
+            vec![run_id.clone()],
+            "case {case:?}: expected the admitted run {run_id:?} to be recorded, got {recorded:?}"
+        );
     }
 }

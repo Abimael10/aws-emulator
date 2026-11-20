@@ -517,6 +517,20 @@ pub struct WorkflowRun {
     pub sequence: u64,
 }
 
+/// What advancing a run's execution by one dependency level left it in
+/// ([`WorkflowRun::advance_declared_tasks`]).
+#[derive(Debug, Clone)]
+enum LevelOutcome {
+    /// A level has started, and occupies this span.
+    Running(Duration),
+    /// No level was left to start: every task the definition declared finished, and
+    /// none of them failed.
+    Succeeded,
+    /// A task of the level that just ended declared work that cannot succeed, so the
+    /// execution is over; this is the reason the run reports.
+    Failed(String),
+}
+
 /// The position of a run in the order a run listing walks: its creation instant
 /// (nanoseconds since the epoch) and, for two runs created at the same instant,
 /// the creation sequence that separates them.
@@ -574,6 +588,11 @@ impl WorkflowRun {
     ///   "This value is null if the run completed successfully". The window
     ///   `StartedOn`/`CompletedOn` then span, and the `Duration` derived from it, are
     ///   therefore the window the declared work occupies.
+    /// * `RUNNING` -> `FAILED` instead, as soon as a level ends with a task whose own
+    ///   declaration states work that cannot succeed ([`workflow_execution::PlannedTask`]):
+    ///   that instance ends `FAILED`, no task that was waiting on the execution runs
+    ///   (`UPSTREAM_FAILED`), and the run carries the reason it failed on as its
+    ///   `ErrorMessage` beside the completion instant and duration.
     /// * `STOPPING` -> `STOPPED` after [`RUN_STOPPED_AFTER`]: the shutdown a stop
     ///   started is complete, so the run is finished and carries the completion
     ///   instant and duration every finished run does. It records no `ErrorMessage`:
@@ -622,10 +641,18 @@ impl WorkflowRun {
                 RUN_STATUS_RUNNING => {
                     self.modified_at = due;
                     match self.advance_declared_tasks(due) {
-                        Some(runs_for) => self.next_status_at = deadline_after(due, runs_for),
-                        None => {
+                        LevelOutcome::Running(runs_for) => {
+                            self.next_status_at = deadline_after(due, runs_for);
+                        }
+                        LevelOutcome::Succeeded => {
                             self.status = RUN_STATUS_SUCCESS.to_string();
                             self.complete_at(due);
+                            self.log_status_reached(due);
+                        }
+                        LevelOutcome::Failed(reason) => {
+                            self.status = RUN_STATUS_FAILED.to_string();
+                            self.complete_at(due);
+                            self.error_message = Some(reason);
                             self.log_status_reached(due);
                         }
                     }
@@ -782,24 +809,50 @@ impl WorkflowRun {
     }
 
     /// Advance the run's execution by ONE dependency level at `at`: the level that was
-    /// running finishes successfully and the level that waited for it starts.
+    /// running ends with the outcome each of its tasks declared, and the level that waited
+    /// for it starts.
     ///
     /// Reports how long the level that just STARTED occupies — the longest span its own
-    /// tasks declare ([`workflow_execution::ExecutionPlan::level_runs_for`]) — and `None`
-    /// once the execution is COMPLETE: no level was left to start, which is also the
-    /// answer for a run whose definition declared no task at all.
+    /// tasks declare ([`workflow_execution::ExecutionPlan::level_runs_for`]) — and
+    /// [`LevelOutcome::Succeeded`] once the execution is COMPLETE: no level was left to
+    /// start, which is also the answer for a run whose definition declared no task at all.
+    ///
+    /// A level in which any instance ended `FAILED` ends the EXECUTION
+    /// ([`LevelOutcome::Failed`]): the tasks that were waiting on it never run, so they
+    /// end `UPSTREAM_FAILED` and no further level is started.
     ///
     /// Each attempt that ends owes its own stream the outcome it ended with, and each
     /// attempt that starts names the stream it writes to and owes it the line saying so
     /// ([`Self::start_declared_tasks`]).
-    fn advance_declared_tasks(&mut self, at: SystemTime) -> Option<Duration> {
-        let level = self.running_level()?;
+    fn advance_declared_tasks(&mut self, at: SystemTime) -> LevelOutcome {
+        let Some(level) = self.running_level() else {
+            return LevelOutcome::Succeeded;
+        };
         let run_id = self.run_id.clone();
         let exporting = self.log_group_name.is_some();
         let mut lines: Vec<(String, String)> = Vec::new();
+        // The reason the run reports, when a task of this level declared work that cannot
+        // succeed: the first such task in the plan's order, so two reads answer alike.
+        let mut failed_on: Option<String> = None;
+        for task in self.execution.tasks_at(level) {
+            if let Some(reason) = task.failure.clone() {
+                failed_on = Some(reason);
+                break;
+            }
+        }
         for id in self.task_instance_ids_at(level) {
+            let failure = self
+                .execution
+                .tasks
+                .iter()
+                .find(|task| task.task_instance_id == id)
+                .and_then(|task| task.failure.clone());
             if let Some(instance) = self.task_instances.get_mut(&id) {
-                instance.status = TASK_INSTANCE_STATUS_SUCCESS.to_string();
+                instance.status = match &failure {
+                    Some(_) => TASK_INSTANCE_STATUS_FAILED.to_string(),
+                    None => TASK_INSTANCE_STATUS_SUCCESS.to_string(),
+                };
+                instance.error_message = failure;
                 instance.ended_at = Some(at);
                 instance.modified_at = at;
                 if let Some(stream) = instance.log_stream.clone() {
@@ -807,12 +860,21 @@ impl WorkflowRun {
                 }
             }
         }
+        // A failed task is work the tasks after it waited for and never got, so nothing
+        // deeper in the graph is executed at all.
+        if let Some(reason) = failed_on {
+            self.fail_waiting_tasks(at);
+            for (stream, message) in lines {
+                self.queue_log_line(stream, at, message);
+            }
+            return LevelOutcome::Failed(reason);
+        }
         let next = self.task_instance_ids_at(level + 1);
         if next.is_empty() {
             for (stream, message) in lines {
                 self.queue_log_line(stream, at, message);
             }
-            return None;
+            return LevelOutcome::Succeeded;
         }
         for id in next {
             if let Some(instance) = self.task_instances.get_mut(&id) {
@@ -829,7 +891,23 @@ impl WorkflowRun {
         for (stream, message) in lines {
             self.queue_log_line(stream, at, message);
         }
-        Some(self.execution.level_runs_for(level + 1))
+        LevelOutcome::Running(self.execution.level_runs_for(level + 1))
+    }
+
+    /// End every instance still WAITING at `at` as `UPSTREAM_FAILED`: a task the
+    /// execution failed before reaching never ran, so it reports neither an outcome of its
+    /// own nor a window.
+    ///
+    /// Only the waiting status this emulator's own execution assigns is ended, so an
+    /// instance that had already finished keeps the outcome it finished with.
+    fn fail_waiting_tasks(&mut self, at: SystemTime) {
+        for instance in self.task_instances.values_mut() {
+            if instance.status != TASK_INSTANCE_STATUS_SCHEDULED {
+                continue;
+            }
+            instance.status = TASK_INSTANCE_STATUS_UPSTREAM_FAILED.to_string();
+            instance.modified_at = at;
+        }
     }
 
     /// The dependency level the run is executing: the shallowest level whose task
@@ -1040,6 +1118,15 @@ pub const TASK_INSTANCE_STATUS_SUCCESS: &str = "SUCCESS";
 /// carries: the stop "terminates all running tasks", so the task ran to neither
 /// success nor failure.
 pub const TASK_INSTANCE_STATUS_CANCELLED: &str = "CANCELLED";
+
+/// The status an instance of a task whose own work answered FAILURE carries
+/// (`GetTaskInstanceResponse$ErrorMessage` is "The error message if the task instance
+/// failed", so an instance that failed is one the model reports a reason for).
+pub const TASK_INSTANCE_STATUS_FAILED: &str = "FAILED";
+
+/// The status an instance of a task that never ran because a task it waits for failed
+/// carries: the work it depends on did not finish, so this task was not executed at all.
+pub const TASK_INSTANCE_STATUS_UPSTREAM_FAILED: &str = "UPSTREAM_FAILED";
 
 /// The instant `span` after `at`, and `at` itself for a sum no clock can hold.
 ///
@@ -2551,7 +2638,7 @@ impl UnresolvedEntity {
         match self {
             Self::Workflow => "Resource not found",
             Self::LatestWorkflowVersion => "Unable to find latest version",
-            Self::NamedWorkflowVersion => "Unable to find the requested version",
+            Self::NamedWorkflowVersion => "Workflow version not found",
             Self::WorkflowRun => "Workflow run not found",
             // Not in any recording of this service (no fixture reads a task
             // instance); entity-level and free of request values, like the others,
@@ -3718,3 +3805,59 @@ pub fn check_logging_configuration(
         }]),
     })
 }
+
+/// The wire path of the engine-version member a refusal is keyed by.
+pub const ENGINE_VERSION_MEMBER: &str = "EngineVersion";
+
+/// The engine versions this service HAS an engine for: the values the member's own shape
+/// defines (`smithy_query(query="shape", shape="EngineVersion")` — an `intEnum` whose one
+/// member `ONE` is `1`, "Engine version 1 of Amazon Managed Workflows for Apache Airflow
+/// Serverless").
+pub const ENGINE_VERSION_VALUES: &[i32] = &[1];
+
+/// Refuse an `EngineVersion` the service defines no engine for.
+///
+/// A member whose shape ENUMERATES the values it may carry admits only those values, and
+/// a request naming another one asks for a configuration the service could not run. The
+/// framework's constraint walk refuses such a value for every one of this service's
+/// STRING enums (their member schemas carry the enum trait, so
+/// [`validate_members`] covers them); the `intEnum` the engine version targets reaches a
+/// handler as a plain integer, which no declared `@length`, `@pattern` or `@range` judges,
+/// so the membership is checked here instead — with the same shape and reason a constraint
+/// failure carries, naming the member at fault.
+///
+/// Every operation that ACCEPTS the member judges it this way, before anything is minted,
+/// so a refused request creates and appends nothing.
+pub fn check_engine_version(engine_version: Option<i32>) -> Result<(), ValidationException> {
+    let Some(version) = engine_version else {
+        return Ok(());
+    };
+    if ENGINE_VERSION_VALUES.contains(&version) {
+        return Ok(());
+    }
+    Err(ValidationException {
+        message: INVALID_ENGINE_VERSION_MESSAGE.to_string(),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: ENGINE_VERSION_MEMBER.to_string(),
+            message: format!(
+                "Value at '{ENGINE_VERSION_MEMBER}' failed to satisfy constraint: Member must \
+                 be one of the engine versions this service runs"
+            ),
+        }]),
+    })
+}
+
+/// The sentence an engine version this service defines no engine for is refused with:
+/// fixed text naming nothing of the request.
+pub const INVALID_ENGINE_VERSION_MESSAGE: &str = "Invalid engine version";
+
+/// The sentence a create is refused with when the name it asks for is one a stored
+/// workflow already holds.
+///
+/// "You must use unique workflow names within your account": the refusal reports THAT
+/// condition, so it is fixed text and interpolates nothing — not the name asked for, not
+/// the holder's identity, which the shape's own required `ResourceId`/`ResourceType`
+/// carry. One sentence covers every holder, including one whose teardown has started and
+/// so still holds the name.
+pub const DUPLICATE_WORKFLOW_NAME_MESSAGE: &str = "Workflow with given name already exists";

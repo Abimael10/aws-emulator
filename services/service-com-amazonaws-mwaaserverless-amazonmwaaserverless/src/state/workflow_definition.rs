@@ -113,8 +113,9 @@ const TASK_DEPENDENCY_KEYS: &[&str] = &["dependencies", "depends_on", "upstream"
 /// takes the command line in, and `command` the shorter spelling a declaration carries it
 /// under. Written either as one command line or as a sequence of words.
 ///
-/// What the command decides here is how long the task occupies, because a command line
-/// states the wait it asks for (`crate::state::declared_runtime`).
+/// What the command decides here is how long the task occupies and whether its work
+/// succeeds, because a command line states the wait it asks for and the status it answers
+/// (`crate::state::declared_runtime`).
 const TASK_COMMAND_KEYS: &[&str] = &["bash_command", "command"];
 
 /// The most task declarations this reader takes out of ONE definition.

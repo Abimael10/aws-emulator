@@ -661,6 +661,15 @@ struct WindowRow {
     levels: Vec<Duration>,
 }
 
+/// The cases of [`window_rows`] whose declared program answers FAILURE, so the run that
+/// executes it settles in the modelled `FAILED` rather than `SUCCESS`.
+///
+/// The window such a run reports is the same either way — the level still occupies the
+/// span its tasks declare, and the run still carries `CompletedOn` and `Duration` — which
+/// is what these rows are about; the outcome they settle in is
+/// `crate::run_execution_outcome`'s rule.
+const WINDOWS_THAT_FAIL: &[&str] = &["the waiting command given no operand"];
+
 /// The table. The rows differ along what the rule generalises over: whether a task
 /// declares a command at all, the UNIT the time it states is written in (a bare number of
 /// seconds and each suffix the waiting command accepts — `s`, `m`, `h`, `d`), whether that
@@ -880,11 +889,15 @@ async fn the_window_a_run_reports_spans_the_work_its_definition_declared() {
             "case {case:?}: expected GetWorkflowRun to succeed, got {status} {answered:?}"
         );
         let detail = &answered["RunDetail"];
+        let settles_in = if WINDOWS_THAT_FAIL.contains(&case) {
+            RUN_STATUS_FAILED
+        } else {
+            RUN_STATUS_SUCCESS
+        };
         assert_eq!(
             detail["RunState"].as_str(),
-            Some(RUN_STATUS_SUCCESS),
-            "case {case:?}: every declared task finished, so the run completed \
-             successfully, got {:?}",
+            Some(settles_in),
+            "case {case:?}: expected the run to settle in {settles_in}, got {:?}",
             detail["RunState"]
         );
 

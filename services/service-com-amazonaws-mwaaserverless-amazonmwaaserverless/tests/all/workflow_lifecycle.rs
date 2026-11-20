@@ -13,12 +13,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    RUN_TERMINAL_STATUSES, WORKFLOW_DELETED_AFTER,
+    DUPLICATE_WORKFLOW_NAME_MESSAGE, RUN_TERMINAL_STATUSES, WORKFLOW_DELETED_AFTER,
+    WORKFLOW_RESOURCE_TYPE,
 };
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::{
     ComAmazonawsMwaaserverlessAmazonmwaaserverlessState, EmulatedService,
 };
 use smithy_server_runtime::MultiServiceRouter;
+
+/// The status the model gives `ConflictException`
+/// (`smithy_query(query="shape", shape="ConflictException")`: `@httpError(409)`).
+const CONFLICT_STATUS: u16 = 409;
 
 /// The members `CreateWorkflowRequest` and `GetWorkflowResponse` share, from
 /// `smithy_query(query="operation", operation="CreateWorkflow,GetWorkflow")`. A create
@@ -605,6 +610,124 @@ async fn an_unknown_workflow_is_refused_and_a_duplicate_name_conflicts() {
                 .is_some_and(|t| t.contains("ConflictException")),
             "case {name:?}: expected a ConflictException, got {:?}",
             conflict["__type"]
+        );
+    }
+}
+
+/// RULE: a create whose `Name` a stored workflow already holds is refused with the
+/// modelled `ConflictException`, whose `Message` is the ONE fixed sentence for that
+/// condition — it carries nothing of the request — while the holder is reported by the
+/// shape's own required `ResourceId`/`ResourceType`.
+///
+/// The rows differ along the FORM of the name a holder already has (plain, carrying each
+/// punctuation character the member admits, the longest the member admits) and along the
+/// STATE the holder is in (ready, and one whose teardown has started and so still holds
+/// the name) — never merely along the name.
+#[tokio::test]
+async fn a_name_a_stored_workflow_holds_is_refused_with_one_fixed_sentence() {
+    let harness = Harness::new("ap-south-1");
+
+    // `NameString` is length 1..255, `^[a-zA-Z0-9]+[a-zA-Z0-9\.\-_]*$`
+    // (`smithy_query(query="operation", operation="CreateWorkflow")`), so the longest
+    // name a holder can have is 255 characters of it.
+    let longest = format!("n{}", "a".repeat(254));
+    let rows: Vec<(&str, String, bool)> = vec![
+        ("a plain name", "holder".to_string(), false),
+        (
+            "a name carrying every punctuation character the member admits",
+            "holder.two-three_4".to_string(),
+            false,
+        ),
+        ("the longest name the member admits", longest, false),
+        (
+            "a holder whose teardown has started and still holds the name",
+            "holderTearingDown".to_string(),
+            true,
+        ),
+    ];
+
+    for (case, name, tearing_down) in rows {
+        let body = serde_json::json!({
+            "Name": name,
+            "DefinitionS3Location": {"Bucket": "defs", "ObjectKey": "dags/d.yaml"},
+            "RoleArn": role_arn(),
+        });
+        let (status, first) = harness.call("CreateWorkflow", body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the first CreateWorkflow to succeed, got {status} {first:?}"
+        );
+        let holder = first["WorkflowArn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        if tearing_down {
+            let (status, deleted) = harness
+                .call(
+                    "DeleteWorkflow",
+                    serde_json::json!({"WorkflowArn": holder.clone()}),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected DeleteWorkflow to succeed, got {status} {deleted:?}"
+            );
+            // The removal deadline out of reach, so the create below meets the
+            // `DELETING` phase rather than an already removed record.
+            crate::workflow_deletion_teardown::with_workflow(&harness, &holder, |workflow| {
+                workflow.deletion_due_at =
+                    Some(std::time::SystemTime::now() + Duration::from_secs(3_600));
+            });
+        }
+
+        let (status, conflict) = harness.call("CreateWorkflow", body).await;
+        assert_eq!(
+            status, CONFLICT_STATUS,
+            "case {case:?}: expected ConflictException ({CONFLICT_STATUS}) for a name already \
+             held, got {status} {conflict:?}"
+        );
+        assert_eq!(
+            conflict["Message"].as_str(),
+            Some(DUPLICATE_WORKFLOW_NAME_MESSAGE),
+            "case {case:?}: expected the one fixed sentence for a name already held, got {:?}",
+            conflict["Message"]
+        );
+        let message = conflict["Message"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains(name.as_str()) && !message.contains(holder.as_str()),
+            "case {case:?}: the sentence carries nothing of the request, got {message:?}"
+        );
+        assert_eq!(
+            conflict["ResourceId"].as_str(),
+            Some(holder.as_str()),
+            "case {case:?}: expected the refusal to report the holder, got {:?}",
+            conflict["ResourceId"]
+        );
+        assert_eq!(
+            conflict["ResourceType"].as_str(),
+            Some(WORKFLOW_RESOURCE_TYPE),
+            "case {case:?}: expected the workflow resource type, got {:?}",
+            conflict["ResourceType"]
+        );
+
+        // The refused create minted nothing: the holder still reports the one version it
+        // was created with, and it is still the only workflow of that name.
+        let (status, reported) = harness
+            .call(
+                "GetWorkflow",
+                serde_json::json!({"WorkflowArn": holder.clone()}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the holder is still readable, got {status} {reported:?}"
+        );
+        let versions = harness.stored_versions(&holder);
+        assert_eq!(
+            versions.len(),
+            1,
+            "case {case:?}: a refused create appends no version, got {versions:?}"
         );
     }
 }

@@ -339,25 +339,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // under a name already in the store is a conflict, not a second workflow. The
         // name is held only at the endpoint the holder was created through, so the same
         // name in another region is a second, independent workflow. A workflow whose
-        // teardown has not finished still holds its name, so the conflict says which
-        // state the holder is in.
+        // teardown has not finished still holds its name, so it is a holder like any
+        // other. What the refusal SAYS is the shared sentence for that condition
+        // (`crate::state::DUPLICATE_WORKFLOW_NAME_MESSAGE`); which workflow holds the
+        // name is carried by the shape's own `ResourceId`/`ResourceType`.
         if let Some(existing) = store.workflow_arn_named(&region, &input.name) {
             let existing = existing.clone();
-            let deleting = store
-                .workflow_in(&region, &existing)
-                .is_some_and(crate::state::Workflow::is_deleting);
-            let message = if deleting {
-                format!(
-                    "A workflow named {} is {} and still holds that name",
-                    input.name,
-                    crate::state::WORKFLOW_STATUS_DELETING
-                )
-            } else {
-                format!("A workflow named {} already exists", input.name)
-            };
             return Err(
                 CreateWorkflowErrorModeled::ConflictException(ConflictException {
-                    message,
+                    message: crate::state::DUPLICATE_WORKFLOW_NAME_MESSAGE.to_string(),
                     resource_id: existing,
                     resource_type: crate::state::WORKFLOW_RESOURCE_TYPE.to_string(),
                 })
@@ -559,7 +549,12 @@ fn validate_input(input: &CreateWorkflowInput) -> Result<(), ValidationException
     // The log group the configuration names is where this service EXPORTS what a run of
     // the workflow produces (`crate::state::run_logs`), so it has to be a name CloudWatch
     // Logs can hold a group under — a rule the member declares no constraint for.
-    crate::state::check_logging_configuration(input.logging_configuration.as_ref())
+    crate::state::check_logging_configuration(input.logging_configuration.as_ref())?;
+    // `EngineVersion` targets an `intEnum`, which reaches this handler as a plain
+    // integer no declared constraint judges, so its membership of the values the
+    // model defines is the shared service rule
+    // (`crate::state::check_engine_version`) — checked before anything is minted.
+    crate::state::check_engine_version(input.engine_version)
 }
 
 /// The modelled server error for a store this handler could not reach.

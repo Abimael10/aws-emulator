@@ -34,6 +34,11 @@
 //! (`WorkflowStatus` `DELETING`) admits no new run and is refused with the modelled
 //! `ConflictException`.
 //!
+//! A run also EXECUTES the workflow as the IAM role that version froze, so the role is
+//! resolved against this account's IAM before the run is admitted, and a role IAM answers
+//! this service cannot assume is refused with the modelled `ValidationException` with no
+//! run recorded (`crate::state::configuration_dependencies::unassumable_execution_role`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -233,6 +238,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
         let fingerprint = request_fingerprint(&input);
+        // The version this run would execute: the one the request names, else the
+        // workflow's latest.
+        let requested = input.workflow_version.as_deref();
+        let tokens = crate::state::TokenLedger::of(
+            Self::NAME,
+            crate::state::WORKFLOW_RUN_RESOURCE_TYPE,
+            &region,
+        );
+
+        // A run EXECUTES the workflow as the IAM role the version it runs froze, so that
+        // role is resolved against this account's IAM BEFORE the run is admitted: a role
+        // IAM answers this service cannot assume is the modelled `ValidationException`
+        // and the refusal records no run
+        // (`crate::state::configuration_dependencies::unassumable_execution_role`).
+        // Resolving it is a call into another emulated service, so the version it reads
+        // is taken under a guard of its own, which is released again before the ask — the
+        // shape `UpdateWorkflow` resolves its own dependencies in.
+        //
+        // Nothing is asked for a request that would admit NO run: a workflow or version
+        // this endpoint does not hold is the lookup miss the admission below reports, a
+        // workflow tearing down is its conflict, and a repeated `ClientToken` reports the
+        // run it already started rather than being judged a second time.
+        let role_to_assume = {
+            let mut store = state.lock();
+            store.advance_clock();
+            let replaying = tokens
+                .replay(
+                    &store.idempotency,
+                    input.client_token.as_deref(),
+                    &fingerprint,
+                )
+                .ok()
+                .flatten()
+                .is_some();
+            if replaying {
+                None
+            } else {
+                store
+                    .workflow_in(&region, &input.workflow_arn)
+                    .filter(|workflow| !workflow.is_deleting())
+                    .and_then(|workflow| workflow.version(requested))
+                    .map(|version| version.snapshot.role_arn.clone())
+            }
+        };
+        if let Some(role_arn) = role_to_assume {
+            if let Some(refusal) =
+                crate::state::configuration_dependencies::unassumable_execution_role(
+                    ctx, &region, &role_arn,
+                )
+                .await
+            {
+                return Err(StartWorkflowRunErrorModeled::ValidationException(refusal).into());
+            }
+        }
+
         let mut store = state.lock();
 
         // Finish every workflow teardown the clock already made due, so a workflow
@@ -243,11 +303,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from below.
         let now = store.advance_clock();
 
-        // The version this run would execute: the one the request names, else the
-        // workflow's latest. It is the entity THIS operation has to resolve, so a
-        // workflow the store does not hold and a version it does not hold are the
-        // same failure to the caller.
-        let requested = input.workflow_version.as_deref();
+        // The entity THIS operation has to resolve is the version the run would
+        // execute, so a workflow the store does not hold and a version it does not hold
+        // are the same failure to the caller.
         let unresolved_version = || {
             crate::state::lookup_miss(StartWorkflowRunErrorModeled::ResourceNotFoundException(
                 crate::state::unresolved(
@@ -274,11 +332,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name and the resource type its refusal reports, so the token is remembered
         // per operation and per region: a token presented at one regional endpoint says
         // nothing about what another endpoint started.
-        let tokens = crate::state::TokenLedger::of(
-            Self::NAME,
-            crate::state::WORKFLOW_RUN_RESOURCE_TYPE,
-            &region,
-        );
         let replayed = tokens
             .replay(
                 &store.idempotency,
