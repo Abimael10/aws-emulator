@@ -6,8 +6,10 @@
 //! # The rule this module implements
 //!
 //! A container runs on a filesystem. Its own layer is writable and lives as long as the
-//! container does, and on top of it the agent MOUNTS the volumes the task definition
-//! declares: `MountPoint$sourceVolume` is "the name of the volume to mount", `containerPath`
+//! container does — ONE layer, shared by every session that runs INSIDE that container
+//! ([`ContainerLayer`]), so what the container's own program writes there is what a later
+//! session of the same container reads back — and on top of it the agent MOUNTS the volumes
+//! the task definition declares: `MountPoint$sourceVolume` is "the name of the volume to mount", `containerPath`
 //! "the path on the container to mount the host volume at", and `readOnly` — "if this value
 //! is `true`, the container has read-only access to the volume". So inside the container that
 //! path IS a filesystem: a redirection into it creates a file, a utility reads the bytes back,
@@ -88,6 +90,42 @@ pub const DEFAULT_WORKING_DIRECTORY: &str = ROOT;
 /// The user and group a process of a container acts as when nothing narrows it, which is what
 /// a listing reports for the files it creates.
 const DEFAULT_OWNER: &str = "root";
+
+/// A handle onto the writable layer of ONE container, shared by every session that runs
+/// inside that container: the container's own program, and the health-check probes the agent
+/// runs in it ([`super::container_health`]). A container has one filesystem, so a file the
+/// program created is a file a probe of the same container finds — and one the program
+/// removed is one it no longer finds.
+#[derive(Debug, Clone)]
+pub struct ContainerLayer {
+    files: Arc<Mutex<ShellVolume>>,
+}
+
+impl Default for ContainerLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ContainerLayer {
+    /// The layer of a container nothing has run in yet: the null device every container has,
+    /// and nothing else.
+    #[must_use]
+    pub fn new() -> Self {
+        let mut layer = ShellVolume::new(CONTAINER_LAYER_LIMITS);
+        layer.add_discarding_device(NULL_DEVICE);
+        Self {
+            files: Arc::new(Mutex::new(layer)),
+        }
+    }
+
+    /// The tree, with a lock poisoned by an earlier panic taken rather than propagated: the
+    /// layer outlives the one session that was writing to it, so one failed write does not
+    /// take the container's files with it.
+    fn files(&self) -> MutexGuard<'_, ShellVolume> {
+        self.files.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// A handle onto the files ONE volume this emulator holds itself holds, shared by every
 /// container that mounts it: what one container writes through its handle, another reads
@@ -248,8 +286,9 @@ impl ContainerMount {
 #[derive(Debug)]
 pub struct ContainerFilesystem {
     /// The container's OWN writable layer: what it writes outside every mount, which lives
-    /// as long as the container does and is shared with nothing.
-    layer: ShellVolume,
+    /// as long as the container does and is shared by every session that runs in it
+    /// ([`ContainerLayer`]).
+    layer: ContainerLayer,
     /// The volumes mounted into it, LONGEST `containerPath` first, so the mount a path lands
     /// in is the deepest one holding it.
     mounts: Vec<ContainerMount>,
@@ -270,11 +309,27 @@ impl ContainerFilesystem {
     /// The layer starts as a container's does: the null device, and the directory each mount
     /// point is at — a mount point is a directory of the container's own filesystem that the
     /// volume is mounted over, so the path above a mount is one the program can list.
-    pub fn new(working_directory: Option<&str>, mut mounts: Vec<ContainerMount>) -> Self {
-        let mut layer = ShellVolume::new(CONTAINER_LAYER_LIMITS);
-        layer.add_discarding_device(NULL_DEVICE);
-        for mount in &mounts {
-            let _ = layer.make_directories(&mount.container_path);
+    pub fn new(working_directory: Option<&str>, mounts: Vec<ContainerMount>) -> Self {
+        Self::on_layer(ContainerLayer::new(), working_directory, mounts)
+    }
+
+    /// The filesystem of the container whose own writable layer is `layer`, with `mounts`
+    /// attached and `working_directory` as the directory a relative path is resolved against.
+    ///
+    /// Every session that runs INSIDE one container is given that container's layer, so the
+    /// files one of them leaves there are the files the next one sees: the container's own
+    /// program writes its page and its marker files, and the agent's health-check probe reads
+    /// exactly those ([`super::container_health`]).
+    pub fn on_layer(
+        layer: ContainerLayer,
+        working_directory: Option<&str>,
+        mut mounts: Vec<ContainerMount>,
+    ) -> Self {
+        {
+            let mut files = layer.files();
+            for mount in &mounts {
+                let _ = files.make_directories(&mount.container_path);
+            }
         }
         // Longest first: a path is matched against the deepest mount that holds it.
         mounts.sort_by(|left, right| {
@@ -321,7 +376,8 @@ impl ContainerFilesystem {
     /// on it holds, which is what the space on that filesystem is reported as used
     /// ([`super::container_process`]).
     pub fn layer_bytes(&self) -> u64 {
-        self.layer
+        let files = self.layer.files();
+        files
             .stored_files()
             .map(|(_, contents)| u64::try_from(contents.len()).unwrap_or(u64::MAX))
             .sum()
@@ -367,7 +423,10 @@ impl ContainerFilesystem {
                 let files = mount.files.files();
                 Some(read(&files, &located.path))
             }
-            None => Some(read(&self.layer, &located.path)),
+            None => {
+                let files = self.layer.files();
+                Some(read(&files, &located.path))
+            }
         }
     }
 
@@ -389,7 +448,10 @@ impl ContainerFilesystem {
                 let mut files = mount.files.files();
                 Ok(write(&mut files, &located.path))
             }
-            None => Ok(write(&mut self.layer, &located.path)),
+            None => {
+                let mut files = self.layer.files();
+                Ok(write(&mut files, &located.path))
+            }
         }
     }
 }
@@ -543,10 +605,7 @@ impl ShellFiles for ContainerFilesystem {
                 let facts = mount.files.files().facts(&located.path)?;
                 (facts, mount.owner.clone())
             }
-            None => (
-                self.layer.facts(&located.path)?,
-                FileOwner::default(),
-            ),
+            None => (self.layer.files().facts(&located.path)?, FileOwner::default()),
         };
         Some(FileEntry {
             kind: facts.kind,

@@ -162,6 +162,11 @@ pub struct ContainerRun {
     /// `None` once the run has ended, and until the spawn that starts it hands its handle
     /// over ([`attach_container_run`]).
     handle: Option<::tokio::task::JoinHandle<()>>,
+    /// The container's OWN writable layer, held here because it belongs to the CONTAINER and
+    /// not to one session of it: the program's session writes to it, and the agent's
+    /// health-check probes read it back through the same handle
+    /// ([`super::container_filesystem::ContainerLayer`]).
+    layer: ContainerLayer,
 }
 
 /// What ONE container's run needs, taken out of the store under its lock.
@@ -219,6 +224,10 @@ pub struct ContainerLaunch {
     /// definition gives it, and the ephemeral storage its task was given
     /// ([`super::container_process`]).
     process: ContainerProcess,
+    /// The container's own writable layer, the one the store holds for it
+    /// ([`ContainerRun::layer`]): the program runs over the CONTAINER's filesystem, not over
+    /// one of its own.
+    layer: ContainerLayer,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -297,7 +306,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 },
                 None => TaskRoleCredential::Absent,
             };
-            let mut started: Vec<(String, Arc<ContainerSignals>, bool)> = Vec::new();
+            let mut started: Vec<(String, Arc<ContainerSignals>, bool, ContainerLayer)> =
+                Vec::new();
             for container in &task.containers {
                 // A container that has not STARTED yet runs nothing: one whose
                 // `dependsOn` conditions are not met is still `PENDING`, and its program
@@ -411,10 +421,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     continue;
                 }
                 let signals = Arc::new(ContainerSignals::new());
+                // The layer this container's filesystem is: minted once for the container and
+                // handed to every session that runs in it — the program's below, and each
+                // health-check probe's off the stored run.
+                let layer = ContainerLayer::new();
                 started.push((
                     container.container_arn.clone(),
                     Arc::clone(&signals),
                     program.is_some(),
+                    layer.clone(),
                 ));
                 launches.push(ContainerLaunch {
                     container_arn: container.container_arn.clone(),
@@ -448,9 +463,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     // What this container's process runs as, read off the same stored
                     // definition its program is, and off the task's own placement.
                     process: ContainerProcess::of(Some(stored), task),
+                    layer,
                 });
             }
-            for (container_arn, signals, runs_a_program) in started {
+            for (container_arn, signals, runs_a_program, layer) in started {
                 self.container_runs.insert(
                     container_arn,
                     ContainerRun {
@@ -459,11 +475,25 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                         runs_a_program,
                         ended: false,
                         handle: None,
+                        layer,
                     },
                 );
             }
         }
         launches
+    }
+
+    /// The writable layer of the container `container_arn` names, and `None` for a container
+    /// this store holds no run of.
+    ///
+    /// What a session that runs INSIDE that container is given, so it reads and writes the
+    /// CONTAINER's filesystem: a health-check probe of a container whose program wrote a file
+    /// finds that file ([`super::container_health`]). A container with no run has had nothing
+    /// run in it, so there is no layer to share and none is invented.
+    pub(super) fn container_layer(&self, container_arn: &str) -> Option<ContainerLayer> {
+        self.container_runs
+            .get(container_arn)
+            .map(|run| run.layer.clone())
     }
 
     /// How many of the runs this store holds are still GOING, which is what
@@ -659,7 +689,8 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
         // store held: the files of an `efsVolumeConfiguration` volume are the Amazon EFS
         // service's own, so resolving one reads that service's store
         // ([`super::container_volumes`]).
-        let filesystem = ContainerFilesystem::new(
+        let filesystem = ContainerFilesystem::on_layer(
+            launch.layer.clone(),
             launch.working_directory.as_deref(),
             mounted_volumes(&**engine, &state, &launch.mounts),
         );

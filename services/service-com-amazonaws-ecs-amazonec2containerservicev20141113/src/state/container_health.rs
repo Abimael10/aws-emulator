@@ -22,8 +22,10 @@
 //! So, for a container whose definition declares a command:
 //!
 //! * the probe is EXECUTED — in this process, through the same session a container's own
-//!   `command` runs in ([`ContainerShell`]) — once the container is running, and again one
-//!   `interval` after each execution;
+//!   `command` runs in ([`ContainerShell`]), over the container's OWN filesystem
+//!   ([`super::container_filesystem::ContainerLayer`]), because the probe runs INSIDE the
+//!   container — once the container is running, and again one `interval` after each
+//!   execution;
 //! * an execution that exits zero makes the container `HEALTHY` and clears the failures
 //!   counted against it; one that exits non-zero, or that the `timeout` ran out on, counts
 //!   as a failure;
@@ -392,6 +394,10 @@ pub struct HealthProbeLaunch {
     /// container, so the user, the resource limits and the storage it reports are the
     /// container's own ([`super::container_process`]).
     process: ContainerProcess,
+    /// The container's OWN writable layer, for that same reason: the probe runs INSIDE the
+    /// container, so the files its command names are the ones the container's own program
+    /// left there ([`super::container_filesystem::ContainerLayer`]).
+    layer: ContainerLayer,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -525,6 +531,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     working_directory: stored
                         .and_then(|stored| stored.working_directory.clone()),
                     process: ContainerProcess::of(stored, task),
+                    // The container's own filesystem: the probe runs inside the container, so
+                    // it reads the layer the container's program writes rather than one of its
+                    // own. A container this store holds no run of has had nothing run in it,
+                    // so its layer holds nothing either.
+                    layer: self
+                        .container_layer(&container.container_arn)
+                        .unwrap_or_default(),
                 });
             }
         }
@@ -803,7 +816,8 @@ pub fn settle_container_health<Eng: Send + Sync + 'static>(
         let callback = callback.clone();
         // Resolved with NO guard of this store held, exactly as a container's own run
         // resolves its mounts ([`super::container_runtime::settle_container_runtime`]).
-        let filesystem = ContainerFilesystem::new(
+        let filesystem = ContainerFilesystem::on_layer(
+            probe.layer.clone(),
             probe.working_directory.as_deref(),
             mounted_volumes(&**engine, &state, &probe.mounts),
         );

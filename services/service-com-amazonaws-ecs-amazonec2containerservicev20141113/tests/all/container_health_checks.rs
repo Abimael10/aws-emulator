@@ -45,6 +45,9 @@
 //!
 //! Nothing here reaches into the state struct: every value asserted is read back through
 //! `DescribeTasks`, so a status that is not computed from persisted state cannot pass.
+//!
+//! The three tests at the very END pin a third rule — WHAT the probe sees when it asks about
+//! the container's FILESYSTEM — and are introduced where they stand.
 
 use std::time::{Duration, Instant};
 
@@ -938,5 +941,276 @@ async fn a_rollout_whose_container_never_passes_its_probe_is_failed_and_rolled_b
         count(&record["deploymentCircuitBreaker"], "failureCount", case) >= THRESHOLD,
         "case {case:?}: expected the breaker to have counted its threshold's worth of \
          failures, got {record}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// What a probe sees of the container's FILESYSTEM.
+//
+// The rule the three tests below pin, which is a rule of its own:
+//
+// > A health check is "the command that the container runs to determine if it is healthy"
+// > (`HealthCheck$command`), so the probe runs INSIDE the container and reads and writes the
+// > CONTAINER's own filesystem — the writable layer the container's `entryPoint`/`command`
+// > runs over. A path that program created is a path the probe finds, one it never wrote is
+// > one the probe does not find, one it removed is gone for the probe too, and what one
+// > execution of the probe leaves behind is there for the next one — while another
+// > container's layer is another filesystem, which this container's probe cannot see.
+//
+// The rows differ along what that rule generalises over: WHAT the probe asks about the
+// filesystem (whether a path exists, what a file it reads contains), WHICH form the command
+// is written in (`CMD-SHELL`, `CMD`), WHERE the path is (the container's own layer, a
+// directory its program made, a path named relative to `workingDirectory`), and WHO wrote
+// what the probe finds — the program, an earlier execution of the probe, or a container
+// beside it, which is the case the rule excludes.
+// ---------------------------------------------------------------------------------------
+
+/// The program a row's container runs: what that row writes into its own filesystem, and
+/// then the wait that keeps the container up for as long as the row observes it.
+fn writes_then_stays_up(writes: &str) -> Value {
+    json!(["sh", "-c", format!("{writes}sleep 300")])
+}
+
+/// A container definition named `name` running `command` under `health_check`, carrying
+/// `workingDirectory` when the row names one.
+fn probing_container(
+    name: &str,
+    command: Value,
+    check: Value,
+    working_directory: Option<&str>,
+) -> Value {
+    let mut container = json!({
+        "name": name,
+        "image": "public.ecr.aws/amazonlinux/amazonlinux:latest",
+        "memory": 128,
+        "command": command,
+        "healthCheck": check,
+    });
+    if let Some(directory) = working_directory {
+        container["workingDirectory"] = json!(directory);
+    }
+    container
+}
+
+/// One row of the filesystem table.
+struct FilesystemRow {
+    case: &'static str,
+    /// The task-definition family, so every row carries its own revision.
+    family: &'static str,
+    /// What the container's own program writes before it settles.
+    writes: &'static str,
+    /// `ContainerDefinition$workingDirectory`, for the row whose probe names a RELATIVE path.
+    working_directory: Option<&'static str>,
+    /// The `HealthCheck$command` array.
+    command: Value,
+    /// The `healthStatus` the container must reach.
+    expected: &'static str,
+}
+
+/// The rows: every kind of question a probe asks about its container's filesystem, in both
+/// forms `HealthCheck$command` documents, each coming to the reading its answer earns.
+fn filesystem_rows() -> Vec<FilesystemRow> {
+    vec![
+        FilesystemRow {
+            case: "a probe testing a path the program created",
+            family: "probefilecreated",
+            writes: "touch /tmp/ready; ",
+            working_directory: None,
+            command: json!(["CMD-SHELL", "test -f /tmp/ready"]),
+            expected: "HEALTHY",
+        },
+        FilesystemRow {
+            case: "a probe testing a path nothing wrote",
+            family: "probefileabsent",
+            writes: "touch /tmp/ready; ",
+            working_directory: None,
+            command: json!(["CMD-SHELL", "test -f /tmp/other"]),
+            expected: "UNHEALTHY",
+        },
+        FilesystemRow {
+            case: "a probe testing a path the program removed again",
+            family: "probefileremoved",
+            writes: "touch /tmp/ready; rm /tmp/ready; ",
+            working_directory: None,
+            command: json!(["CMD-SHELL", "test -f /tmp/ready"]),
+            expected: "UNHEALTHY",
+        },
+        FilesystemRow {
+            case: "a probe reading the contents the program wrote",
+            family: "probefilecontents",
+            writes: "echo ready > /tmp/state; ",
+            working_directory: None,
+            command: json!(["CMD-SHELL", "test \"$(cat /tmp/state)\" = ready"]),
+            expected: "HEALTHY",
+        },
+        FilesystemRow {
+            case: "a probe reading contents it does not accept",
+            family: "probefilecontentsbad",
+            writes: "echo down > /tmp/state; ",
+            working_directory: None,
+            command: json!(["CMD-SHELL", "test \"$(cat /tmp/state)\" = ready"]),
+            expected: "UNHEALTHY",
+        },
+        FilesystemRow {
+            case: "a CMD-form probe over a directory the program made",
+            family: "probecmdform",
+            writes: "mkdir -p /var/run/app; touch /var/run/app/ready; ",
+            working_directory: None,
+            command: json!(["CMD", "test", "-f", "/var/run/app/ready"]),
+            expected: "HEALTHY",
+        },
+        FilesystemRow {
+            case: "a probe naming the file relative to the working directory",
+            family: "proberelativepath",
+            writes: "touch ready; ",
+            working_directory: Some("/srv/app"),
+            command: json!(["CMD-SHELL", "test -f ready"]),
+            expected: "HEALTHY",
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_probe_reads_the_filesystem_the_container_s_own_program_wrote() {
+    let router = service();
+    cluster_with_capacity(&router, CLUSTER, "the cluster every row's task runs in").await;
+
+    // Every row's task is placed up front, so the executions of all of them fall due at once
+    // rather than one row's budget after another's.
+    let rows = filesystem_rows();
+    let mut placed: Vec<String> = Vec::new();
+    for row in &rows {
+        let containers = json!([probing_container(
+            "app",
+            writes_then_stays_up(row.writes),
+            health_check(row.command.clone(), 1, None),
+            row.working_directory,
+        )]);
+        placed.push(run_one(&router, row.family, containers, row.case).await);
+    }
+
+    for (row, task_arn) in rows.iter().zip(&placed) {
+        let case = row.case;
+        let expected = row.expected;
+        let task = poll_until(
+            &router,
+            task_arn,
+            case,
+            "the probe's question about the container's filesystem to be answered",
+            |task| {
+                task["lastStatus"].as_str() == Some("RUNNING")
+                    && container_health(task, "app", case) == expected
+            },
+        )
+        .await;
+        assert_eq!(
+            container_health(&task, "app", case),
+            expected,
+            "case {case:?}: expected the container to report {expected}, got {task}"
+        );
+        // "If all essential containers in the task are reporting as HEALTHY, the task status
+        // also reports as HEALTHY": this task's one container is essential by default.
+        assert_eq!(
+            task["healthStatus"].as_str(),
+            Some(expected),
+            "case {case:?}: the task reports the reading of its essential container, got \
+             {task}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn what_one_execution_of_a_probe_writes_is_there_for_the_next_one() {
+    let router = service();
+    let case = "a probe that writes its own marker on its first execution";
+    cluster_with_capacity(&router, CLUSTER, case).await;
+
+    // The probe runs in the container, so its OWN writes land on the container's layer: this
+    // one fails while the marker is missing and writes it, so the next execution of the very
+    // same command passes. The container's program writes nothing at all, so the only thing
+    // that can have put the marker there is the probe itself.
+    let containers = json!([probing_container(
+        "app",
+        writes_then_stays_up(""),
+        health_check(
+            json!([
+                "CMD-SHELL",
+                "if test -f /tmp/probed; then exit 0; else touch /tmp/probed; exit 1; fi",
+            ]),
+            1,
+            None,
+        ),
+        None,
+    )]);
+    let task_arn = run_one(&router, "probewritesitsown", containers, case).await;
+
+    let task = poll_until(
+        &router,
+        &task_arn,
+        case,
+        "the second execution to find what the first one wrote",
+        |task| container_health(task, "app", case) == "HEALTHY",
+    )
+    .await;
+    assert_eq!(
+        task["healthStatus"].as_str(),
+        Some("HEALTHY"),
+        "case {case:?}: the task reports the reading of its essential container, got {task}"
+    );
+}
+
+#[tokio::test]
+async fn one_container_s_probe_does_not_see_another_container_s_filesystem() {
+    let router = service();
+    let case = "two containers of one task, one of them writing the marker";
+    cluster_with_capacity(&router, CLUSTER, case).await;
+
+    // `writer` creates the marker and tests for it; `watcher` writes nothing and tests for
+    // the SAME path. A container's layer is its own, so only the writer's probe finds it —
+    // an implementation sharing one filesystem across containers would report both healthy.
+    let containers = json!([
+        probing_container(
+            "writer",
+            writes_then_stays_up("touch /tmp/ready; "),
+            health_check(json!(["CMD-SHELL", "test -f /tmp/ready"]), 1, None),
+            None,
+        ),
+        probing_container(
+            "watcher",
+            writes_then_stays_up(""),
+            health_check(json!(["CMD-SHELL", "test -f /tmp/ready"]), 1, None),
+            None,
+        ),
+    ]);
+    let task_arn = run_one(&router, "probepercontainer", containers, case).await;
+
+    let task = poll_until(
+        &router,
+        &task_arn,
+        case,
+        "each container's probe to answer for its own filesystem",
+        |task| {
+            container_health(task, "writer", case) == "HEALTHY"
+                && container_health(task, "watcher", case) == "UNHEALTHY"
+        },
+    )
+    .await;
+    assert_eq!(
+        container_health(&task, "writer", case),
+        "HEALTHY",
+        "case {case:?}: the container that wrote the marker finds it, got {task}"
+    );
+    assert_eq!(
+        container_health(&task, "watcher", case),
+        "UNHEALTHY",
+        "case {case:?}: the container beside it does not, got {task}"
+    );
+    // "If any essential containers in the task are reporting as UNHEALTHY ... the task
+    // status also reports as UNHEALTHY": both containers of this task are essential.
+    assert_eq!(
+        task["healthStatus"].as_str(),
+        Some("UNHEALTHY"),
+        "case {case:?}: the task reports the worst reading of its essential containers, got \
+         {task}"
     );
 }
