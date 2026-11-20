@@ -14,11 +14,11 @@
 //! ItemResponse object is an empty Map" — the map of projected name-value pairs being the
 //! empty one), never the absence that stands for "there is no such item".
 //!
-//! The rows span what the rule generalises over: the READER that carries such a member
-//! (`GetItem` and each element of a `TransactGetItems`), the FORM of the projection that
-//! matched nothing (an attribute the item does not hold, that attribute reached through an
-//! alias, a path into a map the item holds nothing at, a path into a list past its end, a
-//! path through a scalar, several such paths at once), and the item the projection was
+//! The rows span what the rule generalises over: the FORM of the projection that matched
+//! nothing (an attribute the item does not hold, that attribute reached through an alias, a
+//! path into a map the item holds nothing at, a path into a list past its end, a path
+//! through a scalar, several such paths at once), the MEMBER the projection was stated
+//! through (`ProjectionExpression` and the legacy `AttributesToGet`), and the item it was
 //! applied to (one with attributes of every shape, and a key that holds no item at all) —
 //! each beside a projection that DOES match, so the rows show what the member carries for
 //! the same reader and the same item.
@@ -208,6 +208,66 @@ async fn a_single_item_read_reports_the_item_member_of_every_item_it_found() {
             row.reported.is_none(),
             "case {:?} (GetItem): only a key holding no item reports no member, got {read}",
             row.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_legacy_projection_member_reports_that_item_the_same_way() {
+    let router = seeded().await;
+
+    // `AttributesToGet` is "a legacy parameter. Use ProjectionExpression instead" (that
+    // member's doc) — the same ask one generation apart, so what the read REPORTS of the
+    // item it found follows the same rule: a list naming only attributes the item does not
+    // hold still reports the item it found, as the empty map.
+    for (case, key, names, expected) in [
+        (
+            "a name the item does not hold",
+            seed_key(),
+            vec!["absent"],
+            Some(json!({})),
+        ),
+        (
+            "several names the item does not hold",
+            seed_key(),
+            vec!["absent", "missing"],
+            Some(json!({})),
+        ),
+        (
+            "a name the item holds beside one it does not",
+            seed_key(),
+            vec!["absent", "note"],
+            Some(json!({"note": {"S": "hello"}})),
+        ),
+        (
+            "a name whose value is a whole nested document",
+            seed_key(),
+            vec!["doc"],
+            Some(json!({"doc": {"M": {"leaf": {"S": "deep"}}}})),
+        ),
+        (
+            "a name whose value is a whole stored list",
+            seed_key(),
+            vec!["parts"],
+            Some(json!({"parts": {"L": [{"S": "zero"}, {"S": "one"}]}})),
+        ),
+        (
+            "a key that holds no item",
+            absent_key(),
+            vec!["absent"],
+            None,
+        ),
+    ] {
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": TABLE, "Key": key, "AttributesToGet": names}),
+        )
+        .await;
+        assert_eq!(
+            read.get("Item").cloned(),
+            expected,
+            "case {case:?}: expected Item {expected:?}, got {read}"
         );
     }
 }

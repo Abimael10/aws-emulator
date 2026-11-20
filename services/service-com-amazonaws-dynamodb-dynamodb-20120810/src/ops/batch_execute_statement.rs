@@ -38,8 +38,11 @@
 //!   found (none at all when the key holds none), a write reports what its `RETURNING`
 //!   clause asked for, every slot that REACHED its table echoes that table under
 //!   `TableName` — so a batch spread over several tables can be attributed slot by slot,
-//!   while a statement refused on its own merits before it read or wrote anything carries
-//!   the error alone — and `ConsumedCapacity` carries one entry per statement that
+//!   while a statement refused for its own FORM, before it read or wrote anything, carries
+//!   the error alone. A statement the STORED item refused — an operand of the wrong type
+//!   for the value an attribute holds, an item the change would leave too large — reached
+//!   its table as surely as one that ran, so its slot names that table too
+//!   ([`at_table`]) — and `ConsumedCapacity` carries one entry per statement that
 //!   consumed capacity, "ordered according to the ordering of the statements".
 //! * A statement's write is admitted from the capacity its table is provisioned for
 //!   ([`crate::state::Table::admit_write`]): one past that budget is throttled in its
@@ -361,8 +364,10 @@ struct SlotFailure {
     message: String,
     /// The table the statement REACHED: "The table name associated with a failed PartiQL
     /// batch statement" (`BatchStatementResponse$TableName`) — the table a statement that
-    /// ran against its items failed on, and `None` for a statement refused on its own
-    /// merits before it read or wrote anything, which reached no table.
+    /// ran against its items failed on, whether it failed its condition, was refused by
+    /// what the STORED item holds ([`at_table`]) or was throttled, and `None` for a
+    /// statement refused for its own form before it read or wrote anything, which reached
+    /// no table.
     table: Option<String>,
     /// "The item which caused the condition check to fail. This will be set if
     /// ReturnValuesOnConditionCheckFailure is specified as ALL_OLD"
@@ -424,6 +429,20 @@ impl From<crate::state::RequestError> for SlotFailure {
     }
 }
 
+/// A store refusal a statement earned once it was APPLIED to the item its table holds, or
+/// once that table was resolved and inspected, as the slot that earned it reports it:
+/// against the table the statement RAN against, which a name this endpoint resolved to no
+/// table of its own is as well.
+///
+/// Such a refusal is one only the stored data can produce — what a clause does to the value
+/// an attribute already holds, and what the item the statement leaves behind costs — so the
+/// statement did reach its table, exactly as one that ran to completion and one whose
+/// condition a stored item did not satisfy did. Only a statement refused for its own FORM,
+/// before any item was read, reached no table and carries the error alone.
+fn at_table(name: &str) -> impl Fn(crate::state::RequestError) -> SlotFailure + '_ {
+    move |error| SlotFailure::from(error).at(name)
+}
+
 /// What one slot answers: its response, and the capacity that statement consumed when
 /// the request asked for capacity detail.
 type SlotOutcome = (BatchStatementResponse, Option<ConsumedCapacity>);
@@ -450,7 +469,7 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // statement reads or writes anything.
         let table = store
             .active_table(region, &name, now)
-            .map_err(|error| SlotFailure::from(error).at(&name))?;
+            .map_err(at_table(&name))?;
         // A statement of a batch performs its own PartiQL action INSIDE this operation,
         // which is what a statement admitting that action only as part of a given operation
         // tests ([`crate::state::authorization::EnclosingOperation`]).
@@ -470,8 +489,7 @@ fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
         // not use leaves nothing this statement could read or encrypt: this slot reports
         // the KMS fault and writes NOTHING
         // ([`crate::state::check_table_key_accessible`]).
-        crate::state::check_table_key_accessible(engine, table)
-            .map_err(|error| SlotFailure::from(error).at(&name))?;
+        crate::state::check_table_key_accessible(engine, table).map_err(at_table(&name))?;
         // A source keyed by several `HASH` or several `RANGE` attributes is addressed by
         // no equality a statement's `WHERE` clause can pin, so this slot reports that
         // before the clause it states is judged at all
@@ -638,7 +656,7 @@ fn read_item(
     // any further predicate the stored item does not satisfy reports no item, exactly
     // as the single-statement path reports none.
     let found = match table.items.get(&key) {
-        Some(item) if condition.evaluate(Some(item))? => Some(item.clone()),
+        Some(item) if condition.evaluate(Some(item)).map_err(at_table(name))? => Some(item.clone()),
         _ => None,
     };
     let units = crate::state::read_capacity_units(
@@ -722,7 +740,9 @@ fn insert_item(
         .active_table(region, name, now)?
         .write_capacity(None, Some(&item));
     admit_write(store, region, name, now, &key, &capacity)?;
-    store.put_item(region, name, now, key, item.clone())?;
+    store
+        .put_item(region, name, now, key, item.clone())
+        .map_err(at_table(name))?;
     Ok((
         // An `INSERT` states no `RETURNING` clause, so its slot reports the write and
         // no item.
@@ -768,7 +788,8 @@ fn update_item(
     let satisfied = before
         .as_ref()
         .map(|item| condition.evaluate(Some(item)))
-        .transpose()?
+        .transpose()
+        .map_err(at_table(name))?
         .unwrap_or(false);
     if !satisfied {
         // The statement is refused and nothing is written, but its slot is METERED like the
@@ -790,7 +811,10 @@ fn update_item(
     }
 
     let mut item = before.clone().unwrap_or_default();
-    let touched = clauses.apply(&mut item)?;
+    // What a clause DOES is decided against the value the stored item already holds — an
+    // operand of the wrong type for it is the stored data's answer to the statement — so
+    // from here every refusal is one the statement earned at its table ([`at_table`]).
+    let touched = clauses.apply(&mut item).map_err(at_table(name))?;
     for attribute in touched.attributes() {
         if attribute.as_str() == partition_key.as_str()
             || Some(attribute.as_str()) == sort_key.as_deref()
@@ -798,7 +822,8 @@ fn update_item(
             return Err(SlotFailure::validation(format!(
                 "One or more parameter values were invalid: Cannot update attribute \
                  {attribute}. This attribute is part of the key"
-            )));
+            ))
+            .at(name));
         }
     }
     // The item the statement leaves is held to exactly what a `PutItem` of it would be,
@@ -806,9 +831,10 @@ fn update_item(
     // ([`crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE`]).
     for (attribute, value) in &item {
         crate::state::check_attribute_value(attribute, value)
-            .map_err(crate::state::stated_for_an_update)?;
+            .map_err(crate::state::stated_for_an_update)
+            .map_err(at_table(name))?;
     }
-    crate::state::canonicalize_item(&mut item)?;
+    crate::state::canonicalize_item(&mut item).map_err(at_table(name))?;
     // A statement states its change without an expression, so nothing is charged on top of
     // the item it leaves ([`crate::state::update_size_exceeded`]) beyond what its key portion
     // is charged.
@@ -817,15 +843,20 @@ fn update_item(
         if crate::state::update_size_exceeded(table, &item, 0) {
             return Err(SlotFailure::validation(
                 crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
-            ));
+            )
+            .at(name));
         }
-        table.check_index_keys_of_update(&item)?;
+        table
+            .check_index_keys_of_update(&item)
+            .map_err(at_table(name))?;
     }
     let capacity = store
         .active_table(region, name, now)?
         .write_capacity(before.as_ref(), Some(&item));
     admit_write(store, region, name, now, &key, &capacity)?;
-    store.put_item(region, name, now, key, item.clone())?;
+    store
+        .put_item(region, name, now, key, item.clone())
+        .map_err(at_table(name))?;
 
     let reported = crate::state::projected_return_values(
         update
@@ -875,8 +906,8 @@ fn delete_item(
     // See [`crate::ops::execute_statement`]: the key the clause pins ADDRESSES the item,
     // so only what the clause states besides it is the condition this delete is held to —
     // held to the addressed item, and a key that holds none is nothing to remove.
-    let satisfied =
-        crate::state::delete_condition_satisfied(condition.as_ref(), before.as_ref())?;
+    let satisfied = crate::state::delete_condition_satisfied(condition.as_ref(), before.as_ref())
+        .map_err(at_table(name))?;
     if !satisfied {
         // See [`update_item`]: the refused slot writes nothing and is metered all the same
         // ([`crate::state::charge_refused_conditional_write`]).
@@ -897,7 +928,9 @@ fn delete_item(
         .active_table(region, name, now)?
         .write_capacity(before.as_ref(), None);
     admit_write(store, region, name, now, &key, &capacity)?;
-    let removed = store.delete_item(region, name, now, &key)?;
+    let removed = store
+        .delete_item(region, name, now, &key)
+        .map_err(at_table(name))?;
 
     // A delete removes every attribute of the item, so both OLD forms of a `RETURNING`
     // clause report the item as it stood.

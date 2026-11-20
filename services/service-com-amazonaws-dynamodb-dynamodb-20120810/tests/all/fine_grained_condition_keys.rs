@@ -851,9 +851,8 @@ struct ProjectionCase {
     case: &'static str,
     /// The projection as the request states it, in the member it states it through.
     request: Value,
-    /// The `Item` the read reports, or `Value::Null` where it reports no such member at
-    /// all — a projection that matched no location of the item it found reports NO `Item`,
-    /// because the response object is the empty one rather than the member.
+    /// The `Item` the read reports — the empty map where the projection matched no location
+    /// of the item it found, because the member's absence is what says the key held no item.
     reported: Value,
 }
 

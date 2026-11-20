@@ -4,7 +4,9 @@
 //! IMPLEMENTED: looks the item up by the primary key extracted from `Key` and
 //! reports exactly the `AttributeValue` map [`crate::ops::put_item`] stored. A key
 //! with no item is a 200 with `Item` absent, not an error; an unknown — or not yet
-//! `ACTIVE` — table is `ResourceNotFoundException`.
+//! `ACTIVE` — table is `ResourceNotFoundException`. The member's absence is what says
+//! the key held NO item, so an item it did hold is reported whatever its projection
+//! narrowed it to, the empty map included.
 //!
 //! What the response carries of the item is the request's projection — a
 //! `ProjectionExpression` with its `ExpressionAttributeNames` aliases, or the legacy
