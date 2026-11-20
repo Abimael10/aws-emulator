@@ -419,13 +419,15 @@ async fn reading_an_unregistered_on_premises_instance_is_refused() {
     }
 }
 
-/// RULE: deregistering an instance RETIRES its record with a `deregisterTime`
-/// instead of dropping it — so the batch read still reports it while the
-/// single-instance read refuses it as not registered — deregistering a name
-/// twice or deregistering one that was never registered is a success, and the
-/// name can be registered again.
+/// RULE: deregistering an on-premises instance DELETES the record its
+/// registration is — so afterwards the name reads back as one the registry holds
+/// nothing for, through every reader: the single-instance read refuses it, the
+/// batch read reports no entry for it, and it is listed under NEITHER
+/// registration status. Deregistering a name twice, or one that was never
+/// registered, is a success, and registering the name again is a NEW
+/// registration: a new ARN, and none of the tags the old record carried.
 #[tokio::test]
-async fn deregistering_an_on_premises_instance_retires_its_record() {
+async fn deregistering_an_on_premises_instance_deletes_its_record() {
     let emulator = Emulator::new();
     let user_arn = "arn:aws:iam::000000000000:user/CodeDeployUser";
     emulator
@@ -434,6 +436,25 @@ async fn deregistering_an_on_premises_instance_retires_its_record() {
             json!({"instanceName": "retired", "iamUserArn": user_arn}),
         )
         .await;
+    // Tagged before it is deregistered, so what the deletion takes with it is
+    // observable: a re-registration cannot inherit these.
+    emulator
+        .ok(
+            "AddTagsToOnPremisesInstances",
+            json!({
+                "instanceNames": ["retired"],
+                "tags": [{"Key": "Env", "Value": "prod"}],
+            }),
+        )
+        .await;
+    let before = emulator
+        .ok("GetOnPremisesInstance", json!({"instanceName": "retired"}))
+        .await["instanceInfo"]
+        .clone();
+    let old_arn = before["instanceArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
 
     // Rows: the name holds a registration, the name was already deregistered,
     // and the name never held one at all. Every one of them succeeds.
@@ -452,7 +473,7 @@ async fn deregistering_an_on_premises_instance_retires_its_record() {
         );
     }
 
-    // The registration is gone, so the single-instance reader refuses the name.
+    // The record is gone, so the single-instance reader refuses the name.
     let code = emulator
         .refused(
             "a deregistered instance",
@@ -465,38 +486,38 @@ async fn deregistering_an_on_premises_instance_retires_its_record() {
         "case a deregistered instance: expected InstanceNotRegisteredException, got {code}"
     );
 
-    // The retired RECORD is still there: the batch read reports it, with the
-    // instant it was retired at.
+    // The batch reader holds no entry for it either, and neither registration
+    // status lists it: the record was deleted, not moved to another status.
     let read = emulator
         .ok(
             "BatchGetOnPremisesInstances",
             json!({"instanceNames": ["retired"]}),
         )
         .await;
-    let info = &read["instanceInfos"][0];
-    let deregister_time = info["deregisterTime"].as_f64().unwrap_or_default();
+    let infos = read["instanceInfos"].as_array().cloned().unwrap_or_default();
     assert!(
-        deregister_time > 0.0,
-        "case retired record: expected a deregisterTime, got {info:?}"
+        infos.is_empty(),
+        "case retired record: expected no entry for a deleted record, got {infos:?}"
     );
-    assert!(
-        info["registerTime"].as_f64().unwrap_or_default() <= deregister_time,
-        "case retired record: expected registerTime <= deregisterTime, got {info:?}"
-    );
+    for status in ["Registered", "Deregistered"] {
+        let listed = emulator
+            .ok(
+                "ListOnPremisesInstances",
+                json!({"registrationStatus": status}),
+            )
+            .await;
+        let names = listed["instanceNames"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !names.iter().any(|name| name.as_str() == Some("retired")),
+            "case {status:?}: expected a deleted record to be listed under no status, got {names:?}"
+        );
+    }
 
-    // Deregistering twice does not move the instant it was retired at.
-    let again = emulator
-        .ok(
-            "BatchGetOnPremisesInstances",
-            json!({"instanceNames": ["retired"]}),
-        )
-        .await;
-    assert_eq!(
-        again, read,
-        "case retired record read twice: expected a repeatable read, got {again:?}"
-    );
-
-    // The name, and the IAM ARN, are free again.
+    // The name, and the IAM ARN, are free again — and taking the name up again is
+    // a NEW registration: another ARN, and no tags.
     emulator
         .ok(
             "RegisterOnPremisesInstance",
@@ -505,11 +526,22 @@ async fn deregistering_an_on_premises_instance_retires_its_record() {
         .await;
     let reregistered = emulator
         .ok("GetOnPremisesInstance", json!({"instanceName": "retired"}))
-        .await;
+        .await["instanceInfo"]
+        .clone();
     assert!(
-        reregistered["instanceInfo"]["deregisterTime"].is_null(),
-        "case re-registered: expected no deregisterTime, got {:?}",
-        reregistered["instanceInfo"]
+        reregistered["deregisterTime"].is_null(),
+        "case re-registered: expected no deregisterTime, got {reregistered:?}"
+    );
+    let new_arn = reregistered["instanceArn"].as_str().unwrap_or_default();
+    assert!(
+        !new_arn.is_empty() && new_arn != old_arn,
+        "case re-registered: expected an instanceArn of its own, got {new_arn:?} against \
+         {old_arn:?}"
+    );
+    let tags = reregistered["tags"].as_array().cloned().unwrap_or_default();
+    assert!(
+        tags.is_empty(),
+        "case re-registered: expected none of the deleted record's tags, got {tags:?}"
     );
 }
 

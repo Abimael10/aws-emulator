@@ -190,22 +190,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         // Every revision in the batch has to identify an artifact. A
-        // `RevisionLocation` that names no location at all identifies nothing, so
-        // it is the same `InvalidRevisionException` the single-revision
-        // operations answer for one — and the whole batch is refused, since the
-        // answer carries no per-revision error channel to report it in.
+        // `RevisionLocation` that names no location at all identifies nothing,
+        // and neither does an inline one stating neither its content nor its
+        // digest, so each is the same `InvalidRevisionException` the
+        // single-revision operations answer for one — and the whole batch is
+        // refused, since the answer carries no per-revision error channel to
+        // report it in.
         let keys = requested
             .iter()
-            .map(crate::state::revision_key)
-            .collect::<Option<Vec<String>>>()
-            .ok_or_else(|| {
+            .map(crate::state::revision_location::key)
+            .collect::<Result<Vec<String>, crate::state::revision_location::Refusal>>()
+            .map_err(|refusal| {
                 BatchGetApplicationRevisionsError::from(
                     BatchGetApplicationRevisionsErrorModeled::InvalidRevisionException(
                         InvalidRevisionException {
                             message: Some(
-                                "The revision was specified in an invalid format: it names no S3, \
-                                 GitHub, string or AppSpec content location"
-                                    .to_string(),
+                                crate::state::revision_location::message(refusal).to_string(),
                             ),
                         },
                     ),

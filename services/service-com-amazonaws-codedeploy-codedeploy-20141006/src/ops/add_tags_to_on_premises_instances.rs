@@ -278,11 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // become, before writing anything: a refused call leaves no instance
             // tagged, so a caller never observes a half-applied request.
             for name in &names {
-                let registered = state
-                    .on_premises_instances
-                    .get(name)
-                    .is_some_and(crate::state::OnPremisesInstance::is_registered);
-                if !registered {
+                // A record IS a registration — deregistering an instance deletes
+                // it — so a name the registry holds nothing for is a name that is
+                // not registered.
+                if !state.on_premises_instances.contains_key(name) {
                     return Err(
                         AddTagsToOnPremisesInstancesErrorModeled::InstanceNotRegisteredException(
                             InstanceNotRegisteredException {

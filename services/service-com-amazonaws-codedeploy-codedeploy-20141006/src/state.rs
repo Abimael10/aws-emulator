@@ -84,6 +84,10 @@ pub mod ecs_services;
 /// that digest is computed, where such a revision is recorded.
 pub mod revision_digest;
 
+/// What a request's `RevisionLocation` has to carry: the one place a revision a
+/// request names becomes the revision's identity, or the refusal it earns.
+pub mod revision_location;
+
 /// The deployment members a read SUMMARISES or DEFAULTS rather than echoes back:
 /// the status summary of the targets a deployment holds, and the file-handling
 /// policy every deployment runs under.
@@ -1752,18 +1756,20 @@ pub struct DeploymentConfig {
 /// carries (the generated `crate::ops::types::REGISTRATION_STATUS_VALUES`:
 /// Deregistered | Registered).
 pub const REGISTRATION_STATUS_REGISTERED: &str = "Registered";
-/// See [`REGISTRATION_STATUS_REGISTERED`]: the status of an instance whose
-/// registration has ended, whose record CodeDeploy keeps.
+/// See [`REGISTRATION_STATUS_REGISTERED`]: the other value of the enum, the
+/// status no record this store holds is in — deregistering an instance DELETES
+/// its record
+/// ([`ComAmazonawsCodedeployCodedeploy20141006State::deregister_on_premises_instance`]),
+/// so no retired record is left to report under it.
 pub const REGISTRATION_STATUS_DEREGISTERED: &str = "Deregistered";
 
 /// A registered on-premises instance.
 ///
-/// The record OUTLIVES its registration: CodeDeploy keeps a deregistered
-/// instance, with the instant it was deregistered, which is what lets
-/// `ListOnPremisesInstances` answer the `Deregistered` registration status and a
-/// batch read report a `deregisterTime`. The single-instance reader
-/// (`GetOnPremisesInstance`) reports only an instance that is still registered:
-/// a name whose registration is gone is its `InstanceNotRegisteredException`.
+/// A record lives exactly as long as its registration: deregistering an instance
+/// REMOVES it, so every reader — the single-instance read, the batch read and
+/// the listing under either registration status — answers a deregistered name as
+/// a name the registry holds nothing for, and registering that name again is a
+/// new registration with a new ARN and no tags.
 #[derive(Debug, Clone)]
 pub struct OnPremisesInstance {
     pub instance_name: String,
@@ -1774,20 +1780,10 @@ pub struct OnPremisesInstance {
     /// See [`OnPremisesInstance::iam_user_arn`].
     pub iam_session_arn: Option<String>,
     pub register_time_ms: i64,
-    /// `None` while the instance is registered; the instant it was deregistered
-    /// once it is not.
-    pub deregister_time_ms: Option<i64>,
     pub tags: Vec<Tag>,
 }
 
 impl OnPremisesInstance {
-    /// Whether this instance is currently registered, as the model's
-    /// `RegistrationStatus` (`smithy_query(query="shape",shape="RegistrationStatus")`:
-    /// Registered | Deregistered) distinguishes the two.
-    pub fn is_registered(&self) -> bool {
-        self.deregister_time_ms.is_none()
-    }
-
     /// How many tags this instance would carry once `tags` were added: a tag
     /// REPLACES the value of a key the instance already carries rather than
     /// adding a second entry for it, so only genuinely new keys count.
@@ -1915,8 +1911,9 @@ pub struct ComAmazonawsCodedeployCodedeploy20141006State {
     /// operations over this store only READ it (`ListGitHubAccountTokenNames`) and
     /// REMOVE from it (`DeleteGitHubAccountToken`).
     pub git_hub_account_token_names: Vec<String>,
-    /// On-premises instances by `instanceName`, registered and deregistered
-    /// alike — a deregistered instance keeps its record.
+    /// On-premises instances by `instanceName`. A record IS a registration: the
+    /// deregistering operation deletes the record it names, so every name in
+    /// here is a host that holds one.
     pub on_premises_instances: HashMap<String, OnPremisesInstance>,
     /// Registration order of on-premises instance names, so
     /// `ListOnPremisesInstances` is deterministic and pages stably.
@@ -1927,8 +1924,9 @@ pub struct ComAmazonawsCodedeployCodedeploy20141006State {
     ///
     /// It carries an entry only while that instance is REGISTERED, which
     /// [`ComAmazonawsCodedeployCodedeploy20141006State::register_on_premises_instance`]
-    /// maintains; an operation that deregisters an instance drops its entry
-    /// through [`ComAmazonawsCodedeployCodedeploy20141006State::release_iam_arns_of`].
+    /// maintains; the deregistration that deletes an instance's record drops its
+    /// entry through
+    /// [`ComAmazonawsCodedeployCodedeploy20141006State::release_iam_arns_of`].
     iam_arn_owners: HashMap<String, String>,
     /// Counter behind every minted identifier, so two ids from one process can
     /// never collide.
@@ -2389,13 +2387,13 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
             if deployment.start_time_ms.is_some()
                 && deployment.complete_time_ms.is_none()
                 && deployment.completes_at_ms <= now_ms
-                // A deployment whose traffic shift is being carried out right now
-                // is NOT settled: the outcome it reaches has to follow the shift,
-                // so the pass carrying it out writes back what it came to first
-                // (see `lambda_traffic_shift::apply_due_shifts`), and the next
-                // pass settles it.
-                && deployment.traffic_shift
-                    != lambda_traffic_shift::TrafficShiftProgress::InFlight
+                // A deployment whose traffic shift has not been carried out in
+                // full is NOT settled: the shift is what a Lambda deployment
+                // does, so the outcome it reaches has to follow the shift — the
+                // pass carrying an increment out writes back what it came to
+                // first (see `lambda_traffic_shift::apply_due_shifts`), and a
+                // later pass settles it.
+                && !lambda_traffic_shift::blocks_completion(deployment)
                 // Nor is an Amazon ECS deployment that has not finished replacing
                 // the service's task set: its outcome follows the replacement task
                 // set serving the production traffic and the original one being
@@ -2408,7 +2406,18 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                 // long the function takes (see `lifecycle_hook`).
                 && lifecycle_hook::hooks_are_complete(deployment)
             {
-                let status = terminal_status(deployment.target_count());
+                // What this deployment has come to: a Lambda deployment performs
+                // the alias shift its revision's AppSpec declares, so one whose
+                // revision declared none performed nothing and cannot report
+                // success for it — it ends FAILED, carrying the error information
+                // that says why.
+                let status = match lambda_traffic_shift::undeclared_shift_failure(deployment) {
+                    Some(failure) => {
+                        deployment.error_information = Some(failure);
+                        DEPLOYMENT_STATUS_FAILED
+                    }
+                    None => terminal_status(deployment.target_count()),
+                };
                 deployment.status = status.to_string();
                 deployment.complete_time_ms = Some(deployment.completes_at_ms);
                 if status == DEPLOYMENT_STATUS_FAILED {
@@ -2662,27 +2671,22 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
         self.iam_arn_owners
             .get(iam_arn)
             .and_then(|name| self.on_premises_instances.get(name))
-            .filter(|instance| instance.is_registered())
     }
 
     /// The names of the on-premises instances a listing answers for one
     /// `registrationStatus` and one tag filter list, in REGISTRATION order so
     /// the listing is deterministic and pages stably.
     ///
-    /// A host's REGISTRATION is what the fleet listing reports, so the default
-    /// listing answers the hosts that hold one: deregistering a host ends its
-    /// registration, and the record CodeDeploy keeps for it is surfaced by the
-    /// `Deregistered` registration status — the status whose own purpose is to ask
-    /// for the retired records — rather than by the unrestricted listing. That is
-    /// the behaviour measured on the real service: after a successful
-    /// deregistration the host is gone from the unfiltered listing while every
-    /// other registered host is still in it.
+    /// A record the registry holds is a REGISTRATION, so the hosts the listing
+    /// answers are the hosts that hold one: deregistering a host deletes its
+    /// record, which is why the name of a host a caller deregistered is answered
+    /// under NEITHER status — it is gone from the registry rather than moved to
+    /// the other one.
     ///
     /// Both members RESTRICT what the registry would otherwise answer, and the tag
     /// filters "are used to restrict the on-premises instance names returned"
     /// (`smithy_query(query="doc",shape="ListOnPremisesInstancesInput",member="tagFilters")`)
-    /// — a record is reported with the tags it still carries, which is what lets a
-    /// retired record be selected by tag under the `Deregistered` status.
+    /// — a record is reported with the tags it carries.
     pub fn on_premises_instance_names(
         &self,
         registration_status: Option<&str>,
@@ -2691,10 +2695,11 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
         self.on_premises_instance_order
             .iter()
             .filter_map(|name| self.on_premises_instances.get(name))
-            .filter(|instance| match registration_status {
-                None | Some(REGISTRATION_STATUS_REGISTERED) => instance.is_registered(),
-                Some(REGISTRATION_STATUS_DEREGISTERED) => !instance.is_registered(),
-                // A status outside the modelled enum is refused at the request
+            .filter(|_| match registration_status {
+                None | Some(REGISTRATION_STATUS_REGISTERED) => true,
+                // Every record the registry holds is registered, so
+                // [`REGISTRATION_STATUS_DEREGISTERED`] selects none of them. A
+                // status outside the modelled enum is refused at the request
                 // boundary, so it never reaches here; selecting nothing for it
                 // is the conservative answer if it ever did.
                 Some(_) => false,
@@ -2707,15 +2712,15 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
     /// Record `instance` as this store's newest registration, keeping the
     /// registry bounded by [`MAX_ON_PREMISES_INSTANCES`].
     ///
-    /// `false` means the registry is full of instances that are all still
-    /// REGISTERED, so nothing can be evicted to make room and the caller must
-    /// refuse the request rather than grow the store. Re-registering a name the
-    /// store already holds replaces that record and needs no room at all.
+    /// `false` means the registry already holds as many registrations as it
+    /// keeps, so the caller must refuse the request rather than grow the store —
+    /// room is made by DEREGISTERING a host, which deletes its record.
+    /// Re-registering a name the store already holds replaces that record and
+    /// needs no room at all.
     pub fn register_on_premises_instance(&mut self, instance: OnPremisesInstance) -> bool {
         let name = instance.instance_name.clone();
         let replacing = self.on_premises_instances.contains_key(&name);
         if !replacing {
-            self.evict_deregistered_instances(MAX_ON_PREMISES_INSTANCES - 1);
             if self.on_premises_instances.len() >= MAX_ON_PREMISES_INSTANCES {
                 return false;
             }
@@ -2736,7 +2741,7 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
 
     /// Free the IAM ARNs the instance named `name` holds, so they back no
     /// registered instance any more. Called when its registration ends — by a
-    /// re-registration here, and by an operation that deregisters it.
+    /// re-registration here, and by the deregistration that deletes the record.
     pub fn release_iam_arns_of(&mut self, name: &str) {
         let Some(instance) = self.on_premises_instances.get(name) else {
             return;
@@ -2753,37 +2758,25 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
         }
     }
 
-    /// Drop on-premises instance records that are no longer REGISTERED, oldest
-    /// first, until the registry holds at most `target` of them.
+    /// DELETE the on-premises instance record named `name`, answering whether the
+    /// registry held one.
     ///
-    /// Retention, not a reporting-time mutation: it only ever drops records a
-    /// caller already deregistered, and it runs on the registering call that
-    /// needs the room.
-    fn evict_deregistered_instances(&mut self, target: usize) {
-        if self.on_premises_instances.len() <= target {
-            return;
+    /// Deregistering a host ends its registration, and the registration IS the
+    /// record: the record, its ARN, its tags and its place in the listing order
+    /// all go, and the IAM ARN it held backs no instance any more. So a name a
+    /// caller deregistered reads back as a name the registry holds nothing for,
+    /// and registering it again is a new registration rather than a revival of
+    /// the old one.
+    pub fn deregister_on_premises_instance(&mut self, name: &str) -> bool {
+        // Released BEFORE the record is dropped, while the record still names the
+        // ARNs it holds.
+        self.release_iam_arns_of(name);
+        if self.on_premises_instances.remove(name).is_none() {
+            return false;
         }
-        let mut excess = self.on_premises_instances.len() - target;
-        let instances = &mut self.on_premises_instances;
-        let owners = &mut self.iam_arn_owners;
-        self.on_premises_instance_order.retain(|name| {
-            let Some(instance) = instances.get(name) else {
-                // Not in the registry at all: the order list is stale here.
-                return false;
-            };
-            if excess == 0 || instance.is_registered() {
-                return true;
-            }
-            for arn in [&instance.iam_user_arn, &instance.iam_session_arn]
-                .into_iter()
-                .flatten()
-            {
-                owners.remove(arn);
-            }
-            instances.remove(name);
-            excess -= 1;
-            false
-        });
+        self.on_premises_instance_order
+            .retain(|listed| listed != name);
+        true
     }
 
     /// Mint an identifier shaped like the UUID CodeDeploy answers with for an
@@ -3078,9 +3071,6 @@ pub fn deployment_targets(
                 .on_premises_instance_order
                 .iter()
                 .filter_map(|name| state.on_premises_instances.get(name))
-                // A deregistered instance keeps its record but is no longer part
-                // of the fleet, so a deployment cannot target it.
-                .filter(|instance| instance.is_registered())
                 .filter(|instance| group_selects_instance(group, &instance.tags))
                 .map(|instance| DeploymentTargetSnapshot {
                     target_id: Some(instance.instance_name.clone()),
@@ -4160,7 +4150,10 @@ pub fn instance_info(instance: &OnPremisesInstance) -> crate::ops::types::Instan
         iam_user_arn: instance.iam_user_arn.clone(),
         instance_arn: Some(instance.instance_arn.clone()),
         register_time: Some(timestamp(instance.register_time_ms)),
-        deregister_time: instance.deregister_time_ms.map(timestamp),
+        // A record lives as long as its registration — deregistering the
+        // instance deletes it — so an instance a reader can report has not been
+        // deregistered, and the member stating when it was stays absent.
+        deregister_time: None,
         // The tags an instance carries are reported as the list it HOLDS, empty
         // included: an instance registered with no tags and one whose tags were
         // all removed hold the same thing, so they read back the same way and a
@@ -4687,7 +4680,6 @@ mod tests {
         state: &mut ComAmazonawsCodedeployCodedeploy20141006State,
         name: &str,
         tags: Vec<Tag>,
-        deregistered: bool,
     ) {
         let registration_id = mint_uuid_from(&mut state.next_id, "on-premises-registration");
         state.register_on_premises_instance(OnPremisesInstance {
@@ -4696,7 +4688,6 @@ mod tests {
             iam_user_arn: Some(format!("arn:aws:iam::123456789012:user/{name}")),
             iam_session_arn: None,
             register_time_ms: 1,
-            deregister_time_ms: deregistered.then_some(2),
             tags,
         });
     }
@@ -4810,17 +4801,16 @@ mod tests {
                 &mut state,
                 "rack-seven",
                 vec![tag("Env", "prod"), tag("Rack", "seven")],
-                false,
             );
-            register(&mut state, "plain", vec![tag("Env", "prod")], false);
-            // Deregistered, and tagged exactly like the first: it is a record,
-            // not a target.
+            register(&mut state, "plain", vec![tag("Env", "prod")]);
+            // Tagged exactly like the first and then DEREGISTERED, which deletes
+            // its record: there is nothing left for a deployment to target.
             register(
                 &mut state,
                 "retired",
                 vec![tag("Env", "prod"), tag("Rack", "seven")],
-                true,
             );
+            state.deregister_on_premises_instance("retired");
 
             let mut group = group("Server");
             group.on_premises_instance_tag_filters = case.filters;
@@ -4842,7 +4832,7 @@ mod tests {
     #[test]
     fn the_other_selectors_and_platforms_resolve_their_own_targets() {
         let mut state = ComAmazonawsCodedeployCodedeploy20141006State::default();
-        register(&mut state, "rack-seven", vec![tag("Env", "prod")], false);
+        register(&mut state, "rack-seven", vec![tag("Env", "prod")]);
 
         let ec2_filter = EC2TagFilter {
             key: Some("Env".to_string()),

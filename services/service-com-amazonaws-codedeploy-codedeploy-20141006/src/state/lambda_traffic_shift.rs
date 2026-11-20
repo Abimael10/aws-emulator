@@ -52,14 +52,91 @@ pub use super::appspec::{
 /// (`smithy_query(query="shape",shape="ErrorCode")` carries it).
 pub const ERROR_CODE_INVALID_LAMBDA_FUNCTION: &str = "INVALID_LAMBDA_FUNCTION";
 
+/// The `ErrorCode` a Lambda deployment whose revision's AppSpec declares no
+/// traffic shift fails with: the document it was created with configures no
+/// Lambda function for it to shift traffic for
+/// (`smithy_query(query="shape",shape="ErrorCode")` carries it).
+pub const ERROR_CODE_INVALID_LAMBDA_CONFIGURATION: &str = "INVALID_LAMBDA_CONFIGURATION";
+
+/// The message that goes with [`ERROR_CODE_INVALID_LAMBDA_CONFIGURATION`]: the
+/// document the deployment was handed carries no Lambda deployment configuration
+/// it could read — it is not an AppSpec at all, or it is one that declares no
+/// Lambda function to shift traffic for.
+///
+/// A FIXED sentence, naming neither the deployment nor the content it was given:
+/// what a client has to change is the AppSpec it sent, and the whole of that is in
+/// the request it made. Other causes share this error code — a configuration whose
+/// values do not match the function's own state — and this sentence is what tells
+/// a client it was the FILE that could not be read.
+pub const INVALID_LAMBDA_CONFIGURATION_MESSAGE: &str =
+    "The deployment failed because the AppSpec file that specifies the AWS Lambda deployment \
+     configuration is missing or has an invalid format";
+
+/// The failure a deployment has come to because its revision declared no traffic
+/// shift for it to perform, or `None` when it has come to none.
+///
+/// A Lambda deployment's revision IS the AppSpec, and the alias move that document
+/// declares is what the deployment DOES ([`super::appspec`]) — so a revision
+/// declaring none leaves the deployment nothing to carry out: content that is no
+/// YAML or JSON document, content whose `Resources` name no
+/// `AWS::Lambda::Function`, and content missing the properties the move is made of
+/// all leave it with nothing to deploy. Such a deployment cannot reach a
+/// successful outcome, since nothing was shifted; it ends FAILED carrying this
+/// error information instead, from the one place a deployment's outcome is decided
+/// ([`ComAmazonawsCodedeployCodedeploy20141006State::advance_clock`]).
+///
+/// Three deployments are owed nothing here: one of another compute platform (an
+/// EC2/on-premises deployment installs the bundle on its instances and declares no
+/// shift at all, and an Amazon ECS deployment's own steps are
+/// [`super::ecs_blue_green`]'s), one that already came to a failure of its own
+/// (the revision it could not locate, the role that did not authorize it, the
+/// alarms that stopped it), and one whose AppSpec this service never held — a
+/// revision that keeps its document in an artifact elsewhere is
+/// [`super::s3_revision`]'s business, which fails a deployment whose revision it
+/// could not locate.
+#[must_use]
+pub fn undeclared_shift_failure(deployment: &Deployment) -> Option<ErrorInformation> {
+    if deployment.compute_platform != COMPUTE_PLATFORM_LAMBDA
+        || deployment.lambda_traffic_shift.is_some()
+        || deployment.error_information.is_some()
+    {
+        return None;
+    }
+    super::appspec::revision_content(deployment.revision.as_ref()?)?;
+    Some(ErrorInformation {
+        code: Some(ERROR_CODE_INVALID_LAMBDA_CONFIGURATION.to_string()),
+        message: Some(INVALID_LAMBDA_CONFIGURATION_MESSAGE.to_string()),
+    })
+}
+
+/// Whether `deployment` still owes the traffic shift its revision declared, and so
+/// may not be given its terminal status yet.
+///
+/// The counterpart of [`super::ecs_blue_green::blocks_completion`]: the shift is
+/// what a Lambda deployment DOES, so one whose declared increments have not all
+/// been carried out has not finished, however long its window has been open — a
+/// caller that reads `Succeeded` reads it after the alias moved. A shift that was
+/// attempted and REFUSED owes nothing further: the deployment is failed where that
+/// refusal is recorded ([`fail_deployment`]).
+#[must_use]
+pub fn blocks_completion(deployment: &Deployment) -> bool {
+    if deployment.lambda_traffic_shift.is_none() {
+        return false;
+    }
+    match deployment.traffic_shift {
+        TrafficShiftProgress::Applied | TrafficShiftProgress::Refused => false,
+        TrafficShiftProgress::Declared | TrafficShiftProgress::InFlight => true,
+    }
+}
+
 /// How far a deployment's declared traffic shift has got.
 ///
 /// What keeps a deployment from being given a successful outcome before its shift
-/// has happened: the clock settles no deployment whose shift is
-/// [`TrafficShiftProgress::InFlight`]
-/// ([`ComAmazonawsCodedeployCodedeploy20141006State::advance_clock`]), so a
-/// caller that reads `Succeeded` reads it after the alias moved — including a
-/// caller racing the pass that moved it.
+/// has happened: the clock settles no deployment whose shift it still owes
+/// ([`blocks_completion`], read by
+/// [`ComAmazonawsCodedeployCodedeploy20141006State::advance_clock`]), so a caller
+/// that reads `Succeeded` reads it after the alias moved — including a caller
+/// racing the pass that moved it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficShiftProgress {
     /// Declared by the revision, and the next increment not yet carried out.

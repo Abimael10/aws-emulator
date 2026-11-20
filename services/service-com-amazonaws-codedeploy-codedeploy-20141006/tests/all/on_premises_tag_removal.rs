@@ -390,8 +390,9 @@ async fn a_tag_removal_request_is_refused_per_member() {
 
 /// RULE: `GetOnPremisesInstance` reports an instance only while its
 /// registration is live — a name with no live registration is refused with HTTP
-/// 400 `InstanceNotRegisteredException` — while the retired RECORD is still
-/// reported by the batch read, and registering the name again makes it readable.
+/// 400 `InstanceNotRegisteredException` — and the deregistration DELETED the
+/// record, so the batch read holds no entry for it either, while registering the
+/// name again makes it readable.
 #[tokio::test]
 async fn a_name_with_no_live_registration_is_refused_by_the_single_instance_read() {
     let emulator = Emulator::new();
@@ -406,8 +407,8 @@ async fn a_name_with_no_live_registration_is_refused_by_the_single_instance_read
             )
             .await;
     }
-    // Deregistering an already retired name stays a success and leaves it
-    // retired.
+    // Deregistering a name whose record is already gone stays a success and
+    // leaves it gone.
     emulator
         .ok(
             "DeregisterOnPremisesInstance",
@@ -457,22 +458,24 @@ async fn a_name_with_no_live_registration_is_refused_by_the_single_instance_read
         }
     }
 
-    // The retired record itself is kept: the batch read reports it, with the
-    // instant it was retired at.
+    // The record itself is gone: the batch read holds no entry for the name.
     let batched = emulator
         .ok(
             "BatchGetOnPremisesInstances",
             json!({"instanceNames": ["retired-once"]}),
         )
         .await;
-    let info = &batched["instanceInfos"][0];
+    let infos = batched["instanceInfos"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     assert!(
-        info["deregisterTime"].as_f64().unwrap_or_default() > 0.0,
-        "case \"the retired record\": expected a deregisterTime, got {info:?}"
+        infos.is_empty(),
+        "case \"the deleted record\": expected no entry for it, got {infos:?}"
     );
 
     // Tagging either way needs a live registration, so both tagging operations
-    // refuse a retired name with the same code.
+    // refuse a deregistered name with the same code.
     for operation in [
         "AddTagsToOnPremisesInstances",
         "RemoveTagsFromOnPremisesInstances",

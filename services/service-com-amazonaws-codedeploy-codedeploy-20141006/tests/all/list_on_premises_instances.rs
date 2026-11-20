@@ -3,14 +3,15 @@
 //! `ListOnPremisesInstances`, driven over the wire.
 //!
 //! RULE under test: the listing answers the names of the on-premises instance
-//! records the store holds, in one deterministic order, one page of
-//! `nextToken`-continued results at a time, RESTRICTED by the two restricting
-//! input members and by nothing else — `registrationStatus` keeps only the
-//! records in that registration state (absent: the hosts that hold a
-//! registration, which is the fleet the listing reports), and `tagFilters` keeps
-//! only the records matching ANY of its filters (absent or empty: no
-//! restriction, and a list longer than the service scans is refused) — and it
-//! changes nothing a later caller sees.
+//! records the store holds — every one of which is a REGISTRATION, since
+//! deregistering an instance deletes its record — in one deterministic order, one
+//! page of `nextToken`-continued results at a time, RESTRICTED by the two
+//! restricting input members and by nothing else — `registrationStatus` keeps
+//! only the records in that registration state (absent, or `Registered`: the
+//! hosts that hold a registration, which is every record there is; `Deregistered`:
+//! none of them), and `tagFilters` keeps only the records matching ANY of its
+//! filters (absent or empty: no restriction, and a list longer than the service
+//! scans is refused) — and it changes nothing a later caller sees.
 //!
 //! Every case goes through the same front door a client uses — the shared
 //! [`Emulator`] harness of `codedeploy_lifecycle` — so the boundary validator,
@@ -155,7 +156,9 @@ async fn list_every_page(emulator: &Emulator, case: &str, request: &Value) -> Ve
     }
 }
 
-/// A store holding five on-premises instance records, registered in this order:
+/// A store holding five on-premises instance records, registered in this order,
+/// one of which is deregistered again — which DELETES its record, so four are
+/// left:
 ///
 /// | name          | tags                      | registration   |
 /// |---------------|---------------------------|----------------|
@@ -179,10 +182,9 @@ async fn seeded_fleet() -> Emulator {
             tag(&emulator, name, tags).await;
         }
     }
-    // Deregistered AFTER it was tagged: the record (and its tags) outlives the
-    // registration, which is what the `Deregistered` status selects — and what
-    // the unrestricted listing, which reports the fleet that holds a
-    // registration, no longer carries.
+    // Deregistered AFTER it was tagged: the deregistration deletes the record
+    // and the tags with it, so the name is answered by no listing — under either
+    // registration status, and whatever the tag filters.
     emulator
         .ok(
             "DeregisterOnPremisesInstance",
@@ -196,7 +198,8 @@ async fn seeded_fleet() -> Emulator {
 /// restricting members select — `registrationStatus` by registration state, an
 /// absent one selecting the hosts that hold a registration, and `tagFilters` by
 /// ANY of its filters, an absent one restricting nothing — and the same request
-/// answers the same names every time.
+/// answers the same names every time. A record a caller deregistered is not
+/// among them under any status: deregistering deleted it.
 #[tokio::test]
 async fn the_listing_answers_the_records_the_request_selects() {
     let emulator = seeded_fleet().await;
@@ -223,9 +226,9 @@ async fn the_listing_answers_the_records_the_request_selects() {
             &["web-1", "web-2", "db-1", "untagged-1"],
         ),
         (
-            "only the deregistered records",
+            "the deregistered records, of which there are none",
             json!({"registrationStatus": "Deregistered"}),
-            &["retired-1"],
+            &[],
         ),
         (
             "KEY_AND_VALUE: one key/value pair",
@@ -246,7 +249,7 @@ async fn the_listing_answers_the_records_the_request_selects() {
                 "registrationStatus": "Deregistered",
                 "tagFilters": [filter(Some("env"), Some("prod"), Some("KEY_AND_VALUE"))],
             }),
-            &["retired-1"],
+            &[],
         ),
         (
             "KEY_ONLY: the value is not looked at",
@@ -319,6 +322,11 @@ async fn the_listing_answers_the_records_the_request_selects() {
             }),
             &[],
         ),
+        (
+            "the deleted record is not selected by the tags it used to carry",
+            json!({"tagFilters": [filter(Some("role"), Some("web"), Some("KEY_AND_VALUE"))]}),
+            &["web-1", "web-2"],
+        ),
     ];
 
     for (case, request, expected) in cases {
@@ -372,10 +380,10 @@ async fn the_listing_pages_without_repeating_or_skipping() {
     let emulator = Emulator::new();
     let page_size = service_com_amazonaws_codedeploy_codedeploy_20141006::state::PAGE_SIZE;
     // One page's worth plus a remainder, so a walk takes more than one page and
-    // the last page is a short one. Every third instance is deregistered and
-    // every other one is tagged, so each restriction selects a different count;
-    // an unrestricted listing reports the hosts that hold a registration, so a
-    // tag filter with no status alongside it selects the tagged ones among those.
+    // the last page is a short one. Every third instance is deregistered, which
+    // deletes its record, and every other one is tagged, so each restriction
+    // selects a different count: the listing reports the records that are left,
+    // and a tag filter selects the tagged ones among those.
     let total = page_size + page_size / 2 + 3;
     let mut registered: Vec<String> = Vec::new();
     let mut deregistered: Vec<String> = Vec::new();
@@ -403,7 +411,9 @@ async fn the_listing_pages_without_repeating_or_skipping() {
     }
 
     // Rows differ along the restriction, and so along how many records the walk
-    // has to page through.
+    // has to page through. The deregistered names are listed by nothing: their
+    // records are gone.
+    let nothing: Vec<String> = Vec::new();
     let cases: &[(&str, Value, &Vec<String>)] = &[
         ("no restriction: the registered ones", json!({}), &registered),
         (
@@ -412,9 +422,9 @@ async fn the_listing_pages_without_repeating_or_skipping() {
             &registered,
         ),
         (
-            "the deregistered ones",
+            "the deregistered ones, whose records were deleted",
             json!({"registrationStatus": "Deregistered"}),
-            &deregistered,
+            &nothing,
         ),
         (
             "the tagged ones that hold a registration",
@@ -454,6 +464,16 @@ async fn the_listing_pages_without_repeating_or_skipping() {
                 "case {case:?}: expected a nextToken on a full page, got {first:?}"
             );
         }
+    }
+
+    // Every name a caller deregistered is answered by no listing at all: its
+    // record was deleted rather than moved to another status.
+    let left = list_every_page(&emulator, "the records left", &json!({})).await;
+    for name in &deregistered {
+        assert!(
+            !left.contains(name),
+            "case {name:?}: expected a deleted record to be listed nowhere, got {left:?}"
+        );
     }
 }
 
@@ -532,9 +552,9 @@ async fn a_listing_the_service_will_not_accept_is_refused_with_its_modelled_code
 }
 
 /// RULE: the listing answers from the STORE, so a record appears when it is
-/// registered and moves between the two registration statuses as the
-/// registering and deregistering calls move it — a re-registration putting it
-/// back under `Registered`.
+/// registered and is gone from every listing once it is deregistered — the
+/// deregistration deletes it, so it is listed under neither status — and
+/// registering the name again puts it back under `Registered`.
 #[tokio::test]
 async fn the_listing_follows_the_registration_lifecycle() {
     let emulator = Emulator::new();
@@ -578,20 +598,21 @@ async fn the_listing_follows_the_registration_lifecycle() {
     let case = "after the deregistration";
     let names = list_every_page(&emulator, case, &deregistered).await;
     assert_eq!(
-        names, only,
-        "case {case:?}: expected the record under Deregistered, got {names:?}"
+        names, nothing,
+        "case {case:?}: expected nothing under Deregistered, the record having been deleted, got \
+         {names:?}"
     );
     let names = list_every_page(&emulator, case, &registered).await;
     assert_eq!(
         names, nothing,
         "case {case:?}: expected nothing under Registered, got {names:?}"
     );
-    // The retired record is NOT part of the fleet the unrestricted listing
-    // reports: deregistration ended its registration.
+    // Nor is the deleted record part of the fleet the unrestricted listing
+    // reports.
     let names = list_every_page(&emulator, case, &json!({})).await;
     assert_eq!(
         names, nothing,
-        "case {case:?}: expected the retired record to be gone from the listing, got {names:?}"
+        "case {case:?}: expected the deleted record to be gone from the listing, got {names:?}"
     );
 
     register(&emulator, name).await;

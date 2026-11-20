@@ -116,7 +116,7 @@ fn reported_digest(revision: &Value) -> Option<String> {
 /// Rows differ along what the rule generalises over: the inline FORM the revision
 /// takes, and the content it carries — a forward shift, its exact reverse (the same
 /// members, different values), a JSON spelling, content differing by one character,
-/// and empty content.
+/// and content of one character.
 #[tokio::test]
 async fn a_deployments_inline_revision_reports_the_digest_of_its_content() {
     let emulator = Emulator::new();
@@ -157,9 +157,9 @@ async fn a_deployments_inline_revision_reports_the_digest_of_its_content() {
             &forward,
         ),
         (
-            "a string revision carrying empty content",
-            raw_string_revision(""),
-            "",
+            "a string revision carrying one character of content",
+            raw_string_revision(" "),
+            " ",
         ),
     ];
 

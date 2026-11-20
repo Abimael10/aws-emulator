@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOnPremisesInstances
-//! Answers the names of the stored on-premises instances, one page at a time:
-//! registered and deregistered alike unless the request restricts the
-//! registration status, and restricted to the instances its tag filters select.
+//! Answers the names of the registered on-premises instances, one page at a
+//! time, restricted to the instances its tag filters select.
 //!
 //! This is the ONLY file to touch for this operation.
 //!

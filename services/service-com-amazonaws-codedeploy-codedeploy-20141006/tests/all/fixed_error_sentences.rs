@@ -19,6 +19,8 @@
 //!   already holds;
 //! * `InvalidLifecycleEventHookExecutionIdException` — an id that names no hook
 //!   execution the deployment can take a result for;
+//! * `InvalidRevisionException` as an INLINE revision stating neither its content
+//!   nor its digest earns it — a revision that is no revision at all;
 //! * the `NO_INSTANCES` `errorInformation` of a deployment whose group resolved
 //!   no target.
 //!
@@ -68,6 +70,10 @@ const IAM_SESSION_ARN_ALREADY_REGISTERED: &str = "The on-premises instance could
 
 /// `InvalidLifecycleEventHookExecutionIdException`'s whole sentence.
 const HOOK_EXECUTION_ID_INVALID: &str = "The lifecycleEventHookExecutionId is invalid";
+
+/// `InvalidRevisionException`'s whole sentence for an INLINE revision that states
+/// neither its content nor its digest.
+const EMPTY_INLINE_REVISION: &str = "Content and Sha256 value of the string can't both be empty";
 
 /// The `errorInformation.message` of a deployment whose group resolved no target,
 /// which goes with the `NO_INSTANCES` error code.
@@ -564,4 +570,193 @@ async fn a_deployment_that_resolves_no_target_answers_one_fixed_sentence() {
              got {answered:?}"
         );
     }
+}
+
+/// One inline revision, spelled as the request spells it: `member` is the inline
+/// form it travels in — `appSpecContent`, or the deprecated `string`, the two
+/// inline members of `smithy_query(query="shape",shape="RevisionLocation")` — and
+/// a member passed as `None` is left out of the request entirely.
+fn inline_revision(member: &str, content: Option<&str>, sha256: Option<&str>) -> Value {
+    let mut inline = json!({});
+    if let Some(content) = content {
+        inline["content"] = json!(content);
+    }
+    if let Some(sha256) = sha256 {
+        inline["sha256"] = json!(sha256);
+    }
+    let mut revision = json!({
+        "revisionType": if member == "string" { "String" } else { "AppSpecContent" },
+    });
+    revision[member] = inline;
+    revision
+}
+
+/// RULE: an inline revision stating NEITHER its content nor its digest hands the
+/// service no document, so every operation that reads a revision refuses the
+/// request with HTTP 400 `InvalidRevisionException` carrying that class's one
+/// fixed sentence and records nothing — while a revision that DOES carry one of
+/// the pair is a revision, accepted whatever its content says (a deployment of
+/// content that is not a usable AppSpec is what fails on it afterwards).
+#[tokio::test]
+async fn an_inline_revision_stating_nothing_answers_one_fixed_sentence() {
+    let emulator = Emulator::new();
+    let application = "empty-inline-revision";
+    let group = seeded_group(&emulator, application, "Server").await;
+
+    // Rows differ along the inline FORM carrying the pair and along HOW the pair
+    // states nothing: both members left out, an empty content, an empty content
+    // beside an empty digest.
+    let empty: &[(&str, Value)] = &[
+        (
+            "an appSpecContent stating neither member",
+            inline_revision("appSpecContent", None, None),
+        ),
+        (
+            "an appSpecContent whose content is empty",
+            inline_revision("appSpecContent", Some(""), None),
+        ),
+        (
+            "an appSpecContent whose content and digest are both empty",
+            inline_revision("appSpecContent", Some(""), Some("")),
+        ),
+        (
+            "a string revision stating neither member",
+            inline_revision("string", None, None),
+        ),
+        (
+            "a string revision whose content is empty",
+            inline_revision("string", Some(""), None),
+        ),
+    ];
+
+    for (row, revision) in empty {
+        // And along the operation that reads the revision: the one that deploys
+        // it, the one that registers it, and the two that read one back.
+        let requests: &[(&str, Value)] = &[
+            (
+                "CreateDeployment",
+                json!({
+                    "applicationName": application,
+                    "deploymentGroupName": group,
+                    "revision": revision,
+                }),
+            ),
+            (
+                "RegisterApplicationRevision",
+                json!({"applicationName": application, "revision": revision}),
+            ),
+            (
+                "GetApplicationRevision",
+                json!({"applicationName": application, "revision": revision}),
+            ),
+            (
+                "BatchGetApplicationRevisions",
+                json!({"applicationName": application, "revisions": [revision]}),
+            ),
+        ];
+        for (operation, request) in requests {
+            let case = format!("{row} on {operation}");
+            let answered = refused(
+                &emulator,
+                &case,
+                operation,
+                request.clone(),
+                "InvalidRevisionException",
+            )
+            .await;
+            assert_eq!(
+                answered, EMPTY_INLINE_REVISION,
+                "case {case:?}: expected that refusal's own sentence, got {answered:?}"
+            );
+        }
+    }
+
+    // None of those refusals recorded anything: the group holds no deployment and
+    // the application no revision.
+    let listed = emulator
+        .ok(
+            "ListDeployments",
+            json!({"applicationName": application, "deploymentGroupName": group}),
+        )
+        .await;
+    let deployments = listed["deployments"].as_array().cloned().unwrap_or_default();
+    assert!(
+        deployments.is_empty(),
+        "case the refused requests: expected no deployment on the group, got {deployments:?}"
+    );
+    let listed = emulator
+        .ok(
+            "ListApplicationRevisions",
+            json!({"applicationName": application}),
+        )
+        .await;
+    let revisions = listed["revisions"].as_array().cloned().unwrap_or_default();
+    assert!(
+        revisions.is_empty(),
+        "case the refused requests: expected no registered revision, got {revisions:?}"
+    );
+
+    // Rows differ along which of the pair the revision DOES state: content that
+    // is not a usable AppSpec, a digest with no content beside it, and one
+    // character of content. Each is a revision, so each registers and reads back.
+    let accepted: &[(&str, Value)] = &[
+        (
+            "an appSpecContent carrying content that is not an AppSpec",
+            inline_revision("appSpecContent", Some("not-an-appspec"), None),
+        ),
+        (
+            "an appSpecContent stating only its digest",
+            inline_revision(
+                "appSpecContent",
+                None,
+                Some("4355a46b19d348dc2f57c046f8ef63d4538ebb936000f3c9ee954a27460dd865"),
+            ),
+        ),
+        (
+            "a string revision carrying one character of content",
+            inline_revision("string", Some(" "), None),
+        ),
+    ];
+    for (case, revision) in accepted {
+        let (status, body) = emulator
+            .call(
+                "RegisterApplicationRevision",
+                json!({"applicationName": application, "revision": revision}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the revision to be registered, got {status} {body:?}"
+        );
+        let read = emulator
+            .ok(
+                "GetApplicationRevision",
+                json!({"applicationName": application, "revision": revision}),
+            )
+            .await;
+        assert_eq!(
+            read["revision"]["revisionType"], revision["revisionType"],
+            "case {case:?}: expected the registered revision to read back, got {read:?}"
+        );
+    }
+
+    // And the deploying operation takes one too: content the deployment cannot
+    // use is still a revision, so a deployment is created for it.
+    let case = "deploying content that is not an AppSpec";
+    let created = emulator
+        .ok(
+            "CreateDeployment",
+            json!({
+                "applicationName": application,
+                "deploymentGroupName": group,
+                "revision": inline_revision("appSpecContent", Some("not-an-appspec"), None),
+            }),
+        )
+        .await;
+    assert!(
+        created["deploymentId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("d-")),
+        "case {case:?}: expected a minted deploymentId, got {created:?}"
+    );
 }

@@ -481,17 +481,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             };
             // The revision's own identity, which is also what refuses one that
-            // names nowhere to deploy from.
-            let Some(revision_key) = crate::state::revision_key(&revision) else {
-                return Err(CreateDeploymentErrorModeled::InvalidRevisionException(
-                    InvalidRevisionException {
-                        message: Some(
-                            "The revision was specified in an invalid format: it names no S3, \
-                             GitHub, string or AppSpec content location"
-                                .to_string(),
-                        ),
-                    },
-                ));
+            // names nowhere to deploy from, and one whose inline form hands the
+            // service no document at all: both are refused HERE, before a
+            // deployment id is minted or anything is recorded against the group.
+            // A revision whose content is present but wrong IS a revision, and
+            // it is the deployment that fails on it.
+            let revision_key = match crate::state::revision_location::key(&revision) {
+                Ok(key) => key,
+                Err(refusal) => {
+                    return Err(CreateDeploymentErrorModeled::InvalidRevisionException(
+                        InvalidRevisionException {
+                            message: Some(
+                                crate::state::revision_location::message(refusal).to_string(),
+                            ),
+                        },
+                    ));
+                }
             };
             // An automatic rollback that is enabled but names no triggering event
             // cannot ever fire; an all-empty disabled one carries no information

@@ -166,16 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // It reports an instance only while that instance holds a LIVE
         // registration: this operation's `InstanceNotRegisteredException` is
         // documented as "The specified on-premises instance is not registered",
-        // which is exactly the state a deregistered name is in, so a name whose
-        // registration is gone is refused rather than reported. The retired
-        // record itself is kept (see `crate::state::OnPremisesInstance`) for the
-        // readers that report on a deregistered instance — a batch read, and
-        // the `Deregistered` registration-status listing.
+        // which is exactly the state a deregistered name is in. Deregistering an
+        // instance DELETES its record (see `crate::state::OnPremisesInstance`),
+        // so a name the registry holds nothing for is that refusal.
         let instance = crate::state::with_state(&*self.engine, |state| {
             state
                 .on_premises_instances
                 .get(&name)
-                .filter(|instance| instance.is_registered())
                 .map(crate::state::instance_info)
         })
         .ok_or_else(|| {

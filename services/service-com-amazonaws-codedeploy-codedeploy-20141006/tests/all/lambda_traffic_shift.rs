@@ -193,6 +193,15 @@ fn raw_string_revision(content: &str) -> Value {
     json!({"revisionType": "String", "string": {"content": content}})
 }
 
+/// AWS's fixed sentence for the `INVALID_LAMBDA_CONFIGURATION` error code, spelled
+/// out here as a client matching on it reads it: it names neither the deployment
+/// nor the content it was handed, and says that the AppSpec file is what could not
+/// be read — which is how a client tells this cause from the others that share the
+/// code.
+const INVALID_LAMBDA_CONFIGURATION_MESSAGE: &str = "The deployment failed because the AppSpec \
+     file that specifies the AWS Lambda deployment configuration is missing or has an invalid \
+     format";
+
 /// Create a deployment of `revision` and answer its minted id.
 async fn deploy(emulator: &Emulator, application: &str, group: &str, revision: Value) -> String {
     let created = emulator
@@ -351,8 +360,12 @@ async fn a_succeeded_lambda_deployment_has_moved_the_alias_to_the_target_version
     }
 }
 
-/// RULE: only the shift an AppSpec DECLARES is carried out — a revision that
-/// declares none moves nothing, and no other alias of the function is touched.
+/// RULE: a Lambda deployment performs the shift its revision's AppSpec DECLARES,
+/// so a revision that declares none leaves it nothing to perform: it moves no
+/// alias and ends `Failed` with the `INVALID_LAMBDA_CONFIGURATION` error
+/// information rather than reporting success for a shift nothing carried out —
+/// while a revision that declares one moves exactly the alias it names, and no
+/// other alias of the function is touched.
 #[tokio::test]
 async fn a_revision_that_declares_no_shift_moves_no_alias() {
     let emulator = Emulator::with_lambda();
@@ -363,14 +376,17 @@ async fn a_revision_that_declares_no_shift_moves_no_alias() {
     given_alias(&emulator, "handler", "canary", "1", None).await;
 
     // Rows differ along what the revision carries: an AppSpec with no resources
-    // at all, one whose resource is of another compute platform, content that is
-    // no document, and an AppSpec naming the OTHER alias (which moves instead).
-    let cases: &[(&str, Value, &str, &str)] = &[
+    // at all, one whose resource is of another compute platform, one whose Lambda
+    // resource states no properties, content that is no document, and an AppSpec
+    // naming the OTHER alias (which moves instead). Only the last declares a
+    // shift, so only the last can succeed.
+    let cases: &[(&str, Value, &str, &str, &str)] = &[
         (
             "an AppSpec that declares no resource",
             app_spec_revision("version: 0.0"),
             "1",
             "1",
+            "Failed",
         ),
         (
             "an AppSpec of another compute platform",
@@ -379,29 +395,54 @@ async fn a_revision_that_declares_no_shift_moves_no_alias() {
             ),
             "1",
             "1",
+            "Failed",
+        ),
+        (
+            "an AppSpec whose Lambda resource states no properties",
+            app_spec_revision(
+                "version: 0.0\nResources:\n  - handler:\n      Type: AWS::Lambda::Function\n",
+            ),
+            "1",
+            "1",
+            "Failed",
         ),
         (
             "content that is no document at all",
             app_spec_revision("\tnot: a document\n"),
             "1",
             "1",
+            "Failed",
         ),
         (
             "an AppSpec naming the other alias",
             app_spec_revision(&app_spec_yaml("handler", "canary", "1", "2")),
             "1",
             "2",
+            "Succeeded",
         ),
     ];
 
-    for (case, revision, live, canary) in cases {
+    for (case, revision, live, canary, expected) in cases {
         let deployment_id = deploy(&emulator, "undeclared", &group, revision.clone()).await;
         let info = terminal_deployment(&emulator, &deployment_id, case).await;
         assert_eq!(
             info["status"].as_str(),
-            Some("Succeeded"),
-            "case {case:?}: expected the deployment to succeed, got {info:?}"
+            Some(*expected),
+            "case {case:?}: expected the deployment to end {expected}, got {info:?}"
         );
+        if *expected == "Failed" {
+            assert_eq!(
+                info["errorInformation"]["code"].as_str(),
+                Some("INVALID_LAMBDA_CONFIGURATION"),
+                "case {case:?}: expected the INVALID_LAMBDA_CONFIGURATION code, got {info:?}"
+            );
+            assert_eq!(
+                info["errorInformation"]["message"].as_str(),
+                Some(INVALID_LAMBDA_CONFIGURATION_MESSAGE),
+                "case {case:?}: expected that failure's own sentence, got {:?}",
+                info["errorInformation"]["message"]
+            );
+        }
         for (alias, expected) in [("live", live), ("canary", canary)] {
             let read = alias_of(&emulator, "handler", alias).await;
             assert_eq!(

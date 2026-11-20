@@ -258,14 +258,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — happens under ONE hold of the store, so two concurrent registrations
         // of the same name or the same IAM ARN cannot both pass their checks.
         crate::state::with_state(&*self.engine, |state| {
-            // A name is taken only while its instance is REGISTERED: CodeDeploy
-            // keeps a deregistered instance's record, and registering that name
-            // again is a new registration of it.
-            if state
-                .on_premises_instances
-                .get(&name)
-                .is_some_and(crate::state::OnPremisesInstance::is_registered)
-            {
+            // A name is taken while the registry holds a record for it: a record
+            // IS a registration, since deregistering an instance deletes it, so a
+            // name the store holds is a name already registered.
+            if state.on_premises_instances.contains_key(&name) {
                 return Err(
                     RegisterOnPremisesInstanceErrorModeled::InstanceNameAlreadyRegisteredException(
                         InstanceNameAlreadyRegisteredException {
@@ -311,24 +307,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            // Re-registering a deregistered name keeps the tags already on that
-            // instance: deregistration does not remove them, so a later
-            // `GetOnPremisesInstance` reports the tags the instance still carries.
-            let tags = state
-                .on_premises_instances
-                .get(&name)
-                .map(|previous| previous.tags.clone())
-                .unwrap_or_default();
             // The write goes through the store, which bounds the registry: it
-            // evicts records a caller already deregistered to make room, and
-            // refuses only when every record it holds is still registered. That
-            // refusal is not something CodeDeploy models, so it is stated as a
-            // refusal rather than dressed up as one of the modelled errors.
+            // refuses a registration once the registry holds as many as it keeps.
+            // That refusal is not something CodeDeploy models, so it is stated as
+            // a refusal rather than dressed up as one of the modelled errors.
             //
             // The registration's own id is minted here and kept in the ARN, so
             // the ARN identifies THIS registration of the name rather than the
             // name alone: registering a name again after a deregistration mints a
-            // new one, and every reader answers the ARN the registry minted.
+            // new one, and every reader answers the ARN the registry minted. The
+            // deregistration took the old record and its tags with it, so a
+            // re-registered host starts with no tags.
             let registration_id =
                 crate::state::mint_uuid_from(&mut state.next_id, "on-premises-registration");
             let recorded = state.register_on_premises_instance(crate::state::OnPremisesInstance {
@@ -337,8 +326,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 iam_user_arn: identity.user_arn(),
                 iam_session_arn: identity.session_arn(),
                 register_time_ms: crate::state::now_ms(),
-                deregister_time_ms: None,
-                tags,
+                tags: Vec::new(),
             });
             if !recorded {
                 return Err(crate::scaffolded::Scaffolded::validation(format!(

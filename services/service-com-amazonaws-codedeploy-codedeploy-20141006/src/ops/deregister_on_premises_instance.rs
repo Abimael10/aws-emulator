@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterOnPremisesInstance
-//! Retires an on-premises instance's registration, recording when it was retired.
+//! Ends an on-premises instance's registration, DELETING the record that
+//! registration is.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -188,24 +189,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name that holds no registration is not a failure: it is already in the
         // state the caller asked for, and the call is idempotent.
         crate::state::with_state(&*self.engine, |state| {
-            let now_ms = crate::state::now_ms();
-            // The IAM ARN the instance held backs no registered instance any
-            // more, so it is free for another registration. Released BEFORE the
-            // record is retired, while the record still names it.
-            if state
-                .on_premises_instances
-                .get(&name)
-                .is_some_and(crate::state::OnPremisesInstance::is_registered)
-            {
-                state.release_iam_arns_of(&name);
-            }
-            if let Some(instance) = state.on_premises_instances.get_mut(&name) {
-                // Retiring the record rather than dropping it is what lets
-                // `InstanceInfo.deregisterTime` and the `Deregistered`
-                // registration-status filter report on it afterwards. A record
-                // already retired keeps the instant it was retired at.
-                instance.deregister_time_ms = instance.deregister_time_ms.or(Some(now_ms));
-            }
+            // The registration IS the record, so ending it DELETES the record:
+            // the name reads back as one the registry holds nothing for, its tags
+            // and its ARN go with it, and the IAM ARN it held is free for another
+            // registration.
+            state.deregister_on_premises_instance(&name);
         })
         .ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)

@@ -185,20 +185,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `applicationName` is @required with a modelled length and pattern, so
         // the boundary has already refused an absent, empty or malformed one, and
         // `revision` is @required too. What is left is the revision's own
-        // identity: one that names no location is not a revision.
+        // identity: one that names no location, and one whose inline form states
+        // neither its content nor its digest, is not a revision.
         let name = input.application_name;
         let revision = input.revision;
-        let Some(key) = crate::state::revision_key(&revision) else {
-            return Err(RegisterApplicationRevisionErrorModeled::InvalidRevisionException(
-                InvalidRevisionException {
-                    message: Some(
-                        "The revision was specified in an invalid format: it names no S3, GitHub, \
-                         string or AppSpec content location"
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
+        let key = match crate::state::revision_location::key(&revision) {
+            Ok(key) => key,
+            Err(refusal) => {
+                return Err(
+                    RegisterApplicationRevisionErrorModeled::InvalidRevisionException(
+                        InvalidRevisionException {
+                            message: Some(
+                                crate::state::revision_location::message(refusal).to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                )
+            }
         };
         let description = input.description;
 
