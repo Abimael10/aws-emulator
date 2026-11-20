@@ -244,6 +244,17 @@ const REPORTED_ENUM_ORDERS: &[&[&str]] = &[
     // `lambda.msk-esm-topics-list-too-long-rejected` carry for a `StartingPosition`
     // outside its value set.
     &["LATEST", "AT_TIMESTAMP", "TRIM_HORIZON"],
+    // com.amazonaws.lambda#KafkaSchemaRegistryAuthType (`BASIC_AUTH |
+    // CLIENT_CERTIFICATE_TLS_AUTH | SERVER_ROOT_CA_CERTIFICATE | OAUTHBEARER_AUTH` in the
+    // model), reported by AWS as below. Source: the answer the corpus unit
+    // `lambda__secretsmanager.kafka-esm-schema-registry-config-invalid-shape-rejected`
+    // carries for a schema registry access configuration's `Type` outside its value set.
+    &[
+        "CLIENT_CERTIFICATE_TLS_AUTH",
+        "OAUTHBEARER_AUTH",
+        "SERVER_ROOT_CA_CERTIFICATE",
+        "BASIC_AUTH",
+    ],
 ];
 
 /// `allowed` in the order this service reports that enum in, or in the order the model

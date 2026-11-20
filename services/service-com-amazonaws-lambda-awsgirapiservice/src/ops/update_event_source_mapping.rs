@@ -37,7 +37,13 @@
 //! [`crate::state::unsupported_mapping_destination`]); and the write that record takes has to
 //! be one the EXECUTION ROLE of the function the mapping invokes after this update may make,
 //! since that is the identity it is written under (see
-//! [`crate::state::unwritable_mapping_destination`]).
+//! [`crate::state::unwritable_mapping_destination`]). A `kafka://<topic>` destination, the one
+//! kind of that enumeration that is no ARN, takes PROVISIONED MODE — the mode in force after
+//! the update — and may not name a topic the mapping consumes, and is refused with that same
+//! modelled 400 otherwise (see [`crate::state::unsupported_kafka_topic_destination`]). A
+//! `SchemaRegistryConfig` it states takes that same mode, since the records are validated
+//! against the registry by those same pollers (see
+//! [`crate::state::schema_registry_config_refusal`]).
 //!
 //! So are the two settings a request about WHAT the mapping polls states: `FilterCriteria`
 //! carrying text that is not a filter pattern decide nothing, so they are refused with that
@@ -495,6 +501,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) =
             crate::state::unsupported_mapping_destination(input.destination_config.as_ref())
         {
+            return Err(invalid_parameter(message));
+        }
+
+        // And a Kafka-topic destination it states is held to the same rules as a create's: it
+        // is a topic of the mapping's own cluster, produced to by the mapping's own pollers,
+        // so it takes PROVISIONED MODE and may not be a topic the mapping consumes (see
+        // [`crate::state::unsupported_kafka_topic_destination`]). Both are judged against the
+        // mapping AFTER this update: the mode this request states, or the one the mapping
+        // already holds when it states none, and the topics, which no update changes.
+        if let Some(message) = crate::state::unsupported_kafka_topic_destination(
+            input.destination_config.as_ref(),
+            input.provisioned_poller_config.as_ref().or_else(|| {
+                store
+                    .event_source_mappings
+                    .get(&input.uuid)
+                    .and_then(|record| record.provisioned_poller_config.as_ref())
+            }),
+            store
+                .event_source_mappings
+                .get(&input.uuid)
+                .and_then(|record| record.topics.as_deref()),
+        ) {
+            return Err(invalid_parameter(message));
+        }
+
+        // A `SchemaRegistryConfig` this update states is held to exactly what the create's is:
+        // the records are validated against it by the mapping's own pollers, so it takes the
+        // pollers PROVISIONED MODE provides (see
+        // [`crate::state::schema_registry_config_refusal`]) — the mode in force AFTER this
+        // update, which is what this request states or what the mapping already holds. One
+        // stated outside that mode changes nothing.
+        if let Some(message) = crate::state::schema_registry_config_refusal(
+            input.self_managed_kafka_event_source_config.as_ref(),
+            input.amazon_managed_kafka_event_source_config.as_ref(),
+            input.provisioned_poller_config.as_ref().or_else(|| {
+                store
+                    .event_source_mappings
+                    .get(&input.uuid)
+                    .and_then(|record| record.provisioned_poller_config.as_ref())
+            }),
+        ) {
             return Err(invalid_parameter(message));
         }
 

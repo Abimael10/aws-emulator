@@ -20,10 +20,16 @@
 //! same modelled error ([`unwritable_mapping_destination`]) rather than stored as a
 //! dead-letter path no record could reach.
 //!
+//! The one kind of that enumeration that is no ARN carries rules of its own, for the reason
+//! it is not one: a `kafka://<topic>` destination is a topic of the mapping's own cluster,
+//! produced to by the mapping's own pollers, which only PROVISIONED MODE provides, and it may
+//! not be a topic that mapping consumes — so the same two calls hold a Kafka topic to both
+//! ([`unsupported_kafka_topic_destination`]).
+//!
 //! A READ of the request and of the stores the decision is made from: it decides, and changes
 //! nothing.
 
-use crate::ops::types::DestinationConfig;
+use crate::ops::types::{DestinationConfig, ProvisionedPollerConfig};
 
 /// The ARN vendor fields of the destination services an event source mapping delivers a
 /// record of a failed batch to, as [`service_common::arn::vendor`] reads one.
@@ -75,6 +81,105 @@ pub fn unsupported_mapping_destination(
         .iter()
         .any(|destination| !is_supported_mapping_destination(destination))
         .then(|| UNSUPPORTED_MAPPING_DESTINATION_MESSAGE.to_string())
+}
+
+/// The topic a `kafka://<topic>` destination names, and `None` for a destination of any
+/// other form.
+///
+/// The scheme is all the form carries beside the topic: no cluster, no account and no
+/// Region ([`KAFKA_TOPIC_SCHEME`]), so the whole remainder of the value is the topic's
+/// name.
+#[must_use]
+pub fn kafka_destination_topic(destination: &str) -> Option<&str> {
+    destination.strip_prefix(KAFKA_TOPIC_SCHEME)
+}
+
+/// The sentence a request stating a Kafka-topic destination for a mapping that is not in
+/// provisioned mode is refused with.
+///
+/// Entirely FIXED text — it names neither the topic nor the mapping, so a caller compares it
+/// exactly — and it states both the rule the request broke and the member that satisfies it,
+/// which is the only way a caller learns what to send instead. RECORDED from AWS's own answer
+/// to a create whose on-failure destination was a Kafka topic and whose request stated no
+/// `ProvisionedPollerConfig` (the corpus unit
+/// `lambda__secretsmanager.kafka-esm-onfailure-destination-kafka-topic-rules-rejected`).
+pub const KAFKA_DESTINATION_WITHOUT_PROVISIONED_MODE_MESSAGE: &str =
+    "Kafka as a DestinationConfig is only available for provisioned mode. To use Kafka as a \
+     DestinationConfig, enable provisioned mode by specifying MinimumPollers in \
+     ProvisionedPollerConfig, and try again.";
+
+/// The sentence a request stating a Kafka-topic destination that names a topic the mapping
+/// itself CONSUMES is refused with, for the topic `topic` both halves name.
+///
+/// The fixed text states the one thing the value got wrong — the topic a record of a failed
+/// batch is produced to has to be another topic than the one the batch was read from — and
+/// the variable part is the topic NAME the request stated on both sides, which is what an
+/// operator changes. RECORDED from AWS's own answer to a create whose on-failure destination
+/// named the topic its `Topics` named (the corpus unit
+/// `lambda__secretsmanager.kafka-esm-onfailure-destination-kafka-topic-rules-rejected`).
+#[must_use]
+pub fn kafka_destination_is_a_consumed_topic_message(topic: &str) -> String {
+    format!("The destination topic name cannot be the same as the source topic name: {topic}.")
+}
+
+/// The refusal for a request whose `DestinationConfig` states a Kafka-topic destination the
+/// mapping it configures could not deliver to — and `None` when it states none, which
+/// includes a configuration naming no destination at all.
+///
+/// A Kafka topic is the one destination kind `OnFailure$Destination` enumerates that is not a
+/// resource of another service but a topic of the mapping's own cluster, produced to by the
+/// mapping's own pollers. Two things follow, and both are decided by the calls that STATE a
+/// mapping's destinations ([`crate::ops::create_event_source_mapping`],
+/// [`crate::ops::update_event_source_mapping`]) before anything is stored or changed, rather
+/// than kept as a dead-letter path no record would reach:
+///
+/// * that delivery is only made by the pollers PROVISIONED MODE provides — "Use Provisioned
+///   Mode to customize the minimum and maximum number of event pollers for your event source"
+///   (`ProvisionedPollerConfig`), whose `MinimumPollers` is what a request turns that mode on
+///   with — so a Kafka topic is admitted only for a mapping in that mode;
+/// * the topic it names may not be one the mapping CONSUMES (`Topics`: "The name of the Kafka
+///   topic"), since a record of a batch produced back into the topic that batch was read from
+///   is handed straight back to the mapping that gave up on it.
+///
+/// Both halves are judged against the mapping AFTER this call: `provisioned_poller_config` is
+/// what the request states, or what the mapping already holds for a request that states none,
+/// and `topics` are the mapping's own, which no update changes — exactly as the pair
+/// `BatchSize`'s own related setting binds is judged after the call
+/// ([`super::queue_batch_window_refusal`]).
+///
+/// Both slots of the configuration are judged, exactly as the kind of a destination is
+/// ([`unsupported_mapping_destination`]): a Kafka topic is the same value in either.
+///
+/// A READ of the request and of the stored mapping: it decides, and changes nothing.
+#[must_use]
+pub fn unsupported_kafka_topic_destination(
+    destination_config: Option<&DestinationConfig>,
+    provisioned_poller_config: Option<&ProvisionedPollerConfig>,
+    topics: Option<&[String]>,
+) -> Option<String> {
+    // The destinations a request STATES, in the one reading of a `DestinationConfig` this
+    // crate has — which holds the empty string the member's pattern admits as no destination
+    // at all, so taking a destination away states no Kafka topic.
+    let destinations = super::requested_destinations(destination_config);
+    let stated: Vec<&str> = destinations
+        .iter()
+        .filter_map(|destination| kafka_destination_topic(destination))
+        .collect();
+    if stated.is_empty() {
+        return None;
+    }
+    let provisioned =
+        provisioned_poller_config.is_some_and(|config| config.minimum_pollers.is_some());
+    if !provisioned {
+        return Some(KAFKA_DESTINATION_WITHOUT_PROVISIONED_MODE_MESSAGE.to_string());
+    }
+    let consumed = topics.unwrap_or_default();
+    stated.iter().find_map(|topic| {
+        consumed
+            .iter()
+            .find(|consumed| consumed == topic)
+            .map(|consumed| kafka_destination_is_a_consumed_topic_message(consumed))
+    })
 }
 
 /// The sentence a request whose `DestinationConfig` names a failure destination the invoked
@@ -254,5 +359,146 @@ mod tests {
                 destination: Some(destination.to_string()),
             }),
         }
+    }
+
+    /// A Kafka-topic destination is judged on the MODE the mapping would deliver in and on
+    /// the topics it consumes: it stands for a mapping whose provisioned-poller configuration
+    /// states `MinimumPollers` and names a topic that mapping does not consume, and is refused
+    /// for one that is not in provisioned mode or that consumes the topic named. A destination
+    /// of any other form is not judged by this rule at all.
+    #[test]
+    fn a_kafka_topic_destination_takes_provisioned_mode_and_another_topic() {
+        let consumed = ["order-events".to_string()];
+        let dotted = ["order-events.retry".to_string()];
+
+        /// One row: the destination stated, the provisioned-poller configuration and the
+        /// consumed topics in force after the call, and the refusal the three earn.
+        struct Row<'row> {
+            case: &'row str,
+            destination: &'row str,
+            provisioned: Option<ProvisionedPollerConfig>,
+            topics: &'row [String],
+            refusal: Option<String>,
+        }
+
+        let rows = [
+            Row {
+                case: "a Kafka topic for a mapping in provisioned mode",
+                destination: "kafka://failed-batches",
+                provisioned: Some(pollers(Some(2), None)),
+                topics: &consumed,
+                refusal: None,
+            },
+            Row {
+                case: "a Kafka topic for a mapping whose mode states both poller bounds",
+                destination: "kafka://order-events.failed",
+                provisioned: Some(pollers(Some(1), Some(10))),
+                topics: &consumed,
+                refusal: None,
+            },
+            Row {
+                case: "a Kafka topic for a mapping that consumes no topic",
+                destination: "kafka://failed-batches",
+                provisioned: Some(pollers(Some(1), None)),
+                topics: &[],
+                refusal: None,
+            },
+            Row {
+                case: "a Kafka topic for a mapping with no poller configuration at all",
+                destination: "kafka://failed-batches",
+                provisioned: None,
+                topics: &consumed,
+                refusal: Some(KAFKA_DESTINATION_WITHOUT_PROVISIONED_MODE_MESSAGE.to_string()),
+            },
+            Row {
+                case: "a Kafka topic for a configuration that states no minimum",
+                destination: "kafka://failed-batches",
+                provisioned: Some(pollers(None, Some(10))),
+                topics: &consumed,
+                refusal: Some(KAFKA_DESTINATION_WITHOUT_PROVISIONED_MODE_MESSAGE.to_string()),
+            },
+            Row {
+                case: "the topic a provisioned mapping consumes",
+                destination: "kafka://order-events",
+                provisioned: Some(pollers(Some(1), None)),
+                topics: &consumed,
+                refusal: Some(kafka_destination_is_a_consumed_topic_message("order-events")),
+            },
+            Row {
+                case: "the dotted topic a provisioned mapping consumes",
+                destination: "kafka://order-events.retry",
+                provisioned: Some(pollers(Some(1), Some(4))),
+                topics: &dotted,
+                refusal: Some(kafka_destination_is_a_consumed_topic_message(
+                    "order-events.retry",
+                )),
+            },
+            Row {
+                case: "the consumed topic for a mapping not in provisioned mode, the mode \
+                       first",
+                destination: "kafka://order-events",
+                provisioned: None,
+                topics: &consumed,
+                refusal: Some(KAFKA_DESTINATION_WITHOUT_PROVISIONED_MODE_MESSAGE.to_string()),
+            },
+            Row {
+                case: "a queue, which this rule does not judge",
+                destination: "arn:aws:sqs:us-east-1:000000000000:order-dlq",
+                provisioned: None,
+                topics: &consumed,
+                refusal: None,
+            },
+            Row {
+                case: "a bucket, which this rule does not judge",
+                destination: "arn:aws:s3:::failed-batches",
+                provisioned: None,
+                topics: &consumed,
+                refusal: None,
+            },
+            Row {
+                case: "no destination at all, the empty string the pattern admits",
+                destination: "",
+                provisioned: None,
+                topics: &consumed,
+                refusal: None,
+            },
+        ];
+
+        for row in rows {
+            let case = row.case;
+            let config = destination_config(None, Some(row.destination));
+            let message = unsupported_kafka_topic_destination(
+                Some(&config),
+                row.provisioned.as_ref(),
+                Some(row.topics),
+            );
+            assert_eq!(
+                message, row.refusal,
+                "case {case:?}: expected {:?}, got {message:?}",
+                row.refusal
+            );
+        }
+    }
+
+    /// A `ProvisionedPollerConfig` stating the poller bounds given.
+    fn pollers(minimum: Option<i32>, maximum: Option<i32>) -> ProvisionedPollerConfig {
+        ProvisionedPollerConfig {
+            minimum_pollers: minimum,
+            maximum_pollers: maximum,
+            poller_group_name: None,
+        }
+    }
+
+    /// The rule is over the configuration as a whole, so a Kafka topic stated in the
+    /// ON-SUCCESS slot is judged exactly as one in the on-failure slot.
+    #[test]
+    fn a_kafka_topic_in_either_slot_is_judged() {
+        let config = destination_config(Some("kafka://failed-batches"), None);
+        let message = unsupported_kafka_topic_destination(Some(&config), None, None);
+        assert_eq!(
+            message.as_deref(),
+            Some(KAFKA_DESTINATION_WITHOUT_PROVISIONED_MODE_MESSAGE),
+            "a Kafka topic in the on-success slot must be judged alike, got {message:?}"
+        );
     }
 }

@@ -67,7 +67,15 @@
 //! dead-letter path nothing could ever write to. It is held to the invoked function's
 //! EXECUTION ROLE too, since that is the identity the record is written under: a destination
 //! whose write the policies in force on that role withhold is refused with that same modelled
-//! 400 (see [`crate::state::unwritable_mapping_destination`]).
+//! 400 (see [`crate::state::unwritable_mapping_destination`]). The one kind of that
+//! enumeration that is no ARN carries rules of its own: a `kafka://<topic>` destination is a
+//! topic of the mapping's own cluster, produced to by the mapping's own pollers, so it is
+//! admitted only for a mapping this request puts in PROVISIONED MODE and naming a topic the
+//! mapping does not consume, and refused with that same modelled 400 otherwise (see
+//! [`crate::state::unsupported_kafka_topic_destination`]). The same mode is what a KAFKA
+//! SCHEMA REGISTRY takes, since the records are validated against it by those same pollers:
+//! a `SchemaRegistryConfig` stated outside provisioned mode is refused with that same
+//! modelled 400 (see [`crate::state::schema_registry_config_refusal`]).
 //!
 //! A mapping on a QUEUE is also held to the queue's own configuration: a queue hands a
 //! message to one consumer for the length of its `VisibilityTimeout` and makes it visible
@@ -556,6 +564,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(message) =
             crate::state::unsupported_mapping_destination(input.destination_config.as_ref())
         {
+            return Err(invalid_parameter(message));
+        }
+
+        // The one kind of that enumeration that is no ARN is a topic of the mapping's own
+        // cluster, produced to by the mapping's own pollers: that delivery takes the pollers
+        // PROVISIONED MODE provides, and it may not be a topic this mapping consumes (see
+        // [`crate::state::unsupported_kafka_topic_destination`]) — both judged against the
+        // mapping this request asks for.
+        if let Some(message) = crate::state::unsupported_kafka_topic_destination(
+            input.destination_config.as_ref(),
+            input.provisioned_poller_config.as_ref(),
+            input.topics.as_deref(),
+        ) {
+            return Err(invalid_parameter(message));
+        }
+
+        // A `SchemaRegistryConfig` the request states is validated against by the mapping's
+        // own pollers, so it takes the pollers PROVISIONED MODE provides, exactly as a Kafka
+        // topic destination does, and has to say WHAT to validate (see
+        // [`crate::state::schema_registry_config_refusal`]).
+        if let Some(message) = crate::state::schema_registry_config_refusal(
+            input.self_managed_kafka_event_source_config.as_ref(),
+            input.amazon_managed_kafka_event_source_config.as_ref(),
+            input.provisioned_poller_config.as_ref(),
+        ) {
             return Err(invalid_parameter(message));
         }
 

@@ -2784,8 +2784,19 @@ pub use event_source_request::{
 /// `crate::state::…`.
 pub mod event_source_mapping_destination;
 pub use event_source_mapping_destination::{
-    is_supported_mapping_destination, unsupported_mapping_destination,
-    unwritable_mapping_destination, UNSUPPORTED_MAPPING_DESTINATION_MESSAGE,
+    is_supported_mapping_destination, kafka_destination_is_a_consumed_topic_message,
+    kafka_destination_topic, unsupported_kafka_topic_destination, unsupported_mapping_destination,
+    unwritable_mapping_destination, KAFKA_DESTINATION_WITHOUT_PROVISIONED_MODE_MESSAGE,
+    UNSUPPORTED_MAPPING_DESTINATION_MESSAGE,
+};
+
+/// What such a mapping's KAFKA SCHEMA REGISTRY configuration has to state lives in
+/// [`kafka_schema_registry`], for the same reason and re-exported here the same way: the two
+/// calls that state a mapping's registry configuration name it as `crate::state::…`.
+pub mod kafka_schema_registry;
+pub use kafka_schema_registry::{
+    required_registry_field_message, schema_registry_config_refusal,
+    SCHEMA_REGISTRY_WITHOUT_PROVISIONED_MODE_MESSAGE, SCHEMA_VALIDATION_CONFIGS_MEMBER,
 };
 
 /// Which functions Lambda SnapStart can be applied to, and the refusals for asking for it

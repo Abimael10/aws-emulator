@@ -23,17 +23,15 @@
 //! accepts are read back through `GetEventSourceMapping`.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_lambda_awsgirapiservice::state::{
-    EVENT_SOURCE_MAPPING_SETTLE_DELAY, UNSUPPORTED_MAPPING_DESTINATION_MESSAGE,
-};
+use service_com_amazonaws_lambda_awsgirapiservice::state::UNSUPPORTED_MAPPING_DESTINATION_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
-    call, create_function, create_mapping, create_request, get_mapping, list_mappings, router_on,
-    Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, MSK_SOURCE,
+    await_mapping_state, call, create_function, create_mapping, create_request, get_mapping,
+    list_mappings, router_on, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, MSK_SOURCE,
+    STATE_ENABLED,
 };
 
 /// The modelled error a destination no record is delivered to is refused with.
@@ -46,11 +44,6 @@ const VALIDATION: &str = "ValidationException";
 /// The destination every mapping in this suite is created with before an update re-states
 /// one: an Amazon SQS queue, one of the kinds the member enumerates.
 const HELD_DESTINATION: &str = "arn:aws:sqs:us-east-1:000000000000:order-dlq";
-
-/// How long past the instant a create made the move out of `Creating` due this suite waits
-/// before updating the mapping: the transition is owed by the CLOCK, and a mapping still
-/// settling is not available to take another change.
-const SLACK: Duration = Duration::from_millis(100);
 
 /// Lambda alone: the rule is about what the control plane REFUSES, so nothing the ARNs name
 /// has to exist.
@@ -212,11 +205,17 @@ impl Row {
 
     /// What a create of a mapping on this row's event source states beside the destination:
     /// `StartingPosition` is "Required for Amazon Kinesis and Amazon DynamoDB Stream event
-    /// sources", so a mapping on one of those names a position.
+    /// sources", so a mapping on one of those names a position; and a Kafka topic is a
+    /// destination only a mapping in PROVISIONED MODE delivers to, so a row stating one puts
+    /// the mapping in that mode (see
+    /// [`crate::kafka_topic_destination_rules`], which owns that rule).
     fn create_extras(&self, destination_config: Option<Value>) -> Value {
         let mut extras = json!({});
         if self.event_source != MSK_SOURCE {
             extras["StartingPosition"] = json!("LATEST");
+        }
+        if self.destination.starts_with("kafka://") {
+            extras["ProvisionedPollerConfig"] = json!({ "MinimumPollers": 1 });
         }
         if let Some(config) = destination_config {
             extras["DestinationConfig"] = config;
@@ -368,9 +367,10 @@ async fn an_update_naming_a_destination_of_an_undelivered_service_changes_nothin
         );
         let uuid = created.string("UUID").unwrap_or_default();
 
-        // A mapping that is still settling is not available to take another change, so the
-        // update waits past the instant the create made that move due.
-        tokio::time::sleep(EVENT_SOURCE_MAPPING_SETTLE_DELAY + SLACK).await;
+        // A mapping that is still settling is not available to take another change, and that
+        // settle is owed by the CLOCK: this waits for the mapping to REPORT the state its
+        // create asked for rather than for a span of its own.
+        await_mapping_state(&router, case, &uuid, STATE_ENABLED).await;
         let answer = update_mapping(
             &router,
             &uuid,
