@@ -177,6 +177,12 @@ flate2 = "1"
 # `GetTraceSummaries` and `BatchGetTraces` — without it mounted there is nowhere for the
 # publication to reach.
 service-com-amazonaws-xray-awsxray = { workspace = true }
+# The service that owns the api a `Task` state's `arn:aws:states:::apigateway:invoke`
+# integration calls in `tests/all/api_gateway_task_invoke.rs`: mounted beside Step
+# Functions on the one engine the test router builds, so the request the task makes is
+# served by that api's own `execute-api` data plane out of the records its control plane
+# stored.
+service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
 
 [lints]
 workspace = true

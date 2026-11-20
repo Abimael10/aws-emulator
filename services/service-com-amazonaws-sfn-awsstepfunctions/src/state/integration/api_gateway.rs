@@ -47,11 +47,11 @@
 //! refusal — `ApiGateway.AccessDeniedException` for a call the api's documents do not
 //! allow), and the STATUS for an answer that names no class, which is what a response
 //! passed through from the method's own backend carries
-//! (`ApiGateway.404`). The cause is the whole answer as the result reports it — so a
-//! `Catch` on the error name routes the failure and the response that caused it is
-//! readable in the cause — except for an authorization refusal, whose cause is this
-//! service's own sentence about the action rather than the endpoint's own body about the
-//! principal and the method ARN ([`task_cause`]).
+//! (`ApiGateway.404`). The cause is the BODY the stage answered — so a `Catch` on the
+//! error name routes the failure and the document the method's own backend produced is
+//! readable, and parsable, in the cause — except for an authorization refusal, whose cause
+//! is this service's own sentence about the action rather than the endpoint's own body
+//! about the principal and the method ARN ([`task_cause`]).
 
 use super::*;
 
@@ -255,22 +255,33 @@ pub(super) async fn invoke(
     let class = error_shape(answered.header(ERROR_TYPE_HEADER), None);
     Err(Failed {
         error: task_error(&answered, class.as_deref()),
-        cause: task_cause(class.as_deref(), &reported),
+        cause: task_cause(class.as_deref(), &answered),
     })
 }
 
-/// The cause a failed invoke carries: the answer as the result reports it, and the
-/// service's own NOT-AUTHORIZED sentence for the one class whose answer is about the
-/// CALLER rather than about the work.
+/// The cause a failed invoke carries: the BODY the stage answered, and the service's own
+/// NOT-AUTHORIZED sentence for the one class whose answer is about the CALLER rather than
+/// about the work.
 ///
-/// Every answer that IS the work's outcome is reported whole, so a `Catch` path can read
-/// the status, the headers and the body the stage answered. An AUTHORIZATION refusal is
-/// not that: it carries, in its own body, the principal the `execute-api` endpoint refused
-/// and the method ARN it refused them on, and neither reaches the definition. What the
-/// task reports for it is the ACTION an invoke asks for ([`INVOKE_IAM_ACTION`], the one
-/// action the `execute-api` service publishes for invoking a deployed method) and no
-/// resource at all — which is the whole of that sentence, since nothing else in it comes
-/// from the request, the answer or any stored value.
+/// Every answer that IS the work's outcome is relayed as the stage's own body and nothing
+/// else, so a `Catch` path reads the document the method's backend produced — a gateway
+/// response's own sentence for a status the api itself answered, and the backend's own
+/// error document for one it mapped. The members AROUND that body (the status, the headers)
+/// are facts of the ANSWER, which the task's result reports for a served call
+/// ([`crate::state::http_task::reported`]); the error NAME already carries the status, so a
+/// failure's cause is the body alone.
+///
+/// RECORDED BEHAVIOUR: a `Task` state whose stage answered `500` with the document
+/// `{"marker":"err500"}` fails with that document, as text, as its whole `Cause` — which is
+/// what a definition's `Catch` reads back and parses.
+///
+/// An AUTHORIZATION refusal is not the work's outcome: it carries, in its own body, the
+/// principal the `execute-api` endpoint refused and the method ARN it refused them on, and
+/// neither reaches the definition. What the task reports for it is the ACTION an invoke
+/// asks for ([`INVOKE_IAM_ACTION`], the one action the `execute-api` service publishes for
+/// invoking a deployed method) and no resource at all — which is the whole of that
+/// sentence, since nothing else in it comes from the request, the answer or any stored
+/// value.
 ///
 /// RECORDED BEHAVIOUR, which is the only reason that class is worded here rather than
 /// relayed: a `Task` state invoking a stage of an api whose RESOURCE POLICY denies the
@@ -280,10 +291,12 @@ pub(super) async fn invoke(
 /// data plane answers too, and `core/router/tests/all/sfn_api_gateway_invoke_task.rs`
 /// asserts that it stays out of the cause. So a definition's `Catch` path reads the same
 /// sentence whichever api, stage, method or role the denied call named.
-fn task_cause(class: Option<&str>, reported: &Value) -> String {
+fn task_cause(class: Option<&str>, answered: &crate::state::http_task::Answered) -> String {
     match class == Some(API_GATEWAY_API.access_denied_code()) {
         true => format!("Not authorized to perform: {INVOKE_IAM_ACTION} on the resource"),
-        false => reported.to_string(),
+        // The body as the stage answered it, read through the one reading of an answer's
+        // own bytes ([`crate::state::http_task::api_gateway::answered_body`]).
+        false => crate::state::http_task::api_gateway::answered_body(answered),
     }
 }
 
@@ -844,9 +857,7 @@ mod tests {
                 Some("ForbiddenException"),
                 "{\"message\":\"Forbidden\"}",
                 "ApiGateway.ForbiddenException",
-                "{\"Headers\":{\"x-amzn-errortype\":[\"ForbiddenException\"]},\
-                 \"ResponseBody\":{\"message\":\"Forbidden\"},\"StatusCode\":403,\
-                 \"StatusText\":\"Forbidden\"}",
+                "{\"message\":\"Forbidden\"}",
             ),
             (
                 "a class carrying the shape-id decoration restJson1 allows",
@@ -862,8 +873,7 @@ mod tests {
                 None,
                 "{\"served\":\"not-found\"}",
                 "ApiGateway.404",
-                "{\"ResponseBody\":{\"served\":\"not-found\"},\"StatusCode\":404,\
-                 \"StatusText\":\"Not Found\"}",
+                "{\"served\":\"not-found\"}",
             ),
             (
                 "a backend fault naming no class",
@@ -871,7 +881,7 @@ mod tests {
                 None,
                 "",
                 "ApiGateway.502",
-                "{\"StatusCode\":502,\"StatusText\":\"Bad Gateway\"}",
+                "",
             ),
         ];
         for (case, status, named, body, expected, expected_cause) in rows {
@@ -888,8 +898,7 @@ mod tests {
                 name, *expected,
                 "case {case:?}: expected {expected:?}, got {name:?}"
             );
-            let reported = crate::state::http_task::reported(&answered);
-            let cause = task_cause(class.as_deref(), &reported);
+            let cause = task_cause(class.as_deref(), &answered);
             assert_eq!(
                 cause, *expected_cause,
                 "case {case:?}: expected the cause {expected_cause:?}, got {cause:?}"

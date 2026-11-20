@@ -79,6 +79,18 @@
 //!   does not invoke directly — only a Lambda FUNCTION's ARN is work in itself (see
 //!   below).
 //!
+//! ## The integrations whose work is an HTTP REQUEST
+//!
+//! Two `Resource`s name no operation of any service at all: Step Functions' own HTTP
+//! Task (`arn:aws:states:::http:invoke`) and the API Gateway integration
+//! (`arn:aws:states:::apigateway:invoke`). For each of them the unit of work is ONE HTTP
+//! request the state's own parameters describe, and the task's result is that endpoint's
+//! own response — so neither reads a wire fact of an [`Api`] ([`Call::endpoint`],
+//! [`EndpointTask`]). The request itself and the reading of its answer are the HTTP
+//! Task's ([`super::http_task`]); which stage of which api an API Gateway task addresses,
+//! what authorizes its request and how a non-2xx answer is named to the state are that
+//! integration's own ([`api_gateway`]).
+//!
 //! ## The direct Lambda invocation
 //!
 //! A `Resource` that is the ARN of a LAMBDA FUNCTION names no integration token: it
@@ -1488,8 +1500,9 @@ impl Call {
     }
 
     /// How a refusal of this call NAMES the work it is: the operation and the service
-    /// for a call to a service's API, and the request itself for the HTTP Task, which
-    /// calls no operation of any service ([`Call::endpoint`]).
+    /// for a call to a service's API, and the request itself for a `Resource` whose work
+    /// is one HTTP request, which calls no operation of any service
+    /// ([`Call::endpoint`]).
     ///
     /// `pub(crate)`, because the walk words one refusal of its own about a call: the one
     /// it declines to make a SECOND time ([`super::asl`]).
@@ -3704,22 +3717,25 @@ where
                 // a call that has not answered inside it is abandoned here too, so
                 // nothing holds the walk's answer past that bound. Nothing is faked for
                 // an abandoned call: the walk reported the timeout itself.
-                // The HTTP Task's work is a request to the endpoint its own parameters
-                // name rather than a call on a service's operation, so it is made by the
-                // module that owns that reading — over the same transport, under the same
-                // ceiling, and reported to the walk through the same seam.
+                // The work of a `Resource` that names an HTTP REQUEST — Step Functions'
+                // own HTTP Task, and the API Gateway integration — is a request to the
+                // endpoint its own parameters name rather than a call on a service's
+                // operation, so it is made by the module that owns that reading — over
+                // the same transport, under the same ceiling, and reported to the walk
+                // through the same seam.
                 //
                 // That transport is what makes the endpoint a caller's parameters name
-                // safe to hand over here: BOTH arms below go to
+                // safe to hand over here: EVERY arm below goes to
                 // `EmbeddedEmulator::http_connector`, this emulator's own in-process
                 // router, so no client is built, no name is resolved and no address is
                 // dialled — an `ApiEndpoint` naming anything this emulator does not serve
                 // reaches nothing and is answered by the front door's own refusal
                 // (`super::http_task`, "Where the request goes"). There is therefore no
                 // address for an allowlist to screen and nothing of the host on the
-                // request: neither a header of the request being served nor the
-                // emulator's own credentials travel on it, and the only credential it
-                // carries is the emulated connection's own.
+                // request: no header of the request being served travels on it, and the
+                // only credential it carries is the emulated one that integration
+                // authorizes its request with — the connection's own for the HTTP Task,
+                // and a session of the execution role for the API Gateway one.
                 let made = async {
                     match handover.call.endpoint {
                         Some(EndpointTask::Http) => {

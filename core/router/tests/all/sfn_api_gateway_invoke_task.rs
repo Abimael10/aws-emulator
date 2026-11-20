@@ -15,7 +15,8 @@
 //! endpoint's answer is reported by (`StatusCode`, `StatusText`, `Headers`,
 //! `ResponseBody`), and any other status as the task's FAILURE in the `ApiGateway` error
 //! family, named by the exception CLASS the answer identified itself with and by its
-//! STATUS where the answer named none, with that same answer as the cause — except for an
+//! STATUS where the answer named none, with the BODY that answer carried as the cause —
+//! except for an
 //! authorization refusal, whose cause is Step Functions' own sentence about the action an
 //! invoke asks for rather than the endpoint's own body about the principal and the method.
 //!
@@ -306,12 +307,13 @@ enum Expected {
     },
 }
 
-/// What a failed row's cause must be: the whole answer, which is read by the phrase it
-/// holds, or the service's own sentence for an authorization refusal, which is read exactly.
+/// What a failed row's cause must be: the body the stage answered or the service's own
+/// sentence for an authorization refusal, each read exactly, or a phrase a cause holds.
 enum Cause {
     /// The cause carries this phrase of the answer the stage gave.
+    #[allow(dead_code)]
     Holds(&'static str),
-    /// The cause IS this sentence.
+    /// The cause IS this text.
     Is(&'static str),
 }
 
@@ -399,7 +401,10 @@ async fn an_api_gateway_task_invokes_the_stage_its_parameters_address() {
             }),
             expected: Expected::Failed {
                 error: "ApiGateway.404",
-                cause: Cause::Holds(r#""StatusCode":404"#),
+                // The cause IS the body the method's own backend answered: the error name
+                // already carries the status, and what a `Catch` path parses is that
+                // document.
+                cause: Cause::Is(NOT_FOUND_BODY),
             },
         },
         Row {

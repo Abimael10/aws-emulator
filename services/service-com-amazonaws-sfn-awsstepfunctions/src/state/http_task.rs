@@ -84,10 +84,23 @@
 //! the CONNECTION is named for the connection resource instead
 //! ([`CONNECTION_NOT_FOUND_ERROR`], [`INVALID_CONNECTION_STATE_ERROR`]), because no
 //! request was made at all.
+//!
+//! ## The other `Task` whose work is one request
+//!
+//! The API Gateway integration (`arn:aws:states:::apigateway:invoke`) is the second
+//! `Resource` whose unit of work is an HTTP request its own parameters describe rather
+//! than a call on an operation. WHICH stage of which api it addresses, what authorizes
+//! its request and how a non-2xx answer is named to the state are that integration's own
+//! ([`super::integration::api_gateway`]); the request itself, the transport it goes over
+//! and the reading of the answer are this module's, and the one piece of that reading
+//! which only that integration takes lives beside it ([`api_gateway`]).
 
 use ::serde_json::{Map, Value};
 
 use super::integration::{Answer, Failed};
+
+/// The reading of an ANSWER that the API Gateway integration takes from this module.
+pub mod api_gateway;
 
 /// The member that names the endpoint the request is made to, an absolute URL.
 const API_ENDPOINT_MEMBER: &str = "ApiEndpoint";
