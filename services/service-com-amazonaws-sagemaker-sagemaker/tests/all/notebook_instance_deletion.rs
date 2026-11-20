@@ -42,7 +42,7 @@ const STATUS_DEADLINE: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The ARN a notebook instance of `name` carries in `region`.
-fn notebook_instance_arn(region: &str, name: &str) -> String {
+pub(crate) fn notebook_instance_arn(region: &str, name: &str) -> String {
     format!("arn:aws:sagemaker:{region}:{ACCOUNT}:notebook-instance/{name}")
 }
 
@@ -55,8 +55,10 @@ fn lifecycle_config_arn(region: &str, name: &str) -> String {
 /// did.
 ///
 /// The CONDITION is what is waited for, never a span: an instance the clock owes a
-/// transition is read again until it reports the status the rule says it reaches.
-async fn notebook_instance_resting_in(
+/// transition is read again until it reports the status the rule says it reaches. Shared
+/// with the suite that checks what the delete releases
+/// (`tests/all/notebook_instance_delete_releases_the_record.rs`).
+pub(crate) async fn notebook_instance_resting_in(
     emulator: &Emulator,
     case: &str,
     name: &str,
@@ -83,8 +85,13 @@ async fn notebook_instance_resting_in(
     }
 }
 
-/// `DeleteNotebookInstance` for `name`, in `region`.
-async fn delete_notebook_instance(emulator: &Emulator, region: &str, name: &str) -> (u16, Value) {
+/// `DeleteNotebookInstance` for `name`, in `region`. Shared with the suite that checks what
+/// the delete releases (`tests/all/notebook_instance_delete_releases_the_record.rs`).
+pub(crate) async fn delete_notebook_instance(
+    emulator: &Emulator,
+    region: &str,
+    name: &str,
+) -> (u16, Value) {
     emulator
         .call_in(
             region,
