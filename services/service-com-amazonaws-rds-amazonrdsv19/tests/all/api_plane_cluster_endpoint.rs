@@ -25,8 +25,9 @@
 //! (loopback by number and by name, with and without a port), the port the request asks
 //! for, an engine whose data plane this emulator serves as a native WIRE instead (which
 //! keeps publishing its own listener), an engine whose data plane it does not serve at all
-//! (which keeps its AWS DNS name), and a request addressed to this service's own AWS host
-//! on an emulator served on no port (which has no address of its own to publish).
+//! (which keeps its AWS DNS name and its engine's port), and a request addressed to this
+//! service's own AWS host on an emulator served on no port (which has no address of its own
+//! to publish).
 
 use crate::db_clusters::{describe_one, the_cluster};
 use crate::db_instance_engine_endpoint::endpoint_of;

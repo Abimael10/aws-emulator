@@ -6,17 +6,19 @@
 //!
 //! The rules every assertion here is about:
 //!
-//! * **A modelled constraint violation is client input, not an authorization failure.** On
-//!   both association operations a `Resource` (or `ChatConfiguration`) outside the member's
-//!   modelled `@length`/`@pattern` — a malformed string, an ARN of another service or
-//!   partition, a chat-configuration ARN, an action name outside the published charset — is
-//!   refused at the request boundary with this service's client-input class,
-//!   `InvalidRequestException` (HTTP 400, the fixed message `Invalid request body`).
-//! * **The authorization refusal is for a well-formed ARN naming no target of this
-//!   account.** An ARN that SATISFIES the member's pattern yet no custom action of this
-//!   account can be minted under — one carrying a region segment, or another account's id —
-//!   names no target in the account's namespace and is refused HTTP 403
-//!   `UnauthorizedException` with the fixed message `Unauthorized`.
+//! * **The resource-scoped authorization decision comes FIRST, for any `Resource` naming
+//!   no custom action of this account.** `Resource` identifies the resource the call
+//!   addresses, so whether the caller's credentials are valid for that target is decided
+//!   before the member's own `@length`/`@pattern` is judged: a value no custom action of
+//!   this account could ever be minted under — one carrying a region segment, another
+//!   account's id, an ARN of another service, type or partition, or a string that is not an
+//!   ARN at all — is refused HTTP 403 `UnauthorizedException` with the fixed message
+//!   `Unauthorized`, whether or not it satisfies that pattern.
+//! * **Every OTHER member outside its modelled constraints is client input.** A
+//!   `ChatConfiguration` outside its `@length`/`@pattern` names no resource this call is
+//!   authorized against, so it keeps the request-boundary refusal: this service's
+//!   client-input class `InvalidRequestException` (HTTP 400, the fixed message
+//!   `Invalid request body`).
 //! * **A target has to be able to host the link.** An associate against anything other
 //!   than a channel configuration this account holds — an Amazon Chime webhook
 //!   configuration, or an ARN no configuration is stored under — is refused with the
@@ -52,8 +54,8 @@ const WORKSPACE: (&str, &str) = ("T0123ABCD", "Primary Workspace");
 
 const IAM_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/chatbot-role";
 
-/// The modelled 403 a WELL-FORMED ARN no custom action of this account can be minted under
-/// is refused with, and the fixed sentence it carries.
+/// The modelled 403 a `Resource` naming no custom action of this account is refused with,
+/// and the fixed sentence it carries.
 const UNAUTHORIZED_EXCEPTION: &str = "UnauthorizedException";
 const UNAUTHORIZED_MESSAGE: &str = "Unauthorized";
 
@@ -202,20 +204,27 @@ async fn associated_resources(
 }
 
 #[tokio::test]
-async fn a_well_formed_arn_no_action_of_this_account_can_be_minted_under_is_unauthorized() {
+async fn a_resource_naming_no_action_of_this_account_is_unauthorized() {
     let router = router();
     let chat_configuration = given_slack_channel_configuration(&router, "assoc-auth").await;
+    let chime = given_chime_webhook_configuration(&router, "assoc-auth-chime").await;
     // The action really exists, so nothing below is refused for want of a resource.
     let minted = given_custom_action(&router, "auth-probe").await;
 
-    // Every row SATISFIES `ResourceIdentifier`'s modelled pattern
+    // Every row names a resource no custom action of this account could ever be minted
+    // under, differing in HOW it fails to: the first four SATISFY `ResourceIdentifier`'s
+    // modelled pattern
     // (`^arn:aws:chatbot:[A-Za-z0-9_/.-]{0,63}:[A-Za-z0-9_/.-]{0,63}:custom-action/[a-zA-Z0-9_-]{1,64}$`,
-    // smithy_query query="operation" AssociateToConfiguration) and still names no custom
-    // action this account could ever hold, differing in WHICH scope it falls outside: the
-    // region segment (a custom action is account-scoped, so the ARN a create mints carries
-    // none) and the account id. The last row names the action that DOES exist, so what is
-    // refused is the ARN's scope and not the action's absence.
-    let rows: [(&str, String); 4] = [
+    // smithy_query query="operation" AssociateToConfiguration) and fall outside the
+    // account's namespace — by the region segment (a custom action is account-scoped, so
+    // the ARN a create mints carries none) or by the account id — while the rest fall
+    // outside the pattern as well: a string that is no ARN, one below the member's @length
+    // minimum, an ARN of another chatbot resource type, of this service's own
+    // configurations, of another service and of another partition. The decision is about
+    // the NAMESPACE the ARN addresses, so both halves are refused alike; what the ARN says
+    // about the action's own NAME is a modelled constraint on the member and is left to it
+    // (the test below).
+    let rows: [(&str, String); 11] = [
         (
             "another account",
             "arn:aws:chatbot::210987654321:custom-action/auth-probe".to_string(),
@@ -231,6 +240,34 @@ async fn a_well_formed_arn_no_action_of_this_account_can_be_minted_under_is_unau
         (
             "a region segment filled in, naming the action that exists",
             format!("arn:aws:chatbot:{REGION}:{ACCOUNT}:custom-action/auth-probe"),
+        ),
+        (
+            "a Resource that is not an ARN at all",
+            "not-a-valid-arn-at-all".to_string(),
+        ),
+        (
+            "a Resource below the @length minimum",
+            String::new(),
+        ),
+        (
+            "a Resource that is a channel configuration's own ARN",
+            chat_configuration.clone(),
+        ),
+        (
+            "a Resource that is a Chime webhook configuration's ARN",
+            chime.clone(),
+        ),
+        (
+            "a Resource of another chatbot resource type",
+            format!("arn:aws:chatbot::{ACCOUNT}:chat-configuration/slack-channel/assoc-auth"),
+        ),
+        (
+            "a Resource of another service",
+            format!("arn:aws:lambda::{ACCOUNT}:custom-action/auth-probe"),
+        ),
+        (
+            "a Resource of another partition",
+            format!("arn:aws-cn:chatbot::{ACCOUNT}:custom-action/auth-probe"),
         ),
     ];
 
@@ -260,11 +297,20 @@ async fn a_well_formed_arn_no_action_of_this_account_can_be_minted_under_is_unau
                 "case {case:?} on {path}: expected the fixed refusal sentence, got {}",
                 answer.body
             );
+            // restJson1 resolves the error SHAPE from this header, so it names the modelled
+            // error too — not the framework's synthetic validation shape.
+            assert_eq!(
+                answer.error_type.as_deref(),
+                Some(UNAUTHORIZED_EXCEPTION),
+                "case {case:?} on {path}: expected x-amzn-errortype \
+                 {UNAUTHORIZED_EXCEPTION}, got {:?}",
+                answer.error_type
+            );
         }
     }
 
     // The refusals linked nothing, and the ARN a create DOES mint is served on the same
-    // configuration — so the 403s came from the ARN's namespace and not from the call.
+    // configuration — so the 403s came from the target named and not from the call.
     assert_eq!(
         associated_resources(&router, &chat_configuration, None).await,
         Vec::<String>::new(),
@@ -288,58 +334,27 @@ async fn a_well_formed_arn_no_action_of_this_account_can_be_minted_under_is_unau
 async fn a_member_outside_its_modelled_constraints_is_refused_as_client_input() {
     let router = router();
     let chat_configuration = given_slack_channel_configuration(&router, "assoc-shape").await;
-    let chime = given_chime_webhook_configuration(&router, "assoc-shape-chime").await;
-    // The action really exists, so a row that overrides only `ChatConfiguration` carries a
-    // `Resource` nothing else could refuse.
+    // The action really exists, so every row below carries a `Resource` nothing else could
+    // refuse: what is outside its constraints is the OTHER member.
     let minted = given_custom_action(&router, "shape-probe").await;
 
-    // Each row puts ONE member outside the constraints the model declares for it
-    // (smithy_query query="operation" AssociateToConfiguration,DisassociateFromConfiguration):
+    // Each row puts ONE member outside the constraints the model declares for it, where
+    // nothing about the NAMESPACE the request addresses is wrong — so the modelled
+    // constraint is what decides the answer (smithy_query query="operation"
+    // AssociateToConfiguration,DisassociateFromConfiguration):
     //   Resource -> ResourceIdentifier, @length 1..1011, @pattern
     //     ^arn:aws:chatbot:[A-Za-z0-9_/.-]{0,63}:[A-Za-z0-9_/.-]{0,63}:custom-action/[a-zA-Z0-9_-]{1,64}$
     //   ChatConfiguration -> ChatConfigurationArn, @length 19..1169, @pattern
     //     ^arn:aws:(wheatley|chatbot):[A-Za-z0-9_/.-]{0,63}:[A-Za-z0-9_/.-]{0,63}:[A-Za-z0-9][A-Za-z0-9:_/+=,@.-]{0,1023}$
-    // The rows differ along what each constraint generalises over: the length bound, the
-    // partition, the service, the resource type, the action name's charset and its own
-    // length bound, and which of the two members carries the offending value. The
-    // pattern's upper bound on the action name (64) keeps every conforming value well
-    // under `Resource`'s @length maximum, so there is no row past that maximum.
-    let rows: [(&str, String, String); 10] = [
-        (
-            "a Resource that is not an ARN at all",
-            "not-a-valid-arn-at-all".to_string(),
-            chat_configuration.clone(),
-        ),
-        (
-            "a Resource below the @length minimum",
-            String::new(),
-            chat_configuration.clone(),
-        ),
-        (
-            "a Resource that is this configuration's own ARN",
-            chat_configuration.clone(),
-            chat_configuration.clone(),
-        ),
-        (
-            "a Resource that is a Chime webhook configuration's ARN",
-            chime.clone(),
-            chime.clone(),
-        ),
-        (
-            "a Resource of another chatbot resource type",
-            format!("arn:aws:chatbot::{ACCOUNT}:chat-configuration/slack-channel/assoc-shape"),
-            chat_configuration.clone(),
-        ),
-        (
-            "a Resource of another service",
-            format!("arn:aws:lambda::{ACCOUNT}:custom-action/shape-probe"),
-            chat_configuration.clone(),
-        ),
-        (
-            "a Resource of another partition",
-            format!("arn:aws-cn:chatbot::{ACCOUNT}:custom-action/shape-probe"),
-            chat_configuration.clone(),
-        ),
+    // The rows differ along what those constraints generalise over: WHICH member carries
+    // the offending value, the action name's charset and its own length bound (both inside
+    // the ARN form this account mints, so the authorization decision above admits them),
+    // and for `ChatConfiguration` — which names no resource the call is authorized against
+    // — its length bound, its partition, the service name its pattern admits, and the
+    // leading character of its resource segment. The pattern's upper bound on the action
+    // name (64) keeps every conforming value well under `Resource`'s @length maximum, so
+    // there is no row past that maximum.
+    let rows: [(&str, String, String); 7] = [
         (
             "a Resource whose action name is outside the published charset",
             format!("arn:aws:chatbot::{ACCOUNT}:custom-action/has spaces"),
@@ -354,6 +369,30 @@ async fn a_member_outside_its_modelled_constraints_is_refused_as_client_input() 
             "a ChatConfiguration below its @length minimum",
             minted.clone(),
             "arn:aws:chatbot".to_string(),
+        ),
+        (
+            "a ChatConfiguration that is not an ARN at all",
+            minted.clone(),
+            "not-a-valid-arn-at-all".to_string(),
+        ),
+        (
+            "a ChatConfiguration of another partition",
+            minted.clone(),
+            format!(
+                "arn:aws-cn:chatbot:{REGION}:{ACCOUNT}:chat-configuration/slack-channel/assoc-shape"
+            ),
+        ),
+        (
+            "a ChatConfiguration of a service the pattern does not admit",
+            minted.clone(),
+            format!(
+                "arn:aws:lambda:{REGION}:{ACCOUNT}:chat-configuration/slack-channel/assoc-shape"
+            ),
+        ),
+        (
+            "a ChatConfiguration whose resource segment starts outside the pattern's charset",
+            minted.clone(),
+            format!("arn:aws:chatbot:{REGION}:{ACCOUNT}:-chat-configuration/slack-channel/x"),
         ),
     ];
 
