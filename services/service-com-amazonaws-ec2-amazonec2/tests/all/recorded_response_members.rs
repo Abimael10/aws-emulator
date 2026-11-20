@@ -33,7 +33,10 @@
 //!    associated with and the scope is the same `vpc` a VPC names — read off the VPC on
 //!    every read, so moving the VPC's association moves every subnet of it. Neither element
 //!    is in the model's member list for `com.amazonaws.ec2#Subnet`, so the recording is the
-//!    authority for both, and rule 6b pins the derivation by taking it away.
+//!    authority for both, and rule 6b pins the derivation by taking it away. Neither element
+//!    depends on HOW the call reached the subnet or WHICH operation answered with it: a
+//!    selection by id, a filtered read, every page of a paged walk of that same selection and
+//!    the create that mints a Region's default subnet back all report them.
 //! 7. A RESOLVED PRIVATE DNS NAME BELONGS TO AN INTERFACE'S PRIMARY PRIVATE ADDRESS: inside
 //!    `privateIpAddressesSet` only the primary entry carries a name, and every secondary
 //!    entry carries the member EMPTY — whichever call put the address on the interface and
@@ -59,7 +62,9 @@ use ec2::state::{ComAmazonawsEc2Amazonec2State as Ec2State, PublicIpv4PoolSpec};
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::ec2_query::{call, element, elements, emulator, error_code, error_message, indexed};
+use super::ec2_query::{
+    call, element, elements, emulator, error_code, error_message, filters, indexed,
+};
 use super::wire::{child, child_text, document, member, set_items};
 
 /// The Region every call here is signed for.
@@ -773,6 +778,248 @@ async fn a_subnet_whose_vpc_has_no_option_set_reports_neither_element() {
         "case {case:?}: expected no option set and no scope for a subnet whose VPC has none, \
          got {reported:?} in {described}"
     );
+}
+
+/// The page size the walk below asks for: the SMALLEST page `DescribeSubnets` publishes
+/// (`DescribeSubnetsRequest$MaxResults`, `range 5..1000`), so one more subnet than it spills
+/// the read onto a second page.
+const SUBNET_PAGE_SIZE: usize = 5;
+
+/// More pages than the walk below can need: a walk that reaches this is not paging at all.
+const MOST_SUBNET_PAGES: usize = 8;
+
+/// One page of a `DescribeSubnets` walk: the subnets the page reported, and the `NextToken`
+/// it answered with.
+type SubnetPage = (Vec<ReportedSubnet>, Option<String>);
+
+/// The pages a `DescribeSubnets` walk over the subnets of `vpc_id` reports: the subnets each
+/// page carried and the `NextToken` that page answered with.
+///
+/// The walk follows the token the service minted, which is the only thing a client can do
+/// with one, and is bounded so a token that never advanced fails the case instead of looping
+/// for ever.
+async fn subnet_pages(
+    router: &MultiServiceRouter,
+    case: &str,
+    vpc_id: &str,
+    max_results: Option<usize>,
+) -> Vec<SubnetPage> {
+    let mut pages: Vec<SubnetPage> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut params: Params = filters(&[("vpc-id", &[vpc_id])]);
+        if let Some(limit) = max_results {
+            params.push(p("MaxResults", limit.to_string()));
+        }
+        if let Some(held) = token.clone() {
+            params.push(p("NextToken", held));
+        }
+        let body = ok(router, case, "DescribeSubnets", &params).await;
+        let next = super::ec2_query::member(&body, "nextToken");
+        pages.push((reported_subnets(case, &body), next.clone()));
+        assert!(
+            pages.len() <= MOST_SUBNET_PAGES,
+            "case {case:?}: the walk did not end within {MOST_SUBNET_PAGES} pages, got {pages:?}"
+        );
+        match next {
+            Some(held) => token = Some(held),
+            None => break,
+        }
+    }
+    pages
+}
+
+/// RULE 6, over the two things a reported subnet does NOT depend on: HOW the request reached
+/// the subnet, and WHICH operation answered with it.
+///
+/// The rows are a filtered read, each page of a paged walk of the same selection, and the
+/// create that mints a Region's default subnet back — every one of them reports the option
+/// set in force for the subnet and the scope it came from, so neither element is a property
+/// of one selection form or of one operation.
+#[tokio::test]
+async fn every_reported_subnet_carries_the_set_however_the_call_reached_it() {
+    let (router, _engine) = emulator();
+
+    // One VPC with one subnet more than a page holds, so the paged rows below have a page
+    // the limit filled and a page it did not.
+    let case = "a VPC with more subnets than one page holds";
+    let vpc = ok(&router, case, "CreateVpc", &vec![p("CidrBlock", "10.40.0.0/16")]).await;
+    let vpc_id = element(&vpc, "vpcId").expect("the create reports the VPC it minted");
+    let vpc_options =
+        element(&vpc, "dhcpOptionsId").expect("a created VPC is associated with an option set");
+    let mut created: Vec<String> = Vec::new();
+    for nth in 1..=SUBNET_PAGE_SIZE + 1 {
+        created.push(
+            create_subnet(
+                &router,
+                case,
+                &vpc_id,
+                &format!("10.40.{nth}.0/24"),
+                &vpc_options,
+            )
+            .await,
+        );
+    }
+    created.sort();
+
+    let paged = subnet_pages(
+        &router,
+        "a paged walk of the VPC's subnets",
+        &vpc_id,
+        Some(SUBNET_PAGE_SIZE),
+    )
+    .await;
+    let unpaged = subnet_pages(
+        &router,
+        "the VPC's subnets in one page",
+        &vpc_id,
+        None,
+    )
+    .await;
+
+    // The shape of each walk: the limit filled the first page and left a token, the page it
+    // did not fill ended the walk, and a read that named no limit took one page.
+    let shapes: [(&str, &[SubnetPage], &[usize]); 2] = [
+        (
+            "a paged walk of the VPC's subnets",
+            &paged,
+            &[SUBNET_PAGE_SIZE, 1],
+        ),
+        (
+            "the VPC's subnets in one page",
+            &unpaged,
+            &[SUBNET_PAGE_SIZE + 1],
+        ),
+    ];
+    for (case, walk, expected_pages) in shapes {
+        let counts: Vec<usize> = walk.iter().map(|(subnets, _)| subnets.len()).collect();
+        assert_eq!(
+            counts, expected_pages,
+            "case {case:?}: expected pages of {expected_pages:?} subnet(s), got {counts:?}"
+        );
+        let last_token = walk
+            .last()
+            .map(|(_, token)| token.clone())
+            .expect("every walk reports at least one page");
+        assert_eq!(
+            last_token, None,
+            "case {case:?}: the page the limit did not fill ends the walk, got {last_token:?}"
+        );
+
+        // RULE 6 itself: every subnet of every page, however the walk reached it.
+        let mut walked: Vec<String> = Vec::new();
+        for (subnets, _) in walk {
+            for subnet in subnets {
+                assert_eq!(
+                    subnet.dhcp_options_id.as_deref(),
+                    Some(vpc_options.as_str()),
+                    "case {case:?}: expected the VPC's option set on every reported subnet, \
+                     got {subnet:?}"
+                );
+                assert_eq!(
+                    subnet.dhcp_options_source.as_deref(),
+                    Some(DHCP_OPTIONS_SOURCE_VPC),
+                    "case {case:?}: expected the scope {DHCP_OPTIONS_SOURCE_VPC:?} on every \
+                     reported subnet, got {subnet:?}"
+                );
+                walked.push(subnet.subnet_id.clone());
+            }
+        }
+        walked.sort();
+        assert_eq!(
+            walked, created,
+            "case {case:?}: expected the walk to report every subnet of the VPC, got {walked:?}"
+        );
+    }
+
+    // The ambient default subnet of one Availability Zone, which nothing here created: taking
+    // it away and letting `CreateDefaultSubnet` mint it back reports the two elements off the
+    // DEFAULT VPC's association, so the operation that answers with a subnet is as much
+    // subject to the rule as the read is.
+    let case = "the default subnet of a zone, remade";
+    let defaults = ok(
+        &router,
+        case,
+        "DescribeSubnets",
+        &filters(&[("default-for-az", &["true"])]),
+    )
+    .await;
+    let reported = reported_subnets(case, &defaults);
+    let held = reported
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: the account holds default subnets: {defaults}"));
+    let default_options = held
+        .dhcp_options_id
+        .clone()
+        .unwrap_or_else(|| panic!("case {case:?}: a default subnet reports an option set: {held:?}"));
+    let described = ok(
+        &router,
+        case,
+        "DescribeSubnets",
+        &indexed("SubnetId", &[&held.subnet_id]),
+    )
+    .await;
+    let zone = element(&described, "availabilityZone")
+        .unwrap_or_else(|| panic!("case {case:?}: a subnet reports its zone: {described}"));
+    let _ = ok(
+        &router,
+        case,
+        "DeleteSubnet",
+        &vec![p("SubnetId", held.subnet_id.clone())],
+    )
+    .await;
+    let remade = ok(
+        &router,
+        case,
+        "CreateDefaultSubnet",
+        &vec![p("AvailabilityZone", zone)],
+    )
+    .await;
+    let minted = reported_subnets(case, &remade);
+    assert_eq!(
+        minted.len(),
+        1,
+        "case {case:?}: expected exactly one reported subnet, got {minted:?} in {remade}"
+    );
+    assert_ne!(
+        minted[0].subnet_id, held.subnet_id,
+        "case {case:?}: the remade default subnet is a new resource, got {minted:?}"
+    );
+    // And the same answer on the way back out through the read, the subnet now being one the
+    // account holds rather than one a create just answered with.
+    let read_back = ok(
+        &router,
+        case,
+        "DescribeSubnets",
+        &indexed("SubnetId", &[&minted[0].subnet_id]),
+    )
+    .await;
+    let read_back_subnets = reported_subnets(case, &read_back);
+    let answers: [(&str, &[ReportedSubnet]); 2] = [
+        ("the create", &minted),
+        ("the read back", &read_back_subnets),
+    ];
+    for (row, subnets) in answers {
+        assert!(
+            !subnets.is_empty(),
+            "case {case:?}: expected {row} to report the default subnet it minted"
+        );
+        for subnet in subnets {
+            assert_eq!(
+                subnet.dhcp_options_id.as_deref(),
+                Some(default_options.as_str()),
+                "case {case:?}: expected {row} to report the default VPC's option set, got \
+                 {subnet:?}"
+            );
+            assert_eq!(
+                subnet.dhcp_options_source.as_deref(),
+                Some(DHCP_OPTIONS_SOURCE_VPC),
+                "case {case:?}: expected {row} to report the scope {DHCP_OPTIONS_SOURCE_VPC:?}, \
+                 got {subnet:?}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
