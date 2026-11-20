@@ -26,7 +26,13 @@
 //! Every operation that projects a Channel is asserted, since each puts the member on the
 //! wire on its own: `CreateChannel`, `DescribeChannel`, `ListChannels` (per element),
 //! `UpdateChannel`, `ConfigureLogs`, `RotateChannelCredentials` and
-//! `RotateIngestEndpointCredentials`.
+//! `RotateIngestEndpointCredentials`. The list-wrapped projection is driven over a listing
+//! holding SEVERAL channels, each created through a different one of those addresses, since
+//! a listing is how a client discovers channels it did not create and renders one element
+//! per stored record; and a URL harvested from such a listing is dialled, because the rule
+//! is about an address this process answers on rather than about the shape of a string.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
@@ -320,6 +326,182 @@ async fn a_caller_on_an_aws_hostname_is_announced_the_port_the_emulator_is_serve
                 urls, published,
                 "case {case:?}: {operation} must re-report the published ingest URLs, \
                  expected {published:?}, got {urls:?}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE — a LISTING announces each channel at the endpoint its own create reached
+// ---------------------------------------------------------------------------
+
+/// RULE — the list-wrapped projection renders each stored channel's own ingest pair, so a
+/// listing holding several channels, each created through a different one of this
+/// emulator's own addresses, reports every pair rooted at the address that channel's create
+/// reached — whichever address the listing itself is read at — and every URL in the body is
+/// distinct, one per endpoint of each channel.
+#[tokio::test]
+async fn a_listing_announces_every_channel_at_the_endpoint_its_own_create_reached() {
+    let router = emulator();
+
+    // One channel per shape of own address, created THROUGH that address: the id maps to
+    // the origin its pair must be announced under and the pair the create published.
+    let mut published: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
+    for (index, addressing) in OWN_ENDPOINTS.iter().enumerate() {
+        let id = format!("listed-{index}");
+        let created = create_channel_at(&router, addressing, &id).await;
+        published.insert(id, (origin(addressing.announced), urls_of(&created)));
+    }
+
+    // WHERE a listing is READ decides nothing: each read re-reports the announcement each
+    // channel's own create made.
+    for reader in OWN_ENDPOINTS {
+        let case = format!("a listing read at {}", reader.case);
+        let (status, listed) = control_addressed(
+            &router,
+            "GET",
+            "/channels",
+            None,
+            reader.authority,
+            reader.host_header,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: ListChannels expected 200, got {status} {listed}"
+        );
+        let channels = listed
+            .get("channels")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            channels.len(),
+            published.len(),
+            "case {case:?}: expected {} listed channels, got {listed}",
+            published.len()
+        );
+
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for channel in &channels {
+            let id = channel
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let (expected_origin, expected_urls) = published
+                .get(&id)
+                .unwrap_or_else(|| panic!("case {case:?}: unexpected channel {id:?} in {listed}"));
+            let urls = urls_of(channel);
+            assert_eq!(
+                &urls, expected_urls,
+                "case {case:?}: channel {id:?} must list the URLs its create published, \
+                 expected {expected_urls:?}, got {urls:?}"
+            );
+            for url in &urls {
+                assert_ingest_url(&case, url, expected_origin);
+                assert!(
+                    !url.contains("amazonaws.com"),
+                    "case {case:?}: channel {id:?} must not list an AWS host, got {url:?}"
+                );
+                assert!(
+                    seen.insert(url.clone()),
+                    "case {case:?}: {url:?} is listed for more than one ingest endpoint"
+                );
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            published.len() * state::INGEST_ENDPOINT_COUNT,
+            "case {case:?}: expected one distinct URL per endpoint of every listed channel, \
+             got {seen:?}"
+        );
+    }
+}
+
+/// RULE — an address this service announces is one this process answers on, so a `PUT` to a
+/// URL harvested from a LISTING — the discovery path of a client that created none of these
+/// channels — is challenged by that channel's own ingest listener and accepted once the
+/// listed credentials answer the challenge.
+///
+/// The rows span every shape of own address a channel was created through and both
+/// endpoints of each channel's redundant pair.
+#[tokio::test]
+async fn a_push_to_a_url_harvested_from_a_listing_reaches_this_emulator() {
+    let router = emulator();
+    for (index, addressing) in OWN_ENDPOINTS.iter().enumerate() {
+        create_channel_at(&router, addressing, &format!("harvested-{index}")).await;
+    }
+
+    let (status, listed) = control(&router, "GET", "/channels", None).await;
+    assert_eq!(status, 200, "ListChannels expected 200, got {status} {listed}");
+    let channels = listed
+        .get("channels")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        channels.len(),
+        OWN_ENDPOINTS.len(),
+        "ListChannels must report every created channel, got {listed}"
+    );
+
+    for channel in &channels {
+        let id = channel
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let ingests = ingests_of(channel);
+        assert_eq!(
+            ingests.len(),
+            state::INGEST_ENDPOINT_COUNT,
+            "channel {id:?}: a listing must report the redundant ingest pair, got {channel}"
+        );
+        for (position, ingest) in ingests.iter().enumerate() {
+            let case = format!("channel {id:?} endpoint {position}, dialled as listed");
+            let object = format!("{}/index.m3u8", ingest.url);
+            let body = b"#EXTM3U\n#EXT-X-VERSION:3\n";
+
+            let probe = plane(&router, "PUT", &object, &[], body).await;
+            assert_eq!(
+                probe.status,
+                401,
+                "case {case:?}: the listed address must challenge an unauthenticated PUT, \
+                 got {} {}",
+                probe.status,
+                probe.text()
+            );
+            let challenge = probe.header("www-authenticate").unwrap_or_default();
+            assert!(
+                challenge.starts_with("Digest "),
+                "case {case:?}: expected a Digest challenge, got {challenge:?}"
+            );
+
+            let authorized = plane(
+                &router,
+                "PUT",
+                &object,
+                &[(
+                    "authorization",
+                    digest_authorization(
+                        challenge,
+                        "PUT",
+                        path_of(&object),
+                        &ingest.username,
+                        &ingest.password,
+                    ),
+                )],
+                body,
+            )
+            .await;
+            assert_eq!(
+                authorized.status,
+                200,
+                "case {case:?}: the listed credentials must authenticate at the listed \
+                 address, got {} {}",
+                authorized.status,
+                authorized.text()
             );
         }
     }
