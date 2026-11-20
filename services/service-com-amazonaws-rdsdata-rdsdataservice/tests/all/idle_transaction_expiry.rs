@@ -15,14 +15,17 @@
 //!
 //! The sentence for every OTHER way a transaction stops running is pinned beside this
 //! suite (`ended_transaction_sentence`), and what a value this resource could never have
-//! issued gets by `transaction_id_classes`.
+//! issued gets by `transaction_id_classes`. The two classes are pinned APART on one cluster
+//! by [`the_sentence_names_how_each_transaction_of_a_cluster_stopped_running`], and what
+//! the inactivity window is measured from by
+//! [`the_inactivity_window_is_measured_from_the_last_call_that_used_the_id`].
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_rdsdata_rdsdataservice::state::{
-    TRANSACTION_IDLE_MESSAGE, TRANSACTION_IDLE_TIMEOUT, TRANSACTION_MAX_LIFETIME,
-    TRANSACTION_NOT_RUNNING_MESSAGE,
+    TRANSACTION_COMMITTED_STATUS, TRANSACTION_IDLE_MESSAGE, TRANSACTION_IDLE_TIMEOUT,
+    TRANSACTION_MAX_LIFETIME, TRANSACTION_NOT_RUNNING_MESSAGE,
 };
 
 use crate::sql_data_api::{error_code, parameter, DataApi};
@@ -36,6 +39,10 @@ const EXPECTED_IDLE_MESSAGE: &str =
 const EXPECTED_TERMINATED_MESSAGE: &str =
     "INVALID_ARGUMENT: Transaction error: one previous call resulted in a termination of \
      your transaction";
+
+/// AWS's own `transactionStatus` for a `CommitTransaction` that was served — the positive
+/// control an id still running must still answer.
+const EXPECTED_COMMITTED_STATUS: &str = "Transaction Committed";
 
 /// Room either window has left to run, generous enough that a loaded host cannot spend it
 /// while the case is being driven: a transaction this far inside its window is still
@@ -372,5 +379,214 @@ async fn work_goes_on_after_a_transaction_is_abandoned_for_inactivity() {
         body["message"].as_str(),
         Some(EXPECTED_IDLE_MESSAGE),
         "case the abandoned id after later work: expected the idleness sentence, got {body}"
+    );
+}
+
+/// RULE: the sentence a refused `transactionId` carries names how THAT transaction stopped
+/// running — the service's own reclamation of an inactive one is AWS's idleness sentence
+/// and every other way it stopped is AWS's previous-call sentence — so a cluster holding
+/// transactions that stopped different ways answers each of its ids for its own cause at
+/// one instant, and an id still running is served.
+#[tokio::test]
+async fn the_sentence_names_how_each_transaction_of_a_cluster_stopped_running() {
+    assert_eq!(
+        EXPECTED_COMMITTED_STATUS, TRANSACTION_COMMITTED_STATUS,
+        "the commit status this service states must be AWS's own"
+    );
+
+    let api = DataApi::new();
+    given_entries(&api, None).await;
+
+    // Reclaimed for inactivity: no call used its id for the whole window.
+    let abandoned = a_transaction(&api, None, &Prepared::AWrite).await;
+    api.age_transaction(&abandoned, TRANSACTION_IDLE_TIMEOUT, TRANSACTION_IDLE_TIMEOUT);
+
+    // Ended by the CALLER'S OWN commit, with a write only that commit could install.
+    let committed = a_transaction(&api, None, &Prepared::Nothing).await;
+    api.run(json!({
+        "sql": "INSERT INTO entries (id, note) VALUES (2, 'committed')",
+        "transactionId": committed.clone(),
+    }))
+    .await;
+    let (status, body) = api.commit(&committed).await;
+    assert_eq!(
+        status, 200,
+        "case the commit that ends a transaction: expected it to be served, got {status} {body}"
+    );
+
+    // Ended by the caller's own rollback.
+    let rolled_back = a_transaction(&api, None, &Prepared::AWrite).await;
+    let (status, body) = api.rollback(&rolled_back).await;
+    assert_eq!(
+        status, 200,
+        "case the rollback that ends a transaction: expected it to be served, got {status} {body}"
+    );
+
+    // A statement of its own failed in it, and a commit of the caller's then ended it.
+    let aborted = a_transaction(&api, None, &Prepared::AFailedStatement).await;
+    let (status, body) = api.commit(&aborted).await;
+    assert_eq!(
+        status, 200,
+        "case the commit of an aborted transaction: expected it to be served, got {status} {body}"
+    );
+
+    // Still RUNNING: opened now, so it is well inside both windows while the refusals
+    // below are driven, and it is the positive control committed at the end.
+    let live = a_transaction(&api, None, &Prepared::Nothing).await;
+    api.run(json!({
+        "sql": "INSERT INTO entries (id, note) VALUES (3, 'live')",
+        "transactionId": live.clone(),
+    }))
+    .await;
+
+    // The rows: how the transaction behind each id stopped running, and the sentence that
+    // names that cause.
+    let rows = [
+        (
+            "the transaction the service reclaimed for inactivity",
+            abandoned.as_str(),
+            EXPECTED_IDLE_MESSAGE,
+        ),
+        (
+            "the transaction a commit of the caller's ended",
+            committed.as_str(),
+            EXPECTED_TERMINATED_MESSAGE,
+        ),
+        (
+            "the transaction a rollback of the caller's ended",
+            rolled_back.as_str(),
+            EXPECTED_TERMINATED_MESSAGE,
+        ),
+        (
+            "the transaction a statement of its own failed in, ended by a commit",
+            aborted.as_str(),
+            EXPECTED_TERMINATED_MESSAGE,
+        ),
+    ];
+
+    for (case, transaction_id, expected_sentence) in rows {
+        for (operation, (status, body)) in every_operation_taking_an_id(&api, transaction_id).await
+        {
+            assert_eq!(
+                status, 404,
+                "case {case} on {operation}: expected HTTP 404, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "TransactionNotFoundException",
+                "case {case} on {operation}: expected TransactionNotFoundException, got {body}"
+            );
+            assert_eq!(
+                body["message"].as_str(),
+                Some(expected_sentence),
+                "case {case} on {operation}: expected {expected_sentence:?}, got {body}"
+            );
+        }
+    }
+
+    // The positive control, after every refusal above: the id of the transaction that is
+    // still running is served and commits.
+    let (status, body) = api.commit(&live).await;
+    assert_eq!(
+        status, 200,
+        "case the transaction still running: expected the commit to be served, got {status} \
+         {body}"
+    );
+    assert_eq!(
+        body["transactionStatus"].as_str(),
+        Some(EXPECTED_COMMITTED_STATUS),
+        "case the transaction still running: expected the commit status, got {body}"
+    );
+
+    // Only what a commit of the caller's installed is committed: the reclaimed and the
+    // rolled-back writes are gone, and nothing a refused call carried landed.
+    let ids = entry_ids(&api, None).await;
+    assert_eq!(
+        ids,
+        vec![1, 2, 3],
+        "case after every refusal: expected the seeded and the committed rows, got {ids:?}"
+    );
+}
+
+/// RULE (what the window is measured from): the inactivity the service reclaims a
+/// transaction after is measured from the LAST call that used its `transactionId`, so a
+/// transaction used again inside every window is served however long it has been open and
+/// commits, while one of the same cluster that no call used for a whole window is reclaimed
+/// and carries the idleness sentence.
+#[tokio::test]
+async fn the_inactivity_window_is_measured_from_the_last_call_that_used_the_id() {
+    let api = DataApi::new();
+    given_entries(&api, None).await;
+
+    let busy = api.begin_transaction(None).await;
+    let abandoned = api.begin_transaction(None).await;
+
+    // Almost the whole window, three times over: each round presents the busy transaction
+    // as idle for nearly the entire window and then USES its id, which starts the window
+    // again — so it has been open for about three windows without ever sitting idle for
+    // one.
+    let almost_the_whole_window = TRANSACTION_IDLE_TIMEOUT - WELL_INSIDE_THE_WINDOW;
+    for round in 1..=3u32 {
+        api.age_transaction(
+            &busy,
+            almost_the_whole_window * round,
+            almost_the_whole_window,
+        );
+        let (status, body) = api
+            .execute(json!({
+                "sql": format!("INSERT INTO entries (id, note) VALUES ({}, 'round')", 10 + round),
+                "transactionId": busy.clone(),
+            }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case round {round} inside the window: expected the statement to be served, got \
+             {status} {body}"
+        );
+    }
+
+    let (status, body) = api.commit(&busy).await;
+    assert_eq!(
+        status, 200,
+        "case the transaction used inside every window: expected the commit to be served, got \
+         {status} {body}"
+    );
+    assert_eq!(
+        body["transactionStatus"].as_str(),
+        Some(EXPECTED_COMMITTED_STATUS),
+        "case the transaction used inside every window: expected the commit status, got {body}"
+    );
+
+    // Its neighbour, opened at the same time and used by no call since: a whole window of
+    // inactivity, so every operation taking its id answers the idleness sentence.
+    api.age_transaction(&abandoned, TRANSACTION_IDLE_TIMEOUT, TRANSACTION_IDLE_TIMEOUT);
+    for (operation, (status, body)) in every_operation_taking_an_id(&api, &abandoned).await {
+        assert_eq!(
+            status, 404,
+            "case the neighbour no call used on {operation}: expected HTTP 404, got {status} \
+             {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "TransactionNotFoundException",
+            "case the neighbour no call used on {operation}: expected \
+             TransactionNotFoundException, got {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(EXPECTED_IDLE_MESSAGE),
+            "case the neighbour no call used on {operation}: expected the idleness sentence, got \
+             {body}"
+        );
+    }
+
+    // What the busy transaction committed is committed, and nothing the reclaimed one or a
+    // refused call carried is.
+    let ids = entry_ids(&api, None).await;
+    assert_eq!(
+        ids,
+        vec![1, 11, 12, 13],
+        "case after a transaction used inside every window committed: expected the seeded and \
+         its own rows, got {ids:?}"
     );
 }
