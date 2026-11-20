@@ -31,11 +31,28 @@ java-properties = "2.0"
 # the model documents as regular expressions, against a source cluster's topics.
 regex = "1.13"
 # Encodes and decodes the Apache Kafka wire protocol (request/response frames, their
-# per-API versions and the record batch format), which is what the cluster's broker
+# per-API versions and the older record formats), which is what the cluster's broker
 # endpoint SPEAKS (`src/state/broker_plane/`): the messages are the protocol's, so they
-# are read with the protocol's own implementation rather than hand-rolled. No
-# compression codec is taken: the broker reads and writes uncompressed batches.
+# are read with the protocol's own implementation rather than hand-rolled. NO compression
+# codec is taken from it: a batch's codec is the caller's choice, so each one is read
+# through the bounded decode in `src/state/broker_plane/codecs.rs` instead, and this
+# crate's own decoder then reads only an uncompressed batch.
 kafka-protocol = { version = "0.18", default-features = false, features = ["broker", "client"] }
+# The CRC-32C a record batch states over itself, which a broker checks before it appends
+# a batch and states over the batch it answers a fetch with (Apache Kafka record batch).
+crc32c = "0.6"
+# The four codecs a Kafka record batch may travel in, which a producer names in the batch
+# it sends (`src/state/broker_plane/codecs.rs`). Capability class: LIBRARIES computing over
+# a buffer in process — each is PURE RUST, so this endpoint links no native compression
+# library and nothing here compiles C at build time: `flate2` (over `miniz_oxide`) reads
+# and writes the gzip stream, `lz4_flex` the LZ4 frame, `ruzstd` the Zstandard frame, and
+# `snap` the raw snappy blocks Kafka's snappy framing carries. Each decode is handed
+# caller-chosen bytes, so each runs under a byte budget the record layer spends across one
+# payload and refuses past it rather than holding what a codec expands to.
+flate2 = "1"
+lz4_flex = "0.14"
+ruzstd = "0.9"
+snap = "1"
 # The SASL/SCRAM-SHA-512 exchange a Kafka client completes against that endpoint:
 # PBKDF2-HMAC-SHA-512 over the credential, and the HMAC/hash the proof and the server
 # signature are computed with (RFC 5802).

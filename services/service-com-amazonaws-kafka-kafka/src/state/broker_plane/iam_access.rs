@@ -50,6 +50,8 @@ pub const ACTION_ALTER_GROUP: &str = "kafka-cluster:AlterGroup";
 pub const ACTION_DESCRIBE_GROUP: &str = "kafka-cluster:DescribeGroup";
 /// The action deleting a consumer group needs.
 pub const ACTION_DELETE_GROUP: &str = "kafka-cluster:DeleteGroup";
+/// The action changing a topic needs — raising its partition count, for one.
+pub const ACTION_ALTER_TOPIC: &str = "kafka-cluster:AlterTopic";
 
 /// The ARN resource type a topic of a cluster is addressed by in such a policy, and the
 /// one a consumer group is: `topic/<cluster name>/<cluster uuid>/<topic>` and

@@ -157,6 +157,9 @@ impl GroupState {
 pub struct DescribedMember {
     /// The id the coordinator gave the member.
     pub id: String,
+    /// The id the member's own client gave itself — the `client_id` it sent with its
+    /// join. What a reader of the group tells one member from another by.
+    pub client_id: String,
     /// The subscription it joined with.
     pub metadata: Bytes,
     /// The part of the group's assignment that is its own, empty while the group has
@@ -200,6 +203,9 @@ pub struct ConsumerGroup {
 struct GroupMember {
     /// The id the coordinator gave the member, which it quotes in every later call.
     id: String,
+    /// The `client_id` the member sent with its join: the name its own client goes by,
+    /// which a reader of the group reports it under.
+    client_id: String,
     /// The subscription the member joined with, which the leader reads to compute the
     /// assignment.
     metadata: Bytes,
@@ -268,6 +274,7 @@ impl ConsumerGroup {
             .iter()
             .map(|member| DescribedMember {
                 id: member.id.clone(),
+                client_id: member.client_id.clone(),
                 metadata: member.metadata.clone(),
                 assignment: member.assignment.clone().unwrap_or_default(),
             })
@@ -280,11 +287,21 @@ impl ConsumerGroup {
     ///
     /// The removal was owed at the instant the session expired whether or not anybody
     /// called, so materialising it on a read reports the group the clock already left
-    /// behind rather than changing what a later caller sees.
+    /// behind rather than keeping a member no client is behind.
+    ///
+    /// A member whose `JoinGroup` the coordinator is HOLDING is not such a member: it has
+    /// rejoined the rebalance in flight and is waiting on the coordinator's own answer,
+    /// so it is in contact with it, and what bounds that wait is the rebalance barrier
+    /// ([`MAX_REBALANCE_BARRIER`]) rather than the session timeout a client renews by
+    /// heartbeating. Expiring it would answer its join `UNKNOWN_MEMBER_ID` for not
+    /// heartbeating while the coordinator held the call it was waiting for, which leaves
+    /// a client rejoining for as long as the group keeps gathering.
     pub fn expire_members(&mut self, now: SystemTime) {
         let before = self.members.len();
-        self.members
-            .retain(|member| member.session_deadline > now);
+        let gathering = self.state == GroupState::PreparingRebalance;
+        self.members.retain(|member| {
+            member.session_deadline > now || (gathering && member.rejoined.is_some())
+        });
         if self.members.len() == before {
             return;
         }
@@ -320,12 +337,23 @@ impl ConsumerGroup {
     /// Complete the join phase: advance the generation once, take the assignment the
     /// previous one ran with off the members, and make the member that rejoined FIRST the
     /// leader of the new generation — the member the whole membership is handed to.
-    fn form_generation(&mut self) {
+    ///
+    /// Completing the phase is what ANSWERS every member's held `JoinGroup`, so each
+    /// member's session window starts again here: a client's next call is the `SyncGroup`
+    /// that follows the answer it has just been given, not a heartbeat it owed while the
+    /// coordinator was holding the call.
+    ///
+    /// The phase the group enters here is BOUNDED like the one it leaves: the assignment
+    /// is the leader's to state, and a leader that never states one would hold every
+    /// other member's `SyncGroup` for as long as it stayed silent, so the instant that
+    /// wait ends is stored the same way ([`Self::poll_sync`]).
+    fn form_generation(&mut self, now: SystemTime) {
         self.generation = self.generation.saturating_add(1);
         self.state = GroupState::CompletingRebalance;
-        self.rebalance_deadline = None;
+        self.rebalance_deadline = Some(now + MAX_REBALANCE_BARRIER);
         for member in &mut self.members {
             member.assignment = None;
+            member.session_deadline = now + member.session_window;
         }
         self.leader = self
             .members
@@ -346,6 +374,7 @@ impl ConsumerGroup {
     pub fn begin_join(
         &mut self,
         request: &JoinGroupRequest,
+        client_id: &str,
         now: SystemTime,
     ) -> Result<Joining, i16> {
         self.expire_members(now);
@@ -399,6 +428,7 @@ impl ConsumerGroup {
             .find(|member| member.id == member_id)
         {
             Some(member) => {
+                member.client_id = client_id.to_string();
                 member.metadata = metadata;
                 member.rejoined = Some(rejoined);
                 member.session_deadline = session_deadline;
@@ -406,6 +436,7 @@ impl ConsumerGroup {
             }
             None => self.members.push(GroupMember {
                 id: member_id.clone(),
+                client_id: client_id.to_string(),
                 metadata,
                 rejoined: Some(rejoined),
                 assignment: None,
@@ -457,7 +488,7 @@ impl ConsumerGroup {
         if !gathered {
             self.members.retain(|member| member.rejoined.is_some());
         }
-        self.form_generation();
+        self.form_generation(now);
         Some(self.join_response(&joining.member_id))
     }
 
@@ -522,11 +553,18 @@ impl ConsumerGroup {
             member.assignment = stated.get(&member.id).cloned();
         }
         self.state = GroupState::Stable;
+        // The phase is over, so the instant its wait would have ended goes with it.
+        self.rebalance_deadline = None;
         Ok(())
     }
 
     /// The `SyncGroup` answer for a member, or `None` while the group's leader has not
     /// stated the assignment yet.
+    ///
+    /// That wait is BOUNDED by the barrier the generation was formed with
+    /// ([`Self::form_generation`]): past it the member is told to rejoin rather than held
+    /// for as long as a leader that states no assignment stays silent, so a client cannot
+    /// park a call on this coordinator without end.
     pub fn poll_sync(&mut self, request: &SyncGroupRequest, now: SystemTime) -> Option<SyncGroupResponse> {
         self.expire_members(now);
         let member_id = request.member_id.to_string();
@@ -534,6 +572,15 @@ impl ConsumerGroup {
             return Some(SyncGroupResponse::default().with_error_code(code));
         }
         if self.state != GroupState::Stable {
+            if self
+                .rebalance_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                return Some(
+                    SyncGroupResponse::default()
+                        .with_error_code(ResponseError::RebalanceInProgress.code()),
+                );
+            }
             return None;
         }
         let assignment = self
@@ -626,11 +673,27 @@ impl ConsumerGroup {
     /// `OffsetCommit`: store how far the group has read each partition, for at most
     /// `max_entries` (topic, partition) entries of one request — the list comes from
     /// the client.
+    ///
+    /// A commit is FENCED by the group's membership and generation, which is the only
+    /// thing that stops a member the coordinator has already removed — one whose session
+    /// ran out, or that was evicted by a rebalance — from writing over the position the
+    /// member now holding its partitions has committed: a commit quoting a member the
+    /// group does not hold is `UNKNOWN_MEMBER_ID`, one quoting another generation is
+    /// `ILLEGAL_GENERATION`, and one that arrives while the group is handing out a new
+    /// assignment is `REBALANCE_IN_PROGRESS`. A commit that quotes NO generation and no
+    /// member is a client storing offsets in the group without joining it, which is
+    /// admitted only while no member holds the group.
     pub fn commit(
         &mut self,
         request: &OffsetCommitRequest,
         max_entries: usize,
+        now: SystemTime,
     ) -> OffsetCommitResponse {
+        self.expire_members(now);
+        let refusal = self.commit_refusal(
+            &request.member_id.to_string(),
+            request.generation_id_or_member_epoch,
+        );
         let mut topics = Vec::new();
         let mut entries = 0usize;
         for topic in request.topics.iter() {
@@ -642,14 +705,19 @@ impl ConsumerGroup {
                 }
                 entries += 1;
                 let key = (name.clone(), partition.partition_index);
-                let error_code = match self.offsets.contains_key(&key)
-                    || self.offsets.len() < MAX_COMMITTED_PARTITIONS_PER_GROUP
-                {
-                    true => {
-                        self.offsets.insert(key, partition.committed_offset);
-                        0
-                    }
-                    false => ::kafka_protocol::ResponseError::OffsetMetadataTooLarge.code(),
+                let error_code = match refusal {
+                    // Nothing is stored for a refused commit: the position the group
+                    // holds is the one the member that owns the partition committed.
+                    Some(code) => code,
+                    None => match self.offsets.contains_key(&key)
+                        || self.offsets.len() < MAX_COMMITTED_PARTITIONS_PER_GROUP
+                    {
+                        true => {
+                            self.offsets.insert(key, partition.committed_offset);
+                            0
+                        }
+                        false => ::kafka_protocol::ResponseError::OffsetMetadataTooLarge.code(),
+                    },
                 };
                 partitions.push(
                     OffsetCommitResponsePartition::default()
@@ -664,6 +732,32 @@ impl ConsumerGroup {
             );
         }
         OffsetCommitResponse::default().with_topics(topics)
+    }
+
+    /// What a commit quoting `member_id` at `generation` is refused with, and `None` when
+    /// the group admits it ([`Self::commit`]).
+    ///
+    /// Read in the coordinator's order: WHO the commit speaks for first, then the
+    /// generation it quotes, and only then the group's own state — so a commit from a
+    /// member the group does not hold is told that, rather than told to rejoin a
+    /// rebalance it is not part of. A commit that quotes neither is a member id the
+    /// group does not hold either, so a group that HAS members answers it the same way.
+    fn commit_refusal(&self, member_id: &str, generation: i32) -> Option<i16> {
+        // A client that joined no group: admitted while no member holds the group, since
+        // a group with members is handing its partitions out itself.
+        if generation < 0 && member_id.is_empty() && !self.has_members() {
+            return None;
+        }
+        if !self.members.iter().any(|member| member.id == member_id) {
+            return Some(ResponseError::UnknownMemberId.code());
+        }
+        if generation != self.generation {
+            return Some(ResponseError::IllegalGeneration.code());
+        }
+        if self.state == GroupState::CompletingRebalance {
+            return Some(ResponseError::RebalanceInProgress.code());
+        }
+        None
     }
 
     /// `OffsetFetch`: the offsets the group committed for the partitions the request

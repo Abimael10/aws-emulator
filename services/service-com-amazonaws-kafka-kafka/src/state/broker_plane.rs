@@ -43,9 +43,12 @@ use super::*;
 
 pub mod acls;
 pub mod broker_config;
+pub mod codecs;
 pub mod groups;
 pub mod iam_access;
+pub mod records;
 pub mod sasl;
+pub mod topic_config;
 pub mod topics;
 pub mod wire;
 
@@ -119,6 +122,17 @@ pub const BROKER_CONFIG_DEFAULTS: &[(&str, &str)] = &[
 /// The topic configuration key that says how long a record is kept.
 pub const RETENTION_MS_CONFIG: &str = "retention.ms";
 
+/// The topic configuration key that says WHOSE clock a record's timestamp is, and the
+/// value of it that makes the timestamp the broker's own ("Topic-Level Configs", Apache
+/// Kafka documentation: `message.timestamp.type`, `CreateTime` or `LogAppendTime`).
+pub const MESSAGE_TIMESTAMP_TYPE_CONFIG: &str = "message.timestamp.type";
+/// See [`MESSAGE_TIMESTAMP_TYPE_CONFIG`].
+pub const LOG_APPEND_TIME: &str = "LogAppendTime";
+
+/// The topic configuration key that says which codec the broker keeps the topic's
+/// records in.
+pub const COMPRESSION_TYPE_CONFIG: &str = "compression.type";
+
 /// The `AclOperation` a produce needs on a topic, and the one a fetch needs (Apache
 /// Kafka's `AclOperation` enum).
 pub const OPERATION_WRITE: i8 = 4;
@@ -129,6 +143,9 @@ pub const OPERATION_READ: i8 = 3;
 pub const OPERATION_CREATE: i8 = 5;
 /// See [`OPERATION_CREATE`].
 pub const OPERATION_DELETE: i8 = 6;
+/// The `AclOperation` CHANGING a topic needs — raising its partition count, for one (the
+/// same enum).
+pub const OPERATION_ALTER: i8 = 7;
 
 /// The most partitions of one topic this endpoint reports and serves.
 ///
@@ -139,23 +156,87 @@ pub const OPERATION_DELETE: i8 = 6;
 /// counts a cluster of this emulator is driven with.
 pub const MAX_PARTITIONS_PER_TOPIC: i32 = 1024;
 
-/// One record a `Produce` submitted, as the log appends it: the producer's timestamp
-/// (negative when it set none, so the broker stamps the record itself), the record key
-/// and the record value.
-pub type SubmittedRecord = (i64, Option<Vec<u8>>, Option<Vec<u8>>);
+/// One record's headers, in the order the producer wrote them: a sequence of
+/// `(key, value)` pairs where the key may REPEAT and the value may be absent, which is
+/// what a Kafka record header is (KIP-82). Order and bytes are part of the record, so
+/// they are kept as submitted rather than folded into a map.
+pub type RecordHeaders = Vec<(String, Option<Vec<u8>>)>;
+
+/// One record a `Produce` submitted, as the log appends it.
+#[derive(Debug, Clone, Default)]
+pub struct SubmittedRecord {
+    /// The producer's timestamp in epoch milliseconds, negative when it set none — in
+    /// which case the broker stamps the record itself.
+    pub timestamp_ms: i64,
+    /// The record key, absent for a record produced without one.
+    pub key: Option<Vec<u8>>,
+    /// The record value, absent for a tombstone.
+    pub value: Option<Vec<u8>>,
+    /// The record's headers, as the producer wrote them.
+    pub headers: RecordHeaders,
+    /// The codec the batch this record arrived in was compressed with.
+    pub codec: RecordCodec,
+}
 
 /// One record in a partition's log, as a fetch hands it back.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StoredRecord {
     /// The offset this record was written at; a fetch reads from an offset.
     pub offset: i64,
     /// The record's timestamp in epoch milliseconds — the producer's when it sent one,
     /// otherwise the instant the broker appended it. What retention ages out.
     pub timestamp_ms: i64,
+    /// Whether that timestamp is the instant the BROKER appended the record rather than
+    /// the one the producer stated: the topic's `message.timestamp.type`, which a fetch
+    /// reports as the batch's timestamp type so a consumer reads back the kind of
+    /// timestamp the topic keeps.
+    pub log_append_time: bool,
     /// The record key, absent for a record produced without one.
     pub key: Option<Vec<u8>>,
     /// The record value, absent for a tombstone.
     pub value: Option<Vec<u8>>,
+    /// The record's headers, byte for byte as the producer wrote them.
+    pub headers: RecordHeaders,
+    /// The codec the batch this record arrived in was compressed with, which is the
+    /// codec a fetch answers with for a topic whose `compression.type` is `producer`.
+    pub codec: RecordCodec,
+}
+
+/// The compression codec a record batch travels in: the codecs Apache Kafka's record
+/// batch attributes name, which are also the values a topic's `compression.type` may
+/// take beside `producer` and `uncompressed` ("Topic-Level Configs", Apache Kafka
+/// documentation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecordCodec {
+    /// The batch carries its records uncompressed.
+    #[default]
+    None,
+    /// gzip (`compression.type=gzip`).
+    Gzip,
+    /// snappy (`compression.type=snappy`).
+    Snappy,
+    /// LZ4 (`compression.type=lz4`).
+    Lz4,
+    /// Zstandard (`compression.type=zstd`).
+    Zstd,
+}
+
+impl RecordCodec {
+    /// The codec a topic's `compression.type` puts in force, or `None` for the two
+    /// values that name no codec of their own: `producer` keeps the codec the producer
+    /// chose, and `uncompressed` is the absence of one — which is [`Self::None`], not
+    /// the absence of an answer.
+    #[must_use]
+    pub fn of_topic_config(value: &str) -> Option<Self> {
+        match value.trim() {
+            "gzip" => Some(Self::Gzip),
+            "snappy" => Some(Self::Snappy),
+            "lz4" => Some(Self::Lz4),
+            "zstd" => Some(Self::Zstd),
+            "uncompressed" => Some(Self::None),
+            _ => None,
+        }
+    }
 }
 
 /// One partition's log: the records it holds, where the log starts and the offset the
@@ -180,15 +261,10 @@ impl PartitionLog {
     /// Bounded by [`MAX_RECORDS_PER_PARTITION`] and
     /// [`MAX_LOG_BYTES_PER_PARTITION`]: the oldest records go until both hold, which
     /// raises the log's start offset exactly as a retention sweep does.
-    pub fn append(&mut self, timestamp_ms: i64, key: Option<Vec<u8>>, value: Option<Vec<u8>>) -> i64 {
+    pub fn append(&mut self, record: StoredRecord) -> i64 {
         let offset = self.next_offset;
-        self.retained_bytes += record_bytes(key.as_ref(), value.as_ref());
-        self.records.push_back(StoredRecord {
-            offset,
-            timestamp_ms,
-            key,
-            value,
-        });
+        self.retained_bytes += record_bytes(&record);
+        self.records.push_back(StoredRecord { offset, ..record });
         self.next_offset += 1;
         while self.records.len() > MAX_RECORDS_PER_PARTITION
             || (self.retained_bytes > MAX_LOG_BYTES_PER_PARTITION && self.records.len() > 1)
@@ -202,9 +278,7 @@ impl PartitionLog {
     /// Drop the oldest record the log holds, keeping the retained byte count with it.
     fn drop_oldest(&mut self) {
         if let Some(dropped) = self.records.pop_front() {
-            self.retained_bytes = self
-                .retained_bytes
-                .saturating_sub(record_bytes(dropped.key.as_ref(), dropped.value.as_ref()));
+            self.retained_bytes = self.retained_bytes.saturating_sub(record_bytes(&dropped));
         }
     }
 
@@ -240,9 +314,20 @@ impl PartitionLog {
     }
 }
 
-/// The bytes one record's key and value retain.
-fn record_bytes(key: Option<&Vec<u8>>, value: Option<&Vec<u8>>) -> usize {
-    key.map_or(0, Vec::len) + value.map_or(0, Vec::len)
+/// The bytes one record's key, value and headers retain.
+fn record_bytes(record: &StoredRecord) -> usize {
+    record.key.as_ref().map_or(0, Vec::len)
+        + record.value.as_ref().map_or(0, Vec::len)
+        + header_bytes(&record.headers)
+}
+
+/// The bytes one record's headers retain: every key and every value of them, which are
+/// part of the record a producer sent and of the one a fetch hands back.
+pub fn header_bytes(headers: &RecordHeaders) -> usize {
+    headers
+        .iter()
+        .map(|(key, value)| key.len() + value.as_ref().map_or(0, Vec::len))
+        .sum()
 }
 
 /// One ACCESS PATH a cluster's brokers are reached over: the four a client picks
@@ -581,6 +666,19 @@ pub struct DataPlaneTopic {
     pub replication_factor: i32,
 }
 
+/// What an accepted produce of one partition answers: where the records landed, and the
+/// instant the BROKER stamped them at for a topic that stamps its records itself.
+#[derive(Debug, Clone, Copy)]
+pub struct Appended {
+    /// The offset the first appended record took.
+    pub base_offset: i64,
+    /// The instant the broker stamped the batch at, for a topic whose
+    /// `message.timestamp.type` is [`LOG_APPEND_TIME`] — and `None` for a topic that
+    /// keeps the producer's own timestamps, which is what the acknowledgement of a
+    /// produce to such a topic carries no append time for.
+    pub log_append_time_ms: Option<i64>,
+}
+
 /// What a fetch of one partition answers: the records it read and where the log
 /// begins and ends.
 #[derive(Debug, Clone)]
@@ -592,6 +690,10 @@ pub struct FetchedPartition {
     pub high_watermark: i64,
     /// The first offset still readable.
     pub log_start_offset: i64,
+    /// The codec the topic keeps its records in, from its own `compression.type`:
+    /// `None` for a topic that keeps the codec the PRODUCER chose, which is that
+    /// setting's default value (`producer`).
+    pub codec: Option<RecordCodec>,
 }
 
 impl ComAmazonawsKafkaKafkaState {
@@ -635,7 +737,10 @@ impl ComAmazonawsKafkaKafkaState {
     }
 
     /// Append `records` to one partition of one topic, handing back the offset the
-    /// first of them took.
+    /// first of them took and the instant the broker stamped them at, for a topic that
+    /// stamps its records itself ([`LOG_APPEND_TIME`]) — which is what a producer is
+    /// acknowledged with, since on such a topic the timestamp it sent is not the one the
+    /// record carries.
     ///
     /// Refused for a topic the cluster does not hold, a partition the topic does not
     /// have, and a record past [`MAX_RECORD_BYTES`] — the same conditions a broker
@@ -647,36 +752,60 @@ impl ComAmazonawsKafkaKafkaState {
         partition: i32,
         records: Vec<SubmittedRecord>,
         now: SystemTime,
-    ) -> Result<i64, PartitionRefusal> {
+    ) -> Result<Appended, PartitionRefusal> {
+        let configuration = self
+            .data_plane_topic_configuration(cluster_arn, topic, now)
+            .ok_or(PartitionRefusal::UnknownTopicOrPartition)?
+            .effective;
         let held = self
             .data_plane_topic(cluster_arn, topic, now)
             .ok_or(PartitionRefusal::UnknownTopicOrPartition)?;
         if partition < 0 || partition >= held.partition_count.clamp(1, MAX_PARTITIONS_PER_TOPIC) {
             return Err(PartitionRefusal::UnknownTopicOrPartition);
         }
-        for (_, key, value) in &records {
-            let size = key.as_ref().map_or(0, Vec::len) + value.as_ref().map_or(0, Vec::len);
+        for record in &records {
+            let size = record.key.as_ref().map_or(0, Vec::len)
+                + record.value.as_ref().map_or(0, Vec::len)
+                + header_bytes(&record.headers);
             if size > MAX_RECORD_BYTES {
                 return Err(PartitionRefusal::MessageTooLarge);
             }
         }
+        // Whose clock stamps the record: the topic's `message.timestamp.type`. A topic
+        // that keeps `LogAppendTime` replaces every producer timestamp with the instant
+        // the broker appended the record, and reports the record as carrying that kind
+        // of timestamp ("Topic-Level Configs", Apache Kafka documentation).
+        let log_append_time = configuration
+            .get(MESSAGE_TIMESTAMP_TYPE_CONFIG)
+            .is_some_and(|value| value.trim() == LOG_APPEND_TIME);
         let now_ms = epoch_millis(now);
         let log = self
             .partition_logs
             .entry((cluster_arn.to_string(), topic.to_string(), partition))
             .or_default();
         let base = log.next_offset;
-        for (timestamp_ms, key, value) in records {
-            let stamped = match timestamp_ms >= 0 {
-                true => timestamp_ms,
+        for record in records {
+            let stamped = match log_append_time || record.timestamp_ms < 0 {
                 // A producer that sends no timestamp has the broker stamp the record
-                // with the instant it was appended, which is what `CreateTime`'s
-                // fallback (`LogAppendTime`) is.
-                false => now_ms,
+                // with the instant it was appended, which is also what a topic keeping
+                // `LogAppendTime` does to every record.
+                true => now_ms,
+                false => record.timestamp_ms,
             };
-            log.append(stamped, key, value);
+            log.append(StoredRecord {
+                offset: 0,
+                timestamp_ms: stamped,
+                log_append_time,
+                key: record.key,
+                value: record.value,
+                headers: record.headers,
+                codec: record.codec,
+            });
         }
-        Ok(base)
+        Ok(Appended {
+            base_offset: base,
+            log_append_time_ms: log_append_time.then_some(now_ms),
+        })
     }
 
     /// Read one partition from `fetch_offset` on, with the records the topic's
@@ -702,6 +831,9 @@ impl ComAmazonawsKafkaKafkaState {
         }
         let now_ms = epoch_millis(now);
         let retention = retention_ms(&configuration);
+        let codec = configuration
+            .get(COMPRESSION_TYPE_CONFIG)
+            .and_then(|value| RecordCodec::of_topic_config(value));
         // A partition nothing has been produced to has no log to read or to sweep, and
         // reading it writes none: it is empty, which is what a fetch at its first
         // offset is answered.
@@ -713,6 +845,7 @@ impl ComAmazonawsKafkaKafkaState {
                 records: Vec::new(),
                 high_watermark: 0,
                 log_start_offset: 0,
+                codec,
             });
         };
         log.expire(now_ms, retention);
@@ -730,6 +863,7 @@ impl ComAmazonawsKafkaKafkaState {
             records,
             high_watermark: log.next_offset,
             log_start_offset: log.log_start_offset,
+            codec,
         })
     }
 

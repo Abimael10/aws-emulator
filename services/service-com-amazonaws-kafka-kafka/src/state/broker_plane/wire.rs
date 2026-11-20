@@ -61,15 +61,14 @@ use ::kafka_protocol::messages::{
     SaslHandshakeResponse, SyncGroupRequest, TopicName,
 };
 use ::kafka_protocol::protocol::{Decodable, Encodable, Message, StrBytes};
-use ::kafka_protocol::records::{
-    Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions, TimestampType,
-};
 use ::kafka_protocol::ResponseError;
 use ::smithy_server_runtime::EmbeddedEmulator;
 use ::tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::sasl::{self, Authenticated, Mechanism};
-use super::{acls, groups, iam_access, topics, AccessPath, BROKER_NODE_ID, MAX_FRAME_BYTES};
+use super::{
+    acls, groups, iam_access, records, topics, AccessPath, BROKER_NODE_ID, MAX_FRAME_BYTES,
+};
 
 /// The resource type a `DescribeConfigs` request names a TOPIC by, and the one it
 /// names a BROKER by (`ConfigResource.Type`, Apache Kafka protocol).
@@ -89,12 +88,20 @@ const CONFIG_SOURCE_DEFAULT: i8 = 5;
 /// (`STATIC_BROKER_CONFIG`).
 const CONFIG_SOURCE_STATIC_BROKER_CONFIG: i8 = 4;
 
-/// The timestamp a `ListOffsets` request names to ask for the EARLIEST offset still
+/// The two timestamps a `ListOffsets` request names to ask for the EARLIEST offset still
 /// readable, and the one it names to ask for the offset the next produced record will
 /// take (Apache Kafka protocol, `ListOffsets`).
 const OFFSET_EARLIEST: i64 = -2;
 /// See [`OFFSET_EARLIEST`].
 const OFFSET_LATEST: i64 = -1;
+
+/// What a `ListOffsets` answer carries where there is no offset to report, and where
+/// there is no timestamp: a lookup by time that no record satisfies, and the bounds of
+/// the log — which are positions, not records, so they carry no timestamp (Apache Kafka
+/// answers -1 for each).
+const NO_OFFSET: i64 = -1;
+/// See [`NO_OFFSET`].
+const NO_TIMESTAMP: i64 = -1;
 
 /// The most records one fetch answers with FOR ONE PARTITION, and the most across the
 /// whole request: one request names as many (topic, partition) entries as it likes, so
@@ -125,10 +132,6 @@ const GROUP_POLL_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_m
 /// whole poll interval. Apache Kafka's own `fetch.max.wait.ms` default is 500 ms, so a
 /// client's stated wait is normally far below it.
 const MAX_FETCH_WAIT: ::std::time::Duration = ::std::time::Duration::from_secs(5);
-
-/// The record batch version this endpoint writes: the format Apache Kafka has used
-/// since 0.11, which is what every client this endpoint can negotiate with reads.
-const RECORD_BATCH_VERSION: i8 = 2;
 
 /// What a fetch answer states when the leader has no replica it would rather the client
 /// read from (Apache Kafka protocol, `Fetch`: `PreferredReadReplica` is `-1` for no
@@ -247,6 +250,16 @@ fn served_apis() -> Vec<(ApiKey, i16, i16)> {
     serve(
         ApiKey::DeleteTopics,
         carried::<DeleteTopicsRequest, ::kafka_protocol::messages::DeleteTopicsResponse>(0, 5),
+    );
+    // The API an admin client GROWS a topic with: a client that raises a topic's
+    // partition count sends this, and a broker that does not serve it leaves that client
+    // unable to add a partition at all.
+    serve(
+        ApiKey::CreatePartitions,
+        carried::<
+            ::kafka_protocol::messages::CreatePartitionsRequest,
+            ::kafka_protocol::messages::CreatePartitionsResponse,
+        >(0, 3),
     );
     // The API a consumer validates a position it resumed from with: a client that holds a
     // committed offset and the leader epoch it was committed at asks the broker where
@@ -543,7 +556,7 @@ impl Broker {
             }
             ApiKey::Produce => {
                 let request = ProduceRequest::decode(&mut body, api_version).ok()?;
-                let response = self.produce(&request, session);
+                let response = self.produce(&request, session).await;
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::Fetch => {
@@ -573,7 +586,7 @@ impl Broker {
             }
             ApiKey::JoinGroup => {
                 let request = JoinGroupRequest::decode(&mut body, api_version).ok()?;
-                let response = self.join_group(&request, session).await;
+                let response = self.join_group(&request, session, &header).await;
                 self.encode(key, api_version, &header, &response)
             }
             ApiKey::SyncGroup => {
@@ -631,7 +644,7 @@ impl Broker {
                     false => committed_nothing(&request, group_authorization_failed()),
                     true => self
                         .group(&request.group_id.0, true, |group| {
-                            group.commit(&request, MAX_REQUEST_ENTRIES)
+                            group.commit(&request, MAX_REQUEST_ENTRIES, SystemTime::now())
                         })
                         .unwrap_or_default(),
                 };
@@ -712,6 +725,30 @@ impl Broker {
                 );
                 let mut store = self.state.lock();
                 let response = topics::delete(
+                    &mut store,
+                    &self.cluster_arn,
+                    &request,
+                    &withheld,
+                    MAX_REQUEST_ENTRIES,
+                    SystemTime::now(),
+                );
+                drop(store);
+                self.encode(key, api_version, &header, &response)
+            }
+            ApiKey::CreatePartitions => {
+                let request = ::kafka_protocol::messages::CreatePartitionsRequest::decode(
+                    &mut body,
+                    api_version,
+                )
+                .ok()?;
+                let withheld = self.withheld_topics(
+                    session,
+                    request.topics.iter().map(|topic| topic.name.0.to_string()),
+                    super::OPERATION_ALTER,
+                    iam_access::ACTION_ALTER_TOPIC,
+                );
+                let mut store = self.state.lock();
+                let response = topics::create_partitions(
                     &mut store,
                     &self.cluster_arn,
                     &request,
@@ -990,6 +1027,7 @@ impl Broker {
         &self,
         request: &JoinGroupRequest,
         session: &Session,
+        header: &RequestHeader,
     ) -> ::kafka_protocol::messages::JoinGroupResponse {
         if !self.group_allowed(
             session,
@@ -999,8 +1037,18 @@ impl Broker {
             return ::kafka_protocol::messages::JoinGroupResponse::default()
                 .with_error_code(group_authorization_failed());
         }
+        // WHO the member is, as the member itself states it: the client id every request
+        // frame on this connection carries. The coordinator records it with the member,
+        // because a reader of the group reports each member under the id its client gave
+        // itself — that is how a client or an operator tool tells one member's
+        // assignment from another's.
+        let client_id = header
+            .client_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default();
         let begun = self.group(&request.group_id.0, true, |group| {
-            group.begin_join(request, SystemTime::now())
+            group.begin_join(request, &client_id, SystemTime::now())
         });
         let joining = match begun {
             None => {
@@ -1207,6 +1255,10 @@ impl Broker {
                             .map(|member| {
                                 DescribedGroupMember::default()
                                     .with_member_id(StrBytes::from_string(member.id))
+                                    // The id the member's own client gave itself, which
+                                    // is what a reader of the group attributes an
+                                    // assignment to a member by.
+                                    .with_client_id(StrBytes::from_string(member.client_id))
                                     .with_member_metadata(member.metadata)
                                     .with_member_assignment(member.assignment)
                             })
@@ -1467,8 +1519,13 @@ impl Broker {
     ///
     /// Bounded as a whole like [`Self::fetch`]: at most [`MAX_REQUEST_ENTRIES`]
     /// (topic, partition) entries are served, with the store's lock taken and released
-    /// per entry.
-    fn produce(
+    /// per entry, and ONE budget of decompressed record bytes
+    /// ([`records::MAX_DECOMPRESSED_BYTES`]) spent across every entry of the request — so
+    /// a frame carrying many entries cannot make each of them spend a ceiling of its own.
+    /// The connection YIELDS per entry, so a request that carries many of them cannot
+    /// hold the runtime's worker against this connection's own timeout, the cancellation
+    /// the core may send it, or another connection's turn.
+    async fn produce(
         &self,
         request: &ProduceRequest,
         session: &Session,
@@ -1476,6 +1533,7 @@ impl Broker {
         let now = SystemTime::now();
         let mut responses = Vec::new();
         let mut entries = 0usize;
+        let mut budget = records::MAX_DECOMPRESSED_BYTES;
         for topic in request.topic_data.iter().take(MAX_REQUEST_ENTRIES) {
             let name = topic.name.0.to_string();
             let withheld = self.topic_withheld(
@@ -1490,6 +1548,7 @@ impl Broker {
                     continue;
                 }
                 entries += 1;
+                ::tokio::task::yield_now().await;
                 if withheld {
                     partitions.push(
                         PartitionProduceResponse::default()
@@ -1501,7 +1560,8 @@ impl Broker {
                     );
                     continue;
                 }
-                let Some(submitted) = decode_records(partition.records.clone()) else {
+                let Some(submitted) = decode_records(partition.records.clone(), &mut budget)
+                else {
                     partitions.push(
                         PartitionProduceResponse::default()
                             .with_index(partition.index)
@@ -1518,9 +1578,17 @@ impl Broker {
                     now,
                 );
                 partitions.push(match appended {
-                    Ok(base_offset) => PartitionProduceResponse::default()
+                    Ok(appended) => PartitionProduceResponse::default()
                         .with_index(partition.index)
-                        .with_base_offset(base_offset),
+                        .with_base_offset(appended.base_offset)
+                        // The instant the BROKER stamped the batch at, for a topic that
+                        // stamps its records itself: a producer acknowledged by such a
+                        // topic reports that instant as its record's timestamp, not the
+                        // one it sent. A topic that keeps the producer's own timestamps
+                        // states none ([`NO_TIMESTAMP`]).
+                        .with_log_append_time_ms(
+                            appended.log_append_time_ms.unwrap_or(NO_TIMESTAMP),
+                        ),
                     Err(refusal) => PartitionProduceResponse::default()
                         .with_index(partition.index)
                         .with_error_code(refusal.code())
@@ -1629,7 +1697,7 @@ impl Broker {
                             // out, since a client acts on them.
                             .with_aborted_transactions(Some(Vec::new()))
                             .with_preferred_read_replica(BrokerId(NO_PREFERRED_READ_REPLICA))
-                            .with_records(encode_records(&fetched.records))
+                            .with_records(encode_records(&fetched.records, fetched.codec))
                     }
                     Err(refusal) => PartitionData::default()
                         .with_partition_index(partition.partition)
@@ -1652,10 +1720,14 @@ impl Broker {
     ///
     /// The two timestamps a client asks with are the protocol's own
     /// ([`OFFSET_EARLIEST`], [`OFFSET_LATEST`]) and are answered from the log's own
-    /// bounds without rendering a record; a real timestamp selects the first record at
-    /// or after it. Bounded as a whole like [`Self::fetch`]: at most
-    /// [`MAX_REQUEST_ENTRIES`] entries, each one once, with the store's lock taken and
-    /// released per entry.
+    /// bounds without rendering a record, carrying NO timestamp of their own — which is
+    /// what a broker answers a bound with, since a bound is not a record. A real
+    /// timestamp SELECTS a record: the first one at or after it, answered with that
+    /// record's own offset and its own timestamp, which is what a client looking a
+    /// position up by time reads. A timestamp past every record selects none, and is
+    /// answered with neither ([`NO_OFFSET`]). Bounded as a whole like [`Self::fetch`]:
+    /// at most [`MAX_REQUEST_ENTRIES`] entries, each one once, with the store's lock
+    /// taken and released per entry.
     fn list_offsets(&self, request: &ListOffsetsRequest) -> ListOffsetsResponse {
         let now = SystemTime::now();
         let mut topics = Vec::new();
@@ -1682,8 +1754,8 @@ impl Broker {
                             now,
                         )
                         .map(|(earliest, latest)| match partition.timestamp {
-                            OFFSET_EARLIEST => earliest,
-                            _ => latest,
+                            OFFSET_EARLIEST => (earliest, NO_TIMESTAMP),
+                            _ => (latest, NO_TIMESTAMP),
                         }),
                     wanted => self
                         .state
@@ -1701,19 +1773,20 @@ impl Broker {
                                 .records
                                 .iter()
                                 .find(|record| record.timestamp_ms >= wanted)
-                                .map(|record| record.offset)
-                                .unwrap_or(-1)
+                                .map(|record| (record.offset, record.timestamp_ms))
+                                .unwrap_or((NO_OFFSET, NO_TIMESTAMP))
                         }),
                 };
                 partitions.push(match answered {
-                    Ok(offset) => ListOffsetsPartitionResponse::default()
+                    Ok((offset, timestamp)) => ListOffsetsPartitionResponse::default()
                         .with_partition_index(partition.partition_index)
-                        .with_timestamp(partition.timestamp)
+                        .with_timestamp(timestamp)
                         .with_offset(offset),
                     Err(refusal) => ListOffsetsPartitionResponse::default()
                         .with_partition_index(partition.partition_index)
                         .with_error_code(refusal.code())
-                        .with_offset(-1),
+                        .with_timestamp(NO_TIMESTAMP)
+                        .with_offset(NO_OFFSET),
                 });
             }
             topics.push(
@@ -2018,66 +2091,40 @@ fn rendered_configuration(
         .collect()
 }
 
-/// The records a produce submitted, as `(timestamp, key, value)` triples. A request that
-/// carries NO records payload submits none, which is nothing to append; `None` is a
-/// payload that is present and that this endpoint cannot read, which is a produce it
-/// refuses rather than reports as appended.
-fn decode_records(records: Option<Bytes>) -> Option<Vec<super::SubmittedRecord>> {
-    let Some(mut encoded) = records else {
+/// The records a produce submitted, each carrying the codec of the batch it arrived in,
+/// read under what is left of the REQUEST's budget of decompressed record bytes. A
+/// request that carries NO records payload submits none, which is nothing to append;
+/// `None` is a payload that is present and that this endpoint cannot read, which is a
+/// produce it refuses rather than reports as appended.
+fn decode_records(
+    records: Option<Bytes>,
+    budget: &mut usize,
+) -> Option<Vec<super::SubmittedRecord>> {
+    let Some(encoded) = records else {
         return Some(Vec::new());
     };
-    if encoded.is_empty() {
-        return Some(Vec::new());
-    }
-    let decoded = RecordBatchDecoder::decode(&mut encoded).ok()?;
-    Some(
-        decoded
-            .records
-            .iter()
-            .map(|record| {
-                (
-                    record.timestamp,
-                    record.key.as_ref().map(|key| key.to_vec()),
-                    record.value.as_ref().map(|value| value.to_vec()),
-                )
-            })
-            .collect(),
-    )
+    records::decode(&encoded, budget)
 }
 
 /// The records a fetch answers with, in the record-batch form the protocol carries
 /// them in. A fetch that read nothing answers an EMPTY record set rather than a null
 /// one: that is what a broker sends a client whose offset is at the end of the log, and
 /// a client reads the field without first asking whether it is there.
-fn encode_records(records: &[super::StoredRecord]) -> Option<Bytes> {
+///
+/// `topic_codec` is the codec the TOPIC keeps its records in (its own
+/// `compression.type`), and `None` says the topic keeps the one the producer chose — so
+/// a topic configured with a codec of its own hands the batch back recompressed in it,
+/// and a topic that was not hands it back in the codec it arrived under.
+fn encode_records(
+    records: &[super::StoredRecord],
+    topic_codec: Option<super::RecordCodec>,
+) -> Option<Bytes> {
     if records.is_empty() {
         return Some(Bytes::new());
     }
-    let batch: Vec<Record> = records
-        .iter()
-        .map(|record| Record {
-            transactional: false,
-            control: false,
-            partition_leader_epoch: 0,
-            producer_id: -1,
-            producer_epoch: -1,
-            timestamp_type: TimestampType::Creation,
-            offset: record.offset,
-            sequence: i32::try_from(record.offset).unwrap_or(i32::MAX),
-            timestamp: record.timestamp_ms,
-            key: record.key.clone().map(Bytes::from),
-            value: record.value.clone().map(Bytes::from),
-            headers: Default::default(),
-            // A record this endpoint writes is never one the compactor has already
-            // passed its tombstone horizon, which is what this flag marks.
-            delete_horizon: false,
-        })
-        .collect();
-    let mut encoded = BytesMut::new();
-    let options = RecordEncodeOptions {
-        version: RECORD_BATCH_VERSION,
-        compression: Compression::None,
-    };
-    RecordBatchEncoder::encode(&mut encoded, batch.iter(), &options).ok()?;
-    Some(encoded.freeze())
+    let producer_codec = records
+        .first()
+        .map(|record| record.codec)
+        .unwrap_or_default();
+    records::encode(records, topic_codec.unwrap_or(producer_codec))
 }

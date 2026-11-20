@@ -85,6 +85,9 @@ impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Stream for 
 pub(crate) struct Client {
     session: Session,
     correlation: i32,
+    /// The name this client goes by, which every request frame it sends carries and a
+    /// reader of a consumer group reports its member under.
+    client_id: String,
     /// Whether this connection's SASL tokens travel UNWRAPPED, which is what the
     /// version it handshaked at selects: bare, length-prefixed byte strings at version 0
     /// and `SaslAuthenticate` requests from version 1 on.
@@ -100,8 +103,16 @@ impl Client {
         Self {
             session: Box::new(dial(case, authority).await),
             correlation: 0,
+            client_id: CLIENT_ID.to_string(),
             unwrapped_sasl: false,
         }
+    }
+
+    /// The same client under the name `client_id`, which is how a suite drives two
+    /// members a reader of the group must be able to tell apart.
+    pub(crate) fn identified_as(mut self, client_id: &str) -> Self {
+        self.client_id = client_id.to_string();
+        self
     }
 
     /// The same address over TLS, which is how a client reaches one of the encrypted
@@ -129,6 +140,7 @@ impl Client {
         Self {
             session: Box::new(stream),
             correlation: 0,
+            client_id: CLIENT_ID.to_string(),
             unwrapped_sasl: false,
         }
     }
@@ -149,7 +161,7 @@ impl Client {
             .with_request_api_key(key as i16)
             .with_request_api_version(version)
             .with_correlation_id(correlation)
-            .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)))
+            .with_client_id(Some(StrBytes::from_string(self.client_id.clone())))
             .encode(&mut frame, key.request_header_version(version))
             .unwrap_or_else(|error| panic!("case {case:?}: the header must encode: {error}"));
         request
@@ -3468,6 +3480,24 @@ async fn call_at(
                 ]);
             client
                 .exchange::<_, wire::CreateTopicsResponse>(key, version, &request)
+                .await
+                .map(drop)
+        }
+        ApiKey::CreatePartitions => {
+            // A name of its own per row, so no row depends on another's outcome: the
+            // topic is not there, which this API answers per topic.
+            let request = wire::CreatePartitionsRequest::default()
+                .with_timeout_ms(1_000)
+                .with_topics(vec![
+                    wire::create_partitions_request::CreatePartitionsTopic::default()
+                        .with_name(TopicName(StrBytes::from_string(format!(
+                            "swept-grow-v{version}"
+                        ))))
+                        .with_count(4)
+                        .with_assignments(None),
+                ]);
+            client
+                .exchange::<_, wire::CreatePartitionsResponse>(key, version, &request)
                 .await
                 .map(drop)
         }

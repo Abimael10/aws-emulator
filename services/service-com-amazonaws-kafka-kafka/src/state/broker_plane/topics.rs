@@ -139,7 +139,11 @@ pub fn create(
                 Ok(topic) => CreatableTopicResult::default()
                     .with_name(TopicName(StrBytes::from_string(name)))
                     .with_num_partitions(topic.partition_count)
-                    .with_replication_factor(replication_factor_reported(topic.replication_factor)),
+                    .with_replication_factor(replication_factor_reported(topic.replication_factor))
+                    // A topic that was created carries NO error message: the member is a
+                    // nullable string, and what a client reads for a topic nothing went
+                    // wrong with is null — not an empty diagnostic.
+                    .with_error_message(None),
                 Err(refusal) => CreatableTopicResult::default()
                     .with_name(TopicName(StrBytes::from_string(name)))
                     .with_error_code(refusal.code)
@@ -433,6 +437,11 @@ fn assignments_place_every_partition(
 /// control plane stores a topic's `Configs` in — so `DescribeConfigs` reports the
 /// entries a client set here exactly as it reports the ones a control-plane create
 /// set ([`super::submitted_topic_configuration`] reads this form back).
+///
+/// Every entry's value is read against what its key admits
+/// ([`super::topic_config::value_violation`]) before any of them is stored: a topic
+/// whose configuration names a value no broker could act on is refused rather than
+/// created.
 fn topic_configs(requested: &CreatableTopic) -> Result<Option<String>, Refusal> {
     if requested.configs.len() > MAX_TOPIC_CONFIG_ENTRIES {
         return Err(Refusal::new(
@@ -460,6 +469,13 @@ fn topic_configs(requested: &CreatableTopic) -> Result<Option<String>, Refusal> 
                      {MAX_TOPIC_CONFIG_FIELD_BYTES} bytes each."
                 ),
             ));
+        }
+        // What the KEY admits is the key's own published reading, and a value outside it
+        // is a setting no broker could act on: the topic is refused with the sentence
+        // Apache Kafka refuses it with, rather than created with an impossible
+        // configuration a client only discovers at produce time.
+        if let Some(violation) = super::topic_config::value_violation(&name, &value) {
+            return Err(Refusal::new(ResponseError::InvalidConfig, violation));
         }
         entries.insert(name, value);
     }
@@ -526,7 +542,9 @@ pub fn delete(
             let result = DeletableTopicResult::default()
                 .with_name(Some(TopicName(StrBytes::from_string(name))));
             match refusal {
-                None => result,
+                // The same nullable-string reading as the create's: a deletion nothing
+                // went wrong with carries no message at all.
+                None => result.with_error_message(None),
                 Some(refusal) => result
                     .with_error_code(refusal.code)
                     .with_error_message(Some(StrBytes::from_string(refusal.message))),
@@ -534,6 +552,123 @@ pub fn delete(
         })
         .collect();
     DeleteTopicsResponse::default().with_responses(responses)
+}
+
+/// `CreatePartitions`: raise the partition count of each topic the request names to the
+/// total it states.
+///
+/// Apache Kafka only ADDS partitions: a request that names a total below the count the
+/// topic holds, or the count it already holds, is refused for that topic
+/// (`INVALID_PARTITIONS`) with the sentence that error class carries, and the topics it
+/// does not name are untouched. The partitions are added to the SAME registry record
+/// every other reader of the topic reports from, through the one path a topic change
+/// comes through, so a client that grows a topic can produce to the new partitions at
+/// once and reads the new count back out of `Metadata` and the control plane alike.
+///
+/// `withheld` names the topics this connection may not change; `validate_only` runs
+/// every check and changes nothing, which is what that flag means. At most `max_topics`
+/// entries are served, for the reason [`create`] bounds its own list.
+pub fn create_partitions(
+    store: &mut ComAmazonawsKafkaKafkaState,
+    cluster_arn: &str,
+    request: &::kafka_protocol::messages::CreatePartitionsRequest,
+    withheld: &BTreeSet<String>,
+    max_topics: usize,
+    now: SystemTime,
+) -> ::kafka_protocol::messages::CreatePartitionsResponse {
+    use ::kafka_protocol::messages::create_partitions_response::CreatePartitionsTopicResult;
+
+    // The same rule the create and the delete follow: a request that names one topic
+    // twice says two things about one name, so every entry for it is refused.
+    let repeated = repeated_names(request.topics.iter().map(|topic| topic.name.0.to_string()));
+    let results: Vec<CreatePartitionsTopicResult> = request
+        .topics
+        .iter()
+        .take(max_topics)
+        .map(|requested| {
+            let name = requested.name.0.to_string();
+            let refusal = match repeated.contains(&name) {
+                true => Some(named_twice()),
+                false => match withheld.contains(&name) {
+                    true => Some(Refusal::new(
+                        ResponseError::TopicAuthorizationFailed,
+                        "Topic authorization failed.",
+                    )),
+                    false => grow_one(store, cluster_arn, &name, requested.count, request.validate_only, now),
+                },
+            };
+            let result = CreatePartitionsTopicResult::default()
+                .with_name(TopicName(StrBytes::from_string(name)));
+            match refusal {
+                None => result.with_error_message(None),
+                Some(refusal) => result
+                    .with_error_code(refusal.code)
+                    .with_error_message(Some(StrBytes::from_string(refusal.message))),
+            }
+        })
+        .collect();
+    ::kafka_protocol::messages::CreatePartitionsResponse::default().with_results(results)
+}
+
+/// One topic of that request: the refusal it is answered with, and `None` when the
+/// partitions were added (or the request only asked for the validation).
+fn grow_one(
+    store: &mut ComAmazonawsKafkaKafkaState,
+    cluster_arn: &str,
+    name: &str,
+    wanted: i32,
+    validate_only: bool,
+    now: SystemTime,
+) -> Option<Refusal> {
+    let Some(held) = store
+        .observable_topic_in(cluster_arn, name, now)
+        .map(|topic| topic.partition_count)
+    else {
+        return Some(topic_does_not_exist(name));
+    };
+    // Apache Kafka's own sentences for the two ways a stated total is not a growth. The
+    // first is the one the recorded answer of this API carries verbatim, with the count
+    // the topic holds interpolated into it.
+    if wanted == held {
+        return Some(Refusal::new(
+            ResponseError::InvalidPartitions,
+            format!("Topic already has {held} partitions."),
+        ));
+    }
+    if wanted < held {
+        return Some(Refusal::new(
+            ResponseError::InvalidPartitions,
+            format!(
+                "Topic currently has {held} partitions, which is higher than the requested \
+                 {wanted}."
+            ),
+        ));
+    }
+    if wanted > MAX_PARTITIONS_PER_TOPIC {
+        return Some(Refusal::new(
+            ResponseError::InvalidPartitions,
+            format!("This broker places at most {MAX_PARTITIONS_PER_TOPIC} partitions per topic."),
+        ));
+    }
+    if validate_only {
+        return None;
+    }
+    match store.start_topic_update(cluster_arn, name, Some(wanted), None, now) {
+        Some(_) => None,
+        // Unreachable: the topic was resolved above under the lock this call still
+        // holds. Reported as the same refusal that lookup answers.
+        None => Some(topic_does_not_exist(name)),
+    }
+}
+
+/// How Apache Kafka words the refusal of a change to a topic the cluster does not hold:
+/// this API names the topic, where a produce or a fetch names the topic-partition it
+/// could not serve.
+fn topic_does_not_exist(name: &str) -> Refusal {
+    Refusal::new(
+        ResponseError::UnknownTopicOrPartition,
+        format!("The topic '{name}' does not exist."),
+    )
 }
 
 /// The topics one `DeleteTopics` request names, in both forms this API states them:
