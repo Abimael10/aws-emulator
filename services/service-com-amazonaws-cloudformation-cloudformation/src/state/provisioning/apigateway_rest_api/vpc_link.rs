@@ -87,6 +87,19 @@ const VPC_LINK_AVAILABLE: &str = "AVAILABLE";
 /// creation open for.
 const VPC_LINK_PENDING: &str = "PENDING";
 
+/// How THIS TYPE's provider words the failure of a link that settled in a status it carries no
+/// traffic in — the sentence CloudFormation then quotes in the envelope every provider answer
+/// is reported in ([`crate::state::provisioning::handler_reported_failure_reason`]).
+///
+/// FIXED TEXT: the opening, the ` Status Message ` that introduces what API Gateway says about
+/// the link, and the closing period, which is the provider's own and not part of the
+/// `statusMessage` that service reports ("A description about the VPC link status",
+/// `VpcLink$statusMessage`). The VARIABLE parts are the identifier API Gateway assigned the
+/// link and that description, both read off this emulator's own state.
+fn failed_to_stabilise(vpc_link_id: &str, status_message: &str) -> String {
+    format!("Failed to stabilize Vpc Link with id {vpc_link_id} Status Message {status_message}.")
+}
+
 /// Create the link an `AWS::ApiGateway::VpcLink` declares, so a client that deployed the
 /// stack and then calls `apigateway GetVpcLinks` finds it listed — and so a private
 /// integration taking the id the stack published really reaches the VPC behind it — rather
@@ -183,23 +196,34 @@ pub(super) async fn readiness(
     match link.get("status").and_then(Value::as_str) {
         Some(VPC_LINK_AVAILABLE) => Ok(Readiness::Ready),
         Some(VPC_LINK_PENDING) => Ok(Readiness::Pending(VPC_LINK_PENDING.to_string())),
-        // The link settled somewhere nothing brings it out of. `statusMessage` is "a
-        // description about the VPC link status", so it is reported where the link carries
-        // one: that sentence is what says WHY the link cannot carry traffic.
-        Some(other) => Ok(Readiness::Failed(
-            match link.get("statusMessage").and_then(Value::as_str) {
-                Some(message) if !message.is_empty() => format!(
-                    "API Gateway reports VPC link {physical_resource_id} in status {other}: \
-                     {message}"
-                ),
-                _ => format!(
-                    "API Gateway reports VPC link {physical_resource_id} in status {other}"
-                ),
-            },
-        )),
-        None => Ok(Readiness::Failed(format!(
-            "API Gateway reports no status for VPC link {physical_resource_id}"
+        // The link settled somewhere nothing brings it out of, or that service reported no
+        // status for it at all: either way this provider could not stabilise it.
+        _ => Ok(Readiness::Failed(unstabilised_reason(
+            physical_resource_id,
+            &link,
         ))),
+    }
+}
+
+/// Why this provider could not stabilise the link, from what API Gateway reported about it.
+///
+/// `statusMessage` is "a description about the VPC link status" (`VpcLink$statusMessage`) — the
+/// sentence that says WHY the link cannot carry traffic — so a link carrying one is reported in
+/// this provider's own wording around it ([`failed_to_stabilise`]). A link carrying NONE leaves
+/// that wording nothing to quote: there is no description to state after `Status Message`, so
+/// what is reported is the status that service DID state, and for a link it reported no status
+/// for at all, that there was none. Neither is given an invented description.
+fn unstabilised_reason(vpc_link_id: &str, link: &Value) -> String {
+    let status = link
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match link.get("statusMessage").and_then(Value::as_str) {
+        Some(message) if !message.is_empty() => failed_to_stabilise(vpc_link_id, message),
+        _ if !status.is_empty() => {
+            format!("API Gateway reports VPC link {vpc_link_id} in status {status}")
+        }
+        _ => format!("API Gateway reports no status for VPC link {vpc_link_id}"),
     }
 }
 
@@ -397,6 +421,57 @@ mod tests {
                 refusal.message.contains(named) && refusal.message.contains(APIGATEWAY_VPC_LINK),
                 "case {case:?}: expected the refusal to name {named:?} and the type, got \
                  {refusal:?}"
+            );
+        }
+    }
+
+    /// A link this provider could not stabilise is reported in the provider's own wording
+    /// around the description API Gateway settled it with — and, for a link that service
+    /// reported no description for, with what it DID report instead of a dangling fragment.
+    ///
+    /// The rows differ along what the rule generalises over: whether a description was
+    /// reported at all (one, none, and an empty one), the STATUS the link settled in (`FAILED`
+    /// for a link that could not be provisioned, `DELETING` for one being taken away), and a
+    /// read reporting no status at all.
+    #[test]
+    fn a_link_that_did_not_come_up_is_reported_as_this_provider_words_it() {
+        const LINK_ID: &str = "gim7c3q1x2";
+        let rows: &[(&str, Value, String)] = &[
+            (
+                "a failed link carrying a description",
+                json!({ "status": "FAILED", "statusMessage": "NLB ARN not found" }),
+                "Failed to stabilize Vpc Link with id gim7c3q1x2 Status Message NLB ARN not \
+                 found."
+                    .to_string(),
+            ),
+            (
+                "a link being deleted, carrying a description",
+                json!({ "status": "DELETING", "statusMessage": "the link is going away" }),
+                "Failed to stabilize Vpc Link with id gim7c3q1x2 Status Message the link is \
+                 going away."
+                    .to_string(),
+            ),
+            (
+                "a failed link carrying no description",
+                json!({ "status": "FAILED" }),
+                "API Gateway reports VPC link gim7c3q1x2 in status FAILED".to_string(),
+            ),
+            (
+                "a failed link whose description is empty",
+                json!({ "status": "FAILED", "statusMessage": "" }),
+                "API Gateway reports VPC link gim7c3q1x2 in status FAILED".to_string(),
+            ),
+            (
+                "a read reporting no status at all",
+                json!({}),
+                "API Gateway reports no status for VPC link gim7c3q1x2".to_string(),
+            ),
+        ];
+        for (case, link, expected) in rows {
+            let reported = unstabilised_reason(LINK_ID, link);
+            assert_eq!(
+                reported, *expected,
+                "case {case:?}: expected {expected:?}, got {reported:?}"
             );
         }
     }

@@ -1089,7 +1089,47 @@ pub(super) enum Readiness {
     Pending(String),
     /// That service reports the resource FAILED: nothing is going to bring it up, so the
     /// resource's creation failed with this reason rather than waiting the window out.
+    ///
+    /// The reason is the PROVIDER's own sentence about the resource, as that service worded
+    /// what it reported — never an envelope: the reporting site is what quotes it in the one
+    /// envelope a provider's answer is reported in
+    /// ([`handler_reported_failure_reason`]), so an arm that built one here would be
+    /// quoted twice.
     Failed(String),
+    /// The owning service REFUSED a call the provider made while bringing the resource up — an
+    /// association a declared property asks for, which that service takes only once the
+    /// resource is available — so the resource's creation failed on that refusal.
+    ///
+    /// The refusal travels AS the refusal rather than as a sentence, because what is reported
+    /// for it is what is reported for a refused create: the message quoted in the provider
+    /// envelope, under the `HandlerErrorCode` class THAT code falls in
+    /// ([`handler_failure_reason`]) — which only the refusal itself can say.
+    Refused(Refusal),
+}
+
+/// The `ResourceStatusReason` a readiness answer that FAILED the resource is recorded with.
+///
+/// The ONE place the two failure answers are turned into a reason, so the create path, the
+/// update path and the stabilisation pass cannot word the same failure differently: the
+/// provider's own report about the resource is quoted in the provider envelope
+/// ([`handler_reported_failure_reason`]), and a call the owning service REFUSED is reported
+/// exactly as a refused create is — the same envelope, under the `HandlerErrorCode` class that
+/// refusal's own code falls in ([`handler_failure_reason`]).
+///
+/// `Ready` and `Pending` are no failure and carry no reason; every caller matches them ahead of
+/// this, so neither reaches it.
+fn provider_failure_reason(
+    owner: Option<Owner>,
+    physical_resource_id: &str,
+    failure: &Readiness,
+) -> String {
+    match failure {
+        Readiness::Failed(reason) => handler_reported_failure_reason(owner, reason),
+        Readiness::Refused(refusal) => {
+            handler_failure_reason(owner, refusal, physical_resource_id)
+        }
+        Readiness::Ready | Readiness::Pending(_) => String::new(),
+    }
 }
 
 /// What the service that owns a resource says about a resource it has been asked to DELETE:
@@ -1726,10 +1766,19 @@ pub async fn advance_stabilisations_in(
                         }
                     }
                     // That service says the resource will not come up, so waiting the window
-                    // out would report a resource as creating that nothing is creating.
-                    Ok(Readiness::Failed(reason)) => {
-                        stack.fail_stabilisation(now, &barrier, &reason)
-                    }
+                    // out would report a resource as creating that nothing is creating —
+                    // whether what it reported is its own account of the resource or a call it
+                    // refused while bringing the resource up.
+                    Ok(ref failure @ (Readiness::Failed(_) | Readiness::Refused(_))) => stack
+                        .fail_stabilisation(
+                            now,
+                            &barrier,
+                            &provider_failure_reason(
+                                owner_for(&barrier.resource_type),
+                                &barrier.physical_resource_id,
+                                failure,
+                            ),
+                        ),
                     // The service could not be asked at all. One unanswered read is not
                     // evidence about the resource — a service is allowed to throttle or be
                     // briefly unreachable — so the wait holds and the next read asks again;
@@ -2718,8 +2767,10 @@ pub async fn reconcile(
                             }
                             // That service says the change is not going to take effect, so
                             // waiting it out would report a resource as changed that is not:
-                            // the update of this resource failed, carrying what it said.
-                            Ok(Readiness::Failed(reason)) => {
+                            // the update of this resource failed, carrying what that service
+                            // reported — its own account of the resource, or the call of this
+                            // provider's it refused.
+                            Ok(ref failure @ (Readiness::Failed(_) | Readiness::Refused(_))) => {
                                 failed.push((
                                     resource.logical_id.clone(),
                                     super::failed_action::UPDATE,
@@ -2728,7 +2779,11 @@ pub async fn reconcile(
                                     ResourceTransition::finished(
                                         &resource,
                                         super::resource_status::UPDATE_FAILED,
-                                        Some(reason),
+                                        Some(provider_failure_reason(
+                                            owner_for(&resource.resource_type),
+                                            &resource.physical_resource_id,
+                                            failure,
+                                        )),
                                     )
                                     .applying(&declared_properties),
                                 );
@@ -3411,12 +3466,16 @@ pub async fn reconcile(
                     // create did not go through, so the deployment stops here exactly as it
                     // does on a refused create. The record keeps `materialised`, so the
                     // rollback still deletes what the create made.
-                    Ok(Readiness::Failed(reason)) => {
+                    Ok(ref failure @ (Readiness::Failed(_) | Readiness::Refused(_))) => {
                         failed.push((resource.logical_id.clone(), reporting.action));
                         outcome.transitions.push(ResourceTransition::finished(
                             &resource,
                             reporting.failed,
-                            Some(reason),
+                            Some(provider_failure_reason(
+                                owner,
+                                &resource.physical_resource_id,
+                                failure,
+                            )),
                         ));
                         outcome.resources.push(resource);
                         continue;
@@ -4765,181 +4824,7 @@ impl ::std::fmt::Display for Refusal {
 const UNNAMED_CODE_PREFIX: &str = "HTTP ";
 
 #[cfg(test)]
-mod repointed_token_tests {
-    use super::retokenised;
-
-    /// A stand-in CloudFormation computed is re-pointed wherever a template composed it into
-    /// one of its own strings — and left exactly as written where it is only part of a longer
-    /// identifier, which is a value of its own rather than a reference to the resource.
-    ///
-    /// The rows span the delimiters a template puts around such a reference and the ways a
-    /// longer identifier can carry the same characters.
-    #[test]
-    fn a_composed_stand_in_is_re_pointed_at_token_boundaries_only() {
-        let cases: &[(&str, &str, Option<&str>)] = &[
-            // The whole value, and the forms an ARN composes the reference into.
-            ("abc123", "abc123", Some("zzz999")),
-            (
-                "between a colon and a slash",
-                "arn:aws:execute-api:us-east-1:000000000000:abc123/*/*",
-                Some("arn:aws:execute-api:us-east-1:000000000000:zzz999/*/*"),
-            ),
-            (
-                "at the end of the value",
-                "arn:aws:execute-api:us-east-1:000000000000:abc123",
-                Some("arn:aws:execute-api:us-east-1:000000000000:zzz999"),
-            ),
-            (
-                "one whole slash-separated segment",
-                "integrations/abc123",
-                Some("integrations/zzz999"),
-            ),
-            (
-                "more than once in one value",
-                "abc123/stage/abc123",
-                Some("zzz999/stage/zzz999"),
-            ),
-            // ...and the negative branch: part of a longer identifier, so not a reference.
-            ("a suffixed identifier", "abc123-assoc", None),
-            ("a prefixed identifier", "the-abc123", None),
-            ("an underscore away from a boundary", "abc123_two", None),
-            ("a longer identifier around it", "xabc123x", None),
-            ("a value that does not carry it", "arn:aws:sns:us-east-1:000000000000:q", None),
-        ];
-        for (case, text, expected) in cases {
-            let answered = retokenised(text, "abc123", "zzz999");
-            assert_eq!(
-                answered.as_deref(),
-                *expected,
-                "case {case:?}: re-pointing {text:?} answered {answered:?}"
-            );
-        }
-    }
-
-    /// A stand-in that CARRIES a slash is matched by the same rule: a slash is no character
-    /// of an identifier, so such a stand-in is re-pointed where the whole of it is a token of
-    /// a longer value and left alone where a longer identifier runs into it.
-    #[test]
-    fn a_slash_bearing_stand_in_follows_the_same_boundary_rule() {
-        let cases: &[(&str, &str, Option<&str>)] = &[
-            ("the whole value", "apis/abc123", Some("zzz999")),
-            (
-                "composed into a longer value",
-                "arn:aws:execute-api:us-east-1:0:apis/abc123/*",
-                Some("arn:aws:execute-api:us-east-1:0:zzz999/*"),
-            ),
-            ("a longer identifier ahead of it", "the-apis/abc123", None),
-            ("a longer identifier after it", "apis/abc123-assoc", None),
-        ];
-        for (case, text, expected) in cases {
-            let answered = retokenised(text, "apis/abc123", "zzz999");
-            assert_eq!(
-                answered.as_deref(),
-                *expected,
-                "case {case:?}: re-pointing {text:?} answered {answered:?}"
-            );
-        }
-    }
-
-    /// A stand-in that is not there, and the empty one, re-point nothing: an empty value is
-    /// no identifier a reference could have resolved to.
-    #[test]
-    fn nothing_is_re_pointed_for_an_empty_stand_in() {
-        let answered = retokenised("arn:aws:execute-api:us-east-1:0:abc123/*", "", "zzz999");
-        assert_eq!(
-            answered, None,
-            "expected an empty stand-in to re-point nothing, got {answered:?}"
-        );
-    }
-}
+mod repointed_token_tests;
 
 #[cfg(test)]
-mod handler_error_class_tests {
-    use super::{
-        handler_error_code, sdk_attempt_count, HANDLER_ERROR_CLASSES, HANDLER_ERROR_INVALID_REQUEST,
-        HANDLER_ERROR_SERVICE_FAILED, SDK_RETRIED_ATTEMPTS, SDK_RETRIED_CLASSES,
-        SDK_SINGLE_ATTEMPT,
-    };
-    use crate::ops::types::HANDLER_ERROR_CODE_VALUES;
-
-    /// Every class the SDK diagnostic counts attempts for is one the classification above
-    /// can actually answer, so the retried set cannot drift from the class table.
-    #[test]
-    fn every_retried_class_is_one_the_classification_answers() {
-        for class in SDK_RETRIED_CLASSES {
-            assert!(
-                HANDLER_ERROR_CLASSES.iter().any(|(named, _)| *named == class),
-                "case {class:?}: not a class the refusal classification answers, which are \
-                 {HANDLER_ERROR_CLASSES:?}"
-            );
-        }
-    }
-
-    /// The attempt count follows the CLASS of the refusal: the SDK's default maximum for a
-    /// condition that can clear on its own, one attempt for a refusal of the request itself.
-    #[test]
-    fn the_attempt_count_follows_the_class() {
-        for (code, expected) in [
-            ("LimitExceededException", SDK_RETRIED_ATTEMPTS),
-            ("ThrottlingException", SDK_RETRIED_ATTEMPTS),
-            ("ServiceUnavailable", SDK_RETRIED_ATTEMPTS),
-            ("HTTP 503", SDK_RETRIED_ATTEMPTS),
-            ("ValidationException", SDK_SINGLE_ATTEMPT),
-            ("InvalidTypeException", SDK_SINGLE_ATTEMPT),
-            ("ResourceNotFoundException", SDK_SINGLE_ATTEMPT),
-            ("HTTP 400", SDK_SINGLE_ATTEMPT),
-        ] {
-            let actual = sdk_attempt_count(code);
-            assert_eq!(
-                actual, expected,
-                "case {code:?} ({}): expected {expected} attempt(s), got {actual}",
-                handler_error_code(code)
-            );
-        }
-    }
-
-    /// Every class this module reports is one the MODEL declares: the classification is a
-    /// mapping onto `HandlerErrorCode`, so a class spelled any other way would put a value
-    /// on the wire that enum does not have.
-    #[test]
-    fn every_reported_class_is_one_the_model_declares() {
-        for class in HANDLER_ERROR_CLASSES
-            .iter()
-            .map(|(class, _)| *class)
-            .chain([HANDLER_ERROR_INVALID_REQUEST, HANDLER_ERROR_SERVICE_FAILED])
-        {
-            assert!(
-                HANDLER_ERROR_CODE_VALUES.contains(&class),
-                "case {class:?}: not a HandlerErrorCode the model declares, which are \
-                 {HANDLER_ERROR_CODE_VALUES:?}"
-            );
-        }
-    }
-
-    /// And so is whatever the classification answers for an arbitrary code, including one
-    /// no class matches and an answer that named no error at all.
-    #[test]
-    fn every_answer_is_one_the_model_declares() {
-        for code in [
-            "DBSubnetGroupNotFoundFault",
-            "InvalidParameterValue",
-            "ThrottlingException",
-            "BucketAlreadyOwnedByYou",
-            "ResourceInUseException",
-            "LimitExceededException",
-            "AccessDeniedException",
-            "a-code-no-service-answers",
-            "",
-            "HTTP 501",
-            "HTTP 400",
-            "HTTP not-a-status",
-        ] {
-            let class = handler_error_code(code);
-            assert!(
-                HANDLER_ERROR_CODE_VALUES.contains(&class),
-                "case {code:?}: answered {class:?}, which is not a HandlerErrorCode the \
-                 model declares"
-            );
-        }
-    }
-}
+mod handler_error_class_tests;

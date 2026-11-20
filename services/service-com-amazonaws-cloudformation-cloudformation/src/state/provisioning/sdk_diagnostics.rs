@@ -853,6 +853,55 @@ pub(in crate::state) fn handler_failure_reason(owner: Option<Owner>, refusal: &R
         Some(provisioner) => provisioner.handler_message(class, message, &token),
         None => message.to_string(),
     };
+    quoted_provider_message(&message, &token, class)
+}
+
+/// The `ResourceStatusReason` the event for a resource whose own PROVIDER reported that it is
+/// not going to reach the state the deployment waited for carries — a load balancer the owning
+/// service settled in a state it serves no traffic in, a link that service settled `FAILED`.
+///
+/// It is the same answer [`handler_failure_reason`] reports: a provider's, which CloudFormation
+/// does not restate in its own words but QUOTES, beside the token of the resource request it
+/// answered and the `HandlerErrorCode` class it falls in. What differs is only where the
+/// provider's sentence came from — a read of the resource rather than a refused call — so the
+/// envelope is built from the same parts, and a client classifying the failure reads one shape
+/// however the provider arrived at it.
+///
+/// The class is [`HANDLER_ERROR_SERVICE_FAILED`]: nothing about the request was wrong — the
+/// owning service ACCEPTED the call and then could not bring the resource up — which is what
+/// that class says of a provider whose own service failed it.
+///
+/// A type CloudFormation provisions ITSELF, and one backed by a provider of the client's own
+/// (a custom resource, whose answer carries no provider CloudFormation stands behind), has no
+/// resource provider to quote, so its report stands as it reads ([`own_failure_reason`]).
+///
+/// That is where this parts company with [`handler_failure_reason`], which is asked only where
+/// a provider call was made and therefore quotes an owner it does not recognise as well: an
+/// answer reported for a type with NO owner at all reaches this one — a custom resource's own
+/// FAILED response travels as a readiness answer — and such a report is nobody's provider's, so
+/// it is left unquoted rather than attributed to one.
+pub(in crate::state) fn handler_reported_failure_reason(
+    owner: Option<Owner>,
+    reported: &str,
+) -> String {
+    if !owner.is_some_and(Owner::reported_by_a_resource_provider) {
+        return reported.to_string();
+    }
+    // Minted here for the reason [`handler_failure_reason`] records: this is where the resource
+    // request ends, and the token reported is that request's own.
+    let token = crate::state::new_request_id();
+    quoted_provider_message(reported, &token, HANDLER_ERROR_SERVICE_FAILED)
+}
+
+/// One provider's answer in the envelope CloudFormation reports a resource provider's answer
+/// in: the message quoted, the token of the resource request it answered, and the class that
+/// answer falls in.
+///
+/// Stated once, because the two reports that carry it — a refused call
+/// ([`handler_failure_reason`]) and a resource that will not come up
+/// ([`handler_reported_failure_reason`]) — are the same envelope around a different sentence,
+/// and a client parses the one shape.
+fn quoted_provider_message(message: &str, token: &str, class: &str) -> String {
     format!(
         "Resource handler returned message: \"{message}\" (RequestToken: {token}, \
          HandlerErrorCode: {class})",

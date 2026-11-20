@@ -361,9 +361,11 @@ async fn serving_instances(
         Signalling::Instance => {
             match ec2_instance::readiness(ctx, region, &gate.physical_resource_id).await? {
                 Readiness::Ready => Ok(vec![gate.physical_resource_id.clone()]),
-                // Still coming up, or in a state no instance serves from: it has signalled
-                // nothing.
-                Readiness::Pending(_) | Readiness::Failed(_) => Ok(Vec::new()),
+                // Still coming up, or in a state no instance serves from — or a call that
+                // service refused about it: it has signalled nothing.
+                Readiness::Pending(_) | Readiness::Failed(_) | Readiness::Refused(_) => {
+                    Ok(Vec::new())
+                }
             }
         }
     }

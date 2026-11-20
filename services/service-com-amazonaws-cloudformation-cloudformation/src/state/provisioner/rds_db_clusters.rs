@@ -309,7 +309,7 @@ pub(crate) async fn db_cluster_readiness(
         .and_then(scalar_text)
         .unwrap_or_default();
     if status == DB_CLUSTER_STATUS_AVAILABLE {
-        if let Some(reason) = super::rds_role_associations::associate_declared_roles(
+        if let Some(refusal) = super::rds_role_associations::associate_declared_roles(
             ctx,
             region,
             physical_resource_id,
@@ -318,7 +318,7 @@ pub(crate) async fn db_cluster_readiness(
         )
         .await?
         {
-            return Ok(Readiness::Failed(reason));
+            return Ok(Readiness::Refused(refusal));
         }
         return Ok(Readiness::Ready);
     }

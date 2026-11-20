@@ -71,19 +71,20 @@ pub(crate) struct RoleAssociationCalls {
 /// under.
 ///
 /// `Ok(None)` is every role associated — including a declaration that asks for none, which
-/// makes no call at all. `Ok(Some(reason))` is Amazon RDS REFUSING one of the associations,
-/// worded as the resource's status reason exactly as a refusal of any other provider call is
-/// ([`provisioning::handler_failure_reason`]), so the stack reports the resource's own failure
-/// in that service's words. `Err` is the refusal of the READ this arm takes first, which says
-/// nothing about the associations: the caller decides what an unanswered read means, as it
-/// does for every other readiness answer.
+/// makes no call at all. `Ok(Some(refusal))` is Amazon RDS REFUSING one of the associations,
+/// answered AS that refusal: what the resource's event reports for it is what it reports for
+/// any other refused provider call, and only the refusal itself carries the code that says
+/// which `HandlerErrorCode` class it falls in — so the refusal travels to the reporting site
+/// ([`provisioning::Readiness::Refused`]) instead of being worded here. `Err` is the refusal of
+/// the READ this arm takes first, which says nothing about the associations: the caller decides
+/// what an unanswered read means, as it does for every other readiness answer.
 pub(crate) async fn associate_declared_roles(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     physical_resource_id: &str,
     declared: Option<&Value>,
     calls: RoleAssociationCalls,
-) -> Result<Option<String>, Refusal> {
+) -> Result<Option<Refusal>, Refusal> {
     let asked = declared_roles(declared);
     if asked.is_empty() {
         return Ok(None);
@@ -123,11 +124,7 @@ pub(crate) async fn associate_declared_roles(
         )
         .await
         {
-            return Ok(Some(provisioning::handler_failure_reason(
-                None,
-                &refusal,
-                physical_resource_id,
-            )));
+            return Ok(Some(refusal));
         }
     }
     Ok(None)

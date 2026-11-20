@@ -785,20 +785,28 @@ pub async fn settled_stack(
 /// <class>)` — so the ONE reader of that envelope lives here and every suite that asks what a
 /// provider reported splits it the same way.
 pub fn quoted_and_class(case: &str, reason: &str) -> (String, String) {
+    let (quoted, _, class) = envelope_parts(case, reason);
+    (quoted, class)
+}
+
+/// The same split, with the `RequestToken` the envelope carries as well — for a suite that
+/// asserts the token is the one this service mints per resource request ([`is_a_request_id`]),
+/// rather than only what the provider said and how it was classified.
+pub fn envelope_parts(case: &str, reason: &str) -> (String, String, String) {
     const OPENS: &str = "Resource handler returned message: \"";
     const TOKEN: &str = "\" (RequestToken: ";
-    const CLASS: &str = "HandlerErrorCode: ";
+    const CLASS: &str = ", HandlerErrorCode: ";
     let rest = reason.strip_prefix(OPENS).unwrap_or_else(|| {
         panic!("case {case:?}: expected the reason to open with {OPENS:?}, got {reason:?}")
     });
     let (quoted, tail) = rest.split_once(TOKEN).unwrap_or_else(|| {
         panic!("case {case:?}: expected a quoted message and a RequestToken, got {reason:?}")
     });
-    let class = tail
+    let (token, class) = tail
         .split_once(CLASS)
-        .and_then(|(_, class)| class.strip_suffix(')'))
+        .and_then(|(token, class)| class.strip_suffix(')').map(|class| (token, class)))
         .unwrap_or_else(|| panic!("case {case:?}: expected a HandlerErrorCode, got {reason:?}"));
-    (quoted.to_string(), class.to_string())
+    (quoted.to_string(), token.to_string(), class.to_string())
 }
 
 /// Hold one quoted exception to the diagnostic the owning service's SDK appends: the sentence

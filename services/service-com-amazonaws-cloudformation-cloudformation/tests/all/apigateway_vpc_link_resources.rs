@@ -131,7 +131,10 @@ fn target_group_arn(name: &str) -> String {
 }
 
 /// One Elastic Load Balancing ARN over this emulator's own account and Region.
-fn elb_arn(resource: &str) -> String {
+///
+/// `pub(crate)` because more than one suite writes a target a VPC link cannot be provisioned
+/// over: the ARN form is stated once here.
+pub(crate) fn elb_arn(resource: &str) -> String {
     format!("arn:aws:elasticloadbalancing:{REGION}:{ACCOUNT_ID}:{resource}")
 }
 
