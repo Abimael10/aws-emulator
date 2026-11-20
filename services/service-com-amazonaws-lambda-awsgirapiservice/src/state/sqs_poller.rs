@@ -659,6 +659,7 @@ async fn poll_mapping_due<Eng: Send + Sync + 'static>(
                 counts.deleted = counts.deleted.saturating_add(count_of(filtered_out.len()));
                 AdmittedBatch {
                     payload: queue_event(&invoking, &polled),
+                    links: upstream_traces(&invoking, &polled),
                     polled,
                     invoking,
                 }
@@ -795,6 +796,9 @@ struct AdmittedBatch {
     invoking: Vec<String>,
     /// The event the function is invoked with: the records of the admitted messages.
     payload: Value,
+    /// The chains the admitted messages belong to ([`upstream_traces`]), which the invocation
+    /// this batch is handed to links back to.
+    links: Vec<String>,
 }
 
 /// What a mapping has to hand its function at `now`.
@@ -1373,6 +1377,38 @@ fn queue_event(invoking: &[String], polled: &[PolledMessage]) -> Value {
     json!({ "Records": records })
 }
 
+/// The system attribute a message carries its own X-Ray tracing context in: "currently, the
+/// only supported message system attribute is AWSTraceHeader. Its type must be String and its
+/// value must be a correctly formatted X-Ray trace header string"
+/// (`SendMessageRequest$MessageSystemAttributes`), which the record reports under that name.
+const RECORD_TRACE_HEADER_ATTRIBUTE: &str = "AWSTraceHeader";
+
+/// The CHAINS the messages this batch is handing over belong to: the trace of each admitted
+/// message's own tracing context, each named once, in the order the queue handed them over.
+///
+/// The invocation a batch is handed to runs under a chain of its OWN — one batch may carry
+/// messages of many chains, so there is no one chain for it to continue — and REFERS back to
+/// each of these ([`crate::state::execution::trace_context`]). A message whose send carried no
+/// tracing context, or one naming nothing X-Ray reads as a chain, belongs to none and is
+/// referred to nowhere.
+fn upstream_traces(invoking: &[String], polled: &[PolledMessage]) -> Vec<String> {
+    let mut traces: Vec<String> = Vec::new();
+    for message in polled
+        .iter()
+        .filter(|message| invoking.contains(&message.message_id))
+    {
+        let named = message.record["attributes"][RECORD_TRACE_HEADER_ATTRIBUTE]
+            .as_str()
+            .and_then(::service_common::xray_trace::trace_root);
+        if let Some(trace) = named {
+            if !traces.iter().any(|held| held == trace) {
+                traces.push(trace.to_string());
+            }
+        }
+    }
+    traces
+}
+
 /// One stored message as the record of the event Lambda hands a function for a queue
 /// source: the message's own id, receipt handle, body and MD5 digests, the system attributes
 /// the queue records for it, its message attributes, and which source it came from.
@@ -1411,6 +1447,16 @@ fn queue_record(
     }
     if let Some(sequence_number) = &message.sequence_number {
         attributes.insert("SequenceNumber".to_string(), sequence_number.clone());
+    }
+    // What the SEND stored in `MessageSystemAttributes` — "currently, the only supported
+    // message system attribute is AWSTraceHeader" — reported under the name the queue holds it
+    // under, exactly as the queue's own `ReceiveMessage` reports it to any other consumer. It
+    // is the record's own copy of the chain the message belongs to, which is the chain the
+    // invocation this record is handed to links back to ([`upstream_traces`]).
+    for (name, attribute) in &message.message_system_attributes {
+        if let Some(string_value) = attribute.string_value.clone() {
+            attributes.insert(name.clone(), string_value);
+        }
     }
     let mut message_attributes: BTreeMap<String, Value> = BTreeMap::new();
     for (name, attribute) in &message.message_attributes {
@@ -1473,7 +1519,7 @@ async fn batch_attempt(
     // The report reading below answers a non-empty set for every report it could read, so the
     // guard on an empty one is belt and braces: it keeps this pass from recording a successful
     // attempt that consumed nothing, whatever a future reading answers.
-    attempt_batch(client, target, &batch.payload, &batch.invoking, &held)
+    attempt_batch(client, target, batch, &held)
         .await
         .and_then(|processed| {
             if processed.is_empty() {
@@ -1496,10 +1542,10 @@ async fn batch_attempt(
 async fn hand_over_batch(
     client: &::aws_sdk_lambda::Client,
     target: &PollTarget,
-    payload: &Value,
-    invoking: &[String],
+    batch: &AdmittedBatch,
 ) -> Result<Vec<String>, String> {
-    let answered = invoke_function(client, target, payload).await?;
+    let invoking = batch.invoking.as_slice();
+    let answered = invoke_function(client, target, batch).await?;
     if !target.reports_batch_item_failures {
         return Ok(invoking.to_vec());
     }
@@ -1530,12 +1576,11 @@ async fn hand_over_batch(
 async fn attempt_batch(
     client: &::aws_sdk_lambda::Client,
     target: &PollTarget,
-    payload: &Value,
-    invoking: &[String],
+    batch: &AdmittedBatch,
     held: &HeldBatch<'_>,
 ) -> Result<Vec<String>, String> {
     renew_hold(target, held, SystemTime::now());
-    let mut attempt = ::std::pin::pin!(hand_over_batch(client, target, payload, invoking));
+    let mut attempt = ::std::pin::pin!(hand_over_batch(client, target, batch));
     let renew_every = hold_renewal(held.hold_seconds);
     loop {
         // No store is locked across the attempt: the renewal takes the queue store, finishes
@@ -1549,17 +1594,30 @@ async fn attempt_batch(
 
 /// Hand one batch to the function, synchronously, as a queue event source's invocation is,
 /// and answer with the response document it returned.
+///
+/// The call carries the chains of the records it is handing over
+/// ([`crate::state::EventSourceTraceLinks`]): the invocation runs under a chain of its own and
+/// refers back to each of theirs, which is what links a producer's trace to the work its message
+/// was handed to. A batch whose messages belong to no chain carries none.
 async fn invoke_function(
     client: &::aws_sdk_lambda::Client,
     target: &PollTarget,
-    payload: &Value,
+    batch: &AdmittedBatch,
 ) -> Result<Option<Vec<u8>>, String> {
+    let links = crate::state::EventSourceTraceLinks(batch.links.clone());
     let answer = client
         .invoke()
         .function_name(&target.function_arn)
         .payload(::aws_sdk_lambda::primitives::Blob::new(
-            payload.to_string().into_bytes(),
+            batch.payload.to_string().into_bytes(),
         ))
+        .customize()
+        .mutate_request(move |request| {
+            if links.0.is_empty() {
+                return;
+            }
+            request.add_extension(links.clone());
+        })
         .send()
         .await
         .map_err(|error| {
@@ -1797,11 +1855,14 @@ mod tests {
 
     use ::serde_json::json;
     use ::service_com_amazonaws_sqs_amazonsqs as sqs;
-    use ::service_com_amazonaws_sqs_amazonsqs::ops::types::shared_types::MessageAttributeValue;
+    use ::service_com_amazonaws_sqs_amazonsqs::ops::types::shared_types::{
+        MessageAttributeValue, MessageSystemAttributeValue,
+    };
 
     use super::{
         filter_event, invisible_for_seconds, minute_of, queue_event, queue_record,
-        wait_for_the_next_pass, NextPass, PolledMessage, RECORD_MD5_OF_MESSAGE_ATTRIBUTES,
+        upstream_traces, wait_for_the_next_pass, NextPass, PolledMessage,
+        RECORD_MD5_OF_MESSAGE_ATTRIBUTES, RECORD_TRACE_HEADER_ATTRIBUTE,
     };
 
     /// RULE: the wait between two passes ends the instant a message ARRIVES on one of the
@@ -2150,6 +2211,177 @@ mod tests {
             message_id: id.to_string(),
             receipt_handle: RECEIPT_HANDLE.to_string(),
             record: json!({ "messageId": id, "body": body }),
+        }
+    }
+
+    /// The `String` message SYSTEM attribute `name` carrying `string_value`, as a send stores
+    /// one.
+    fn system_attribute(string_value: &str) -> MessageSystemAttributeValue {
+        MessageSystemAttributeValue {
+            data_type: "String".to_string(),
+            string_value: Some(string_value.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// One polled message whose send carried `trace_header` as its tracing context, under the
+    /// id `id` — the record built by [`queue_record`] itself, so what this feeds the links is
+    /// the very record the function is handed.
+    fn polled_tracing(id: &str, trace_header: Option<&str>) -> PolledMessage {
+        let mut message = stored_message();
+        message.message_id = id.to_string();
+        if let Some(trace_header) = trace_header {
+            message.message_system_attributes.insert(
+                RECORD_TRACE_HEADER_ATTRIBUTE.to_string(),
+                system_attribute(trace_header),
+            );
+        }
+        PolledMessage {
+            message_id: id.to_string(),
+            receipt_handle: RECEIPT_HANDLE.to_string(),
+            record: queue_record(&message, RECEIPT_HANDLE, QUEUE_ARN, REGION),
+        }
+    }
+
+    /// RULE: a record reports the tracing context its send carried, as the queue holds it \u2014
+    /// "AWSTraceHeader \u2013 Returns the X-Ray trace header string" \u2014 and a message whose send
+    /// carried none reports none.
+    ///
+    /// The rows differ along what the send stored: a context naming a chain, one naming a chain
+    /// with no decision, one whose `Root` is not a chain X-Ray reads (reported as written: what
+    /// a tracer put there is the tracer's business), and no context at all.
+    #[test]
+    fn a_record_reports_the_tracing_context_its_send_carried() {
+        let root = "1-5759e988-bd862e3fe1be46a994272793";
+        let rows: Vec<(&str, Option<String>)> = vec![
+            (
+                "a sampled context",
+                Some(format!("Root={root};Parent=ae60e65a7062dd18;Sampled=1")),
+            ),
+            ("a context with no decision", Some(format!("Root={root}"))),
+            (
+                "a context naming no chain X-Ray reads",
+                Some("Root=not-a-trace-id;Sampled=1".to_string()),
+            ),
+            ("no context at all", None),
+        ];
+        for (case, stored) in rows {
+            let mut message = stored_message();
+            if let Some(stored) = stored.as_deref() {
+                message.message_system_attributes.insert(
+                    RECORD_TRACE_HEADER_ATTRIBUTE.to_string(),
+                    system_attribute(stored),
+                );
+            }
+            let record = queue_record(&message, RECEIPT_HANDLE, QUEUE_ARN, REGION);
+            let reported = record["attributes"][RECORD_TRACE_HEADER_ATTRIBUTE]
+                .as_str()
+                .map(str::to_string);
+            assert_eq!(
+                reported, stored,
+                "case {case:?}: expected the record to report {stored:?} under \
+                 {RECORD_TRACE_HEADER_ATTRIBUTE}, got {reported:?} in {record}"
+            );
+        }
+    }
+
+    /// RULE: the batch a pass hands over names the CHAIN of each admitted record once —
+    /// which is what the invocation that batch is handed to links back to.
+    ///
+    /// The rows differ along what the rule generalises over: how many records the batch holds,
+    /// how many distinct chains they belong to, whether two of them repeat one chain, whether a
+    /// record carries a tracing context at all, whether the one it carries names a chain X-Ray
+    /// reads, and whether the record the chain would come from was admitted by the filter.
+    #[test]
+    fn a_batch_names_the_chain_of_each_record_the_filter_admitted() {
+        let first = "1-5759e988-bd862e3fe1be46a994272793";
+        let second = "1-00000000-000000000000000000000000";
+        // (case, the records of the batch, the ids the filter admitted, the chains the batch
+        // names)
+        type Row = (
+            &'static str,
+            Vec<PolledMessage>,
+            Vec<String>,
+            Vec<&'static str>,
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "one record of a sampled chain",
+                vec![polled_tracing(
+                    "m-1",
+                    Some(&format!("Root={first};Parent=ae60e65a7062dd18;Sampled=1")),
+                )],
+                vec!["m-1".to_string()],
+                vec![first],
+            ),
+            (
+                "one record of an unsampled chain",
+                vec![polled_tracing("m-1", Some(&format!("Root={first};Sampled=0")))],
+                vec!["m-1".to_string()],
+                vec![first],
+            ),
+            (
+                "two records of two chains",
+                vec![
+                    polled_tracing("m-1", Some(&format!("Root={first};Sampled=1"))),
+                    polled_tracing("m-2", Some(&format!("Root={second};Sampled=1"))),
+                ],
+                vec!["m-1".to_string(), "m-2".to_string()],
+                vec![first, second],
+            ),
+            (
+                "two records of ONE chain",
+                vec![
+                    polled_tracing("m-1", Some(&format!("Root={first};Sampled=1"))),
+                    polled_tracing("m-2", Some(&format!("Root={first};Sampled=0"))),
+                ],
+                vec!["m-1".to_string(), "m-2".to_string()],
+                vec![first],
+            ),
+            (
+                "a record carrying no tracing context",
+                vec![polled_tracing("m-1", None)],
+                vec!["m-1".to_string()],
+                Vec::new(),
+            ),
+            (
+                "a context naming no chain X-Ray reads",
+                vec![polled_tracing("m-1", Some("Root=not-a-trace-id;Sampled=1"))],
+                vec!["m-1".to_string()],
+                Vec::new(),
+            ),
+            (
+                "a context that is not a tracing header at all",
+                vec![polled_tracing("m-1", Some("whatever"))],
+                vec!["m-1".to_string()],
+                Vec::new(),
+            ),
+            (
+                "the record of the second chain was not admitted",
+                vec![
+                    polled_tracing("m-1", Some(&format!("Root={first};Sampled=1"))),
+                    polled_tracing("m-2", Some(&format!("Root={second};Sampled=1"))),
+                ],
+                vec!["m-1".to_string()],
+                vec![first],
+            ),
+            (
+                "no record admitted at all",
+                vec![polled_tracing(
+                    "m-1",
+                    Some(&format!("Root={first};Sampled=1")),
+                )],
+                Vec::new(),
+                Vec::new(),
+            ),
+        ];
+        for (case, polled_messages, invoking, expected) in rows {
+            let named = upstream_traces(&invoking, &polled_messages);
+            assert_eq!(
+                named, expected,
+                "case {case:?}: expected the batch to name the chains {expected:?}, got \
+                 {named:?}"
+            );
         }
     }
 

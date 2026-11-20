@@ -469,6 +469,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // continues (`crate::state::execution::trace_context`). Read once, off this
         // request.
         let supplied_trace = crate::state::supplied_trace_header(ctx);
+        // The chains of the RECORDS this invocation is being handed, where it is a delivery an
+        // event source mapping's poller is making: a batch may carry records of many chains, so
+        // the invocation runs under a chain of its own and LINKS back to each of theirs
+        // (`crate::state::execution::trace_context`). Read once, off this request.
+        let supplied_links = crate::state::supplied_event_source_links(ctx);
         // The resource an INVOCATION addresses is a function AT a version, so the refusal
         // for a pair that resolves to nothing names that QUALIFIED resource — the ARN this
         // invocation resolved, built from the request by the one construction every
@@ -745,13 +750,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     request_id: crate::service::request_id_header::starting_invocation(),
                     // The X-Ray trace context the queued invocation runs with: the chain
                     // its CALLER named, read off this request's own tracing header, under
-                    // the rule the function's `TracingConfig` mode gives
+                    // the rule the function's `TracingConfig` mode gives, linking back to
+                    // the chains of the records it was handed
                     // (`crate::state::execution::trace_context`).
-                    trace: Some(crate::state::invocation_trace_context(
-                        supplied_trace.as_deref(),
-                        &resolved_config.tracing_mode,
-                        now,
-                    )),
+                    trace: Some(
+                        crate::state::invocation_trace_context(
+                            supplied_trace.as_deref(),
+                            &resolved_config.tracing_mode,
+                            now,
+                        )
+                        .linking_to(supplied_links.clone()),
+                    ),
                     // A queued event is delivered off the response path, so no execution
                     // environment has been chosen for it at this point and none of the
                     // qualifier's provisioned ones is holding it: the delivery runs on an
@@ -925,13 +934,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             request_id: crate::service::request_id_header::starting_invocation(),
             // The X-Ray trace context this invocation runs with, which the run reports to
             // the handler in `_X_AMZN_TRACE_ID`: the chain this caller named, continued or
-            // started under the rule the function's `TracingConfig` mode gives
+            // started under the rule the function's `TracingConfig` mode gives, linking back
+            // to the chains of the records it was handed
             // (`crate::state::execution::trace_context`).
-            trace: Some(crate::state::invocation_trace_context(
-                supplied_trace.as_deref(),
-                &resolved_config.tracing_mode,
-                now,
-            )),
+            trace: Some(
+                crate::state::invocation_trace_context(
+                    supplied_trace.as_deref(),
+                    &resolved_config.tracing_mode,
+                    now,
+                )
+                .linking_to(supplied_links.clone()),
+            ),
             initialization_type: admitted.initialization_type,
             // The AWS SDK this runtime supplies the handler reaches the rest of this
             // emulator through the callback the framework handed THIS request, signing

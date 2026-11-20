@@ -46,6 +46,20 @@
 //! They are submitted through the one AWS SDK seam a run has ([`super::aws_api`]), which is
 //! also the seam the handler's own datagrams are submitted over, so a trace's documents all
 //! arrive in the store `BatchGetTraces` answers from.
+//!
+//! # The traces an invocation LINKS to
+//!
+//! An invocation Lambda makes for RECORDS it read out of an event source did not continue the
+//! chain each record belongs to: one batch may carry records of many chains, so the invocation
+//! runs under a chain of its OWN and REFERS to each chain it was asked by. X-Ray carries such a
+//! reference as a `links` entry on the segment — the trace it points at, with
+//! [`LINK_REFERENCE_TYPE_ATTRIBUTE`] saying how this segment relates to it — so a reader that
+//! walks the links of a producer's trace finds the invocation its records were handed to.
+//!
+//! Those chains travel from the poller that read the records to the invocation it hands them to
+//! as [`EventSourceTraceLinks`]: the poller reads each record's own tracing context out of the
+//! source ([`crate::state::sqs_poller`]) and hands the batch over through this emulator's own
+//! `Invoke` surface, which is the one hop between the two halves of that delivery.
 
 use std::time::SystemTime;
 
@@ -66,6 +80,37 @@ const SERVICE_ORIGIN: &str = "AWS::Lambda";
 
 /// The `origin` of the segment covering the FUNCTION's own run.
 const FUNCTION_ORIGIN: &str = "AWS::Lambda::Function";
+
+/// The member a segment carries its references to OTHER traces in.
+const LINKS_MEMBER: &str = "links";
+
+/// The attribute of a link that says how the linked trace relates to this segment.
+const LINK_REFERENCE_TYPE_ATTRIBUTE: &str = "aws.xray.reserved.reference_type";
+
+/// The reference type of a link to the trace this work was ASKED for by: the chain of the
+/// record the invocation was handed, which the invocation's own chain is not a continuation of.
+const LINK_PARENT_REFERENCE: &str = "parent";
+
+/// The chains of the RECORDS an event source mapping's poller is handing over, as they travel
+/// from that poller to the `Invoke` it hands them to.
+///
+/// Lambda's own poll-and-invoke hop is internal to the service; this emulator performs it over
+/// its own `Invoke` surface ([`crate::state::sqs_poller`]), so the chains travel as a typed
+/// request EXTENSION of this process, the way the framework carries its own in-process facts
+/// ([`::smithy_server_runtime::CallbackRecursionDepth`], the same kind of stamp
+/// [`crate::state::resource_tags::tag_key_origin`] reads). Nothing a client can send — on any
+/// socket, signed with any credential — sets one, so no caller can have a link published on an
+/// invocation's trace, which the `Invoke` API gives no way to ask for.
+#[derive(Debug, Clone)]
+pub struct EventSourceTraceLinks(pub Vec<String>);
+
+/// How many links ONE invocation reports at most.
+///
+/// A queue source's batch may hold as many records as `BatchSize` allows (`@range(min: 1, max:
+/// 10000)`), each of a chain of its own, so that is the most chains one invocation can have
+/// been asked by — and the bound on what is read off a header, so no caller-supplied value is
+/// unbounded.
+const MAX_LINKED_TRACES: usize = 10_000;
 
 /// The X-Ray trace context one invocation runs with.
 #[derive(Debug, Clone)]
@@ -90,6 +135,25 @@ pub struct Recorded {
     pub function_span: String,
     /// The span the CALLER named as the parent of this invocation, where it named one.
     pub caller_span: Option<String>,
+    /// The chains this invocation was ASKED by and did not continue: the trace of each record
+    /// an event source mapping's poller handed it, in the order the batch holds them (see the
+    /// module docs). Empty for an invocation nothing links to.
+    pub linked_traces: Vec<String>,
+}
+
+impl InvocationTrace {
+    /// The same context, with `upstream` as the chains the segments of a RECORDED invocation
+    /// link back to ([`Recorded::linked_traces`]).
+    ///
+    /// An invocation X-Ray records nothing for has no segment to carry a link, so nothing is
+    /// kept for it.
+    #[must_use]
+    pub fn linking_to(mut self, upstream: Vec<String>) -> Self {
+        if let Some(recorded) = self.recorded.as_mut() {
+            recorded.linked_traces = upstream;
+        }
+        self
+    }
 }
 
 /// The tracing header the caller of this invocation supplied, or `None` where it supplied
@@ -101,6 +165,45 @@ pub fn supplied_trace_header(ctx: &smithy_server_runtime::OperationContext<'_>) 
         .get(TRACE_HEADER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
+}
+
+/// The chains the records of THIS invocation's batch belong to, as the poller that read them
+/// stamped them ([`EventSourceTraceLinks`]) — empty for an invocation that was handed no record
+/// of a traced chain, and for every request a client made, which carries no such stamp.
+#[must_use]
+pub fn supplied_event_source_links(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> Vec<String> {
+    ctx.parts()
+        .extensions
+        .get::<EventSourceTraceLinks>()
+        .map(|stamped| event_source_links(&stamped.0))
+        .unwrap_or_default()
+}
+
+/// The chains `supplied` names: each value that IS a trace id, each named once, at most
+/// [`MAX_LINKED_TRACES`] of them.
+///
+/// A value that is not a trace id names no chain X-Ray could index, so it is left out rather
+/// than reported as a link to nothing; the order is the one the stamp was written in, which is
+/// the order the batch holds its records in.
+#[must_use]
+pub fn event_source_links(supplied: &[String]) -> Vec<String> {
+    let mut links: Vec<String> = Vec::new();
+    for named in supplied {
+        let named = named.trim();
+        if !::service_common::xray_trace::is_trace_id(named) {
+            continue;
+        }
+        if links.iter().any(|held| held == named) {
+            continue;
+        }
+        links.push(named.to_string());
+        if links.len() == MAX_LINKED_TRACES {
+            break;
+        }
+    }
+    links
 }
 
 /// The trace context ONE invocation runs with — see the module docs for the rule each
@@ -150,6 +253,10 @@ pub fn invocation_trace_context(
             caller_span: supplied
                 .and_then(::service_common::xray_trace::parent_span)
                 .map(str::to_string),
+            // The chains an invocation was asked by are the ones the hop that handed it its
+            // records named ([`InvocationTrace::linking_to`]), and no invocation is asked by
+            // one until it is told so.
+            linked_traces: Vec::new(),
         }),
         _ => None,
     };
@@ -179,9 +286,26 @@ pub fn segment_documents(
         "end_time": to,
         "origin": SERVICE_ORIGIN,
     });
-    if let Some(caller_span) = recorded.caller_span.as_deref() {
-        if let Some(object) = service.as_object_mut() {
+    if let Some(object) = service.as_object_mut() {
+        if let Some(caller_span) = recorded.caller_span.as_deref() {
             object.insert("parent_id".to_string(), json!(caller_span));
+        }
+        // The chains this invocation was ASKED by, each as one `links` entry of the segment
+        // covering Lambda's own handling of the invocation: the invocation runs under a chain
+        // of its own, and each record it was handed belongs to a chain this one refers back to
+        // (see the module docs). An invocation nothing links to carries no member at all.
+        let links: Vec<::serde_json::Value> = recorded
+            .linked_traces
+            .iter()
+            .map(|trace_id| {
+                json!({
+                    "trace_id": trace_id,
+                    "attributes": { LINK_REFERENCE_TYPE_ATTRIBUTE: LINK_PARENT_REFERENCE },
+                })
+            })
+            .collect();
+        if !links.is_empty() {
+            object.insert(LINKS_MEMBER.to_string(), json!(links));
         }
     }
     let function = json!({
@@ -249,7 +373,130 @@ pub async fn report_segments(
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use super::{invocation_trace_context, segment_documents};
+    use super::{
+        event_source_links, invocation_trace_context, segment_documents, LINK_PARENT_REFERENCE,
+        LINK_REFERENCE_TYPE_ATTRIBUTE, LINKS_MEMBER,
+    };
+
+    /// RULE: an invocation handed records of OTHER chains runs under a chain of its own and
+    /// REFERS back to each of theirs — one `links` entry per chain on the segment covering
+    /// Lambda's own handling of the invocation, each naming that chain and
+    /// [`LINK_PARENT_REFERENCE`] as how it relates to this one — and an invocation nothing
+    /// links to carries no such member.
+    ///
+    /// The rows differ along what the rule generalises over: how many chains the hop stamped, a
+    /// chain it stamped twice, a value that is not a chain X-Ray reads, and no chain at all. The
+    /// mode and the decision are the other test's business: these rows all run an invocation
+    /// X-Ray records.
+    #[test]
+    fn a_recorded_invocation_links_back_to_the_chains_its_records_belong_to() {
+        let first = "1-5759e988-bd862e3fe1be46a994272793";
+        let second = "1-00000000-000000000000000000000000";
+        let at = UNIX_EPOCH + Duration::from_secs(0x5759_e988);
+        // (case, the chains the hop stamped, the chains the segment links to)
+        let rows: Vec<(&str, Vec<String>, Vec<&str>)> = vec![
+            ("no chain at all", Vec::new(), Vec::new()),
+            ("one chain", vec![first.to_string()], vec![first]),
+            (
+                "two chains",
+                vec![first.to_string(), second.to_string()],
+                vec![first, second],
+            ),
+            (
+                "one chain stamped twice",
+                vec![first.to_string(), first.to_string()],
+                vec![first],
+            ),
+            (
+                "a value that is no chain, beside one that is",
+                vec!["not-a-trace-id".to_string(), second.to_string()],
+                vec![second],
+            ),
+            (
+                "a value that is no chain at all",
+                vec!["whatever".to_string()],
+                Vec::new(),
+            ),
+            (
+                "a chain written with spaces around it",
+                vec![format!(" {first} ")],
+                vec![first],
+            ),
+        ];
+        for (case, stamped, expected) in rows {
+            let links = event_source_links(&stamped);
+            let context = invocation_trace_context(None, "Active", at).linking_to(links.clone());
+            let recorded = context
+                .recorded
+                .as_ref()
+                .unwrap_or_else(|| panic!("case {case:?}: an active function records a segment"));
+            assert_eq!(
+                recorded.linked_traces, expected,
+                "case {case:?}: expected the invocation to link to {expected:?}, got {:?}",
+                recorded.linked_traces
+            );
+            // The invocation runs under a chain of its OWN: a record's chain is referred to,
+            // never continued.
+            for chain in &expected {
+                assert_ne!(
+                    recorded.trace_id, *chain,
+                    "case {case:?}: the invocation must run under a chain of its own, it runs \
+                     under {chain:?}"
+                );
+            }
+            let documents = segment_documents(
+                recorded,
+                "probe",
+                at,
+                at + Duration::from_millis(25),
+                false,
+            );
+            let service: ::serde_json::Value = ::serde_json::from_str(
+                documents
+                    .first()
+                    .unwrap_or_else(|| panic!("case {case:?}: two documents are produced")),
+            )
+            .unwrap_or_else(|error| panic!("case {case:?}: the document is JSON ({error})"));
+            let reported: Vec<(String, String)> = service[LINKS_MEMBER]
+                .as_array()
+                .map(|links| {
+                    links
+                        .iter()
+                        .map(|link| {
+                            (
+                                link["trace_id"].as_str().unwrap_or_default().to_string(),
+                                link["attributes"][LINK_REFERENCE_TYPE_ATTRIBUTE]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let wanted: Vec<(String, String)> = expected
+                .iter()
+                .map(|chain| ((*chain).to_string(), LINK_PARENT_REFERENCE.to_string()))
+                .collect();
+            assert_eq!(
+                reported, wanted,
+                "case {case:?}: expected the segment to carry the links {wanted:?}, got \
+                 {service}"
+            );
+            // The segment of the FUNCTION's own run carries none: the reference is Lambda's
+            // own handling of the invocation.
+            let function: ::serde_json::Value = ::serde_json::from_str(
+                documents
+                    .get(1)
+                    .unwrap_or_else(|| panic!("case {case:?}: two documents are produced")),
+            )
+            .unwrap_or_else(|error| panic!("case {case:?}: the document is JSON ({error})"));
+            assert!(
+                function.get(LINKS_MEMBER).is_none(),
+                "case {case:?}: the function segment carries no link, got {function}"
+            );
+        }
+    }
 
     /// Which trace context an invocation runs with — over a TABLE whose rows differ along
     /// the function's `TracingConfig` mode and what the caller supplied (a sampled chain, an

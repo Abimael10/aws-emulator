@@ -260,7 +260,10 @@ pub use environment_key::{
 /// The X-Ray trace context one invocation runs with, which the execution environment
 /// reports in `_X_AMZN_TRACE_ID`.
 pub mod trace_context;
-pub use trace_context::{invocation_trace_context, supplied_trace_header};
+pub use trace_context::{
+    invocation_trace_context, supplied_event_source_links, supplied_trace_header,
+    EventSourceTraceLinks,
+};
 use trace_context::report_segments;
 
 /// The X-Ray daemon a traced invocation reports its own work to, and the datagram surface a
@@ -3026,6 +3029,7 @@ mod tests {
                         service_span: "0000000000000004".to_string(),
                         function_span: "0000000000000003".to_string(),
                         caller_span: None,
+                        linked_traces: Vec::new(),
                     }),
                 }),
                 own_address: None,
