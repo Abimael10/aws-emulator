@@ -42,15 +42,14 @@
 //! object below it, a directory-style path).
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::cloudfront_oac_s3_origin_edge::{
-    assert_deployed, call, create_bucket, create_origin_access_control, emulator, origin_domain,
-    put_bucket_policy, put_object, view, Answer, API_VERSION, CLOUDFRONT_HOST,
-    CLOUDFRONT_PRINCIPAL,
+    assert_deployed, awaited_deployment, call, create_bucket, create_origin_access_control,
+    emulator, origin_domain, put_bucket_policy, put_object, view, Answer, API_VERSION,
+    CLOUDFRONT_HOST, CLOUDFRONT_PRINCIPAL,
 };
 
 /// The AWS-managed cache policy `Managed-CachingDisabled`, whose TTLs are all zero: every
@@ -69,38 +68,6 @@ const NO_SUCH_KEY: &str = "NoSuchKey";
 
 /// What the edge reports as the outcome of an answer the ORIGIN produced for this request.
 const MISS: &str = "Miss from cloudfront";
-
-/// How long the suite waits for the clock to deploy a distribution, and how often it looks.
-/// The wait is on the CONDITION — the status CloudFront reports — with a deadline far past the
-/// propagation any configuration is owed.
-const POLL: Duration = Duration::from_millis(25);
-const POLL_DEADLINE: Duration = Duration::from_secs(60);
-
-/// Poll `GetDistribution` until CloudFront first reports `id` deployed, which is the state a
-/// viewer request is served in.
-async fn awaited_deployment(router: &MultiServiceRouter, case: &str, id: &str) {
-    let polls = POLL_DEADLINE.as_millis() / POLL.as_millis().max(1);
-    for _ in 0..polls {
-        let read = call(
-            router,
-            "cloudfront",
-            CLOUDFRONT_HOST,
-            "GET",
-            &format!("/{API_VERSION}/distribution/{id}"),
-            &[],
-            Bytes::new(),
-        )
-        .await;
-        if read.element("Status") == "Deployed" {
-            return;
-        }
-        ::tokio::time::sleep(POLL).await;
-    }
-    panic!(
-        "case {case:?}: CloudFront never reported the distribution {id} deployed within \
-         {POLL_DEADLINE:?}"
-    );
-}
 
 // ---------------------------------------------------------------------------
 // The documents a bucket carries

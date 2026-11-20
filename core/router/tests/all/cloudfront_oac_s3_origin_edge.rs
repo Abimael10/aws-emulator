@@ -360,6 +360,42 @@ pub(crate) async fn create_distribution(
     (id, domain, arn)
 }
 
+/// How long a suite waits for the clock to deploy a distribution, and how often it looks. The
+/// wait is on the CONDITION — the status CloudFront reports — with a deadline far past the
+/// propagation any configuration is owed.
+const POLL: Duration = Duration::from_millis(25);
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Poll `GetDistribution` until CloudFront first reports `id` deployed, which is the state a
+/// viewer request is served in.
+///
+/// The polling half of [`assert_deployed`], for a suite that submits a configuration and then
+/// waits for it rather than one that has already waited: the wait is on the status CloudFront
+/// reports, never on a span of the clock.
+pub(crate) async fn awaited_deployment(router: &MultiServiceRouter, case: &str, id: &str) {
+    let polls = POLL_DEADLINE.as_millis() / POLL.as_millis().max(1);
+    for _ in 0..polls {
+        let read = call(
+            router,
+            "cloudfront",
+            CLOUDFRONT_HOST,
+            "GET",
+            &format!("/{API_VERSION}/distribution/{id}"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        if read.element("Status") == "Deployed" {
+            return;
+        }
+        ::tokio::time::sleep(POLL).await;
+    }
+    panic!(
+        "case {case:?}: CloudFront never reported the distribution {id} deployed within \
+         {POLL_DEADLINE:?}"
+    );
+}
+
 /// Assert through `GetDistribution` that the clock has deployed `id`.
 pub(crate) async fn assert_deployed(router: &MultiServiceRouter, case: &str, id: &str) {
     let read = call(

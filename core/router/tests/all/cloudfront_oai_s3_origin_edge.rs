@@ -55,7 +55,7 @@ fn past_propagation() -> Duration {
 
 /// `cloudfront:CreateCloudFrontOriginAccessIdentity`, answering the identity's
 /// `(Id, S3CanonicalUserId)`.
-async fn create_origin_access_identity(
+pub(crate) async fn create_origin_access_identity(
     router: &MultiServiceRouter,
     case: &str,
     caller_reference: &str,
@@ -99,7 +99,7 @@ async fn create_origin_access_identity(
 ///
 /// `S3OriginConfig$OriginAccessIdentity` carries the documented reference form, which is what
 /// a client writes and what the bucket policy's grant is then written for.
-async fn create_distribution(
+pub(crate) async fn create_distribution(
     router: &MultiServiceRouter,
     case: &str,
     caller_reference: &str,
