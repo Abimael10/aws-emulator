@@ -12,11 +12,11 @@
 //! concurrently, and a channel nobody created answers `ResourceNotFoundException`.
 //!
 //! The issued `Uris` are an address a WebRTC client DIALS, so every one of them names the
-//! address THIS emulator is reached at for the call being served
-//! ([`crate::state::relay_address`]) — never a host AWS publishes an endpoint at, which
-//! would send a client out of the environment the call was served from. Only the
-//! control-plane answer is emulated here: no TURN relay is served, so what the address
-//! gives a client is this emulator itself.
+//! address THIS emulator ANSWERS on — the endpoint this process is served at
+//! ([`crate::state::relay_address`]) — never a host AWS publishes an endpoint at and never
+//! an address a request merely carried, either of which would send a client out of the
+//! environment the call was served from. Only the control-plane answer is emulated here: no
+//! TURN relay is served, so what the address gives a client is this emulator itself.
 //!
 //! ## Shape of an operation
 //!
@@ -375,11 +375,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The relay the issued credentials are good for is reached where THIS emulator is
-        // reached: resolved from the request's own addressing before the store is locked,
-        // so no announced address depends on a host AWS publishes (see
+        // The relay the issued credentials are good for is reached where THIS emulator
+        // answers: the address this process is SERVED at, resolved before the store is
+        // locked and never read off the request's own addressing (see
         // `crate::state::relay_address`).
-        let relay_uris = crate::state::relay_uris(ctx.parts(), ctx.endpoint().as_str());
+        let relay_uris = crate::state::relay_uris(ctx.endpoint().as_str());
 
         let now = SystemTime::now();
         let mut store = state.lock();

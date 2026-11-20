@@ -5,16 +5,17 @@
 //! The rule these cases assert, one level above the recorded case (one channel, one call,
 //! one address):
 //!
-//! > Every address this plane announces for a client to DIAL names a host and port THIS
-//! > emulator is reached at — the endpoint the request addressed when the caller resolves
-//! > nothing else, otherwise the address this process is served at — and never a host AWS
-//! > publishes an endpoint at, in the `turn:`/`turns:` URI form `IceServer$Uris` documents.
+//! > Every address this plane announces for a client to DIAL names the host and port THIS
+//! > emulator ANSWERS on — the endpoint this process is served at, else the one it is
+//! > configured to serve on — never a host AWS publishes an endpoint at and never an
+//! > address a request merely carried, in the `turn:`/`turns:` URI form `IceServer$Uris`
+//! > documents.
 //!
-//! The rows span what the rule generalises over: how a request carries its address (an
-//! IPv4 literal with a port, a loopback name without one, a bracketed IPv6 literal), a
-//! caller that addressed one of AWS's own hosts instead, and whether this process is served
-//! on a port at all. The channel's region and name differ with the rows, because neither is
-//! part of the answer.
+//! The rows span what the rule generalises over: the port this process is served on, and
+//! the addressing a request carries (the served endpoint itself, another of this emulator's
+//! own names, a bracketed IPv6 literal, a port this process does not serve, a name carrying
+//! no port, one of AWS's own hosts) — none of which moves the answer. The channel's region
+//! and name differ with the rows, because neither is part of the answer either.
 
 use std::sync::Arc;
 
@@ -145,10 +146,10 @@ struct AddressCase {
 }
 
 #[tokio::test]
-async fn every_announced_relay_uri_names_an_address_this_emulator_is_reached_at() {
+async fn every_announced_relay_uri_names_an_address_this_emulator_is_served_at() {
     let cases = [
         AddressCase {
-            case: "the loopback endpoint the client addressed, with its port",
+            case: "the loopback endpoint the client addressed, which is the served one",
             arn: "arn:aws:kinesisvideo:us-west-2:123456789012:channel/probe-channel/1700000000",
             addressed: "127.0.0.1:9297",
             served_base: Some("https://127.0.0.1:9297"),
@@ -162,18 +163,39 @@ async fn every_announced_relay_uri_names_an_address_this_emulator_is_reached_at(
             expected_authority: "127.0.0.1:18443",
         },
         AddressCase {
-            case: "a loopback name without a port, which https dials on 443",
+            case: "another of this emulator's own names does not move the answer",
             arn: "arn:aws:kinesisvideo:ap-southeast-1:999999999999:channel/named-host/42",
-            addressed: "localhost",
+            addressed: "localhost:9297",
             served_base: Some("https://127.0.0.1:9297"),
-            expected_authority: "localhost:443",
+            expected_authority: "127.0.0.1:9297",
         },
         AddressCase {
-            case: "a bracketed IPv6 loopback literal keeps its brackets",
+            case: "a bracketed IPv6 addressing does not move the answer either",
             arn: "arn:aws:kinesisvideo:sa-east-1:123456789012:channel/ipv6-host/7",
             addressed: "[::1]:9297",
             served_base: Some("https://127.0.0.1:9297"),
-            expected_authority: "[::1]:9297",
+            expected_authority: "127.0.0.1:9297",
+        },
+        AddressCase {
+            case: "a served IPv6 endpoint keeps its brackets",
+            arn: "arn:aws:kinesisvideo:ca-central-1:123456789012:channel/ipv6-served/8",
+            addressed: "[::1]:9443",
+            served_base: Some("https://[::1]:9443"),
+            expected_authority: "[::1]:9443",
+        },
+        AddressCase {
+            case: "a carried port this process does not serve is not announced",
+            arn: "arn:aws:kinesisvideo:us-west-1:123456789012:channel/foreign-port/1700000001",
+            addressed: "127.0.0.1:43577",
+            served_base: Some("https://127.0.0.1:35713"),
+            expected_authority: "127.0.0.1:35713",
+        },
+        AddressCase {
+            case: "a loopback name carrying no port is not announced either",
+            arn: "arn:aws:kinesisvideo:eu-central-1:123456789012:channel/no-port/1700000002",
+            addressed: "localhost",
+            served_base: Some("https://127.0.0.1:9297"),
+            expected_authority: "127.0.0.1:9297",
         },
         AddressCase {
             case: "a client that addressed AWS's own host is told where this process is served",
@@ -265,13 +287,15 @@ async fn every_announced_relay_uri_names_an_address_this_emulator_is_reached_at(
     }
 }
 
-/// RULE: a credential set minted under one of this emulator's addresses is never replayed
-/// under another — the issuance keeps its credentials for its whole lifetime, and the relay
-/// address it is served with is the one the ASKING call reached.
+/// RULE: a credential set minted under this emulator's address is never replayed under
+/// another — the issuance keeps its credentials for its whole lifetime, and every call is
+/// answered with the relay address this process is served at, whichever of this emulator's
+/// addresses the asking client used.
 #[tokio::test]
-async fn a_stored_credential_set_is_re_addressed_onto_the_endpoint_the_asking_call_reached() {
+async fn a_stored_credential_set_keeps_the_address_this_process_is_served_at() {
     const ARN: &str = "arn:aws:kinesisvideo:us-west-2:123456789012:channel/re-addressed/1700000000";
-    // The emulator is served at one address and reached at several: the rows are the
+    const SERVED_AUTHORITY: &str = "127.0.0.1:9297";
+    // The emulator is served at one address and addressed at several: the rows are the
     // endpoints one client after another addresses it on, in order.
     let addressings = ["127.0.0.1:9297", "localhost:9297", "[::1]:9297"];
 
@@ -289,7 +313,9 @@ async fn a_stored_credential_set_is_re_addressed_onto_the_endpoint_the_asking_ca
         let uris = served_uris(addressed, &answer);
         let expected: Vec<String> = RELAY_TRANSPORTS
             .iter()
-            .map(|(scheme, transport)| format!("{scheme}:{addressed}?transport={transport}"))
+            .map(|(scheme, transport)| {
+                format!("{scheme}:{SERVED_AUTHORITY}?transport={transport}")
+            })
             .collect();
         assert_eq!(
             uris, expected,
@@ -315,6 +341,84 @@ async fn a_stored_credential_set_is_re_addressed_onto_the_endpoint_the_asking_ca
                 "case {addressed:?}: a repeat call must answer with the recorded credentials"
             ),
             None => credentials = Some(issued),
+        }
+    }
+}
+
+/// RULE, stated as the invariant it is: whatever a request CARRIES as its address, every
+/// announced relay URI names the authority this process is SERVED at — so no client is ever
+/// sent to an address nothing here answers on.
+///
+/// The rows differ along the addressing a request can carry (an address of a front end
+/// between the client and this process, a routable host, a host naming a service, a name
+/// with no port, the served endpoint itself under each of this emulator's own names) and
+/// along the port this process is served on, which is the one every answer has to carry.
+#[tokio::test]
+async fn every_announced_relay_uri_names_the_authority_this_process_is_served_at() {
+    const SERVED_PORTS: [u16; 3] = [9297, 35713, 18443];
+    // One carried addressing per row, with the channel it asks about: the channel's name
+    // and region are part of no answer, so they differ with the rows.
+    let carried: [(&str, &str); 6] = [
+        (
+            "a front end between the client and this process",
+            "arn:aws:kinesisvideo:us-west-2:123456789012:channel/front-end/1700000000",
+        ),
+        (
+            "a routable host this process is not bound on",
+            "arn:aws:kinesisvideo:eu-west-1:000000000001:channel/routable-host/1700000001",
+        ),
+        (
+            "a host naming one of AWS's own endpoints",
+            "arn:aws:kinesisvideo:ap-northeast-1:999999999999:channel/aws-host/1700000002",
+        ),
+        (
+            "a loopback name carrying no port at all",
+            "arn:aws:kinesisvideo:sa-east-1:123456789012:channel/no-port/1700000003",
+        ),
+        (
+            "the loopback literal on the served port",
+            "arn:aws:kinesisvideo:us-east-1:123456789012:channel/own-literal/1700000004",
+        ),
+        (
+            "the loopback name on the served port",
+            "arn:aws:kinesisvideo:us-east-2:123456789012:channel/own-name/1700000005",
+        ),
+    ];
+
+    for served_port in SERVED_PORTS {
+        let served_authority = format!("127.0.0.1:{served_port}");
+        let (engine, router) = emulator_served_at(Some(&format!("https://{served_authority}")));
+        for (index, (addressing, arn)) in carried.iter().enumerate() {
+            // The addressings are built from the served port so the rows that carry a
+            // DIFFERENT port stay different at every served port.
+            let addressed = match index {
+                0 => format!("127.0.0.1:{}", served_port + 1),
+                1 => "10.0.0.7:8443".to_string(),
+                2 => "kinesisvideo.us-west-2.amazonaws.com".to_string(),
+                3 => "localhost".to_string(),
+                4 => served_authority.clone(),
+                _ => format!("localhost:{served_port}"),
+            };
+            let case = format!("{addressing} at the served port {served_port}");
+            seed_channel(&engine, arn);
+
+            let (status, answer) = get_ice_server_config(&router, &addressed, arn).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with {answer}"
+            );
+
+            let uris = served_uris(&case, &answer);
+            let expected: Vec<String> = RELAY_TRANSPORTS
+                .iter()
+                .map(|(scheme, transport)| {
+                    format!("{scheme}:{served_authority}?transport={transport}")
+                })
+                .collect();
+            assert_eq!(
+                uris, expected,
+                "case {case:?}: expected the relay URIs {expected:?}, got {uris:?}"
+            );
         }
     }
 }

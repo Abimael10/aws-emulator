@@ -3,24 +3,32 @@
 //! The ADDRESS the relay URIs of an issued TURN credential set name.
 //!
 //! `IceServer$Uris` is not a label: a WebRTC client takes each URI verbatim and DIALS the
-//! relay it names. So the address has to be one THIS emulator answers on. An address under
-//! a host AWS publishes its own endpoints at is the failure to avoid: a client either leaves
-//! the emulated environment for infrastructure the test has no relationship with, or
-//! resolves nothing at all, while the answer claims a relay is there for the reported `Ttl`.
+//! relay it names. So the address has to be one THIS emulator is SERVING the call on. An
+//! address nothing here answers on is the failure to avoid — a host AWS publishes its own
+//! endpoints at, or a `host:port` the request merely CARRIED (a forwarding front end, an
+//! endpoint of an earlier run): a client either leaves the emulated environment for
+//! infrastructure the test has no relationship with, or resolves nothing at all, while the
+//! answer claims a relay is there for the reported `Ttl`.
 //!
-//! Which address is this emulator's own is one question with one reading for the whole tree
-//! ([`::service_common::data_plane_addressing`]), and it is CALLED here rather than written
-//! again, in the order every announced address of this emulator resolves it:
+//! Which address this emulator is served at is one question with one reading for the whole
+//! tree ([`::service_common::data_plane_addressing`]), and it is CALLED here rather than
+//! written again:
 //!
-//! * the emulator's OWN endpoint when the request ADDRESSED it — a client that resolves
-//!   nothing else, which is the client this plane is reached by, and the same address the
-//!   signaling channel's own `HTTPS` and `WSS` endpoints are announced at;
-//! * otherwise the address this process is SERVED at, which is what an in-process call of
-//!   another service is told, so a credential set minted through one is addressed where its
-//!   caller can reach it too;
+//! * the address this process is SERVED at — the base
+//!   [`::smithy_server_runtime::OperationContext::endpoint`] reports, which is the data
+//!   port's own published address and therefore the socket this emulator answers requests
+//!   on;
 //! * otherwise the address this emulator is CONFIGURED to serve on
-//!   ([`configured_authority`]), for a process answering on no socket at all, where the two
-//!   readings above have nothing to report.
+//!   ([`configured_authority`]), for a process answering on no socket at all, where the
+//!   reading above has nothing to report.
+//!
+//! NOTHING of a request moves the answer: where this emulator answers is a property of the
+//! PROCESS, not of the host a request happened to carry. A carried host is whatever the
+//! client was pointed at — a forwarding front end, an endpoint of an earlier run, one of
+//! AWS's own names — and re-announcing it as a relay sends the next client to an address
+//! this process does not answer on, which is exactly the failure above. So the two readings
+//! below are the whole answer, and the same address is announced to every viewer of every
+//! channel.
 //!
 //! The emulator serves no TURN relay of its own, so what this address gives a client is the
 //! emulator itself: a dial that fails locally, in the environment the call was served from,
@@ -37,26 +45,35 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 /// UDP and on TCP.
 const RELAY_TRANSPORTS: [(&str, &str); 3] = [("turn", "udp"), ("turns", "udp"), ("turns", "tcp")];
 
-/// The `host:port` the relay URIs of a credential set issued for THIS request name: the
-/// address this emulator is reached at, by the reading this module's header states.
+/// The `host:port` the relay URIs of an issued credential set name: the address this
+/// emulator ANSWERS on, by the reading this module's header states — the endpoint this
+/// process is served at (`served_base`, the base
+/// [`::smithy_server_runtime::OperationContext::endpoint`] reports), else the one it is
+/// configured to serve on.
+///
+/// Reported with a port in every case, because an address a client DIALS a relay at names
+/// one: an authority that states none is dialled on the port `https` implies
+/// ([`::service_common::data_plane_addressing::IMPLICIT_HTTPS_PORT`]).
 #[must_use]
-pub fn relay_authority(parts: &::http::request::Parts, served_base: &str) -> String {
-    match ::service_common::data_plane_addressing::reached_emulator_host_and_port(
-        parts,
-        served_base,
-    ) {
-        Some((host, port)) => {
-            ::service_common::data_plane_addressing::host_port_authority(&host, port)
+pub fn relay_authority(served_base: &str) -> String {
+    use ::service_common::data_plane_addressing as addressing;
+    match addressing::served_endpoint_authority(served_base) {
+        Some(authority) => {
+            let host = addressing::host_only(&authority).to_string();
+            let port = addressing::addressed_port(Some(authority.as_str()))
+                .and_then(|port| u16::try_from(port).ok())
+                .unwrap_or(addressing::IMPLICIT_HTTPS_PORT);
+            addressing::host_port_authority(&host, port)
         }
         None => configured_authority(),
     }
 }
 
-/// The relay URIs a credential set issued for THIS request is good for: one per entry of
+/// The relay URIs an issued credential set is good for: one per entry of
 /// [`RELAY_TRANSPORTS`], all naming [`relay_authority`].
 #[must_use]
-pub fn relay_uris(parts: &::http::request::Parts, served_base: &str) -> Vec<String> {
-    turn_uris(&relay_authority(parts, served_base))
+pub fn relay_uris(served_base: &str) -> Vec<String> {
+    turn_uris(&relay_authority(served_base))
 }
 
 /// The relay URIs that name `authority`, in the documented URI form.
@@ -99,78 +116,50 @@ fn configured_authority() -> String {
 mod tests {
     use super::*;
 
-    /// A request carrying `host` on its `Host` header, addressed at this route.
-    fn parts(host: Option<&str>, uri: &str) -> ::http::request::Parts {
-        let mut builder = ::http::Request::builder().method("POST").uri(uri);
-        if let Some(host) = host {
-            builder = builder.header(::http::header::HOST, host);
-        }
-        builder
-            .body(())
-            .expect("the request under test is well formed")
-            .into_parts()
-            .0
-    }
-
-    /// The rule: the relay authority is the address this emulator is reached at — the
-    /// endpoint the request addressed, else the one this process is served at, and never a
-    /// host AWS publishes an endpoint at.
+    /// The rule: the relay authority is the address this emulator ANSWERS on — the endpoint
+    /// this process is served at, else the one it is configured to serve on — whatever a
+    /// request carries as its own addressing.
     ///
-    /// The rows differ along what the reading generalises over: where the request carries
-    /// its address (header, absolute-form URI, neither), whether that address is the
-    /// emulator's own or a host naming a service, whether it states a port, and whether
-    /// this process is served on one.
+    /// The rows differ along what the reading generalises over: the form of the served base
+    /// (a loopback literal with a port, a bracketed IPv6 literal, a name carrying no port,
+    /// a trailing `/`) and a process served on no port at all.
     #[test]
-    fn the_relay_authority_is_an_address_this_emulator_is_reached_at() {
-        let served = "https://127.0.0.1:9443";
-        let unserved = ::smithy_server_runtime::UNSERVED_URL_BASE;
+    fn the_relay_authority_is_an_address_this_emulator_is_served_at() {
         let configured = configured_authority();
-        let cases: [(&str, Option<&str>, &str, &str, String); 6] = [
+        let cases: [(&str, &str, String); 6] = [
             (
-                "the loopback endpoint the request addressed, with its port",
-                Some("127.0.0.1:9297"),
-                "/v1/get-ice-server-config",
-                served,
-                "127.0.0.1:9297".to_string(),
-            ),
-            (
-                "a loopback name without a port is dialled on the https port",
-                Some("localhost"),
-                "/v1/get-ice-server-config",
-                served,
-                "localhost:443".to_string(),
-            ),
-            (
-                "an absolute-form URI carries the address when no header does",
-                None,
-                "https://127.0.0.1:9443/v1/get-ice-server-config",
-                served,
+                "the loopback endpoint this process is served at",
+                "https://127.0.0.1:9443",
                 "127.0.0.1:9443".to_string(),
             ),
             (
-                "a host naming a service is AWS's own, so the served address answers",
-                Some("kinesisvideo.us-west-2.amazonaws.com"),
-                "/v1/get-ice-server-config",
-                served,
-                "127.0.0.1:9443".to_string(),
+                "an ephemeral port chosen at boot",
+                "https://127.0.0.1:35713",
+                "127.0.0.1:35713".to_string(),
             ),
             (
                 "a bracketed IPv6 endpoint keeps its brackets",
-                Some("[::1]:9297"),
-                "/v1/get-ice-server-config",
-                served,
-                "[::1]:9297".to_string(),
+                "https://[::1]:9443",
+                "[::1]:9443".to_string(),
             ),
             (
-                "neither an own endpoint nor a served port: the configured address",
-                Some("kinesisvideo.us-west-2.amazonaws.com"),
-                "/v1/get-ice-server-config",
-                unserved,
+                "a served base naming no port is dialled on the https port",
+                "https://localhost",
+                "localhost:443".to_string(),
+            ),
+            (
+                "a served base with a trailing path separator",
+                "https://127.0.0.1:9443/",
+                "127.0.0.1:9443".to_string(),
+            ),
+            (
+                "served on no port at all: the configured address",
+                ::smithy_server_runtime::UNSERVED_URL_BASE,
                 configured.clone(),
             ),
         ];
-        for (case, host, uri, base, expected) in cases {
-            let resolved = relay_authority(&parts(host, uri), base);
+        for (case, base, expected) in cases {
+            let resolved = relay_authority(base);
             assert_eq!(
                 resolved, expected,
                 "case {case:?}: expected the relay authority {expected:?}, got {resolved:?}"
