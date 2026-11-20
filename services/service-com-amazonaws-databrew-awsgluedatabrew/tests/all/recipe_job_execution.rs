@@ -27,6 +27,14 @@
 //! that work reached: `SUCCEEDED` only once every output object is written, and `FAILED`
 //! with the reason as its `ErrorMessage` otherwise.
 //!
+//! RULE FOUR: the output configuration a job reports is the one its runs write with — the
+//! members the create supplied, plus the account that owns the destination bucket and the
+//! options a comma-separated output is written with, which the service settles for an
+//! output that left them out.
+//!
+//! RULE FIVE: a run's instants reach the wire as this protocol's epoch-seconds numbers, of
+//! at most millisecond precision.
+//!
 //! The tables span what the rules generalise over: which principal a role trusts (this
 //! service, another service, several, a denial, a role IAM does not hold); which
 //! transformation a recipe step names and how it is gated (an unconditioned rename, a
@@ -1167,6 +1175,243 @@ async fn a_run_fails_for_an_output_kind_this_emulator_does_not_write() {
             run.member(reported)
         );
     }
+}
+
+/// RULE FOUR: the output configuration a job reports is the one its runs WRITE with. Every
+/// member the create supplied is kept, and the two the service settles for an output that
+/// left them out are recorded on the job: the account that owns the destination bucket
+/// (model: `S3Location$BucketOwner` — "the Amazon Web Services account ID of the bucket
+/// owner", `@pattern ^[0-9]{12}$`) and the options a comma-separated output is written with
+/// (model: `Output$FormatOptions` -> `OutputFormatOptions$Csv` ->
+/// `CsvOutputOptions$Delimiter`, one character). Every read of the job and of its runs
+/// reports that same configuration.
+///
+/// The table spans how an output is configured: which delimiter it names, whether its
+/// location names a bucket owner and which account it names, an output that names no
+/// format options, one that names no format at all, and one written in a format that has
+/// no CSV options to settle.
+#[tokio::test]
+async fn a_run_reports_the_output_configuration_it_writes_with() {
+    // The account every bucket of this emulator belongs to, as the emulator itself names
+    // it: what an output location that named no owner records.
+    let account = ::engine::emulator_account_id().to_string();
+    // The delimiter a CSV output that named no options is written with, as the shape's own
+    // doc states it ("a single character that specifies the delimiter used to create CSV
+    // job output"): the comma CSV is named for.
+    let comma = json!({"Csv": {"Delimiter": ","}});
+    for (case, output, expected_options, expected_owner) in [
+        (
+            "a comma delimiter and this account as owner",
+            json!({
+                "Format": "CSV",
+                "Location": {"Bucket": BUCKET, "Key": "out/", "BucketOwner": account},
+                "FormatOptions": {"Csv": {"Delimiter": ","}},
+                "Overwrite": true,
+                "MaxOutputFiles": 1,
+            }),
+            comma.clone(),
+            account.clone(),
+        ),
+        (
+            "a pipe delimiter and another account as owner",
+            json!({
+                "Format": "CSV",
+                "Location": {
+                    "Bucket": BUCKET, "Key": "nested/out/", "BucketOwner": "210987654321",
+                },
+                "FormatOptions": {"Csv": {"Delimiter": "|"}},
+                "Overwrite": true,
+                "MaxOutputFiles": 2,
+            }),
+            json!({"Csv": {"Delimiter": "|"}}),
+            "210987654321".to_string(),
+        ),
+        (
+            "a tab delimiter and no bucket owner",
+            json!({
+                "Format": "CSV",
+                "Location": {"Bucket": BUCKET, "Key": "out/"},
+                "FormatOptions": {"Csv": {"Delimiter": "\t"}},
+                "Overwrite": true,
+            }),
+            json!({"Csv": {"Delimiter": "\t"}}),
+            account.clone(),
+        ),
+        (
+            "no format options at all",
+            json!({
+                "Format": "CSV",
+                "Location": {"Bucket": BUCKET, "Key": "out/"},
+                "Overwrite": true,
+            }),
+            comma.clone(),
+            account.clone(),
+        ),
+        (
+            "no format at all",
+            json!({
+                "Location": {"Bucket": BUCKET, "Key": "out/"},
+                "Overwrite": true,
+            }),
+            comma.clone(),
+            account.clone(),
+        ),
+        (
+            "a JSON output, which has no CSV options to settle",
+            json!({
+                "Format": "JSON",
+                "Location": {"Bucket": BUCKET, "Key": "out/"},
+                "Overwrite": true,
+            }),
+            Value::Null,
+            account.clone(),
+        ),
+    ] {
+        let emulator = emulator_with_input(INPUT_CSV).await;
+        assert_eq!(
+            create_dataset(&emulator, "echo-ds").await.status,
+            200,
+            "case {case:?}: the dataset must be created"
+        );
+        assert_eq!(
+            create_job(
+                &emulator,
+                json!({
+                    "Name": "echo-job",
+                    "DatasetName": "echo-ds",
+                    "RoleArn": "arn:aws:iam::000000000000:role/brew",
+                    "Outputs": [output.clone()],
+                }),
+            )
+            .await
+            .status,
+            200,
+            "case {case:?}: the job must be created"
+        );
+
+        let described_job = emulator.call("GET", "/jobs/echo-job", None).await;
+        let run = run_to_completion(&emulator, "echo-job").await;
+        assert_eq!(
+            run.text("State"),
+            "SUCCEEDED",
+            "case {case:?}: expected a SUCCEEDED run, got {:?}",
+            run.body
+        );
+        let reported = run.member("Outputs")[0].clone();
+
+        // Every member the create named is reported back unchanged.
+        for (member, supplied) in output.as_object().expect("the output is an object") {
+            if member == "Location" {
+                continue;
+            }
+            assert_eq!(
+                reported[member], *supplied,
+                "case {case:?}: expected the run's Outputs[0].{member} to be {supplied:?}, got \
+                 {:?}",
+                reported[member]
+            );
+        }
+        for member in ["Bucket", "Key"] {
+            assert_eq!(
+                reported["Location"][member], output["Location"][member],
+                "case {case:?}: expected the run's Outputs[0].Location.{member} to be {:?}, got \
+                 {:?}",
+                output["Location"][member], reported["Location"][member]
+            );
+        }
+
+        // The two members the service settles are reported as the run writes with them: a
+        // format with no CSV options to settle reports none at all.
+        assert_eq!(
+            reported["Location"]["BucketOwner"],
+            json!(expected_owner),
+            "case {case:?}: expected Outputs[0].Location.BucketOwner {expected_owner:?}, got {:?}",
+            reported["Location"]["BucketOwner"]
+        );
+        let expected_format_options =
+            (expected_options != Value::Null).then(|| expected_options.clone());
+        assert_eq!(
+            reported.get("FormatOptions").cloned(),
+            expected_format_options,
+            "case {case:?}: expected Outputs[0].FormatOptions {expected_options:?}, got {:?}",
+            reported.get("FormatOptions")
+        );
+
+        // The job read and the run's listing report the very same configuration: one
+        // record, read three ways.
+        assert_eq!(
+            described_job.member("Outputs")[0],
+            reported,
+            "case {case:?}: expected DescribeJob to report the same output, got {:?}",
+            described_job.member("Outputs")
+        );
+        let listed = emulator.call("GET", "/jobs/echo-job/jobRuns", None).await;
+        assert_eq!(
+            listed.member("JobRuns")[0]["Outputs"][0],
+            reported,
+            "case {case:?}: expected ListJobRuns to report the same output, got {:?}",
+            listed.member("JobRuns")
+        );
+    }
+}
+
+/// RULE FIVE: a run's timestamps are epoch-seconds numbers of at most millisecond
+/// precision, which is what this protocol's timestamp serializer emits — the host clock's
+/// finer reading is not part of the value.
+///
+/// The cases span the two members a run reports and the two reads that report them, so the
+/// rule is asserted wherever a run's instant reaches the wire.
+#[tokio::test]
+async fn a_run_reports_its_timestamps_at_millisecond_precision() {
+    let emulator = emulator_with_input(INPUT_CSV).await;
+    assert_eq!(
+        create_dataset(&emulator, "clock-ds").await.status,
+        200,
+        "the dataset must be created"
+    );
+    assert_eq!(
+        create_job(
+            &emulator,
+            json!({
+                "Name": "clock-job",
+                "DatasetName": "clock-ds",
+                "RoleArn": "arn:aws:iam::000000000000:role/brew",
+                "Outputs": job_outputs("out/"),
+            }),
+        )
+        .await
+        .status,
+        200,
+        "the job must be created"
+    );
+    let run = run_to_completion(&emulator, "clock-job").await;
+    let listed = emulator.call("GET", "/jobs/clock-job/jobRuns", None).await;
+    let listed_run = listed.member("JobRuns")[0].clone();
+
+    for (case, reported) in [
+        ("DescribeJobRun StartedOn", run.member("StartedOn")),
+        ("DescribeJobRun CompletedOn", run.member("CompletedOn")),
+        ("ListJobRuns StartedOn", listed_run["StartedOn"].clone()),
+        ("ListJobRuns CompletedOn", listed_run["CompletedOn"].clone()),
+    ] {
+        assert!(
+            reported.is_number(),
+            "case {case:?}: expected an epoch-seconds number, got {reported:?}"
+        );
+        let text = reported.to_string();
+        let fraction = text.split_once('.').map(|(_, digits)| digits.len());
+        assert!(
+            fraction.unwrap_or(0) <= 3,
+            "case {case:?}: expected at most millisecond precision, got {text}"
+        );
+    }
+    let started = run.member("StartedOn").as_f64().unwrap_or_default();
+    let completed = run.member("CompletedOn").as_f64().unwrap_or_default();
+    assert!(
+        completed >= started,
+        "case \"a completed run\": expected CompletedOn {completed} at or after StartedOn \
+         {started}"
+    );
 }
 
 /// `Overwrite` decides whether a run may replace what the output location already holds:

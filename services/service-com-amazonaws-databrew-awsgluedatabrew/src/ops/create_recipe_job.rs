@@ -242,7 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             dataset_name: input.dataset_name.clone(),
             project_name: input.project_name.clone(),
             recipe_reference: input.recipe_reference.clone(),
-            outputs: input.outputs.clone().unwrap_or_default(),
+            outputs: crate::state::job_execution::recorded_outputs(
+                input.outputs.as_deref().unwrap_or_default(),
+            ),
             data_catalog_outputs: input.data_catalog_outputs.clone().unwrap_or_default(),
             database_outputs: input.database_outputs.clone().unwrap_or_default(),
             role_arn: input.role_arn.clone(),

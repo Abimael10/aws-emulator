@@ -215,6 +215,62 @@ fn unwritten_output_kinds(job: &JobRecord) -> Vec<&'static str> {
     kinds
 }
 
+/// An output as the job RECORDS it: every member the request supplied, plus the members
+/// the SERVICE settles for an output that left them out — the account that owns the
+/// location's bucket, and the options a CSV output is written with.
+///
+/// What a job reports as its output configuration is what its runs WRITE with, so the
+/// values the write path would otherwise apply silently are settled once, when the job is
+/// created, and held on the record: a client reading the job or any of its runs back
+/// learns the delimiter its output files are separated by and the account the destination
+/// bucket belongs to, rather than having to know the service's own defaults.
+///
+/// Every operation that STORES a job's `Outputs` records them through here, so one rule
+/// settles them however the job was created or updated.
+pub fn recorded_outputs(outputs: &[Output]) -> Vec<Output> {
+    outputs.iter().map(recorded_output).collect()
+}
+
+/// One output as [`recorded_outputs`] records it.
+fn recorded_output(output: &Output) -> Output {
+    let mut recorded = output.clone();
+    // "The Amazon Web Services account ID of the bucket owner" (model:
+    // `S3Location$BucketOwner`): every bucket a run of this emulator writes to belongs to
+    // the one account it serves, so a location that named no owner records that account.
+    // A location that named one keeps it: the destination may be another account's.
+    if recorded.location.bucket_owner.is_none() {
+        recorded.location.bucket_owner = Some(::engine::emulator_account_id().to_string());
+    }
+    // "The data format of the output of the job" (model: `Output$Format`) — an output that
+    // names none is written as [`DEFAULT_OUTPUT_FORMAT`] — and a comma-separated output is
+    // written with the delimiter its CSV options name ([`write_output`]), so a CSV output
+    // records the options it is written with. An output of another format records none:
+    // `OutputFormatOptions` holds CSV options only.
+    if writes_csv(&recorded) {
+        let mut options = recorded.format_options.unwrap_or_default();
+        let mut csv = options.csv.unwrap_or_default();
+        if csv.delimiter.is_none() {
+            // The one character the writer separates a CSV output with when the output
+            // names none ([`tabular_data::DEFAULT_DELIMITER`]), as the single-character
+            // string the modelled `CsvOutputOptions$Delimiter` carries.
+            csv.delimiter = Some(char::from(tabular_data::DEFAULT_DELIMITER).to_string());
+        }
+        options.csv = Some(csv);
+        recorded.format_options = Some(options);
+    }
+    recorded
+}
+
+/// Whether `output` is written as comma-separated values: the format it names, or
+/// [`DEFAULT_OUTPUT_FORMAT`] when it names none.
+fn writes_csv(output: &Output) -> bool {
+    output
+        .format
+        .as_deref()
+        .unwrap_or(DEFAULT_OUTPUT_FORMAT)
+        .eq_ignore_ascii_case("CSV")
+}
+
 /// The format a dataset is read as: the `Format` it names, else the one its object's name
 /// states ([`FORMAT_EXTENSIONS`]), else [`DEFAULT_INPUT_FORMAT`].
 fn input_format_of(format: Option<&str>, key: Option<&str>) -> String {

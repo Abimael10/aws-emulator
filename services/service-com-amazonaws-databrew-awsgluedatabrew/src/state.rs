@@ -1305,11 +1305,19 @@ impl JobRunRecord {
 }
 
 /// An instant as the modelled `Date` timestamp.
+///
+/// The instant is taken to the MILLISECOND. This protocol carries a timestamp as an
+/// epoch-seconds number, and the number it carries is one of at most millisecond
+/// precision, so the finer reading the host clock happens to offer is not part of the
+/// value: a client reading the number back, or re-sending it, sees a form the service
+/// defines, and two instants are not ordered on digits it does not define.
 pub fn wire_date(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
-    ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+    ::aws_smithy_types::DateTime::from_millis(
+        i64::try_from(since_epoch.as_millis()).unwrap_or_default(),
+    )
 }
 
 /// A stored tag map as the modelled `TagMap`: absent rather than empty, because

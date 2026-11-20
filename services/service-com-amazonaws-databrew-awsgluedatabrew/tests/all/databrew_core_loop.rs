@@ -323,9 +323,18 @@ async fn the_dataset_recipe_job_and_job_run_loop_is_served_from_state() {
     let emulator = Emulator::new();
     let outputs = json!([{"Location": {"Bucket": "brew-bucket", "Key": "out/"}}]);
     // `Output$Overwrite` carries `@default: false`, so the stored output reports it
-    // explicitly even when the request left it out.
-    let stored_outputs =
-        json!([{"Location": {"Bucket": "brew-bucket", "Key": "out/"}, "Overwrite": false}]);
+    // explicitly even when the request left it out, and the create settles the two members
+    // an output that named neither is written with: the account that owns the destination
+    // bucket, and the options a comma-separated output is written with.
+    let stored_outputs = json!([{
+        "Location": {
+            "Bucket": "brew-bucket",
+            "Key": "out/",
+            "BucketOwner": ::engine::emulator_account_id(),
+        },
+        "FormatOptions": {"Csv": {"Delimiter": ","}},
+        "Overwrite": false,
+    }]);
     // The model names `RecipeReference`'s members `Name` and `RecipeVersion` (the
     // issue's `RecipeName` is not a member of that shape).
     let recipe_reference = json!({"Name": "demo-recipe", "RecipeVersion": "1.0"});
