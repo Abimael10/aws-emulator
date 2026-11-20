@@ -1700,3 +1700,176 @@ fn assert_reported(case: &str, operation: &str, answer: &Answer, expected: &Repo
         );
     }
 }
+
+/// The two sentences a copy that would write tags into a DIRECTORY bucket is refused with,
+/// spelled out here rather than read from the crate, so this suite pins the wording a client
+/// branches on and not merely that the handler and the test agree.
+///
+/// Each states its own restriction and interpolates nothing of the request. They differ because
+/// the remedy differs: a copy CARRYING OVER the source's tag set is told that carrying over is
+/// what this kind of bucket does not support (set `TaggingDirective=REPLACE` over an empty tag
+/// set), while a request STATING a tag set of its own is told the bucket has no object tag-set
+/// plane at all — the sentence every call asking a directory bucket for that plane earns.
+const COPYING_SOURCE_TAGS_REFUSAL: &str =
+    "This bucket does not support copying source objects with Object Tags.";
+/// See [`COPYING_SOURCE_TAGS_REFUSAL`].
+const OBJECT_TAGS_REFUSAL: &str = "This bucket does not support Object Tags.";
+
+/// One copy into a directory bucket that must be REFUSED: `(case, the source key, the headers
+/// the copy carries, the destination key, the sentence it must be refused with)`.
+type TagRefusalRow = (
+    &'static str,
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+    &'static str,
+    &'static str,
+);
+
+/// One copy into a directory bucket that must be SERVED: [`TagRefusalRow`] without the
+/// sentence.
+type TagServedRow = (
+    &'static str,
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+    &'static str,
+);
+
+/// RULE: a copy into a directory bucket that would write a non-empty tag set is refused with
+/// the 501 `CopyObjectRequest$TaggingDirective` names, and the sentence states WHICH
+/// restriction fired — the carrying over of the source's tags, or the object tag-set plane the
+/// request stated a set for — while the empty-tag-set forms that member allows are served and a
+/// refused copy leaves the destination key holding nothing.
+///
+/// The rows differ along what asked for the tags (the directive's default, the directive named
+/// `COPY`, and a `REPLACE` naming a set of its own), along whether the source carries tags at
+/// all, and along the destination key, so the rule is pinned over the forms that member lists
+/// rather than over one recorded call.
+#[tokio::test]
+async fn a_copy_into_a_directory_bucket_names_the_tag_restriction_that_refused_it() {
+    let router = router();
+    let source_bucket = "copy-tags-origin";
+    let directory = "copytags--use1-az4--x-s3";
+    bucket(&router, source_bucket).await;
+    super::directory_bucket_sessions_and_appends::directory_bucket(&router, directory, "use1-az4")
+        .await;
+
+    let payload = b"sepal,petal\n1,2\n";
+    for (key, headers) in [
+        ("tagged.csv", vec![("x-amz-tagging", "class=gold&stage=raw")]),
+        ("untagged.csv", Vec::new()),
+    ] {
+        let stored = put_object(&router, source_bucket, key, payload, &headers).await;
+        assert_eq!(
+            stored.status, 200,
+            "the source {key:?} must be stored first, got {} with body {:?}",
+            stored.status,
+            text(&stored)
+        );
+    }
+
+    // (case, the source key, the headers the copy carries, the destination key, the sentence)
+    let refused_rows: [TagRefusalRow; 3] = [
+        (
+            "a tagged source and no directive, COPY being the default",
+            "tagged.csv",
+            Vec::new(),
+            "copies/defaulted.csv",
+            COPYING_SOURCE_TAGS_REFUSAL,
+        ),
+        (
+            "a tagged source with the directive named COPY",
+            "tagged.csv",
+            vec![("x-amz-tagging-directive", "COPY")],
+            "copies/explicit-copy.csv",
+            COPYING_SOURCE_TAGS_REFUSAL,
+        ),
+        (
+            "a tag set the request states itself",
+            "untagged.csv",
+            vec![
+                ("x-amz-tagging-directive", "REPLACE"),
+                ("x-amz-tagging", "class=silver"),
+            ],
+            "copies/replaced.csv",
+            OBJECT_TAGS_REFUSAL,
+        ),
+    ];
+    for (case, source_key, headers, destination_key, message) in refused_rows {
+        let refused = copy_object(
+            &router,
+            directory,
+            destination_key,
+            &format!("{source_bucket}/{source_key}"),
+            &headers,
+        )
+        .await;
+        assert_eq!(
+            refused.status, 501,
+            "case {case:?}: expected the published 501, got {} with body {:?}",
+            refused.status,
+            text(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "NotImplemented",
+            "case {case:?}: expected the NotImplemented code, got {:?}",
+            refused.error_code()
+        );
+        assert_eq!(
+            refused.error_message(),
+            message,
+            "case {case:?}: the refusal must name the restriction that fired, got {:?}",
+            refused.error_message()
+        );
+        // And it wrote nothing: a refused copy leaves the destination key holding no object.
+        let read = get_object(&router, directory, destination_key, "", &[]).await;
+        assert_eq!(
+            read.status, 404,
+            "case {case:?}: a refused copy must leave the destination key empty, got {} with \
+             body {:?}",
+            read.status,
+            text(&read)
+        );
+    }
+
+    // The empty-tag-set forms that same member allows are served, and the copy carries the
+    // source's bytes.
+    let served_rows: [TagServedRow; 2] = [
+        (
+            "a tagged source whose tags the copy replaces with none",
+            "tagged.csv",
+            vec![("x-amz-tagging-directive", "REPLACE")],
+            "copies/untagged-replacement.csv",
+        ),
+        (
+            "an untagged source, carried over as the empty tag set",
+            "untagged.csv",
+            Vec::new(),
+            "copies/plain.csv",
+        ),
+    ];
+    for (case, source_key, headers, destination_key) in served_rows {
+        let served = copy_object(
+            &router,
+            directory,
+            destination_key,
+            &format!("{source_bucket}/{source_key}"),
+            &headers,
+        )
+        .await;
+        assert_eq!(
+            served.status, 200,
+            "case {case:?}: an empty tag set is what a directory bucket supports, got {} with \
+             body {:?}",
+            served.status,
+            text(&served)
+        );
+        let read = get_object(&router, directory, destination_key, "", &[]).await;
+        assert_eq!(
+            read.body.as_ref(),
+            payload.as_slice(),
+            "case {case:?}: the copy must carry the source's bytes, got {:?}",
+            String::from_utf8_lossy(&read.body)
+        );
+    }
+}

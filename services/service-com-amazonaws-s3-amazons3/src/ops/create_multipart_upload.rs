@@ -416,6 +416,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store the upload cannot be recorded at all, and no modelled
+            // error says that, so the documented code for "we could not carry out the
+            // request" goes out rather than a 501, which would claim this operation is
+            // unwritten.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // WHETHER the bucket this upload addresses serves a CUSTOMER-PROVIDED key at all, asked
+        // before the key's own members are judged: a DIRECTORY bucket does not serve that
+        // encryption form, so on such a bucket no value of those members could be used and what
+        // is refused is the ASK — with the restriction that kind of bucket publishes, through
+        // the one place that rule lives for every write of this service
+        // ([`crate::service::object_write::directory_bucket_customer_key_refusal`]) and before
+        // the upload is registered, so no part can be uploaded under an encryption the finished
+        // object could not be stored with. A bucket this emulator does not hold is answered by
+        // the initiation below.
+        {
+            let store = state.lock();
+            if let Some(message) = store.bucket(&input.bucket).and_then(|bucket| {
+                crate::service::object_write::directory_bucket_customer_key_refusal(
+                    bucket,
+                    input.sse_customer_algorithm.as_deref(),
+                    input.sse_customer_key.as_deref(),
+                    input.sse_customer_key_md5.as_deref(),
+                )
+            }) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NOT_IMPLEMENTED_CODE,
+                    crate::state::NOT_IMPLEMENTED_STATUS,
+                    message,
+                ));
+            }
+        }
+
         // The CUSTOMER-PROVIDED key this upload asks its parts to be encrypted under, read
         // off the three members that carry it through the one rule every call of this
         // service reads them by ([`crate::state::requested_customer_key`]) — exactly as
@@ -583,18 +622,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::INVALID_REQUEST_MESSAGE,
                 ))
             }
-        };
-
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            // Without the store the upload cannot be recorded at all, and no modelled
-            // error says that, so the documented code for "we could not carry out the
-            // request" goes out rather than a 501, which would claim this operation is
-            // unwritten.
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INTERNAL_ERROR_CODE,
-                crate::state::INTERNAL_ERROR_STATUS,
-                "the shared S3 store is unreachable from this engine",
-            ));
         };
 
         // The encryption the upload is INITIATED under, which is what every later part write

@@ -401,6 +401,40 @@ pub fn committed_encryption(
     (!scope.encryption.names_no_member()).then(|| scope.encryption.clone())
 }
 
+/// The sentence S3 refuses a write that asks the DIRECTORY bucket `bucket` to store an object
+/// under a CUSTOMER-PROVIDED key with, or `None` for a write that names no such key or one into
+/// a general purpose bucket, which serves them.
+///
+/// "This functionality is not supported for directory buckets"
+/// (`PutObjectRequest$SSECustomerAlgorithm`), and "not supported when the destination bucket is
+/// a directory bucket" (`CopyObjectRequest$SSECustomerAlgorithm`) — a directory bucket serves
+/// SSE-S3 and SSE-KMS and no customer-provided key at all, so what refused the write is that
+/// kind of bucket's own restriction, which is the sentence a directory bucket names a feature it
+/// does not have in (`crate::service::directory_bucket::unsupported_message`) rather than a
+/// member this emulator has not written.
+///
+/// Read off the three members that carry such a key, as every call of this service reads them
+/// ([`state::requested_customer_key`] takes the same three): any of them names one, and it is
+/// the ASK that is refused rather than whether the key is usable.
+///
+/// The ONE place that refusal is built, so a write carrying the same member is refused
+/// identically whichever operation stores the object — and before anything is stored.
+pub fn directory_bucket_customer_key_refusal(
+    bucket: &Bucket,
+    algorithm: Option<&str>,
+    key: Option<&str>,
+    key_md5: Option<&str>,
+) -> Option<String> {
+    let names_a_key = [algorithm, key, key_md5]
+        .into_iter()
+        .any(|member| member.is_some_and(|value| !value.is_empty()));
+    (bucket.is_directory() && names_a_key).then(|| {
+        crate::service::directory_bucket::unsupported_message(
+            crate::service::directory_bucket::SSE_CUSTOMER_KEY,
+        )
+    })
+}
+
 /// The sentence S3 refuses a Zonal endpoint write naming `requested` under a session
 /// established with `committed` with, or `None` when the two name one encryption.
 ///

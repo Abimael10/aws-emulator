@@ -1028,3 +1028,156 @@ async fn a_part_copy_re_keys_an_ssec_source_into_an_ssec_upload() {
         text(&with_source_key)
     );
 }
+
+/// The sentence a DIRECTORY bucket refuses a write naming a customer-provided key with, spelled
+/// out here rather than read from the crate so this suite pins the wording a client branches on
+/// and not merely that the handler and the test agree.
+///
+/// It names the restriction that kind of BUCKET publishes — "this functionality is not supported
+/// for directory buckets" (`PutObjectRequest$SSECustomerAlgorithm`), such a bucket serving
+/// server-side encryption with Amazon S3 managed keys and with KMS keys only — and interpolates
+/// nothing of the request.
+const SSE_C_UNSUPPORTED_MESSAGE: &str =
+    "This bucket does not support server side encryption with a customer provided key.";
+
+/// RULE: a DIRECTORY bucket does not serve server-side encryption with a customer-provided key,
+/// so every write that asks one to store an object under such a key is refused `NotImplemented`
+/// naming that restriction, and nothing is stored — while the same write into a general purpose
+/// bucket, which does serve it, is served.
+///
+/// The rows differ along WHICH write presents the key (a one-shot write, a copy's destination
+/// and a multipart initiation) and along WHICH of the three members carries it (all three, the
+/// algorithm alone, and the digest alone), because what is refused is the ASK rather than
+/// whether the key itself is usable.
+#[tokio::test]
+async fn a_directory_bucket_does_not_serve_a_customer_provided_key() {
+    let router = router();
+    let directory = "ssec--use1-az4--x-s3";
+    super::directory_bucket_sessions_and_appends::directory_bucket(&router, directory, "use1-az4")
+        .await;
+    bucket(&router, "ssec-general-purpose").await;
+    let source = put_object(
+        &router,
+        "ssec-general-purpose",
+        "source.bin",
+        b"the source bytes",
+        &[],
+    )
+    .await;
+    assert_eq!(
+        source.status, 200,
+        "the copy source must be stored first, got {} with body {:?}",
+        source.status,
+        text(&source)
+    );
+
+    let key = customer_key(9);
+    let whole_key = presenting(&key);
+    // (case, the members the write carries)
+    let member_rows: [(&str, Vec<(&'static str, String)>); 3] = [
+        ("all three members", whole_key.clone()),
+        (
+            "the algorithm alone",
+            vec![(ALGORITHM_HEADER, ALGORITHM.to_string())],
+        ),
+        ("the key digest alone", vec![(KEY_MD5_HEADER, key_digest(&key))]),
+    ];
+
+    for (case, members) in member_rows {
+        let headers = borrowed(&members);
+        // A one-shot write.
+        let written = put_object(&router, directory, "ssec/written.bin", b"bytes", &headers).await;
+        // A copy whose DESTINATION asks for the key.
+        let mut copy_headers: Vec<(&'static str, &str)> =
+            vec![("x-amz-copy-source", "ssec-general-purpose/source.bin")];
+        copy_headers.extend_from_slice(&headers);
+        let copied = send_bytes(
+            &router,
+            "PUT",
+            &format!("/{directory}/ssec/copied.bin"),
+            &copy_headers,
+            b"",
+        )
+        .await;
+        // And a multipart initiation, which records the key every later part must present.
+        let initiated = send_bytes(
+            &router,
+            "POST",
+            &format!("/{directory}/ssec/multipart.bin?uploads"),
+            &headers,
+            b"",
+        )
+        .await;
+
+        for (operation, refused) in [
+            ("PutObject", &written),
+            ("CopyObject", &copied),
+            ("CreateMultipartUpload", &initiated),
+        ] {
+            assert_eq!(
+                refused.status, 501,
+                "case {case:?} ({operation}): expected the published 501, got {} with body {:?}",
+                refused.status,
+                text(refused)
+            );
+            assert_eq!(
+                refused.error_code(),
+                "NotImplemented",
+                "case {case:?} ({operation}): expected the NotImplemented code, got {:?}",
+                refused.error_code()
+            );
+            assert_eq!(
+                refused.error_message(),
+                SSE_C_UNSUPPORTED_MESSAGE,
+                "case {case:?} ({operation}): the refusal must name the restriction this kind \
+                 of bucket publishes, got {:?}",
+                refused.error_message()
+            );
+        }
+
+        // And nothing was stored: neither key the refused writes addressed holds an object.
+        for object_key in ["ssec/written.bin", "ssec/copied.bin"] {
+            let read = get_object(&router, directory, object_key, "", &[]).await;
+            assert_eq!(
+                read.status, 404,
+                "case {case:?}: a refused write must store nothing at {object_key:?}, got {} \
+                 with body {:?}",
+                read.status,
+                text(&read)
+            );
+        }
+    }
+
+    // The other half of the rule: a general purpose bucket DOES serve that encryption form, so
+    // the same write there is served and the object opens with the key it was written under.
+    let served = put_object(
+        &router,
+        "ssec-general-purpose",
+        "written.bin",
+        b"bytes",
+        &borrowed(&whole_key),
+    )
+    .await;
+    assert_eq!(
+        served.status, 200,
+        "case \"a general purpose bucket\": the write must be served, got {} with body {:?}",
+        served.status,
+        text(&served)
+    );
+    let read = get_object(
+        &router,
+        "ssec-general-purpose",
+        "written.bin",
+        "",
+        &borrowed(&whole_key),
+    )
+    .await;
+    assert_eq!(
+        read.body.as_ref(),
+        b"bytes".as_slice(),
+        "case \"a general purpose bucket\": the object must open with the key it was written \
+         under, got {} with status {}",
+        String::from_utf8_lossy(&read.body),
+        read.status
+    );
+}

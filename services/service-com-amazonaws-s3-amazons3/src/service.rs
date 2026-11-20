@@ -1406,10 +1406,12 @@ fn front_door<Eng: Send + Sync + 'static>(
     // that kind of bucket does not serve, one entry per operation of the catalog: the sentence
     // names the operation, so the answer is built here rather than per request. See
     // [`directory_bucket`] for the rule and for why it is answered as an operation.
-    for (_, key, feature) in directory_bucket::UNSUPPORTED_BY_A_DIRECTORY_BUCKET {
+    for (operation, key, feature) in directory_bucket::UNSUPPORTED_BY_A_DIRECTORY_BUCKET {
         table.add_operation(
             key,
-            Box::new(directory_bucket::RefuseUnsupportedOperation::new(feature)),
+            Box::new(directory_bucket::RefuseUnsupportedOperation::new(
+                operation, feature,
+            )),
         );
     }
     // And the refusal a request earns for the bucket NAME it addresses, held here for the

@@ -32,20 +32,29 @@
 //!   (`PutObjectOutput$Size`);
 //! * a session is a credential this process keeps ACCEPTING until it expires, so the
 //!   sessions it holds at once are bounded and an expired one is released — the documented
-//!   5-minute interval is enforced, not only reported.
+//!   5-minute interval is enforced, not only reported;
+//! * the name a create accepted is the name the session call resolves, for every zone such a
+//!   bucket may be placed in and over both published addresses of the directory-bucket control
+//!   plane — so `CreateSession`'s single modelled error, `NoSuchBucket` (404), is reserved for
+//!   a name this account holds no bucket under;
+//! * a bucket-configuration PUT on a directory bucket is refused for the DOCUMENT it submits —
+//!   `CreateBucketConfiguration` is the one bucket-configuration document that endpoint parses
+//!   — which is a different class of answer from the 501 naming a feature the bucket does not
+//!   have (`crate::service::directory_bucket`).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
+use service_com_amazonaws_s3_amazons3::service::express_session::SESSION_TOKEN_HEADER;
 use service_com_amazonaws_s3_amazons3::state::{
     ComAmazonawsS3Amazons3State, MAX_VENDED_SESSIONS,
 };
 use service_com_amazonaws_s3_amazons3::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{router, send, Answer};
+use super::bucket_lifecycle::{router, send, send_bytes, send_bytes_signed, send_in_region, Answer};
 use super::object_and_tagging_roundtrip::{bucket, get_object, put_object, text};
 
 /// The `CreateBucketConfiguration` a directory-bucket create carries: the zone it is placed
@@ -787,4 +796,578 @@ async fn the_sessions_held_at_once_are_bounded_and_expired_ones_are_released() {
          got {:?}",
         text(&vended)
     );
+}
+
+/// How a client addresses the S3 EXPRESS surface of `region`: the signing name `s3express`,
+/// which is what tells that surface from the general purpose one on a single emulator host.
+/// Neither the key id nor the signature is a credential here (this suite's router verifies
+/// none, as the other suites' do).
+fn express_authorization(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=emulator-test-key/20260101/{region}/s3express/aws4_request, \
+         SignedHeaders=host, Signature=not-verified"
+    )
+}
+
+/// The host the S3 Express control endpoint of `region` is addressed as — "the HTTP Host header
+/// syntax is `s3express-control.region.amazonaws.com`" (`CreateBucket`'s own documentation of
+/// its directory-bucket surface).
+fn express_control_host(region: &str) -> String {
+    format!("s3express-control.{region}.amazonaws.com")
+}
+
+/// WHICH published address a client sent a directory-bucket control-plane call to. Both serve
+/// that plane, and the rule holds for either, so each row of the table below names one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Address {
+    /// `s3express-control.<region>.amazonaws.com`, path-style — "you must use path-style
+    /// requests in the format `https://s3express-control.region-code.amazonaws.com/bucket-name`"
+    /// (`CreateBucket`).
+    ExpressControl,
+    /// That Region's own S3 endpoint, path-style, signed for `s3`.
+    Regional,
+}
+
+/// `PUT /<name>` carrying a directory-bucket configuration, sent to `address`.
+async fn create_directory_bucket_at(
+    router: &MultiServiceRouter,
+    region: &str,
+    address: Address,
+    name: &str,
+    configuration: &str,
+) -> Answer {
+    match address {
+        Address::ExpressControl => {
+            send_bytes_signed(
+                router,
+                &express_authorization(region),
+                "PUT",
+                &express_control_host(region),
+                &format!("/{name}"),
+                &[("content-type", "application/xml")],
+                configuration.as_bytes(),
+            )
+            .await
+        }
+        Address::Regional => {
+            send_in_region(router, region, "PUT", &format!("/{name}"), &[], configuration).await
+        }
+    }
+}
+
+/// `GET /<name>?session` — `CreateSession`, sent to `address`.
+async fn create_session_at(
+    router: &MultiServiceRouter,
+    region: &str,
+    address: Address,
+    name: &str,
+) -> Answer {
+    match address {
+        Address::ExpressControl => {
+            send_bytes_signed(
+                router,
+                &express_authorization(region),
+                "GET",
+                &express_control_host(region),
+                &format!("/{name}?session"),
+                &[],
+                b"",
+            )
+            .await
+        }
+        Address::Regional => {
+            send_in_region(router, region, "GET", &format!("/{name}?session"), &[], "").await
+        }
+    }
+}
+
+/// The documented interval a session's credentials live for: "temporary security credentials
+/// are scoped to the bucket and expire after 5 minutes" (`CreateSession`).
+const SESSION_SECONDS: i64 = 5 * 60;
+
+/// The sentence the DIRECTORY bucket surface words `NoSuchBucket` with, spelled out here rather
+/// than read from the crate so this suite pins the wording a client branches on and not merely
+/// that the handler and the test agree. It states the condition and interpolates nothing of the
+/// request.
+const NO_SUCH_DIRECTORY_BUCKET_MESSAGE: &str = "The specified bucket does not exist.";
+
+/// One zone a directory bucket may be placed in, and the address its calls reached:
+/// `(case, region, location type, zone id, data redundancy, address)`.
+type ZoneRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    Address,
+);
+
+/// RULE: a directory bucket created in ANY zone can be sessioned straight away —
+/// `CreateSession` on the name the create accepted answers HTTP 200 carrying the whole
+/// `Credentials` member, whose token then authorizes the Zonal endpoint calls on that bucket —
+/// and `NoSuchBucket` is reserved for a name this account holds no bucket under.
+///
+/// The rows differ along everything the rule generalises over and nothing it is keyed to: the
+/// Region the zone belongs to, the KIND of zone (an Availability Zone and a Local Zone, whose
+/// zone ids are shaped differently), WHICH zone of a Region it is, whether the redundancy is
+/// the Availability Zone's or the Local Zone's, and which of the two published addresses the
+/// create and the session call reached.
+#[tokio::test]
+async fn a_directory_bucket_in_any_zone_is_sessionable_as_soon_as_it_exists() {
+    let router = router();
+
+    let rows: [ZoneRow; 5] = [
+        (
+            "an Availability Zone of us-west-2, on the Express control endpoint",
+            "us-west-2",
+            "AvailabilityZone",
+            "usw2-az3",
+            "SingleAvailabilityZone",
+            Address::ExpressControl,
+        ),
+        (
+            "another Availability Zone of the same Region, on the Regional endpoint",
+            "us-west-2",
+            "AvailabilityZone",
+            "usw2-az4",
+            "SingleAvailabilityZone",
+            Address::Regional,
+        ),
+        (
+            "an Availability Zone of us-east-1",
+            "us-east-1",
+            "AvailabilityZone",
+            "use1-az6",
+            "SingleAvailabilityZone",
+            Address::ExpressControl,
+        ),
+        (
+            "an Availability Zone of eu-west-1",
+            "eu-west-1",
+            "AvailabilityZone",
+            "euw1-az2",
+            "SingleAvailabilityZone",
+            Address::Regional,
+        ),
+        (
+            // A Local Zone id carries the zone's own name before the AZ suffix, which the
+            // `--`-separated bucket name still reads as one segment.
+            "a Local Zone of us-east-1",
+            "us-east-1",
+            "LocalZone",
+            "use1-atl1-az1",
+            "SingleLocalZone",
+            Address::ExpressControl,
+        ),
+    ];
+
+    for (case, region, location_type, zone_id, redundancy, address) in rows {
+        let name = format!("reachable--{zone_id}--x-s3");
+        let created = create_directory_bucket_at(
+            &router,
+            region,
+            address,
+            &name,
+            &directory_configuration(
+                Some(location_type),
+                Some(zone_id),
+                Some(redundancy),
+                Some("Directory"),
+            ),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: the create of {name:?} must be served, got {} with body {:?}",
+            created.status,
+            text(&created)
+        );
+
+        let session = create_session_at(&router, region, address, &name).await;
+        assert_eq!(
+            session.status, 200,
+            "case {case:?}: a session on the bucket just created must be vended, got {} with \
+             body {:?}",
+            session.status,
+            text(&session)
+        );
+        let token = session.element("SessionToken").unwrap_or_default();
+        for member in [
+            "AccessKeyId",
+            "SecretAccessKey",
+            "SessionToken",
+            "Expiration",
+        ] {
+            let value = session.element(member).unwrap_or_default();
+            assert!(
+                !value.is_empty(),
+                "case {case:?}: the session must carry a {member}, got {:?}",
+                text(&session)
+            );
+        }
+        // The interval is the documented one, read off the reported instant rather than
+        // compared with any literal: the session is live NOW and expires no later than the
+        // published five minutes out.
+        let expiration = session.element("Expiration").unwrap_or_default();
+        let parsed = DateTime::from_str(&expiration, Format::DateTime).unwrap_or_else(|error| {
+            panic!("case {case:?}: the Expiration must be a timestamp ({error}): {expiration}")
+        });
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock must be after the epoch")
+            .as_secs() as i64;
+        let remaining = parsed.secs() - now;
+        assert!(
+            (0..=SESSION_SECONDS).contains(&remaining),
+            "case {case:?}: the session must be live and expire within the published \
+             {SESSION_SECONDS} seconds, but {expiration} is {remaining} seconds away"
+        );
+
+        // And what the token is FOR: "you also apply the session token to the
+        // x-amz-s3session-token request header for authorization" — so the Zonal data plane of
+        // the bucket is reachable under it, which is the whole point of taking a session.
+        let key = "reachable/object.txt";
+        let body = format!("stored in {zone_id}").into_bytes();
+        let written = send_bytes(
+            &router,
+            "PUT",
+            &format!("/{name}/{key}"),
+            &[(SESSION_TOKEN_HEADER, token.as_str())],
+            &body,
+        )
+        .await;
+        assert_eq!(
+            written.status, 200,
+            "case {case:?}: a write under the vended session must be served, got {} with body \
+             {:?}",
+            written.status,
+            text(&written)
+        );
+        let read = send_bytes(
+            &router,
+            "GET",
+            &format!("/{name}/{key}"),
+            &[(SESSION_TOKEN_HEADER, token.as_str())],
+            b"",
+        )
+        .await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: a read under the vended session must be served, got {} with body \
+             {:?}",
+            read.status,
+            text(&read)
+        );
+        assert_eq!(
+            read.body.as_ref(),
+            body.as_slice(),
+            "case {case:?}: the read must serve the bytes written under the session, got {:?}",
+            String::from_utf8_lossy(&read.body)
+        );
+
+        // The other half of the rule, in the same zone and at the same address: `NoSuchBucket`
+        // is what a name this account holds NO bucket under earns, and nothing else is.
+        let absent = format!("absent--{zone_id}--x-s3");
+        let refused = create_session_at(&router, region, address, &absent).await;
+        assert_eq!(
+            refused.status, 404,
+            "case {case:?}: a session on a bucket that is not there must be refused 404, got {} \
+             with body {:?}",
+            refused.status,
+            text(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "NoSuchBucket",
+            "case {case:?}: expected the NoSuchBucket code, got {:?}",
+            refused.error_code()
+        );
+        assert_eq!(
+            refused.error_message(),
+            NO_SUCH_DIRECTORY_BUCKET_MESSAGE,
+            "case {case:?}: expected the sentence the directory-bucket surface words that \
+             condition with, got {:?}",
+            refused.error_message()
+        );
+    }
+}
+
+/// One bucket-configuration PUT: `(case, the subresource and query it is addressed by, the root
+/// element of the document it submits, that document)`.
+type ConfigurationPutRow = (&'static str, &'static str, &'static str, &'static str);
+
+/// Every bucket-configuration PUT whose document a directory bucket's endpoint does not parse,
+/// one row per subresource, each submitting the document the model binds for that call.
+///
+/// The documents are the smallest well-formed ones of their shape: what is under test is the
+/// ROOT element the refusal names, which is the member the model binds as the call's payload.
+const CONFIGURATION_PUTS: [ConfigurationPutRow; 13] = [
+    (
+        "versioning",
+        "?versioning",
+        "VersioningConfiguration",
+        "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+    ),
+    (
+        "event notifications",
+        "?notification",
+        "NotificationConfiguration",
+        "<NotificationConfiguration></NotificationConfiguration>",
+    ),
+    (
+        "replication",
+        "?replication",
+        "ReplicationConfiguration",
+        "<ReplicationConfiguration><Role>arn:aws:iam::000000000000:role/replication</Role>\
+         <Rule><Status>Enabled</Status><Prefix></Prefix>\
+         <Destination><Bucket>arn:aws:s3:::replica</Bucket></Destination></Rule>\
+         </ReplicationConfiguration>",
+    ),
+    (
+        "transfer acceleration",
+        "?accelerate",
+        "AccelerateConfiguration",
+        "<AccelerateConfiguration><Status>Enabled</Status></AccelerateConfiguration>",
+    ),
+    (
+        "cors",
+        "?cors",
+        "CORSConfiguration",
+        "<CORSConfiguration><CORSRule><AllowedMethod>GET</AllowedMethod>\
+         <AllowedOrigin>*</AllowedOrigin></CORSRule></CORSConfiguration>",
+    ),
+    (
+        "the bucket tag set",
+        "?tagging",
+        "Tagging",
+        "<Tagging><TagSet><Tag><Key>stage</Key><Value>curated</Value></Tag></TagSet></Tagging>",
+    ),
+    (
+        "static website hosting",
+        "?website",
+        "WebsiteConfiguration",
+        "<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument>\
+         </WebsiteConfiguration>",
+    ),
+    (
+        "request payment",
+        "?requestPayment",
+        "RequestPaymentConfiguration",
+        "<RequestPaymentConfiguration><Payer>Requester</Payer></RequestPaymentConfiguration>",
+    ),
+    (
+        "server access logging",
+        "?logging",
+        "BucketLoggingStatus",
+        "<BucketLoggingStatus></BucketLoggingStatus>",
+    ),
+    (
+        "object ownership",
+        "?ownershipControls",
+        "OwnershipControls",
+        "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule>\
+         </OwnershipControls>",
+    ),
+    (
+        "the public access block",
+        "?publicAccessBlock",
+        "PublicAccessBlockConfiguration",
+        "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls>\
+         </PublicAccessBlockConfiguration>",
+    ),
+    (
+        "an analytics configuration",
+        "?analytics&id=refused",
+        "AnalyticsConfiguration",
+        "<AnalyticsConfiguration><Id>refused</Id>\
+         <StorageClassAnalysis></StorageClassAnalysis></AnalyticsConfiguration>",
+    ),
+    (
+        "an S3 Intelligent-Tiering configuration",
+        "?intelligent-tiering&id=refused",
+        "IntelligentTieringConfiguration",
+        "<IntelligentTieringConfiguration><Id>refused</Id><Status>Enabled</Status>\
+         <Tiering><Days>90</Days><AccessTier>ARCHIVE_ACCESS</AccessTier></Tiering>\
+         </IntelligentTieringConfiguration>",
+    ),
+];
+
+/// One call refused for a FEATURE a directory bucket does not have rather than for a document
+/// it submitted: `(case, method, the subresource under the bucket, the headers, the feature the
+/// refusal names)`.
+type FeatureRefusalRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    &'static str,
+);
+
+/// RULE: a bucket-configuration PUT on a DIRECTORY bucket is refused for the DOCUMENT it
+/// submits — HTTP 400 `InvalidArgument`, naming that document's root element beside
+/// `CreateBucketConfiguration`, the one bucket-configuration document a directory bucket's
+/// endpoint parses — while a call that submits no such document keeps the 501 naming the
+/// feature that kind of bucket does not have, and the same PUT on a general purpose bucket is
+/// served.
+///
+/// The rows span every subresource the rule covers (and so every configuration member name the
+/// message interpolates), a document whose root is NOT the member the model binds for the call,
+/// and four refusals of the other class — a read, a canned-ACL write that submits no document,
+/// an object-level tag write, and a configuration PUT carrying no document at all — so what is
+/// pinned is which refusal each class of call earns rather than one recorded call's answer.
+#[tokio::test]
+async fn a_bucket_configuration_put_on_a_directory_bucket_names_the_document_it_submitted() {
+    let router = router();
+    let directory = "configrefusal--use1-az4--x-s3";
+    directory_bucket(&router, directory, "use1-az4").await;
+    bucket(&router, "configrefusal-general-purpose").await;
+
+    for (case, subresource, element, document) in CONFIGURATION_PUTS {
+        let refused = send(
+            &router,
+            "PUT",
+            &format!("/{directory}{subresource}"),
+            &[],
+            document,
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: expected HTTP 400 for a document this endpoint does not parse, got \
+             {} with body {:?}",
+            refused.status,
+            text(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "InvalidArgument",
+            "case {case:?}: expected the InvalidArgument code, got {:?}",
+            refused.error_code()
+        );
+        assert_eq!(
+            refused.error_message(),
+            format!("{element} is not valid, expected CreateBucketConfiguration"),
+            "case {case:?}: the refusal must name the submitted document, got {:?}",
+            refused.error_message()
+        );
+    }
+
+    // The variable part comes from the REQUEST: a document whose root is not the member the
+    // model binds for the call is still the document the caller sent, and the refusal names it.
+    let other_document = send(
+        &router,
+        "PUT",
+        &format!("/{directory}?versioning"),
+        &[],
+        "<SomeOtherConfiguration><Status>Enabled</Status></SomeOtherConfiguration>",
+    )
+    .await;
+    assert_eq!(
+        other_document.error_message(),
+        "SomeOtherConfiguration is not valid, expected CreateBucketConfiguration",
+        "case \"a document of another shape\": the refusal must name the element the request \
+         carried, got {:?}",
+        other_document.error_message()
+    );
+
+    // A call that submits no such document is refused for what the bucket does not HAVE, which
+    // is a different class of answer: the published 501 naming that feature. The last row is a
+    // configuration PUT whose body carries no document at all, which therefore submits none for
+    // the refusal above to name.
+    // (case, method, the subresource under the bucket, the headers, the feature named)
+    let feature_rows: [FeatureRefusalRow; 4] = [
+        (
+            "a read of the versioning state",
+            "GET",
+            "?versioning",
+            &[],
+            "Versioning",
+        ),
+        (
+            "an ACL named in headers, which submits no document",
+            "PUT",
+            "?acl",
+            &[("x-amz-acl", "private")],
+            "ACL",
+        ),
+        (
+            "an object's tag set, which is not a bucket configuration",
+            "PUT",
+            "/tagged.txt?tagging",
+            &[],
+            "Object Tags",
+        ),
+        (
+            "a configuration PUT carrying no document at all",
+            "PUT",
+            "?notification",
+            &[],
+            "Notifications",
+        ),
+    ];
+    for (case, method, subresource, headers, feature) in feature_rows {
+        let body = match subresource.ends_with("/tagged.txt?tagging") {
+            true => "<Tagging><TagSet><Tag><Key>stage</Key><Value>curated</Value></Tag></TagSet>\
+                     </Tagging>",
+            false => "",
+        };
+        let refused = send(
+            &router,
+            method,
+            &format!("/{directory}{subresource}"),
+            headers,
+            body,
+        )
+        .await;
+        assert_eq!(
+            refused.status, 501,
+            "case {case:?}: expected the published 501 for a feature this bucket kind does not \
+             have, got {} with body {:?}",
+            refused.status,
+            text(&refused)
+        );
+        assert_eq!(
+            refused.error_code(),
+            "NotImplemented",
+            "case {case:?}: expected the NotImplemented code, got {:?}",
+            refused.error_code()
+        );
+        assert_eq!(
+            refused.error_message(),
+            format!("This bucket does not support {feature}."),
+            "case {case:?}: the refusal must name the feature the bucket does not have, got {:?}",
+            refused.error_message()
+        );
+    }
+
+    // And the other half of the rule: the same documents are CONFIGURATION on a general purpose
+    // bucket, so the refusal belongs to the bucket's kind and not to the document.
+    for case in [
+        "versioning",
+        "event notifications",
+        "transfer acceleration",
+        "cors",
+        "the bucket tag set",
+        "the public access block",
+    ] {
+        let (_, subresource, _, document) = CONFIGURATION_PUTS
+            .into_iter()
+            .find(|(named, _, _, _)| *named == case)
+            .unwrap_or_else(|| panic!("case {case:?} must be one of the configuration rows"));
+        let served = send(
+            &router,
+            "PUT",
+            &format!("/configrefusal-general-purpose{subresource}"),
+            &[],
+            document,
+        )
+        .await;
+        assert!(
+            (200..300).contains(&served.status),
+            "case {case:?}: a general purpose bucket takes this configuration, got {} with body \
+             {:?}",
+            served.status,
+            text(&served)
+        );
+    }
 }

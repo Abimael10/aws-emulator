@@ -7,12 +7,15 @@
 //! for directory buckets"
 //! (`service_com_amazonaws_s3_amazons3::service::directory_bucket::UNSUPPORTED_NOTE`), so a
 //! request that addresses a directory bucket and names such an operation is REFUSED rather
-//! than served: it asks a bucket for a FEATURE its KIND does not have, which S3 answers with
-//! the 501 `NotImplemented` and a sentence naming that feature ("This bucket does not support
-//! Object Tags." for the object tag-set plane). Two further members of the same rule are pinned
-//! here: a `CopyObject` into a directory bucket may write no tags at all ("only the empty
-//! tag-set is supported … any requests that attempt to write non-empty tags into directory
-//! buckets will receive a `501 Not Implemented` status code",
+//! than served, and the answer states WHAT refused it: a call asking for a FEATURE its KIND
+//! does not have earns the 501 `NotImplemented` and a sentence naming that feature ("This
+//! bucket does not support Object Tags." for the object tag-set plane), while a PUT that
+//! SUBMITS a bucket-configuration document earns the request-shape refusal for that document
+//! (400 `InvalidArgument`, "<Element> is not valid, expected CreateBucketConfiguration", that
+//! being the one bucket-configuration document such a bucket's endpoint parses). Two further
+//! members of the same rule are pinned here: a `CopyObject` into a directory bucket may write
+//! no tags at all ("only the empty tag-set is supported … any requests that attempt to write
+//! non-empty tags into directory buckets will receive a `501 Not Implemented` status code",
 //! `CopyObjectRequest$TaggingDirective`), and such a bucket's completed multipart entity tag is
 //! NOT the MD5 composite a general purpose bucket's is ("the entity tag may or may not be an
 //! MD5 digest of the object data. If the entity tag is not an MD5 digest of the object data, it
@@ -200,14 +203,58 @@ async fn general_purpose_bucket(router: &MultiServiceRouter, name: &str) {
     );
 }
 
+/// WHICH refusal a call of this surface earns, which is not one answer for all of them.
+///
+/// A call that asks for a FEATURE the bucket's kind does not have is answered 501
+/// `NotImplemented` with the sentence naming that feature. A PUT that SUBMITS a
+/// bucket-configuration document is answered for the DOCUMENT instead — HTTP 400
+/// `InvalidArgument` naming the root element the request carried beside
+/// `CreateBucketConfiguration`, the one bucket-configuration document a directory bucket's
+/// endpoint parses — which is the answer recorded against that very surface (the behavioural
+/// check `s3.directory-bucket-rejects-object-tagging-versioning-notification-and-replication`
+/// records `('InvalidArgument', 'VersioningConfiguration is not valid, expected
+/// CreateBucketConfiguration')` for `PutBucketVersioning` on a directory bucket). The model's
+/// note says such an operation is not supported; WHICH refusal AWS answers it with is recorded
+/// behaviour, and the two classes differ because a caller branches on them differently: a
+/// document it sent is a terminal caller error, an unimplemented feature is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// The feature the bucket's kind does not have.
+    Feature(&'static str),
+    /// The root element of the configuration document the request submitted.
+    Document(&'static str),
+}
+
+/// The code and status a submitted document the endpoint does not parse is refused with.
+const INVALID_ARGUMENT: &str = "InvalidArgument";
+const INVALID_ARGUMENT_STATUS: u16 = 400;
+
+impl Refusal {
+    /// The status, the code and the whole sentence this refusal is answered with.
+    fn answer(&self) -> (u16, &'static str, String) {
+        match self {
+            Self::Feature(feature) => (
+                NOT_IMPLEMENTED_STATUS,
+                NOT_IMPLEMENTED,
+                format!("This bucket does not support {feature}."),
+            ),
+            Self::Document(element) => (
+                INVALID_ARGUMENT_STATUS,
+                INVALID_ARGUMENT,
+                format!("{element} is not valid, expected CreateBucketConfiguration"),
+            ),
+        }
+    }
+}
+
 /// One call of the surface, as `(case, method, the path and query under the bucket, the body,
-/// the FEATURE the refusal names)`.
+/// the refusal it earns)`.
 type Call = (
     &'static str,
     &'static str,
     &'static str,
     &'static str,
-    &'static str,
+    Refusal,
 );
 
 /// The calls this suite drives against both kinds of bucket.
@@ -216,39 +263,52 @@ type Call = (
 /// of one, a write and a read of an OBJECT subresource, and a LISTING — across the tagging,
 /// versioning, notification, replication, ACL, location, request-payment, logging and
 /// public-access planes, so the refusal is pinned for the surface the model marks rather than
-/// for the four operations the report cited. The FEATURE beside each is what the sentence names:
-/// every call of one plane names that plane, so the read and the write of it tell a client the
-/// same thing.
+/// for the four operations the report cited. Beside each is the refusal it earns ([`Refusal`]):
+/// every call asking for one plane names that plane, so the read of it and a write that submits
+/// no document tell a client the same thing, while a write that submits a configuration DOCUMENT
+/// is answered for that document.
 const UNSUPPORTED_CALLS: [Call; 16] = [
     (
         "PutObjectTagging",
         "PUT",
         "/held.txt?tagging",
         "<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
-        "Object Tags",
+        Refusal::Feature("Object Tags"),
     ),
-    ("GetObjectTagging", "GET", "/held.txt?tagging", "", "Object Tags"),
+    (
+        "GetObjectTagging",
+        "GET",
+        "/held.txt?tagging",
+        "",
+        Refusal::Feature("Object Tags"),
+    ),
     (
         "PutBucketVersioning",
         "PUT",
         "?versioning",
         "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
-        "Versioning",
+        Refusal::Document("VersioningConfiguration"),
     ),
-    ("GetBucketVersioning", "GET", "?versioning", "", "Versioning"),
+    (
+        "GetBucketVersioning",
+        "GET",
+        "?versioning",
+        "",
+        Refusal::Feature("Versioning"),
+    ),
     (
         "PutBucketNotificationConfiguration",
         "PUT",
         "?notification",
         "<NotificationConfiguration></NotificationConfiguration>",
-        "Notifications",
+        Refusal::Document("NotificationConfiguration"),
     ),
     (
         "GetBucketNotificationConfiguration",
         "GET",
         "?notification",
         "",
-        "Notifications",
+        Refusal::Feature("Notifications"),
     ),
     (
         "PutBucketReplication",
@@ -259,41 +319,72 @@ const UNSUPPORTED_CALLS: [Call; 16] = [
          <Rule><Priority>1</Priority><Filter></Filter><Status>Enabled</Status>\
          <Destination><Bucket>arn:aws:s3:::somewhere</Bucket></Destination></Rule>\
          </ReplicationConfiguration>",
-        "Replication",
+        Refusal::Document("ReplicationConfiguration"),
     ),
-    ("GetBucketReplication", "GET", "?replication", "", "Replication"),
+    (
+        "GetBucketReplication",
+        "GET",
+        "?replication",
+        "",
+        Refusal::Feature("Replication"),
+    ),
     (
         "PutBucketTagging",
         "PUT",
         "?tagging",
         "<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
-        "Bucket Tagging",
+        Refusal::Document("Tagging"),
     ),
-    ("GetBucketTagging", "GET", "?tagging", "", "Bucket Tagging"),
-    ("GetBucketAcl", "GET", "?acl", "", "ACL"),
-    ("GetBucketLocation", "GET", "?location", "", "GetBucketLocation"),
+    (
+        "GetBucketTagging",
+        "GET",
+        "?tagging",
+        "",
+        Refusal::Feature("Bucket Tagging"),
+    ),
+    ("GetBucketAcl", "GET", "?acl", "", Refusal::Feature("ACL")),
+    (
+        "GetBucketLocation",
+        "GET",
+        "?location",
+        "",
+        Refusal::Feature("GetBucketLocation"),
+    ),
     (
         "GetBucketRequestPayment",
         "GET",
         "?requestPayment",
         "",
-        "Request Payment",
+        Refusal::Feature("Request Payment"),
     ),
-    ("GetBucketLogging", "GET", "?logging", "", "Logging"),
+    (
+        "GetBucketLogging",
+        "GET",
+        "?logging",
+        "",
+        Refusal::Feature("Logging"),
+    ),
     (
         "GetPublicAccessBlock",
         "GET",
         "?publicAccessBlock",
         "",
-        "Public Access Block",
+        Refusal::Feature("Public Access Block"),
     ),
-    ("ListObjects", "GET", "", "", "ListObjects"),
+    (
+        "ListObjects",
+        "GET",
+        "",
+        "",
+        Refusal::Feature("ListObjects"),
+    ),
 ];
 
 /// RULE: a request addressing a DIRECTORY bucket and naming an operation the model says such a
-/// bucket does not serve is refused 501 `NotImplemented`, with the sentence naming the feature
-/// that bucket does not have — while the SAME call against a general purpose bucket is not
-/// refused that way at all.
+/// bucket does not serve is REFUSED — for the FEATURE that bucket's kind does not have (501
+/// `NotImplemented`), or, where the call submits a bucket-configuration document, for that
+/// DOCUMENT (400 `InvalidArgument`, naming it beside `CreateBucketConfiguration`) — while the
+/// SAME call against a general purpose bucket is not refused that way at all.
 #[tokio::test]
 async fn an_operation_a_directory_bucket_does_not_serve_is_refused() {
     let (router, _engine) = emulator();
@@ -320,7 +411,8 @@ async fn an_operation_a_directory_bucket_does_not_serve_is_refused() {
         );
     }
 
-    for (case, method, path, body, feature) in UNSUPPORTED_CALLS {
+    for (case, method, path, body, refusal) in UNSUPPORTED_CALLS {
+        let (status, code, message) = refusal.answer();
         let refused = call(
             &router,
             method,
@@ -331,17 +423,17 @@ async fn an_operation_a_directory_bucket_does_not_serve_is_refused() {
         .await;
         assert_eq!(
             (refused.status, refused.code().as_str()),
-            (NOT_IMPLEMENTED_STATUS, NOT_IMPLEMENTED),
-            "case {case:?}: a directory bucket does not serve this operation, expected \
-             {NOT_IMPLEMENTED_STATUS} {NOT_IMPLEMENTED:?}, got {} {:?} with {:?}",
+            (status, code),
+            "case {case:?}: a directory bucket does not serve this call, expected {status} \
+             {code:?}, got {} {:?} with {:?}",
             refused.status,
             refused.code(),
             refused.body
         );
         assert_eq!(
             refused.message(),
-            format!("This bucket does not support {feature}."),
-            "case {case:?}: the refusal must name the feature the bucket does not have, got {:?}",
+            message,
+            "case {case:?}: the refusal must state what refused it, got {:?}",
             refused.message()
         );
 
@@ -357,7 +449,7 @@ async fn an_operation_a_directory_bucket_does_not_serve_is_refused() {
         .await;
         assert_ne!(
             served.message(),
-            format!("This bucket does not support {feature}."),
+            message,
             "case {case:?}: a general purpose bucket serves this operation, got {} with {:?}",
             served.status,
             served.body
@@ -392,7 +484,10 @@ async fn an_operation_a_directory_bucket_does_not_serve_is_refused() {
 
 /// RULE: a `CopyObject` whose destination is a directory bucket may write no tags — the tag set
 /// the copy WOULD write is what decides it, whichever member asked for it — and the empty cases
-/// the same member lists as allowed are served.
+/// the same member lists as allowed are served. The sentence names WHICH restriction fired: the
+/// carrying over of the SOURCE's tag set for a copy that would copy one (recorded against this
+/// surface as "This bucket does not support copying source objects with Object Tags."), and the
+/// object tag-set plane for a request that states a set of its own.
 ///
 /// The rows span what the rule generalises over: which member asks (the directive stated as
 /// `COPY`, no directive at all, and a `REPLACE` with a non-empty `x-amz-tagging`), and the
@@ -426,15 +521,21 @@ async fn a_copy_into_a_directory_bucket_may_write_no_tags() {
         );
     }
 
-    // (case, source key, the headers the copy carries beyond the source, whether it is refused)
+    // (case, source key, the headers the copy carries beyond the source, the sentence it is
+    // refused with — `None` for a copy that is served)
     let rows: [CopyRow; 5] = [
         (
             "COPY of a tagged source",
             "tagged.txt",
             &[("x-amz-tagging-directive", "COPY")],
-            true,
+            Some(COPYING_SOURCE_TAGS),
         ),
-        ("no directive over a tagged source", "tagged.txt", &[], true),
+        (
+            "no directive over a tagged source",
+            "tagged.txt",
+            &[],
+            Some(COPYING_SOURCE_TAGS),
+        ),
         (
             "REPLACE with a non-empty tag set",
             "untagged.txt",
@@ -442,19 +543,19 @@ async fn a_copy_into_a_directory_bucket_may_write_no_tags() {
                 ("x-amz-tagging-directive", "REPLACE"),
                 ("x-amz-tagging", "team=storage"),
             ],
-            true,
+            Some(OBJECT_TAGS),
         ),
         (
             "REPLACE naming no tag set",
             "tagged.txt",
             &[("x-amz-tagging-directive", "REPLACE")],
-            false,
+            None,
         ),
         (
             "COPY of an untagged source",
             "untagged.txt",
             &[("x-amz-tagging-directive", "COPY")],
-            false,
+            None,
         ),
     ];
 
@@ -472,7 +573,7 @@ async fn a_copy_into_a_directory_bucket_may_write_no_tags() {
             b"",
         )
         .await;
-        if refused {
+        if let Some(message) = refused {
             assert_eq!(
                 (copied.status, copied.code().as_str()),
                 (NOT_IMPLEMENTED_STATUS, NOT_IMPLEMENTED),
@@ -484,9 +585,8 @@ async fn a_copy_into_a_directory_bucket_may_write_no_tags() {
             );
             assert_eq!(
                 copied.message(),
-                "This bucket does not support Object Tags.",
-                "case {case:?}: the refusal must name the plane the bucket does not have, got \
-                 {:?}",
+                message,
+                "case {case:?}: the refusal must name the restriction that fired, got {:?}",
                 copied.message()
             );
             // Refused before anything was written: the destination key holds nothing.
@@ -530,8 +630,22 @@ async fn a_copy_into_a_directory_bucket_may_write_no_tags() {
 }
 
 /// One row of the copy table: the case, the source key, the headers the copy carries beyond
-/// the source reference, and whether the copy is refused.
-type CopyRow = (&'static str, &'static str, &'static [(&'static str, &'static str)], bool);
+/// the source reference, and the sentence it is refused with (`None` for a copy that is served).
+type CopyRow = (
+    &'static str,
+    &'static str,
+    &'static [(&'static str, &'static str)],
+    Option<&'static str>,
+);
+
+/// The two sentences a copy that would write tags into a directory bucket is refused with, each
+/// naming the restriction that fired: the carrying over of the SOURCE's tag set, whose remedy is
+/// `TaggingDirective=REPLACE` over an empty set, and the object tag-set plane a request that
+/// states a set of its own asks for. Both are fixed text, with nothing of the request in them.
+const COPYING_SOURCE_TAGS: &str =
+    "This bucket does not support copying source objects with Object Tags.";
+/// See [`COPYING_SOURCE_TAGS`].
+const OBJECT_TAGS: &str = "This bucket does not support Object Tags.";
 
 /// One row of the session table: the case, the token presented, and the status and code it
 /// earns — `None` for a call that is served.

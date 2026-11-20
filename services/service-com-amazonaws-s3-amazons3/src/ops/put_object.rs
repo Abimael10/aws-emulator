@@ -469,12 +469,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PutObject<Eng> {
             ));
         }
 
-        // The CUSTOMER-PROVIDED key this write asks the object to be encrypted under, read
-        // off the three members that carry it through the one rule every call of this service
-        // reads them by ([`crate::state::requested_customer_key`]): the algorithm S3 serves,
-        // a key of the length it takes, and the client's own digest of that key, which is the
-        // integrity check the third member exists for. Any of the three that does not hold is
-        // a value the request carried that S3 cannot use, refused before anything is stored.
+        // The CUSTOMER-PROVIDED key this write asks the object to be encrypted under. WHETHER
+        // the bucket it addresses serves that encryption form at all comes first: a DIRECTORY
+        // bucket does not, so the ASK is refused with the restriction that kind of bucket
+        // publishes — before the key's own members are judged, since on such a bucket no value
+        // of them could be used — through the one place that rule lives for every write of this
+        // service ([`crate::service::object_write::directory_bucket_customer_key_refusal`]) and
+        // before anything is stored. A bucket this emulator does not hold is answered by the
+        // write below.
+        {
+            let store = state.lock();
+            if let Some(message) = store.bucket(&input.bucket).and_then(|bucket| {
+                crate::service::object_write::directory_bucket_customer_key_refusal(
+                    bucket,
+                    input.sse_customer_algorithm.as_deref(),
+                    input.sse_customer_key.as_deref(),
+                    input.sse_customer_key_md5.as_deref(),
+                )
+            }) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NOT_IMPLEMENTED_CODE,
+                    crate::state::NOT_IMPLEMENTED_STATUS,
+                    message,
+                ));
+            }
+        }
+
+        // And the key itself, read off the three members that carry it through the one rule
+        // every call of this service reads them by
+        // ([`crate::state::requested_customer_key`]): the algorithm S3 serves, a key of the
+        // length it takes, and the client's own digest of that key, which is the integrity check
+        // the third member exists for. Any of the three that does not hold is a value the
+        // request carried that S3 cannot use, refused before anything is stored.
         let customer_key = crate::state::requested_customer_key(
             input.sse_customer_algorithm.as_deref(),
             input.sse_customer_key.as_deref(),

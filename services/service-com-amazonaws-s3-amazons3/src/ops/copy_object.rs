@@ -403,13 +403,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // Members whose semantics this emulator cannot carry out faithfully — the same
         // list `PutObject` refuses a write for, minus the destination preconditions:
         //
-        // * the SSE-C members carry a customer-provided KEY. S3 "doesn't store the
-        //   encryption key you provide", so an object written under one could not be read
-        //   back here, and no object this store holds was encrypted with one — which is
-        //   also why the `x-amz-copy-source-server-side-encryption-customer-*` members
-        //   have nothing to decrypt.
+        // * the copy-source SSE-C members name a customer-provided KEY the SOURCE object
+        //   would have been sealed with. S3 "doesn't store the encryption key you provide",
+        //   so no object this store holds was encrypted with one and they have nothing to
+        //   decrypt.
         // * the Object Lock EVENT hold members decide when a period starts running from an
         //   event nothing here raises, so no stored version can carry one.
+        //
+        // The DESTINATION's own SSE-C members are NOT in this list: whether a copy may ask for
+        // one at all is the DESTINATION BUCKET's to answer — a directory bucket does not serve
+        // that encryption form at all — so they are judged below, once that bucket is resolved.
         //
         // Neither the copy-source PRECONDITIONS nor the DESTINATION's are in this list: both
         // are judged below — the source's against the stored source object, the destination's
@@ -420,14 +423,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // either: they are the lock the destination version is stored with, recorded on it
         // below exactly as `PutObject` records its own.
         for (member, present) in [
-            (
-                "x-amz-server-side-encryption-customer-algorithm",
-                input.sse_customer_algorithm.is_some(),
-            ),
-            (
-                "x-amz-server-side-encryption-customer-key",
-                input.sse_customer_key.is_some(),
-            ),
             (
                 "x-amz-copy-source-server-side-encryption-customer-algorithm",
                 input.copy_source_sse_customer_algorithm.is_some(),
@@ -650,6 +645,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // tag set a copy into a DIRECTORY bucket may write is judged below, once the directive
         // and the source have settled what that set is.
         let into_a_directory_bucket = destination.is_directory();
+        // The DESTINATION's own SSE-C members, judged now that the bucket they address is
+        // resolved: a DIRECTORY bucket does not serve that encryption form at all, so the
+        // refusal names the restriction that kind of bucket publishes
+        // ([`crate::service::object_write::directory_bucket_customer_key_refusal`], the one
+        // place that rule lives for every write of this service), while on a general purpose
+        // bucket — which does serve it — a customer-provided key is a member this emulator has
+        // not written, and keeps the scaffold's 501 naming that member. Either way nothing is
+        // written.
+        if let Some(message) = crate::service::object_write::directory_bucket_customer_key_refusal(
+            destination,
+            input.sse_customer_algorithm.as_deref(),
+            input.sse_customer_key.as_deref(),
+            input.sse_customer_key_md5.as_deref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NOT_IMPLEMENTED_CODE,
+                crate::state::NOT_IMPLEMENTED_STATUS,
+                message,
+            ));
+        }
+        for (member, present) in [
+            (
+                "x-amz-server-side-encryption-customer-algorithm",
+                input.sse_customer_algorithm.is_some(),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                input.sse_customer_key.is_some(),
+            ),
+        ] {
+            if present {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "CopyObject with {member}"
+                )));
+            }
+        }
         let mut encryption = if requested.names_no_member() {
             destination.default_object_encryption()
         } else {
@@ -1083,17 +1114,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // So the rule is about the tag set the copy WOULD WRITE, whichever of the three asked
         // for it: `tags` above is that set, resolved from the directive and the source, so one
         // test covers all three forms and the empty cases that same member lists as allowed
-        // are served. The refusal is the 501 that member names, carrying the sentence this
-        // service answers every call asking a directory bucket for the object tag-set plane
-        // with (`crate::service::directory_bucket`), and it is answered before anything is
-        // written.
+        // are served. The refusal is the 501 that member names, and it is answered before
+        // anything is written.
+        //
+        // WHICH restriction it names is read off where those tags came from, because the
+        // sentence is the only thing that tells the two apart and the remedy differs: a copy
+        // CARRYING OVER the source's tag set is refused for that carrying over
+        // ([`crate::service::directory_bucket::COPYING_SOURCE_OBJECT_TAGS`], whose remedy is
+        // `TaggingDirective=REPLACE` over an empty tag set), and a request STATING a tag set of
+        // its own is refused for the object tag-set plane this kind of bucket does not have
+        // ([`crate::service::directory_bucket::OBJECT_TAGS`], the sentence every call asking a
+        // directory bucket for that plane earns).
         if into_a_directory_bucket && !tags.is_empty() {
+            let restriction = match replaces_tags {
+                true => crate::service::directory_bucket::OBJECT_TAGS,
+                false => crate::service::directory_bucket::COPYING_SOURCE_OBJECT_TAGS,
+            };
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::NOT_IMPLEMENTED_CODE,
                 crate::state::NOT_IMPLEMENTED_STATUS,
-                crate::service::directory_bucket::unsupported_message(
-                    crate::service::directory_bucket::OBJECT_TAGS,
-                ),
+                crate::service::directory_bucket::unsupported_message(restriction),
             ));
         }
 
