@@ -7,6 +7,11 @@
 //! merge strategy (`OVERWRITE`) replaces the stored terms and moves
 //! `LastUpdatedAt` on rather than creating a second resource.
 //!
+//! It also puts the file itself where this resource's reported locations name
+//! it, in this account's object store, so the presigned location a read hands
+//! back serves the bytes this import accepted; the one builder of those
+//! addresses is [`crate::state::terminology_files`].
+//!
 //! Shared types live in `super::types`; the stored shapes and everything the
 //! five terminology operations report by live in [`crate::state`].
 //!
@@ -80,10 +85,11 @@ use std::collections::BTreeMap;
 
 use crate::state::{
     auxiliary_data_location, canonical_language, content_revision, counted,
-    invalid_parameter_value, request_region, service_state, terminology_arn,
-    terminology_properties, too_many_tags, TermEntry, Terminology, FORMAT_CSV, FORMAT_TMX,
-    FORMAT_TSV, MAX_TAGS_PER_RESOURCE, MAX_TERMINOLOGY_FILE_BYTES, MAX_STORED_TERMINOLOGIES,
-    MAX_TERM_TEXT_CHARS, MAX_TERMS_PER_TERMINOLOGY,
+    invalid_parameter_value, request_region, service_state, store_terminology_files,
+    terminology_arn, terminology_properties, too_many_tags, TermEntry, Terminology, FORMAT_CSV,
+    FORMAT_TMX, FORMAT_TSV, MAX_AUXILIARY_WARNINGS, MAX_STORED_TERMINOLOGIES,
+    MAX_TAGS_PER_RESOURCE, MAX_TERMINOLOGY_FILE_BYTES, MAX_TERMS_PER_TERMINOLOGY,
+    MAX_TERM_TEXT_CHARS,
 };
 
 /// The member a refusal about the uploaded file names, as the caller addresses it.
@@ -99,12 +105,27 @@ const MIN_LANGUAGE_COLUMNS: usize = 2;
 const MIN_FILLED_CELLS: usize = 2;
 
 /// What one terminology file declares: the language code of each column, in the
-/// order the file declares them, one entry per usable row, and how many rows
-/// the service could not use.
+/// order the file declares them, one entry per usable row, how many rows the
+/// service could not use, and what it has to report about each of those — the
+/// "errors or warnings that were produced by your input file" the auxiliary
+/// location names.
 struct ParsedTerminology {
     languages: Vec<&'static str>,
     entries: Vec<TermEntry>,
     skipped: usize,
+    warnings: Vec<String>,
+}
+
+/// Record one warning about the input file, up to the bound the auxiliary report
+/// carries ([`MAX_AUXILIARY_WARNINGS`]).
+///
+/// The input file is caller-sized and every one of its rows may be a skipped one,
+/// so what the report can grow to is bounded like every other answer computed
+/// from it; `SkippedTermCount` still counts them all.
+fn note(warnings: &mut Vec<String>, row: &str, reason: &str) {
+    if warnings.len() < MAX_AUXILIARY_WARNINGS {
+        warnings.push(format!("{row} was not imported: {reason}"));
+    }
 }
 
 /// Parse a CSV or TSV terminology file: the first row names the languages of
@@ -128,8 +149,12 @@ fn parse_delimited(file: &[u8], delimiter: u8) -> Result<ParsedTerminology, Stri
 
     let mut entries = Vec::new();
     let mut skipped = 0usize;
-    for row in records {
+    let mut warnings = Vec::new();
+    // The header row is the file's first, so the rows carrying terms start at
+    // its second — which is the row an auxiliary warning names.
+    for (offset, row) in records.enumerate() {
         let row = row.map_err(|error| format!("a row could not be read ({error})"))?;
+        let numbered = format!("row {}", offset + 2);
         let mut values = BTreeMap::new();
         let mut oversized = false;
         for (language, cell) in languages.iter().zip(row.iter()) {
@@ -144,8 +169,38 @@ fn parse_delimited(file: &[u8], delimiter: u8) -> Result<ParsedTerminology, Stri
                 values.insert((*language).to_string(), cell.to_string());
             }
         }
-        if oversized || row.len() > languages.len() || values.len() < MIN_FILLED_CELLS {
+        if oversized {
             skipped = skipped.saturating_add(1);
+            note(
+                &mut warnings,
+                &numbered,
+                &format!("it states a term longer than {MAX_TERM_TEXT_CHARS} characters"),
+            );
+            continue;
+        }
+        if row.len() > languages.len() {
+            skipped = skipped.saturating_add(1);
+            note(
+                &mut warnings,
+                &numbered,
+                &format!(
+                    "it holds {} cells and the file declares {} language column(s)",
+                    row.len(),
+                    languages.len()
+                ),
+            );
+            continue;
+        }
+        if values.len() < MIN_FILLED_CELLS {
+            skipped = skipped.saturating_add(1);
+            note(
+                &mut warnings,
+                &numbered,
+                &format!(
+                    "it states {} language(s) and a term needs at least {MIN_FILLED_CELLS}",
+                    values.len()
+                ),
+            );
             continue;
         }
         entries.push(TermEntry { values });
@@ -160,6 +215,7 @@ fn parse_delimited(file: &[u8], delimiter: u8) -> Result<ParsedTerminology, Stri
         languages,
         entries,
         skipped,
+        warnings,
     })
 }
 
@@ -217,6 +273,8 @@ fn parse_tmx(file: &[u8]) -> Result<ParsedTerminology, String> {
     let mut languages: Vec<&'static str> = Vec::new();
     let mut entries: Vec<TermEntry> = Vec::new();
     let mut skipped = 0usize;
+    let mut warnings = Vec::new();
+    let mut units = 0usize;
 
     let mut row: Option<BTreeMap<String, String>> = None;
     let mut row_oversized = false;
@@ -289,9 +347,29 @@ fn parse_tmx(file: &[u8]) -> Result<ParsedTerminology, String> {
                 }
                 b"tuv" => unit_language = None,
                 b"tu" => {
+                    units = units.saturating_add(1);
                     if let Some(values) = row.take() {
-                        if row_oversized || values.len() < MIN_FILLED_CELLS {
+                        let numbered = format!("translation unit {units}");
+                        if row_oversized {
                             skipped = skipped.saturating_add(1);
+                            note(
+                                &mut warnings,
+                                &numbered,
+                                &format!(
+                                    "it states a term longer than {MAX_TERM_TEXT_CHARS} characters"
+                                ),
+                            );
+                        } else if values.len() < MIN_FILLED_CELLS {
+                            skipped = skipped.saturating_add(1);
+                            note(
+                                &mut warnings,
+                                &numbered,
+                                &format!(
+                                    "it states {} language(s) and a term needs at least \
+                                     {MIN_FILLED_CELLS}",
+                                    values.len()
+                                ),
+                            );
                         } else {
                             entries.push(TermEntry { values });
                         }
@@ -318,6 +396,7 @@ fn parse_tmx(file: &[u8]) -> Result<ParsedTerminology, String> {
         languages,
         entries,
         skipped,
+        warnings,
     })
 }
 
@@ -486,64 +565,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let revision = content_revision(&file);
-        let mut store = state.lock();
-        let existing = store.terminologies.get(&input.name);
+        // The store's guard lives in THIS block alone: the files behind the
+        // resource's announced locations are written below, over the in-process
+        // callback into another service, and no lock of this one is held across
+        // that await.
+        let stored = {
+            let mut store = state.lock();
+            let existing = store.terminologies.get(&input.name);
 
-        // A new name grows the store, which only a caller's delete ever
-        // shrinks, so the account's terminology quota is checked before the
-        // insert. An overwrite of a name the store already holds adds no entry
-        // and is never refused by it.
-        if existing.is_none() && store.terminologies.len() >= MAX_STORED_TERMINOLOGIES {
-            return Err(ImportTerminologyErrorModeled::LimitExceededException(
-                LimitExceededException {
-                    message: Some(format!(
-                        "This account already holds the maximum of \
-                         {MAX_STORED_TERMINOLOGIES} custom terminologies. Review your \
-                         request and retry it with a quantity below the stated limit."
-                    )),
-                },
-            )
-            .into());
-        }
+            // A new name grows the store, which only a caller's delete ever
+            // shrinks, so the account's terminology quota is checked before the
+            // insert. An overwrite of a name the store already holds adds no
+            // entry and is never refused by it.
+            if existing.is_none() && store.terminologies.len() >= MAX_STORED_TERMINOLOGIES {
+                return Err(ImportTerminologyErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "This account already holds the maximum of \
+                             {MAX_STORED_TERMINOLOGIES} custom terminologies. Review your \
+                             request and retry it with a quantity below the stated limit."
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        let record = Terminology {
-            name: input.name.clone(),
-            description: input.description,
-            arn: terminology_arn(&region, &input.name, &revision),
-            revision,
-            source_language_code: (*source_language_code).to_string(),
-            target_language_codes: target_language_codes
-                .iter()
-                .map(|language| (*language).to_string())
-                .collect(),
-            format,
-            directionality: input.terminology_data.directionality,
-            encryption_key: input.encryption_key,
-            size_bytes: counted(file.len()),
-            term_count: counted(parsed.entries.len()),
-            skipped_term_count: counted(parsed.skipped),
-            // An overwrite of an existing name keeps the instant the resource
-            // was first created and moves only `LastUpdatedAt` on.
-            created_at: existing.map_or(now, |previous| previous.created_at),
-            last_updated_at: now,
-            // Tags the request does not restate are the ones the resource
-            // already carries: this operation's input has no way to say "drop
-            // my tags", which is what `UntagResource` is for.
-            tags: tags.unwrap_or_else(|| {
-                existing.map(|previous| previous.tags.clone()).unwrap_or_default()
-            }),
-            terms: parsed.entries,
+            let record = Terminology {
+                name: input.name.clone(),
+                description: input.description,
+                arn: terminology_arn(&region, &input.name, &revision),
+                revision,
+                source_language_code: (*source_language_code).to_string(),
+                target_language_codes: target_language_codes
+                    .iter()
+                    .map(|language| (*language).to_string())
+                    .collect(),
+                format,
+                directionality: input.terminology_data.directionality,
+                encryption_key: input.encryption_key,
+                size_bytes: counted(file.len()),
+                term_count: counted(parsed.entries.len()),
+                skipped_term_count: counted(parsed.skipped),
+                // An overwrite of an existing name keeps the instant the
+                // resource was first created and moves only `LastUpdatedAt` on.
+                created_at: existing.map_or(now, |previous| previous.created_at),
+                last_updated_at: now,
+                // Tags the request does not restate are the ones the resource
+                // already carries: this operation's input has no way to say
+                // "drop my tags", which is what `UntagResource` is for.
+                tags: tags.unwrap_or_else(|| {
+                    existing
+                        .map(|previous| previous.tags.clone())
+                        .unwrap_or_default()
+                }),
+                terms: parsed.entries,
+            };
+            store.terminologies.insert(input.name.clone(), record);
+
+            store
+                .terminologies
+                .get(&input.name)
+                .cloned()
+                .ok_or_else(|| {
+                    ImportTerminologyErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(
+                                "the imported terminology could not be read back".to_string(),
+                            ),
+                        },
+                    )
+                })?
         };
-        store.terminologies.insert(input.name.clone(), record);
 
-        let stored = store.terminologies.get(&input.name).ok_or_else(|| {
-            ImportTerminologyErrorModeled::InternalServerException(InternalServerException {
-                message: Some("the imported terminology could not be read back".to_string()),
-            })
-        })?;
+        // The locations a read of this resource announces name real objects of
+        // this account's object store, which the import is what puts there.
+        store_terminology_files(ctx, &region, &stored, &file, &parsed.warnings).await;
+
         Ok(ImportTerminologyOutput {
-            terminology_properties: Some(terminology_properties(stored)),
-            auxiliary_data_location: auxiliary_data_location(&region, stored),
+            terminology_properties: Some(terminology_properties(&stored)),
+            auxiliary_data_location: auxiliary_data_location(ctx, &region, &stored),
         })
     }
 }

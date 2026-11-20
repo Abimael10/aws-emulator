@@ -45,7 +45,8 @@
 use super::types::*;
 
 use crate::state::{
-    service_state, terminology_not_found, WireRefusal, TERMINOLOGY_METADATA_RESOURCE,
+    request_region, service_state, terminology_not_found, withdraw_terminology_files, WireRefusal,
+    TERMINOLOGY_METADATA_RESOURCE,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -139,15 +140,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = service_state(&*self.engine).ok_or_else(|| {
             DeleteTerminologyErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the terminology store is unavailable".to_string()),
             })
         })?;
+        let region = request_region(ctx.parts());
 
-        let mut store = state.lock();
-        if store.terminologies.remove(&input.name).is_none() {
+        // The store's guard lives in THIS block alone: the files behind the
+        // resource's locations are taken back below, over the in-process
+        // callback into another service, and no lock of this one is held across
+        // that await.
+        let removed = {
+            let mut store = state.lock();
+            store.terminologies.remove(&input.name)
+        };
+        let Some(removed) = removed else {
             // A delete addresses the resource's metadata record, which is the
             // resource this refusal names.
             return Err(WireRefusal::not_found(terminology_not_found(
@@ -155,7 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.name,
             ))
             .into());
-        }
+        };
+
+        // The resource is gone, so nothing is served where its locations pointed.
+        withdraw_terminology_files(ctx, &region, &removed).await;
         Ok(DeleteTerminologyOutput)
     }
 }

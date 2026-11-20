@@ -22,6 +22,12 @@
 //! it, and the data plane that reads its input documents out of object storage
 //! and writes their translations back, live in [`batch_translation`] — which
 //! translates a document with that same shared transform.
+//!
+//! The locations the terminology operations announce for a resource's files, and
+//! the objects this emulator serves at them, live in [`terminology_files`]: a
+//! location a caller is handed to fetch is an address on the endpoint it reached
+//! this emulator on, so one builder states it for every operation that reports
+//! one.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -30,9 +36,9 @@ use ::sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     EncryptionKey, InvalidParameterValueException, InvalidRequestException,
-    LimitExceededException, ResourceNotFoundException, Tag, Term, TerminologyDataLocation,
-    TerminologyProperties, TextSizeLimitExceededException, TooManyTagsException,
-    TranslationSettings, UnsupportedLanguagePairException,
+    LimitExceededException, ResourceNotFoundException, Tag, Term, TerminologyProperties,
+    TextSizeLimitExceededException, TooManyTagsException, TranslationSettings,
+    UnsupportedLanguagePairException,
 };
 
 /// The asynchronous batch translation jobs this service runs: the stored
@@ -44,8 +50,16 @@ pub mod batch_translation;
 /// express, and the error channel every operation that answers one carries.
 pub mod wire_refusals;
 
+/// WHERE a custom terminology's files are, and the presigned locations the
+/// terminology operations announce for them.
+pub mod terminology_files;
+
 use batch_translation::TranslationJob;
 
+pub use terminology_files::{
+    auxiliary_data_location, store_terminology_files, terminology_data_location,
+    withdraw_terminology_files, MAX_AUXILIARY_WARNINGS,
+};
 pub use wire_refusals::{Refusable, WireRefusal};
 
 /// The ARN namespace this service stamps into every resource ARN: `translate`
@@ -73,14 +87,6 @@ pub const FORMAT_TMX: &str = "TMX";
 /// `SourceLanguageCode` field", `smithy_query shape=TranslateTextRequest
 /// member=SourceLanguageCode`).
 pub const AUTO_LANGUAGE_CODE: &str = "auto";
-
-/// The repository a terminology's input file is presigned from.
-const REPOSITORY_TYPE_S3: &str = "S3";
-
-/// How long a reported data location stays valid: "The location is returned as
-/// a presigned URL that has a 30-minute expiration"
-/// (`smithy_query shape=TerminologyDataLocation member=Location`).
-const PRESIGNED_EXPIRY_SECONDS: u32 = 1800;
 
 /// The largest terminology input file this emulator parses, which is the
 /// documented quota for a custom terminology file (10 MB). The cap is applied to
@@ -491,66 +497,6 @@ pub fn terminology_properties(record: &Terminology) -> TerminologyProperties {
         skipped_term_count: Some(record.skipped_term_count),
         format: Some(record.format.clone()),
     }
-}
-
-/// The object key the terminology's input file is held under, which carries the
-/// revision so one name's successive imports are distinct objects.
-fn terminology_object_key(record: &Terminology, format: &str, suffix: &str) -> String {
-    let extension = format.to_ascii_lowercase();
-    format!(
-        "{}/{}/{}{suffix}.{extension}",
-        record.name, record.revision, record.name
-    )
-}
-
-/// A presigned-style S3 location for `key`, derived entirely from the stored
-/// record and the request's Region, so two reads of one terminology report one
-/// location.
-fn presigned_location(region: &str, key: &str) -> String {
-    let bucket = format!(
-        "translate-terminology-{}-{region}",
-        ::engine::emulator_account_id()
-    );
-    let signature = ::hex::encode(Sha256::digest(format!("{bucket}/{key}").as_bytes()));
-    format!(
-        "https://{bucket}.s3.{region}.amazonaws.com/{key}\
-         ?X-Amz-Algorithm=AWS4-HMAC-SHA256\
-         &X-Amz-Expires={PRESIGNED_EXPIRY_SECONDS}\
-         &X-Amz-SignedHeaders=host\
-         &X-Amz-Signature={signature}"
-    )
-}
-
-/// Where the terminology's input file is reported from, in `format`.
-pub fn terminology_data_location(
-    region: &str,
-    record: &Terminology,
-    format: &str,
-) -> TerminologyDataLocation {
-    TerminologyDataLocation {
-        repository_type: REPOSITORY_TYPE_S3.to_string(),
-        location: presigned_location(region, &terminology_object_key(record, format, "")),
-    }
-}
-
-/// The auxiliary location, which reports "any errors or warnings that were
-/// produced by your input file" (`smithy_query shape=ImportTerminologyResponse
-/// member=AuxiliaryDataLocation`) — so it exists only for an import that had
-/// something to report, i.e. one whose file held rows the service skipped.
-pub fn auxiliary_data_location(
-    region: &str,
-    record: &Terminology,
-) -> Option<TerminologyDataLocation> {
-    if record.skipped_term_count <= 0 {
-        return None;
-    }
-    Some(TerminologyDataLocation {
-        repository_type: REPOSITORY_TYPE_S3.to_string(),
-        location: presigned_location(
-            region,
-            &terminology_object_key(record, FORMAT_CSV, "-auxiliary"),
-        ),
-    })
 }
 
 /// The opaque `NextToken` a listing hands back for the name its page ended on.

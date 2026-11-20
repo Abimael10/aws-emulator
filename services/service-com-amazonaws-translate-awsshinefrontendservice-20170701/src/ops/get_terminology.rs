@@ -6,6 +6,11 @@
 //! `ImportTerminology` reported for it — plus the location its input file is
 //! presigned from. A name no import stored is a 404, never an empty success.
 //!
+//! The location is a presigned address on the endpoint the request reached this
+//! emulator on, serving the file the import stored there; the one builder every
+//! operation that reports one goes through is
+//! [`crate::state::terminology_files`].
+//!
 //! Shared types live in `super::types`; the stored shapes and everything the
 //! five terminology operations report by live in [`crate::state`].
 //!
@@ -188,8 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetTerminologyOutput {
             terminology_properties: Some(terminology_properties(record)),
-            terminology_data_location: Some(terminology_data_location(&region, record, &format)),
-            auxiliary_data_location: auxiliary_data_location(&region, record),
+            terminology_data_location: Some(terminology_data_location(
+                ctx, &region, record, &format,
+            )),
+            auxiliary_data_location: auxiliary_data_location(ctx, &region, record),
         })
     }
 }

@@ -18,7 +18,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{MultiServiceRouter, UNSERVED_URL_BASE};
 
 use service_com_amazonaws_translate_awsshinefrontendservice_20170701::EmulatedService;
 
@@ -129,6 +129,13 @@ pub(crate) fn expected_arn(name: &str, file: &[u8]) -> String {
         "arn:aws:translate:{REGION}:{ACCOUNT}:terminology/{name}/{}",
         revision_of(file)
     )
+}
+
+/// The object an announced location names: everything before its query, which is
+/// what carries the presigning. Two reads of one resource name one object; the
+/// signature and the instant it was signed at are a presigned URL's own.
+fn announced_object(location: &str) -> &str {
+    location.split('?').next().unwrap_or(location)
 }
 
 fn import_body(name: &str, file: &[u8], format: &str, directionality: Option<&str>) -> Value {
@@ -290,16 +297,26 @@ async fn terminology_lifecycle_is_served_from_stored_state() {
         "the data location names its repository, got {fetched}"
     );
     let location = string_at(&fetched, "/TerminologyDataLocation/Location");
+    // The location is an address on the endpoint this emulator is reached on —
+    // never a host only AWS serves — presigned, naming the object the import
+    // stored. That the object is really served there is pinned across the two
+    // services it spans by
+    // `core/router/tests/all/translate_terminology_data_locations.rs`.
     assert!(
-        location.starts_with("https://") && location.contains(&revision_of(EN_FR_CSV)),
-        "the location must be a presigned URL for the stored revision, got {location:?}"
+        location.starts_with(&format!("{UNSERVED_URL_BASE}/")),
+        "the location must address the endpoint this emulator is reached on, got {location:?}"
+    );
+    assert!(
+        location.contains("/demo-terms/demo-terms.csv?") && location.contains("X-Amz-Signature="),
+        "the location must be a presigned address of the stored file, got {location:?}"
     );
     let (_, fetched_again) =
         call(&router, "GetTerminology", &json!({"Name": "demo-terms"})).await;
+    let again = string_at(&fetched_again, "/TerminologyDataLocation/Location");
     assert_eq!(
-        string_at(&fetched_again, "/TerminologyDataLocation/Location"),
-        location,
-        "two reads of one terminology must report one location, got {fetched_again}"
+        announced_object(&again),
+        announced_object(&location),
+        "two reads of one terminology must name one object, got {fetched_again}"
     );
 
     // Listed.
