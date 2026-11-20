@@ -24,7 +24,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Accelerator, AcceleratorAttributes, CustomRoutingAccelerator, CustomRoutingListener,
+    Accelerator, AcceleratorAttributes, CustomRoutingAccelerator,
+    CustomRoutingDestinationConfiguration, CustomRoutingDestinationDescription,
+    CustomRoutingEndpointDescription, CustomRoutingEndpointGroup, CustomRoutingListener,
     EndpointConfiguration, EndpointDescription, EndpointGroup, IpAddressDetail, IpSet, Listener,
     PortOverride, PortRange, Tag,
 };
@@ -141,6 +143,12 @@ pub const MAX_ENDPOINTS_PER_ENDPOINT_GROUP: usize = 10;
 /// `PortOverrides` (0..10). Re-checked in [`port_overrides_to_pairs`] for the reason
 /// [`MAX_ENDPOINTS_PER_ENDPOINT_GROUP`] gives.
 pub const MAX_PORT_OVERRIDES_PER_ENDPOINT_GROUP: usize = 10;
+
+/// Destination configurations one CUSTOM ROUTING endpoint group can hold: the model's own
+/// `@length` on `CustomRoutingDestinationConfigurations` (1..100). Re-checked in
+/// [`destinations_from_configurations`] for the reason
+/// [`MAX_ENDPOINTS_PER_ENDPOINT_GROUP`] gives.
+pub const MAX_DESTINATIONS_PER_ENDPOINT_GROUP: usize = 100;
 
 /// The most idempotency records the store can hold: one per resource that can exist.
 /// [`ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State::prune_idempotency`]
@@ -450,6 +458,84 @@ impl StoredCustomRoutingListener {
     }
 }
 
+/// One destination configuration of a custom routing endpoint group, as persisted.
+///
+/// "Sets the port range and protocol for all endpoints (virtual private cloud subnets)
+/// in a custom routing endpoint group to accept client traffic on"
+/// (`CreateCustomRoutingEndpointGroup$DestinationConfigurations`), so the two ends of the
+/// range and the protocols are held TOGETHER: a write that replaces a range cannot leave
+/// behind the protocols of another one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCustomRoutingDestination {
+    /// `FromPort`, the first port of the range, inclusive.
+    pub from_port: i32,
+    /// `ToPort`, the last port of the range, inclusive.
+    pub to_port: i32,
+    /// `Protocols`, in the order the configuration named them. Each is one of
+    /// `CUSTOM_ROUTING_PROTOCOL_VALUES` in `ops::types`; the boundary validator refuses
+    /// any other value before a handler runs.
+    pub protocols: Vec<String>,
+}
+
+impl StoredCustomRoutingDestination {
+    /// This record as the modelled `CustomRoutingDestinationDescription`.
+    pub fn to_wire(&self) -> CustomRoutingDestinationDescription {
+        CustomRoutingDestinationDescription {
+            from_port: Some(self.from_port),
+            to_port: Some(self.to_port),
+            protocols: Some(self.protocols.clone()),
+        }
+    }
+}
+
+/// A custom routing accelerator's endpoint group, as persisted.
+///
+/// Held apart from [`StoredEndpointGroup`] for the reason [`StoredAccelerator`] gives
+/// about the two accelerator kinds: a `CustomRoutingEndpointGroup` carries destination
+/// configurations and subnet endpoints instead of health checks, traffic dial and port
+/// overrides, and it is reached only through the custom routing operations.
+#[derive(Debug, Clone)]
+pub struct StoredCustomRoutingEndpointGroup {
+    /// `EndpointGroupArn` — also this record's key in
+    /// [`GlobalAcceleratorState::custom_routing_endpoint_groups`].
+    pub arn: String,
+    /// The ARN of the custom routing listener this endpoint group belongs to.
+    pub listener_arn: String,
+    /// `EndpointGroupRegion`: "An Amazon Web Services Region can have only one endpoint
+    /// group for a specific listener" (`CustomRoutingEndpointGroup` doc).
+    pub endpoint_group_region: String,
+    /// The group's destination configurations, in the order they were configured.
+    pub destinations: Vec<StoredCustomRoutingDestination>,
+    /// The `EndpointId` of each endpoint (virtual private cloud subnet) in the group, in
+    /// the order it was added. A create adds none: endpoints join through
+    /// `AddCustomRoutingEndpoints`.
+    pub endpoint_ids: Vec<String>,
+}
+
+impl StoredCustomRoutingEndpointGroup {
+    /// This record as the modelled `CustomRoutingEndpointGroup`.
+    pub fn to_wire(&self) -> CustomRoutingEndpointGroup {
+        CustomRoutingEndpointGroup {
+            endpoint_group_arn: Some(self.arn.clone()),
+            endpoint_group_region: Some(self.endpoint_group_region.clone()),
+            destination_descriptions: Some(
+                self.destinations
+                    .iter()
+                    .map(StoredCustomRoutingDestination::to_wire)
+                    .collect(),
+            ),
+            endpoint_descriptions: Some(
+                self.endpoint_ids
+                    .iter()
+                    .map(|endpoint_id| CustomRoutingEndpointDescription {
+                        endpoint_id: Some(endpoint_id.clone()),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// One endpoint of an endpoint group, as persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredEndpoint {
@@ -612,6 +698,11 @@ pub struct ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
     /// Endpoint groups by `EndpointGroupArn`; the parent listener's
     /// `endpoint_group_arns` holds the per-listener order.
     pub endpoint_groups: BTreeMap<String, StoredEndpointGroup>,
+    /// Custom routing endpoint groups by `EndpointGroupArn`, held apart from the standard
+    /// ones for the reason [`StoredCustomRoutingEndpointGroup`] gives: each kind is
+    /// reached only through its own operations. The parent custom routing listener's
+    /// `endpoint_group_arns` holds the per-listener order.
+    pub custom_routing_endpoint_groups: BTreeMap<String, StoredCustomRoutingEndpointGroup>,
     /// Flow-log attributes by `AcceleratorArn`, for an accelerator of either kind:
     /// `AcceleratorAttributes` and `CustomRoutingAcceleratorAttributes` carry the same
     /// three flow-log members, and an `AcceleratorArn` identifies one accelerator
@@ -685,6 +776,22 @@ impl ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
             })
     }
 
+    /// How many endpoint groups a CUSTOM ROUTING accelerator holds across every one of its
+    /// listeners — [`Self::endpoint_group_count`] for the other family, bounded by the
+    /// same [`MAX_ENDPOINT_GROUPS_PER_ACCELERATOR`].
+    pub fn custom_routing_endpoint_group_count(&self, accelerator_arn: &str) -> usize {
+        self.custom_routing_accelerators
+            .get(accelerator_arn)
+            .map_or(0, |accelerator| {
+                accelerator
+                    .listener_arns
+                    .iter()
+                    .filter_map(|listener_arn| self.custom_routing_listeners.get(listener_arn))
+                    .map(|listener| listener.endpoint_group_arns.len())
+                    .sum()
+            })
+    }
+
     /// The cross-family refusal a STANDARD accelerator lookup of `accelerator_arn` owes,
     /// or `None` when the ARN names no accelerator of the custom routing family either
     /// — in which case the calling operation states its own absent-resource wording.
@@ -723,6 +830,50 @@ impl ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
             .then(|| standard_resource_not_supported_message(listener_arn))
     }
 
+    /// The cross-family refusal a STANDARD endpoint-group lookup of `endpoint_group_arn`
+    /// owes — the rule [`Self::custom_routing_accelerator_crossing`] states, two levels
+    /// down.
+    pub fn custom_routing_endpoint_group_crossing(
+        &self,
+        endpoint_group_arn: &str,
+    ) -> Option<String> {
+        self.custom_routing_endpoint_groups
+            .contains_key(endpoint_group_arn)
+            .then(|| custom_routing_api_required_message(endpoint_group_arn))
+    }
+
+    /// The cross-family refusal a CUSTOM ROUTING endpoint-group lookup of
+    /// `endpoint_group_arn` owes — [`Self::custom_routing_endpoint_group_crossing`] in the
+    /// other direction.
+    pub fn standard_endpoint_group_crossing(&self, endpoint_group_arn: &str) -> Option<String> {
+        self.endpoint_groups
+            .contains_key(endpoint_group_arn)
+            .then(|| standard_resource_not_supported_message(endpoint_group_arn))
+    }
+
+    /// What a STANDARD endpoint-group lookup that found nothing states: the family
+    /// crossing when the custom routing family holds that ARN
+    /// ([`Self::custom_routing_endpoint_group_crossing`]), else this service's
+    /// absent-resource wording ([`endpoint_group_not_found_message`]).
+    ///
+    /// One place for the pair so every standard operation that resolves an
+    /// `EndpointGroupArn` — a read, an update, a delete, an endpoint add or remove — tells
+    /// a caller that used the wrong API family the same thing.
+    pub fn standard_endpoint_group_not_found_message(&self, endpoint_group_arn: &str) -> String {
+        self.custom_routing_endpoint_group_crossing(endpoint_group_arn)
+            .unwrap_or_else(|| endpoint_group_not_found_message(endpoint_group_arn))
+    }
+
+    /// What a CUSTOM ROUTING endpoint-group lookup that found nothing states —
+    /// [`Self::standard_endpoint_group_not_found_message`] in the other direction.
+    pub fn custom_routing_endpoint_group_not_found_message(
+        &self,
+        endpoint_group_arn: &str,
+    ) -> String {
+        self.standard_endpoint_group_crossing(endpoint_group_arn)
+            .unwrap_or_else(|| endpoint_group_not_found_message(endpoint_group_arn))
+    }
+
     /// Drop every idempotency record whose resource is gone.
     ///
     /// This is the release path for [`Self::idempotency`]: a record is only useful
@@ -738,6 +889,7 @@ impl ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
             listeners,
             custom_routing_listeners,
             endpoint_groups,
+            custom_routing_endpoint_groups,
             idempotency,
             ..
         } = self;
@@ -747,6 +899,7 @@ impl ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State {
                 || listeners.contains_key(minted)
                 || custom_routing_listeners.contains_key(minted)
                 || endpoint_groups.contains_key(minted)
+                || custom_routing_endpoint_groups.contains_key(minted)
         });
         debug_assert!(idempotency.len() <= MAX_IDEMPOTENCY_RECORDS);
     }
@@ -820,6 +973,16 @@ pub fn custom_routing_listener_idempotency_key(accelerator_arn: &str, token: &st
 /// the same token sent against a different listener is a different create request.
 pub fn endpoint_group_idempotency_key(listener_arn: &str, token: &str) -> String {
     format!("endpoint-group:{listener_arn}:{token}")
+}
+
+/// An `IdempotencyToken` key for `CreateCustomRoutingEndpointGroup`.
+///
+/// Scoped by the PARENT listener like [`endpoint_group_idempotency_key`], but under its
+/// OWN kind, for the reason [`custom_routing_accelerator_idempotency_key`] gives: the same
+/// token sent to the standard endpoint group create is a different request against a
+/// different resource kind, so neither may replay the other's endpoint group.
+pub fn custom_routing_endpoint_group_idempotency_key(listener_arn: &str, token: &str) -> String {
+    format!("custom-routing-endpoint-group:{listener_arn}:{token}")
 }
 
 /// Mint an accelerator ARN: the account-scoped ARN of one accelerator, over the record's
@@ -986,6 +1149,15 @@ pub fn validate_port_range(range: &PortRange) -> Result<(i32, i32), String> {
     let (Some(from), Some(to)) = (range.from_port, range.to_port) else {
         return Err("a PortRange must carry both FromPort and ToPort".to_string());
     };
+    validate_port_bounds(from, to)
+}
+
+/// The inclusive bounds of one port range, validated.
+///
+/// The rule [`validate_port_range`] states, over a range whose two ends the model makes
+/// REQUIRED (`CustomRoutingDestinationConfiguration$FromPort` / `$ToPort`) rather than
+/// optional, so both callers refuse the same ranges with the same words.
+pub fn validate_port_bounds(from: i32, to: i32) -> Result<(i32, i32), String> {
     if !(1..=65535).contains(&from) || !(1..=65535).contains(&to) {
         return Err(format!(
             "PortRange {from}-{to} is outside the supported port range 1-65535"
@@ -1146,6 +1318,41 @@ pub fn endpoints_from_configurations(
     Ok(endpoints)
 }
 
+/// A `CustomRoutingDestinationConfigurations` list as the destinations the store holds.
+///
+/// Each configuration "sets the port range and protocol for all endpoints (virtual private
+/// cloud subnets) in a custom routing endpoint group to accept client traffic on"
+/// (`CreateCustomRoutingEndpointGroup$DestinationConfigurations`), so a configuration whose
+/// range names no port — the rule [`validate_port_bounds`] states — sets nothing. Returns
+/// the message for an `InvalidPortRangeException`.
+///
+/// The list is refused past [`MAX_DESTINATIONS_PER_ENDPOINT_GROUP`] BEFORE it is walked, so
+/// neither the work this helper does nor the vector the store ends up holding is
+/// proportional to a length the caller chose.
+pub fn destinations_from_configurations(
+    configurations: &[CustomRoutingDestinationConfiguration],
+) -> Result<Vec<StoredCustomRoutingDestination>, String> {
+    if configurations.len() > MAX_DESTINATIONS_PER_ENDPOINT_GROUP {
+        return Err(format!(
+            "DestinationConfigurations holds {} entries; an endpoint group has at most \
+             {MAX_DESTINATIONS_PER_ENDPOINT_GROUP}",
+            configurations.len()
+        ));
+    }
+    let mut destinations: Vec<StoredCustomRoutingDestination> =
+        Vec::with_capacity(configurations.len());
+    for configuration in configurations {
+        let (from_port, to_port) =
+            validate_port_bounds(configuration.from_port, configuration.to_port)?;
+        destinations.push(StoredCustomRoutingDestination {
+            from_port,
+            to_port,
+            protocols: configuration.protocols.clone(),
+        });
+    }
+    Ok(destinations)
+}
+
 /// Validate a caller-supplied static IPv4 address (the BYOIP path of
 /// `CreateAccelerator$IpAddresses`). Returns the message for an
 /// `InvalidArgumentException`.
@@ -1284,6 +1491,20 @@ pub fn endpoint_group_not_found_message(endpoint_group_arn: &str) -> String {
 /// the Region, nor the listener, nor the group that already covers it. Every duplicate
 /// therefore gets the same text, and no generated identifier leaks into it.
 pub const ENDPOINT_GROUP_ALREADY_EXISTS_MESSAGE: &str = "Endpoint group already exists.";
+
+/// The message an endpoint group create states when its accelerator already holds as many
+/// endpoint groups as [`MAX_ENDPOINT_GROUPS_PER_ACCELERATOR`] allows.
+///
+/// One place for the wording so both endpoint group creates — the standard family's and
+/// the custom routing family's — state the quota they refused against alike, with the
+/// accelerator and the limit interpolated rather than written into the sentence; the same
+/// rule [`accelerator_quota_exceeded_message`] states one level up.
+pub fn endpoint_group_quota_exceeded_message(accelerator_arn: &str) -> String {
+    format!(
+        "Accelerator {accelerator_arn} already holds the maximum of \
+         {MAX_ENDPOINT_GROUPS_PER_ACCELERATOR} endpoint groups."
+    )
+}
 
 /// The message for an endpoint whose `AttachmentArn` names a cross-account attachment the
 /// store does not hold.

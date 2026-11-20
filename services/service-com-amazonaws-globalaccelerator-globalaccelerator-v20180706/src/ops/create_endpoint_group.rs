@@ -337,10 +337,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(CreateEndpointGroupErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "Accelerator {accelerator_arn} already holds the maximum of {} endpoint \
-                         groups.",
-                        crate::state::MAX_ENDPOINT_GROUPS_PER_ACCELERATOR
+                    message: Some(crate::state::endpoint_group_quota_exceeded_message(
+                        &accelerator_arn,
                     )),
                 },
             )

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCustomRoutingEndpointGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCustomRoutingEndpointGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCustomRoutingEndpointGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the CUSTOM ROUTING endpoint group [`crate::state`] holds under the
+//! `EndpointGroupArn` the request names — its Region, its destination descriptions and
+//! its endpoints, exactly as persisted — and writes nothing. An `EndpointGroupArn` that
+//! names a STANDARD endpoint group is refused as the family crossing it is; one that names
+//! no endpoint group of either family is `EndpointGroupNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +138,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCustomRoutingEndpointGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCustomRoutingEndpointGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCustomRoutingEndpointGroup"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeCustomRoutingEndpointGroupErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Global Accelerator store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let store = state.lock();
+        let Some(record) = store
+            .custom_routing_endpoint_groups
+            .get(&input.endpoint_group_arn)
+        else {
+            // A standard endpoint group's ARN names a resource that exists and is served
+            // by the standard APIs, so it is refused as a family crossing rather than as
+            // an absent resource.
+            return Err(
+                DescribeCustomRoutingEndpointGroupErrorModeled::EndpointGroupNotFoundException(
+                    EndpointGroupNotFoundException {
+                        message: Some(
+                            store.custom_routing_endpoint_group_not_found_message(
+                                &input.endpoint_group_arn,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeCustomRoutingEndpointGroupOutput {
+            endpoint_group: Some(record.to_wire()),
+        })
     }
 }

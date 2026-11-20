@@ -163,12 +163,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         let Some(record) = store.endpoint_groups.remove(&input.endpoint_group_arn) else {
+            // A custom routing endpoint group's ARN names a resource that exists and is
+            // served by the Custom Routing APIs, so it is refused as a family crossing
+            // rather than as an absent resource.
+            let message = store.standard_endpoint_group_not_found_message(&input.endpoint_group_arn);
             return Err(
                 DeleteEndpointGroupErrorModeled::EndpointGroupNotFoundException(
                     EndpointGroupNotFoundException {
-                        message: Some(crate::state::endpoint_group_not_found_message(
-                            &input.endpoint_group_arn,
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into(),

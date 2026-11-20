@@ -200,12 +200,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // Resolved BEFORE the mutable lookup below: the family-crossing half of this
+        // sentence reads the other family's map, which the borrow that lookup takes out
+        // would rule out.
+        let absent = store.standard_endpoint_group_not_found_message(&input.endpoint_group_arn);
         let Some(record) = store.endpoint_groups.get_mut(&input.endpoint_group_arn) else {
             return Err(RemoveEndpointsErrorModeled::EndpointGroupNotFoundException(
                 EndpointGroupNotFoundException {
-                    message: Some(crate::state::endpoint_group_not_found_message(
-                        &input.endpoint_group_arn,
-                    )),
+                    message: Some(absent),
                 },
             )
             .into());

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomRoutingEndpointGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomRoutingEndpointGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomRoutingEndpointGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and PERSISTS an endpoint group under its parent CUSTOM ROUTING listener in
+//! [`crate::state`]: an `EndpointGroupArn` derived from the parent's ARN, the Region the
+//! request names and the destination configurations it carries. A
+//! `CustomRoutingEndpointGroup` carries no health check, no traffic dial and no port
+//! overrides — the model gives it only the Region, the destination descriptions and the
+//! endpoints — and a create adds no endpoints, which join through
+//! `AddCustomRoutingEndpoints`. A `ListenerArn` that names no custom routing listener is
+//! `ListenerNotFoundException`; a destination range that names no ports is
+//! `InvalidPortRangeException`; a Region the parent listener already has a group in is
+//! `EndpointGroupAlreadyExistsException`; a parent accelerator already at the documented
+//! per-accelerator endpoint group quota is `LimitExceededException`. Repeating the call
+//! with the same `IdempotencyToken` returns the endpoint group that token already minted.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +168,177 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomRoutingEndpointGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomRoutingEndpointGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomRoutingEndpointGroup"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateCustomRoutingEndpointGroupErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Global Accelerator store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Everything that depends only on the request is checked before the store is
+        // touched, so a refused create writes nothing.
+
+        // "An endpoint group is a collection of endpoints in one Amazon Web Services
+        // Region": a group with no Region names no collection.
+        if input.endpoint_group_region.is_empty() {
+            return Err(
+                CreateCustomRoutingEndpointGroupErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(
+                            "EndpointGroupRegion must name an Amazon Web Services Region"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let destinations =
+            match crate::state::destinations_from_configurations(&input.destination_configurations)
+            {
+                Ok(destinations) => destinations,
+                Err(message) => {
+                    return Err(
+                        CreateCustomRoutingEndpointGroupErrorModeled::InvalidPortRangeException(
+                            InvalidPortRangeException {
+                                message: Some(message),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            };
+
+        let mut store = state.lock();
+
+        // A custom routing endpoint group hangs off a custom routing listener: a standard
+        // listener's ARN names a resource the standard APIs serve, not a parent for this
+        // create.
+        let Some(listener) = store.custom_routing_listeners.get(&input.listener_arn) else {
+            return Err(
+                CreateCustomRoutingEndpointGroupErrorModeled::ListenerNotFoundException(
+                    ListenerNotFoundException {
+                        message: Some(
+                            store
+                                .standard_listener_crossing(&input.listener_arn)
+                                .unwrap_or_else(|| {
+                                    crate::state::listener_not_found_message(&input.listener_arn)
+                                }),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let accelerator_arn = listener.accelerator_arn.clone();
+        let group_arns = listener.endpoint_group_arns.clone();
+        if !store
+            .custom_routing_accelerators
+            .contains_key(&accelerator_arn)
+        {
+            return Err(
+                CreateCustomRoutingEndpointGroupErrorModeled::AcceleratorNotFoundException(
+                    AcceleratorNotFoundException {
+                        message: Some(crate::state::accelerator_not_found_message(
+                            &accelerator_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The same token against the same listener is the same create request: replay the
+        // group it minted rather than minting a second one.
+        let token_key = crate::state::custom_routing_endpoint_group_idempotency_key(
+            &input.listener_arn,
+            &input.idempotency_token,
+        );
+        if let Some(minted) = store.idempotency.get(&token_key) {
+            if let Some(existing) = store.custom_routing_endpoint_groups.get(minted) {
+                return Ok(CreateCustomRoutingEndpointGroupOutput {
+                    endpoint_group: Some(existing.to_wire()),
+                });
+            }
+        }
+
+        // "An Amazon Web Services Region can have only one endpoint group for a specific
+        // listener" (`CustomRoutingEndpointGroup` doc). The refusal is the fixed sentence
+        // the service states this conflict with
+        // ([`crate::state::ENDPOINT_GROUP_ALREADY_EXISTS_MESSAGE`]): it names neither the
+        // Region nor an ARN, so no generated identifier reaches it.
+        if group_arns.iter().any(|arn| {
+            store
+                .custom_routing_endpoint_groups
+                .get(arn)
+                .is_some_and(|group| group.endpoint_group_region == input.endpoint_group_region)
+        }) {
+            return Err(
+                CreateCustomRoutingEndpointGroupErrorModeled::EndpointGroupAlreadyExistsException(
+                    EndpointGroupAlreadyExistsException {
+                        message: Some(
+                            crate::state::ENDPOINT_GROUP_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The per-accelerator quota bounds this store, the same way it bounds the standard
+        // family's endpoint groups: an accelerator's endpoint groups are counted across
+        // every one of its listeners.
+        if store.custom_routing_endpoint_group_count(&accelerator_arn)
+            >= crate::state::MAX_ENDPOINT_GROUPS_PER_ACCELERATOR
+        {
+            return Err(
+                CreateCustomRoutingEndpointGroupErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::endpoint_group_quota_exceeded_message(
+                            &accelerator_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Past every refusal, so a refused create still writes nothing: stale idempotency
+        // records are released as this one's is added.
+        store.prune_idempotency();
+
+        let uuid = store.mint_uuid();
+        let arn = crate::state::mint_endpoint_group_arn(&input.listener_arn, &uuid);
+        let record = crate::state::StoredCustomRoutingEndpointGroup {
+            arn: arn.clone(),
+            listener_arn: input.listener_arn.clone(),
+            endpoint_group_region: input.endpoint_group_region.clone(),
+            destinations,
+            // "Endpoints for a custom routing accelerator are virtual private cloud (VPC)
+            // subnets", added through `AddCustomRoutingEndpoints`: this create configures
+            // the destinations, not the membership.
+            endpoint_ids: Vec::new(),
+        };
+        let endpoint_group = record.to_wire();
+
+        if let Some(parent) = store
+            .custom_routing_listeners
+            .get_mut(&input.listener_arn)
+        {
+            parent.endpoint_group_arns.push(arn.clone());
+        }
+        store.idempotency.insert(token_key, arn.clone());
+        store.custom_routing_endpoint_groups.insert(arn, record);
+
+        Ok(CreateCustomRoutingEndpointGroupOutput {
+            endpoint_group: Some(endpoint_group),
+        })
     }
 }
