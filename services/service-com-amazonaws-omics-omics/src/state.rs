@@ -12,7 +12,8 @@
 //! (`CreateSequenceStore` / `GetSequenceStore` / `DeleteSequenceStore`), together with the **multipart read set
 //! upload** a caller initiates against that store
 //! (`CreateMultipartReadSetUpload`) and the **parts** uploaded into it
-//! (`UploadReadSetPart` / `ListReadSetUploadParts`). Each resource is stored exactly once, keyed by the numeric id
+//! (`UploadReadSetPart` / `ListReadSetUploadParts`), and the **read set** that upload's
+//! completion forms (`CompleteMultipartReadSetUpload` / `GetReadSetMetadata`). Each resource is stored exactly once, keyed by the numeric id
 //! the model's `^[0-9]+$` patterns describe (a version by its name, inside its
 //! workflow's record), so every operation reads and writes the one record.
 //!
@@ -26,8 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    ContainerRegistryMap, DefinitionRepository, DefinitionRepositoryDetails, SequenceStoreS3Access,
-    ShareDetails, SseConfig, WorkflowParameter,
+    ContainerRegistryMap, DefinitionRepository, DefinitionRepositoryDetails, FileInformation,
+    ReadSetFiles, SequenceInformation, SequenceStoreS3Access, ShareDetails, SseConfig,
+    WorkflowParameter,
 };
 
 /// The ARN service namespace for this service (`arnNamespace`/sigv4 name `omics`).
@@ -51,6 +53,11 @@ pub const RUN_ARN_RESOURCE_PREFIX: &str = "run/";
 
 /// The resource portion a sequence store ARN carries before its id.
 pub const SEQUENCE_STORE_ARN_RESOURCE_PREFIX: &str = "sequenceStore/";
+
+/// What a read set ARN carries between its sequence store's id and its own: a read set
+/// is named INSIDE the store that holds it — every read set operation names both ids —
+/// so one ARN names the pair and no read set ARN can collide with a store's own.
+pub const READ_SET_ARN_INFIX: &str = "/readSet/";
 
 /// The resource portion a run cache ARN carries before its id.
 pub const RUN_CACHE_ARN_RESOURCE_PREFIX: &str = "runCache/";
@@ -124,12 +131,39 @@ pub const FIRST_SEQUENCE_STORE_ID: u64 = 1_000_000_000;
 /// instead of reaching an unrelated record.
 pub const UPLOAD_ID_OFFSET: u64 = 1_000_000_000;
 
+/// How far above [`FIRST_SEQUENCE_STORE_ID`] the read-set counter starts.
+///
+/// The modelled `ReadSetId` is the same `^[0-9]+$` with length 10..36 as a
+/// `SequenceStoreId` and an `UploadId`, so every id this mints is ten digits wide too.
+/// Offsetting it past [`UPLOAD_ID_OFFSET`] keeps a read set id in its own range, so a
+/// cross-type mix-up (an upload id handed to a read set operation) resolves to nothing
+/// and is answered "not found" instead of reaching an unrelated record.
+pub const READ_SET_ID_OFFSET: u64 = 2_000_000_000;
+
 /// `SequenceStoreStatus` a freshly created sequence store carries, from the modelled
 /// `SequenceStoreStatus` enum.
 pub const SEQUENCE_STORE_STATUS_CREATING: &str = "CREATING";
 /// The `SequenceStoreStatus` the clock owes a `CREATING` sequence store, from the same
 /// enum.
 pub const SEQUENCE_STORE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `ReadSetStatus` a read set carries from the moment the upload that formed it was
+/// completed, from the modelled `ReadSetStatus` enum: the service has taken the uploaded
+/// parts and is still turning them into the read set's files.
+pub const READ_SET_STATUS_PROCESSING_UPLOAD: &str = "PROCESSING_UPLOAD";
+
+/// The `ReadSetStatus` the clock owes a `PROCESSING_UPLOAD` read set, from the same
+/// enum: the status a read set a caller can read back holds.
+pub const READ_SET_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The `ReadSetStatus` of a read set that has been deleted, from the same enum. A read
+/// set in it holds nothing a store still needs to keep.
+pub const READ_SET_STATUS_DELETED: &str = "DELETED";
+
+/// The `CreationType` of a read set formed by completing a multipart read set upload,
+/// from the modelled `CreationType` enum (IMPORT | UPLOAD): the caller uploaded it
+/// rather than importing it from an object store.
+pub const CREATION_TYPE_UPLOAD: &str = "UPLOAD";
 
 /// The `ETagAlgorithmFamily` applied when `CreateSequenceStore` omits
 /// `eTagAlgorithmFamily`.
@@ -250,6 +284,20 @@ pub const SEQUENCE_STORE_NOT_FOUND_MESSAGE: &str = "The specified sequence store
 /// presented under another store is "does not exist" too.
 pub const MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE: &str =
     "The specified upload does not exist.";
+
+/// The same wording class again, for the read set an operation resolves inside a
+/// sequence store. A read set belongs to the store it was created in, so a read set id
+/// presented under another store is "does not exist" too.
+pub const READ_SET_NOT_FOUND_MESSAGE: &str = "The specified read set does not exist.";
+
+/// What a delete answers when the resource it names still has resources of its own
+/// hanging off it — a sequence store that still holds read sets, say.
+///
+/// The service words this refusal as FIXED text for the whole condition: the sentence
+/// states that the resource is associated with others and echoes nothing of the request,
+/// so one wording serves every delete that is blocked by what the resource still holds.
+pub const RESOURCE_HAS_DEPENDENTS_MESSAGE: &str =
+    "The specified resource is associated with other resources and cannot be deleted.";
 
 /// What an operation that resolves a CALLER-SUPPLIED resource ARN answers when the ARN
 /// names no resource this emulator holds.
@@ -446,6 +494,22 @@ pub const MAX_MULTIPART_READ_SET_UPLOADS: usize = 100;
 /// so a part past it is refused with the modelled `ServiceQuotaExceededException`
 /// instead of being held.
 pub const MAX_READ_SET_UPLOAD_PART_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most read sets this emulator will hold for ONE sequence store.
+///
+/// Emulator resource guard, not an AWS quota: a read set is created by a caller
+/// completing an upload and reclaimed only by an explicit delete, so the per-store
+/// collection carries a cap like every other growth site here. A completion past it is
+/// refused with the modelled `ServiceQuotaExceededException`.
+pub const MAX_READ_SETS: usize = 100;
+
+/// The most read set content bytes this emulator will hold for ONE sequence store.
+///
+/// Emulator resource guard, for the same reason [`MAX_READ_SET_UPLOAD_PART_BYTES`]
+/// exists: a read set's files are kept as the bytes the caller uploaded, and that content
+/// lives in this process's memory. A completion that would take the store past it is
+/// refused with the modelled `ServiceQuotaExceededException`.
+pub const MAX_READ_SET_BYTES: usize = 256 * 1024 * 1024;
 
 /// The most tags one workflow or run may carry.
 ///
@@ -786,6 +850,161 @@ impl ReadSetUploadPart {
         self.payload.len() as i64
     }
 }
+
+/// One read set held by a sequence store: every member `GetReadSetMetadata` reports,
+/// plus the content of each of its files.
+///
+/// A read set is what `CompleteMultipartReadSetUpload` forms out of an initiated upload
+/// and the parts uploaded into it: the descriptive members are the ones that upload
+/// carried, and the files are the parts' content, so nothing here is invented for a
+/// member the upload never named.
+#[derive(Debug, Clone, Default)]
+pub struct ReadSet {
+    /// The decimal numeric id: this record's store key, rendered.
+    pub id: String,
+    pub arn: String,
+    /// The sequence store that holds this read set, so one listing can be narrowed to the
+    /// store the request names and a read set id cannot be reached through another store.
+    pub sequence_store_id: String,
+    pub subject_id: String,
+    pub sample_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// Where the sequence originated, when the upload named it; reported inside
+    /// `sequenceInformation`.
+    pub generated_from: Option<String>,
+    pub reference_arn: Option<String>,
+    /// The modelled `FileType` of the uploaded source files.
+    pub file_type: String,
+    pub status: String,
+    pub status_message: Option<String>,
+    pub creation_time_ms: i64,
+    /// When the transition this record owes the clock becomes due, in epoch millis;
+    /// `None` once it has settled.
+    pub status_due_at_ms: Option<i64>,
+    /// How this read set came to exist, from the modelled `CreationType` enum.
+    pub creation_type: String,
+    /// The job that created it: for an uploaded read set, the multipart upload whose
+    /// completion formed it, which is the one job this emulator ran for it.
+    pub creation_job_id: String,
+    /// This read set's files, keyed by the modelled `ReadSetPartSource` their parts were
+    /// uploaded from (`SOURCE1` / `SOURCE2`), so one source is held exactly once and the
+    /// key order is the order `ReadSetFiles` lists them in.
+    pub sources: BTreeMap<String, ReadSetSource>,
+    /// The tags the upload asked for, which `CreateMultipartReadSetUpload` documents as
+    /// "The tags to add to the read set".
+    pub tags: BTreeMap<String, String>,
+}
+
+impl ReadSet {
+    /// Apply the `PROCESSING_UPLOAD` -> `ACTIVE` move the clock already owed this read
+    /// set by `now_ms`, under the same rule every other record settles by.
+    pub fn settle(&mut self, now_ms: i64) {
+        settle_creating(
+            &mut self.status,
+            &mut self.status_due_at_ms,
+            now_ms,
+            READ_SET_STATUS_ACTIVE,
+        );
+    }
+
+    /// Whether this read set still occupies its sequence store: a deleted one holds
+    /// nothing the store has to keep, so it no longer stands in the way of the store's
+    /// own delete.
+    pub fn is_held(&self) -> bool {
+        self.status != READ_SET_STATUS_DELETED
+    }
+
+    /// The bytes every file of this read set holds together.
+    pub fn held_bytes(&self) -> usize {
+        self.sources.values().map(|file| file.content.len()).sum()
+    }
+
+    /// `files` as the wire shapes want it: one `FileInformation` per source this read set
+    /// holds.
+    ///
+    /// `index` is left out: HealthOmics builds a read set's index from the sequence data
+    /// it ingests, and this emulator stores the uploaded bytes without parsing a FASTQ,
+    /// BAM or CRAM record out of them, so there is no index file to report rather than one
+    /// standing for a file nothing produced.
+    pub fn files_output(&self) -> Option<ReadSetFiles> {
+        let files = ReadSetFiles {
+            source1: self.sources.get(READ_SET_PART_SOURCE1).map(file_information),
+            source2: self.sources.get(READ_SET_PART_SOURCE2).map(file_information),
+            index: None,
+        };
+        (files.source1.is_some() || files.source2.is_some()).then_some(files)
+    }
+
+    /// `sequenceInformation` as the wire shapes want it.
+    ///
+    /// Only where the sequence came from is reported, because it is the one member the
+    /// upload itself carried. `totalReadCount`, `totalBaseCount` and `alignment` are read
+    /// by the real service out of the sequence records it ingests; nothing here parses
+    /// those records, so the members are omitted rather than filled with counts nothing
+    /// counted. The structure itself is omitted when the upload named no source.
+    pub fn sequence_information_output(&self) -> Option<SequenceInformation> {
+        let generated_from = self.generated_from.clone()?;
+        Some(SequenceInformation {
+            total_read_count: None,
+            total_base_count: None,
+            generated_from: Some(generated_from),
+            alignment: None,
+        })
+    }
+
+    /// `tags` as the wire shapes want it: omitted when none were ever set.
+    pub fn tags_output(&self) -> Option<HashMap<String, String>> {
+        tags_output(&self.tags)
+    }
+}
+
+/// One file of a read set: the content uploaded from one `ReadSetPartSource`, and what
+/// `FileInformation` reports for it.
+#[derive(Debug, Clone, Default)]
+pub struct ReadSetSource {
+    /// The modelled `ReadSetPartSource` this file's parts were uploaded from: this
+    /// record's key inside its read set, rendered.
+    pub part_source: String,
+    /// The file's content: the parts that formed it, in ascending part-number order.
+    pub content: Vec<u8>,
+    /// How many parts formed it, as the modelled `totalParts` reports it.
+    pub total_parts: i32,
+    /// The size of the part the file was uploaded in, as the modelled `partSize` reports
+    /// it: the FIRST part's length, which is the part size a multipart upload is made
+    /// with (only its last part may be shorter).
+    pub part_size: i64,
+}
+
+impl ReadSetSource {
+    /// The file's length, as the modelled `contentLength` (a `Long`) reports it.
+    pub fn content_length(&self) -> i64 {
+        self.content.len() as i64
+    }
+}
+
+/// `FileInformation` for one read set file.
+///
+/// `s3Access` is omitted: it carries the S3 URI the real service exposes the file at, and
+/// this emulator serves no object store, so there is no location a client could reach and
+/// the member is left out rather than filled with an address nothing answers on \u2014 the
+/// same rule [`SequenceStore::s3_access_output`] applies to the store's own S3 access.
+fn file_information(file: &ReadSetSource) -> FileInformation {
+    FileInformation {
+        total_parts: Some(file.total_parts),
+        part_size: Some(file.part_size),
+        content_length: Some(file.content_length()),
+        s3_access: None,
+    }
+}
+
+/// The modelled `ReadSetPartSource` of a read set's first file.
+/// Source: `smithy_query(query="shape",shape="ReadSetPartSource")` -> SOURCE1 | SOURCE2.
+pub const READ_SET_PART_SOURCE1: &str = "SOURCE1";
+
+/// The modelled `ReadSetPartSource` of a read set's second file, which a paired-end
+/// upload carries beside the first.
+pub const READ_SET_PART_SOURCE2: &str = "SOURCE2";
 
 /// One stored run cache: every member `GetRunCache` reports.
 ///
@@ -1153,6 +1372,10 @@ pub struct ComAmazonawsOmicsOmicsState {
     /// order for the same reason. Each record names the sequence store it writes into,
     /// so one store's uploads are the records that name it.
     pub multipart_read_set_uploads: BTreeMap<u64, MultipartReadSetUpload>,
+    /// Every read set, keyed by its numeric read set id, in creation order for the same
+    /// reason. Each record names the sequence store that holds it, so one store's read
+    /// sets are the records that name it.
+    pub read_sets: BTreeMap<u64, ReadSet>,
     /// Every run cache, keyed by its numeric id, in creation order for the same reason.
     pub run_caches: BTreeMap<u64, RunCache>,
     /// Every run group, keyed by its numeric id, in creation order for the same reason.
@@ -1172,6 +1395,7 @@ pub struct ComAmazonawsOmicsOmicsState {
     next_run_id: u64,
     next_sequence_store_id: u64,
     next_multipart_read_set_upload_id: u64,
+    next_read_set_id: u64,
     next_run_cache_id: u64,
     next_run_group_id: u64,
     next_share_key: u64,
@@ -1193,6 +1417,9 @@ impl ComAmazonawsOmicsOmicsState {
         }
         for share in self.shares.values_mut() {
             share.settle(now_ms);
+        }
+        for read_set in self.read_sets.values_mut() {
+            read_set.settle(now_ms);
         }
         // A run cache owes the clock nothing: no value of the modelled
         // `RunCacheStatus` enum is a transient "being created" state, so a cache is
@@ -1237,12 +1464,13 @@ impl ComAmazonawsOmicsOmicsState {
     /// with everything held INSIDE it, and answer the record that was removed (`None`
     /// when no store carries that id).
     ///
-    /// The store's own tags and the multipart read set uploads initiated against it live
-    /// inside the store: every upload operation names the store its upload belongs to, so
-    /// an upload left behind here would be a record nothing could ever read, finish or
-    /// abort. `DeleteSequenceStore` documents that reclamation for the tags ("When a
-    /// sequence store is deleted, all tags associated with the store are also deleted"),
-    /// and it is the same rule for every other record scoped to the store.
+    /// The store's own tags, the multipart read set uploads initiated against it and the
+    /// read sets it holds live inside the store: every upload and read set operation names
+    /// the store its record belongs to, so a record left behind here would be one nothing
+    /// could ever read, finish or abort. `DeleteSequenceStore` documents that reclamation
+    /// for the tags ("When a sequence store is deleted, all tags associated with the store
+    /// are also deleted"), and it is the same rule for every other record scoped to the
+    /// store.
     pub fn remove_sequence_store(&mut self, id: &str) -> Option<SequenceStore> {
         let key = numeric_id(id)?;
         let store = self.sequence_stores.remove(&key)?;
@@ -1251,6 +1479,8 @@ impl ComAmazonawsOmicsOmicsState {
         // `^[0-9]+$` admits leading zeros) is still reclaimed with it.
         self.multipart_read_set_uploads
             .retain(|_, upload| numeric_id(&upload.sequence_store_id) != Some(key));
+        self.read_sets
+            .retain(|_, read_set| numeric_id(&read_set.sequence_store_id) != Some(key));
         Some(store)
     }
 
@@ -1292,6 +1522,71 @@ impl ComAmazonawsOmicsOmicsState {
         self.multipart_read_set_uploads
             .get_mut(&numeric_id(upload_id)?)
             .filter(|upload| upload.sequence_store_id == sequence_store_id)
+    }
+
+    /// Remove the multipart read set upload `upload_id` from the store
+    /// `sequence_store_id`, and answer the record that was removed (`None` when that pair
+    /// names no upload this emulator holds).
+    ///
+    /// An upload is spent once it is completed or aborted: the parts it collected are no
+    /// longer something a caller can add to, list or finish, so the record goes rather
+    /// than lingering as an upload nothing can act on.
+    pub fn remove_multipart_read_set_upload(
+        &mut self,
+        sequence_store_id: &str,
+        upload_id: &str,
+    ) -> Option<MultipartReadSetUpload> {
+        let key = numeric_id(upload_id)?;
+        // Resolved by the same rule every other upload lookup uses, so an upload id
+        // presented under another store is not removed from the store it belongs to.
+        self.multipart_read_set_upload(sequence_store_id, upload_id)?;
+        self.multipart_read_set_uploads.remove(&key)
+    }
+
+    /// The read set the modelled `ReadSetId` `id` names INSIDE the sequence store
+    /// `sequence_store_id`, or `None`.
+    ///
+    /// A read set belongs to the store that holds it — every read set operation names both
+    /// ids — so a read set id presented under another store resolves to nothing here
+    /// rather than reaching that record.
+    pub fn read_set(&self, sequence_store_id: &str, id: &str) -> Option<&ReadSet> {
+        self.read_sets
+            .get(&numeric_id(id)?)
+            .filter(|read_set| read_set.sequence_store_id == sequence_store_id)
+    }
+
+    /// The same record, for an operation that CHANGES the read set. One lookup rule for
+    /// both, so a read and a write cannot disagree about which read set a pair of ids
+    /// names.
+    pub fn read_set_mut(&mut self, sequence_store_id: &str, id: &str) -> Option<&mut ReadSet> {
+        self.read_sets
+            .get_mut(&numeric_id(id)?)
+            .filter(|read_set| read_set.sequence_store_id == sequence_store_id)
+    }
+
+    /// Every read set held by `sequence_store_id`, in creation order: the map's own key
+    /// order.
+    pub fn read_sets_for<'a>(
+        &'a self,
+        sequence_store_id: &'a str,
+    ) -> impl Iterator<Item = (&'a u64, &'a ReadSet)> + 'a {
+        self.read_sets
+            .iter()
+            .filter(move |(_, read_set)| read_set.sequence_store_id == sequence_store_id)
+    }
+
+    /// Whether `sequence_store_id` still holds a read set, which is what stands in the way
+    /// of deleting the store itself.
+    pub fn holds_read_sets(&self, sequence_store_id: &str) -> bool {
+        self.read_sets_for(sequence_store_id)
+            .any(|(_, read_set)| read_set.is_held())
+    }
+
+    /// The content bytes every read set of `sequence_store_id` holds together.
+    pub fn read_set_bytes_held(&self, sequence_store_id: &str) -> usize {
+        self.read_sets_for(sequence_store_id)
+            .map(|(_, read_set)| read_set.held_bytes())
+            .sum()
     }
 
     /// The run cache the modelled `RunCacheId` `id` names, or `None`.
@@ -1464,6 +1759,16 @@ impl ComAmazonawsOmicsOmicsState {
         let key =
             FIRST_SEQUENCE_STORE_ID + UPLOAD_ID_OFFSET + self.next_multipart_read_set_upload_id;
         self.next_multipart_read_set_upload_id += 1;
+        (key, key.to_string())
+    }
+
+    /// Mint the next read set id, from [`FIRST_SEQUENCE_STORE_ID`] plus
+    /// [`READ_SET_ID_OFFSET`] so every one is the ten-digit decimal the modelled
+    /// `ReadSetId` length admits and no read set shares an id with a sequence store or an
+    /// upload.
+    pub fn next_read_set_id(&mut self) -> (u64, String) {
+        let key = FIRST_SEQUENCE_STORE_ID + READ_SET_ID_OFFSET + self.next_read_set_id;
+        self.next_read_set_id += 1;
         (key, key.to_string())
     }
 
@@ -1687,6 +1992,23 @@ pub fn sequence_store_arn(region: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{SEQUENCE_STORE_ARN_RESOURCE_PREFIX}{id}"),
+    )
+}
+
+/// The ARN of the read set `read_set_id` held by the sequence store `sequence_store_id`
+/// in `region`.
+///
+/// The read set is named inside its store's own resource path, so one ARN names the pair.
+/// Well inside the modelled `ReadSetArn` length (1..127): the account and region are
+/// fixed and each id is at most 36 characters.
+pub fn read_set_arn(region: &str, sequence_store_id: &str, read_set_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!(
+            "{SEQUENCE_STORE_ARN_RESOURCE_PREFIX}{sequence_store_id}\
+             {READ_SET_ARN_INFIX}{read_set_id}"
+        ),
     )
 }
 
@@ -1944,6 +2266,9 @@ pub enum AuditOutcome {
     /// A part was stored against a multipart read set upload, replacing whatever that
     /// source and part number held before.
     ReadSetUploadPartStored,
+    /// A multipart read set upload was completed: its parts were formed into a read set
+    /// held by the sequence store, and the upload itself is spent.
+    ReadSetCreated,
     /// A run cache was minted and stored.
     RunCacheCreated,
     /// A run group was minted and stored.
@@ -1992,6 +2317,7 @@ impl AuditOutcome {
             Self::SequenceStoreDeleted => "sequence-store-deleted",
             Self::MultipartReadSetUploadCreated => "multipart-read-set-upload-created",
             Self::ReadSetUploadPartStored => "read-set-upload-part-stored",
+            Self::ReadSetCreated => "read-set-created",
             Self::RunCacheCreated => "run-cache-created",
             Self::RunGroupCreated => "run-group-created",
             Self::RunGroupUpdated => "run-group-updated",

@@ -176,6 +176,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // would report at this instant.
         registry.settle(now_ms);
 
+        // A store that still holds read sets is not empty, and its read sets are not
+        // reclaimed by deleting it: they are resources of their own, each readable by its
+        // own id, so the delete is refused until they are gone rather than discarding
+        // them. The store itself is resolved first, so a store this emulator does not hold
+        // is still "not found" rather than reported as holding nothing.
+        if registry.sequence_store(&input.id).is_some() && registry.holds_read_sets(&input.id) {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::Conflict,
+                Some(&input.id),
+            );
+            return Err(DeleteSequenceStoreErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::RESOURCE_HAS_DEPENDENTS_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
         // The store and everything scoped to it go in one step, under the state module's
         // own rule, so no upload is left holding an id nothing can reach.
         let Some(store) = registry.remove_sequence_store(&input.id) else {

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetReadSetMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetReadSetMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetReadSetMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the one read set the request names inside the sequence store that holds it,
+//! every member read from that stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +174,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetReadSetMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetReadSetMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetReadSetMetadata"))
+        // Reporting only: every member below is read from the stored read set, and the
+        // only write is the status transition the clock already owed it, which was due at
+        // the same instant whether or not anybody called.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            GetReadSetMetadataErrorModeled::InternalServerException(InternalServerException {
+                message: "the omics sequence store registry is unavailable".to_string(),
+            })
+        })?;
+
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // A read set is held BY a sequence store, so there is no read set collection to
+        // reach when the store the path names is not one this emulator holds.
+        if registry.sequence_store(&input.sequence_store_id).is_none() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.sequence_store_id),
+            );
+            return Err(GetReadSetMetadataErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let Some(read_set) = registry.read_set(&input.sequence_store_id, &input.id) else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.id),
+            );
+            return Err(GetReadSetMetadataErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::READ_SET_NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        let response = GetReadSetMetadataOutput {
+            id: read_set.id.clone(),
+            arn: read_set.arn.clone(),
+            sequence_store_id: read_set.sequence_store_id.clone(),
+            subject_id: Some(read_set.subject_id.clone()),
+            sample_id: Some(read_set.sample_id.clone()),
+            status: read_set.status.clone(),
+            name: Some(read_set.name.clone()),
+            description: read_set.description.clone(),
+            file_type: read_set.file_type.clone(),
+            creation_time: crate::state::timestamp(read_set.creation_time_ms),
+            sequence_information: read_set.sequence_information_output(),
+            reference_arn: read_set.reference_arn.clone(),
+            files: read_set.files_output(),
+            status_message: read_set.status_message.clone(),
+            creation_type: Some(read_set.creation_type.clone()),
+            // `etag` is left out. The published ETag algorithm families are computed by
+            // the real service over the sequence records it ingests; this emulator holds
+            // the uploaded bytes without parsing a FASTQ, BAM or CRAM record out of them,
+            // so a hash of anything else would be indistinguishable on the wire from the
+            // service's own while never matching a client's — the member is omitted
+            // rather than filled with a digest of something else.
+            etag: None,
+            creation_job_id: Some(read_set.creation_job_id.clone()),
+        };
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::Reported,
+            Some(&input.id),
+        );
+
+        Ok(response)
     }
 }

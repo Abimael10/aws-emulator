@@ -26,15 +26,20 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_omics_omics::state::{
-    MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE, SEQUENCE_STORE_NOT_FOUND_MESSAGE,
+    service_state, CREATION_TYPE_UPLOAD, FIRST_SEQUENCE_STORE_ID,
+    MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE, READ_SET_ID_OFFSET, READ_SET_NOT_FOUND_MESSAGE,
+    READ_SET_STATUS_ACTIVE, READ_SET_STATUS_PROCESSING_UPLOAD, RESOURCE_HAS_DEPENDENTS_MESSAGE,
+    SEQUENCE_STORE_NOT_FOUND_MESSAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::multipart_read_set_uploads::{
     create_store, create_upload, created_upload_id, emulator_holding_its_engine, stored_upload,
+    REFERENCE_ARN,
 };
 use crate::private_workflow_runs::{
-    assert_timestamp, call, error_code, expected_digest, REGION,
+    assert_absent, assert_arn, assert_members, assert_timestamp, call, error_code, expected_digest,
+    POLL_INTERVAL, REGION, SETTLE_DEADLINE,
 };
 
 /// Every value the modelled `ReadSetPartSource` enum admits.
@@ -883,4 +888,718 @@ async fn listing_an_uploads_parts_pages_and_narrows_over_the_stored_parts() {
             "case {case:?}: expected {expected} parts, got {body:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// CompleteMultipartReadSetUpload -> GetReadSetMetadata
+// ---------------------------------------------------------------------------
+//
+// The rules the cases below assert:
+//
+// * completing a multipart read set upload forms ONE read set inside the sequence store
+//   the request names, out of the parts the request lists: each file of the read set is
+//   the content of that source's parts in ascending part-number order, however the
+//   request happened to list them, and every descriptive member is the one the upload
+//   carried;
+// * the upload is spent by the completion: nothing can be added to, listed in or aborted
+//   on it afterwards;
+// * a completion naming a part the upload does not hold, a checksum that is not the
+//   stored part's, the same part twice, or no part at all is refused and forms nothing;
+// * a sequence store that holds a read set is not empty, so deleting it is refused until
+//   its read sets are gone.
+
+/// The published bounds of the modelled `ReadSetId` length (10..36).
+/// Source: the `readSetId` member of `CompleteMultipartReadSetUploadResponse`.
+const READ_SET_ID_WIDTH: (usize, usize) = (10, 36);
+
+/// `POST /sequencestore/{store}/upload/{upload}/complete` with `parts` as the list.
+async fn complete_upload(
+    router: &MultiServiceRouter,
+    sequence_store_id: &str,
+    upload_id: &str,
+    parts: &Value,
+) -> (u16, Value) {
+    call(
+        router,
+        "POST",
+        &format!("/sequencestore/{sequence_store_id}/upload/{upload_id}/complete"),
+        Some(&json!({ "parts": parts })),
+    )
+    .await
+}
+
+/// `GET /sequencestore/{store}/readset/{id}/metadata`.
+async fn read_set_metadata(
+    router: &MultiServiceRouter,
+    sequence_store_id: &str,
+    read_set_id: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "GET",
+        &format!("/sequencestore/{sequence_store_id}/readset/{read_set_id}/metadata"),
+        None,
+    )
+    .await
+}
+
+/// `DELETE /sequencestore/{id}`.
+async fn delete_sequence_store(
+    router: &MultiServiceRouter,
+    sequence_store_id: &str,
+) -> (u16, Value) {
+    call(
+        router,
+        "DELETE",
+        &format!("/sequencestore/{sequence_store_id}"),
+        None,
+    )
+    .await
+}
+
+/// The `readSetId` of a 200 completion response, after asserting the status and its shape.
+fn completed_read_set_id(case: &str, status: u16, body: &Value) -> String {
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {body:?}");
+    let id = body
+        .get("readSetId")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: response carried no readSetId, got {body:?}"))
+        .to_string();
+    let (min, max) = READ_SET_ID_WIDTH;
+    assert!(
+        id.len() >= min && id.len() <= max && id.bytes().all(|b| b.is_ascii_digit()),
+        "case {case:?}: expected a {min}..{max} digit decimal readSetId, got {id:?}"
+    );
+    let value: u64 = id
+        .parse()
+        .unwrap_or_else(|_| panic!("case {case:?}: readSetId {id:?} does not parse as a number"));
+    let floor = FIRST_SEQUENCE_STORE_ID + READ_SET_ID_OFFSET;
+    assert!(
+        value >= floor,
+        "case {case:?}: expected a readSetId at or above {floor}, got {value}"
+    );
+    id
+}
+
+/// The parts list a completion carries: one entry per uploaded part, with the checksum
+/// `UploadReadSetPart` answered with.
+fn parts_list(parts: &[(&str, i32, String)]) -> Value {
+    Value::Array(
+        parts
+            .iter()
+            .map(|(part_source, part_number, checksum)| {
+                json!({
+                    "partSource": part_source,
+                    "partNumber": part_number,
+                    "checksum": checksum,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Upload every part of `parts` and answer the completion list entry for each, in the
+/// order the parts were uploaded.
+async fn upload_all(
+    router: &MultiServiceRouter,
+    case: &str,
+    sequence_store_id: &str,
+    upload_id: &str,
+    parts: &[(&'static str, i32, Vec<u8>)],
+) -> Vec<(&'static str, i32, String)> {
+    let mut listed = Vec::new();
+    for (part_source, part_number, payload) in parts {
+        let (status, body) = upload_part(
+            router,
+            sequence_store_id,
+            upload_id,
+            part_source,
+            *part_number,
+            payload,
+        )
+        .await;
+        let checksum = uploaded_checksum(case, status, &body);
+        assert_eq!(
+            checksum,
+            expected_digest(payload),
+            "case {case:?}: part {part_number} of {part_source} must report the digest of \
+             its own content"
+        );
+        listed.push((*part_source, *part_number, checksum));
+    }
+    listed
+}
+
+/// Read the read set until it reports `expected`, and answer that response.
+///
+/// Polling rather than sleeping a fixed span: the status is owed to the clock, so what is
+/// asserted is that it arrives, not when a single read happened to land.
+async fn await_read_set_status(
+    router: &MultiServiceRouter,
+    sequence_store_id: &str,
+    read_set_id: &str,
+    expected: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (status, body) = read_set_metadata(router, sequence_store_id, read_set_id).await;
+        assert_eq!(
+            status, 200,
+            "read set {read_set_id}: expected 200, got {body:?}"
+        );
+        if body.get("status").and_then(Value::as_str) == Some(expected) {
+            return body;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "read set {read_set_id}: expected status {expected} within {SETTLE_DEADLINE:?}, \
+             last read {body:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// A row of the completion table: what the upload carried, which parts were uploaded into
+/// it, and the descriptive members the read set must report.
+struct CompleteCase {
+    /// How the row is reported in a failure, and the upload's `name`.
+    case: &'static str,
+    /// The `sourceFileType` the row uploads.
+    source_file_type: &'static str,
+    /// The members the upload is initiated with around the required ones.
+    upload: Value,
+    /// The parts uploaded into it: source file, part number, content.
+    parts: Vec<(&'static str, i32, Vec<u8>)>,
+    /// Every member `GetReadSetMetadata` must report with exactly this value.
+    expected: Value,
+    /// Members it must NOT carry: nothing is invented for what the upload left out, and
+    /// nothing is reported for what this emulator does not compute.
+    absent: Vec<&'static str>,
+}
+
+/// The table: one row per way a completed upload can differ, so the rule is asserted over
+/// the class and not over one request. The rows vary along the source format, the number
+/// of source files (one and a paired pair), the number of parts per source, the part
+/// numbers (including the top of the modelled range), the size and bytes of the content,
+/// and which optional members the upload carried.
+fn complete_cases() -> Vec<CompleteCase> {
+    let (_, last_number) = PART_NUMBER_RANGE;
+    vec![
+        CompleteCase {
+            case: "one part from one source",
+            source_file_type: "FASTQ",
+            upload: json!({}),
+            parts: vec![(
+                "SOURCE1",
+                1,
+                b"@read1\nACGTACGTACGT\n+\n!!!!!!!!!!!!\n".to_vec(),
+            )],
+            expected: json!({ "fileType": "FASTQ" }),
+            absent: vec![
+                "description",
+                "referenceArn",
+                "sequenceInformation",
+                "etag",
+                "statusMessage",
+            ],
+        },
+        CompleteCase {
+            case: "several parts from one source",
+            source_file_type: "FASTQ",
+            upload: json!({ "description": "reads for the autumn cohort" }),
+            parts: vec![
+                ("SOURCE1", 1, vec![b'A'; 64]),
+                ("SOURCE1", 2, vec![b'C'; 64]),
+                ("SOURCE1", 3, vec![b'G'; 17]),
+            ],
+            expected: json!({
+                "fileType": "FASTQ",
+                "description": "reads for the autumn cohort",
+            }),
+            absent: vec!["referenceArn", "sequenceInformation", "etag"],
+        },
+        CompleteCase {
+            case: "a paired-end upload",
+            source_file_type: "FASTQ",
+            upload: json!({ "generatedFrom": "1000 Genomes" }),
+            parts: vec![
+                ("SOURCE1", 1, (0..4096u32).map(|n| (n % 251) as u8).collect()),
+                ("SOURCE1", 2, vec![0x1f, 0x8b, 0x08, 0x00, 0xff, 0xfe]),
+                ("SOURCE2", 1, vec![b'N']),
+            ],
+            expected: json!({
+                "fileType": "FASTQ",
+                "sequenceInformation": { "generatedFrom": "1000 Genomes" },
+            }),
+            absent: vec!["description", "referenceArn", "etag"],
+        },
+        CompleteCase {
+            case: "an aligned upload with a reference",
+            source_file_type: "CRAM",
+            upload: json!({
+                "referenceArn": REFERENCE_ARN,
+                "description": "aligned reads",
+            }),
+            parts: vec![
+                ("SOURCE1", 7, vec![b'T'; 10]),
+                ("SOURCE1", 9, vec![b'G'; 3]),
+            ],
+            expected: json!({
+                "fileType": "CRAM",
+                "referenceArn": REFERENCE_ARN,
+                "description": "aligned reads",
+            }),
+            absent: vec!["sequenceInformation", "etag"],
+        },
+        CompleteCase {
+            case: "the highest part number the model admits",
+            source_file_type: "UBAM",
+            upload: json!({}),
+            parts: vec![
+                ("SOURCE1", 1, vec![0x42; 128]),
+                ("SOURCE1", last_number, vec![0x43; 5]),
+            ],
+            expected: json!({ "fileType": "UBAM" }),
+            absent: vec!["description", "referenceArn", "sequenceInformation", "etag"],
+        },
+    ]
+}
+
+/// The `FileInformation` a source's parts must be reported as: how many parts formed the
+/// file, the size of its first part, and the total content length.
+fn expected_file(parts: &[(&'static str, i32, Vec<u8>)], part_source: &str) -> Option<Value> {
+    let mut of_source: Vec<&(&'static str, i32, Vec<u8>)> = parts
+        .iter()
+        .filter(|(source, _, _)| *source == part_source)
+        .collect();
+    of_source.sort_by_key(|(_, number, _)| *number);
+    let first = of_source.first()?;
+    let content_length: usize = of_source.iter().map(|(_, _, payload)| payload.len()).sum();
+    Some(json!({
+        "totalParts": of_source.len(),
+        "partSize": first.2.len(),
+        "contentLength": content_length,
+    }))
+}
+
+/// The content a source's file must hold: its parts concatenated in ascending part-number
+/// order, whatever order they were uploaded or listed in.
+fn expected_content(parts: &[(&'static str, i32, Vec<u8>)], part_source: &str) -> Vec<u8> {
+    let mut of_source: Vec<&(&'static str, i32, Vec<u8>)> = parts
+        .iter()
+        .filter(|(source, _, _)| *source == part_source)
+        .collect();
+    of_source.sort_by_key(|(_, number, _)| *number);
+    of_source
+        .iter()
+        .flat_map(|(_, _, payload)| payload.clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn completing_an_upload_forms_a_read_set_from_the_parts_it_lists() {
+    let (router, engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the completion destination").await;
+    let mut read_set_ids: Vec<String> = Vec::new();
+
+    for row in complete_cases() {
+        let case = row.case;
+        let mut upload_body = row.upload.as_object().cloned().unwrap_or_default();
+        upload_body.insert("name".to_string(), Value::String(case.to_string()));
+        upload_body.insert(
+            "sourceFileType".to_string(),
+            Value::String(row.source_file_type.to_string()),
+        );
+        upload_body.insert(
+            "subjectId".to_string(),
+            Value::String(format!("subject for {case}")),
+        );
+        upload_body.insert(
+            "sampleId".to_string(),
+            Value::String(format!("sample for {case}")),
+        );
+        let (status, body) = create_upload(&router, &store, &Value::Object(upload_body)).await;
+        let upload = created_upload_id(case, status, &body);
+
+        let mut listed = upload_all(&router, case, &store, &upload, &row.parts).await;
+        // Listed in the REVERSE of the order they were uploaded: the read set's files are
+        // assembled by part number, not by the order the request happened to name them.
+        listed.reverse();
+        let (status, body) = complete_upload(&router, &store, &upload, &parts_list(&listed)).await;
+        let read_set_id = completed_read_set_id(case, status, &body);
+        assert!(
+            !read_set_ids.contains(&read_set_id),
+            "case {case:?}: readSetId {read_set_id} was already minted for another read set"
+        );
+        read_set_ids.push(read_set_id.clone());
+
+        // The read set is readable back through its own Get, every member from the one
+        // stored record. The status is the transient one the completion leaves behind
+        // until the clock moves it, so both values are admitted here and the move itself
+        // is awaited below.
+        let (status, metadata) = read_set_metadata(&router, &store, &read_set_id).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {metadata:?}");
+        let reported_status = metadata.get("status").and_then(Value::as_str);
+        assert!(
+            reported_status == Some(READ_SET_STATUS_PROCESSING_UPLOAD)
+                || reported_status == Some(READ_SET_STATUS_ACTIVE),
+            "case {case:?}: expected a read set still being processed or already active, \
+             got {metadata:?}"
+        );
+        assert_members(
+            case,
+            "GetReadSetMetadata",
+            &json!({
+                "id": read_set_id,
+                "sequenceStoreId": store,
+                "subjectId": format!("subject for {case}"),
+                "sampleId": format!("sample for {case}"),
+                "name": case,
+                "creationType": CREATION_TYPE_UPLOAD,
+                // The upload whose completion formed it: the one job this service ran.
+                "creationJobId": upload,
+            }),
+            &metadata,
+        );
+        assert_members(case, "GetReadSetMetadata", &row.expected, &metadata);
+        assert_absent(case, &row.absent, &metadata);
+        assert_timestamp(case, "creationTime", &metadata);
+        let arn = metadata
+            .get("arn")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: response carried no arn, got {metadata:?}"));
+        assert_arn(
+            case,
+            arn,
+            &format!("sequenceStore/{store}/readSet"),
+            &read_set_id,
+        );
+
+        // One `FileInformation` per source the parts came from, read off those parts.
+        let files = metadata
+            .get("files")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: response carried no files, got {metadata:?}"));
+        for part_source in PART_SOURCES {
+            let member = match *part_source {
+                "SOURCE1" => "source1",
+                _ => "source2",
+            };
+            match expected_file(&row.parts, part_source) {
+                Some(expected) => assert_eq!(
+                    files.get(member),
+                    Some(&expected),
+                    "case {case:?}: expected {member} = {expected}, got {files:?}"
+                ),
+                None => assert!(
+                    files.get(member).is_none(),
+                    "case {case:?}: expected no {member}, got {files:?}"
+                ),
+            }
+        }
+        // No index file is reported: nothing here builds one.
+        assert_absent(case, &["index"], &files);
+
+        // And the read set really holds the uploaded bytes, in part-number order.
+        {
+            let state = service_state(&*engine).expect("the omics service state");
+            let registry = state.lock();
+            let stored = registry
+                .read_set(&store, &read_set_id)
+                .unwrap_or_else(|| panic!("case {case:?}: no read set {read_set_id} is stored"));
+            for part_source in PART_SOURCES {
+                let expected = expected_content(&row.parts, part_source);
+                match stored.sources.get(*part_source) {
+                    Some(file) => assert_eq!(
+                        file.content, expected,
+                        "case {case:?}: {part_source} must hold its parts in part-number \
+                         order, got {} bytes",
+                        file.content.len()
+                    ),
+                    None => assert!(
+                        expected.is_empty(),
+                        "case {case:?}: expected a stored {part_source} file of {} bytes",
+                        expected.len()
+                    ),
+                }
+            }
+            // The upload is spent: the completion consumed it.
+            assert!(
+                registry
+                    .multipart_read_set_upload(&store, &upload)
+                    .is_none(),
+                "case {case:?}: upload {upload} must not survive its completion"
+            );
+        }
+
+        // Which is also what the wire says: nothing can be listed on the spent upload.
+        let (status, body) = list_parts(
+            &router,
+            &store,
+            &upload,
+            "",
+            &json!({ "partSource": "SOURCE1" }),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404 from ListReadSetUploadParts on a completed \
+             upload, got {body:?}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the upload-not-found message, got {body:?}"
+        );
+
+        // The status the clock owes the read set arrives, and its creation instant does
+        // not move with it.
+        let settled = await_read_set_status(&router, &store, &read_set_id, READ_SET_STATUS_ACTIVE)
+            .await;
+        assert_eq!(
+            settled.get("creationTime"),
+            metadata.get("creationTime"),
+            "case {case:?}: the creation instant must not move, got {settled:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_completion_this_emulator_cannot_place_is_refused() {
+    let (router, engine) = emulator_holding_its_engine();
+    let store = create_store(&router, "the refusal destination").await;
+    let (status, body) = create_upload(&router, &store, &upload_request("a refused completion"))
+        .await;
+    let upload = created_upload_id("the fixture upload", status, &body);
+    let uploaded = upload_all(
+        &router,
+        "the fixture upload",
+        &store,
+        &upload,
+        &[
+            ("SOURCE1", 1, vec![b'A'; 32]),
+            ("SOURCE2", 1, vec![b'C'; 16]),
+        ],
+    )
+    .await;
+    let good = parts_list(&uploaded);
+    let checksum = uploaded[0].2.clone();
+    let other_checksum = uploaded[1].2.clone();
+
+    // Each row is a way a completion can fail to name the parts the upload holds, plus
+    // the two ids it resolves; every one is refused and forms no read set.
+    struct RefusalCase {
+        /// How the row is reported in a failure.
+        case: &'static str,
+        sequence_store_id: String,
+        upload_id: String,
+        parts: Value,
+        expected_status: u16,
+        expected_code: &'static str,
+        /// The modelled message, where the refusal is one this service words for the
+        /// whole resource class.
+        message: Option<&'static str>,
+    }
+    let rows = vec![
+        RefusalCase {
+            case: "no part at all",
+            sequence_store_id: store.clone(),
+            upload_id: upload.clone(),
+            parts: Value::Array(Vec::new()),
+            expected_status: 400,
+            expected_code: "ValidationException",
+            message: None,
+        },
+        RefusalCase {
+            case: "a part number the upload does not hold",
+            sequence_store_id: store.clone(),
+            upload_id: upload.clone(),
+            parts: parts_list(&[("SOURCE1", 2, checksum.clone())]),
+            expected_status: 400,
+            expected_code: "ValidationException",
+            message: None,
+        },
+        RefusalCase {
+            case: "a source the part was not uploaded from",
+            sequence_store_id: store.clone(),
+            upload_id: upload.clone(),
+            parts: parts_list(&[("SOURCE2", 2, other_checksum.clone())]),
+            expected_status: 400,
+            expected_code: "ValidationException",
+            message: None,
+        },
+        RefusalCase {
+            case: "a checksum that is not the stored part's",
+            sequence_store_id: store.clone(),
+            upload_id: upload.clone(),
+            parts: parts_list(&[("SOURCE1", 1, other_checksum.clone())]),
+            expected_status: 400,
+            expected_code: "ValidationException",
+            message: None,
+        },
+        RefusalCase {
+            case: "the same part listed twice",
+            sequence_store_id: store.clone(),
+            upload_id: upload.clone(),
+            parts: parts_list(&[
+                ("SOURCE1", 1, checksum.clone()),
+                ("SOURCE1", 1, checksum.clone()),
+            ]),
+            expected_status: 400,
+            expected_code: "ValidationException",
+            message: None,
+        },
+        RefusalCase {
+            case: "an upload id this emulator does not hold",
+            sequence_store_id: store.clone(),
+            upload_id: "9999999999".to_string(),
+            parts: good.clone(),
+            expected_status: 404,
+            expected_code: "ResourceNotFoundException",
+            message: Some(MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE),
+        },
+        RefusalCase {
+            case: "a sequence store this emulator does not hold",
+            sequence_store_id: "9999999999".to_string(),
+            upload_id: upload.clone(),
+            parts: good.clone(),
+            expected_status: 404,
+            expected_code: "ResourceNotFoundException",
+            message: Some(SEQUENCE_STORE_NOT_FOUND_MESSAGE),
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let (status, body) = complete_upload(
+            &router,
+            &row.sequence_store_id,
+            &row.upload_id,
+            &row.parts,
+        )
+        .await;
+        assert_eq!(
+            status, row.expected_status,
+            "case {case:?}: expected {}, got {body:?}",
+            row.expected_status
+        );
+        assert_eq!(
+            error_code(&body),
+            row.expected_code,
+            "case {case:?}: expected {}, got {body:?}",
+            row.expected_code
+        );
+        if let Some(message) = row.message {
+            assert_eq!(
+                body.get("message").and_then(Value::as_str),
+                Some(message),
+                "case {case:?}: expected the modelled message, got {body:?}"
+            );
+        }
+        // Nothing was formed and nothing was spent: the upload is still there with its
+        // parts, and the store holds no read set.
+        let stored = stored_upload(&engine, &store, &upload);
+        assert_eq!(
+            stored.parts.len(),
+            uploaded.len(),
+            "case {case:?}: the refused completion must leave the upload's parts alone, \
+             got {stored:?}"
+        );
+        let state = service_state(&*engine).expect("the omics service state");
+        let registry = state.lock();
+        assert_eq!(
+            registry.read_sets_for(&store).count(),
+            0,
+            "case {case:?}: a refused completion must form no read set"
+        );
+    }
+
+    // A read set no store holds is not found, and so is one addressed through another
+    // store: a read set is resolved inside the store the request names.
+    let elsewhere = create_store(&router, "another store").await;
+    let listed = parts_list(&uploaded);
+    let (status, body) = complete_upload(&router, &store, &upload, &listed).await;
+    let read_set_id = completed_read_set_id("the accepted completion", status, &body);
+    for (case, sequence_store_id, id) in [
+        ("a read set id nothing holds", store.as_str(), "9999999999"),
+        (
+            "a read set addressed through another store",
+            elsewhere.as_str(),
+            read_set_id.as_str(),
+        ),
+    ] {
+        let (status, body) = read_set_metadata(&router, sequence_store_id, id).await;
+        assert_eq!(status, 404, "case {case:?}: expected 404, got {body:?}");
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(READ_SET_NOT_FOUND_MESSAGE),
+            "case {case:?}: expected the read-set-not-found message, got {body:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sequence_store_holding_a_read_set_cannot_be_deleted() {
+    let (router, engine) = emulator_holding_its_engine();
+    let empty = create_store(&router, "an empty store").await;
+    let filled = create_store(&router, "a store with a read set").await;
+    let (status, body) = create_upload(&router, &filled, &upload_request("the held read set"))
+        .await;
+    let upload = created_upload_id("the held read set", status, &body);
+    let uploaded = upload_all(
+        &router,
+        "the held read set",
+        &filled,
+        &upload,
+        &[("SOURCE1", 1, vec![b'A'; 48])],
+    )
+    .await;
+    let (status, body) = complete_upload(&router, &filled, &upload, &parts_list(&uploaded)).await;
+    let read_set_id = completed_read_set_id("the held read set", status, &body);
+
+    // The store is not empty, so the delete is refused and the store stays.
+    let (status, body) = delete_sequence_store(&router, &filled).await;
+    assert_eq!(
+        status, 409,
+        "case \"a store holding a read set\": expected 409, got {body:?}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ConflictException",
+        "case \"a store holding a read set\": expected ConflictException, got {body:?}"
+    );
+    assert_eq!(
+        body.get("message").and_then(Value::as_str),
+        Some(RESOURCE_HAS_DEPENDENTS_MESSAGE),
+        "case \"a store holding a read set\": expected the modelled message, got {body:?}"
+    );
+    let (status, body) = read_set_metadata(&router, &filled, &read_set_id).await;
+    assert_eq!(
+        status, 200,
+        "case \"a store holding a read set\": the read set must survive the refused \
+         delete, got {body:?}"
+    );
+
+    // A store holding none deletes as before, so what the refusal is about is the read
+    // set and not the delete itself.
+    let (status, body) = delete_sequence_store(&router, &empty).await;
+    assert_eq!(
+        status, 200,
+        "case \"an empty store\": expected 200, got {body:?}"
+    );
+    let state = service_state(&*engine).expect("the omics service state");
+    let registry = state.lock();
+    assert!(
+        registry.sequence_store(&filled).is_some(),
+        "case \"a store holding a read set\": the store must survive its refused delete"
+    );
+    assert!(
+        registry.sequence_store(&empty).is_none(),
+        "case \"an empty store\": the store must be gone"
+    );
 }

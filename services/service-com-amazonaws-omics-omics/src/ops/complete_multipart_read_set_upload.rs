@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CompleteMultipartReadSetUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CompleteMultipartReadSetUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CompleteMultipartReadSetUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Completes a multipart read set upload: the parts the request lists are formed into a
+//! read set held by the sequence store, and the upload itself is spent.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +157,290 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CompleteMultipartReadSetUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CompleteMultipartReadSetUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CompleteMultipartReadSetUpload"))
+        // The modelled `partNumber` range and `partSource` enum on every listed part are
+        // constraints the centralized walk has already refused anything outside of, so
+        // what is checked below is only what the model does not express: that the upload
+        // and the parts the request names are ones this emulator holds, and that each
+        // listed checksum is the one the stored part carries.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::StoreUnavailable,
+                None,
+            );
+            CompleteMultipartReadSetUploadErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the omics sequence store registry is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let now_ms = crate::state::now_epoch_millis();
+        let mut registry = state.lock();
+        registry.settle(now_ms);
+
+        // The read set is created IN the sequence store the request's path names, so
+        // there is nothing to complete into until that store is one this emulator holds.
+        if registry.sequence_store(&input.sequence_store_id).is_none() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.sequence_store_id),
+            );
+            return Err(
+                CompleteMultipartReadSetUploadErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::SEQUENCE_STORE_NOT_FOUND_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(upload) =
+            registry.multipart_read_set_upload(&input.sequence_store_id, &input.upload_id)
+        else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.upload_id),
+            );
+            return Err(
+                CompleteMultipartReadSetUploadErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A read set is the content of the parts the request lists, so a request that
+        // lists none describes no read set. The model puts no length on
+        // `CompleteReadSetUploadPartList`, so this is refused here rather than by the
+        // centralized walk.
+        if input.parts.is_empty() {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&input.upload_id),
+            );
+            return Err(
+                CompleteMultipartReadSetUploadErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "parts lists no part; a read set is formed from the parts \
+                                  uploaded for it"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Each listed part is matched against the part the upload holds for the pair that
+        // identifies it there — its source file and its part number — and against the
+        // checksum `UploadReadSetPart` answered with for that content, which is what the
+        // listed `checksum` is for ("A unique identifier used to confirm that parts are
+        // being added to the correct upload"). The map is keyed by that pair, so the parts
+        // are collected in source order and then in ascending part-number order however
+        // the request happened to list them, and a pair listed twice is caught.
+        let mut listed: ::std::collections::BTreeMap<
+            (String, i32),
+            &crate::state::ReadSetUploadPart,
+        > = ::std::collections::BTreeMap::new();
+        for part in &input.parts {
+            let key = (part.part_source.clone(), part.part_number);
+            let Some(stored) = upload.parts.get(&key) else {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    Some(&input.upload_id),
+                );
+                return Err(
+                    CompleteMultipartReadSetUploadErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "upload {} holds no part {} of {}",
+                                input.upload_id, part.part_number, part.part_source
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            if stored.checksum != part.checksum {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    Some(&input.upload_id),
+                );
+                return Err(
+                    CompleteMultipartReadSetUploadErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "the checksum listed for part {} of {} is not the checksum \
+                                 of the part upload {} holds",
+                                part.part_number, part.part_source, input.upload_id
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if listed.insert(key, stored).is_some() {
+                crate::state::audit(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    Some(&input.upload_id),
+                );
+                return Err(
+                    CompleteMultipartReadSetUploadErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "part {} of {} is listed more than once",
+                                part.part_number, part.part_source
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // One file per source the listed parts came from, each carrying those parts'
+        // content concatenated in ascending part-number order: the read set is backed by
+        // the bytes the caller uploaded, not by a count of them.
+        let mut sources: ::std::collections::BTreeMap<String, crate::state::ReadSetSource> =
+            ::std::collections::BTreeMap::new();
+        for ((part_source, _), part) in &listed {
+            let file = sources
+                .entry(part_source.clone())
+                .or_insert_with(|| crate::state::ReadSetSource {
+                    part_source: part_source.clone(),
+                    content: Vec::new(),
+                    total_parts: 0,
+                    // The parts arrive here in ascending part-number order, so the first
+                    // one is the part size the upload was made with.
+                    part_size: part.part_size(),
+                });
+            file.content.extend_from_slice(&part.payload);
+            file.total_parts += 1;
+        }
+        let read_set_bytes: usize = sources.values().map(|file| file.content.len()).sum();
+
+        // The registry is finite: a read set that would take this store past either of
+        // its caps is refused rather than held, the way the service refuses one past its
+        // quota.
+        let held = registry.read_sets_for(&input.sequence_store_id).count();
+        if held >= crate::state::MAX_READ_SETS {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::QuotaExceeded,
+                Some(&input.sequence_store_id),
+            );
+            return Err(
+                CompleteMultipartReadSetUploadErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "sequence store {} already holds the maximum of {} read sets",
+                            input.sequence_store_id,
+                            crate::state::MAX_READ_SETS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        let bytes_after = registry.read_set_bytes_held(&input.sequence_store_id) + read_set_bytes;
+        if bytes_after > crate::state::MAX_READ_SET_BYTES {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::QuotaExceeded,
+                Some(&input.sequence_store_id),
+            );
+            return Err(
+                CompleteMultipartReadSetUploadErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "sequence store {} would hold {bytes_after} read set bytes, more \
+                             than the {} this service accepts for one store",
+                            input.sequence_store_id,
+                            crate::state::MAX_READ_SET_BYTES
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Completing the upload spends it: the read set is what a caller reads from now
+        // on, and the upload is no longer something parts can be added to, listed or
+        // aborted. The record it carried is what the read set's own members are read
+        // from, so nothing is invented for a member the upload never named.
+        let Some(upload) =
+            registry.remove_multipart_read_set_upload(&input.sequence_store_id, &input.upload_id)
+        else {
+            crate::state::audit(
+                Self::NAME,
+                ctx,
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.upload_id),
+            );
+            return Err(
+                CompleteMultipartReadSetUploadErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::MULTIPART_READ_SET_UPLOAD_NOT_FOUND_MESSAGE
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let (key, read_set_id) = registry.next_read_set_id();
+        let read_set = crate::state::ReadSet {
+            arn: crate::state::read_set_arn(&region, &upload.sequence_store_id, &read_set_id),
+            id: read_set_id.clone(),
+            sequence_store_id: upload.sequence_store_id,
+            subject_id: upload.subject_id,
+            sample_id: upload.sample_id,
+            name: upload.name,
+            description: upload.description,
+            generated_from: upload.generated_from,
+            reference_arn: upload.reference_arn,
+            file_type: upload.source_file_type,
+            // The parts are in and the service is still forming the read set's files out
+            // of them, so the status a completion leaves behind is the transient one and
+            // the move to active is owed to the clock.
+            status: crate::state::READ_SET_STATUS_PROCESSING_UPLOAD.to_string(),
+            status_message: None,
+            creation_time_ms: now_ms,
+            status_due_at_ms: Some(now_ms + crate::state::TRANSITION_DELAY.as_millis() as i64),
+            creation_type: crate::state::CREATION_TYPE_UPLOAD.to_string(),
+            // The upload whose completion formed it: the one job this service ran for
+            // this read set.
+            creation_job_id: upload.upload_id,
+            sources,
+            tags: upload.tags,
+        };
+        registry.read_sets.insert(key, read_set);
+        crate::state::audit(
+            Self::NAME,
+            ctx,
+            crate::state::AuditOutcome::ReadSetCreated,
+            Some(&read_set_id),
+        );
+
+        Ok(CompleteMultipartReadSetUploadOutput { read_set_id })
     }
 }
