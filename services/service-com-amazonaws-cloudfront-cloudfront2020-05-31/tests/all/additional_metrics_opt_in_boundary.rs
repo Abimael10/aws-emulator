@@ -137,7 +137,7 @@ async fn created(router: &MultiServiceRouter, case: &str, caller_reference: &str
 }
 
 /// `CreateMonitoringSubscription` for `id`, carrying `flag`.
-async fn subscribe(router: &MultiServiceRouter, case: &str, id: &str, flag: &str) {
+pub(crate) async fn subscribe(router: &MultiServiceRouter, case: &str, id: &str, flag: &str) {
     let document = format!(
         "<MonitoringSubscription xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <RealtimeMetricsSubscriptionConfig>\

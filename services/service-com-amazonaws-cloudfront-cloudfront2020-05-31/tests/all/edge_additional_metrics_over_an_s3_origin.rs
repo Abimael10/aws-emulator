@@ -73,12 +73,12 @@ const CACHING_OPTIMIZED: &str = "658327ea-f89d-4fab-a63d-7e88639e58f6";
 const ORIGIN_BUCKET: &str = "edge-additional-metrics-origin";
 
 /// The key the origin bucket HOLDS, and the bytes it holds there.
-const PRESENT_KEY: &str = "present-1.txt";
+pub(crate) const PRESENT_KEY: &str = "present-1.txt";
 const PRESENT_BODY: &str = "the object the edge serves";
 
 /// A key the origin bucket does NOT hold, so the ORIGIN answers a read of it with its own
 /// not-found.
-const ABSENT_KEY: &str = "absent-never-written.txt";
+pub(crate) const ABSENT_KEY: &str = "absent-never-written.txt";
 
 /// How close a folded percentage has to be to the share it is a percentage of. Both sides are
 /// computed in floating point out of the same whole counts, so the slack only has to absorb the
@@ -91,7 +91,10 @@ const TOLERANCE: f64 = 1e-9;
 /// All three have to share the engine: the edge publishes into the CloudWatch store (a metric
 /// has one home) and fetches the origin out of the object store, so only a router carrying all
 /// of them can reconcile what a client reads against what the edge served.
-fn mounted(engine: &Arc<engine::InMemoryEngine>, authenticated: bool) -> MultiServiceRouter {
+pub(crate) fn mounted(
+    engine: &Arc<engine::InMemoryEngine>,
+    authenticated: bool,
+) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(authenticated);
     router.register_service(
@@ -136,7 +139,7 @@ fn grant(bucket: &str) -> String {
 /// Create the origin bucket, put [`PRESENT_BODY`] at [`PRESENT_KEY`] in it and grant CloudFront
 /// the read — through Amazon S3's OWN API over the in-process callback, so the object the edge
 /// fetches is one a client really put there.
-async fn given_origin_bucket(setup: &MultiServiceRouter) {
+pub(crate) async fn given_origin_bucket(setup: &MultiServiceRouter) {
     let callback = EmbeddedEmulator::from_router(setup.clone());
     let s3 = service_common::s3_client::s3_client(&callback, REGION);
     s3.create_bucket()
@@ -167,7 +170,7 @@ async fn given_origin_bucket(setup: &MultiServiceRouter) {
 
 /// `CreateOriginAccessControl` for an `s3` origin CloudFront signs every request to, answering
 /// the control's id.
-async fn given_origin_access_control(setup: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn given_origin_access_control(setup: &MultiServiceRouter, name: &str) -> String {
     let created = call(
         setup,
         "POST",
@@ -226,7 +229,7 @@ fn config(caller_reference: &str, control: &str) -> String {
 }
 
 /// Create one row's distribution and answer its `(id, DomainName)`.
-async fn created(
+pub(crate) async fn created(
     setup: &MultiServiceRouter,
     case: &str,
     caller_reference: &str,
