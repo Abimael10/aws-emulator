@@ -238,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(AssociateDataShareConsumerErrorModeled::InvalidDataShareFault(
                 InvalidDataShareFault {
-                    message: Some(st::invalid_data_share_message(&input.data_share_arn)),
+                    message: Some(st::DATA_SHARE_NOT_AVAILABLE.to_string()),
                 },
             )
             .into());

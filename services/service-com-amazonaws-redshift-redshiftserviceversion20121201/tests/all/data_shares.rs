@@ -8,7 +8,11 @@
 //!   this account's datashares first, and an ARN that resolves to nothing is the
 //!   modelled `InvalidDataShareFault` — a datashare is created on the producer's
 //!   DATABASE and Amazon Redshift publishes no API that creates one, so an account
-//!   that has created none holds none;
+//!   that has created none holds none — carrying the fixed sentence Amazon
+//!   Redshift words for that path, with nothing of the request in it;
+//! * an authorization change validates the `ConsumerIdentifier` it carries BEFORE
+//!   any datashare is resolved, so a value that names no consumer is the
+//!   parameter-value refusal whether or not the datashare exists;
 //! * every operation that names a NAMESPACE resolves it against the control plane
 //!   that owns it — this one for a provisioned cluster's namespace, Amazon Redshift
 //!   Serverless for one of its namespaces — and an ARN that control plane holds no
@@ -137,13 +141,34 @@ async fn every_datashare_operation_refuses_an_absent_datashare() {
             params.extend(members.iter().copied());
             let answer = emulator.call(action, &params).await;
             assert_refused(&case, &answer, 400, "InvalidDataShareFault");
+            let expected = expected_absent_message(action);
             assert_eq!(
                 answer.text("Message").as_deref(),
-                Some(state::invalid_data_share_message(arn).as_str()),
-                "case {case}: expected the ARN named in the refusal, got {:?}",
+                Some(expected),
+                "case {case}: expected the sentence {expected:?}, got {:?}",
                 answer.text("Message")
             );
+            // The sentence is entirely fixed: it reports nothing of the request
+            // back, so no identifier the caller sent appears in it.
+            assert!(
+                !expected.contains(*arn),
+                "case {case}: expected no request value in the refusal, got {expected:?}"
+            );
         }
+    }
+}
+
+/// The fixed sentence the datashare fault carries for `action`.
+///
+/// The READ names the ARN its optional filter carried as the thing that does not
+/// exist, and every operation that ACTS on a datashare speaks about the share's
+/// availability instead — two sentences, one per path, held beside the handlers
+/// that answer them.
+fn expected_absent_message(action: &str) -> &'static str {
+    if action == "DescribeDataShares" {
+        state::DATA_SHARE_ARN_DOES_NOT_EXIST
+    } else {
+        state::DATA_SHARE_NOT_AVAILABLE
     }
 }
 
@@ -317,5 +342,214 @@ async fn a_namespace_an_operation_names_is_resolved_where_it_lives() {
             .call(action, &[("DataShareArn", ABSENT_DATASHARE)])
             .await;
         assert_refused(case, &answer, 400, "InvalidParameterCombination");
+    }
+}
+
+/// A datashare of this account, written straight into the shared store the
+/// handlers read.
+///
+/// A datashare is created on the PRODUCER's database and Amazon Redshift
+/// publishes no API of this control plane that mints one, so a case about a
+/// datashare that EXISTS seeds it the way the store holds it — exactly as the
+/// suites about a store bound seed the records they need.
+fn seed_data_share(emulator: &Emulator, data_share_arn: &str, producer_arn: &str) {
+    let store = state::service_state(&*emulator.engine).expect("the Redshift store");
+    store.lock().data_shares.push(state::StoredDataShare {
+        data_share_arn: Some(data_share_arn.to_string()),
+        producer_arn: Some(producer_arn.to_string()),
+        allow_publicly_accessible_consumers: Some(false),
+        data_share_associations: None,
+        managed_by: None,
+        data_share_type: Some("INTERNAL".to_string()),
+    });
+}
+
+/// The datashare ARN the seeded cases act on, in the form Amazon Redshift mints
+/// one in.
+const HELD_DATASHARE: &str =
+    "arn:aws:redshift:us-west-2:000000000000:datashare:1f0d60a4-5a11-4d93-a1ed-2a03da4a7cd1/sales";
+
+/// An authorization change checks the consumer identifier it carries BEFORE any
+/// datashare is resolved — over a table spanning the forms a consumer is named by
+/// and the forms that name none, each driven against a datashare that exists and
+/// one that does not.
+#[tokio::test]
+async fn an_authorization_change_validates_the_consumer_identifier_first() {
+    let (emulator, namespace) = harness("consumer-identifier-cluster").await;
+    seed_data_share(&emulator, HELD_DATASHARE, &namespace);
+
+    // The forms a consumer IS named by: an account identifier, the managing
+    // entity keyword the model names (`smithy_query(query="doc",
+    // shape="AuthorizeDataShareMessage", member="ConsumerIdentifier")` — "an
+    // Amazon Web Services account ID or a keyword, such as ADX"), and a namespace
+    // ARN of either control plane in either spelling the model's own namespace
+    // pattern admits.
+    let named: Vec<(&str, &str)> = vec![
+        ("another account of this partition", "000000000001"),
+        ("this emulator's own account", ::engine::emulator_account_id()),
+        (
+            "the managing entity the model names",
+            state::CONSUMER_IDENTIFIER_KEYWORDS[0],
+        ),
+        ("a namespace of this account", namespace.as_str()),
+        (
+            "a namespace ARN of this control plane that no cluster carries",
+            ABSENT_NAMESPACE,
+        ),
+        (
+            "a namespace ARN of the serverless control plane",
+            SERVERLESS_NAMESPACE,
+        ),
+    ];
+
+    // The forms that name NO consumer: everything the account-identifier shape
+    // and the two ARN spellings exclude.
+    let unnamed: Vec<(&str, &str)> = vec![
+        ("an account identifier one digit short", "00000000001"),
+        ("an account identifier one digit too long", "0000000000012"),
+        ("an account identifier with a letter in it", "00000000000a"),
+        ("a name rather than an identifier", "sales-consumer"),
+        (
+            "an ARN that names no namespace",
+            "arn:aws:redshift:us-west-2:000000000000:cluster:consumer-identifier-cluster",
+        ),
+        ("the managing entity keyword in another case", "adx"),
+    ];
+
+    // Both halves are driven against a datashare that EXISTS and one that does
+    // not, because what the consumer identifier is checked against is the request
+    // alone.
+    let shares: [(&str, &str); 2] = [
+        ("a datashare of this account", HELD_DATASHARE),
+        ("a datashare nothing created", ABSENT_DATASHARE),
+    ];
+
+    for action in ["AuthorizeDataShare", "DeauthorizeDataShare"] {
+        for (consumer_case, consumer) in &unnamed {
+            for (share_case, data_share_arn) in &shares {
+                let case = format!("{action} naming {consumer_case} against {share_case}");
+                let answer = emulator
+                    .call(
+                        action,
+                        &[
+                            ("DataShareArn", data_share_arn),
+                            ("ConsumerIdentifier", consumer),
+                        ],
+                    )
+                    .await;
+                assert_refused(&case, &answer, 400, "InvalidParameterValue");
+                assert_eq!(
+                    answer.text("Message").as_deref(),
+                    Some(state::CONSUMER_IDENTIFIER_INVALID),
+                    "case {case}: expected the consumer-identifier sentence, got {:?}",
+                    answer.text("Message")
+                );
+            }
+        }
+
+        // A consumer that IS named gets past the check, so the datashare is
+        // resolved next and an ARN that resolves to nothing is the datashare's own
+        // fault.
+        for (consumer_case, consumer) in &named {
+            let case = format!("{action} naming {consumer_case} against a datashare nothing created");
+            let answer = emulator
+                .call(
+                    action,
+                    &[
+                        ("DataShareArn", ABSENT_DATASHARE),
+                        ("ConsumerIdentifier", consumer),
+                    ],
+                )
+                .await;
+            assert_refused(&case, &answer, 400, "InvalidDataShareFault");
+            assert_eq!(
+                answer.text("Message").as_deref(),
+                Some(state::DATA_SHARE_NOT_AVAILABLE),
+                "case {case}: expected the datashare-availability sentence, got {:?}",
+                answer.text("Message")
+            );
+        }
+    }
+}
+
+/// A named consumer and a datashare that exists is a change the store keeps: the
+/// authorization is reported back and read back through `DescribeDataShares`, and
+/// the deauthorization moves that same association.
+#[tokio::test]
+async fn an_authorization_change_is_recorded_on_the_datashare_it_names() {
+    let (emulator, namespace) = harness("authorized-datashare-cluster").await;
+    seed_data_share(&emulator, HELD_DATASHARE, &namespace);
+
+    // (case, the action, the consumer it names, the status the association is left
+    // at afterwards)
+    let changes: [(&str, &str, &str, &str); 4] = [
+        (
+            "an account the producer authorizes",
+            "AuthorizeDataShare",
+            "000000000001",
+            "AUTHORIZED",
+        ),
+        (
+            "the managing entity the producer authorizes",
+            "AuthorizeDataShare",
+            state::CONSUMER_IDENTIFIER_KEYWORDS[0],
+            "AUTHORIZED",
+        ),
+        (
+            "the account the producer takes that authorization back from",
+            "DeauthorizeDataShare",
+            "000000000001",
+            "DEAUTHORIZED",
+        ),
+        (
+            "the managing entity the producer takes it back from",
+            "DeauthorizeDataShare",
+            state::CONSUMER_IDENTIFIER_KEYWORDS[0],
+            "DEAUTHORIZED",
+        ),
+    ];
+
+    for (case, action, consumer, status) in changes {
+        let answer = emulator
+            .call(
+                action,
+                &[
+                    ("DataShareArn", HELD_DATASHARE),
+                    ("ConsumerIdentifier", consumer),
+                ],
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {} with body {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.text("DataShareArn").as_deref(),
+            Some(HELD_DATASHARE),
+            "case {case}: expected the datashare reported back, got body {}",
+            answer.body
+        );
+
+        // Read back through the implemented reader: the association the change
+        // wrote is what a later caller sees.
+        let read = emulator
+            .call("DescribeDataShares", &[("DataShareArn", HELD_DATASHARE)])
+            .await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: expected the read served, got {} with body {}",
+            read.status, read.body
+        );
+        let consumers = all_text(&read.body, "ConsumerIdentifier");
+        assert!(
+            consumers.iter().any(|held| held == consumer),
+            "case {case}: expected {consumer} among the associations, got {consumers:?}"
+        );
+        assert!(
+            all_text(&read.body, "Status").iter().any(|held| held == status),
+            "case {case}: expected an association at {status}, got body {}",
+            read.body
+        );
     }
 }

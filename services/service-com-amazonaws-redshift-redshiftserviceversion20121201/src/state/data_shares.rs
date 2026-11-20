@@ -39,14 +39,66 @@ use super::*;
 pub type StoredDataShare = crate::ops::types::AssociateDataShareConsumerOutput;
 
 /// Why a request naming a `DataShareArn` this account holds no datashare under is
-/// refused, naming the ARN the request carried.
+/// refused by the operations that ACT on the datashare — `AuthorizeDataShare`,
+/// `DeauthorizeDataShare`, `AssociateDataShareConsumer`,
+/// `DisassociateDataShareConsumer` and `RejectDataShare`.
 ///
 /// `smithy_query(query="shape", shape="InvalidDataShareFault")` — "There is an
-/// error with the datashare" — which says nothing a caller can act on, so the
-/// sentence names what was wrong with the value it carried: the datashare the ARN
-/// names is not one of this account's.
-pub fn invalid_data_share_message(data_share_arn: &str) -> String {
-    format!("Datashare {data_share_arn} not found.")
+/// error with the datashare" — leaves the sentence to the service, and Amazon
+/// Redshift words this one about the datashare's AVAILABILITY: the share the call
+/// would act on is not there. Entirely fixed text, with nothing of the request in
+/// it, so one refusal cannot report back a value the caller already holds.
+pub const DATA_SHARE_NOT_AVAILABLE: &str =
+    "The data share isn't available because it doesn't exist.";
+
+/// Why the datashare READ — `DescribeDataShares`, whose `DataShareArn` is the
+/// optional filter rather than the resource a write acts on — refuses an ARN that
+/// resolves to no datashare of this account.
+///
+/// The read path has its OWN fixed sentence, which speaks about the ARN the
+/// filter carried rather than about a share a call would have changed, and names
+/// no value of the request either.
+pub const DATA_SHARE_ARN_DOES_NOT_EXIST: &str = "The datashare Amazon Resource Name (ARN) isn't \
+     valid because the ARN doesn't exist. Use a valid datashare ARN.";
+
+/// Why a datashare authorization change whose `ConsumerIdentifier` is not one of
+/// the forms a consumer is named by is refused.
+///
+/// A REQUEST-VALIDATION refusal — decided on the value alone, before any
+/// datashare is resolved — so its text says what was wrong with the value and
+/// carries none of it. The code is the parameter-value refusal
+/// ([`crate::scaffolded::Scaffolded::invalid_parameter_value`]) rather than the
+/// datashare fault, because nothing about a datashare was established.
+pub const CONSUMER_IDENTIFIER_INVALID: &str = "The consumer identifier isn't valid.";
+
+/// The managing entities a consumer may be named by instead of an account.
+///
+/// Source: `smithy_query(query="doc", shape="AuthorizeDataShareMessage",
+/// member="ConsumerIdentifier")` — "This identifier is an Amazon Web Services
+/// account ID or a keyword, such as ADX" — the one keyword the model names, which
+/// is Amazon Web Services Data Exchange as a managing entity
+/// (`DataShare$ManagedBy`).
+pub const CONSUMER_IDENTIFIER_KEYWORDS: [&str; 1] = ["ADX"];
+
+/// Whether `value` names a data consumer at all.
+///
+/// The forms a consumer is named by, from
+/// `smithy_query(query="doc", shape="AuthorizeDataShareMessage",
+/// member="ConsumerIdentifier")` — "an Amazon Web Services account ID or a
+/// keyword, such as ADX" — plus the namespace ARN a consumer is named by where
+/// the authorization is for one namespace rather than a whole account, written in
+/// either of the two spellings the model admits (see
+/// [`is_provisioned_namespace_arn`]). A value that is none of those names no
+/// consumer this authorization could be recorded against.
+pub fn is_valid_consumer_identifier(value: &str) -> bool {
+    if CONSUMER_IDENTIFIER_KEYWORDS.contains(&value) {
+        return true;
+    }
+    if value.len() == super::ACCOUNT_ID_DIGITS && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return true;
+    }
+    is_provisioned_namespace_arn(value)
+        || super::serverless::serverless_namespace_token(value).is_some()
 }
 
 /// Why a request naming a namespace that resolves to nothing is refused, naming

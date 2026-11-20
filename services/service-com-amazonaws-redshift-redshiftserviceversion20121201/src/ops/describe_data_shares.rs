@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(held) = store.data_share(data_share_arn) else {
                     return Err(DescribeDataSharesErrorModeled::InvalidDataShareFault(
                         InvalidDataShareFault {
-                            message: Some(st::invalid_data_share_message(data_share_arn)),
+                            message: Some(st::DATA_SHARE_ARN_DOES_NOT_EXIST.to_string()),
                         },
                     )
                     .into());

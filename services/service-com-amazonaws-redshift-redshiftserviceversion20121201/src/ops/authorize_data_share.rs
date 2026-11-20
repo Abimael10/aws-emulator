@@ -13,6 +13,11 @@
 //! [`crate::state::StoredDataShare`]), so nothing is authorized for an ARN that
 //! resolves to nothing.
 //!
+//! The `ConsumerIdentifier` is checked on the REQUEST, before any datashare is
+//! resolved: a value that is none of the forms a data consumer is named by
+//! ([`crate::state::is_valid_consumer_identifier`]) is the parameter-value refusal
+//! and establishes nothing about the datashare the request also carried.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,6 +179,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The whole write is one lock-held step and nothing is awaited while the
         // store is locked.
         let _ = ctx;
+        // The consumer the authorization would be recorded against is checked on
+        // the REQUEST, before any datashare is resolved: a value that names no
+        // consumer is a parameter refusal and establishes nothing about the
+        // datashare the request also carried.
+        if !st::is_valid_consumer_identifier(&input.consumer_identifier) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                st::CONSUMER_IDENTIFIER_INVALID,
+            ));
+        }
         let Some(state) = st::service_state(&*self.engine) else {
             return Err(AuthorizeDataShareErrorModeled::DependentServiceUnavailableFault(
                 DependentServiceUnavailableFault {
@@ -198,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) else {
             return Err(AuthorizeDataShareErrorModeled::InvalidDataShareFault(
                 InvalidDataShareFault {
-                    message: Some(st::invalid_data_share_message(&input.data_share_arn)),
+                    message: Some(st::DATA_SHARE_NOT_AVAILABLE.to_string()),
                 },
             )
             .into());
