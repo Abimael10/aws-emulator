@@ -168,6 +168,7 @@ pub mod update_patch_baseline_types;
 pub mod update_resource_data_sync_types;
 pub mod update_service_setting_types;
 pub mod validate_cloud_connector_types;
+pub mod validation_exception_wire;
 
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use add_tags_to_resource_types::*;
@@ -477,4 +478,6 @@ pub use update_resource_data_sync_types::*;
 pub use update_service_setting_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use validate_cloud_connector_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use validation_exception_wire::*;
 

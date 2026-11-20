@@ -454,7 +454,11 @@ fn assert_refusal(case: &str, expected_code: &str, expected_message: &str, got: 
 /// The targets a start may name, one row per form `Target` accepts
 /// (`smithy_query(query="shape", shape="Target")`: a key and the values that map to it),
 /// up to the modelled `Targets` length of 5.
-fn target_forms() -> Vec<(&'static str, Value)> {
+///
+/// `pub(crate)` for the reason the harness above is: the sibling suite
+/// `validation_exception_message_key.rs` puts the same forms to the same start, and one
+/// spelling of "every form a target takes" keeps the two from drifting.
+pub(crate) fn target_forms() -> Vec<(&'static str, Value)> {
     vec![
         (
             "one node by id",

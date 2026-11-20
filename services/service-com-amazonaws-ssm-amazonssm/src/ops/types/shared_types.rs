@@ -893,12 +893,9 @@ pub struct ThrottlingException {
     pub service_code: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ssm#ValidationException")]
-#[derive(Debug, Clone, Default)]
-pub struct ValidationException {
-    pub message: Option<String>,
-    pub reason_code: Option<String>,
-}
+// `ValidationException` is NOT derived here: this service keys its text member lower case
+// on the wire, which the derive cannot express, so the shape is written out in
+// `super::validation_exception_wire` and re-exported beside these.
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ssm#CloudWatchOutputConfig")]
 #[derive(Debug, Clone, Default)]
