@@ -2736,6 +2736,12 @@ pub use guest_cpu::*;
 pub mod guest_services;
 pub use guest_services::*;
 
+/// The AWS AGENTS one instance's guest can hold — a unit of the machine rather than a server
+/// on a port — and the programs the documented procedure that installs one invokes. A
+/// SUBMODULE for the same reason [`image_usage_reports`] is one.
+pub mod guest_agents;
+pub use guest_agents::*;
+
 /// Whether the security groups on an interface ADMIT one arriving packet — the one decision
 /// every service whose resource is reached through an interface of this account asks of this
 /// crate. A SUBMODULE for the same reason [`image_usage_reports`] is one.

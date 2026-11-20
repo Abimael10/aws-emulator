@@ -3,6 +3,11 @@
 //! The SERVICES one instance's guest runs — the web server its own program installed and
 //! started — and what such a server answers for a request made to the port it listens on.
 //!
+//! A unit that listens on NO port is one of these too: an agent the machine installed
+//! ([`super::guest_agents`]) is a unit of the init system like any other, so what makes it
+//! active is that something started it ([`GuestRuntime::running`]) rather than a port it
+//! answers on.
+//!
 //! # Why a guest needs them
 //!
 //! A machine's whole purpose is to SERVE something: "a script that installs and starts a web
@@ -131,6 +136,11 @@ pub struct GuestRuntime {
     pub enabled: BTreeSet<String>,
     /// What is listening, by the port each server listens on.
     pub listening: BTreeMap<i32, GuestServer>,
+    /// The units that are RUNNING and listen on no port: an AGENT is a unit of the machine
+    /// rather than a server on a port ([`super::guest_agents`]), so what makes it active is
+    /// that something STARTED it — the init system's control program, or the agent's own
+    /// installer — and nothing about it can be read off [`Self::listening`].
+    pub running: BTreeSet<String>,
 }
 
 impl GuestRuntime {
@@ -144,10 +154,17 @@ impl GuestRuntime {
             installed: self.installed.clone(),
             enabled: self.enabled.clone(),
             listening: BTreeMap::new(),
+            running: BTreeSet::new(),
         };
         for unit in &self.enabled {
             if let Some(package) = package_named(unit) {
                 started.listen(unit, package.port, package.document_root, false);
+                continue;
+            }
+            // An enabled unit that listens on nothing is RUNNING again after the boot, the
+            // same way an enabled server is listening again.
+            if super::guest_agents::agent_unit_named(unit).is_some() {
+                started.running.insert(unit.clone());
             }
         }
         started
@@ -238,6 +255,14 @@ impl GuestServices {
         let mut status = SUCCESS;
         for name in packages {
             let Some(package) = package_named(name) else {
+                // An AGENT, or one of the packages an agent's own installation procedure
+                // names: installing it records it on the machine and starts nothing, because
+                // installing a package does not start its unit ([`super::guest_agents`]).
+                if let Some(agent) = super::guest_agents::agent_named(name) {
+                    self.held().installed.insert(agent.name.to_string());
+                    output.push(format!("Installed: {}", agent.name));
+                    continue;
+                }
                 // A package this guest has none of installs nothing, and the manager reports
                 // it the way one reports a name it cannot resolve.
                 output.push(format!("No package {name} available."));
@@ -268,6 +293,15 @@ impl GuestServices {
     fn remove(&self, packages: &[&str]) -> ProgramOutcome {
         let mut output: Vec<String> = Vec::new();
         for name in packages {
+            if let Some(agent) = super::guest_agents::agent_named(name) {
+                let mut held = self.held();
+                held.installed.remove(agent.name);
+                held.enabled.remove(agent.name);
+                held.running.remove(agent.name);
+                drop(held);
+                output.push(format!("Removed: {}", agent.name));
+                continue;
+            }
             let Some(package) = package_named(name) else {
                 continue;
             };
@@ -290,6 +324,9 @@ impl GuestServices {
     /// unit beside enabling it.
     fn control(&self, verb: &str, unit: &str, now: bool) -> Option<ProgramOutcome> {
         let unit = unit.trim().trim_end_matches(UNIT_SUFFIX);
+        if let Some(agent) = super::guest_agents::agent_unit_named(unit) {
+            return self.control_agent(verb, agent, unit, now);
+        }
         let known = package_named(unit);
         let answered = |status: i32, line: String| {
             Some(ProgramOutcome {
@@ -372,6 +409,101 @@ impl GuestServices {
             }),
             // Every other verb is one this guest's control program performs nothing of.
             _ => None,
+        }
+    }
+
+    /// Perform one verb of the init system's control program on the AGENT unit `agent` names.
+    ///
+    /// An agent listens on nothing, so what makes its unit active is that something started
+    /// it: a `start` of a unit this machine has records it running
+    /// ([`GuestRuntime::running`]), an `enable --now` does the same beside enabling it, and
+    /// a unit this machine never installed is one the init system has no unit file for —
+    /// which is what it reports rather than starting anything.
+    fn control_agent(
+        &self,
+        verb: &str,
+        agent: &'static super::guest_agents::GuestAgent,
+        unit: &str,
+        now: bool,
+    ) -> Option<ProgramOutcome> {
+        let installed = self.has(agent.name);
+        let answered = |status: i32, line: String| {
+            Some(ProgramOutcome {
+                status,
+                output: vec![line],
+            })
+        };
+        let changed = Some(ProgramOutcome {
+            status: SUCCESS,
+            output: Vec::new(),
+        });
+        match verb {
+            "start" | "restart" | "reload-or-restart" | "try-restart" => {
+                if !installed {
+                    return answered(
+                        NO_SUCH_UNIT,
+                        format!(
+                            "Failed to {verb} {unit}{UNIT_SUFFIX}: Unit {unit}{UNIT_SUFFIX} not found."
+                        ),
+                    );
+                }
+                self.held().running.insert(agent.name.to_string());
+                changed
+            }
+            "stop" => {
+                self.held().running.remove(agent.name);
+                changed
+            }
+            "enable" | "disable" => {
+                if !installed {
+                    return answered(
+                        NO_SUCH_UNIT,
+                        format!("Failed to {verb} unit: Unit file {unit}{UNIT_SUFFIX} does not exist."),
+                    );
+                }
+                let mut held = self.held();
+                if verb == "enable" {
+                    held.enabled.insert(agent.name.to_string());
+                    if now {
+                        held.running.insert(agent.name.to_string());
+                    }
+                } else {
+                    held.enabled.remove(agent.name);
+                    if now {
+                        held.running.remove(agent.name);
+                    }
+                }
+                drop(held);
+                changed
+            }
+            "is-active" | "status" => {
+                let running = self.held().running.contains(agent.name);
+                answered(
+                    if running { SUCCESS } else { UNIT_INACTIVE },
+                    if running { "active" } else { "inactive" }.to_string(),
+                )
+            }
+            "is-enabled" => {
+                let enabled = self.held().enabled.contains(agent.name);
+                answered(
+                    if enabled { SUCCESS } else { UNIT_NOT_ENABLED },
+                    if enabled { "enabled" } else { "disabled" }.to_string(),
+                )
+            }
+            "daemon-reload" | "daemon-reexec" => changed,
+            _ => None,
+        }
+    }
+
+    /// Install `agent` and start its unit, which is what running the agent's OWN installer
+    /// does: "run the installer" leaves the agent on the machine, enabled and running
+    /// ([`super::guest_agents::installer_outcome`]).
+    fn install_agent_and_start(&self, agent: &'static super::guest_agents::GuestAgent) {
+        let mut held = self.held();
+        held.installed.insert(agent.name.to_string());
+        if agent.unit {
+            held.enabled.insert(agent.name.to_string());
+            held.running.insert(agent.name.to_string());
         }
     }
 
@@ -489,11 +621,30 @@ impl GuestEnvironment {
         arguments: &[String],
         files: &mut dyn ProgramFiles,
     ) -> Option<ProgramOutcome> {
+        // A path of this machine's OWN storage holding an agent's installer is a program of
+        // this guest: running it installs that agent ([`super::guest_agents`]). Asked before
+        // the name is read as a program name, because what makes it one is the file at the
+        // path as the command wrote it.
+        if let Some(outcome) = super::guest_agents::installer_outcome(name, &*files, |agent| {
+            self.services.install_agent_and_start(agent);
+        }) {
+            return Some(outcome);
+        }
         // A program named by its absolute path is the same program: `/usr/sbin/httpd` and
         // `httpd` are one, as a shell resolving a name on `PATH` finds.
         let name = name.rsplit('/').next().unwrap_or(name);
         if PACKAGE_MANAGERS.contains(&name) {
             return Some(self.package_manager(arguments, files));
+        }
+        // The programs an agent's documented installation procedure invokes: the downloader
+        // that fetches its installer, and the one that makes what it fetched executable.
+        if name == super::guest_agents::DOWNLOAD_PROGRAM
+            || name == super::guest_agents::TRANSFER_PROGRAM
+        {
+            return super::guest_agents::downloaded(name, arguments, files);
+        }
+        if name == super::guest_agents::MODE_PROGRAM {
+            return super::guest_agents::mode_changed(arguments, files);
         }
         if name == INIT_CONTROL {
             let (verb, operands, now) = invocation(arguments);

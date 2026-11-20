@@ -91,6 +91,9 @@
 //!
 //! * the file utilities ([`VOLUME_COMMANDS`]) beside the session-local catalog, which name
 //!   what the tree holds as well as change it;
+//! * the WORKING DIRECTORY of the session, which `cd` changes and `pwd` writes: a path a
+//!   program names without a directory is resolved against it ([`ShellSession::at`]), which is
+//!   how a script written for a machine names a file it put somewhere;
 //! * the redirections that reach the tree's other descriptors: standard error to a file or a
 //!   device, and standard input from one;
 //! * arithmetic expansion ([`super::posix_shell_arithmetic`]), which is how such a program
@@ -406,6 +409,36 @@ pub const VOLUME_COMMANDS: &[&str] = &[
     "source", "sleep",
 ];
 
+/// The commands only a session working over a MACHINE's tree provides
+/// ([`ShellSession::in_volume`]), as their names: `cd` changes the DIRECTORY the paths a
+/// program names without one are resolved against — "cd: change the working directory" — and
+/// `pwd` writes it.
+///
+/// They are not among [`VOLUME_COMMANDS`] because a session whose tree is its OWN
+/// ([`ShellSession::with_file_utilities`]) has no directory to be in: such a tree keys a file
+/// by the path the program named, so neither command is one that session performs, and a name
+/// its own environment provides a program for stays that program's.
+pub const MACHINE_TREE_COMMANDS: &[&str] = &[CHANGE_DIRECTORY, PRINT_DIRECTORY];
+
+/// The command of [`MACHINE_TREE_COMMANDS`] that changes the working directory, and the one
+/// that writes it.
+const CHANGE_DIRECTORY: &str = "cd";
+const PRINT_DIRECTORY: &str = "pwd";
+
+/// The variable a shell publishes the working directory in: "PWD … shall be set by the cd
+/// utility", beside the one it publishes the directory before it in, which is what `cd -`
+/// changes back to.
+const WORKING_DIRECTORY_VARIABLE: &str = "PWD";
+const PREVIOUS_DIRECTORY_VARIABLE: &str = "OLDPWD";
+
+/// The variable `cd` with no operand changes to: "if no directory operand is given and the
+/// HOME environment variable is set to a non-empty value, the cd utility shall behave as if
+/// the directory named in the HOME variable was specified".
+const HOME_VARIABLE: &str = "HOME";
+
+/// The operand `cd` takes for the directory the session was in BEFORE the last one.
+const PREVIOUS_DIRECTORY_OPERAND: &str = "-";
+
 /// The command of [`VOLUME_COMMANDS`] that writes what it READS into the files it names: a
 /// program's own way of putting a document somewhere, beside a redirection.
 const TEE_COMMAND: &str = "tee";
@@ -696,6 +729,11 @@ pub struct ShellSession {
     piped_input: Option<String>,
     /// How long this session's `sleep` commands have stated the program took.
     slept: ::std::time::Duration,
+    /// The directory the paths a program names WITHOUT one are resolved against, which `cd`
+    /// is what changes ([`Self::run_change_directory`]). The root of the tree for a session
+    /// nothing has changed it in, and never read for a session whose tree is its own: such a
+    /// tree keys a file by the path a program named.
+    working_directory: String,
 }
 
 /// The FILES of the tree this session works over, handed to the ENVIRONMENT's programs
@@ -831,6 +869,7 @@ impl ShellSession {
             redirect_failed: false,
             piped_input: None,
             slept: ::std::time::Duration::ZERO,
+            working_directory: super::posix_shell_volume::ROOT.to_string(),
             config,
         };
         for (name, value) in variables {
@@ -1507,11 +1546,36 @@ impl ShellSession {
         }
     }
 
+    /// `path` as the tree this session works over keys it: a path a program named WITHOUT a
+    /// directory is resolved against this session's working directory, which is what `cd`
+    /// changes ([`Self::run_change_directory`]), and `./name` and `name` are the same file.
+    ///
+    /// A session whose tree is its OWN keys a file by the path the program named and has no
+    /// working directory to resolve one against, so the path is left exactly as written.
+    fn at(&self, path: &str) -> String {
+        if self.volume.is_none() {
+            return path.to_string();
+        }
+        let named = path.trim();
+        let folded = named.strip_prefix("./").unwrap_or(named);
+        if folded.starts_with('/') {
+            return folded.to_string();
+        }
+        if folded.is_empty() || folded == "." {
+            return self.working_directory.clone();
+        }
+        format!(
+            "{}/{folded}",
+            self.working_directory
+                .trim_end_matches('/')
+        )
+    }
+
     /// What reading `path` answers in the tree this session reads: a machine's tree where it
     /// was given one, and its own otherwise.
     fn read_path(&self, path: &str) -> Option<String> {
         match &self.volume {
-            Some(volume) => volume.read(path),
+            Some(volume) => volume.read(&self.at(path)),
             None => self.files.get(&file_path(path)?).cloned(),
         }
     }
@@ -1569,8 +1633,9 @@ impl ShellSession {
     /// will not let a program write, or a write past one of its bounds — which the command
     /// performing it reports.
     fn write_path(&mut self, path: &str, text: &str, append: bool) -> bool {
+        let resolved = self.at(path);
         if let Some(volume) = self.volume.as_mut() {
-            return volume.write(path, text, append);
+            return volume.write(&resolved, text, append);
         }
         let Some(path) = file_path(path) else {
             return false;
@@ -1608,7 +1673,7 @@ impl ShellSession {
     /// directory, or (in a machine's tree) a device.
     fn tree_holds(&self, path: &str) -> bool {
         match &self.volume {
-            Some(volume) => volume.exists(path),
+            Some(volume) => volume.exists(&self.at(path)),
             None => self.tree_holds_file(path) || self.tree_holds_directory(path),
         }
     }
@@ -1616,7 +1681,7 @@ impl ShellSession {
     /// Whether `path` is a FILE of the tree this session works over.
     fn tree_holds_file(&self, path: &str) -> bool {
         match &self.volume {
-            Some(volume) => volume.is_file(path),
+            Some(volume) => volume.is_file(&self.at(path)),
             None => file_path(path).is_some_and(|path| self.files.contains_key(&path)),
         }
     }
@@ -1628,7 +1693,7 @@ impl ShellSession {
     /// for: removing the last file under it leaves no directory behind.
     fn tree_holds_directory(&self, path: &str) -> bool {
         match &self.volume {
-            Some(volume) => volume.is_directory(path),
+            Some(volume) => volume.is_directory(&self.at(path)),
             None => file_path(path).is_some_and(|path| {
                 let under = format!("{path}/");
                 !self.files.contains_key(&path)
@@ -1644,8 +1709,9 @@ impl ShellSession {
     /// written under `path` whether or not anything made it first, and the only answer that
     /// is not success is a FILE already holding that path.
     fn tree_make_directories(&mut self, path: &str) -> bool {
+        let resolved = self.at(path);
         match self.volume.as_mut() {
-            Some(volume) => volume.make_directories(path),
+            Some(volume) => volume.make_directories(&resolved),
             None => !self.tree_holds_file(path),
         }
     }
@@ -1653,8 +1719,9 @@ impl ShellSession {
     /// Remove the file at `path` from the tree this session works over, answering whether
     /// there was one to remove.
     fn tree_remove_file(&mut self, path: &str) -> bool {
+        let resolved = self.at(path);
         if let Some(volume) = self.volume.as_mut() {
-            return volume.remove_file(path);
+            return volume.remove_file(&resolved);
         }
         let Some(path) = file_path(path) else {
             return false;
@@ -1677,7 +1744,8 @@ impl ShellSession {
     /// so a name here is either a file directly under that path or the first segment of a
     /// deeper file's path, which is what makes it a directory.
     fn tree_entry_names(&self, directory: &str) -> Vec<String> {
-        let held = directory.trim();
+        let resolved = self.at(directory);
+        let held = resolved.trim();
         let held = held.strip_prefix("./").unwrap_or(held);
         let prefix = match held {
             "" | "." | "/" => String::new(),
@@ -2000,6 +2068,14 @@ impl ShellSession {
                 }
                 return self.run_text_filter(name, arguments, redirections);
             }
+            // The commands about the DIRECTORY the session is in, which only a session
+            // working over a machine's tree provides ([`MACHINE_TREE_COMMANDS`]).
+            if self.volume.is_some() && MACHINE_TREE_COMMANDS.contains(&name) {
+                return match name {
+                    CHANGE_DIRECTORY => self.run_change_directory(arguments, redirections),
+                    _ => self.run_print_directory(redirections),
+                };
+            }
             if (self.volume.is_some() || self.working_tree) && VOLUME_COMMANDS.contains(&name) {
                 // `ls` NAMES what the tree holds rather than changing it, and an environment
                 // whose storage has its own catalog provides its own program for that name —
@@ -2109,6 +2185,91 @@ impl ShellSession {
             "." | "source" => self.run_dot(arguments, redirections),
             "sleep" => self.run_sleep(arguments, redirections),
             _ => self.config.statuses.could_not_run,
+        }
+    }
+
+    /// Perform `cd`: change the directory the paths a program names without one are resolved
+    /// against ([`Self::at`]).
+    ///
+    /// The operand is resolved against the directory the session is in now, so a relative
+    /// operand walks from there, and the change happens only for a directory the tree HOLDS:
+    /// a path it holds a file at is not a directory and a path it holds nothing at is not
+    /// there, each reported in the wording the utility reports it in and leaving the session
+    /// where it was. An invocation with no operand changes to the directory `HOME` names, and
+    /// changes nothing at all for a session whose environment publishes none — "the default
+    /// behavior is implementation-defined and no further action shall be taken"; `cd -`
+    /// changes back to the directory before this one and writes it, as a shell does.
+    ///
+    /// A session whose tree is its own performs none of this: such a tree keys a file by the
+    /// path a program named and holds no directory to be in.
+    fn run_change_directory(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
+        if self.volume.is_none() {
+            return self.config.statuses.could_not_run;
+        }
+        let operand = arguments
+            .iter()
+            .map(String::as_str)
+            .find(|word| *word == PREVIOUS_DIRECTORY_OPERAND || !word.starts_with('-'));
+        let previous = operand == Some(PREVIOUS_DIRECTORY_OPERAND);
+        let named = match operand {
+            Some(PREVIOUS_DIRECTORY_OPERAND) => match self
+                .variable(PREVIOUS_DIRECTORY_VARIABLE)
+                .map(str::to_string)
+            {
+                Some(held) => held,
+                None => {
+                    let _ = self.write_stderr(
+                        &format!("{CHANGE_DIRECTORY}: {PREVIOUS_DIRECTORY_VARIABLE} not set\n"),
+                        redirections,
+                    );
+                    return self.config.statuses.failure;
+                }
+            },
+            Some(named) => named.to_string(),
+            None => match self
+                .variable(HOME_VARIABLE)
+                .filter(|held| !held.is_empty())
+                .map(str::to_string)
+            {
+                Some(home) => home,
+                None => return self.config.statuses.success,
+            },
+        };
+        let target = self.at(&named);
+        if self.tree_holds_file(&target) {
+            let _ = self.write_stderr(
+                &format!("{CHANGE_DIRECTORY}: {named}: Not a directory\n"),
+                redirections,
+            );
+            return self.config.statuses.failure;
+        }
+        if !self.tree_holds_directory(&target) {
+            let _ = self.write_stderr(
+                &format!("{CHANGE_DIRECTORY}: {named}: No such file or directory\n"),
+                redirections,
+            );
+            return self.config.statuses.failure;
+        }
+        let left = ::std::mem::replace(&mut self.working_directory, target.clone());
+        let _ = self.set_variable(PREVIOUS_DIRECTORY_VARIABLE.to_string(), left);
+        let _ = self.set_variable(WORKING_DIRECTORY_VARIABLE.to_string(), target.clone());
+        if previous && !self.write_stdout(&format!("{target}\n"), redirections) {
+            return self.config.statuses.failure;
+        }
+        self.config.statuses.success
+    }
+
+    /// Perform `pwd`: write the directory this session is in — "write the absolute pathname of
+    /// the current working directory".
+    fn run_print_directory(&mut self, redirections: &Redirections) -> i32 {
+        if self.volume.is_none() {
+            return self.config.statuses.could_not_run;
+        }
+        let written = format!("{}\n", self.working_directory);
+        if self.write_stdout(&written, redirections) {
+            self.config.statuses.success
+        } else {
+            self.config.statuses.failure
         }
     }
 
@@ -3828,6 +3989,133 @@ mod tests {
             },
             volume,
         )
+    }
+
+    /// RULE: a session working over a machine's tree is IN a directory of it — `cd` changes
+    /// which, `pwd` writes it, and a path a program names without a directory is resolved
+    /// against it, so a file saved under a bare name is the same file read back under one.
+    #[test]
+    fn a_path_without_a_directory_is_under_the_one_cd_changed_to() {
+        let statuses = Statuses::default();
+        let mut held = in_volume();
+        /// The last line the session wrote, which is what the command just performed wrote.
+        fn last(session: &ShellSession) -> String {
+            session.output().last().cloned().unwrap_or_default()
+        }
+
+        assert_eq!(
+            held.run("pwd"),
+            statuses.success,
+            "case the directory a session starts in: expected it to be written"
+        );
+        assert_eq!(
+            last(&held),
+            "/",
+            "case the directory a session starts in: expected the tree's root, got {:?}",
+            last(&held)
+        );
+
+        assert_eq!(
+            held.run("cd /var/lib && pwd"),
+            statuses.success,
+            "case a directory the tree holds: expected the change to happen"
+        );
+        assert_eq!(
+            last(&held),
+            "/var/lib",
+            "case a directory the tree holds: expected it to be the directory now, got {:?}",
+            last(&held)
+        );
+
+        assert_eq!(
+            held.run("cat counter"),
+            statuses.success,
+            "case a bare name after a change: expected the file under that directory to be read"
+        );
+        assert_eq!(
+            last(&held),
+            "1",
+            "case a bare name after a change: expected the file's own contents, got {:?}",
+            last(&held)
+        );
+
+        assert_eq!(
+            held.run("echo kept > made"),
+            statuses.success,
+            "case a write under a bare name: expected it to happen"
+        );
+        assert_eq!(
+            held.run("cat /var/lib/made"),
+            statuses.success,
+            "case a write under a bare name: expected it under the directory the session is in"
+        );
+        assert_eq!(
+            last(&held),
+            "kept",
+            "case a write under a bare name: expected what the program wrote, got {:?}",
+            last(&held)
+        );
+
+        assert_eq!(
+            held.run("cd /var/lib/absent"),
+            statuses.failure,
+            "case a path the tree holds nothing at: expected the change to fail"
+        );
+        assert_eq!(
+            held.run("cd counter"),
+            statuses.failure,
+            "case a path the tree holds a FILE at: expected the change to fail"
+        );
+        assert_eq!(
+            held.run("pwd"),
+            statuses.success,
+            "case a change that failed: expected the session to answer where it still is"
+        );
+        assert_eq!(
+            last(&held),
+            "/var/lib",
+            "case a change that failed: expected the session where it was, got {:?}",
+            last(&held)
+        );
+
+        assert_eq!(
+            held.run("mkdir deeper && cd deeper && pwd"),
+            statuses.success,
+            "case a relative operand: expected the change to walk from the directory it is in"
+        );
+        assert_eq!(
+            last(&held),
+            "/var/lib/deeper",
+            "case a relative operand: expected the directory under it, got {:?}",
+            last(&held)
+        );
+
+        assert_eq!(
+            held.run("cd -"),
+            statuses.success,
+            "case the directory before this one: expected the change back"
+        );
+        assert_eq!(
+            last(&held),
+            "/var/lib",
+            "case the directory before this one: expected it written, got {:?}",
+            last(&held)
+        );
+    }
+
+    /// RULE: a session whose tree is its OWN has no directory to be in, so neither command is
+    /// one it performs.
+    #[test]
+    fn a_session_with_no_machine_tree_performs_no_directory_change() {
+        let statuses = Statuses::default();
+        let mut held = ShellSession::new(BTreeMap::new(), SessionConfig::default());
+        for line in ["cd /tmp", "pwd"] {
+            assert_eq!(
+                held.run(line),
+                statuses.could_not_run,
+                "case {line:?}: expected a command this session could not run"
+            );
+        }
     }
 
     /// RULE: a session that runs in a volume performs the forms a program of a machine is
