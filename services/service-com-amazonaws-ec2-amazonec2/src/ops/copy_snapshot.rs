@@ -497,11 +497,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 data_encryption_key_id: None,
                 // "The full size of the snapshot, in bytes. […] represents the size of all
                 // the blocks that were written to the source volume"
-                // (`Snapshot$FullSnapshotSizeInBytes`): a copy holds every block of the
-                // source volume the snapshot was taken of, so the store derives it from the
-                // size this copy carries, as a fact of the copy's age
-                // ([`crate::state::SnapshotRecord::view_at`]).
-                full_snapshot_size_in_bytes: None,
+                // (`Snapshot$FullSnapshotSizeInBytes`): a copy holds every block the SOURCE
+                // SNAPSHOT holds, so it measures exactly what that snapshot measures — the
+                // copy's own arbitrary volume id names no volume of the account to read it
+                // off.
+                full_snapshot_size_in_bytes: source.full_snapshot_size_in_bytes,
                 // Minted, stamped and derived by the store: the id, the start time, and the
                 // state, progress and completion time the clock decides.
                 snapshot_id: None,

@@ -416,6 +416,19 @@ async fn a_list_fills_to_its_maximum_and_refuses_the_entry_past_it() {
              be applied, got {status} with body {body}",
             max = case.max_entries
         );
+        revised.push((name, prefix_list_id.clone()));
+    }
+    // The revisions the clock owes, waited for as the CONDITION the describe reports, so the
+    // call past the bound is not refused for a state the list has already left — and the
+    // entry set a revision mints is the entry set of the version it settles into, so the
+    // entries are read back once the list has settled.
+    settle_all(&router, &revised, MODIFY_COMPLETE).await;
+
+    for ((name, prefix_list_id), case) in lists.iter().zip(BOUND_CASES) {
+        let name = *name;
+        if case.fill.is_empty() {
+            continue;
+        }
         let blocks = reported_blocks(&router, name, prefix_list_id).await;
         assert_eq!(
             blocks.len(),
@@ -423,11 +436,7 @@ async fn a_list_fills_to_its_maximum_and_refuses_the_entry_past_it() {
             "case {name:?}: expected the list filled to {max} entries, got {blocks:?}",
             max = case.max_entries
         );
-        revised.push((name, prefix_list_id.clone()));
     }
-    // The revisions the clock owes, waited for as the CONDITION the describe reports, so the
-    // call past the bound is not refused for a state the list has already left.
-    settle_all(&router, &revised, MODIFY_COMPLETE).await;
 
     for ((name, prefix_list_id), case) in lists.iter().zip(BOUND_CASES) {
         let name = *name;

@@ -3,12 +3,15 @@
 //! @op DisassociateRouteServer
 //!
 //! "Disassociates a route server from a VPC": it resolves the route server and the VPC the
-//! request pairs, and takes the association between the two OUT of the one association
-//! store, so `GetRouteServerAssociations` no longer reports it and the VPC can be associated
-//! with a route server again.
+//! request pairs, and STARTS taking the association between the two apart — the association
+//! is answered `disassociating`, the CLOCK owes it the terminal `disassociated` and takes the
+//! record out of the store at that instant, and it holds the pair no longer from this call
+//! on, so the VPC can be associated with a route server again and the route server it was
+//! holding can be deleted.
 //!
-//! A pairing the account holds no association for is refused rather than reported as
-//! disassociated: that is the one way a client learns that the VPC it named was never served
+//! A pairing the account holds no association that still joins it — one it never had, and one
+//! a disassociation has already taken apart — is refused rather than reported as
+//! disassociated: that is the one way a client learns that the VPC it named was not served
 //! by the route server it named.
 //!
 //! ## Shape of an operation
@@ -179,9 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — so a pair the store holds no association for has nothing to disassociate, and
         // that is refused rather than answered as though the pair had just been separated.
         // A VPC associated with ANOTHER route server is not associated with this one either,
-        // so it earns the same refusal.
+        // and a pair whose disassociation has already been started joins the two no longer,
+        // so both earn the same refusal.
         let pairing = (input.route_server_id.clone(), input.vpc_id.clone());
-        if !store.route_server_associations.contains_key(&pairing) {
+        if !store
+            .route_server_associations
+            .get(&pairing)
+            .is_some_and(state::RouteServerAssociationRecord::joins_its_pair)
+        {
             return Err(route_server_not_associated(
                 &input.route_server_id,
                 &input.vpc_id,
@@ -197,25 +205,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::dry_run_operation());
         }
 
-        // The disassociation itself: the association is the only record of the pairing, so
-        // taking it out of the store IS the disassociation — nothing is left to report it,
-        // which is why the answer carries the state the store has actually reached rather
-        // than a transient one no record would hold.
-        store.route_server_associations.remove(&pairing);
+        // The disassociation itself: the call STARTS the teardown rather than completing it,
+        // so the association goes into the non-terminal `disassociating` state with the
+        // terminal `disassociated` owed to the clock — which also takes the record out of the
+        // store at that instant — and the answer is the record the store now holds, so a
+        // disassociate and a later `GetRouteServerAssociations` cannot drift apart.
+        //
+        // The write asks the SAME question the refusal above asked, and under the same hold of
+        // the store, so this arm is unreachable: it is kept because the refusal cannot move
+        // down here — `DryRun` has to be answered with the reason the request would have been
+        // refused for, which means the pairing is resolved BEFORE the flag and written after.
+        let now = ::std::time::Instant::now();
+        let Some(association) = store.begin_route_server_disassociation(
+            &input.route_server_id,
+            &input.vpc_id,
+            now,
+        ) else {
+            return Err(state::internal_error(format!(
+                "the association of the route server '{route_server_id}' with the VPC \
+                 '{vpc_id}' resolved a moment ago is not in the store any more",
+                route_server_id = input.route_server_id,
+                vpc_id = input.vpc_id,
+            )));
+        };
         Ok(DisassociateRouteServerOutput {
-            route_server_association: Some(RouteServerAssociation {
-                route_server_id: Some(input.route_server_id.clone()),
-                vpc_id: Some(input.vpc_id.clone()),
-                state: Some(ROUTE_SERVER_ASSOCIATION_STATE_DISASSOCIATED.to_string()),
-            }),
+            route_server_association: Some(association),
         })
     }
 }
-
-/// An association that is no longer in force: the `RouteServerAssociationState` enum's
-/// `disassociated` member (`smithy_query(query="shape",shape="RouteServerAssociationState")`,
-/// whose members are `associating`, `associated`, `disassociating` and `disassociated`).
-const ROUTE_SERVER_ASSOCIATION_STATE_DISASSOCIATED: &str = "disassociated";
 
 /// `InvalidRouteServerId.NotAssociated` (HTTP 400): the request paired a route server with a
 /// VPC the account holds no association between.

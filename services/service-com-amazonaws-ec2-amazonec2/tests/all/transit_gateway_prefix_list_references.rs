@@ -232,6 +232,7 @@ fn seed_prefix_list(engine: &engine::InMemoryEngine, prefix_list_id: &str) {
             },
             entries: Vec::new(),
             pending: None,
+            pending_revision: None,
         },
     );
 }

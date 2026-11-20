@@ -37,9 +37,9 @@ use crate::ops::types::{
 use crate::scaffolded::Scaffolded;
 
 use super::{
-    AvailabilityZoneRecord, ClockTransition, ComAmazonawsEc2Amazonec2State, MAX_RESOURCE_IDS,
-    TRANSITION_DELAY, availability_zone_of_region, availability_zones_in_region, deduplicate_ids,
-    invalid_parameter_combination, invalid_parameter_value, missing_parameter,
+    AvailabilityZoneRecord, ClockTransition, ComAmazonawsEc2Amazonec2State, INVALID_PARAMETER_VALUE,
+    MAX_RESOURCE_IDS, TRANSITION_DELAY, availability_zone_of_region, availability_zones_in_region,
+    deduplicate_ids, invalid_parameter_combination, invalid_parameter_value, missing_parameter,
     system_time_to_date_time,
 };
 
@@ -58,8 +58,7 @@ pub const FAST_SNAPSHOT_RESTORE_STATE_ENABLED: &str = "enabled";
 /// `FastSnapshotRestoreStateCode`'s `disabling`: the state a disable puts a pair in.
 pub const FAST_SNAPSHOT_RESTORE_STATE_DISABLING: &str = "disabling";
 
-/// `FastSnapshotRestoreStateCode`'s `disabled`: the terminal state of a disable, and the
-/// state a pair nothing has ever enabled is in.
+/// `FastSnapshotRestoreStateCode`'s `disabled`: the terminal state of a disable.
 pub const FAST_SNAPSHOT_RESTORE_STATE_DISABLED: &str = "disabled";
 
 /// "`Client.UserInitiated` - The state successfully transitioned to `enabling` or
@@ -324,33 +323,29 @@ impl FastSnapshotRestoreRecord {
     }
 }
 
-/// The pair as a disable of a snapshot that has no fast snapshot restore in that zone
-/// reports it: `disabled`.
+/// The pair a disable names no fast snapshot restore for, as that call reports it: the error
+/// code and message EC2 answers one (snapshot, Availability Zone) pair with when the account
+/// has no fast snapshot restore in force for it.
 ///
-/// A pair nothing enabled is already in the state the request asks for, so the disable is
-/// reported as done rather than as a failure — and it carries no lifecycle at all: no
-/// account enabled it, and none of the five phase timestamps happened, so the item names
-/// only the pair and the state it is in.
-pub fn disabled_fast_snapshot_restore_item(
-    snapshot_id: &str,
-    zone: &AvailabilityZoneRecord,
-    zone_form: FastSnapshotRestoreZoneForm,
-) -> DisableFastSnapshotRestoreSuccessItem {
-    DisableFastSnapshotRestoreSuccessItem {
-        snapshot_id: Some(snapshot_id.to_string()),
-        availability_zone: zone_form.reported_zone_name(&zone.zone_name),
-        availability_zone_id: zone_form.reported_zone_id(&zone.zone_id),
-        state: Some(FAST_SNAPSHOT_RESTORE_STATE_DISABLED.to_string()),
-        state_transition_reason: None,
-        owner_id: None,
-        owner_alias: None,
-        enabling_time: None,
-        optimizing_time: None,
-        enabled_time: None,
-        disabling_time: None,
-        disabled_time: None,
-    }
+/// "Disables fast snapshot restores for the specified snapshots in the specified Availability
+/// Zones" (`DisableFastSnapshotRestores`): a pair that has none is not a pair the call can
+/// turn off, so it is reported as a per-pair FAILURE rather than as a disable of nothing —
+/// `Unsuccessful` is "information about the snapshots for which fast snapshot restores could
+/// not be disabled". The classification is a pair rather than an error, like
+/// [`super::unresolvable_snapshot_id_error`], because it is carried in the per-pair channel
+/// and never refuses the pairs beside it.
+pub fn fast_snapshot_restore_not_enabled_error() -> (&'static str, String) {
+    (
+        INVALID_PARAMETER_VALUE,
+        FAST_SNAPSHOT_RESTORE_NOT_ENABLED_MESSAGE.to_string(),
+    )
 }
+
+/// The message of [`fast_snapshot_restore_not_enabled_error`], whose whole text is fixed: it
+/// names neither the snapshot nor the zone, both of which the item carrying it already
+/// reports.
+const FAST_SNAPSHOT_RESTORE_NOT_ENABLED_MESSAGE: &str =
+    "Fast Restore is not enabled for this snapshot";
 
 /// Which of the two identifiers of an Availability Zone a request named its zones by.
 ///
@@ -543,7 +538,9 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 
     /// Disable fast snapshot restores for one pair at `now`, and answer the record the pair
-    /// now has — `None` when the account has none for it, there being nothing to disable.
+    /// now has — `None` when the account has NO fast snapshot restore in force for it, there
+    /// being nothing to disable: a pair no enable ever named, and one a disable has already
+    /// taken off.
     ///
     /// The record is KEPT rather than dropped: `FastSnapshotRestoreStateCode` has a word for
     /// a pair whose restore was turned off (`disabled`), and a describe that no longer
@@ -557,6 +554,9 @@ impl ComAmazonawsEc2Amazonec2State {
         let record = self
             .fast_snapshot_restores
             .get_mut(&fast_snapshot_restore_key(snapshot_id, availability_zone))?;
+        if record.disabling.is_some() {
+            return None;
+        }
         record.begin_disable(now);
         Some(record)
     }

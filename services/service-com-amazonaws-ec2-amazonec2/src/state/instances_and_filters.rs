@@ -631,6 +631,15 @@ impl ComAmazonawsEc2Amazonec2State {
                 Some(ManagedPrefixListMove::Settled(state)) => {
                     record.view.state = Some(state.to_string());
                     record.pending = None;
+                    // The entry set a modification or a restore accepted comes into force
+                    // with the state it settles into, and so does the version it is the
+                    // entry set of: "adding or removing entries in a prefix list creates a
+                    // new version of the prefix list", and that version is created when the
+                    // change is carried out rather than when it was asked for.
+                    if let Some(revision) = record.pending_revision.take() {
+                        record.entries = revision.entries;
+                        record.view.version = Some(revision.version);
+                    }
                 }
                 Some(ManagedPrefixListMove::Removed) => deleted.push(prefix_list_id.clone()),
                 None => {}
@@ -1341,6 +1350,14 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
                 false
             });
+        // A route server association `DisassociateRouteServer` answered `disassociating` is
+        // GONE at its own due instant: the disassociation was carried out at that instant
+        // whether or not anybody called, and a pair it has taken apart is not an association
+        // the account holds — which is also what gives its slot in the store's record
+        // ceiling back. The record holds no caller-supplied bytes, so there is nothing to
+        // give back to the byte budget.
+        self.route_server_associations
+            .retain(|_, record| !record.disassociation_settled_at(now));
         // A secondary subnet goes down the same way: `DeleteSecondarySubnet` answers it in
         // the non-terminal `delete-in-progress` state with its IPv4 CIDR blocks
         // `disassociating`, so the clock owes it `delete-complete` with those blocks

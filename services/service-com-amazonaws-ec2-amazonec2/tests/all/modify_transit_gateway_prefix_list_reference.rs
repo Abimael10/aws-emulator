@@ -242,6 +242,7 @@ fn seed_prefix_lists(engine: &engine::InMemoryEngine) {
                 },
                 entries: Vec::new(),
                 pending: None,
+                pending_revision: None,
             },
         );
     }

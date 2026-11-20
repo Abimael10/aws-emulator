@@ -1305,8 +1305,17 @@ pub const ROUTE_SERVER_ASSOCIATION_STATE_ASSOCIATING: &str = "associating";
 /// An association that is established: that same enum's `associated` member.
 pub const ROUTE_SERVER_ASSOCIATION_STATE_ASSOCIATED: &str = "associated";
 
-/// One stored route server association: the instant the clock owes it its `associating` ->
-/// `associated` move, and nothing else.
+/// An association that is being taken down: that same enum's `disassociating` member, the
+/// state `DisassociateRouteServer` starts.
+pub const ROUTE_SERVER_ASSOCIATION_STATE_DISASSOCIATING: &str = "disassociating";
+
+/// An association that is no longer in force: that same enum's `disassociated` member, the
+/// terminal state of a disassociation.
+pub const ROUTE_SERVER_ASSOCIATION_STATE_DISASSOCIATED: &str = "disassociated";
+
+/// One stored route server association: the instants the clock owes it its `associating` ->
+/// `associated` move and, once a disassociation has been asked for, its `disassociating` ->
+/// `disassociated` one.
 ///
 /// The (route server, VPC) PAIR is the whole identity of an association — "A route server
 /// association is the connection established between a route server and a VPC"
@@ -1327,6 +1336,10 @@ pub struct RouteServerAssociationRecord {
     /// it is only ever compared against the clock, never reported, so a wall-clock
     /// adjustment cannot move an association back to `associating`.
     pub associated_at: Instant,
+    /// The instant from which this association's `disassociating` -> `disassociated` move is
+    /// due, once `DisassociateRouteServer` has started one; `None` on an association nothing
+    /// has asked to take down. Monotonic for the same reason the instant above is.
+    pub disassociated_at: Option<Instant>,
 }
 
 impl RouteServerAssociationRecord {
@@ -1347,12 +1360,45 @@ impl RouteServerAssociationRecord {
     }
 
     /// The association's `RouteServerAssociationState` at `now`.
+    ///
+    /// A disassociation overrides the association's own lifecycle: the pair is
+    /// `disassociating` until that move falls due and `disassociated` from then on, whichever
+    /// word the association had reached.
     pub fn state_at(&self, now: Instant) -> &'static str {
+        if let Some(disassociated_at) = self.disassociated_at {
+            return if now < disassociated_at {
+                ROUTE_SERVER_ASSOCIATION_STATE_DISASSOCIATING
+            } else {
+                ROUTE_SERVER_ASSOCIATION_STATE_DISASSOCIATED
+            };
+        }
         if now < self.associated_at {
             ROUTE_SERVER_ASSOCIATION_STATE_ASSOCIATING
         } else {
             ROUTE_SERVER_ASSOCIATION_STATE_ASSOCIATED
         }
+    }
+
+    /// Whether this association still joins its pair.
+    ///
+    /// An association a disassociation has started is on its way out whatever the clock has
+    /// reached: it holds the VPC no longer, so the VPC may be served by another route server
+    /// and the route server it was holding may be deleted. The ONE reading of that question,
+    /// so the lookups that ask whether a pair is joined cannot disagree.
+    pub fn joins_its_pair(&self) -> bool {
+        self.disassociated_at.is_none()
+    }
+
+    /// Whether the disassociation of this association has been CARRIED OUT by `now`.
+    ///
+    /// A pair a disassociation has taken apart is no longer an association of the account:
+    /// nothing reports the record from that instant on and the clock takes it out of the
+    /// store ([`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]), which is also
+    /// what gives its slot in the store's record ceiling back. The reporting path asks it
+    /// too, so a read observes that removal whether or not a writer has swept it yet.
+    pub fn disassociation_settled_at(&self, now: Instant) -> bool {
+        self.disassociated_at
+            .is_some_and(|disassociated_at| now >= disassociated_at)
     }
 }
 
@@ -1361,8 +1407,20 @@ impl ComAmazonawsEc2Amazonec2State {
     /// ([`MAX_ROUTE_SERVER_RECORDS`]) — the same contract as
     /// [`Self::has_route_server_endpoint_capacity`], asked of its own store so a full
     /// store of one kind cannot refuse a write of another.
+    ///
+    /// Only the associations that still JOIN their pair are counted: one a disassociation has
+    /// taken apart holds nothing and is on its way out of the store, so a client that
+    /// associates and disassociates repeatedly cannot fill the ceiling with pairs that are no
+    /// longer associations ([`RouteServerAssociationRecord::joins_its_pair`]). The MAP's
+    /// length is therefore not the ceiling: a record stays keyed until the clock sweeps it,
+    /// so the store may briefly hold a few more entries than [`MAX_ROUTE_SERVER_RECORDS`] —
+    /// bounded by what one transition span's worth of disassociations can leave behind.
     pub fn has_route_server_association_capacity(&self) -> bool {
-        self.route_server_associations.len() < MAX_ROUTE_SERVER_RECORDS
+        self.route_server_associations
+            .values()
+            .filter(|record| record.joins_its_pair())
+            .count()
+            < MAX_ROUTE_SERVER_RECORDS
     }
 
     /// The route server the VPC `vpc_id` is already associated with, or `None` when it has
@@ -1372,9 +1430,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// to know whether a VPC is already served by a route server cannot disagree about it.
     pub fn route_server_association_of_vpc(&self, vpc_id: &str) -> Option<&str> {
         self.route_server_associations
-            .keys()
-            .find(|(_, associated_vpc)| associated_vpc == vpc_id)
-            .map(|(route_server_id, _)| route_server_id.as_str())
+            .iter()
+            .find(|((_, associated_vpc), record)| {
+                associated_vpc == vpc_id && record.joins_its_pair()
+            })
+            .map(|((route_server_id, _), _)| route_server_id.as_str())
     }
 
     /// The VPC the route server `route_server_id` is already associated with, or `None` when
@@ -1387,9 +1447,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// itself.
     pub fn vpc_route_server_is_associated_with(&self, route_server_id: &str) -> Option<&str> {
         self.route_server_associations
-            .keys()
-            .find(|(associated_server, _)| associated_server == route_server_id)
-            .map(|(_, vpc_id)| vpc_id.as_str())
+            .iter()
+            .find(|((associated_server, _), record)| {
+                associated_server == route_server_id && record.joins_its_pair()
+            })
+            .map(|((_, vpc_id), _)| vpc_id.as_str())
     }
 
     /// Associate `route_server_id` with `vpc_id` from `now`, and answer the association as
@@ -1407,6 +1469,7 @@ impl ComAmazonawsEc2Amazonec2State {
     ) -> RouteServerAssociation {
         let record = RouteServerAssociationRecord {
             associated_at: now + TRANSITION_DELAY,
+            disassociated_at: None,
         };
         let view = record.view_at(route_server_id, vpc_id, now);
         self.route_server_associations
@@ -1414,8 +1477,14 @@ impl ComAmazonawsEc2Amazonec2State {
         view
     }
 
-    /// Every association of the route server `route_server_id` as of `now`, in `VpcId`
-    /// order — the order the store itself is kept in.
+    /// Every association of the route server `route_server_id` this store reports as of
+    /// `now`, in `VpcId` order — the order the store itself is kept in.
+    ///
+    /// An association whose disassociation the clock has CARRIED OUT is not one of them: the
+    /// pair it joined has been taken apart, so it is reported no longer
+    /// ([`RouteServerAssociationRecord::disassociation_settled_at`]) — the same reading the
+    /// removal this store makes at that instant takes, so a read never reports a pair a
+    /// writer would already have swept.
     pub fn route_server_associations_at(
         &self,
         route_server_id: &str,
@@ -1423,11 +1492,63 @@ impl ComAmazonawsEc2Amazonec2State {
     ) -> Vec<RouteServerAssociation> {
         self.route_server_associations
             .iter()
-            .filter(|((associated_server, _), _)| associated_server == route_server_id)
+            .filter(|((associated_server, _), record)| {
+                associated_server == route_server_id && !record.disassociation_settled_at(now)
+            })
             .map(|((associated_server, vpc_id), record)| {
                 record.view_at(associated_server, vpc_id, now)
             })
             .collect()
+    }
+
+    /// Every association of the route server `route_server_id` that still JOINS its pair, as
+    /// of `now`.
+    ///
+    /// What [`Self::route_server_associations_at`] reports, narrowed to the associations whose
+    /// disassociation has not been started ([`RouteServerAssociationRecord::joins_its_pair`]):
+    /// an operation refused for the VPCs a route server still serves asks this, so a pair
+    /// already on its way out does not hold the route server back.
+    pub fn route_server_associations_in_force_at(
+        &self,
+        route_server_id: &str,
+        now: Instant,
+    ) -> Vec<RouteServerAssociation> {
+        self.route_server_associations
+            .iter()
+            .filter(|((associated_server, _), record)| {
+                associated_server == route_server_id && record.joins_its_pair()
+            })
+            .map(|((associated_server, vpc_id), record)| {
+                record.view_at(associated_server, vpc_id, now)
+            })
+            .collect()
+    }
+
+    /// Start the disassociation of `route_server_id` from `vpc_id` at `now`, and answer the
+    /// association as of that instant — `None` when the store holds no association that still
+    /// joins the pair, there being nothing to take down.
+    ///
+    /// The association is answered in the non-terminal `disassociating` state with the clock
+    /// owing it `disassociated` one [`TRANSITION_DELAY`] later, the same span the
+    /// `associating` -> `associated` move of [`Self::insert_route_server_association`] takes:
+    /// the transitional word is what tells a caller to start polling, so a caller reading
+    /// straight after the call still sees `disassociating`. The record holds the pair no
+    /// longer from this instant on, and the clock takes it out of the store once that move
+    /// falls due: a pair a disassociation has taken apart is not an association the account
+    /// holds.
+    pub fn begin_route_server_disassociation(
+        &mut self,
+        route_server_id: &str,
+        vpc_id: &str,
+        now: Instant,
+    ) -> Option<RouteServerAssociation> {
+        let key = (route_server_id.to_string(), vpc_id.to_string());
+        let record = self.route_server_associations.get_mut(&key)?;
+        if !record.joins_its_pair() {
+            return None;
+        }
+        record.disassociated_at = Some(now + TRANSITION_DELAY);
+        Some(record.view_at(route_server_id, vpc_id, now))
     }
 }
 

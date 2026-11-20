@@ -480,13 +480,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ))
                 })?;
             // "Adding or removing entries in a prefix list creates a new version of the prefix
-            // list": the revised entry set belongs to the NEXT version, and the one it
-            // replaced belongs to the version it was the entry set of, which comes back out of
-            // here to be kept.
+            // list": that version is created when the modification is CARRIED OUT, so the
+            // revised entry set and the version it belongs to are held against the list and
+            // come into force with the `modify-complete` the clock owes it — which is why this
+            // call answers the version the list still stands at. The entry set it replaces
+            // belongs to the version it was the entry set of, which comes back out of here to
+            // be kept.
             let superseded = if revises_entries {
-                let previous = ::std::mem::replace(&mut record.entries, entries);
-                record.view.version = Some(current_version.saturating_add(1));
-                Some((current_version, previous))
+                record.pending_revision = Some(state::ManagedPrefixListRevision {
+                    entries,
+                    version: current_version.saturating_add(1),
+                });
+                Some((current_version, record.entries.clone()))
             } else {
                 None
             };

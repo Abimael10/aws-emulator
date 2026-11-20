@@ -70,8 +70,10 @@
 //!
 //! [`ComAmazonawsEc2Amazonec2State::managed_prefix_lists`] holds the prefix lists the
 //! ACCOUNT created, keyed by `PrefixListId`, as [`ManagedPrefixListRecord`]s: the modelled
-//! `ManagedPrefixList` shape beside the facts it carries no member for — the list's entries
-//! and the `create-complete` move the clock owes it.
+//! `ManagedPrefixList` shape beside the facts it carries no member for — the list's entries,
+//! the `create-complete` move the clock owes it, and the entry set and version a
+//! modification or a restore has accepted, which come into force with the state the clock
+//! settles the list into ([`ManagedPrefixListRevision`]).
 //! [`ComAmazonawsEc2Amazonec2State::insert_managed_prefix_list`] is the one way one is
 //! stored. The prefix lists AMAZON WEB SERVICES publishes for the services of a Region are
 //! NOT stored: no EC2 operation creates or withdraws one, so
@@ -1094,7 +1096,12 @@
 //! one pair can hold only one association and `GetRouteServerAssociations` reports one route
 //! server's associations in VPC order. The association's `State` is a fact of the record's
 //! age, derived by [`RouteServerAssociationRecord::view_at`] like a route server's own two
-//! states.
+//! states: the clock carries it from `associating` to `associated`, and from the
+//! `disassociating` a `DisassociateRouteServer` starts to the terminal `disassociated` — at
+//! which instant the pair has been taken apart, so the record is reported no longer and the
+//! clock takes it out of the store. From the disassociate ON it joins its pair no longer
+//! ([`RouteServerAssociationRecord::joins_its_pair`]), so the VPC may be served by another
+//! route server and the route server it held may be deleted.
 //!
 //! [`ComAmazonawsEc2Amazonec2State::route_server_propagations`] holds which route tables
 //! each of those route servers may install its learned routes into, keyed by the (route

@@ -252,6 +252,24 @@ pub enum ManagedPrefixListMove {
 /// [`ManagedPrefixListMove`].
 pub type ManagedPrefixListTransition = ClockTransition<ManagedPrefixListMove>;
 
+/// The entry set a modification or a restore has accepted for a managed prefix list, and the
+/// version it will be the entry set OF.
+///
+/// "Adding or removing entries in a prefix list creates a new version of the prefix list"
+/// (`ModifyManagedPrefixList`): the new version is created when the modification is CARRIED
+/// OUT, not when it is accepted, so the revision is held here while the list is
+/// `modify-in-progress` or `restore-in-progress` and applied by
+/// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] at the instant the list
+/// settles. Until then the list stands at the version it was read at, which is what the
+/// `CurrentVersion` of a conditional revision is compared against.
+#[derive(Debug, Clone)]
+pub struct ManagedPrefixListRevision {
+    /// The entry set the list carries once the change is carried out.
+    pub entries: Vec<crate::ops::types::PrefixListEntry>,
+    /// The version that entry set belongs to (`ManagedPrefixList$Version`).
+    pub version: i64,
+}
+
 /// One stored managed prefix list: the modelled shape every operation that reports one
 /// answers with, plus the facts that shape carries no member for.
 #[derive(Debug, Clone)]
@@ -270,6 +288,10 @@ pub struct ManagedPrefixListRecord {
     /// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`] applies it. `None` on a
     /// list that has nothing owed.
     pub pending: Option<ManagedPrefixListTransition>,
+    /// The entry set and version a modification or a restore has accepted, which come into
+    /// force with the move above ([`ManagedPrefixListRevision`]). `None` on a list with no
+    /// change in progress.
+    pub pending_revision: Option<ManagedPrefixListRevision>,
 }
 
 /// The caller-chosen bytes one stored managed prefix list holds for the process's lifetime:
@@ -350,6 +372,7 @@ impl ComAmazonawsEc2Amazonec2State {
             pending: Some(ManagedPrefixListTransition::starting_now(
                 ManagedPrefixListMove::Settled(PREFIX_LIST_STATE_CREATE_COMPLETE),
             )),
+            pending_revision: None,
         };
         if let Some(token) = spec.client_token {
             self.managed_prefix_list_client_tokens

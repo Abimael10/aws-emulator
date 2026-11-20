@@ -12,18 +12,23 @@
 //! [`std::collections::BTreeMap`], so a report has one stable order and a pagination token
 //! can name the id the next page starts at.
 //!
-//! Four members are NOT stored: the state, the progress, the completion time and the full
-//! snapshot size. "Creates
+//! Three members are NOT stored: the state, the progress and the completion time. "Creates
 //! crash-consistent snapshots" hands back a snapshot in `pending`
 //! ([`SNAPSHOT_STATE_PENDING`]), and reaching `completed` is owed by the CLOCK rather than
 //! by a later call — so the record keeps the instant that move falls due
 //! ([`SnapshotRecord::completed_at`], monotonic and never reported, on the same
 //! [`super::TRANSITION_DELAY`] span as a volume's `creating` -> `available` move) and
-//! [`SnapshotRecord::view_at`] derives the first three from it. A read therefore observes the
+//! [`SnapshotRecord::view_at`] derives all three from it. A read therefore observes the
 //! move the clock already owed without writing anything, and two writers cannot store two
-//! different words for one snapshot's state. The fourth is derived from the size of the
-//! volume the snapshot was taken of ([`volume_full_snapshot_size_in_bytes`]), which is what
-//! the member measures, so one volume is never measured two ways.
+//! different words for one snapshot's state.
+//!
+//! The FULL SIZE is settled where the snapshot is STORED rather than derived on read: "the
+//! size of all the blocks that were written to the source volume AT THE TIME THE SNAPSHOT WAS
+//! CREATED" (`Snapshot$FullSnapshotSizeInBytes`) is a fact of that source as the write found
+//! it, which no later read can recover — so a writer whose source is not a volume of the
+//! account names it, and [`ComAmazonawsEc2Amazonec2State::insert_snapshot_completing_at`]
+//! measures it off the source volume for every writer that does not
+//! ([`ComAmazonawsEc2Amazonec2State::volume_written_bytes`]).
 //!
 //! [`ComAmazonawsEc2Amazonec2State::insert_snapshot`] is the one way a snapshot is stored,
 //! and it mints the id itself: a snapshot id is the service's to choose, never a caller's.
@@ -234,18 +239,11 @@ impl SnapshotRecord {
             // "The time stamp when the snapshot was completed": a snapshot that has not
             // completed has none, rather than one in the future.
             completion_time: completed.then(|| system_time_to_date_time(self.completion_time)),
-            // "The full size of the snapshot, in bytes […] represents the size of all the
-            // blocks that were written to the source volume AT THE TIME THE SNAPSHOT WAS
-            // CREATED" (`Snapshot$FullSnapshotSizeInBytes`): a fact of the source volume as
-            // the create found it, so it is settled when the snapshot starts and does not
-            // wait on the transfer the way the three members above do. Derived from that
-            // volume's size through the one conversion [`volume_full_snapshot_size_in_bytes`]
-            // holds,
-            // rather than stored, so one volume is never measured two ways.
-            full_snapshot_size_in_bytes: self
-                .view
-                .volume_size
-                .and_then(volume_full_snapshot_size_in_bytes),
+            // The full size is the one the write settled (see the module docs): "the size of
+            // all the blocks that were written to the source volume AT THE TIME THE SNAPSHOT
+            // WAS CREATED" (`Snapshot$FullSnapshotSizeInBytes`) is a fact of that source as
+            // the write found it, so it does not wait on the transfer the way the three
+            // members above do and is reported exactly as stored.
             ..self.view.clone()
         }
     }
@@ -259,16 +257,20 @@ pub const BYTES_PER_GIB: i64 = 1_024 * 1_024 * 1_024;
 
 /// "The full size of the snapshot, in bytes […] represents the size of all the blocks that
 /// were written to the source volume at the time the snapshot was created"
-/// (`Snapshot$FullSnapshotSizeInBytes`) for a snapshot of a volume of `volume_size` GiB.
+/// (`Snapshot$FullSnapshotSizeInBytes`) for a snapshot of a source of `volume_size` GiB every
+/// block of which holds data.
 ///
-/// The FULL size rather than an incremental one: every block of the source volume is
-/// accounted for, so the size a snapshot of a volume reports is that volume's own size in
-/// bytes. The ONE definition of that conversion, so the snapshot a create, a copy or an
-/// image's catalogue entry reports cannot measure the same volume differently; a size
-/// outside the width of the reported member is reported as none rather than wrapped, which
-/// the modelled width of `Snapshot$VolumeSize` makes unreachable. A snapshot written BLOCK BY
-/// BLOCK through the EBS direct APIs is measured off its blocks instead, by that module's own
-/// reading of the same member.
+/// The WHOLE of the source rather than the part of it that was written: for a snapshot whose
+/// source is not a volume of this account — a disk image an import read, the device of an
+/// image a copy duplicated — this emulator holds no account of which of its blocks carried
+/// data, and as far as it can tell all of them did. The ONE definition of that conversion, so
+/// the snapshot an import or an image's catalogue entry reports cannot measure the same
+/// source differently; a size outside the width of the reported member is reported as none
+/// rather than wrapped, which the modelled width of `Snapshot$VolumeSize` makes unreachable.
+/// A snapshot OF A VOLUME of the account is measured by what that volume HELD
+/// ([`ComAmazonawsEc2Amazonec2State::volume_written_bytes`]), and one written BLOCK BY BLOCK
+/// through the EBS direct APIs off its blocks, by that module's own reading of the same
+/// member.
 pub fn volume_full_snapshot_size_in_bytes(volume_size: i32) -> Option<i64> {
     i64::from(volume_size)
         .checked_mul(BYTES_PER_GIB)
@@ -359,6 +361,20 @@ impl ComAmazonawsEc2Amazonec2State {
         let snapshot_id = self.next_id(SNAPSHOT_ID_PREFIX);
         view.snapshot_id = Some(snapshot_id.clone());
         view.start_time = Some(system_time_to_date_time(started_at));
+        // "The full size of the snapshot, in bytes […] represents the size of all the blocks
+        // that were written to the source volume AT THE TIME THE SNAPSHOT WAS CREATED"
+        // (`Snapshot$FullSnapshotSizeInBytes`): settled here, where the snapshot is stored,
+        // off the volume it names as its source — so every writer that takes a snapshot of a
+        // volume of the account measures that volume the one way
+        // ([`Self::volume_written_bytes`]). A writer whose source is NOT a volume of the
+        // account names the size itself and keeps it; one that names neither falls back to the
+        // whole of the source it declared a size for.
+        view.full_snapshot_size_in_bytes = view.full_snapshot_size_in_bytes.or_else(|| {
+            view.volume_id
+                .as_deref()
+                .and_then(|volume_id| self.volume_written_bytes(volume_id))
+                .or_else(|| view.volume_size.and_then(volume_full_snapshot_size_in_bytes))
+        });
         // "Indicates whether the snapshot […] was created with a standard or time-based
         // snapshot copy operation […] `standard` […] completed on a best-effort basis"
         // (`Snapshot$TransferType`): EC2 reports a transfer type for EVERY snapshot it

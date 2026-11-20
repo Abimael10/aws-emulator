@@ -17,7 +17,9 @@
 //!    once, a range removed and added back with another description, the address family, and a
 //!    block named with host bits set.
 //! 2. "Adding or removing entries in a prefix list creates a new version of the prefix list":
-//!    the revised entry set belongs to the NEXT version, and the version it replaced still
+//!    that version is created when the revision is CARRIED OUT, so the call that accepts one
+//!    answers the version the list still stands at and the revised entry set belongs to the
+//!    version the clock settles the list into — after which the version it replaced still
 //!    reports ITS OWN entries when `GetManagedPrefixListEntries` is asked for it.
 //! 3. "Changing the name of the prefix list does not affect the version": a request that
 //!    renames the list, or that changes its maximum size, leaves the version where it stands
@@ -321,9 +323,11 @@ fn revision_params(prefix_list_id: &str, case: &RevisionCase) -> Vec<(String, St
 async fn a_revision_computes_the_next_versions_entry_set_from_the_one_the_list_holds() {
     let (router, _engine) = super::ec2_query::emulator();
 
-    // Every row's list first, then ONE wait for the creations the clock owes: a list whose
-    // creation is still in progress is not one a revision may start from, which rule 5 asserts
-    // in its own right.
+    // Every row's list first, then one wait per list for the creation the clock owes it: a
+    // list whose creation is still in progress is not one a revision may start from, which
+    // rule 5 asserts in its own right. The wait is for that CONDITION — the state the
+    // describe reports — and not for a span of the clock, so a loaded host cannot turn "not
+    // yet" into a failure.
     let mut lists = Vec::new();
     for (index, case) in revision_cases().into_iter().enumerate() {
         let prefix_list_id = create_list(
@@ -337,7 +341,20 @@ async fn a_revision_computes_the_next_versions_entry_set_from_the_one_the_list_h
         .await;
         lists.push((case, prefix_list_id));
     }
-    tokio::time::sleep(past_the_transition()).await;
+    for (case, prefix_list_id) in &lists {
+        let settled = poll_until_state(
+            &router,
+            case.name,
+            prefix_list_id,
+            PREFIX_LIST_STATE_CREATE_COMPLETE,
+        )
+        .await;
+        assert_eq!(
+            settled, PREFIX_LIST_STATE_CREATE_COMPLETE,
+            "case {name:?}: the create must settle before the revision, got {settled:?}",
+            name = case.name
+        );
+    }
 
     for (case, prefix_list_id) in &lists {
         let (status, body) = modify(&router, &revision_params(prefix_list_id, case)).await;
@@ -354,8 +371,9 @@ async fn a_revision_computes_the_next_versions_entry_set_from_the_one_the_list_h
         );
         assert_eq!(
             element(&body, "version"),
-            Some((FIRST_PREFIX_LIST_VERSION + 1).to_string()),
-            "case {name:?}: expected the next version, got {body}",
+            Some(FIRST_PREFIX_LIST_VERSION.to_string()),
+            "case {name:?}: a revision still in progress leaves the list at the version it \
+             stands at, got {body}",
             name = case.name
         );
         assert_eq!(
@@ -369,6 +387,33 @@ async fn a_revision_computes_the_next_versions_entry_set_from_the_one_the_list_h
             Some(case.max_entries.to_string()),
             "case {name:?}: a revision of the entries must leave the maximum size alone, got \
              {body}",
+            name = case.name
+        );
+
+        // The entry set the revision mints is the entry set of the version it mints, so both
+        // come into force when the revision is carried out: until then the list reports the
+        // entries it held.
+        let held = entries_at(&router, case.name, prefix_list_id, None).await;
+        assert_eq!(
+            held,
+            expected_entries(&case.created),
+            "case {name:?}: a revision still in progress leaves the entry set it started \
+             from, got {held:?}",
+            name = case.name
+        );
+
+        // The revision the clock owes, waited for as the CONDITION the describe reports.
+        let settled = poll_until_state(&router, case.name, prefix_list_id, MODIFY_COMPLETE).await;
+        assert_eq!(
+            settled, MODIFY_COMPLETE,
+            "case {name:?}: the revision must settle, got {settled:?}",
+            name = case.name
+        );
+        let described = describe_one(&router, case.name, prefix_list_id).await;
+        assert_eq!(
+            element(&described, "version"),
+            Some((FIRST_PREFIX_LIST_VERSION + 1).to_string()),
+            "case {name:?}: expected the next version, got {described}",
             name = case.name
         );
 
@@ -906,7 +951,20 @@ async fn a_dry_run_changes_nothing_and_the_revision_after_it_does() {
         &[("10.16.0.0/16", None)],
     )
     .await;
-    tokio::time::sleep(past_the_transition()).await;
+    // The creation the clock owes, waited for as the CONDITION the describe reports rather
+    // than as a span of the clock: a list still being created is not one a revision may start
+    // from.
+    let settled = poll_until_state(
+        &router,
+        "a dry run",
+        &prefix_list_id,
+        PREFIX_LIST_STATE_CREATE_COMPLETE,
+    )
+    .await;
+    assert_eq!(
+        settled, PREFIX_LIST_STATE_CREATE_COMPLETE,
+        "a dry run: the create must settle before the rows run, got {settled:?}"
+    );
 
     let (status, body) = modify(
         &router,
@@ -950,6 +1008,19 @@ async fn a_dry_run_changes_nothing_and_the_revision_after_it_does() {
     assert_eq!(
         status, 200,
         "the revision after the dry run: expected HTTP 200, got {status} with body {applied}"
+    );
+    // The entry set the revision mints comes into force with the state the clock settles the
+    // list into, so the entries are read back once the revision has been carried out.
+    let settled = poll_until_state(
+        &router,
+        "after the revision",
+        &prefix_list_id,
+        MODIFY_COMPLETE,
+    )
+    .await;
+    assert_eq!(
+        settled, MODIFY_COMPLETE,
+        "after the revision: the revision must settle, got {settled:?}"
     );
     let reported = entries_at(&router, "after the revision", &prefix_list_id, None).await;
     assert_eq!(

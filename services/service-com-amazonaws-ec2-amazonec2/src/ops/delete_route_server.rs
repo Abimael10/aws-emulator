@@ -175,10 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // taken away while an association is live: the association has to be removed first
         // with `DisassociateRouteServer`. That is a refusal for the STATE the route server
         // is in, which EC2 answers with `IncorrectState`, and it names the VPCs that hold
-        // it.
+        // it. An association whose disassociation has been STARTED holds it no longer, so it
+        // is not one of them — the delete follows the disassociate without waiting for the
+        // clock to settle it.
         let now = ::std::time::Instant::now();
         let associated_vpcs: Vec<String> = store
-            .route_server_associations_at(&input.route_server_id, now)
+            .route_server_associations_in_force_at(&input.route_server_id, now)
             .into_iter()
             .filter_map(|association| association.vpc_id)
             .collect();

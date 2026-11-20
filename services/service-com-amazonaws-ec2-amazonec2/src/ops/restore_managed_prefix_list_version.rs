@@ -342,11 +342,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ))
                 })?;
             // "Restores the entries from a previous version of a managed prefix list to a NEW
-            // version of the prefix list": the restored entry set belongs to the next version,
-            // and the one it replaced belongs to the version it was the entry set of, which
-            // comes back out of here to be kept.
-            let previous = ::std::mem::replace(&mut record.entries, restored);
-            record.view.version = Some(current_version.saturating_add(1));
+            // version of the prefix list": that version is created when the restore is CARRIED
+            // OUT, so the restored entry set and the version it belongs to come into force
+            // with the `restore-complete` the clock owes the list and this call answers the
+            // version the list still stands at — the same rule a direct revision of the entry
+            // set follows. The entry set it replaces belongs to the version it was the entry
+            // set of, which comes back out of here to be kept.
+            let previous = record.entries.clone();
+            record.pending_revision = Some(state::ManagedPrefixListRevision {
+                entries: restored,
+                version: current_version.saturating_add(1),
+            });
             // The restore is answered in the transient state the model publishes for it, and
             // the clock — not a later call — owes the list the settled one, so a caller reading
             // straight after this call still sees `restore-in-progress`.

@@ -21,11 +21,15 @@
 //! `ImportImage` task's snapshot details names no stored snapshot either, so it is answered
 //! `InvalidSnapshot.NotFound` like any other id the store does not hold.
 //!
-//! A pair that DOES resolve is put in `disabling`, from which the clock owes it `disabled`
+//! A pair that DOES resolve and HAS a fast snapshot restore in force is put in `disabling`,
+//! from which the clock owes it `disabled`
 //! ([`crate::state::FastSnapshotRestoreRecord`]), and the record is kept rather than
 //! dropped so `DescribeFastSnapshotRestores` still reports the pair in the state this call
-//! left it in. A pair the account never enabled is already `disabled`, so it is reported as
-//! that state with no lifecycle at all: there is nothing to turn off and nothing to store.
+//! left it in. A pair the account holds NO fast snapshot restore in force for — one no
+//! enable ever named, and one a disable has already taken off — is not a pair this call can
+//! turn off, so it comes back in the per-pair failure channel as `InvalidParameterValue`
+//! ([`crate::state::fast_snapshot_restore_not_enabled_error`]) rather than being reported as
+//! a disable of something that was never on.
 //!
 //! ## Shape of an operation
 //!
@@ -161,8 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            disabled_fast_snapshot_restore_item, dry_run_operation, fast_snapshot_restore_request,
-            request_region, require_service_state, unresolvable_snapshot_id_error,
+            dry_run_operation, fast_snapshot_restore_not_enabled_error,
+            fast_snapshot_restore_request, request_region, require_service_state,
+            unresolvable_snapshot_id_error,
         };
 
         // The members an enable and a disable share, read the one way both read them: the
@@ -207,52 +212,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A snapshot of this account is one its id names on EITHER side of the one
             // snapshot resource the EBS direct APIs and EC2 describe, so an id this store
             // holds nothing under is resolved against that side before it is reported
-            // unresolvable.
-            if !store.snapshots.contains_key(snapshot_id)
-                && !crate::state::direct_api_snapshot_exists(&*self.engine, snapshot_id)
-            {
-                let (code, message) = unresolvable_snapshot_id_error(snapshot_id);
-                unsuccessful.push(DisableFastSnapshotRestoreErrorItem {
-                    fast_snapshot_restore_state_errors: Some(
-                        requested
-                            .zones
-                            .iter()
-                            .map(|zone| DisableFastSnapshotRestoreStateErrorItem {
-                                availability_zone: requested
-                                    .zone_form
-                                    .reported_zone_name(&zone.zone_name),
-                                availability_zone_id: requested
-                                    .zone_form
-                                    .reported_zone_id(&zone.zone_id),
-                                error: Some(DisableFastSnapshotRestoreStateError {
-                                    code: Some(code.to_string()),
-                                    message: Some(message.clone()),
-                                }),
-                            })
-                            .collect(),
-                    ),
-                    snapshot_id: Some(snapshot_id.clone()),
-                });
-                continue;
-            }
+            // unresolvable. An unresolvable snapshot fails every pair it was named in, with
+            // the SNAPSHOT's own cause.
+            let unresolvable = (!store.snapshots.contains_key(snapshot_id)
+                && !crate::state::direct_api_snapshot_exists(&*self.engine, snapshot_id))
+            .then(|| unresolvable_snapshot_id_error(snapshot_id));
+
+            // The pairs of this snapshot the call could not turn off, each under its own
+            // zone: "information about the snapshots for which fast snapshot restores could
+            // not be disabled" (`Unsuccessful`) is reported per PAIR, so one zone's failure
+            // never decides another's.
+            let mut failed_zones = Vec::new();
             for zone in &requested.zones {
                 // Read the answer back OUT of the record the store now holds, so the caller
                 // sees what a later `DescribeFastSnapshotRestores` will see rather than the
-                // request object. A pair the account never enabled has no record to read,
-                // and is already in the state this call asks for.
-                let item = match store.disable_fast_snapshot_restore(
-                    snapshot_id,
-                    &zone.zone_name,
-                    now,
-                ) {
-                    Some(record) => record.disable_item_at(observed, requested.zone_form),
-                    None => disabled_fast_snapshot_restore_item(
+                // request object. A pair this call cannot turn off has no record to read: a
+                // snapshot nothing resolves, and a pair the account holds no fast snapshot
+                // restore in force for, are both reported in the per-pair failure channel.
+                let failure = match unresolvable.as_ref() {
+                    Some((code, message)) => Some((*code, message.clone())),
+                    None => match store.disable_fast_snapshot_restore(
                         snapshot_id,
-                        zone,
-                        requested.zone_form,
-                    ),
+                        &zone.zone_name,
+                        now,
+                    ) {
+                        Some(record) => {
+                            successful.push(record.disable_item_at(observed, requested.zone_form));
+                            None
+                        }
+                        None => Some(fast_snapshot_restore_not_enabled_error()),
+                    },
                 };
-                successful.push(item);
+                if let Some((code, message)) = failure {
+                    failed_zones.push(DisableFastSnapshotRestoreStateErrorItem {
+                        availability_zone: requested
+                            .zone_form
+                            .reported_zone_name(&zone.zone_name),
+                        availability_zone_id: requested.zone_form.reported_zone_id(&zone.zone_id),
+                        error: Some(DisableFastSnapshotRestoreStateError {
+                            code: Some(code.to_string()),
+                            message: Some(message),
+                        }),
+                    });
+                }
+            }
+            // One item per SNAPSHOT, carrying the zones of it that failed: the modelled
+            // `DisableFastSnapshotRestoreErrorItem` is keyed by `snapshotId` and holds a
+            // `fastSnapshotRestoreStateErrorSet`, so a snapshot with no failed zone has no
+            // item at all.
+            if !failed_zones.is_empty() {
+                unsuccessful.push(DisableFastSnapshotRestoreErrorItem {
+                    fast_snapshot_restore_state_errors: Some(failed_zones),
+                    snapshot_id: Some(snapshot_id.clone()),
+                });
             }
         }
 

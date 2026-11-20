@@ -297,6 +297,7 @@ async fn a_delete_removes_the_table_and_everything_stored_in_it() {
                         },
                         entries: Vec::new(),
                         pending: None,
+                        pending_revision: None,
                     },
                 );
             }

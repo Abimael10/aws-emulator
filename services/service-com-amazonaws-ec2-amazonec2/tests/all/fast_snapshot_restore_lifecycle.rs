@@ -23,8 +23,9 @@
 //!    the one that failed.
 //! 4. THE DESCRIBE NARROWS BY THE FILTERS IT DOCUMENTS and refuses a name it does not, and
 //!    pages by `MaxResults`/`NextToken` in one stable order.
-//! 5. A DISABLE REPORTS THE STATE IT LEFT THE PAIR IN, and a pair nothing enabled is already
-//!    `disabled`; `DryRun` reports whether a call would have worked and changes nothing.
+//! 5. A DISABLE REPORTS THE STATE IT LEFT THE PAIR IN, and a pair the account holds no fast
+//!    snapshot restore in force for is a per-pair FAILURE rather than a disable of nothing;
+//!    `DryRun` reports whether a call would have worked and changes nothing.
 //!
 //! Each table row is a distinct input along what the rule generalises over — how many
 //! snapshots, how many zones, which of the two zone identifiers, which filter, which page
@@ -1219,56 +1220,113 @@ async fn a_disable_carries_an_enabled_pair_to_disabled() {
     }
 }
 
-/// RULE: a pair the account never enabled is already in the state a disable asks for, so the
-/// disable reports it `disabled` — with no lifecycle at all, nothing having run — and stores
-/// nothing for it.
+/// RULE: a disable turns off only a pair the account HAS a fast snapshot restore in force
+/// for; a pair it holds none for — one no enable ever named, and one a disable has already
+/// taken off — is reported in the per-pair failure channel as `InvalidParameterValue` with
+/// the fixed sentence EC2 words for it, and nothing is stored for it.
+///
+/// The rows are the two ways a pair can hold no restore, so the rule is asserted for the
+/// class rather than for the one the recorded call named.
 #[tokio::test]
-async fn disabling_a_pair_nothing_enabled_reports_it_disabled() {
-    let case = "a stored snapshot with no fast snapshot restore";
+async fn disabling_a_pair_with_no_restore_in_force_fails_per_pair() {
     let (router, engine) = emulator();
-    let snapshot = seed_snapshot(&router, &engine, case).await;
+    let snapshot = seed_snapshot(&router, &engine, "a stored snapshot").await;
 
-    let (status, body) = disable(&router, &[snapshot.as_str()], By::Id, &[1], &[]).await;
+    // Row 1: a pair no enable ever named. Row 2: the same pair after a disable has already
+    // taken its restore off — the zone of row 2 is enabled and disabled first, so what the
+    // row asserts is the SECOND disable of it.
+    let (status, body) = enable(&router, &[snapshot.as_str()], By::Id, &[0], &[]).await;
     assert_eq!(
         status, 200,
-        "case {case:?}: expected HTTP 200, got {status} with body {body}"
+        "the enable row 2 starts from: expected HTTP 200, got {status} with body {body}"
     );
-    let successful = items(case, &body, "successful");
+    let (status, body) = disable(&router, &[snapshot.as_str()], By::Id, &[0], &[]).await;
     assert_eq!(
-        successful.len(),
+        status, 200,
+        "the disable row 2 starts from: expected HTTP 200, got {status} with body {body}"
+    );
+    assert_eq!(
+        items("the disable row 2 starts from", &body, "successful").len(),
         1,
-        "case {case:?}: one pair was named, got {successful:?}"
+        "the disable row 2 starts from: the pair it names was enabled, so it is turned off: \
+         {body}"
     );
-    assert_eq!(
-        member(&successful[0], "state"),
-        FAST_SNAPSHOT_RESTORE_STATE_DISABLED,
-        "case {case:?}: a pair nothing enabled is already disabled, got {successful:?}"
-    );
-    assert_eq!(
-        member(&successful[0], "availabilityZoneId"),
-        zone_id(1),
-        "case {case:?}: the zone is reported by the identifier the request used, got \
-         {successful:?}"
-    );
-    for name in [
-        "enablingTime",
-        "optimizingTime",
-        "enabledTime",
-        "disablingTime",
-        "disabledTime",
-        "ownerId",
-    ] {
+
+    let rows: Vec<(&str, usize)> = vec![
+        ("a pair nothing ever enabled", 1),
+        ("a pair a disable has already taken off", 0),
+    ];
+    for (case, zone) in rows {
+        let (status, body) = disable(&router, &[snapshot.as_str()], By::Id, &[zone], &[]).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a pair with no restore in force is a per-pair failure, so the \
+             call answers HTTP 200; got {status} with body {body}"
+        );
         assert!(
-            !successful[0].contains_key(name),
-            "case {case:?}: nothing ran for this pair, so it reports no {name}, got \
-             {successful:?}"
+            items(case, &body, "successful").is_empty(),
+            "case {case:?}: nothing was turned off, so no pair is successful: {body}"
+        );
+        let unsuccessful = items(case, &body, "unsuccessful");
+        assert_eq!(
+            unsuccessful.len(),
+            1,
+            "case {case:?}: one item for the snapshot the pair names, got {unsuccessful:?}"
+        );
+        assert_eq!(
+            member(&unsuccessful[0], "snapshotId"),
+            snapshot,
+            "case {case:?}: the item is reported under the id the request named, got \
+             {unsuccessful:?}"
+        );
+        let doc = document(case, &body);
+        let errors: Vec<(String, String, Option<String>)> =
+            set_items(doc.root_element(), "unsuccessful")
+                .into_iter()
+                .flat_map(|item| set_items(item, "fastSnapshotRestoreStateErrorSet"))
+                .map(|pair| {
+                    let error = child(pair, "error");
+                    (
+                        error
+                            .and_then(|error| child_text(error, "code"))
+                            .unwrap_or_default(),
+                        error
+                            .and_then(|error| child_text(error, "message"))
+                            .unwrap_or_default(),
+                        child_text(pair, "availabilityZoneId"),
+                    )
+                })
+                .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "case {case:?}: one error for the one zone the request named, got {errors:?}"
+        );
+        assert_eq!(
+            errors[0].0, INVALID_PARAMETER_VALUE,
+            "case {case:?}: expected code {INVALID_PARAMETER_VALUE:?}, got {errors:?}"
+        );
+        assert_eq!(
+            errors[0].1, "Fast Restore is not enabled for this snapshot",
+            "case {case:?}: expected the sentence EC2 words for a pair with no restore, got \
+             {errors:?}"
+        );
+        assert_eq!(
+            errors[0].2.as_deref(),
+            Some(zone_id(zone).as_str()),
+            "case {case:?}: the zone is reported by the identifier the request used, got \
+             {errors:?}"
         );
     }
+
+    // Nothing was stored for the pair no enable ever named: the one pair the describe reports
+    // is the one the enable above made.
     let (status, body) = describe(&router, &[]).await;
-    let described = reported(case, status, &body);
-    assert!(
-        described.is_empty(),
-        "case {case:?}: a pair nothing enabled is no pair of the account, got {described:?}"
+    let described = reported("the store after the rows", status, &body);
+    assert_eq!(
+        keys(&described),
+        vec![format!("{snapshot}|{zone}", zone = zone_name(0))],
+        "a pair nothing enabled is no pair of the account, got {described:?}"
     );
 }
 

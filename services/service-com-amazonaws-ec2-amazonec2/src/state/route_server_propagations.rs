@@ -161,7 +161,8 @@ impl ComAmazonawsEc2Amazonec2State {
         self.vpc_of_route_table(route_table_id)
             .is_some_and(|vpc_id| {
                 self.route_server_associations
-                    .contains_key(&(route_server_id.to_string(), vpc_id.to_string()))
+                    .get(&(route_server_id.to_string(), vpc_id.to_string()))
+                    .is_some_and(RouteServerAssociationRecord::joins_its_pair)
             })
     }
 

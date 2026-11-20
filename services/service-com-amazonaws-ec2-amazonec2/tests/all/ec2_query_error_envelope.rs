@@ -477,6 +477,7 @@ async fn a_success_reports_the_request_in_its_own_lowercase_element() {
             },
             entries: Vec::new(),
             pending: None,
+            pending_revision: None,
         },
     );
 

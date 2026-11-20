@@ -1155,6 +1155,48 @@ impl ComAmazonawsEc2Amazonec2State {
         self.snapshots.contains_key(snapshot_id)
     }
 
+    /// The bytes the volume `volume_id` HOLDS — "all the blocks that were written to the
+    /// source volume" a snapshot of it measures (`Snapshot$FullSnapshotSizeInBytes`) — or
+    /// `None` when `volume_id` names no volume of the account.
+    ///
+    /// A volume's data plane is not emulated: nothing here writes a block to a volume, so the
+    /// blocks a volume holds are the ones it was RESTORED with. A volume created empty holds
+    /// NONE of its blocks, however large it is, so a snapshot of it measures nothing; one
+    /// restored from a snapshot ("the snapshot from which to create the volume",
+    /// `CreateVolumeRequest$SnapshotId` — an instance's root volume, restored from its image's
+    /// snapshot) holds the blocks that snapshot carried, which is the full size that snapshot
+    /// itself reports.
+    ///
+    /// The ONE reading of that measurement, asked by the one writer of a snapshot
+    /// ([`Self::insert_snapshot_completing_at`]), so two snapshots of one volume cannot report
+    /// two sizes for it.
+    pub fn volume_written_bytes(&self, volume_id: &str) -> Option<i64> {
+        let record = self.volumes.get(volume_id)?;
+        let restored_from = record
+            .view
+            .snapshot_id
+            .as_deref()
+            .filter(|snapshot_id| !snapshot_id.is_empty());
+        let Some(snapshot_id) = restored_from else {
+            return Some(0);
+        };
+        Some(
+            self.snapshots
+                .get(snapshot_id)
+                .and_then(|snapshot| snapshot.view.full_snapshot_size_in_bytes)
+                // A source snapshot this store holds no record of — one of the images the
+                // Region publishes — carried the whole of the volume it fills, there being no
+                // account here of which of its blocks held data.
+                .or_else(|| {
+                    record
+                        .view
+                        .size
+                        .and_then(super::volume_full_snapshot_size_in_bytes)
+                })
+                .unwrap_or(0),
+        )
+    }
+
     /// Whether the volume `volume_id` has already been withdrawn at `now`: the account holds
     /// no record for it, or the record it holds is one whose encryption key refused its data
     /// key and whose withdrawal the clock has made due

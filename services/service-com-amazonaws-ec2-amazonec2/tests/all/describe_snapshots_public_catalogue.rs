@@ -14,8 +14,10 @@
 //!    standard storage tier, and carrying the size of the device the image restores. Each
 //!    narrowing a caller can reach them by selects them;
 //! 2. EVERY REPORTED SNAPSHOT PROJECTS ITS FULL SIZE AND ITS TRANSFER TYPE: the full size is
-//!    the source volume's size in bytes, whatever that size is, and the transfer type is the
-//!    standard one for a snapshot no caller asked a completion duration for;
+//!    the size of the blocks that were WRITTEN to the source the snapshot was taken of — the
+//!    whole of a device an image is published with, and none of a volume created empty,
+//!    whatever that volume's size — and the transfer type is the standard one for a snapshot
+//!    no caller asked a completion duration for;
 //! 3. A TRUNCATED PAGE CARRIES A `NextToken` AND THE WALK RESUMES AFTER IT, over an inventory
 //!    the account did not create;
 //! 4. A `SnapshotIds` ENTRY THAT IS NOT IN THE FORM EC2 PRINTS A SNAPSHOT ID IN IS REFUSED AT
@@ -350,14 +352,16 @@ async fn a_published_snapshot_reports_the_device_its_image_restores() {
     }
 }
 
-/// RULE 2: the full size a snapshot reports is the size of the volume it was taken of, in
-/// bytes, for every volume size — and its transfer type is the standard one.
+/// RULE 2: the full size a snapshot reports is the size of the blocks that were WRITTEN to
+/// the volume it was taken of — none at all for a volume created empty, whatever that
+/// volume's size — and its transfer type is the standard one.
 #[tokio::test]
-async fn a_snapshot_reports_the_full_size_of_the_volume_it_was_taken_of() {
+async fn a_snapshot_reports_the_blocks_written_to_the_volume_it_was_taken_of() {
     let (router, _engine) = emulator();
 
     // One row per source volume size, spanning the sizes a volume can be created at: the
-    // smallest, a middling one and a large one.
+    // smallest, a middling one and a large one. None of them has ever been written to, so
+    // what the rows assert is that the SIZE of the volume is not what the member measures.
     for size in [1_i64, 8, 125, 1_024] {
         let case = format!("a {size} GiB source volume");
         let (status, body) = op(
@@ -397,8 +401,9 @@ async fn a_snapshot_reports_the_full_size_of_the_volume_it_was_taken_of() {
         let snapshot = &snapshots[0];
         assert_eq!(
             snapshot.member("fullSnapshotSizeInBytes"),
-            (size * BYTES_PER_GIB).to_string(),
-            "case {case:?}: the full size is the source volume's size in bytes, got {:?}",
+            "0",
+            "case {case:?}: no block was ever written to the source volume, so the snapshot \
+             measures none, got {:?}",
             snapshot.member("fullSnapshotSizeInBytes")
         );
         assert_eq!(

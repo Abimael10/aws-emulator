@@ -11,8 +11,11 @@
 //!
 //! 1. A restore writes the entry set an EARLIER version of the list had onto a NEW version of
 //!    it: "restores the entries from a previous version of a managed prefix list to a new
-//!    version of the prefix list". The version the list stood at is left behind and reports
-//!    ITS own entries, so a restore is itself restorable. Every row of the table is a distinct
+//!    version of the prefix list". That version is created when the restore is CARRIED OUT, so
+//!    the call that accepts one answers the version the list still stands at and the restored
+//!    entry set comes into force with the state the clock settles the list into. The version
+//!    the list stood at is left behind and reports ITS own entries, so a restore is itself
+//!    restorable. Every row of the table is a distinct
 //!    input along what that generalises over: how many versions back the restored one is, how
 //!    many entries it carried (none included), whether the restored set is larger or smaller
 //!    than the one it replaces, the descriptions those entries carry, and the address family.
@@ -410,8 +413,9 @@ async fn a_restore_writes_an_earlier_versions_entry_set_onto_a_new_version() {
         );
         assert_eq!(
             element(&body, "version"),
-            Some((current_version + 1).to_string()),
-            "case {name:?}: expected the next version, got {body}",
+            Some(current_version.to_string()),
+            "case {name:?}: a restore still in progress leaves the list at the version it \
+             stands at, got {body}",
             name = case.name
         );
         assert_eq!(
@@ -424,6 +428,18 @@ async fn a_restore_writes_an_earlier_versions_entry_set_onto_a_new_version() {
             element(&body, "maxEntries"),
             Some(case.max_entries.to_string()),
             "case {name:?}: a restore must leave the maximum size alone, got {body}",
+            name = case.name
+        );
+
+        // The version a restore mints is created when the restore is CARRIED OUT, so the
+        // entry set it writes comes into force with the state the clock settles the list
+        // into.
+        poll_until_state(&router, case.name, &prefix_list_id, RESTORE_COMPLETE).await;
+        let settled = describe_one(&router, case.name, &prefix_list_id).await;
+        assert_eq!(
+            element(&settled, "version"),
+            Some((current_version + 1).to_string()),
+            "case {name:?}: expected the version the restore minted, got {settled}",
             name = case.name
         );
 
@@ -556,8 +572,23 @@ async fn the_clock_settles_a_restored_list_and_a_further_restore_starts_from_the
     );
     assert_eq!(
         element(&body, "version"),
+        Some((FIRST_PREFIX_LIST_VERSION + 2).to_string()),
+        "the second restore: a restore still in progress leaves the list at the version it \
+         stands at, got {body}"
+    );
+    poll_until_state(
+        &router,
+        "the second restore",
+        &prefix_list_id,
+        RESTORE_COMPLETE,
+    )
+    .await;
+    let second_settled = describe_one(&router, "the second restore", &prefix_list_id).await;
+    assert_eq!(
+        element(&second_settled, "version"),
         Some((FIRST_PREFIX_LIST_VERSION + 3).to_string()),
-        "the second restore: expected the next version, got {body}"
+        "the second restore: expected the version it minted once carried out, got \
+         {second_settled}"
     );
     let reported = entries_at(&router, "the second restore", &prefix_list_id, None).await;
     assert_eq!(
@@ -965,6 +996,9 @@ async fn a_dry_run_changes_nothing_and_the_restore_after_it_does() {
         status, 200,
         "the restore after the dry run: expected HTTP 200, got {status} with body {applied}"
     );
+    // The entry set a restore writes comes into force with the state the clock settles the
+    // list into, so it is read back once the restore has been carried out.
+    poll_until_state(&router, "after the restore", &prefix_list_id, RESTORE_COMPLETE).await;
     let reported = entries_at(&router, "after the restore", &prefix_list_id, None).await;
     assert_eq!(
         reported,
