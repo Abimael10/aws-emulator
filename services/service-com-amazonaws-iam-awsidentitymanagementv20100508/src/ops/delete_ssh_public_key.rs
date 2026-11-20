@@ -226,9 +226,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(DeleteSSHPublicKeyErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!(
-                        "The SSH Public Key with id {} cannot be found.",
-                        input.ssh_public_key_id
+                    message: Some(crate::state::ssh_public_key_not_found(
+                        &input.ssh_public_key_id,
                     )),
                 },
             )

@@ -238,7 +238,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 RemoveRoleFromInstanceProfileErrorModeled::NoSuchEntityException(
                     NoSuchEntityException {
-                        message: Some(format!("Role {} cannot be found.", input.role_name)),
+                        // The same role-absence sentence the add answers, from the one place
+                        // this service words it (`crate::state::role_cannot_be_found`): a
+                        // name the account holds no role under names no role, which is a
+                        // different absence from the BINDING refusal below.
+                        message: Some(crate::state::role_cannot_be_found(&input.role_name)),
                     },
                 )
                 .into(),

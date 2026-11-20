@@ -244,7 +244,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(role_path) = store.addressed_role_path(&input.role_name) else {
             return Err(AddRoleToInstanceProfileErrorModeled::NoSuchEntityException(
                 NoSuchEntityException {
-                    message: Some(format!("Role {} cannot be found.", input.role_name)),
+                    // Worded in the one sentence this service words a `RoleName` the account
+                    // holds no role under with (`crate::state::role_cannot_be_found`), so a
+                    // missing ROLE reads the same here as on every other role-addressed
+                    // call, and a client can tell it from the missing PROFILE above.
+                    message: Some(crate::state::role_cannot_be_found(&input.role_name)),
                 },
             )
             .into());

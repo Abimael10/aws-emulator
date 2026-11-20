@@ -279,13 +279,13 @@ async fn a_key_the_named_user_does_not_hold_is_refused() {
             "an id the account never minted",
             "holder",
             unminted,
-            format!("The SSH Public Key with id {unminted} cannot be found."),
+            format!("The Public Key with id {unminted} cannot be found."),
         ),
         (
             "an id another user holds",
             "bystander",
             &held,
-            format!("The SSH Public Key with id {held} cannot be found."),
+            format!("The Public Key with id {held} cannot be found."),
         ),
     ];
 

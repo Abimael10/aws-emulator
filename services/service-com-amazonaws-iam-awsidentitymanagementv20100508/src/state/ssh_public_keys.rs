@@ -539,6 +539,21 @@ fn colon_separated_hex(digest: &[u8]) -> String {
     pairs.join(":")
 }
 
+/// The message IAM refuses a call addressed by an `SSHPublicKeyId` no key is reachable
+/// under with — the `NoSuchEntityException` message, whose fixed text is `The Public Key
+/// with id ` and ` cannot be found.` around the id the request supplied.
+///
+/// The sentence names the entity `Public Key`, with nothing of SSH in it, even though the
+/// member that carried the id is `SSHPublicKeyId`: what varies is only the id, echoed as the
+/// request spelled it (`publicKeyIdType`, pattern `^[\w]+$`). ONE wording for the
+/// key-absence this surface answers — the read, the status update and the delete — so none
+/// of them can describe the same missing key differently. The user-absence that precedes it
+/// keeps its own sentence (`The user with name … cannot be found.`), because a name the
+/// account holds no user under is a different entity missing.
+pub fn ssh_public_key_not_found(ssh_public_key_id: &str) -> String {
+    format!("The Public Key with id {ssh_public_key_id} cannot be found.")
+}
+
 /// The user an SSH public key operation addresses, as the account keys users.
 ///
 /// "The name of the IAM user … if none is specified, the UserName field is determined
