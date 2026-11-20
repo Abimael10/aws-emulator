@@ -47,16 +47,27 @@
 //! ## The media type this service announces
 //!
 //! The model declares the `restJson1` protocol trait, whose generic default response
-//! media type is `application/json`, while every recorded response of this service —
-//! success and refusal alike — announces `application/x-amz-json-1.1`: its front end
-//! labels its JSON bodies with that media type whatever the modelled protocol is, and
-//! the media type a client reads is what it keys its parsing and content negotiation
-//! off. The rule, the one function that applies it and the operation-seam wrapper that
-//! reaches the refusal tail with it all live in
+//! media type is `application/json`, while the recorded responses of this service's own
+//! front door — success and refusal alike — announce `application/x-amz-json-1.1`: that
+//! front end labels its JSON bodies with that media type whatever the modelled protocol
+//! is, and the media type a client reads is what it keys its parsing and content
+//! negotiation off. The rule, the one function that applies it and the operation-seam
+//! wrapper that reaches the refusal tail with it all live in
 //! [`service_common::response_media_type`]; [`RESPONSE_MEDIA_TYPE`] is this service's
 //! own pair, and the seams it is applied at are `override_operation` (every routed
 //! request, including the refusal the framework renders inside the request walk),
 //! `override_routing_error` and `override_framework_error`.
+//!
+//! This service's wire shows a SECOND announcer in front of that front door, and then which
+//! layer answered decides the value: the refusals of its TAG operations are recorded under
+//! the protocol's own `application/json`, and they are recognisable on the wire by the error
+//! CODE they carry — `BadRequestException` and `NotFoundException`
+//! ([`crate::state::TAG_BAD_REQUEST_CODE`], [`crate::state::TAG_NOT_FOUND_CODE`]), neither
+//! of which is the name of any shape this service's model declares, where every answer of
+//! the modelled front door carries a modelled shape's name. So those refusals keep the media
+//! type their own producer stamped and everything else is re-announced
+//! ([`announced_by_the_modelled_front_door`]). The sibling ConnectCampaignsV2 API is served
+//! by the same front door and the same tag tier, and splits its wire at the same place.
 //!
 //! One response is announced by the framework alone, because no author seam reaches it:
 //! the authentication refusal, which the router renders through
@@ -152,6 +163,30 @@ pub const RESPONSE_MEDIA_TYPE: ResponseMediaType = ResponseMediaType::new(
     service_common::response_media_type::AWS_JSON_1_1,
 );
 
+/// The wire error codes this service's TAG tier answers with, neither of which is the name
+/// of a shape this service's model declares ([`crate::state::TAG_BAD_REQUEST_CODE`] and
+/// [`crate::state::TAG_NOT_FOUND_CODE`]) — which is what tells that tier's refusals apart
+/// from every answer of the modelled front door on the wire a client reads.
+const TAG_TIER_ERROR_CODES: [&str; 2] = [
+    crate::state::TAG_BAD_REQUEST_CODE,
+    crate::state::TAG_NOT_FOUND_CODE,
+];
+
+/// Whether `resp` is one of the responses THIS service's front door produced — the
+/// [`service_common::response_media_type::AnnouncedResponses`] predicate the media type pair
+/// above belongs to.
+///
+/// Everything but a refusal the TAG tier answered is the front door's: its successes, the
+/// refusals its handlers raise in the model's own shapes, and the refusals the framework
+/// renders inside the walk, all of which the recorded wire announces under the awsJson 1.1
+/// media type. The tag tier's own refusals — the client errors carrying one of
+/// [`TAG_TIER_ERROR_CODES`], read off the response a client receives by the shared
+/// [`service_common::response_media_type::client_error_naming_one_of`] — are recorded under
+/// the protocol-implied value, so they are handed back exactly as their producer wrote them.
+fn announced_by_the_modelled_front_door(resp: &aws_smithy_runtime_api::http::Response) -> bool {
+    !service_common::response_media_type::client_error_naming_one_of(resp, &TAG_TIER_ERROR_CODES)
+}
+
 /// Whether this service serves the request these `parts` came from.
 ///
 /// `emulator_server::can_handle_based_on_route_key_and_path` is the agent-immutable
@@ -206,7 +241,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            media_type: ResponseMediaTypeOperation::new(RESPONSE_MEDIA_TYPE),
+            media_type: ResponseMediaTypeOperation::announcing(
+                RESPONSE_MEDIA_TYPE,
+                announced_by_the_modelled_front_door,
+            ),
         }
     }
 }
@@ -237,8 +275,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Every request the generated routing table can serve is served through the
         // shared media-type wrapper, which delegates to that same table entry and then
         // re-announces the media type of what it answered — reaching the refusal the
-        // framework renders inside the request walk (see the module header). The
-        // routing stays the model's: a request whose routing key names no modelled
+        // framework renders inside the request walk — for the responses this service's own
+        // front door produced ([`announced_by_the_modelled_front_door`]); a refusal of the
+        // TAG tier keeps the media type its own producer stamped (see the module header).
+        // The routing stays the model's: a request whose routing key names no modelled
         // operation is declined here, so the framework answers it as the unroutable
         // request it is — through `override_routing_error` below, which re-announces
         // that answer too.

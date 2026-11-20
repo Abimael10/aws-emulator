@@ -19,10 +19,11 @@
 //!   hold is refused as the decode failure it is, naming that character by the hex code
 //!   of its byte, and a token that decodes but names no position this service issued is
 //!   refused in different words.
-//! * Every reply this service serves — a success, a refusal a handler raised, a refusal
-//!   the framework rendered in front of one, and an unroutable request alike — announces
-//!   the media type this service's front end labels its JSON with, rather than the one
-//!   its protocol trait implies.
+//! * Every reply this service's own front door serves — a success, a refusal a handler
+//!   raised, a refusal the framework rendered in front of one, and an unroutable request
+//!   alike — announces the media type that front end labels its JSON with, rather than the
+//!   one its protocol trait implies. (The refusals of the TAG tier in front of it are the
+//!   one exception, and `resource_tags.rs` owns them.)
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::state::{
@@ -624,9 +625,11 @@ async fn every_reply_announces_the_media_type_this_services_front_end_labels_jso
     let router = router();
     let stored = a_stored_campaign(&router, "control").await;
 
-    // One row per kind of producer a reply can come from: a handler's success, a handler's
-    // refusal, the refusal the framework renders INSIDE the request walk from a modelled
-    // bound, a stub's 501, and a request this service claims but no modelled route serves.
+    // One row per kind of producer a reply of this service's FRONT DOOR can come from: a
+    // handler's success, a handler's refusal, the refusal the framework renders INSIDE the
+    // request walk from a modelled bound, a stub's 501, and a request this service claims
+    // but no modelled route serves. The refusals of the tag tier in front of that front
+    // door keep their own producer's media type, and `resource_tags.rs` asserts that.
     let rows: Vec<(&str, &str, String, Value)> = vec![
         (
             "a handler's success",
@@ -676,8 +679,8 @@ async fn every_reply_announces_the_media_type_this_services_front_end_labels_jso
         let answer = call(&router, REGION, method, &path, &body).await;
         assert_eq!(
             answer.media_type, "application/x-amz-json-1.1",
-            "case {case:?}: expected every reply to announce this service's media type, \
-             got {:?} on HTTP {} {}",
+            "case {case:?}: expected every reply of this service's front door to announce \
+             its media type, got {:?} on HTTP {} {}",
             answer.media_type, answer.status, answer.body
         );
     }

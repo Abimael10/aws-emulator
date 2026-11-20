@@ -81,11 +81,14 @@
 //! `service-com-amazonaws-connectcampaigns-amazonconnectcampaignservice`,
 //! `service-com-amazonaws-connectcampaignsv2-amazonconnectcampaignservicev2` and
 //! `service-com-amazonaws-lexmodelsv2-lexmodelbuildingservicev2`, whose models declare
-//! `restJson1` and whose recorded wires announce the awsJson `1.1` media type on every
-//! reply, so each states its own pair (`application/json` → `1.1`) and takes the
-//! mechanism, including [`ResponseMediaTypeOperation`] and
+//! `restJson1` and whose recorded wires announce the awsJson `1.1` media type on the
+//! replies of their own front door, so each states its own pair (`application/json` → `1.1`)
+//! and takes the mechanism, including [`ResponseMediaTypeOperation`] and
 //! [`reannounced_framework_error`], from here. Each of them states
-//! only its own pair (`RESPONSE_MEDIA_TYPE`).
+//! only its own pair (`RESPONSE_MEDIA_TYPE`). The two ConnectCampaigns services are the
+//! second two-announcer case: both serve a TAG tier whose refusals their recorded wire
+//! announces under the protocol's own media type, told apart from their front door's
+//! answers by the error CODE those refusals carry ([`client_error_naming_one_of`]).
 //!
 //! STILL TO MIGRATE onto this module: `service-com-amazonaws-amp-amazonprometheusservice`
 //! (`RESPONSE_CONTENT_TYPE` in its `src/state.rs`, with the rewrite in its
@@ -347,6 +350,29 @@ pub fn is_input_validation_refusal(resp: &RtResponse) -> bool {
 #[must_use]
 pub fn not_an_input_validation_refusal(resp: &RtResponse) -> bool {
     !is_input_validation_refusal(resp)
+}
+
+/// Whether `resp` is a client error whose JSON envelope names one of `codes` as its error
+/// code.
+///
+/// The other way a service tells its announcers apart: where the layer in front of the
+/// modelled front door answers under error CODES of its own — codes that name no shape the
+/// service's model declares, while every answer of the modelled front door names a modelled
+/// shape — the code a client branches on is what says which layer answered. A service names
+/// the codes its own extra tier answers with and asks this, rather than spelling the
+/// envelope read out again: `__type` is where both JSON protocols carry that code, and it
+/// may qualify the code by a namespace or a protocol-version prefix, so only the last
+/// segment is the code ([`envelope_shape`]).
+///
+/// Read off the response a CLIENT receives, like every other predicate here: which internal
+/// seam rendered a refusal is the emulator's business, and the code on the wire is the
+/// service's.
+#[must_use]
+pub fn client_error_naming_one_of(resp: &RtResponse, codes: &[&str]) -> bool {
+    let Some(envelope) = client_error_envelope(resp) else {
+        return false;
+    };
+    envelope_shape(&envelope).is_some_and(|code| codes.contains(&code))
 }
 
 impl ResponseMediaTypeOperation {

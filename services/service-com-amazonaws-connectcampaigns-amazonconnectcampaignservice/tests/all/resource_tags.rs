@@ -13,6 +13,14 @@
 //! nothing. Every write is scoped to the one resource its ARN names, so two campaigns —
 //! siblings under one Connect instance or campaigns of different instances — hold
 //! separate maps even when they carry the same key.
+//!
+//! A second rule is asserted here because this plane is where it shows: the `content-type`
+//! of a reply is the media type the LAYER that answered it announces. The refusals of these
+//! three operations come from the tag tier in front of this service's modelled front door —
+//! recognisable by the wire codes they carry, which name no shape this model declares — and
+//! are announced under the protocol's own `application/json`, while everything this
+//! service's front door answers, these operations' successes included, announces that front
+//! door's own media type.
 
 use std::collections::BTreeMap;
 
@@ -899,5 +907,191 @@ async fn a_tag_write_lands_on_exactly_the_resource_its_arn_names() {
                 row.case
             );
         }
+    }
+}
+
+/// The media type this service's own front door announces on the replies it produces: the
+/// awsJson 1.1 value its recorded wire carries, which is NOT the `application/json` its
+/// `restJson1` protocol trait implies.
+const FRONT_DOOR_MEDIA_TYPE: &str = "application/x-amz-json-1.1";
+
+/// The media type the TAG tier's own refusals are announced under: the protocol's own,
+/// which is the value their producer stamped.
+const TAG_TIER_MEDIA_TYPE: &str = "application/json";
+
+/// What one row of the media-type table asks for.
+enum Announced {
+    /// `ListTagsForResource` on this ARN.
+    ListTags(String),
+    /// `TagResource` on this ARN, carrying one pair.
+    Tag(String),
+    /// `UntagResource` on this ARN, naming one key.
+    Untag(String),
+    /// A request addressed somewhere else in this service: a method, a path and a body.
+    Elsewhere(&'static str, String, Value),
+}
+
+/// One row of the media-type table: what to ask, the status and wire error code the reply
+/// must carry (an empty code for a reply that carries none), and the media type the layer
+/// that answered it announces.
+struct AnnouncedRow {
+    case: &'static str,
+    asked: Announced,
+    status: u16,
+    code: &'static str,
+    announced: &'static str,
+}
+
+#[tokio::test]
+async fn a_reply_announces_the_media_type_of_the_layer_that_answered_it() {
+    let router = router();
+    let arn = a_stored_campaign(&router, "announced", Some(tag_map([("env", "dev")]))).await;
+
+    // An ARN whose resource path is not a campaign of this service, and a well-formed
+    // campaign ARN this store holds nothing under: the two classes of refusal the tag tier
+    // answers, each under its own wire code.
+    let not_a_campaign = arn.replace("campaign/", "queue/");
+    let another_vendor = "arn:aws:connect:us-east-1:000000000000:instance/abcdef".to_string();
+    let absent = arn.replace(id_of(&arn), "2f9c7b416d054e389a210b7c5d4e3f20");
+
+    // Rows differ along the layer that answers (this service's front door, the tag tier),
+    // the status class of the reply (200 with a body, 200 with none, 400, 404), the
+    // operation it came from (all three tag operations, plus the campaign plane) and, for
+    // the tag tier, the class of ARN that reaches it.
+    let rows: Vec<AnnouncedRow> = vec![
+        AnnouncedRow {
+            case: "the tag listing of a stored campaign (200, a body)",
+            asked: Announced::ListTags(arn.clone()),
+            status: 200,
+            code: "",
+            announced: FRONT_DOOR_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "a tag merge on a stored campaign (200, no body)",
+            asked: Announced::Tag(arn.clone()),
+            status: 200,
+            code: "",
+            announced: FRONT_DOOR_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "an untag of a stored campaign (200, no body)",
+            asked: Announced::Untag(arn.clone()),
+            status: 200,
+            code: "",
+            announced: FRONT_DOOR_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "a campaign read (200, a body)",
+            asked: Announced::Elsewhere(
+                "GET",
+                format!("/campaigns/{}", id_of(&arn)),
+                Value::Null,
+            ),
+            status: 200,
+            code: "",
+            announced: FRONT_DOOR_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "a campaign id that resolves to nothing (404, a handler's modelled shape)",
+            asked: Announced::Elsewhere(
+                "GET",
+                "/campaigns/no-such-campaign".to_string(),
+                Value::Null,
+            ),
+            status: 404,
+            code: "ResourceNotFoundException",
+            announced: FRONT_DOOR_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "a value outside a modelled bound (400, the walk's own refusal)",
+            asked: Announced::Elsewhere(
+                "POST",
+                "/campaigns-summary".to_string(),
+                json!({"maxResults": 0}),
+            ),
+            status: 400,
+            code: "ValidationException",
+            announced: FRONT_DOOR_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "the tag listing of an ARN of another resource (400, the tag tier)",
+            asked: Announced::ListTags(not_a_campaign.clone()),
+            status: 400,
+            code: TAG_BAD_REQUEST_CODE,
+            announced: TAG_TIER_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "a tag merge on an ARN of another vendor (400, the tag tier)",
+            asked: Announced::Tag(another_vendor.clone()),
+            status: 400,
+            code: TAG_BAD_REQUEST_CODE,
+            announced: TAG_TIER_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "an untag of an ARN of another resource (400, the tag tier)",
+            asked: Announced::Untag(not_a_campaign),
+            status: 400,
+            code: TAG_BAD_REQUEST_CODE,
+            announced: TAG_TIER_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "the tag listing of an absent campaign (404, the tag tier)",
+            asked: Announced::ListTags(absent.clone()),
+            status: 404,
+            code: TAG_NOT_FOUND_CODE,
+            announced: TAG_TIER_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "a tag merge on an absent campaign (404, the tag tier)",
+            asked: Announced::Tag(absent.clone()),
+            status: 404,
+            code: TAG_NOT_FOUND_CODE,
+            announced: TAG_TIER_MEDIA_TYPE,
+        },
+        AnnouncedRow {
+            case: "an untag of an absent campaign (404, the tag tier)",
+            asked: Announced::Untag(absent),
+            status: 404,
+            code: TAG_NOT_FOUND_CODE,
+            announced: TAG_TIER_MEDIA_TYPE,
+        },
+    ];
+
+    for row in rows {
+        let answer = match &row.asked {
+            Announced::ListTags(arn) => list_tags(&router, arn).await,
+            Announced::Tag(arn) => tag(&router, arn, &tag_map([("owner", "announced")])).await,
+            Announced::Untag(arn) => untag(&router, arn, &["owner"]).await,
+            Announced::Elsewhere(method, path, body) => {
+                call(&router, REGION, method, path, body).await
+            }
+        };
+        assert_eq!(
+            answer.status, row.status,
+            "case {:?}: expected HTTP {}, got {} {}",
+            row.case, row.status, answer.status, answer.body
+        );
+        if row.code.is_empty() {
+            assert!(
+                answer.error_code.is_empty(),
+                "case {:?}: expected a reply carrying no error code, got {:?}",
+                row.case,
+                answer.error_code
+            );
+        } else {
+            assert!(
+                answer.error_code.ends_with(row.code),
+                "case {:?}: expected the wire code {:?}, got {:?}",
+                row.case,
+                row.code,
+                answer.error_code
+            );
+        }
+        assert_eq!(
+            answer.media_type, row.announced,
+            "case {:?}: expected the media type {:?} of the layer that answered it, got {:?} \
+             on HTTP {} {}",
+            row.case, row.announced, answer.media_type, answer.status, answer.body
+        );
     }
 }

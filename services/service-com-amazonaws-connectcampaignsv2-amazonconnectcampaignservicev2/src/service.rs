@@ -62,7 +62,8 @@
 //! of which is the name of any shape this service's model declares, where every answer of
 //! the modelled front door carries a modelled shape's name. So those refusals keep the media
 //! type their own producer stamped and everything else is re-announced
-//! ([`announced_by_the_modelled_front_door`]).
+//! ([`announced_by_the_modelled_front_door`]). The sibling ConnectCampaigns v1 API is served
+//! by the same front door and the same tag tier, and splits its wire at the same place.
 //!
 //! One response is announced by the framework alone, because no author seam reaches it:
 //! the authentication refusal, which the router renders through
@@ -103,41 +104,15 @@ const TAG_TIER_ERROR_CODES: [&str; 2] = [
 /// [`service_common::response_media_type::AnnouncedResponses`] predicate the media type pair
 /// above belongs to.
 ///
-/// Everything but a refusal of the TAG tier ([`tag_tier_refusal`]) is the front door's: its
-/// successes, the refusals its handlers raise in the model's own shapes, and the refusals
-/// the framework renders inside the walk, all of which the recorded wire announces under the
-/// awsJson 1.1 media type. The tag tier's own refusals are recorded under the
-/// protocol-implied value, so they are handed back exactly as their producer wrote them.
-fn announced_by_the_modelled_front_door(
-    resp: &aws_smithy_runtime_api::http::Response,
-) -> bool {
-    !tag_tier_refusal(resp)
-}
-
-/// Whether `resp` is a refusal of the tag tier: a client error whose JSON envelope names one
-/// of [`TAG_TIER_ERROR_CODES`] in `__type`, which is where the `restJson1` envelope carries
-/// the error code a client branches on.
-///
-/// Read off the response a CLIENT receives rather than off the seam that rendered it: which
-/// internal seam answered is the emulator's business, and the code on the wire is the
-/// service's.
-fn tag_tier_refusal(resp: &aws_smithy_runtime_api::http::Response) -> bool {
-    if !resp.status().is_client_error() {
-        return false;
-    }
-    let Some(body) = resp.body().bytes() else {
-        return false;
-    };
-    let Ok(envelope) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
-    };
-    envelope
-        .get("__type")
-        .and_then(serde_json::Value::as_str)
-        // `__type` may qualify the code by a namespace or a protocol-version prefix, so the
-        // code itself is its last segment.
-        .and_then(|code| code.split(['#', '/']).next_back())
-        .is_some_and(|code| TAG_TIER_ERROR_CODES.contains(&code))
+/// Everything but a refusal the TAG tier answered is the front door's: its successes, the
+/// refusals its handlers raise in the model's own shapes, and the refusals the framework
+/// renders inside the walk, all of which the recorded wire announces under the awsJson 1.1
+/// media type. The tag tier's own refusals — the client errors carrying one of
+/// [`TAG_TIER_ERROR_CODES`], read off the response a client receives by the shared
+/// [`service_common::response_media_type::client_error_naming_one_of`] — are recorded under
+/// the protocol-implied value, so they are handed back exactly as their producer wrote them.
+fn announced_by_the_modelled_front_door(resp: &aws_smithy_runtime_api::http::Response) -> bool {
+    !service_common::response_media_type::client_error_naming_one_of(resp, &TAG_TIER_ERROR_CODES)
 }
 
 /// Whether this service serves the request these `parts` came from.
