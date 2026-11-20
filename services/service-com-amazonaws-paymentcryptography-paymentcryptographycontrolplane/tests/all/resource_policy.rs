@@ -19,6 +19,9 @@
 //! * a removal removes: once `DeleteResourcePolicy` has run, the key carries no policy at
 //!   all, so every later read reports that same empty document and a later attach starts
 //!   from nothing;
+//! * a removal reaches ONE record and only its policy element: every other key still
+//!   carries the document it was attached, and the named key's own record — its attributes,
+//!   its state, its timestamps, its tags — is what it was before the removal;
 //! * a document that would grant access to a principal nobody named is refused with
 //!   `PublicPolicyException` and nothing is written — a grant reaches everybody when its
 //!   principal element names the wildcard (bare or under any principal type) or excludes a
@@ -31,6 +34,7 @@
 //! was submitted with, which condition narrows a wildcard, and which clause a refused
 //! document breaks.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -62,6 +66,41 @@ async fn create_key(router: &MultiServiceRouter) -> String {
     let created = ok_call(router, "CreateKey", &create_key_body()).await;
     let key = created.get("Key").expect("CreateKey answers a Key");
     string(key, "KeyArn").to_string()
+}
+
+/// One `CreateKey` body carrying `tags`, so what a removal leaves of the rest of the same
+/// stored record is observable rather than only the policy element being checked.
+fn create_key_body_with_tags(tags: &[(&str, &str)]) -> Value {
+    let mut body = create_key_body();
+    body["Tags"] = Value::Array(
+        tags.iter()
+            .map(|(key, value)| json!({"Key": key, "Value": value}))
+            .collect(),
+    );
+    body
+}
+
+/// Create one key carrying `tags` and answer its `KeyArn`.
+async fn create_tagged_key(router: &MultiServiceRouter, tags: &[(&str, &str)]) -> String {
+    let created = ok_call(router, "CreateKey", &create_key_body_with_tags(tags)).await;
+    let key = created.get("Key").expect("CreateKey answers a Key");
+    string(key, "KeyArn").to_string()
+}
+
+/// Every tag `ListTagsForResource` reports for `arn`, as the set the key holds them as.
+async fn tags_of(router: &MultiServiceRouter, case: &str, arn: &str) -> BTreeMap<String, String> {
+    let page = ok_call(router, "ListTagsForResource", &json!({"ResourceArn": arn})).await;
+    page.get("Tags")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case}: expected a Tags list, got {page}"))
+        .iter()
+        .map(|tag| {
+            (
+                string(tag, "Key").to_string(),
+                string(tag, "Value").to_string(),
+            )
+        })
+        .collect()
 }
 
 /// A one-statement document carrying `statement`.
@@ -716,4 +755,101 @@ async fn the_policy_operations_name_the_resource_that_was_not_found() {
         None,
         "a read attaches nothing"
     );
+}
+
+/// The tag every key below carries, so the removal can be checked against the rest of the
+/// record it wrote to.
+const OWNER_TAG: &str = "owner";
+
+#[tokio::test]
+async fn a_removal_clears_only_the_policy_of_the_key_it_names() {
+    let (router, engine) = router_with_engine();
+
+    // One key per row: the rows differ along what the removal rule generalises over — the
+    // form of the document each key carries (every form the attachable table spans) and,
+    // in the last row, a key no call has attached a policy to. Each key is tagged with its
+    // own value, so what the removal left of the rest of that key's record is observable.
+    let mut rows: Vec<(&str, Option<String>)> = attachable_documents()
+        .into_iter()
+        .map(|(case, document)| (case, Some(document)))
+        .collect();
+    rows.push(("no policy attached at all", None));
+
+    // (case, key ARN, the tag value that key carries, the document it holds now).
+    let mut keys: Vec<(&str, String, String, Option<String>)> = Vec::new();
+    for (index, (case, document)) in rows.into_iter().enumerate() {
+        let tag_value = format!("key-{index:03}");
+        let arn = create_tagged_key(&router, &[(OWNER_TAG, tag_value.as_str())]).await;
+        let held = match &document {
+            Some(document) => {
+                ok_call(
+                    &router,
+                    "PutResourcePolicy",
+                    &json!({"ResourceArn": arn, "Policy": document}),
+                )
+                .await;
+                Some(reported(document))
+            }
+            None => None,
+        };
+        keys.push((case, arn, tag_value, held));
+    }
+
+    let arns: Vec<String> = keys.iter().map(|(_, arn, _, _)| arn.clone()).collect();
+    for (index, arn) in arns.iter().enumerate() {
+        let (case, _, tag_value, _) = keys[index].clone();
+
+        // The key's record as it stands before the removal, read back through the one
+        // reader of a key: every member of it but the policy must survive the removal.
+        let before = ok_call(&router, "GetKey", &json!({"KeyIdentifier": arn})).await;
+
+        ok_call(
+            &router,
+            "DeleteResourcePolicy",
+            &json!({"ResourceArn": arn}),
+        )
+        .await;
+        keys[index].3 = None;
+
+        // Every key answers the document it is holding now: the removal reached exactly
+        // the record it named, so a key it did not name still carries what was attached to
+        // it — and a key whose policy an earlier round removed still carries none.
+        for (other_case, other_arn, _, held) in &keys {
+            let stored = stored_policy(&engine, other_case, other_arn);
+            assert_eq!(
+                stored.as_deref(),
+                held.as_deref(),
+                "case {case:?} removing {arn}: expected {other_case:?} to hold \
+                 {held:?}, got {stored:?}"
+            );
+            let got = ok_call(
+                &router,
+                "GetResourcePolicy",
+                &json!({"ResourceArn": other_arn}),
+            )
+            .await;
+            assert_eq!(
+                string(&got, "Policy"),
+                held.as_deref().unwrap_or(NO_POLICY_DOCUMENT),
+                "case {case:?} removing {arn}: expected {other_case:?} to report \
+                 {held:?}, got {got}"
+            );
+        }
+
+        // The removal removes the policy and nothing else of the key it wrote to: the key
+        // record reads back unchanged and the tags it held are still held.
+        let after = ok_call(&router, "GetKey", &json!({"KeyIdentifier": arn})).await;
+        assert_eq!(
+            after.get("Key"),
+            before.get("Key"),
+            "case {case:?}: expected the key record unchanged by the removal, got {after}"
+        );
+        let tags = tags_of(&router, case, arn).await;
+        let expected: BTreeMap<String, String> =
+            BTreeMap::from([(OWNER_TAG.to_string(), tag_value.clone())]);
+        assert_eq!(
+            tags, expected,
+            "case {case:?}: expected the tags {expected:?} to survive the removal, got {tags:?}"
+        );
+    }
 }
