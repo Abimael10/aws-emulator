@@ -16442,6 +16442,7 @@ dependencies = [
  "hmac 0.12.1",
  "http",
  "serde_json",
+ "service-common",
  "sha2 0.10.9",
  "tokio",
  "tracing",

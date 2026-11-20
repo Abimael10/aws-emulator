@@ -157,8 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `LicenseConfigurationArn` is `@required` and `LicenseConfigurationStatus`
-        // targets a modelled enum, so the centralized walk has already refused a
-        // request that omits the ARN or names a status outside the catalog. The
+        // targets a modelled enum, so a request that omits the ARN or names a status
+        // outside the catalog is already refused before this runs — in this
+        // operation's own modelled error (`crate::service::modelled_refusal`). The
         // catalog check below is this handler's own guard, so no status outside it
         // can reach the store; the model publishes no length for any string or list
         // here, so those bounds live here too.
@@ -172,10 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if let Some(status) = input.license_configuration_status.as_deref() {
             if !LICENSE_CONFIGURATION_STATUS_VALUES.contains(&status) {
-                return Err(invalid_parameter(format!(
-                    "LicenseConfigurationStatus must be one of [{}], got '{status}'",
-                    LICENSE_CONFIGURATION_STATUS_VALUES.join(", ")
-                )));
+                return Err(invalid_parameter(
+                    crate::state::invalid_parameter_value_message(
+                        "licenseConfigurationStatus",
+                        status,
+                    ),
+                ));
             }
         }
 
@@ -192,18 +195,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
+        // The configuration this update addresses, resolved before anything about
+        // the request is applied.
+        let stored = store
+            .configuration(&input.license_configuration_arn)
+            .ok_or_else(unresolved_configuration)?;
+
+        // Hard enforcement needs a positive count to enforce, judged on what the
+        // record would carry ONCE THIS UPDATE LANDED: a member the request omits
+        // keeps its stored value, so turning the limit on over a stored count is
+        // acceptable and dropping the count under a stored limit is not.
+        let enforcement = crate::state::enforced_license_count_rejection(
+            input.license_count_hard_limit.or(stored.license_count_hard_limit),
+            input.license_count.or(stored.license_count),
+        );
+        // The dimension a configuration counts by is not something this operation
+        // can change, so a replacement rule list and any product information it
+        // carries are judged against the stored one.
+        let dimension = crate::state::configuration_dimension_rejection(
+            &stored.license_counting_type,
+            input.license_rules.as_deref(),
+            input.product_information_list.as_deref(),
+        );
+        if let Some(why) = dimension.or(enforcement) {
+            return Err(invalid_parameter(why));
+        }
+
         let configuration = store
             .configuration_mut(&input.license_configuration_arn)
-            .ok_or_else(|| {
-                UpdateLicenseConfigurationErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(format!(
-                            "no license configuration exists with the ARN '{}'",
-                            input.license_configuration_arn
-                        )),
-                    },
-                )
-            })?;
+            .ok_or_else(unresolved_configuration)?;
 
         // Every member the request carries replaces the stored one; every member it
         // omits is left exactly as it was.
@@ -248,4 +268,11 @@ fn invalid_parameter(message: impl Into<String>) -> UpdateLicenseConfigurationEr
         },
     )
     .into()
+}
+
+/// The modelled 400 this operation answers for a `LicenseConfigurationArn` it
+/// cannot resolve: the update path states ownership and status together, in a
+/// sentence that names no ARN.
+fn unresolved_configuration() -> UpdateLicenseConfigurationError {
+    invalid_parameter(crate::state::CONFIGURATION_OWNERSHIP_MESSAGE)
 }

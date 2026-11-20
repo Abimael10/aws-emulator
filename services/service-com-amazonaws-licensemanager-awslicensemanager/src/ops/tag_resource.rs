@@ -169,10 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource this service stores, since the operation is modelled against a
         // generic `ResourceArn`.
         if !store.is_taggable(&input.resource_arn) {
-            return Err(invalid_parameter(format!(
-                "no resource exists with the ARN '{}'",
-                input.resource_arn
-            )));
+            return Err(invalid_parameter(
+                crate::state::invalid_resource_arn_message(&input.resource_arn),
+            ));
         }
 
         // The store is finite, and `merge_tags` is what enforces that: a merge whose

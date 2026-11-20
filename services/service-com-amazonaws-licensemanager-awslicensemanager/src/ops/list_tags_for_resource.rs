@@ -158,9 +158,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.is_taggable(&input.resource_arn) {
             return Err(ListTagsForResourceErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
-                    message: Some(format!(
-                        "no resource exists with the ARN '{}'",
-                        input.resource_arn
+                    message: Some(crate::state::invalid_resource_arn_message(
+                        &input.resource_arn,
                     )),
                 },
             )

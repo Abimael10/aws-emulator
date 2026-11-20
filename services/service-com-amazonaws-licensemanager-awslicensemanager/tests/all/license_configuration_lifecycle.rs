@@ -611,10 +611,12 @@ async fn list_filters_scope_on_the_documented_names() {
         &json!({"Name": "soft-vcpu", "LicenseCountingType": "vCPU", "LicenseCount": 4, "LicenseCountHardLimit": false}),
     )
     .await;
+    // A hard limit needs a count to enforce, so this row carries one; what it
+    // differs from `hard_vcpu` in is the counting type.
     let hard_socket = create_ok(
         &router,
         "filters",
-        &json!({"Name": "hard-socket", "LicenseCountingType": "Socket", "LicenseCountHardLimit": true}),
+        &json!({"Name": "hard-socket", "LicenseCountingType": "Socket", "LicenseCount": 2, "LicenseCountHardLimit": true}),
     )
     .await;
     let plain_core = create_ok(
@@ -888,11 +890,13 @@ async fn update_replaces_only_the_members_it_carries() {
         ("Status", json!({"LicenseConfigurationStatus": "DISABLED"})),
         (
             "ProductInformationList",
+            // SSM_MANAGED, because the stored configuration below counts by Core:
+            // RDS product information belongs to a vCPU configuration only.
             json!({"ProductInformationList": [{
-                "ResourceType": "RDS",
+                "ResourceType": "SSM_MANAGED",
                 "ProductInformationFilterList": [{
-                    "ProductInformationFilterName": "Engine Edition",
-                    "ProductInformationFilterValue": ["sqlserver-ee"],
+                    "ProductInformationFilterName": "Application Name",
+                    "ProductInformationFilterValue": ["SQL Server Standard"],
                     "ProductInformationFilterComparator": "EQUALS"
                 }]
             }]}),
@@ -1230,7 +1234,9 @@ async fn a_counting_type_or_status_outside_the_modelled_catalog_is_refused() {
     let router = emulator();
     // Anything outside the modelled `LicenseCountingType` catalog is refused with a
     // 400, and nothing is stored for it. The catalog is a modelled enum, so the
-    // centralized constraint walk is what words the refusal.
+    // centralized constraint walk is what finds the value — and this operation
+    // declares no `ValidationException`, so the refusal is stated as the parameter
+    // value it will not accept, naming the value and the member.
     for counting_type in ["CPU", "vcpu", "INSTANCE", "Cores", ""] {
         let case = format!("LicenseCountingType={counting_type:?}");
         let (status, response) = call(
@@ -1245,8 +1251,13 @@ async fn a_counting_type_or_status_outside_the_modelled_catalog_is_refused() {
         );
         assert_eq!(
             error_code(&response),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {response}"
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        assert_eq!(
+            message(&case, &response),
+            format!("Invalid parameter value {counting_type} for licenseCountingType"),
+            "case {case:?}: unexpected refusal sentence in {response}"
         );
     }
     assert!(
@@ -1277,8 +1288,13 @@ async fn a_counting_type_or_status_outside_the_modelled_catalog_is_refused() {
         );
         assert_eq!(
             error_code(&response),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {response}"
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        assert_eq!(
+            message(&case, &response),
+            format!("Invalid parameter value {status_value} for licenseConfigurationStatus"),
+            "case {case:?}: unexpected refusal sentence in {response}"
         );
         // The refused update left the stored status alone.
         let stored = get_ok(&router, &case, &arn).await;
@@ -1306,6 +1322,77 @@ async fn a_counting_type_or_status_outside_the_modelled_catalog_is_refused() {
             stored["Status"].as_str(),
             Some(status_value),
             "case {case:?}: Status was not persisted, got {stored}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_value_a_modelled_constraint_refuses_is_stated_as_an_invalid_parameter_value() {
+    let router = emulator();
+    // The rule generalises over the CONSTRAINT CLASS and over the operation: an
+    // enumerated value set, a pattern and a numeric range, on three operations
+    // whose model declares no `ValidationException` (two of them not cited by the
+    // issue, one of them still a stub — the refusal is stated before any handler
+    // runs, so an unwritten handler words nothing).
+    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+        (
+            "an enumerated value set",
+            "CreateLicenseConfiguration",
+            json!({"Name": "rejected", "LicenseCountingType": "Cores"}),
+            "licenseCountingType",
+            "Cores",
+        ),
+        (
+            "a pattern",
+            "GetLicenseConversionTask",
+            json!({"LicenseConversionTaskId": "not-a-task-id"}),
+            "licenseConversionTaskId",
+            "not-a-task-id",
+        ),
+        (
+            "a numeric range below its minimum",
+            "ListLicenseVersions",
+            json!({
+                "LicenseArn": format!(
+                    "arn:aws:license-manager:{DEFAULT_REGION}:{ACCOUNT_ID}:license:l-{}",
+                    "c".repeat(32)
+                ),
+                "MaxResults": 0
+            }),
+            "maxResults",
+            "0",
+        ),
+        (
+            "a numeric range above its maximum",
+            "ListLicenseVersions",
+            json!({
+                "LicenseArn": format!(
+                    "arn:aws:license-manager:{DEFAULT_REGION}:{ACCOUNT_ID}:license:l-{}",
+                    "c".repeat(32)
+                ),
+                "MaxResults": 101
+            }),
+            "maxResults",
+            "101",
+        ),
+    ];
+
+    for (class, operation, body, member, value) in rows {
+        let case = format!("{operation} breaking {class}");
+        let (status, response) = call(&router, operation, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        assert_eq!(
+            message(&case, &response),
+            format!("Invalid parameter value {value} for {member}"),
+            "case {case:?}: unexpected refusal sentence in {response}"
         );
     }
 }
@@ -1567,5 +1654,1244 @@ async fn a_create_past_the_store_cap_is_refused_and_the_store_stays_at_its_cap()
         list_all_arns(&router, case, Some(100), &json!({})).await.len(),
         cap,
         "case {case:?}: the store must be back at its cap"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// How this surface REFUSES a request: the identity of the error, and the
+// sentence it carries.
+// ---------------------------------------------------------------------------
+
+/// The `Message` member of a refusal body, as the modelled error shapes of this
+/// service carry it.
+fn message(case: &str, body: &Value) -> String {
+    body.get("Message")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: no Message member in {body}"))
+        .to_string()
+}
+
+/// An ARN of the right shape that no configuration was ever stored under.
+fn unstored_configuration_arn(suffix: &str) -> String {
+    format!(
+        "arn:aws:license-manager:{DEFAULT_REGION}:{ACCOUNT_ID}:license-configuration:lic-{:0>32}",
+        suffix
+    )
+}
+
+/// One row of the absent-required-member table: the operation, a body that omits
+/// one of its `@required` members, and that member's wire name.
+struct AbsentMemberCase {
+    operation: &'static str,
+    body: Value,
+    member: &'static str,
+}
+
+#[tokio::test]
+async fn an_absent_required_member_is_refused_under_a_code_the_operation_models() {
+    let router = emulator();
+    // The table spans the operations whose model declares no `ValidationException`
+    // — so `InvalidParameterValueException` is the only client error they can
+    // answer with — and, for each, a `@required` member the request omits. The
+    // last two rows are operations the issue did not cite, one of them still a
+    // stub: the rule is keyed on the model's error list, not on the handler.
+    let rows = vec![
+        AbsentMemberCase {
+            operation: "CreateLicenseConfiguration",
+            body: json!({"LicenseCountingType": "Core"}),
+            member: "name",
+        },
+        AbsentMemberCase {
+            operation: "CreateLicenseConfiguration",
+            body: json!({"Name": "no-counting-type"}),
+            member: "licenseCountingType",
+        },
+        AbsentMemberCase {
+            operation: "GetLicenseConfiguration",
+            body: json!({}),
+            member: "licenseConfigurationArn",
+        },
+        AbsentMemberCase {
+            operation: "UpdateLicenseConfiguration",
+            body: json!({"LicenseCount": 1}),
+            member: "licenseConfigurationArn",
+        },
+        AbsentMemberCase {
+            operation: "DeleteLicenseConfiguration",
+            body: json!({}),
+            member: "licenseConfigurationArn",
+        },
+        AbsentMemberCase {
+            operation: "ListLicenseSpecificationsForResource",
+            body: json!({"MaxResults": 10}),
+            member: "resourceArn",
+        },
+        AbsentMemberCase {
+            operation: "ListAssociationsForLicenseConfiguration",
+            body: json!({}),
+            member: "licenseConfigurationArn",
+        },
+    ];
+
+    for AbsentMemberCase {
+        operation,
+        body,
+        member,
+    } in rows
+    {
+        let case = format!("{operation} without {member}");
+        let (status, response) = call(&router, operation, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        assert_eq!(
+            message(&case, &response),
+            format!("Required parameter {member} must not be null."),
+            "case {case:?}: unexpected refusal sentence in {response}"
+        );
+    }
+
+    // Nothing was stored for any of them.
+    assert!(
+        list_all_arns(&router, "absent members", None, &json!({}))
+            .await
+            .is_empty(),
+        "a refused request must store nothing"
+    );
+}
+
+#[tokio::test]
+async fn an_operation_that_models_validation_exception_keeps_that_envelope() {
+    let router = emulator();
+    // The contrast rows: these three operations DO declare `ValidationException`
+    // (`smithy_query(query="digest")`), so an absent required member keeps the
+    // centralized walk's own refusal instead of being restated as a parameter
+    // value this service will not accept.
+    for (operation, body) in [
+        ("ListTagsForResource", json!({})),
+        ("TagResource", json!({"Tags": tag_list(&[("k", "v")])})),
+        ("UntagResource", json!({"TagKeys": ["k"]})),
+    ] {
+        let case = format!("{operation} without ResourceArn");
+        let (status, response) = call(&router, operation, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_value_below_zero_is_refused_naming_the_field_and_echoing_nothing() {
+    // The rule generalises over the member and over how far below zero the value
+    // is; the accepted boundary is zero itself.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "licenseCount",
+            "LicenseCount of -1",
+            json!({"Name": "neg", "LicenseCountingType": "Core", "LicenseCount": -1}),
+        ),
+        (
+            "licenseCount",
+            "LicenseCount of -5",
+            json!({"Name": "neg", "LicenseCountingType": "Core", "LicenseCount": -5}),
+        ),
+        (
+            "licenseCount",
+            "a very negative LicenseCount",
+            json!({"Name": "neg", "LicenseCountingType": "vCPU", "LicenseCount": -9_007_199_254_740_991_i64}),
+        ),
+        (
+            "licenseExpiry",
+            "LicenseExpiry of -1",
+            json!({"Name": "neg", "LicenseCountingType": "Socket", "LicenseExpiry": -1}),
+        ),
+        (
+            "licenseExpiry",
+            "LicenseExpiry of -2_000_000_000",
+            json!({"Name": "neg", "LicenseCountingType": "Instance", "LicenseExpiry": -2_000_000_000_i64}),
+        ),
+    ];
+
+    for (member, case, body) in rows {
+        let router = emulator();
+        let (status, response) = call(&router, "CreateLicenseConfiguration", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        let stated = message(case, &response);
+        assert_eq!(
+            stated,
+            format!("Field '{member}' cannot be lesser than 0."),
+            "case {case:?}: unexpected refusal sentence in {response}"
+        );
+        // The sentence is fixed text around the member name: the submitted number
+        // is never echoed into it.
+        let submitted = body
+            .get(if member == "licenseCount" {
+                "LicenseCount"
+            } else {
+                "LicenseExpiry"
+            })
+            .and_then(Value::as_i64)
+            .expect("the row carries the member it is about");
+        assert!(
+            !stated.contains(&submitted.to_string()),
+            "case {case:?}: the refusal echoed the submitted {submitted}: {stated:?}"
+        );
+        assert!(
+            list_all_arns(&router, case, None, &json!({})).await.is_empty(),
+            "case {case:?}: a refused create must store nothing"
+        );
+    }
+
+    // The same sentence on the update path, and zero is accepted on both.
+    let router = emulator();
+    let arn = create_ok(
+        &router,
+        "zero is accepted",
+        &json!({"Name": "zeroed", "LicenseCountingType": "Core", "LicenseCount": 0, "LicenseExpiry": 0}),
+    )
+    .await;
+    let (status, response) = call(
+        &router,
+        "UpdateLicenseConfiguration",
+        &json!({"LicenseConfigurationArn": arn, "LicenseCount": -7}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"update with a negative LicenseCount\": expected a 400, got {status} {response}"
+    );
+    assert_eq!(
+        message("update with a negative LicenseCount", &response),
+        "Field 'licenseCount' cannot be lesser than 0.",
+        "case \"update with a negative LicenseCount\": unexpected sentence in {response}"
+    );
+    let stored = get_ok(&router, "update with a negative LicenseCount", &arn).await;
+    assert_eq!(
+        stored["LicenseCount"].as_i64(),
+        Some(0),
+        "a refused update changed the stored LicenseCount: {stored}"
+    );
+}
+
+/// One row of the enforcement table: the `LicenseCountHardLimit` and `LicenseCount`
+/// a create carries, and whether the configuration it describes is one this service
+/// stores.
+struct EnforcementCase {
+    case: &'static str,
+    hard_limit: Option<bool>,
+    license_count: Option<i64>,
+    stored: bool,
+}
+
+/// The sentence this service refuses an enforced count it cannot enforce with.
+const ENFORCEMENT_REFUSAL: &str =
+    "License count should be non-null and greater than zero, if license count has been enforced.";
+
+#[tokio::test]
+async fn an_enforced_license_count_must_be_positive() {
+    // The table spans both members: the limit absent, off and on, against a count
+    // absent, zero and positive. Only an ON limit without a positive count is
+    // refused.
+    let rows = vec![
+        EnforcementCase {
+            case: "a hard limit with no count",
+            hard_limit: Some(true),
+            license_count: None,
+            stored: false,
+        },
+        EnforcementCase {
+            case: "a hard limit over a zero count",
+            hard_limit: Some(true),
+            license_count: Some(0),
+            stored: false,
+        },
+        EnforcementCase {
+            case: "a hard limit over a count of one",
+            hard_limit: Some(true),
+            license_count: Some(1),
+            stored: true,
+        },
+        EnforcementCase {
+            case: "a hard limit over a large count",
+            hard_limit: Some(true),
+            license_count: Some(9_007_199_254_740_991),
+            stored: true,
+        },
+        EnforcementCase {
+            case: "a soft limit with no count",
+            hard_limit: Some(false),
+            license_count: None,
+            stored: true,
+        },
+        EnforcementCase {
+            case: "a soft limit over a zero count",
+            hard_limit: Some(false),
+            license_count: Some(0),
+            stored: true,
+        },
+        EnforcementCase {
+            case: "no limit at all",
+            hard_limit: None,
+            license_count: None,
+            stored: true,
+        },
+        EnforcementCase {
+            case: "no limit over a zero count",
+            hard_limit: None,
+            license_count: Some(0),
+            stored: true,
+        },
+    ];
+
+    for EnforcementCase {
+        case,
+        hard_limit,
+        license_count,
+        stored,
+    } in rows
+    {
+        let router = emulator();
+        let mut body = json!({"Name": "enforced", "LicenseCountingType": "Core"});
+        if let Some(hard_limit) = hard_limit {
+            body["LicenseCountHardLimit"] = json!(hard_limit);
+        }
+        if let Some(license_count) = license_count {
+            body["LicenseCount"] = json!(license_count);
+        }
+        let (status, response) = call(&router, "CreateLicenseConfiguration", &body).await;
+        if stored {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create to succeed, got {status} {response}"
+            );
+            // What was accepted is what a later read reports.
+            let arn = response["LicenseConfigurationArn"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no ARN in {response}"));
+            let read_back = get_ok(&router, case, arn).await;
+            assert_eq!(
+                read_back["LicenseCountHardLimit"].as_bool(),
+                hard_limit,
+                "case {case:?}: LicenseCountHardLimit was not stored as supplied: {read_back}"
+            );
+            assert_eq!(
+                read_back["LicenseCount"].as_i64(),
+                license_count,
+                "case {case:?}: LicenseCount was not stored as supplied: {read_back}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        assert_eq!(
+            message(case, &response),
+            ENFORCEMENT_REFUSAL,
+            "case {case:?}: unexpected refusal sentence in {response}"
+        );
+        assert!(
+            list_all_arns(&router, case, None, &json!({})).await.is_empty(),
+            "case {case:?}: a refused create must mint no configuration"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_update_is_judged_on_the_configuration_it_would_leave_behind() {
+    // Each row: what the store holds, the patch, and whether the configuration the
+    // patch would leave behind is one this service holds. A member the patch omits
+    // keeps its stored value, so the same patch is acceptable over one record and
+    // refused over another.
+    let rows: Vec<(&str, Value, Value, bool)> = vec![
+        (
+            "the limit turned on over a stored count",
+            json!({"LicenseCount": 5, "LicenseCountHardLimit": false}),
+            json!({"LicenseCountHardLimit": true}),
+            true,
+        ),
+        (
+            "the limit turned on over a stored zero count",
+            json!({"LicenseCount": 0, "LicenseCountHardLimit": false}),
+            json!({"LicenseCountHardLimit": true}),
+            false,
+        ),
+        (
+            "the limit turned on over no stored count",
+            json!({}),
+            json!({"LicenseCountHardLimit": true}),
+            false,
+        ),
+        (
+            "the limit and a count turned on together",
+            json!({}),
+            json!({"LicenseCountHardLimit": true, "LicenseCount": 3}),
+            true,
+        ),
+        (
+            "the count dropped to zero under a stored limit",
+            json!({"LicenseCount": 4, "LicenseCountHardLimit": true}),
+            json!({"LicenseCount": 0}),
+            false,
+        ),
+        (
+            "the count raised under a stored limit",
+            json!({"LicenseCount": 4, "LicenseCountHardLimit": true}),
+            json!({"LicenseCount": 40}),
+            true,
+        ),
+        (
+            "the limit turned off over a stored zero count",
+            json!({"LicenseCount": 0, "LicenseCountHardLimit": false}),
+            json!({"LicenseCountHardLimit": false}),
+            true,
+        ),
+    ];
+
+    for (case, seed, patch, accepted) in rows {
+        let router = emulator();
+        let mut body = json!({"Name": "updated", "LicenseCountingType": "Instance"});
+        for (member, value) in seed.as_object().expect("the seed is an object") {
+            body[member] = value.clone();
+        }
+        let arn = create_ok(&router, case, &body).await;
+        let before = get_ok(&router, case, &arn).await;
+
+        let mut request = patch.clone();
+        request["LicenseConfigurationArn"] = json!(arn);
+        let (status, response) = call(&router, "UpdateLicenseConfiguration", &request).await;
+        if accepted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the update to succeed, got {status} {response}"
+            );
+            let after = get_ok(&router, case, &arn).await;
+            for (member, value) in patch.as_object().expect("the patch is an object") {
+                assert_eq!(
+                    after.get(member),
+                    Some(value),
+                    "case {case:?}: {member} was not persisted: {after}"
+                );
+            }
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        assert_eq!(
+            message(case, &response),
+            ENFORCEMENT_REFUSAL,
+            "case {case:?}: unexpected refusal sentence in {response}"
+        );
+        assert_eq!(
+            get_ok(&router, case, &arn).await,
+            before,
+            "case {case:?}: a refused update changed the stored configuration"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unresolvable_arn_is_refused_in_the_sentence_its_operation_states() {
+    let router = emulator();
+    // One configuration exists, so the ARNs below are refused because the store
+    // resolves them to nothing — not because nothing is stored at all.
+    let live = create_ok(
+        &router,
+        "unresolvable ARNs",
+        &json!({"Name": "live", "LicenseCountingType": "Core"}),
+    )
+    .await;
+    // A configuration that WAS stored and has since been deleted, so one of the
+    // rows below is refused on state this test changed rather than on the ARN's
+    // spelling.
+    let deleted = create_ok(
+        &router,
+        "unresolvable ARNs",
+        &json!({"Name": "doomed", "LicenseCountingType": "Core"}),
+    )
+    .await;
+    let (status, response) = call(
+        &router,
+        "DeleteLicenseConfiguration",
+        &json!({"LicenseConfigurationArn": deleted}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected the delete to succeed, got {status} {response}"
+    );
+
+    // The rule generalises over the ARN: one never stored, one deleted, one in
+    // another region, and one naming a license rather than a configuration.
+    let arns = vec![
+        unstored_configuration_arn("1"),
+        deleted,
+        format!(
+            "arn:aws:license-manager:eu-west-1:{ACCOUNT_ID}:license-configuration:lic-{}",
+            "a".repeat(32)
+        ),
+        format!(
+            "arn:aws:license-manager:{DEFAULT_REGION}:{ACCOUNT_ID}:license:l-{}",
+            "b".repeat(32)
+        ),
+    ];
+
+    for arn in &arns {
+        // Each operation states the sentence AWS words for ITS surface: the
+        // configuration readers name the ARN, the tagging surface names a generic
+        // resource, and the update path states ownership and status without naming
+        // anything.
+        let rows: Vec<(&str, Value, String)> = vec![
+            (
+                "GetLicenseConfiguration",
+                json!({"LicenseConfigurationArn": arn}),
+                format!("Invalid license configuration ARN {arn}."),
+            ),
+            (
+                "DeleteLicenseConfiguration",
+                json!({"LicenseConfigurationArn": arn}),
+                format!("Invalid license configuration ARN {arn}."),
+            ),
+            (
+                "UpdateLicenseConfiguration",
+                json!({"LicenseConfigurationArn": arn, "LicenseCount": 1}),
+                "Please check license configurations for ownership and status.".to_string(),
+            ),
+            (
+                "ListTagsForResource",
+                json!({"ResourceArn": arn}),
+                format!("Invalid resource ARN {arn}."),
+            ),
+            (
+                "TagResource",
+                json!({"ResourceArn": arn, "Tags": tag_list(&[("k", "v")])}),
+                format!("Invalid resource ARN {arn}."),
+            ),
+            (
+                "UntagResource",
+                json!({"ResourceArn": arn, "TagKeys": ["k"]}),
+                format!("Invalid resource ARN {arn}."),
+            ),
+        ];
+        for (operation, body, expected) in rows {
+            let case = format!("{operation} on {arn}");
+            let (status, response) = call(&router, operation, &body).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected a 400, got {status} {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                "InvalidParameterValueException",
+                "case {case:?}: expected InvalidParameterValueException, got {response}"
+            );
+            assert_eq!(
+                message(&case, &response),
+                expected,
+                "case {case:?}: unexpected refusal sentence in {response}"
+            );
+        }
+    }
+
+    // The configuration that IS stored is still served, so the refusals above are
+    // about resolution and not about the operations themselves.
+    let stored = get_ok(&router, "the live configuration", &live).await;
+    assert_eq!(
+        stored["Name"].as_str(),
+        Some("live"),
+        "the stored configuration is still reported: {stored}"
+    );
+}
+
+#[tokio::test]
+async fn the_update_refusal_withholds_the_arn_it_was_asked_about() {
+    let router = emulator();
+    // The ownership sentence names nothing about the request, so an ARN that
+    // resolves to nothing is not disclosed back to the caller — whatever ARN was
+    // asked about.
+    for suffix in ["1", "2", "deadbeef"] {
+        let arn = unstored_configuration_arn(suffix);
+        let case = format!("UpdateLicenseConfiguration on {arn}");
+        let (status, response) = call(
+            &router,
+            "UpdateLicenseConfiguration",
+            &json!({"LicenseConfigurationArn": arn, "Name": "renamed"}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        let stated = message(&case, &response);
+        assert!(
+            !stated.contains(&arn),
+            "case {case:?}: the refusal disclosed the ARN: {stated:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_refuses_a_page_size_outside_the_range_it_pages_in() {
+    let router = emulator();
+    create_ok(
+        &router,
+        "page sizes",
+        &json!({"Name": "only", "LicenseCountingType": "Core"}),
+    )
+    .await;
+
+    // The range is 1 to 100 — the bound the model itself declares on this
+    // service's `MaxSize100` page member
+    // (`smithy_query(query="operation",operation="ListLicenseVersions")`), applied
+    // here because this operation's own `MaxResults` declares none. Each published
+    // bound, and one value past each, plus the extremes.
+    let refused: Vec<(&str, Value)> = vec![
+        ("MaxResults of 0", json!(0)),
+        ("a negative MaxResults", json!(-1)),
+        ("one past the page ceiling", json!(101)),
+        ("a very large MaxResults", json!(2_147_483_647_i64)),
+        ("a very negative MaxResults", json!(-2_147_483_648_i64)),
+    ];
+    for (case, max_results) in refused {
+        let (status, response) = call(
+            &router,
+            "ListLicenseConfigurations",
+            &json!({"MaxResults": max_results}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        let stated = message(case, &response);
+        assert_eq!(
+            stated, "Invalid parameter value. Valid range is from 1 to 100 for MaxResults",
+            "case {case:?}: unexpected refusal sentence in {response}"
+        );
+        // The sentence above is the whole of the refusal: fixed text stating the
+        // range and the member, with no echo of the size that was asked for.
+    }
+
+    // Both published bounds are served.
+    for max_results in [1_i64, 100] {
+        let case = format!("MaxResults={max_results}");
+        let (status, response) = call(
+            &router,
+            "ListLicenseConfigurations",
+            &json!({"MaxResults": max_results}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the list to succeed, got {status} {response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_refuses_an_arn_selection_outside_the_size_it_accepts() {
+    let router = emulator();
+    let arn = create_ok(
+        &router,
+        "selection sizes",
+        &json!({"Name": "only", "LicenseCountingType": "Core"}),
+    )
+    .await;
+
+    // The accepted range is 1 to 100 entries: a request that carries the member at
+    // all has to carry a usable selection. Both ends, and one past each.
+    let refused: Vec<(&str, Value)> = vec![
+        ("an empty selection", json!([])),
+        (
+            "one entry past the selection ceiling",
+            Value::Array(
+                (0..101)
+                    .map(|n| json!(unstored_configuration_arn(&n.to_string())))
+                    .collect(),
+            ),
+        ),
+        (
+            "a selection far past the ceiling",
+            Value::Array(
+                (0..250)
+                    .map(|n| json!(unstored_configuration_arn(&n.to_string())))
+                    .collect(),
+            ),
+        ),
+    ];
+    for (case, selection) in refused {
+        let (status, response) = call(
+            &router,
+            "ListLicenseConfigurations",
+            &json!({"LicenseConfigurationArns": selection}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        assert_eq!(
+            message(case, &response),
+            "Invalid list size for parameter LicenseConfigurationArns. Valid range is range 1 to 100.",
+            "case {case:?}: unexpected refusal sentence in {response}"
+        );
+    }
+
+    // One entry and a selection at the ceiling are both served, and the page
+    // reports exactly the stored configuration the selection names.
+    for (case, selection) in [
+        ("one entry", vec![arn.clone()]),
+        (
+            "a selection at the ceiling",
+            std::iter::once(arn.clone())
+                .chain((0..99).map(|n| unstored_configuration_arn(&n.to_string())))
+                .collect(),
+        ),
+    ] {
+        let walked = list_all_arns(
+            &router,
+            case,
+            Some(100),
+            &json!({"LicenseConfigurationArns": selection}),
+        )
+        .await;
+        assert_eq!(
+            walked,
+            vec![arn.clone()],
+            "case {case:?}: the selection reported {walked:?}"
+        );
+    }
+}
+
+/// One row of the license-rules table: the dimension the configuration counts by,
+/// the rule list, and the restriction the refusal must name (`None` when the rules
+/// are ones that dimension admits).
+struct RuleCase {
+    counting_type: &'static str,
+    rules: &'static [&'static str],
+    refused: Option<&'static str>,
+}
+
+#[tokio::test]
+async fn a_license_rule_must_be_a_restriction_its_dimension_admits() {
+    // The table walks the documented catalog: for every dimension, a restriction it
+    // admits, a restriction another dimension admits and it does not, and a name no
+    // dimension has. The catalog is the `LicenseRules` member's own documentation
+    // (`smithy_query(query="doc",shape="CreateLicenseConfigurationRequest",member="LicenseRules")`).
+    let rows: &[RuleCase] = &[
+        RuleCase {
+            counting_type: "Core",
+            rules: &["#allowedTenancy=EC2-Default", "#minimumCores=1", "#maximumCores=8"],
+            refused: None,
+        },
+        RuleCase {
+            counting_type: "Core",
+            rules: &["#licenseAffinityToHost=30"],
+            refused: None,
+        },
+        RuleCase {
+            counting_type: "Core",
+            rules: &["#minimumSockets=1"],
+            refused: Some("minimumSockets"),
+        },
+        RuleCase {
+            counting_type: "Instance",
+            rules: &["#minimumVcpus=2", "#maximumVcpus=16"],
+            refused: None,
+        },
+        RuleCase {
+            counting_type: "Instance",
+            rules: &["#licenseAffinityToHost=30"],
+            refused: Some("licenseAffinityToHost"),
+        },
+        RuleCase {
+            counting_type: "Socket",
+            rules: &["#minimumSockets=1", "#licenseAffinityToHost=180"],
+            refused: None,
+        },
+        RuleCase {
+            counting_type: "Socket",
+            rules: &["#honorVcpuOptimization=True"],
+            refused: Some("honorVcpuOptimization"),
+        },
+        RuleCase {
+            counting_type: "vCPU",
+            rules: &["#honorVcpuOptimization=True", "#minimumVcpus=1"],
+            refused: None,
+        },
+        RuleCase {
+            counting_type: "vCPU",
+            rules: &["#maximumCores=2"],
+            refused: Some("maximumCores"),
+        },
+        RuleCase {
+            counting_type: "vCPU",
+            rules: &["#bogusRule=1"],
+            refused: Some("bogusRule"),
+        },
+        // The documented syntax is `#name=value`; an entry that spells neither is
+        // reported as the restriction it asks for rather than quietly stored.
+        RuleCase {
+            counting_type: "Core",
+            rules: &["bogusRule"],
+            refused: Some("bogusRule"),
+        },
+        // The second entry is the offending one, so the walk does not stop at the
+        // first.
+        RuleCase {
+            counting_type: "Core",
+            rules: &["#minimumCores=1", "#maximumVcpus=4"],
+            refused: Some("maximumVcpus"),
+        },
+    ];
+
+    for RuleCase {
+        counting_type,
+        rules,
+        refused,
+    } in rows
+    {
+        let router = emulator();
+        let case = format!("{counting_type} with {rules:?}");
+        let body = json!({
+            "Name": "ruled",
+            "LicenseCountingType": counting_type,
+            "LicenseRules": rules
+        });
+        let (status, response) = call(&router, "CreateLicenseConfiguration", &body).await;
+        match refused {
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the create to succeed, got {status} {response}"
+                );
+                let arn = response["LicenseConfigurationArn"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case:?}: no ARN in {response}"));
+                let stored = get_ok(&router, &case, arn).await;
+                assert_eq!(
+                    stored["LicenseRules"],
+                    json!(rules),
+                    "case {case:?}: the rules were not stored as supplied: {stored}"
+                );
+            }
+            Some(restriction) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected a 400, got {status} {response}"
+                );
+                assert_eq!(
+                    error_code(&response),
+                    "InvalidParameterValueException",
+                    "case {case:?}: expected InvalidParameterValueException, got {response}"
+                );
+                assert_eq!(
+                    message(&case, &response),
+                    format!(
+                        "Restriction {restriction} not allowed for license type {counting_type}."
+                    ),
+                    "case {case:?}: unexpected refusal sentence in {response}"
+                );
+            }
+        }
+    }
+
+    // An update cannot change the dimension, so a replacement rule list is judged
+    // against the stored one — and a refused update leaves the stored rules alone.
+    let router = emulator();
+    let arn = create_ok(
+        &router,
+        "update rules",
+        &json!({
+            "Name": "ruled",
+            "LicenseCountingType": "Socket",
+            "LicenseRules": ["#minimumSockets=1"]
+        }),
+    )
+    .await;
+    let (status, response) = call(
+        &router,
+        "UpdateLicenseConfiguration",
+        &json!({"LicenseConfigurationArn": arn, "LicenseRules": ["#minimumVcpus=2"]}),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"update to a rule the stored dimension does not admit\": expected a 400, \
+         got {status} {response}"
+    );
+    assert_eq!(
+        message("update to a foreign rule", &response),
+        "Restriction minimumVcpus not allowed for license type Socket.",
+        "case \"update to a rule the stored dimension does not admit\": unexpected \
+         sentence in {response}"
+    );
+    let stored = get_ok(&router, "update rules", &arn).await;
+    assert_eq!(
+        stored["LicenseRules"],
+        json!(["#minimumSockets=1"]),
+        "a refused update changed the stored rules: {stored}"
+    );
+}
+
+/// One row of the product-information table: the dimension the configuration counts
+/// by, one `ProductInformationList` entry, and the sentence the refusal must state
+/// (`None` when the entry is one this service stores).
+struct ProductInformationCase {
+    case: &'static str,
+    counting_type: &'static str,
+    entry: Value,
+    refused: Option<String>,
+}
+
+/// The filter names the SSM_MANAGED surface supports, as the refusal lists them.
+const SSM_FILTERS: &str = "Application Name, Application Publisher, Application Version, \
+                           Platform Name, Platform Type, Tag:key, AccountId, License Included";
+
+/// One `ProductInformation` entry carrying one filter.
+fn product_information(resource_type: &str, name: &str, comparator: &str) -> Value {
+    json!({
+        "ResourceType": resource_type,
+        "ProductInformationFilterList": [{
+            "ProductInformationFilterName": name,
+            "ProductInformationFilterValue": ["a value"],
+            "ProductInformationFilterComparator": comparator
+        }]
+    })
+}
+
+#[tokio::test]
+async fn product_information_must_name_a_resource_type_and_its_own_filters() {
+    // The table spans the three rules product information is judged by — the
+    // resource type itself, the dimension it can be licensed by, and the filters
+    // and logical operators that resource type supports — with a refused and an
+    // accepted row for each. The catalogs are the model's own
+    // (`smithy_query(query="doc",shape="ProductInformation",member="ProductInformationFilterList")`).
+    let rows: Vec<ProductInformationCase> = vec![
+        ProductInformationCase {
+            case: "a resource type that does not exist",
+            counting_type: "Core",
+            entry: product_information("EC2", "Application Name", "EQUALS"),
+            refused: Some("Invalid or non-existent resource type in Product Information.".into()),
+        },
+        ProductInformationCase {
+            case: "a resource type in the wrong case",
+            counting_type: "Core",
+            entry: product_information("ssm_managed", "Application Name", "EQUALS"),
+            refused: Some("Invalid or non-existent resource type in Product Information.".into()),
+        },
+        ProductInformationCase {
+            case: "an empty resource type",
+            counting_type: "Core",
+            entry: product_information("", "Application Name", "EQUALS"),
+            refused: Some("Invalid or non-existent resource type in Product Information.".into()),
+        },
+        ProductInformationCase {
+            case: "RDS on a configuration counting by cores",
+            counting_type: "Core",
+            entry: product_information("RDS", "Engine Edition", "EQUALS"),
+            refused: Some("RDS product information is only supported vCPU license type.".into()),
+        },
+        ProductInformationCase {
+            case: "RDS on a configuration counting by sockets",
+            counting_type: "Socket",
+            entry: product_information("RDS", "License Pack", "EQUALS"),
+            refused: Some("RDS product information is only supported vCPU license type.".into()),
+        },
+        ProductInformationCase {
+            case: "RDS on a configuration counting by vCPU",
+            counting_type: "vCPU",
+            entry: product_information("RDS", "Engine Edition", "EQUALS"),
+            refused: None,
+        },
+        ProductInformationCase {
+            case: "a filter name the SSM surface does not support",
+            counting_type: "Core",
+            entry: product_information("SSM_MANAGED", "Bogus Field", "EQUALS"),
+            refused: Some(format!(
+                "Unsupported filter name - Bogus Field - provided in product information \
+                 for SSM_MANAGED. Supported values are [{SSM_FILTERS}]."
+            )),
+        },
+        ProductInformationCase {
+            case: "an SSM filter name asked of the RDS surface",
+            counting_type: "vCPU",
+            entry: product_information("RDS", "Application Name", "EQUALS"),
+            refused: Some(
+                "Unsupported filter name - Application Name - provided in product \
+                 information for RDS. Supported values are [Engine Edition, License Pack]."
+                    .into(),
+            ),
+        },
+        ProductInformationCase {
+            case: "a supported filter name in the wrong case",
+            counting_type: "Core",
+            entry: product_information("SSM_MANAGED", "application name", "EQUALS"),
+            refused: Some(format!(
+                "Unsupported filter name - application name - provided in product \
+                 information for SSM_MANAGED. Supported values are [{SSM_FILTERS}]."
+            )),
+        },
+        ProductInformationCase {
+            case: "a comparator in the wrong case",
+            counting_type: "Core",
+            entry: product_information("SSM_MANAGED", "Application Name", "Equals"),
+            refused: Some(
+                "Unsupported filter comparator Equals provided for SSM Managed Instance. \
+                 Supported comparators are [\"EQUALS\"]."
+                    .into(),
+            ),
+        },
+        ProductInformationCase {
+            case: "an operator the filter is not applied with",
+            counting_type: "Core",
+            entry: product_information("SSM_MANAGED", "AccountId", "EQUALS"),
+            refused: Some(
+                "Unsupported filter comparator EQUALS provided for SSM Managed Instance. \
+                 Supported comparators are [\"NOT_EQUALS\"]."
+                    .into(),
+            ),
+        },
+        ProductInformationCase {
+            case: "the operator that filter IS applied with",
+            counting_type: "Core",
+            entry: product_information("SSM_MANAGED", "AccountId", "NOT_EQUALS"),
+            refused: None,
+        },
+        ProductInformationCase {
+            case: "a filter applied with either operator",
+            counting_type: "Core",
+            entry: product_information("SSM_MANAGED", "License Included", "NOT_EQUALS"),
+            refused: None,
+        },
+        ProductInformationCase {
+            case: "the tag filter with its key appended",
+            counting_type: "Core",
+            entry: product_information("SSM_MANAGED", "Tag:owner", "NOT_EQUALS"),
+            refused: None,
+        },
+        ProductInformationCase {
+            case: "the tag filter with an operator it is not applied with",
+            counting_type: "Core",
+            entry: product_information("SSM_MANAGED", "Tag:owner", "EQUALS"),
+            refused: Some(
+                "Unsupported filter comparator EQUALS provided for SSM Managed Instance. \
+                 Supported comparators are [\"NOT_EQUALS\"]."
+                    .into(),
+            ),
+        },
+        ProductInformationCase {
+            case: "a supported filter of the SSM surface",
+            counting_type: "Instance",
+            entry: product_information("SSM_MANAGED", "Platform Type", "EQUALS"),
+            refused: None,
+        },
+    ];
+
+    for ProductInformationCase {
+        case,
+        counting_type,
+        entry,
+        refused,
+    } in rows
+    {
+        let router = emulator();
+        let body = json!({
+            "Name": "described",
+            "LicenseCountingType": counting_type,
+            "ProductInformationList": [entry.clone()]
+        });
+        let (status, response) = call(&router, "CreateLicenseConfiguration", &body).await;
+        match &refused {
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the create to succeed, got {status} {response}"
+                );
+                let arn = response["LicenseConfigurationArn"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case:?}: no ARN in {response}"));
+                let stored = get_ok(&router, case, arn).await;
+                assert_eq!(
+                    stored["ProductInformationList"],
+                    json!([entry]),
+                    "case {case:?}: the product information was not stored as supplied: {stored}"
+                );
+            }
+            Some(expected) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected a 400, got {status} {response}"
+                );
+                assert_eq!(
+                    error_code(&response),
+                    "InvalidParameterValueException",
+                    "case {case:?}: expected InvalidParameterValueException, got {response}"
+                );
+                assert_eq!(
+                    &message(case, &response),
+                    expected,
+                    "case {case:?}: unexpected refusal sentence in {response}"
+                );
+                assert!(
+                    list_all_arns(&router, case, None, &json!({})).await.is_empty(),
+                    "case {case:?}: a refused create must store nothing"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn list_refuses_a_filter_name_it_does_not_scope_on() {
+    let router = emulator();
+    create_ok(
+        &router,
+        "filter names",
+        &json!({"Name": "only", "LicenseCountingType": "Core"}),
+    )
+    .await;
+
+    // The rule generalises over the name: one no list scopes on, a documented name
+    // in the wrong case, and an empty one.
+    for name in ["bogusFilter", "LicenseCountingType", ""] {
+        let case = format!("Filters Name={name:?}");
+        let (status, response) = call(
+            &router,
+            "ListLicenseConfigurations",
+            &json!({"Filters": [{"Name": name, "Values": ["Core"]}]}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        assert_eq!(
+            message(&case, &response),
+            format!("{name} is not a supported filter."),
+            "case {case:?}: unexpected refusal sentence in {response}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_refuses_a_page_token_it_did_not_issue() {
+    let router = emulator();
+    for n in 0..3 {
+        create_ok(
+            &router,
+            "page tokens",
+            &json!({"Name": format!("token-{n}"), "LicenseCountingType": "Core"}),
+        )
+        .await;
+    }
+    // A token this walk DID issue, to be presented against another scope below.
+    let (status, response) = call(
+        &router,
+        "ListLicenseConfigurations",
+        &json!({"MaxResults": 1}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected the first page to succeed, got {status} {response}"
+    );
+    let issued = response["NextToken"]
+        .as_str()
+        .expect("the first of three pages hands out a token")
+        .to_string();
+
+    // The rule generalises over what the token is: text this service never issued,
+    // a truncated one, and one issued for a DIFFERENT scope.
+    let rows: Vec<(&str, Value)> = vec![
+        ("text that is not a token", json!({"NextToken": "not-a-token"})),
+        ("an empty token", json!({"NextToken": ""})),
+        (
+            "a truncated token",
+            json!({"NextToken": issued[..issued.len() / 2].to_string()}),
+        ),
+        (
+            "a token issued for another scope",
+            json!({
+                "NextToken": issued.clone(),
+                "Filters": [{"Name": "licenseCountingType", "Values": ["Core"]}]
+            }),
+        ),
+    ];
+    for (case, body) in rows {
+        let (status, response) = call(&router, "ListLicenseConfigurations", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "InvalidParameterValueException",
+            "case {case:?}: expected InvalidParameterValueException, got {response}"
+        );
+        assert_eq!(
+            message(case, &response),
+            "Invalid value for nextToken parameter.",
+            "case {case:?}: unexpected refusal sentence in {response}"
+        );
+    }
+
+    // The token this walk issued still resumes the walk it was issued for.
+    let (status, response) = call(
+        &router,
+        "ListLicenseConfigurations",
+        &json!({"MaxResults": 1, "NextToken": issued}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected the issued token to resume the walk, got {status} {response}"
     );
 }

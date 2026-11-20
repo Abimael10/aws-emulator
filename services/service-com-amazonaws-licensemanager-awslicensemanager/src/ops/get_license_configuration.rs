@@ -178,9 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetLicenseConfigurationErrorModeled::InvalidParameterValueException(
                     InvalidParameterValueException {
-                        message: Some(format!(
-                            "no license configuration exists with the ARN '{}'",
-                            input.license_configuration_arn
+                        message: Some(crate::state::invalid_configuration_arn_message(
+                            &input.license_configuration_arn,
                         )),
                     },
                 )

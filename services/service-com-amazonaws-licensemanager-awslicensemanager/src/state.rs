@@ -1136,7 +1136,7 @@ impl ComAmazonawsLicensemanagerAwslicensemanagerState {
             return Err(why);
         }
         if !self.is_taggable(arn) {
-            return Err(format!("no resource exists with the ARN '{arn}'"));
+            return Err(invalid_resource_arn_message(arn));
         }
         let after = self.tag_count_after_merge(arn, tags);
         if after > MAX_TAGS {
@@ -1315,7 +1315,7 @@ fn entitlement_rejection(entitlement: &Entitlement) -> Option<String> {
         })
         // `MaxCount` is the "maximum entitlement count", so it has no meaning below
         // zero; the model gives it the unconstrained `Long`.
-        .or_else(|| negative_rejection("an Entitlements entry's MaxCount", entitlement.max_count))
+        .or_else(|| negative_rejection("maxCount", entitlement.max_count))
 }
 
 /// Why a `ConsumptionConfiguration` is unacceptable, or `None` when it fits.
@@ -1338,7 +1338,7 @@ fn consumption_configuration_rejection(
                 .as_ref()
                 .and_then(|provisional| {
                     minutes_rejection(
-                        "ConsumptionConfiguration.ProvisionalConfiguration.MaxTimeToLiveInMinutes",
+                        "maxTimeToLiveInMinutes",
                         provisional.max_time_to_live_in_minutes,
                     )
                 })
@@ -1349,7 +1349,7 @@ fn consumption_configuration_rejection(
                 .as_ref()
                 .and_then(|borrow| {
                     minutes_rejection(
-                        "ConsumptionConfiguration.BorrowConfiguration.MaxTimeToLiveInMinutes",
+                        "maxTimeToLiveInMinutes",
                         borrow.max_time_to_live_in_minutes,
                     )
                 })
@@ -1359,7 +1359,7 @@ fn consumption_configuration_rejection(
 /// Why a time-to-live in minutes is unacceptable, or `None` when it is not
 /// negative: a maximum time to live is a duration, so it has no meaning below zero.
 fn minutes_rejection(member: &str, minutes: i32) -> Option<String> {
-    (minutes < 0).then(|| format!("{member} must not be negative, got {minutes}"))
+    (minutes < 0).then(|| negative_value_message(member))
 }
 
 /// Why a `Validity` range is unacceptable, or `None` when it fits the store.
@@ -1414,8 +1414,283 @@ fn list_rejection(member: &str, len: usize, cap: usize) -> Option<String> {
 /// and `LicenseExpiry` is an instant, so neither has a meaning below zero. The model
 /// gives both the unconstrained `BoxLong`, so this is where the rule lives.
 fn negative_rejection(member: &str, value: Option<i64>) -> Option<String> {
-    value.filter(|value| *value < 0).map(|value| {
-        format!("{member} must not be negative, got {value}")
+    value
+        .filter(|value| *value < 0)
+        .map(|_| negative_value_message(member))
+}
+
+/// How this service states that a member whose value cannot be below zero carried
+/// one: fixed text around the member's own wire name, quoted.
+///
+/// The sentence is the same whichever member it is about, and it echoes NO value:
+/// the refusal names the field and the rule, and the submitted number is the
+/// caller's own input, which this error class does not carry back.
+fn negative_value_message(member: &str) -> String {
+    format!("Field '{member}' cannot be lesser than 0.")
+}
+
+/// How this service states a value a parameter cannot carry: fixed text around the
+/// value the request sent and the member's own wire name.
+///
+/// Shared by the pre-handler refusal of a value a modelled constraint refuses
+/// ([`crate::service::modelled_refusal`]) and by the handlers' own catalog guards,
+/// so one unacceptable value is stated the same way wherever it is caught.
+pub fn invalid_parameter_value_message(member: &str, value: &str) -> String {
+    format!("Invalid parameter value {value} for {member}")
+}
+
+/// How this service refuses a filter name it does not scope on: fixed text after
+/// the name the request asked for.
+///
+/// Shared by every list operation that takes `Filters`, so one unsupported filter is
+/// refused the same way whichever of them was called.
+pub fn unsupported_filter_message(name: &str) -> String {
+    format!("{name} is not a supported filter.")
+}
+
+/// How this service refuses a parameter whose value it will not accept and will not
+/// echo: fixed text around the member's own wire name.
+///
+/// What it is for: a value that is neither absent nor outside a published range, but
+/// one this service alone can judge — a pagination token it did not issue, say.
+/// Echoing it back would state nothing a caller can act on.
+pub fn invalid_parameter_message(member: &str) -> String {
+    format!("Invalid value for {member} parameter.")
+}
+
+/// How this service refuses a license count that is enforced but not positive.
+///
+/// Fully fixed text: the refusal states the rule and names neither the member nor
+/// the value.
+pub const ENFORCED_LICENSE_COUNT_MESSAGE: &str =
+    "License count should be non-null and greater than zero, if license count has \
+     been enforced.";
+
+/// The restriction names each counting dimension admits in `LicenseRules`.
+///
+/// The catalog is the `LicenseRules` member's own documentation, which lists the
+/// rules "available by dimension"
+/// (`smithy_query(query="doc",shape="CreateLicenseConfigurationRequest",member="LicenseRules")`):
+/// one row per modelled `LicenseCountingType` value, naming the restrictions that
+/// dimension counts by. A restriction outside its dimension's row is not a rule this
+/// dimension has, so the configuration could never be enforced by it.
+const LICENSE_RULES_BY_DIMENSION: &[(&str, &[&str])] = &[
+    (
+        "Core",
+        &[
+            "allowedTenancy",
+            "licenseAffinityToHost",
+            "maximumCores",
+            "minimumCores",
+        ],
+    ),
+    (
+        "Instance",
+        &["allowedTenancy", "maximumVcpus", "minimumVcpus"],
+    ),
+    (
+        "Socket",
+        &[
+            "allowedTenancy",
+            "licenseAffinityToHost",
+            "maximumSockets",
+            "minimumSockets",
+        ],
+    ),
+    (
+        "vCPU",
+        &[
+            "allowedTenancy",
+            "honorVcpuOptimization",
+            "maximumVcpus",
+            "minimumVcpus",
+        ],
+    ),
+];
+
+/// The restriction name one `LicenseRules` entry names.
+///
+/// The documented syntax is `#name=value`, so the name is what stands between the
+/// leading `#` and the `=`; an entry that spells neither is taken whole, so it is
+/// reported as the restriction the caller asked for rather than silently accepted.
+fn restriction_name(rule: &str) -> &str {
+    let named = rule.strip_prefix('#').unwrap_or(rule);
+    named.split_once('=').map_or(named, |(name, _)| name)
+}
+
+/// Why `rules` are unacceptable for a configuration counting by `counting_type`, or
+/// `None` when every one of them is a restriction that dimension admits.
+///
+/// The refusal names the restriction the request asked for and the dimension that
+/// does not admit it, and nothing else.
+fn license_rules_rejection(counting_type: &str, rules: &[String]) -> Option<String> {
+    let admitted = LICENSE_RULES_BY_DIMENSION
+        .iter()
+        .find(|(dimension, _)| *dimension == counting_type)
+        .map(|(_, admitted)| *admitted)?;
+    rules.iter().find_map(|rule| {
+        let restriction = restriction_name(rule);
+        (!admitted.contains(&restriction)).then(|| {
+            format!("Restriction {restriction} not allowed for license type {counting_type}.")
+        })
+    })
+}
+
+/// The resource type a `ProductInformation` entry describes that only ONE counting
+/// dimension can be licensed by, and that dimension.
+///
+/// A relational database is licensed per virtual CPU, so product information about
+/// one belongs to a configuration counting that way and to no other.
+const RDS_RESOURCE_TYPE: &str = "RDS";
+
+/// See [`RDS_RESOURCE_TYPE`]. One of the modelled `LicenseCountingType` values
+/// (`smithy_query(query="shape",shape="LicenseCountingType")`).
+const VCPU_COUNTING_TYPE: &str = "vCPU";
+
+/// How this service refuses product information about a resource type the
+/// configuration's own counting dimension cannot be licensed by.
+///
+/// Fully fixed text, as the service words it.
+pub const RDS_PRODUCT_INFORMATION_MESSAGE: &str =
+    "RDS product information is only supported vCPU license type.";
+
+/// Why `product_information_list` is unacceptable for a configuration counting by
+/// `counting_type`, or `None` when every entry describes a resource type that
+/// dimension can be licensed by.
+fn product_information_dimension_rejection(
+    counting_type: &str,
+    product_information_list: &[ProductInformation],
+) -> Option<String> {
+    (counting_type != VCPU_COUNTING_TYPE
+        && product_information_list
+            .iter()
+            .any(|entry| entry.resource_type == RDS_RESOURCE_TYPE))
+    .then(|| RDS_PRODUCT_INFORMATION_MESSAGE.to_string())
+}
+
+/// Why what the request asks a configuration to carry does not fit the dimension it
+/// counts by, or `None` when all of it does.
+///
+/// The dimension decides two things about the rest of the configuration — which
+/// restrictions it can be enforced by, and which resource types it can carry product
+/// information about — so both live here, applied to the dimension the configuration
+/// HAS: the one the create names, and the stored one on an update, which cannot
+/// change it.
+pub fn configuration_dimension_rejection(
+    counting_type: &str,
+    license_rules: Option<&[String]>,
+    product_information_list: Option<&[ProductInformation]>,
+) -> Option<String> {
+    license_rules_rejection(counting_type, license_rules.unwrap_or_default()).or_else(|| {
+        product_information_dimension_rejection(
+            counting_type,
+            product_information_list.unwrap_or_default(),
+        )
+    })
+}
+
+/// Why a configuration's license-count enforcement is unacceptable, or `None` when
+/// the two members agree.
+///
+/// `LicenseCountHardLimit` selects hard enforcement, and there is nothing to enforce
+/// without a positive `LicenseCount`: a configuration that enforces a limit it does
+/// not have could never block a launch, so the combination is refused rather than
+/// stored. The model makes `LicenseCount` optional and correlates the two members
+/// nowhere, so the rule is service-side and lives here, applied to the values the
+/// configuration would END UP with — the request's own on a create, and the
+/// request's merged over the stored record's on an update, which is what the record
+/// would carry once the update landed.
+pub fn enforced_license_count_rejection(
+    license_count_hard_limit: Option<bool>,
+    license_count: Option<i64>,
+) -> Option<String> {
+    (license_count_hard_limit.unwrap_or(false)
+        && license_count.is_none_or(|count| count <= 0))
+    .then(|| ENFORCED_LICENSE_COUNT_MESSAGE.to_string())
+}
+
+/// How this service refuses a license-configuration ARN it resolves to no stored
+/// configuration: fixed text plus the ARN exactly as the request supplied it.
+///
+/// Shared by every operation that reaches a configuration through its ARN, so one
+/// unresolvable ARN is refused the same way whichever of them was called.
+pub fn invalid_configuration_arn_message(arn: &str) -> String {
+    format!("Invalid license configuration ARN {arn}.")
+}
+
+/// How this service refuses a resource ARN it resolves to no stored resource:
+/// fixed text plus the ARN exactly as the request supplied it.
+///
+/// The tagging operations are modelled against a generic `ResourceArn` rather than
+/// against one resource kind, so their refusal names the resource generically too.
+pub fn invalid_resource_arn_message(arn: &str) -> String {
+    format!("Invalid resource ARN {arn}.")
+}
+
+/// How `UpdateLicenseConfiguration` refuses a configuration it cannot resolve for
+/// this owner and status.
+///
+/// Fully fixed text that deliberately names NO ARN: the update path answers
+/// ownership and status together, and says nothing about which configurations the
+/// caller's account holds.
+pub const CONFIGURATION_OWNERSHIP_MESSAGE: &str =
+    "Please check license configurations for ownership and status.";
+
+/// The smallest and largest page a list operation of this service will build, and
+/// the page size applied when the request omits `MaxResults`.
+///
+/// Several `MaxResults` members of this model carry no `@range`, so the accepted
+/// range is a service-side rule and lives here, as one bound for every list
+/// operation rather than one per handler. The numbers are the model's own: the
+/// `MaxSize100` shape the paged operations that DO declare a range target bounds a
+/// page at 1 to 100
+/// (`smithy_query(query="operation",operation="ListLicenseVersions")`).
+pub const MIN_PAGE_SIZE: i32 = 1;
+
+/// See [`MIN_PAGE_SIZE`].
+pub const MAX_PAGE_SIZE: i32 = 100;
+
+/// The page size `max_results` asks for, or why it is outside the range this service
+/// accepts.
+///
+/// The refusal states the range and the member it is about, and echoes no value.
+/// `member` is the member's wire name, so an operation that pages on a differently
+/// named member states that name.
+pub fn requested_page_size(member: &str, max_results: Option<i32>) -> Result<usize, String> {
+    let Some(requested) = max_results else {
+        return Ok(MAX_PAGE_SIZE as usize);
+    };
+    if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&requested) {
+        return Err(format!(
+            "Invalid parameter value. Valid range is from {MIN_PAGE_SIZE} to \
+             {MAX_PAGE_SIZE} for {member}"
+        ));
+    }
+    Ok(requested as usize)
+}
+
+/// The fewest and most entries a caller-supplied selection list — a list of ARNs or
+/// ids a request scopes a read to — may carry.
+///
+/// No such member of this model carries a `@length`, so the bound is service-side
+/// and lives here; a request that carries the member at all has to carry a usable
+/// selection, so the range starts at one.
+pub const MIN_SELECTION_ENTRIES: usize = 1;
+
+/// See [`MIN_SELECTION_ENTRIES`].
+pub const MAX_SELECTION_ENTRIES: usize = 100;
+
+/// Why a caller-supplied selection list of `len` entries is unacceptable, or `None`
+/// when its size is inside the accepted range.
+///
+/// `member` is the member's wire name, which the refusal states along with the
+/// range; no entry of the list is echoed.
+pub fn selection_list_size_rejection(member: &str, len: usize) -> Option<String> {
+    (!(MIN_SELECTION_ENTRIES..=MAX_SELECTION_ENTRIES).contains(&len)).then(|| {
+        format!(
+            "Invalid list size for parameter {member}. Valid range is range \
+             {MIN_SELECTION_ENTRIES} to {MAX_SELECTION_ENTRIES}."
+        )
     })
 }
 
@@ -1435,8 +1710,8 @@ pub fn configuration_input_rejection(
 ) -> Option<String> {
     text_rejection("Name", name)
         .or_else(|| text_rejection("Description", description))
-        .or_else(|| negative_rejection("LicenseCount", license_count))
-        .or_else(|| negative_rejection("LicenseExpiry", license_expiry))
+        .or_else(|| negative_rejection("licenseCount", license_count))
+        .or_else(|| negative_rejection("licenseExpiry", license_expiry))
         .or_else(|| {
             list_rejection(
                 "LicenseRules",
@@ -1466,12 +1741,135 @@ pub fn configuration_input_rejection(
         .or_else(|| tags.and_then(tag_list_rejection))
 }
 
+/// The resource types a `ProductInformation` entry can describe.
+///
+/// The catalog is the `ResourceType` member's own documentation, which states "The
+/// possible values are SSM_MANAGED | RDS"
+/// (`smithy_query(query="doc",shape="ProductInformation",member="ResourceType")`).
+/// The member targets a plain string rather than a modelled enum, so the catalog is
+/// enforced here.
+const PRODUCT_RESOURCE_TYPES: &[&str] = &["SSM_MANAGED", "RDS"];
+
+/// How this service refuses a `ProductInformation` entry describing a resource type
+/// it does not know.
+///
+/// Fully fixed text: the refusal names neither the value nor the entry it came from.
+pub const INVALID_PRODUCT_RESOURCE_TYPE_MESSAGE: &str =
+    "Invalid or non-existent resource type in Product Information.";
+
+/// One product-information resource type: the filters it supports, each with the
+/// logical operators it is applied with.
+///
+/// The catalogs are the `ProductInformationFilterList` member's own documentation,
+/// which lists "the following filters and logical operators" supported "when the
+/// resource type is SSM_MANAGED" and "when the resource type is RDS", one row per
+/// filter
+/// (`smithy_query(query="doc",shape="ProductInformation",member="ProductInformationFilterList")`).
+/// A filter the entry's resource type does not support cannot be applied to it, and
+/// neither can an operator that filter is not applied with, so a configuration could
+/// never discover anything by either.
+struct ProductInformationSurface {
+    /// The `ResourceType` value this row is about.
+    resource_type: &'static str,
+    /// The supported filters, in the order the model lists them, each with its
+    /// logical operators.
+    filters: &'static [(&'static str, &'static [&'static str])],
+}
+
+/// One row per resource type a `ProductInformation` entry can describe. See
+/// [`ProductInformationSurface`].
+const PRODUCT_INFORMATION_SURFACES: &[ProductInformationSurface] = &[
+    ProductInformationSurface {
+        resource_type: "SSM_MANAGED",
+        filters: &[
+            ("Application Name", &[EQUALS]),
+            ("Application Publisher", &[EQUALS]),
+            ("Application Version", &[EQUALS]),
+            ("Platform Name", &[EQUALS]),
+            ("Platform Type", &[EQUALS]),
+            (TAG_KEY_FILTER, &[NOT_EQUALS]),
+            ("AccountId", &[NOT_EQUALS]),
+            ("License Included", &[EQUALS, NOT_EQUALS]),
+        ],
+    },
+    ProductInformationSurface {
+        resource_type: RDS_RESOURCE_TYPE,
+        filters: &[("Engine Edition", &[EQUALS]), ("License Pack", &[EQUALS])],
+    },
+];
+
+/// The surface a refusal of a filter's logical operator names.
+///
+/// It is fixed text of that refusal rather than the entry's own resource type: the
+/// service states this one surface whichever resource type the product information
+/// describes, and the filter-name refusal above is the one that names the resource
+/// type.
+const FILTER_COMPARATOR_SURFACE: &str = "SSM Managed Instance";
+
+/// The two logical operators the documented filters are applied with.
+const EQUALS: &str = "EQUALS";
+
+/// See [`EQUALS`].
+const NOT_EQUALS: &str = "NOT_EQUALS";
+
+/// The one supported filter name the caller completes rather than spells exactly:
+/// "the key for your tag must be appended to `Tag:`", so the name a request carries
+/// is `Tag:` followed by that key.
+const TAG_KEY_FILTER: &str = "Tag:key";
+
+/// The part of [`TAG_KEY_FILTER`] a request's own filter name begins with.
+const TAG_KEY_PREFIX: &str = "Tag:";
+
+/// Why one product-information filter is unacceptable for an entry of
+/// `resource_type`, or `None` when that resource type supports the filter's name and
+/// is filtered with the comparator the request asked for.
+///
+/// Each refusal states what the request asked for and what the surface does support,
+/// so a caller is told what to send instead: the supported filter NAMES for a name
+/// the surface has no filter under, and the operators THAT filter is applied with
+/// for one it does.
+fn product_information_filter_rejection(
+    resource_type: &str,
+    name: &str,
+    comparator: &str,
+) -> Option<String> {
+    let surface = PRODUCT_INFORMATION_SURFACES
+        .iter()
+        .find(|row| row.resource_type == resource_type)?;
+    let supported = surface.filters.iter().find(|(filter, _)| {
+        *filter == name || (*filter == TAG_KEY_FILTER && name.starts_with(TAG_KEY_PREFIX))
+    });
+    let Some((_, comparators)) = supported else {
+        let names: Vec<&str> = surface.filters.iter().map(|(filter, _)| *filter).collect();
+        return Some(format!(
+            "Unsupported filter name - {name} - provided in product information for \
+             {resource_type}. Supported values are [{}].",
+            names.join(", ")
+        ));
+    };
+    (!comparators.contains(&comparator)).then(|| {
+        let quoted: Vec<String> = comparators
+            .iter()
+            .map(|comparator| format!("\"{comparator}\""))
+            .collect();
+        format!(
+            "Unsupported filter comparator {comparator} provided for \
+             {FILTER_COMPARATOR_SURFACE}. Supported comparators are [{}].",
+            quoted.join(", ")
+        )
+    })
+}
+
 /// Why one `ProductInformation` entry is unacceptable, or `None` when it fits.
 fn product_information_rejection(product_information: &ProductInformation) -> Option<String> {
     text_rejection(
         "a ProductInformationList entry's ResourceType",
         Some(&product_information.resource_type),
     )
+    .or_else(|| {
+        (!PRODUCT_RESOURCE_TYPES.contains(&product_information.resource_type.as_str()))
+            .then(|| INVALID_PRODUCT_RESOURCE_TYPE_MESSAGE.to_string())
+    })
     .or_else(|| {
         list_rejection(
             "a ProductInformationList entry's ProductInformationFilterList",
@@ -1492,6 +1890,13 @@ fn product_information_rejection(product_information: &ProductInformation) -> Op
                     text_rejection(
                         "a ProductInformationFilter's ProductInformationFilterComparator",
                         Some(&filter.product_information_filter_comparator),
+                    )
+                })
+                .or_else(|| {
+                    product_information_filter_rejection(
+                        &product_information.resource_type,
+                        &filter.product_information_filter_name,
+                        &filter.product_information_filter_comparator,
                     )
                 })
                 .or_else(|| {
@@ -1558,6 +1963,22 @@ pub fn configuration_arn(region: &str, id: &str) -> String {
         region,
         &format!("{CONFIGURATION_ARN_RESOURCE_PREFIX}{id}"),
     )
+}
+
+/// Whether `arn` is spelled like a license-configuration ARN this service mints:
+/// one whose resource part is [`CONFIGURATION_ARN_RESOURCE_PREFIX`] followed by a
+/// [`CONFIGURATION_ID_PREFIX`] id of [`CONFIGURATION_ID_HEX_LEN`] hex characters.
+///
+/// It says nothing about whether the store HOLDS one — that is
+/// [`ComAmazonawsLicensemanagerAwslicensemanagerState::configuration`]'s answer.
+/// What it is for: text this service hands a caller and reads back, where only a
+/// complete ARN can have come from here.
+pub fn is_configuration_arn(arn: &str) -> bool {
+    let resource = format!("{CONFIGURATION_ARN_RESOURCE_PREFIX}{CONFIGURATION_ID_PREFIX}");
+    arn.starts_with("arn:")
+        && arn.split_once(&resource).is_some_and(|(_, id)| {
+            id.len() == CONFIGURATION_ID_HEX_LEN && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 /// The ARN of the license `id` in `region`, which for a license is its home Region:

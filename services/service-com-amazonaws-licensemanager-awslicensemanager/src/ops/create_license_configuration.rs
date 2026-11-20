@@ -169,19 +169,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `Name` and `LicenseCountingType` are `@required` and the latter targets a
-        // modelled enum, so the centralized walk has already refused a request that
-        // omits either or names a dimension outside the catalog. The catalog check
+        // modelled enum, so a request that omits either or names a dimension outside
+        // the catalog is already refused before this runs — in this operation's own
+        // modelled error (`crate::service::modelled_refusal`). The catalog check
         // below is this handler's own guard, so nothing outside it can reach the
         // store whatever the walk does; the model publishes no length for any string
         // or list on this input, so those bounds live here too.
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
         if !LICENSE_COUNTING_TYPE_VALUES.contains(&input.license_counting_type.as_str()) {
-            return Err(invalid_parameter(format!(
-                "LicenseCountingType must be one of [{}], got '{}'",
-                LICENSE_COUNTING_TYPE_VALUES.join(", "),
-                input.license_counting_type
-            )));
+            return Err(invalid_parameter(
+                crate::state::invalid_parameter_value_message(
+                    "licenseCountingType",
+                    &input.license_counting_type,
+                ),
+            ));
         }
 
         if let Some(why) = crate::state::configuration_input_rejection(
@@ -192,6 +194,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.license_rules.as_deref(),
             input.product_information_list.as_deref(),
             input.tags.as_deref(),
+        ) {
+            return Err(invalid_parameter(why));
+        }
+
+        // Each `LicenseRules` entry has to be a restriction the dimension this
+        // configuration counts by actually admits, and so does every resource type
+        // it carries product information about.
+        if let Some(why) = crate::state::configuration_dimension_rejection(
+            &input.license_counting_type,
+            input.license_rules.as_deref(),
+            input.product_information_list.as_deref(),
+        ) {
+            return Err(invalid_parameter(why));
+        }
+
+        // Hard enforcement needs a positive count to enforce, so the two members
+        // are correlated before anything is stored: the configuration this create
+        // would mint is the one the rule is applied to.
+        if let Some(why) = crate::state::enforced_license_count_rejection(
+            input.license_count_hard_limit,
+            input.license_count,
         ) {
             return Err(invalid_parameter(why));
         }

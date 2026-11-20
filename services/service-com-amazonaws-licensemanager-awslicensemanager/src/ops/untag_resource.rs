@@ -162,10 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Any resource this service stores can be tagged, so any of them can be
         // untagged: the operation is modelled against a generic `ResourceArn`.
         if !store.is_taggable(&input.resource_arn) {
-            return Err(invalid_parameter(format!(
-                "no resource exists with the ARN '{}'",
-                input.resource_arn
-            )));
+            return Err(invalid_parameter(
+                crate::state::invalid_resource_arn_message(&input.resource_arn),
+            ));
         }
 
         store.remove_tag_keys(&input.resource_arn, &input.tag_keys);

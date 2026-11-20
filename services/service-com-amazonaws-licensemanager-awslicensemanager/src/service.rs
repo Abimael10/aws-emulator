@@ -21,8 +21,13 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. THIS SERVICE USES IT: the operations whose model declares no
+//!   `ValidationException` are served behind the wrapper in [`modelled_refusal`],
+//!   so a request one of them is refused before its handler runs — a `@required`
+//!   member absent, a value a modelled constraint refuses — is answered in the
+//!   modelled `InvalidParameterValueException` that operation declares, with the
+//!   `Message` the model carries that refusal in. Every other request is handed to
+//!   the generated operation unchanged.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -45,6 +50,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod modelled_refusal;
+
 /// The `com-amazonaws-licensemanager-awslicensemanager` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -52,6 +59,11 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// One wrapper per operation that models no `ValidationException`, keyed by the
+    /// name the model names that operation by. See
+    /// [`modelled_refusal::modelled_refusal_table`]; an operation absent from the
+    /// table is served straight from the generated routing table.
+    refusals: ::std::collections::HashMap<&'static str, Box<dyn ErasedOperation>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +73,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            refusals: modelled_refusal::modelled_refusal_table::<Eng>(),
         }
     }
 }
@@ -87,12 +100,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve the operations that model no `ValidationException` through the
+        // wrapper in [`modelled_refusal`], so a request one of them is refused
+        // before its handler runs is refused under a code that operation declares,
+        // stating which parameter was refused. The wrapper hands every request it
+        // does not refuse to the generated operation in the routing table, which
+        // remains the only thing that serves one.
+        //
+        // Keyed by the protocol's own routing key, so a request the model names no
+        // operation for resolves to nothing here and keeps the framework's routing
+        // failure.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        self.refusals.get(key).map(|wrapper| &**wrapper)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

@@ -144,28 +144,19 @@ const FILTER_NAMES: &[&str] = &[
 /// modelled `FilterLimitExceededException` rather than walked.
 const MAX_FILTERS: usize = 8;
 
-/// The largest page this operation will build, and the page size applied when the
-/// request omits `MaxResults`.
-///
-/// `MaxResults` carries no modelled range, so the accepted range lives here: a
-/// request asking for a page outside `1..=MAX_PAGE_SIZE` is refused rather than
-/// quietly served a different size, and the page this handler allocates is therefore
-/// always one the server decided.
-const MAX_PAGE_SIZE: usize = 100;
-
-/// The page size the request asked for, refused when it is outside
-/// `1..=MAX_PAGE_SIZE`.
+/// The page size the request asked for, refused when it is outside the range this
+/// service pages in ([`crate::state::requested_page_size`], the one bound every list
+/// operation of this service shares).
 fn page_size(max_results: Option<i32>) -> Result<usize, ListLicenseConfigurationsError> {
-    let Some(requested) = max_results else {
-        return Ok(MAX_PAGE_SIZE);
-    };
-    if requested < 1 || requested as usize > MAX_PAGE_SIZE {
-        return Err(invalid_parameter(format!(
-            "MaxResults must be between 1 and {MAX_PAGE_SIZE}, got {requested}"
-        )));
-    }
-    Ok(requested as usize)
+    crate::state::requested_page_size(MAX_RESULTS_MEMBER, max_results).map_err(invalid_parameter)
 }
+
+/// The wire name of the member that asks for a page size, as the refusal states it.
+const MAX_RESULTS_MEMBER: &str = "MaxResults";
+
+/// The wire name of the member that scopes the walk to named ARNs, as the refusal
+/// states it.
+const LICENSE_CONFIGURATION_ARNS_MEMBER: &str = "LicenseConfigurationArns";
 
 /// A page token naming the ARN the NEXT page starts at, bound to the scope the page
 /// was issued under.
@@ -181,6 +172,9 @@ fn encode_page_token(fingerprint: u64, arn: &str) -> String {
     hex::encode(format!("{fingerprint:016x}:{arn}"))
 }
 
+/// The wire name of the member a page token travels in, as the refusal states it.
+const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
 /// The ARN a page token names, or a modelled 400 when the token is not one this
 /// operation issued for this scope.
 fn decode_page_token(
@@ -192,14 +186,16 @@ fn decode_page_token(
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|decoded| {
             let (issued_for, arn) = decoded.split_once(':')?;
-            (issued_for == format!("{fingerprint:016x}") && arn.starts_with("arn:"))
-                .then(|| arn.to_string())
+            // Both halves have to be ones this operation wrote: the scope it issued
+            // the token under, and a WHOLE configuration ARN. A token cut short
+            // would otherwise name an ARN prefix and resume the walk somewhere no
+            // page ever ended.
+            (issued_for == format!("{fingerprint:016x}")
+                && crate::state::is_configuration_arn(arn))
+            .then(|| arn.to_string())
         })
         .ok_or_else(|| {
-            invalid_parameter(
-                "NextToken is not a pagination token ListLicenseConfigurations issued for this \
-                 combination of LicenseConfigurationArns and Filters",
-            )
+            invalid_parameter(crate::state::invalid_parameter_message(NEXT_TOKEN_MEMBER))
         })
 }
 
@@ -270,9 +266,8 @@ fn scoped_filters(
         .map(|filter| {
             let name = filter.name.unwrap_or_default();
             if !FILTER_NAMES.contains(&name.as_str()) {
-                return Err(invalid_parameter(format!(
-                    "Filters Name must be one of [{}], got '{name}'",
-                    FILTER_NAMES.join(", ")
+                return Err(invalid_parameter(crate::state::unsupported_filter_message(
+                    &name,
                 )));
             }
             // "You can only specify one value for the filter" — the `Values`
@@ -395,11 +390,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let filters = scoped_filters(input.filters)?;
-        // `LicenseConfigurationArns` scopes the result to the ARNs named; an empty
-        // or absent list scopes nothing.
+        // `LicenseConfigurationArns` scopes the result to the ARNs named. The model
+        // bounds the list at no length, so the size this service accepts is checked
+        // here: a request that carries the member has to carry a usable selection,
+        // and one outside the range is refused rather than served a page.
+        if let Some(arns) = input.license_configuration_arns.as_deref() {
+            if let Some(why) = crate::state::selection_list_size_rejection(
+                LICENSE_CONFIGURATION_ARNS_MEMBER,
+                arns.len(),
+            ) {
+                return Err(invalid_parameter(why));
+            }
+        }
         let requested: Option<BTreeSet<String>> = input
             .license_configuration_arns
-            .filter(|arns| !arns.is_empty())
             .map(|arns| arns.into_iter().collect());
         let fingerprint = scope_fingerprint(requested.as_ref(), &filters);
 
