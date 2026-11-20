@@ -2099,6 +2099,14 @@ pub struct ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// [`alarm_evaluation::MAX_PENDING_NOTIFICATIONS`]; drained by
     /// [`alarm_actions::settle_alarms`], which is what delivers them.
     pub pending_notifications: VecDeque<alarm_actions::AlarmNotification>,
+    /// The scaling-policy invocations the alarm actions this store has executed owe but the
+    /// service owning each policy has not taken yet, oldest first. Bounded by
+    /// [`alarm_actions::scaling_policy_actions::MAX_PENDING_SCALING_POLICY_INVOCATIONS`];
+    /// drained by
+    /// [`alarm_actions::scaling_policy_actions::take_invocations`], which is how the scaling
+    /// service that owns a policy receives the transition that fired it.
+    pub pending_scaling_policy_invocations:
+        VecDeque<alarm_actions::scaling_policy_actions::ScalingPolicyInvocation>,
     /// The configuration changes the alarm writes this store has made owe but nothing has
     /// published yet, oldest first. Bounded by
     /// [`alarm_configuration_events::MAX_PENDING_CONFIGURATION_CHANGES`]; drained by

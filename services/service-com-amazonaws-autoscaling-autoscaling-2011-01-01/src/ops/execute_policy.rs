@@ -251,7 +251,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut state = store.lock();
         state.materialize_due(&*self.engine, now);
-        let outcome = state.execute_scaling_policy(&*self.engine, &key, request, now);
+        let outcome = state.execute_scaling_policy(
+            &*self.engine,
+            &key,
+            request,
+            execution::PolicyTrigger::UserRequest,
+            now,
+        );
         if let Err(refusal) = outcome {
             let message = refusal.message(&policy_name, &group_name);
             crate::state::audit(ctx.parts(), Self::NAME, &group_name, "refused");

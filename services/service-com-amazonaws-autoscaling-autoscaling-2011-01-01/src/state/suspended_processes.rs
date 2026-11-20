@@ -54,6 +54,16 @@ pub const PROCESS_LAUNCH: &str = "Launch";
 /// it.
 pub const PROCESS_TERMINATE: &str = "Terminate";
 
+/// The process that RECEIVES the CloudWatch alarm notifications the group's scaling policies
+/// are driven by, as the catalog names it.
+///
+/// What it does is take the alarm notification and perform the policy the alarm's action
+/// names, so while it is suspended an alarm-driven execution of a policy of this group is
+/// declined and the group's capacity is left where it is
+/// ([`super::alarm_driven_policies`]) — a policy performed by a request of its own is
+/// another process and is not affected.
+pub const PROCESS_ALARM_NOTIFICATION: &str = "AlarmNotification";
+
 /// The suspended processes of ONE group: the instant each process was suspended at, keyed
 /// by the process name.
 ///

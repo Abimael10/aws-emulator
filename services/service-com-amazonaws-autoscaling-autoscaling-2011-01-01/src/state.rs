@@ -279,6 +279,10 @@ pub mod refresh_preferences;
 /// own CloudWatch store: a refresh cannot START while one of them is sounding.
 pub mod refresh_alarms;
 
+/// The scaling policies a CloudWatch ALARM drives: the notifications this service receives
+/// from the alarms whose actions name its policies, and what receiving one performs.
+pub mod alarm_driven_policies;
+
 /// The instances a group holds that the account's Amazon EC2 store no longer runs: the
 /// health check that takes them out of the group and the convergence that replaces them.
 pub mod ec2_health;
@@ -1926,6 +1930,13 @@ impl AutoScalingState {
             // it was applied straight away or waited for this instant.
             self.override_cooldown(&change.group_name, change.cooldown_override, change.due);
         }
+        // The alarm notifications this store's scaling policies have been handed since the
+        // last pass: an alarm that moved owed the policy its action names, so the policy is
+        // performed here ([`alarm_driven_policies`]). After the deferred changes above, so the
+        // cooldown a change the clock already owed left behind is in force when an
+        // alarm-driven execution is weighed against it, and before the convergence passes
+        // below, so the instances such an execution asks for are part of this same pass.
+        self.receive_alarm_notifications(engine, now);
         // The members the groups have lost to Amazon EC2 itself, and the replacements the
         // groups are then short of: the health check that notices them is owed on the clock
         // like everything else in this pass ([`ec2_health`]). Before the refreshes below, so
@@ -2123,6 +2134,9 @@ impl AutoScalingState {
         let arn = group.arn.clone();
         let zoneless = group.availability_zones.is_empty();
         let cooldown = group.default_cooldown.max(0);
+        // The capacity the group holds as this change is applied, which is what says whether
+        // this change is a scaling activity at all ([`Self::cooldown_until`] below).
+        let held_capacity = group.desired_capacity;
         let headroom = group.launch_headroom();
         // A scale-out is the `Launch` process and a scale-in is the `Terminate` process, so
         // a group that has either suspended does not do that half of the change: the
@@ -2181,7 +2195,19 @@ impl AutoScalingState {
             .expect("the group was present a moment ago");
         group.desired_capacity = desired_capacity;
         group.pending_capacity = None;
-        group.cooldown_until = Some(now + Duration::from_secs(u64::from(cooldown.unsigned_abs())));
+        // A cooldown FOLLOWS a scaling activity — it is what "helps to ensure that your Auto
+        // Scaling group doesn't launch or terminate additional instances before the previous
+        // scaling activity takes effect" (`AutoScalingGroup$DefaultCooldown`'s own
+        // documentation of the period) — so a change that leaves the group's capacity exactly
+        // where it already was starts none: a group created at the capacity it asks for, a
+        // request that re-states the capacity the group holds, a convergence that had nothing
+        // to converge. Without this, a group that has never scaled would be inside a cooldown
+        // from the moment it was created, and the first policy performed on it would be
+        // blocked by an activity nothing made.
+        if held_capacity != desired_capacity {
+            group.cooldown_until =
+                Some(now + Duration::from_secs(u64::from(cooldown.unsigned_abs())));
+        }
 
         let terminated_ids = self.scale_in_selection(group_name, surplus_units, now);
         self.terminate_group_instances(engine, group_name, &terminated_ids, now, due);

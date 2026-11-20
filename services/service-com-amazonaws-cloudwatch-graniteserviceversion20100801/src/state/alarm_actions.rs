@@ -40,15 +40,16 @@
 //! was already due, and what is due NEXT is exactly what the client is no longer here to ask
 //! for.
 //!
-//! Four action kinds are executed from here, because each is an operation of another service
+//! Five action kinds are executed from here, because each is an operation of another service
 //! this emulator serves: an SNS topic ARN, which receives the notification, an EC2 INSTANCE
 //! action ([`ec2_instance_actions`]), which is the EC2 operation it names performed on the
 //! instance the alarm watches, a LAMBDA FUNCTION ([`lambda_actions`]), which is invoked with
-//! the transition, and a SYSTEMS MANAGER OPSITEM ([`ssm_ops_item_actions`]), for which
-//! OpsCenter opens a work item about the transition. Every other action kind an alarm may carry
-//! (an Auto Scaling policy) needs its own invocation path, which is not implemented in this
-//! emulator: such an action is logged and NOTHING is invented for it — no history item claiming
-//! it ran.
+//! the transition, a SYSTEMS MANAGER OPSITEM ([`ssm_ops_item_actions`]), for which
+//! OpsCenter opens a work item about the transition, and a SCALING POLICY
+//! ([`scaling_policy_actions`]), which is handed the transition for the scaling service that
+//! owns it to apply. Every other action kind an alarm may carry needs its own invocation path,
+//! which is not implemented in this emulator: such an action is logged and NOTHING is invented
+//! for it — no history item claiming it ran.
 //!
 //! A transition also publishes an EVENT that is no action of the alarm's at all: CloudWatch
 //! puts every change of an alarm's state onto the account's default event bus
@@ -83,6 +84,10 @@ pub mod state_change_events;
 /// The Systems Manager OpsItem actions an alarm action list may carry, and the work item
 /// executing one opens.
 pub mod ssm_ops_item_actions;
+
+/// The SCALING POLICY actions an alarm action list may carry, and the hand-over executing one
+/// makes to the scaling service that owns the policy.
+pub mod scaling_policy_actions;
 
 /// Whether the SNS topic an alarm action names takes the notification at all: the documents in
 /// force on that topic, and what they say about this service's publish.
@@ -611,13 +616,23 @@ async fn settle<Eng: Send + Sync + 'static>(
                 record_action(&state, &notification, action, failure.as_deref(), now);
                 continue;
             }
+            // A SCALING POLICY action is not a message to a target either: the transition is
+            // handed to the scaling service that owns the policy, which is what applies it
+            // ([`scaling_policy_actions`]). What that service then decides — to move the
+            // capacity, to hold the change back, to decline it — is no part of this action:
+            // the hand-over is what was executed, and it is recorded as executed.
+            if scaling_policy_actions::of_action_arn(action).is_some() {
+                scaling_policy_actions::execute(&state, &notification, action, now);
+                record_action(&state, &notification, action, None, now);
+                continue;
+            }
             let Some(region) = ::service_common::arn::region_of(action, SNS_ARN_NAMESPACE) else {
                 ::tracing::warn!(
                     alarm = %notification.alarm_name,
                     action = %action,
                     "this alarm action is neither an EC2 instance action, a Lambda function, \
-                     a Systems Manager OpsItem nor an SNS topic in a Region this emulator can \
-                     reach; no other action kind is executed here"
+                     a Systems Manager OpsItem, a scaling policy nor an SNS topic in a Region \
+                     this emulator can reach; no other action kind is executed here"
                 );
                 continue;
             };
@@ -1007,7 +1022,9 @@ fn action_history_item(
     // one. Neither does an EC2 instance action, which is an operation performed on an
     // instance rather than a message handed to a target: nothing was published for it. A
     // LAMBDA function was handed the transition itself rather than the notification envelope,
-    // so that is what the record reports for it.
+    // so that is what the record reports for it. Neither is a SCALING POLICY action a message
+    // handed to a target: it is a hand-over of the transition to the service that owns the
+    // policy, so nothing was published for it either.
     //
     // `AlarmHistoryItem$HistoryData` is `@length 1..4095` and the document is JSON, so it can
     // never be truncated to fit: the published message is the one part of it whose size the
@@ -1016,6 +1033,7 @@ fn action_history_item(
     // notification itself and is the largest thing this item holds.
     let published = if ec2_instance_actions::of_action_arn(action).is_some()
         || ssm_ops_item_actions::of_action_arn(action).is_some()
+        || scaling_policy_actions::of_action_arn(action).is_some()
     {
         None
     } else if lambda_actions::of_action_arn(action).is_some() {

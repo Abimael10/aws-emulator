@@ -118,6 +118,41 @@ impl MetricBreach {
     }
 }
 
+/// WHAT asked for a policy to be performed, which is what the scaling activity it records
+/// names as its cause.
+///
+/// One execution path ([`AutoScalingState::execute_scaling_policy`]) however the policy was
+/// asked for, so the two askers cannot apply an adjustment differently; what differs is only
+/// the cause the activity log carries, and a client reading that log can tell a policy a
+/// request performed from one an alarm drove.
+#[derive(Debug, Clone, Copy)]
+pub enum PolicyTrigger<'a> {
+    /// A request of this service's own API named the policy (`ExecutePolicy`).
+    UserRequest,
+    /// A CloudWatch alarm's action named the policy: the alarm, and the state it moved to
+    /// (which is what selected the action list the policy was in).
+    Alarm {
+        /// The alarm whose transition fired the policy.
+        alarm_name: &'a str,
+        /// The state that alarm moved to.
+        state_value: &'a str,
+    },
+}
+
+impl PolicyTrigger<'_> {
+    /// The cause the capacity change this trigger asks for records.
+    #[must_use]
+    pub fn cause(&self, policy_name: &str, from: i32, to: i32) -> String {
+        match self {
+            Self::UserRequest => policy_execution_cause(policy_name, from, to),
+            Self::Alarm {
+                alarm_name,
+                state_value,
+            } => alarm_execution_cause(alarm_name, state_value, policy_name, from, to),
+        }
+    }
+}
+
 /// What a request asks of the policy it names, beside the policy itself.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PolicyExecutionRequest {
@@ -368,6 +403,7 @@ impl AutoScalingState {
         engine: &Eng,
         key: &PolicyKey,
         request: PolicyExecutionRequest,
+        trigger: PolicyTrigger<'_>,
         now: SystemTime,
     ) -> Result<PolicyExecution, PolicyExecutionRefusal> {
         let Some(policy) = self.scaling_policies.get(key).cloned() else {
@@ -430,7 +466,7 @@ impl AutoScalingState {
         if request.honor_cooldown && policy_type == POLICY_TYPE_SIMPLE_SCALING && in_cooldown {
             return Err(PolicyExecutionRefusal::CooldownInProgress);
         }
-        let cause = policy_execution_cause(&key.policy_name, from, to);
+        let cause = trigger.cause(&key.policy_name, from, to);
 
         self.apply_capacity(engine, &key.auto_scaling_group_name, to, &cause, now);
         // The cooldown the change leaves behind is the POLICY's when it carries one, which
@@ -582,6 +618,31 @@ pub fn percentage_magnitude(
 pub fn policy_execution_cause(policy_name: &str, from: i32, to: i32) -> String {
     AutoScalingState::capacity_change_cause(
         &format!("a user request executed policy {policy_name}"),
+        from,
+        to,
+    )
+}
+
+/// The cause a capacity change an ALARM's action drove records: that a monitor alarm in a
+/// state triggered the policy, which alarm and which policy, and the capacities it moved
+/// between.
+///
+/// The same subject form as every other capacity change of this service
+/// ([`AutoScalingState::capacity_change_cause`]), naming the alarm and the state it was in
+/// instead of the request that asked — which is what tells a client reading the activity log
+/// that this change was driven by the alarm it configured.
+#[must_use]
+pub fn alarm_execution_cause(
+    alarm_name: &str,
+    state_value: &str,
+    policy_name: &str,
+    from: i32,
+    to: i32,
+) -> String {
+    AutoScalingState::capacity_change_cause(
+        &format!(
+            "a monitor alarm {alarm_name} in state {state_value} triggered policy {policy_name}"
+        ),
         from,
         to,
     )
