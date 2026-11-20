@@ -8,10 +8,12 @@
 //! name with the modelled `ResourceNotFound`. This is the ONLY file to touch for this
 //! operation.
 //!
-//! `InferenceRecommendations` and `EndpointPerformances` stay absent: nothing ran the
-//! benchmark, so there are no measured metrics to report (see
-//! `crate::state::NO_INFERENCE_BENCHMARK_REASON`), and the job's terminal status carries
-//! the reason instead.
+//! `InferenceRecommendations` is what the job's own load test MEASURED, revealed once the
+//! clock has settled the job: one entry per endpoint it benchmarked, each carrying the
+//! `RecommendationId` `GetScalingConfigurationRecommendation` resolves. A job whose benchmark
+//! measured nothing reports none, and its terminal status carries the condition that stopped
+//! it instead. `EndpointPerformances` stays absent: the load test measured each endpoint it
+//! tested as the recommendation itself reports it.
 //!
 //! ## Shape of an operation
 //!

@@ -29,8 +29,11 @@
 //! own production variant. A job that names none has SageMaker deploy an endpoint of its own
 //! for each `EndpointConfigurations` entry under test — "specifies the endpoint configuration
 //! to use for a job" — and take it down when the job ends, so the name such a recommendation
-//! reports is the name of an endpoint that is no longer there; the model under test is then
-//! the job's own `ModelName`. How many configurations are tested is
+//! reports is the name of an endpoint that is no longer there; the model under test is then the
+//! one the job's input configuration names, either by `ModelName` ("the name of the created
+//! model") or by `ModelPackageVersionArn` ("the Amazon Resource Name (ARN) of a versioned model
+//! package"), whose artifact is the one the named inference specification of that package
+//! carries ([`model_under_test`]). How many configurations are tested is
 //! `RecommendationJobResourceLimit$MaxNumberOfTests`, "defines the maximum number of load
 //! tests", bounded by [`MAX_BENCHMARKED_CONFIGURATIONS`].
 //!
@@ -143,7 +146,7 @@ pub fn benchmark_variant_name(job_name: &str, test: usize) -> String {
 ///
 /// The existing endpoints the job names come first, as the module docs state; a job that names
 /// none is benchmarked on the endpoints it deploys for its own `EndpointConfigurations`, over
-/// the model its `ModelName` names.
+/// the model its `ModelName` or its `ModelPackageVersionArn` names ([`model_under_test`]).
 #[must_use]
 pub fn benchmark_targets(
     store: &ComAmazonawsSagemakerSagemakerState,
@@ -194,22 +197,20 @@ pub fn benchmark_targets(
         targets.truncate(MAX_BENCHMARKED_CONFIGURATIONS);
         return targets;
     }
-    let Some(model_name) = config.model_name.as_deref() else {
-        return targets;
-    };
-    let Some(variant) = model_serving_variant(store, model_name) else {
-        return targets;
-    };
-    // The instance types under test: one target per endpoint configuration the job declares,
-    // and a single test on no named instance type for a job that declares none. The request's
-    // list is bounded before any per-entry work, as the endpoints above are.
-    let tested: Vec<Option<String>> = match config.endpoint_configurations.as_deref() {
+    // The endpoint configurations under test: one target per `EndpointConfigurations` entry the
+    // job declares, and a single test on no named instance type and the model package's own
+    // inference specification for a job that declares none. The request's list is bounded
+    // before any per-entry work, as the endpoints above are.
+    let tested: Vec<EndpointUnderTest> = match config.endpoint_configurations.as_deref() {
         Some(configurations) if !configurations.is_empty() => configurations
             .iter()
             .take(MAX_BENCHMARKED_CONFIGURATIONS)
-            .map(|configuration| configuration.instance_type.clone())
+            .map(|configuration| EndpointUnderTest {
+                instance_type: configuration.instance_type.clone(),
+                specification: configuration.inference_specification_name.clone(),
+            })
             .collect(),
-        _ => vec![None],
+        _ => vec![EndpointUnderTest::default()],
     };
     let limit = config
         .resource_limit
@@ -218,19 +219,67 @@ pub fn benchmark_targets(
         .and_then(|asked| usize::try_from(asked).ok())
         .unwrap_or(MAX_BENCHMARKED_CONFIGURATIONS)
         .clamp(1, MAX_BENCHMARKED_CONFIGURATIONS);
-    for (test, instance_type) in tested.into_iter().take(limit).enumerate() {
+    for (test, under_test) in tested.into_iter().take(limit).enumerate() {
+        // The model this test deploys its own endpoint for, which is the model the job's input
+        // configuration names. A job naming one this account does not hold has nothing to
+        // deploy for the test, and so nothing to benchmark on it. The test's position in the
+        // request is what names the endpoint it deploys, so a request whose entries select a
+        // mix of resolvable and unresolvable inference specifications reports the positions of
+        // the tests that ran rather than renumbering them.
+        let Some(variant) = model_under_test(store, config, under_test.specification.as_deref())
+        else {
+            continue;
+        };
         targets.push(BenchmarkTarget {
             endpoint_name: benchmark_endpoint_name(job_name, test),
             variant_name: benchmark_variant_name(job_name, test),
-            instance_type,
+            instance_type: under_test.instance_type,
             variant: ServingVariant {
                 variant_name: benchmark_variant_name(job_name, test),
-                ..variant.clone()
+                ..variant
             },
         });
     }
     targets.truncate(MAX_BENCHMARKED_CONFIGURATIONS);
     targets
+}
+
+/// One endpoint configuration a job has SageMaker deploy for a test of its own, as
+/// `EndpointInputConfiguration` declares it: the ML compute the test runs on
+/// (`$InstanceType`, "the instance types to use for the load test") and which of the model
+/// package's inference specifications it deploys (`$InferenceSpecificationName`, "the inference
+/// specification name in the model package version").
+#[derive(Debug, Clone, Default)]
+struct EndpointUnderTest {
+    instance_type: Option<String>,
+    specification: Option<String>,
+}
+
+/// What serves one test's traffic: the model the job's `InputConfig` names, however it names
+/// it.
+///
+/// `RecommendationJobInputConfig` names the model under test in exactly one of two ways —
+/// `$ModelName`, "the name of the created model", or `$ModelPackageVersionArn`, "the Amazon
+/// Resource Name (ARN) of a versioned model package" — so both resolve to the model whose
+/// artifact the load test invokes, read off the store rather than off the request. A package
+/// this account holds is served from the container its selected inference specification names
+/// ([`model_package_serving_variant`]), `specification` selecting which specification this test
+/// deploys; a package or model the store does not hold resolves to nothing, and the job has
+/// nothing to benchmark.
+///
+/// The `variant_name` it answers is the model's own: the caller replaces it with the name of
+/// the production variant the job's own deployment carried
+/// ([`benchmark_variant_name`]), which is the name the recommendation reports.
+fn model_under_test(
+    store: &ComAmazonawsSagemakerSagemakerState,
+    config: &RecommendationJobInputConfig,
+    specification: Option<&str>,
+) -> Option<ServingVariant> {
+    if let Some(model_name) = config.model_name.as_deref() {
+        return model_serving_variant(store, model_name);
+    }
+    let identifier = config.model_package_version_arn.as_deref()?;
+    model_package_serving_variant(store, identifier, specification)
 }
 
 /// What serves an invocation of the model `model_name` when it is deployed on its own: the
@@ -244,8 +293,8 @@ fn model_serving_variant(
     Some(ServingVariant {
         variant_name: model.name.clone(),
         model_name: model.name.clone(),
-        model_data_url: model_artifact_url(model),
-        inference_program: model_inference_program(model),
+        model_data_url: served_artifact_url(store, model),
+        inference_program: served_inference_program(store, model),
     })
 }
 

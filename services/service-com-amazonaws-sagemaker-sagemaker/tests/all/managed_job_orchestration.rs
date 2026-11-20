@@ -50,7 +50,7 @@ const TERMINAL_TUNING_STATUSES: [&str; 3] = ["Completed", "Failed", "Stopped"];
 
 /// The `RecommendationJobStatus` members a recommendation job's work has ENDED in
 /// (`smithy_query(query="shape",shape="RecommendationJobStatus")`).
-const TERMINAL_RECOMMENDATION_STATUSES: [&str; 3] = ["COMPLETED", "FAILED", "STOPPED"];
+pub(crate) const TERMINAL_RECOMMENDATION_STATUSES: [&str; 3] = ["COMPLETED", "FAILED", "STOPPED"];
 
 /// Stage one channel's records in Amazon S3 and answer the `InputDataConfig` addressing it.
 async fn given_channel(emulator: &Emulator, prefix: &str, name: &str) -> Value {
@@ -62,7 +62,10 @@ async fn given_channel(emulator: &Emulator, prefix: &str, name: &str) -> Value {
 }
 
 /// Poll `target` until the job reaches one of `terminal`, and answer that read.
-async fn ended(
+///
+/// `pub(crate)` so a sibling suite that drives a job of this service to its terminal status
+/// polls through this one helper rather than a copy of it.
+pub(crate) async fn ended(
     emulator: &Emulator,
     target: &str,
     body: &Value,

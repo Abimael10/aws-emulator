@@ -289,8 +289,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             (
                 model.execution_role_arn.clone(),
-                crate::state::model_artifact_url(model),
-                crate::state::model_inference_program(model),
+                crate::state::served_artifact_url(&store, model),
+                crate::state::served_inference_program(&store, model),
             )
         };
         // The transform reads the dataset the input names ("TransformInput - Describes the

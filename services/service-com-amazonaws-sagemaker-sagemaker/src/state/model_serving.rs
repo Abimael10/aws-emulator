@@ -19,6 +19,9 @@
 //! * that model's `ModelDataUrl` is read out of this emulator's own Amazon S3 and the fitted
 //!   parameters are read back out of the `model.tar.gz` a training or AutoML run wrote
 //!   ([`super::model_from_archive`]), so the model served is the model trained;
+//! * a model that carries no artifact of its own but names a MODEL PACKAGE is served from the
+//!   artifact that package's inference specification names ([`model_package_artifact_url`]), so
+//!   a model deployed out of the registry serves what the registered package carries;
 //! * an artifact holding a SERIALIZED GRADIENT-BOOSTED model instead — what SageMaker's own
 //!   boosting algorithm and the framework containers that wrap it upload — is read for the
 //!   booster's own parameters ([`super::boosted_model`]) and the prediction is computed from
@@ -58,7 +61,7 @@
 
 use super::*;
 
-use crate::ops::types::ContainerDefinition;
+use crate::ops::types::{ContainerDefinition, ModelPackageContainerDefinition};
 
 /// The most entries of a model archive that are examined for a serialized model: a container's
 /// artifact carries its model file beside what else it needs (the feature names, the
@@ -228,8 +231,9 @@ pub fn endpoint_serving_variants(
             let deployed = store.models.get(&model_name);
             Some(ServingVariant {
                 variant_name: variant.variant_name.clone(),
-                model_data_url: deployed.and_then(model_artifact_url),
-                inference_program: deployed.and_then(model_inference_program),
+                model_data_url: deployed.and_then(|model| served_artifact_url(store, model)),
+                inference_program: deployed
+                    .and_then(|model| served_inference_program(store, model)),
                 model_name,
             })
         })
@@ -258,6 +262,210 @@ fn container_artifact_url(container: &ContainerDefinition) -> Option<String> {
         .as_ref()
         .filter(|uri| !uri.is_empty())
         .cloned()
+}
+
+/// What serves an invocation of the model a MODEL PACKAGE names, when this account holds that
+/// package: the variant the package's own selected inference specification describes.
+///
+/// The package is resolved ONCE here — through [`resolved_package`], then the specification
+/// `specification` selects ([`specification_containers`]) — so a caller that needs the whole
+/// variant (a load test deploying the package for a test of its own) does not look the same
+/// package up per member. `model_name` is the package's own key, which is what a condition that
+/// stopped an invocation names as the model it could not serve; `variant_name` is the package's
+/// name, and a caller that deploys the package under a variant of its own replaces it.
+///
+/// A package this account holds whose named specification it does NOT carry answers the variant
+/// with no artifact rather than nothing at all: the package is the model under test either way,
+/// so what stopped the invocation is reported as the model carrying no artifact — deliberately,
+/// because the caller needs the model the request named in order to say so.
+#[must_use]
+pub fn model_package_serving_variant(
+    store: &ComAmazonawsSagemakerSagemakerState,
+    identifier: &str,
+    specification: Option<&str>,
+) -> Option<ServingVariant> {
+    let package = resolved_package(store, identifier)?;
+    let containers = specification_containers(package, specification);
+    Some(ServingVariant {
+        variant_name: package.name.clone(),
+        model_name: package.key(),
+        model_data_url: containers
+            .iter()
+            .copied()
+            .flatten()
+            .find_map(package_container_artifact_url),
+        inference_program: containers
+            .iter()
+            .copied()
+            .flatten()
+            .find_map(package_container_program),
+    })
+}
+
+/// Where the artifacts of a model named by a MODEL PACKAGE this account holds are: the first
+/// container of the package's inference specification that names a `ModelDataUrl`.
+///
+/// A model package is one of the ways a request names the model to serve —
+/// `ContainerDefinition$ModelPackageName` deploys one, and
+/// `RecommendationJobInputConfig$ModelPackageVersionArn` is "the Amazon Resource Name (ARN) of
+/// a versioned model package" to benchmark — and the package's `InferenceSpecification`
+/// carries "the Amazon ECR paths of containers that contain the inference code and model
+/// artifacts". So the artifact such a model is served from is the `ModelDataUrl` that
+/// specification's container names, read off the package the store holds rather than off the
+/// request.
+///
+/// `specification` picks WHICH specification of the package the request asked for, as
+/// `EndpointInputConfiguration$InferenceSpecificationName` and
+/// `ContainerDefinition$InferenceSpecificationName` ("the inference specification name in the
+/// model package version") name it: the package's additional inference specification of that
+/// name, and the package's own `InferenceSpecification` when the request names none.
+///
+/// `identifier` is read the one way this crate reads a package identifier
+/// ([`model_package_lookup_key`]), so an ARN and a name resolve to the same package; a package
+/// this account does not hold resolves to nothing, which is not an artifact.
+#[must_use]
+pub fn model_package_artifact_url(
+    store: &ComAmazonawsSagemakerSagemakerState,
+    identifier: &str,
+    specification: Option<&str>,
+) -> Option<String> {
+    model_package_containers(store, identifier, specification)?
+        .iter()
+        .find_map(package_container_artifact_url)
+}
+
+/// The entry point the container of that same specification runs the artifact's own inference
+/// code by: the `SAGEMAKER_PROGRAM` variable of the first of its containers that declares one,
+/// read the way a deployed model's is ([`model_inference_program`]) —
+/// `ModelPackageContainerDefinition$Environment` is "the environment variables to set in the
+/// Docker container", the same place a model's container declares its handler script.
+#[must_use]
+pub fn model_package_inference_program(
+    store: &ComAmazonawsSagemakerSagemakerState,
+    identifier: &str,
+    specification: Option<&str>,
+) -> Option<String> {
+    model_package_containers(store, identifier, specification)?
+        .iter()
+        .find_map(package_container_program)
+}
+
+/// The containers of the inference specification `specification` selects on the package
+/// `identifier` names, and `None` when this account holds no such package or that package
+/// carries no such specification.
+fn model_package_containers<'package>(
+    store: &'package ComAmazonawsSagemakerSagemakerState,
+    identifier: &str,
+    specification: Option<&str>,
+) -> Option<&'package [ModelPackageContainerDefinition]> {
+    specification_containers(resolved_package(store, identifier)?, specification)
+}
+
+/// The model package a caller-supplied identifier names, when this account holds one.
+///
+/// The ONE reading of such an identifier in this module ([`model_package_lookup_key`], the
+/// reading `DescribeModelPackage` and `DeleteModelPackage` resolve one by), so an ARN and a
+/// name reach the same stored package wherever a model is named by its package.
+fn resolved_package<'package>(
+    store: &'package ComAmazonawsSagemakerSagemakerState,
+    identifier: &str,
+) -> Option<&'package ModelPackage> {
+    store.model_packages.get(model_package_lookup_key(identifier))
+}
+
+/// The containers `specification` selects on `package`: its additional inference specification
+/// of that name, and the package's own `InferenceSpecification` when the request names none.
+fn specification_containers<'package>(
+    package: &'package ModelPackage,
+    specification: Option<&str>,
+) -> Option<&'package [ModelPackageContainerDefinition]> {
+    match specification {
+        Some(name) => package
+            .additional_inference_specifications
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|additional| additional.name == name)
+            .map(|additional| additional.containers.as_slice()),
+        None => package
+            .inference_specification
+            .as_ref()
+            .map(|specification| specification.containers.as_slice()),
+    }
+}
+
+/// One model package container's `ModelDataUrl`, when it names one.
+fn package_container_artifact_url(
+    container: &ModelPackageContainerDefinition,
+) -> Option<String> {
+    container
+        .model_data_url
+        .as_ref()
+        .filter(|uri| !uri.is_empty())
+        .cloned()
+}
+
+/// One model package container's `SAGEMAKER_PROGRAM`, when its environment declares one.
+fn package_container_program(container: &ModelPackageContainerDefinition) -> Option<String> {
+    container
+        .environment
+        .as_ref()?
+        .get(super::SAGEMAKER_PROGRAM_VARIABLE)
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|named| !named.is_empty())
+        .map(str::to_string)
+}
+
+/// Where the artifacts of the DEPLOYED model `model` are: its own container's `ModelDataUrl`,
+/// and otherwise the artifact of the model package one of its containers names
+/// ([`model_package_artifact_url`]) — which is how a model deployed out of the registry names
+/// the artifact it serves.
+#[must_use]
+pub fn served_artifact_url(
+    store: &ComAmazonawsSagemakerSagemakerState,
+    model: &Model,
+) -> Option<String> {
+    if let Some(uri) = model_artifact_url(model) {
+        return Some(uri);
+    }
+    model
+        .primary_container
+        .iter()
+        .chain(model.containers.iter().flatten())
+        .find_map(|container| {
+            model_package_artifact_url(
+                store,
+                container.model_package_name.as_deref()?,
+                container.inference_specification_name.as_deref(),
+            )
+        })
+}
+
+/// The entry point the DEPLOYED model `model` runs the artifact's own inference code by: its
+/// own container's `SAGEMAKER_PROGRAM`, and otherwise the one declared by the container of the
+/// model package a container of it names ([`model_package_inference_program`]) — read beside
+/// the artifact, because the container that carries the artifact is the one that names its
+/// handler.
+#[must_use]
+pub fn served_inference_program(
+    store: &ComAmazonawsSagemakerSagemakerState,
+    model: &Model,
+) -> Option<String> {
+    if let Some(program) = model_inference_program(model) {
+        return Some(program);
+    }
+    model
+        .primary_container
+        .iter()
+        .chain(model.containers.iter().flatten())
+        .find_map(|container| {
+            model_package_inference_program(
+                store,
+                container.model_package_name.as_deref()?,
+                container.inference_specification_name.as_deref(),
+            )
+        })
 }
 
 /// The entry point a model's container runs the artifact's own inference code by: the
