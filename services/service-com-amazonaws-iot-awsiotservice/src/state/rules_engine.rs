@@ -28,9 +28,14 @@
 //! the failures, so a client using `errorAction` as its dead-letter path for rule failures
 //! gets the failure it was promised rather than silence.
 //!
+//! An action's PARAMETERS are not always literals: a value carrying `${…}` is a substitution
+//! template, which AWS IoT renders from the message before it makes the action's call, so each
+//! one is evaluated over the published message and the topic here too
+//! ([`substitution_template`]) — the object key an `s3` action computes per message among them.
+//!
 //! What this engine cannot compute faithfully it does NOT perform: a statement it cannot
-//! read, a condition it cannot decide, and an action parameter carrying a substitution
-//! template are each left unperformed rather than performed on a guessed value. None of those
+//! read, a condition it cannot decide, and a parameter whose template it cannot evaluate are
+//! each left unperformed rather than performed on a guessed value. None of those
 //! is a FAILURE of the action either, because they are this emulator's limits and not the
 //! service's answer, so none of them manufactures an error report.
 //!
@@ -39,7 +44,11 @@
 //! ([`::service_common::kinesis_client`] — no socket, and no part of the action is a
 //! destination), `sqs`, "publish data to an Amazon SQS queue", over that same transport
 //! ([`::service_common::sqs_client`]), `lambda`, "invoke a Lambda function", over that same
-//! transport ([`lambda_action`]), `republish`, "publish to another MQTT topic", which
+//! transport ([`lambda_action`]), `dynamoDBv2`, which writes "each attribute in an MQTT message
+//! payload into a separate DynamoDB column", one item per selected message over that same
+//! transport ([`dynamodb_action`]), `s3`, "write to an Amazon S3 bucket", one object holding the
+//! selected message under the key the action renders ([`s3_action`]), `republish`, "publish to
+//! another MQTT topic", which
 //! re-injects the selected message into this same broker so the rules whose filters cover the
 //! action's topic match it in turn ([`republish`]), and `http`, "send data to an HTTPS
 //! endpoint", whose endpoint is a TOPIC RULE
@@ -47,8 +56,9 @@
 //! admits that URL is `ENABLED` ([`super::topic_rule_destinations::http_action_is_allowed`]),
 //! and nothing is sent otherwise — "the destination must be confirmed prior to use"
 //! (`CreateTopicRuleDestination`), which is the gate the whole confirm/enable lifecycle
-//! exists for. Every other member of `Action` is a target service with its own semantics (a
-//! DynamoDB column per message attribute, a rendered S3 object key) and
+//! exists for. Every other member of `Action` is a target service with its own semantics (the
+//! `dynamoDB` action's own key fields, operation verb and payload column, a Firehose record, an
+//! OpenSearch document) and
 //! its own open issue; an action this engine does not perform is left alone rather than
 //! approximated.
 //!
@@ -64,12 +74,25 @@ use super::rule_action_role::{role_bars_action, IamState};
 use super::rule_sql::{selected_message, Selected};
 use super::topic_rule_destinations::{http_action_is_allowed, http_action_unperformable};
 use crate::ops::types::{
-    Action, HttpAction, KinesisAction, LambdaAction, RepublishAction, SqsAction,
+    Action, DynamoDBv2Action, HttpAction, KinesisAction, LambdaAction, RepublishAction, S3Action,
+    SqsAction,
 };
+use substitution_template::Parameters;
+
+/// `Action$dynamoDBv2`: the item a rule's `dynamoDBv2` action writes for one selected message,
+/// and the hop it is written over.
+pub mod dynamodb_action;
 
 /// `Action$lambda`: the invocation a rule's `lambda` action makes, and the function
 /// resource-policy grant that admits it.
 pub mod lambda_action;
+
+/// `Action$s3`: the object a rule's `s3` action stores for one selected message.
+pub mod s3_action;
+
+/// The `${…}` substitution templates an action's parameters carry, and what each is worth for
+/// the message being acted on.
+pub mod substitution_template;
 
 /// The service principal the rules engine acts as: the one an action's role must trust, and
 /// the one a target function's resource policy must admit.
@@ -110,11 +133,6 @@ const MAX_ACTIONS_PER_MESSAGE: usize = 100;
 /// chains a client under test writes; past it the message is not republished again and the
 /// engine says so in its log.
 const MAX_REPUBLISH_HOPS: usize = 4;
-
-/// The opening of a substitution template in an action parameter. AWS IoT renders `${…}` from
-/// the message; this engine does not compute those expressions, so a parameter carrying one is
-/// an action it cannot perform faithfully rather than one to perform on the literal text.
-const SUBSTITUTION_TEMPLATE_OPENING: &str = "${";
 
 /// One message IN THE BROKER: the topic it was published to, its payload, and how many
 /// `republish` hops carried it here.
@@ -228,6 +246,12 @@ pub async fn dispatch_published_message<Eng: ::std::marker::Send + ::std::marker
         // PASS 2 — with NO guard held: the statement is read and the action's calls are made
         // outside the critical section, so no caller's statement is evaluated under a lock
         // over shared state and no lock is held across an await.
+        //
+        // The parameters of every action of every rule are rendered against THIS message —
+        // read once here, because a template is evaluated over the message the broker took
+        // and the topic it was published to rather than over what a rule's statement selected
+        // ([`substitution_template`]).
+        let parameters = Parameters::of(&published.topic, &published.payload);
         for rule in selecting {
             // Reading a statement and evaluating it is CPU work on this worker, and a message
             // may select many rules: yielding first gives a cancellation or shutdown signal
@@ -268,6 +292,7 @@ pub async fn dispatch_published_message<Eng: ::std::marker::Send + ::std::marker
                         iam.as_ref(),
                         &rule,
                         &published,
+                        &parameters,
                         &message,
                         &mut pending,
                     )
@@ -309,6 +334,7 @@ pub async fn dispatch_published_message<Eng: ::std::marker::Send + ::std::marker
                     iam.as_ref(),
                     &rule,
                     &published,
+                    &parameters,
                     &report,
                     &mut pending,
                 )
@@ -367,6 +393,12 @@ enum Performed<'a> {
     /// `Action$lambda`: one invocation of the function the action names, with the selected
     /// message as the invocation event.
     Lambda(&'a LambdaAction),
+    /// `Action$dynamoDBv2`: one [`dynamodb_action::PUT_ITEM_ACTION`] of the selected message
+    /// into the table the action names, one column per attribute of the message.
+    DynamoDbV2(&'a DynamoDBv2Action),
+    /// `Action$s3`: one [`s3_action::PUT_OBJECT_ACTION`] of the selected message into the
+    /// bucket the action names, under the object key it renders.
+    S3(&'a S3Action),
     /// `Action$republish`: the selected message put back into the broker on the action's own
     /// topic, where the rules whose filters cover it match it in turn.
     Republish(&'a RepublishAction),
@@ -387,6 +419,8 @@ impl<'a> Performed<'a> {
             .map(Performed::Kinesis)
             .or_else(|| action.sqs.as_ref().map(Performed::Sqs))
             .or_else(|| action.lambda.as_ref().map(Performed::Lambda))
+            .or_else(|| action.dynamo_d_bv2.as_ref().map(Performed::DynamoDbV2))
+            .or_else(|| action.s3.as_ref().map(Performed::S3))
             .or_else(|| action.republish.as_ref().map(Performed::Republish))
             .or_else(|| action.http.as_ref().map(Performed::Http))
     }
@@ -405,25 +439,160 @@ impl<'a> Performed<'a> {
         iam: Option<&::engine::ServiceState<IamState>>,
         rule: &Selecting,
         published: &Published,
+        parameters: &Parameters,
         message: &[u8],
         pending: &mut VecDeque<Published>,
     ) -> Result<(), Failure> {
         match self {
             Self::Kinesis(action) => {
-                put_record(ctx, region, iam, &rule.rule_name, action, message).await
+                put_record(ctx, region, iam, &rule.rule_name, parameters, action, message).await
             }
             Self::Sqs(action) => {
-                send_message(ctx, region, iam, &rule.rule_name, action, message).await
+                send_message(ctx, region, iam, &rule.rule_name, parameters, action, message).await
             }
             Self::Lambda(action) => invoke_function(ctx, region, rule, action, message).await,
+            Self::DynamoDbV2(action) => {
+                write_item(ctx, region, iam, &rule.rule_name, parameters, action, message).await
+            }
+            Self::S3(action) => {
+                store_object(ctx, region, iam, &rule.rule_name, parameters, action, message).await
+            }
             Self::Republish(action) => {
-                republish(region, iam, rule, published, action, message, pending)
+                republish(region, iam, rule, published, parameters, action, message, pending)
             }
             Self::Http(action) => {
                 post_to_endpoint(ctx, state, &rule.rule_name, action, message).await
             }
         }
     }
+}
+
+/// Write one DynamoDB item for the selected message, under the action's role: the item is the
+/// message itself — one column per attribute — and the table is the one the action's `putItem`
+/// names in this publish's Region ([`dynamodb_action`]).
+///
+/// Nothing is written when the role bars the call, and nothing when DynamoDB refuses the item (a
+/// table the account does not hold, one not yet active, a message carrying no value for the
+/// table's key); either is the action FAILING, which is what the rule's `errorAction` reports
+/// and which AWS does not surface to the publisher either.
+#[allow(clippy::too_many_arguments)]
+async fn write_item(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    iam: Option<&::engine::ServiceState<IamState>>,
+    rule_name: &str,
+    parameters: &Parameters,
+    action: &DynamoDBv2Action,
+    message: &[u8],
+) -> Result<(), Failure> {
+    let Some(table_name) = parameters.rendered(&action.put_item.table_name) else {
+        unrenderable(rule_name, "dynamoDBv2", "putItem.tableName");
+        return Ok(());
+    };
+    let table_arn = dynamodb_action::table_arn(region, &table_name);
+    // The verdict is read under the IAM guard and the guard is released before the write: no
+    // lock is held across an await.
+    let barred = iam.is_some_and(|iam| {
+        role_bars_action(
+            &iam.lock(),
+            &action.role_arn,
+            SERVICE_PRINCIPAL,
+            dynamodb_action::PUT_ITEM_ACTION,
+            &table_arn,
+        )
+    });
+    if barred {
+        return Err(Failure {
+            failed_action: dynamodb_action::FAILED_ACTION,
+            failed_resource: table_arn.clone(),
+            error_message: role_refusal(
+                &action.role_arn,
+                dynamodb_action::PUT_ITEM_ACTION,
+                &table_arn,
+            ),
+        });
+    }
+    dynamodb_action::put_item(ctx, region, &table_name, message)
+        .await
+        .map_err(|error_message| Failure {
+            failed_action: dynamodb_action::FAILED_ACTION,
+            failed_resource: table_arn,
+            error_message,
+        })
+}
+
+/// Store one Amazon S3 object holding the selected message, under the action's role: the body is
+/// the message the statement selected and the key is the one the action renders for this message
+/// ([`s3_action`]).
+///
+/// Nothing is stored when the role bars the call, and nothing when Amazon S3 refuses the object
+/// (a bucket the account does not hold, an ACL the bucket bars); either is the action FAILING,
+/// which is what the rule's `errorAction` reports and which AWS does not surface to the publisher
+/// either.
+#[allow(clippy::too_many_arguments)]
+async fn store_object(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    iam: Option<&::engine::ServiceState<IamState>>,
+    rule_name: &str,
+    parameters: &Parameters,
+    action: &S3Action,
+    message: &[u8],
+) -> Result<(), Failure> {
+    let Some(bucket) = parameters.rendered(&action.bucket_name) else {
+        unrenderable(rule_name, "s3", "bucketName");
+        return Ok(());
+    };
+    // "The object key" is the parameter AWS IoT most often computes per message, which is what a
+    // rule writing one object per device or per day is written with.
+    let Some(key) = parameters.rendered(&action.key) else {
+        unrenderable(rule_name, "s3", "key");
+        return Ok(());
+    };
+    let object_arn = s3_action::object_arn(&bucket, &key);
+    // The verdict is read under the IAM guard and the guard is released before the write: no
+    // lock is held across an await.
+    let barred = iam.is_some_and(|iam| {
+        role_bars_action(
+            &iam.lock(),
+            &action.role_arn,
+            SERVICE_PRINCIPAL,
+            s3_action::PUT_OBJECT_ACTION,
+            &object_arn,
+        )
+    });
+    if barred {
+        return Err(Failure {
+            failed_action: s3_action::FAILED_ACTION,
+            failed_resource: object_arn.clone(),
+            error_message: role_refusal(
+                &action.role_arn,
+                s3_action::PUT_OBJECT_ACTION,
+                &object_arn,
+            ),
+        });
+    }
+    s3_action::put_object(ctx, region, &bucket, &key, action, message)
+        .await
+        .map_err(|error_message| Failure {
+            failed_action: s3_action::FAILED_ACTION,
+            failed_resource: object_arn,
+            error_message,
+        })
+}
+
+/// What the engine's log says about an action parameter whose substitution template this
+/// emulator does not evaluate: the action is not performed at all, which is this emulator's own
+/// limit rather than the service's answer, so it is no failure of the action
+/// ([`substitution_template`]).
+fn unrenderable(rule_name: &str, action: &str, parameter: &str) {
+    ::tracing::debug!(
+        rule = %rule_name,
+        action,
+        parameter,
+        "a rule action's parameter carries a substitution template this emulator's rules \
+         engine does not evaluate, so the action was not performed"
+    );
 }
 
 /// Invoke the function a `lambda` action names with the selected message as its event, as the
@@ -458,30 +627,27 @@ async fn invoke_function(
 /// the broker guarantees delivery to SUBSCRIBERS, which this emulator has none of, so it
 /// changes nothing about which rules then match the republished message.
 ///
-/// Nothing is republished for a topic carrying a substitution template, which this engine does
-/// not render, nor past [`MAX_REPUBLISH_HOPS`]; neither is a failure of the action.
+/// Nothing is republished for a topic whose substitution template this engine does not evaluate,
+/// nor past [`MAX_REPUBLISH_HOPS`]; neither is a failure of the action.
 #[allow(clippy::too_many_arguments)]
 fn republish(
     region: &str,
     iam: Option<&::engine::ServiceState<IamState>>,
     rule: &Selecting,
     published: &Published,
+    parameters: &Parameters,
     action: &RepublishAction,
     message: &[u8],
     pending: &mut VecDeque<Published>,
 ) -> Result<(), Failure> {
-    if action.topic.contains(SUBSTITUTION_TEMPLATE_OPENING) {
-        ::tracing::debug!(
-            rule = %rule.rule_name,
-            "a republish rule action's topic is not one this emulator's rules engine renders \
-             as the topic the action means, so nothing was republished"
-        );
+    let Some(topic) = parameters.rendered(&action.topic) else {
+        unrenderable(&rule.rule_name, "republish", "topic");
         return Ok(());
-    }
+    };
     let topic_arn = ::emulator_server::emulator_arn(
         IOT_ARN_NAMESPACE,
         region,
-        &format!("{TOPIC_RESOURCE_TYPE}/{}", action.topic),
+        &format!("{TOPIC_RESOURCE_TYPE}/{topic}"),
     );
     let barred = iam.is_some_and(|iam| {
         role_bars_action(
@@ -509,7 +675,7 @@ fn republish(
         return Ok(());
     }
     pending.push_back(Published {
-        topic: action.topic.clone(),
+        topic,
         payload: message.to_vec(),
         hops: published.hops + 1,
     });
@@ -598,13 +764,18 @@ async fn put_record(
     region: &str,
     iam: Option<&::engine::ServiceState<IamState>>,
     rule_name: &str,
+    parameters: &Parameters,
     action: &KinesisAction,
     message: &[u8],
 ) -> Result<(), Failure> {
+    let Some(stream_name) = parameters.rendered(&action.stream_name) else {
+        unrenderable(rule_name, "kinesis", "streamName");
+        return Ok(());
+    };
     let stream_arn = ::emulator_server::emulator_arn(
         KINESIS_ARN_NAMESPACE,
         region,
-        &format!("{STREAM_RESOURCE_TYPE}/{}", action.stream_name),
+        &format!("{STREAM_RESOURCE_TYPE}/{stream_name}"),
     );
     // The verdict is read under the IAM guard and the guard is released before the write: no
     // lock is held across an await.
@@ -628,17 +799,13 @@ async fn put_record(
             ),
         });
     }
-    let Some(partition_key) = partition_key(action) else {
-        ::tracing::debug!(
-            rule = %rule_name,
-            "a kinesis rule action's partitionKey is not one this emulator's rules engine \
-             renders as the value the action means, so no record was written"
-        );
+    let Some(partition_key) = partition_key(parameters, action) else {
+        unrenderable(rule_name, "kinesis", "partitionKey");
         return Ok(());
     };
     let written = ::service_common::kinesis_client::kinesis_client(ctx, region)
         .put_record()
-        .stream_name(&action.stream_name)
+        .stream_name(&stream_name)
         .data(::aws_sdk_kinesis::primitives::Blob::new(message))
         .partition_key(partition_key)
         .send()
@@ -650,20 +817,19 @@ async fn put_record(
     })
 }
 
-/// The partition key one record is written under: "the partition key" the action names, or a
-/// key unique to this record when the action names NONE — the key decides the shard and
-/// Kinesis takes no record without one, so each record of an action naming none gets its own,
-/// which spreads them over the stream's shards.
+/// The partition key one record is written under: "the partition key" the action names, rendered
+/// for this message, or a key unique to this record when the action names NONE — the key decides
+/// the shard and Kinesis takes no record without one, so each record of an action naming none
+/// gets its own, which spreads them over the stream's shards.
 ///
-/// `None` — an action this engine does not perform — for a key it cannot render as the value
-/// the action means: one carrying a substitution template
-/// ([`SUBSTITUTION_TEMPLATE_OPENING`]), whose value is computed from the message, and an EMPTY
-/// one, which `PartitionKey` (`length 1..256`) is not a value of, so Kinesis would refuse the
-/// record rather than take it under a key this engine chose.
-fn partition_key(action: &KinesisAction) -> Option<String> {
+/// `None` — an action this engine does not perform — for a key it cannot render as the value the
+/// action means: one whose substitution template it does not evaluate
+/// ([`substitution_template`]), and an EMPTY one, which `PartitionKey` (`length 1..256`) is not a
+/// value of, so Kinesis would refuse the record rather than take it under a key this engine
+/// chose.
+fn partition_key(parameters: &Parameters, action: &KinesisAction) -> Option<String> {
     match action.partition_key.as_deref() {
-        Some(key) if key.contains(SUBSTITUTION_TEMPLATE_OPENING) || key.is_empty() => None,
-        Some(key) => Some(key.to_string()),
+        Some(key) => parameters.rendered(key).filter(|key| !key.is_empty()),
         None => Some(super::fresh_uuid()),
     }
 }
@@ -686,20 +852,16 @@ async fn send_message(
     region: &str,
     iam: Option<&::engine::ServiceState<IamState>>,
     rule_name: &str,
+    parameters: &Parameters,
     action: &SqsAction,
     message: &[u8],
 ) -> Result<(), Failure> {
-    if action.queue_url.contains(SUBSTITUTION_TEMPLATE_OPENING) {
-        ::tracing::debug!(
-            rule = %rule_name,
-            "an sqs rule action's queueUrl is not one this emulator's rules engine renders \
-             as the queue the action means, so no message was sent"
-        );
+    let Some(queue_url) = parameters.rendered(&action.queue_url) else {
+        unrenderable(rule_name, "sqs", "queueUrl");
         return Ok(());
-    }
+    };
     // The resource the role is granted the send on: the queue the action's URL addresses.
-    let Some(queue_arn) = ::service_common::sqs_client::queue_arn_of_url(region, &action.queue_url)
-    else {
+    let Some(queue_arn) = ::service_common::sqs_client::queue_arn_of_url(region, &queue_url) else {
         ::tracing::debug!(
             rule = %rule_name,
             "an sqs rule action's queueUrl addresses no queue, so no message was sent"
@@ -733,7 +895,7 @@ async fn send_message(
     };
     let sent = ::service_common::sqs_client::sqs_client(ctx, region)
         .send_message()
-        .queue_url(&action.queue_url)
+        .queue_url(&queue_url)
         .message_body(body)
         .send()
         .await;

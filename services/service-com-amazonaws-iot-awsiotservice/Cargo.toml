@@ -40,6 +40,18 @@ hex = { workspace = true }
 # runtime are left out and nothing off this process is reachable.
 aws-sdk-kinesis = { version = "1", default-features = false }
 
+# A `dynamoDBv2` topic-rule action writes the selected message into its table with `PutItem`,
+# one column per message attribute (`state::rules_engine::dynamodb_action`), built as the SDK's
+# generated client only: the transport is the emulator's own in-process callback, so the SDK's
+# HTTPS stack and runtime are left out and nothing off this process is reachable.
+aws-sdk-dynamodb = { version = "1", default-features = false }
+
+# `chrono`: `parse_time(<format>, <time>)` of the AWS IoT SQL library writes an instant out
+# through a date pattern (`state::rule_expression::library`), so the calendar arithmetic that
+# turns milliseconds since the epoch into a year, a month and a day is this maintained crate's
+# rather than hand-rolled here. No clock feature: the instant comes from the expression.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 # `sqlparser`: the SELECT clause and the WHERE condition of a topic rule's SQL statement
 # are PARSED with it (`state::rule_sql`), so the statement a caller stores is read by a
 # maintained SQL parser rather than matched here. A parser only — it yields an AST and has

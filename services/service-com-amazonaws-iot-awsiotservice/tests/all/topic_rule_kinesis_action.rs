@@ -649,11 +649,13 @@ fn rows() -> Vec<Row> {
         )
         .delivers_nothing(),
         Row::new(
-            "a condition naming a function of the AWS IoT SQL library",
-            "SELECT * FROM 'sensors/one' WHERE startswith(marker, 'm')",
+            "a condition naming a function of the AWS IoT SQL library this engine does not \
+             compute",
+            "SELECT * FROM 'sensors/one' WHERE get_thing_shadow('thing', 'role') = 1",
             "sensors/one",
         )
-        // An expression this engine does not compute: the rule's actions are not performed,
+        // An expression this engine does not compute — `get_thing_shadow` reads another
+        // service's state rather than this message: the rule's actions are not performed,
         // rather than performed on a condition nobody evaluated.
         .delivers_nothing(),
         Row::new(
@@ -697,9 +699,10 @@ fn rows() -> Vec<Row> {
             "SELECT * FROM 'sensors/one'",
             "sensors/one",
         )
-        // A key this engine does not render: no record, rather than one keyed on the
-        // template's literal text.
-        .keyed(vec![Some("${newuuid()}")])
+        // A key whose template this engine does not evaluate — `clientid()` is the MQTT client
+        // id, which a message published over HTTP has none of: no record, rather than one keyed
+        // on the template's literal text.
+        .keyed(vec![Some("${clientid()}")])
         .delivers_nothing(),
         Row::new(
             "an action whose partitionKey is the empty string",

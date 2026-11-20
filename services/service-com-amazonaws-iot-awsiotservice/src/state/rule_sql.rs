@@ -57,6 +57,9 @@ pub enum Selected {
 /// * a select clause naming attributes hands over a document carrying those attributes, each
 ///   under the name the clause gives it (its alias, else the last segment of the path), with
 ///   an attribute the message does not carry left out;
+/// * a select clause naming the wildcard BESIDE other attributes hands over the message's own
+///   members with those attributes added to them, which is what `SELECT *, <expression> AS
+///   <alias>` adds a value to the payload with;
 /// * a `WHERE` condition decides selection with SQL's three-valued logic: a condition that is
 ///   unknown for the message selects nothing, as it does in SQL.
 ///
@@ -102,11 +105,23 @@ pub fn selected_message(sql: &str, topic: &str, payload: &[u8]) -> Selected {
                 None => return Selected::Undecided,
             },
             SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr),
-            // A wildcard beside other items, and a qualified one, name a projection this
-            // engine does not compute.
-            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
-                return Selected::Undecided
-            }
+            // `SELECT *, <expression> AS <alias>` ADDS to the message: the wildcard beside
+            // other items is every member of the message's own document, and the items beside
+            // it are added to those — which is how a statement carries the payload through and
+            // names one more value with it. A document the message has no members of (a payload
+            // that is no JSON object) is a projection this engine does not compute, because
+            // there is nothing for the wildcard to carry.
+            SelectItem::Wildcard(_) => match document {
+                Value::Object(members) => {
+                    for (member, value) in members {
+                        selected.insert(member.clone(), value.clone());
+                    }
+                    continue;
+                }
+                _ => return Selected::Undecided,
+            },
+            // A qualified wildcard names a relation, which an AWS IoT statement has none of.
+            SelectItem::QualifiedWildcard(..) => return Selected::Undecided,
         };
         match evaluate(expression, Message { topic, document }, 0) {
             Evaluated::Known(value) => {
@@ -417,7 +432,8 @@ mod tests {
     #[test]
     fn a_statement_selects_the_document_it_names_out_of_the_message_and_the_topic() {
         // The rows differ along what the select clause names and what the condition decides:
-        // the wildcard, the `topic()` builtin called with no argument and with each segment's
+        // the wildcard alone and beside another item, the `topic()` builtin called with no
+        // argument and with each segment's
         // number (including one past the topic's last), an alias and the name an unaliased
         // expression takes, arithmetic over integers and arithmetic that is not whole, a path
         // the message does not carry, a condition that holds and one that does not, and a
@@ -534,6 +550,25 @@ mod tests {
                 TOPIC,
                 MESSAGE,
                 Expected::NotSelected,
+            ),
+            (
+                "the wildcard beside another item, which adds to the message",
+                "SELECT *, topic(2) AS level FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({
+                    "temperature": 20,
+                    "humidity": 55,
+                    "extra": "dropped",
+                    "level": "room-1",
+                })),
+            ),
+            (
+                "the wildcard beside another item over a payload that is no document",
+                "SELECT *, topic(2) AS level FROM 'sensors/room-1/temp'",
+                TOPIC,
+                "not a document",
+                Expected::Undecided,
             ),
             (
                 "a function of the library this engine does not compute",

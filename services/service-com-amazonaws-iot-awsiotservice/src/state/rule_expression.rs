@@ -4,9 +4,11 @@
 //! message: the walk of the AST [`super::rule_sql`] hands over.
 //!
 //! It is a purpose-built walk of that AST, not an engine: every arm reads the MESSAGE
-//! DOCUMENT, or the topic the message was published to, and nothing else. There is no
-//! user-defined-function dispatch and the ONE function of the AWS IoT SQL library it computes
-//! is `topic()`, which reads that same topic ([`topic_function`]), so no expression of a
+//! DOCUMENT, the topic the message was published to, the clock and this account's own id, and
+//! nothing else. There is no
+//! user-defined-function dispatch: the functions of the AWS IoT SQL library it computes are the
+//! scalar ones held in [`library`], each a value of its arguments and of those same inputs. So
+//! no expression of a
 //! caller's statement can reach a socket, a subprocess, the filesystem, the
 //! process environment or any other host primitive, and there is nothing for it to escape
 //! into. It is bounded — every evaluation carries its depth and stops at
@@ -20,25 +22,19 @@ use ::sqlparser::ast::{
     BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArguments, UnaryOperator,
 };
 
+/// The scalar functions of the AWS IoT SQL library this walk computes.
+pub mod library;
+
 /// How deep an expression is evaluated. The statement is a caller's text, so its tree is
 /// caller-controlled; the bound is counted on the TREE rather than on the brackets, because a
 /// chain of `AND`s nests the tree without nesting one bracket.
 const MAX_EXPRESSION_DEPTH: usize = 32;
 
-/// The one function of the AWS IoT SQL library this walk computes: "topic(Decimal)" returns
-/// "the topic to which the message was sent", whole when it is called with no argument and one
-/// SEGMENT of that topic when it is called with the segment's 1-based number.
-const TOPIC_FUNCTION: &str = "topic";
-
-/// The separator between two levels of an MQTT topic name, which is what [`TOPIC_FUNCTION`]
-/// numbers the segments of.
-const TOPIC_LEVEL_SEPARATOR: char = '/';
-
 /// The ONE published message an expression is evaluated over.
 ///
 /// It carries the message's document AND the topic it was published to, because a statement's
-/// value for a message is a function of both: an attribute path reads the document, while
-/// [`TOPIC_FUNCTION`] reads the topic. Nothing else about the publish is reachable from an
+/// value for a message is a function of both: an attribute path reads the document, while the
+/// library's `topic()` reads the topic. Nothing else about the publish is reachable from an
 /// expression.
 #[derive(Debug, Clone, Copy)]
 pub struct Message<'a> {
@@ -82,7 +78,7 @@ pub fn evaluate(expression: &Expr, message: Message<'_>, depth: usize) -> Evalua
             attribute(document, &path)
         }
         Expr::Value(value) => literal(&value.value),
-        Expr::Function(function) => topic_function(function, message, depth),
+        Expr::Function(function) => library_function(function, message, depth),
         Expr::UnaryOp { op, expr } => {
             let inner = evaluate(expr, message, depth);
             match op {
@@ -174,45 +170,26 @@ pub fn evaluate(expression: &Expr, message: Message<'_>, depth: usize) -> Evalua
     }
 }
 
-/// The value a CALL in a statement has, which is [`TOPIC_FUNCTION`]'s and no other's.
+/// The value a CALL in a statement has, for the functions of the AWS IoT SQL library this walk
+/// computes and no others ([`library`]).
 ///
-/// "topic(Decimal)" is "the topic to which the message was sent": called with no argument it is
-/// the whole topic name, and called with a number it is that 1-based SEGMENT of it, so
-/// `topic(2)` of `sensors/room-1/temp` is `room-1`. A number outside the topic's segments names
-/// no segment, which is SQL's unknown ([`Evaluated::Absent`]) rather than an invented value.
-///
-/// Every other call — every other function of that library, and anything spelled like a call —
-/// is [`Evaluated::Undecided`]: this walk computes no function it does not implement, so a rule
-/// whose statement uses one performs no action rather than acting on a guess.
-fn topic_function(function: &Function, message: Message<'_>, depth: usize) -> Evaluated {
-    if !function.name.to_string().eq_ignore_ascii_case(TOPIC_FUNCTION) {
-        return Evaluated::Undecided;
-    }
+/// The arguments are evaluated first, in the order the call writes them, so a function is a
+/// function of VALUES this same walk read off the message — a call carrying a named or
+/// otherwise non-positional argument is not one of these functions at all.
+fn library_function(function: &Function, message: Message<'_>, depth: usize) -> Evaluated {
     let arguments: &[FunctionArg] = match &function.args {
         FunctionArguments::None => &[],
         FunctionArguments::List(list) if list.clauses.is_empty() => list.args.as_slice(),
         _ => return Evaluated::Undecided,
     };
-    match arguments {
-        [] => Evaluated::Known(Value::String(message.topic.to_string())),
-        [FunctionArg::Unnamed(FunctionArgExpr::Expr(argument))] => {
-            let Evaluated::Known(value) = evaluate(argument, message, depth) else {
-                return Evaluated::Undecided;
-            };
-            let Some(number) = value.as_u64().filter(|number| *number >= 1) else {
-                return Evaluated::Undecided;
-            };
-            let index = usize::try_from(number - 1).unwrap_or(usize::MAX);
-            message
-                .topic
-                .split(TOPIC_LEVEL_SEPARATOR)
-                .nth(index)
-                .map_or(Evaluated::Absent, |segment| {
-                    Evaluated::Known(Value::String(segment.to_string()))
-                })
-        }
-        _ => Evaluated::Undecided,
+    let mut evaluated = Vec::with_capacity(arguments.len());
+    for argument in arguments {
+        let FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) = argument else {
+            return Evaluated::Undecided;
+        };
+        evaluated.push(evaluate(expression, message, depth));
     }
+    library::call(&function.name.to_string(), &evaluated, message)
 }
 
 /// The value the attribute `path` names in `document`: its members walked in order, so
