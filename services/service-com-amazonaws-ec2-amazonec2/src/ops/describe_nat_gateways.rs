@@ -320,9 +320,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         Ok(DescribeNatGatewaysOutput {
-            nat_gateways: Some(page.iter().map(|gateway| (*gateway).clone()).collect()),
+            nat_gateways: Some(page.iter().map(|gateway| reported(gateway)).collect()),
             next_token,
         })
+    }
+}
+
+/// The `NatGateway` this read REPORTS for the stored `gateway`: the record as it stands,
+/// with the appliance list this operation always knows the contents of reported as a list.
+///
+/// "The proxy appliances attached to the NAT Gateway for filtering and inspecting traffic"
+/// (`NatGateway$AttachedAppliances`, the `attachedApplianceSet` of
+/// `NatGatewayAttachedApplianceList`) is a fact this read always has in full: a gateway
+/// either holds appliances or holds none. So a gateway with none is reported with an EMPTY
+/// list rather than with the member left out — an absent member says the appliances were not
+/// reported, which is a different answer from "none are attached", and a reader deciding
+/// whether traffic is being inspected cannot act on the first. The same thing this read
+/// already does for the tags of a gateway that carries none.
+fn reported(gateway: &NatGateway) -> NatGateway {
+    NatGateway {
+        attached_appliances: Some(
+            gateway
+                .attached_appliances
+                .clone()
+                .unwrap_or_default(),
+        ),
+        ..gateway.clone()
     }
 }
 
