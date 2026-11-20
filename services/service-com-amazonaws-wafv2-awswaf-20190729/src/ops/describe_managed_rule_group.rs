@@ -307,15 +307,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rules: Some(group.rule_summaries()),
             // A VENDOR publishes the labels of its own group FULLY QUALIFIED — each
             // entry is the whole label a matching request carries, which is the text
-            // a `LabelMatchStatement` composing against the group is written with —
-            // so the namespace is the prefix those labels already carry and is not
-            // reported a second time on its own. `AvailableLabels` and
-            // `ConsumedLabels` report what the catalogue publishes for the group,
-            // and a list the vendor publishes nothing for is left OFF rather than
-            // answered empty: an empty list states the group adds or matches no
-            // label at all, which is not what a group whose label texts nobody
-            // published has said.
-            label_namespace: None,
+            // a `LabelMatchStatement` composing against the group is written with.
+            // The namespace those labels carry is reported beside them, because
+            // `LabelNamespace` is "the label namespace prefix for this rule group.
+            // All labels added by rules in this rule group have this prefix", a
+            // property of the group rather than of any one label — so it is answered
+            // whichever of the group's labels this catalogue can cite.
+            // `AvailableLabels` and `ConsumedLabels` report what the catalogue
+            // publishes for the group, and a list the vendor publishes nothing for is
+            // left OFF rather than answered empty: an empty list states the group adds
+            // or matches no label at all, which is not what a group whose label texts
+            // nobody published has said.
+            label_namespace: Some(group.managed_label_namespace()),
             available_labels: published(group.available_labels()),
             consumed_labels: published(group.consumed_labels()),
         })

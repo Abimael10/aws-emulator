@@ -131,13 +131,17 @@ async fn every_catalogued_group_is_described_from_the_published_catalogue() {
                  got {response}"
             );
 
-            // A vendor publishes its own group's labels FULLY QUALIFIED, so the
-            // namespace is the prefix they carry and is not reported a second time
-            // on its own.
-            assert!(
-                response["LabelNamespace"].is_null(),
-                "case {case:?}: a vendor's own group reports no separate label \
-                 namespace, got {response}"
+            // "The label namespace prefix for this rule group. All labels added by
+            // rules in this rule group have this prefix"
+            // (`DescribeManagedRuleGroupResponse$LabelNamespace`): a property of the
+            // group, so it is reported for every published group, whichever of its
+            // labels this catalogue can cite.
+            assert_eq!(
+                response["LabelNamespace"],
+                json!(group.managed_label_namespace()),
+                "case {case:?}: expected the group's own published label namespace \
+                 {:?}, got {response}",
+                group.managed_label_namespace()
             );
 
             let expected_rules: Vec<(String, Value)> = group

@@ -10,8 +10,8 @@
 //! FULLY QUALIFIED under the namespace the publishing vendor states for the group
 //! (`awswaf:managed:<vendor>:<published slug>:`, whose slug is published and is not
 //! the group's API name), with a list the vendor publishes nothing for left OFF
-//! rather than answered empty, and with no separate `LabelNamespace` member because
-//! the namespace is the prefix those labels already carry.
+//! rather than answered empty, and with that same namespace reported in
+//! `LabelNamespace`, the prefix "all labels added by rules in this rule group have".
 //!
 //! The labels a group publishes are therefore the texts a `LabelMatchStatement`
 //! composing against that group is written with: the last suite here DISCOVERS a
@@ -86,7 +86,7 @@ fn is_label_name(label: &str) -> bool {
 }
 
 /// Every published group reports its label surface as its vendor publishes it: fully
-/// qualified labels under the group's own published namespace, no separate
+/// qualified labels under the group's own published namespace, that namespace in
 /// `LabelNamespace`, a consumed list only where the group's rules match on a label,
 /// and no label naming the group's API name.
 ///
@@ -111,12 +111,14 @@ async fn every_published_group_reports_its_label_surface_as_published() {
             let consumed = reported(&response, "ConsumedLabels");
             let namespace = group.managed_label_namespace();
 
-            // The namespace is the prefix the labels carry, so it is not reported a
-            // second time as a member of its own.
-            assert!(
-                response["LabelNamespace"].is_null(),
-                "case {case:?}: a vendor's own group reports no separate label \
-                 namespace, got {response}"
+            // "The label namespace prefix for this rule group. All labels added by
+            // rules in this rule group have this prefix": a property of the group, so
+            // it is reported whichever of its labels the catalogue can cite.
+            assert_eq!(
+                response["LabelNamespace"].as_str(),
+                Some(namespace.as_str()),
+                "case {case:?}: expected the group's own published label namespace \
+                 {namespace:?}, got {response}"
             );
 
             if available.is_empty() {

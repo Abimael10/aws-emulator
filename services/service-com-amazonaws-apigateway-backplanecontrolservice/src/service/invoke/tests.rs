@@ -93,25 +93,28 @@ fn the_data_plane_path_prefix_names_the_api_before_the_stage() {
     // partition a host of it is written in), along the spelling of the prefix itself
     // (extra slashes, a label that merely starts with it, one segment of it alone) and
     // along paths that carry no prefix at all, which the other addressings read.
+    //
+    // The invoke path the prefix leaves is a PATH: it keeps the `/` that introduces it,
+    // because it is what the stage reports as the request's own path.
     let cases: &[(&str, Option<(&str, &str)>)] = &[
         (
             "/_aws/execute-api/abc1230000/prod/pets",
-            Some(("abc1230000", "prod/pets")),
+            Some(("abc1230000", "/prod/pets")),
         ),
         (
             "/_aws/execute-api/abc1230000/prod",
-            Some(("abc1230000", "prod")),
+            Some(("abc1230000", "/prod")),
         ),
         ("/_aws/execute-api/abc1230000", Some(("abc1230000", ""))),
         // The endpoint HOST spelling, which is what a client that rewrote the endpoint it
         // was handed carries across: the api is the host's own first label.
         (
             "/_aws/abc1230000.execute-api.us-east-1.amazonaws.com/prod/pets",
-            Some(("abc1230000", "prod/pets")),
+            Some(("abc1230000", "/prod/pets")),
         ),
         (
             "/_aws/abc1230000.execute-api.us-east-1.amazonaws.com/prod",
-            Some(("abc1230000", "prod")),
+            Some(("abc1230000", "/prod")),
         ),
         (
             "/_aws/abc1230000.execute-api.us-east-1.amazonaws.com",
@@ -119,18 +122,18 @@ fn the_data_plane_path_prefix_names_the_api_before_the_stage() {
         ),
         (
             "/_aws/0123456789.execute-api-fips.us-gov-west-1.amazonaws.com/live/pets",
-            Some(("0123456789", "live/pets")),
+            Some(("0123456789", "/live/pets")),
         ),
         (
             "/_aws/abc1230000.execute-api.cn-north-1.amazonaws.com.cn/prod/pets",
-            Some(("abc1230000", "prod/pets")),
+            Some(("abc1230000", "/prod/pets")),
         ),
         // Empty segments are not segments, so the same address spelled with extra
         // slashes names the same api, and the invoke path it leaves is read by
         // [`split_stage`], which drops them too.
         (
             "//_aws//execute-api//abc1230000//prod//pets",
-            Some(("abc1230000", "/prod//pets")),
+            Some(("abc1230000", "//prod//pets")),
         ),
         // The prefix is read by exact segment equality, so a segment that merely starts
         // with it is a different path.

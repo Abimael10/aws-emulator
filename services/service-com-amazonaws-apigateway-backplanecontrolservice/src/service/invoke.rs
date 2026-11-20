@@ -1284,13 +1284,25 @@ fn split_execute_api_prefix(path: &str) -> Option<(&str, &str)> {
 /// The first non-empty segment of `path` and the path that follows it, or `None` for a
 /// path with no segment at all.
 ///
-/// The remainder keeps no leading `/` — [`path_segments`] drops empty segments, so the two
-/// spellings read the same — and is a SLICE of the path, so a resolved addressing borrows
-/// the request rather than copying it.
+/// The remainder KEEPS the `/` that introduces it, so what is left after a segment is
+/// stripped is still a PATH (`/a/b` -> `("a", "/b")`), exactly as the shared reading of a
+/// data-plane addressing answers it
+/// ([`::service_common::data_plane_addressing::first_segment`]). That matters because the
+/// remainder is the invoke path a resolved addressing carries, and the invoke path is
+/// REPORTED as the request's own path — it is what a web ACL's `FieldToMatch$UriPath`
+/// criterion inspects, and a URI path always begins with `/`
+/// ("the part of the URL that identifies a resource, for example, /images/daily-ad.jpg").
+/// Dropping it would make a path criterion decide one way for a client that reached this
+/// api on its own endpoint host and another way for one that carried the api id in the
+/// path. Nothing that only reads SEGMENTS is affected, because [`path_segments`] drops
+/// empty segments and so reads both spellings the same.
+///
+/// The remainder is a SLICE of the path, so a resolved addressing borrows the request
+/// rather than copying it.
 fn split_first_segment(path: &str) -> Option<(&str, &str)> {
     let trimmed = path.trim_start_matches('/');
-    let (first, rest) = match trimmed.split_once('/') {
-        Some((first, rest)) => (first, rest),
+    let (first, rest) = match trimmed.find('/') {
+        Some(end) => (&trimmed[..end], &trimmed[end..]),
         None => (trimmed, ""),
     };
     (!first.is_empty()).then_some((first, rest))
