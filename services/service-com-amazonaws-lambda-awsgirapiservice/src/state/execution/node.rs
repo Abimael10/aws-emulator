@@ -1873,7 +1873,10 @@ mod tests {
                 "a write outside the writable directory",
                 "require('fs').writeFileSync('/var/task/written.txt', 'x')",
             ),
-            ("a child process", "require('child_process')"),
+            (
+                "a child process",
+                "require('child_process').execSync('ls /')",
+            ),
             ("a socket", "require('net')"),
             ("a native binding", "process.binding('fs')"),
             ("a host path above the task root", "require('../../../etc/passwd')"),
@@ -2287,6 +2290,12 @@ mod tests {
                 "buffer",
                 "require('buffer').Buffer.from('hi', 'utf8').toString('base64')",
                 r#""aGk=""#,
+            ),
+            (
+                "child_process",
+                "(() => { try { require('child_process').execSync('ls'); return 'started'; } \
+                 catch (error) { return error.code; } })()",
+                r#""ENOSYS""#,
             ),
             (
                 "crypto",

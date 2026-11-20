@@ -16,9 +16,17 @@
 //! Node program expects and this emulator does not supply is simply not resolvable, so a
 //! handler that needs one fails to import exactly as it would if the dependency were
 //! missing from its package; nothing here pretends to be a module it is not.
+//!
+//! A module whose whole capability this runtime HAS NONE OF is supplied all the same, with
+//! the calls that need that capability refused ([`child_process`]): the standard library is
+//! part of what a managed runtime promises, so an import of one of its modules has to load
+//! — a program whose module body imports one and whose running code handles the refusal is
+//! a program that runs — and what is answered for is the CALL rather than the import.
 
 /// The byte container and its codecs.
 mod buffer;
+/// The child-process interface, on a runtime that starts no child.
+mod child_process;
 /// The digests, keyed digests and random bytes.
 mod crypto;
 /// The in-memory filesystem a function has.
@@ -38,6 +46,7 @@ pub(super) const CORE_MODULES: &[(&str, &str)] = &[
     ("util", UTIL_SOURCE),
     ("events", EVENTS_SOURCE),
     ("buffer", buffer::BUFFER_SOURCE),
+    ("child_process", child_process::CHILD_PROCESS_SOURCE),
     ("crypto", crypto::CRYPTO_SOURCE),
     ("fs", fs::FS_SOURCE),
     ("fs/promises", fs::FS_PROMISES_SOURCE),
@@ -570,7 +579,7 @@ mod tests {
                 );
             }
         }
-        for absent in ["net", "child_process", "worker_threads", "node:net", "", "node:"] {
+        for absent in ["net", "worker_threads", "node:net", "", "node:"] {
             assert!(
                 core_module_source(absent).is_none(),
                 "case {absent:?}: this emulator supplies no such core module, so none must \

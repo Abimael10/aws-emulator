@@ -306,6 +306,7 @@ const CORE_MODULE_NAMES: &[&str] = &[
     "util",
     "events",
     "buffer",
+    "child_process",
     "crypto",
     "fs",
     "fs/promises",

@@ -862,7 +862,10 @@ async fn a_node_handler_cannot_reach_the_host() {
             "a write outside the one writable directory",
             "require('fs').writeFileSync('/var/task/written', 'x')",
         ),
-        ("a child process", "require('child_process')"),
+        (
+            "a child process",
+            "require('child_process').execSync('ls /')",
+        ),
         ("a socket", "require('net')"),
         // The HTTP client the runtime does supply reaches only this emulator: a request to
         // an address off it is one the host does not make, so the handler fails on it.

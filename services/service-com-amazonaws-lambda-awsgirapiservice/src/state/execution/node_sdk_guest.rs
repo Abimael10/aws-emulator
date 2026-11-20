@@ -24,6 +24,11 @@
 //!   operation's input and answering a promise of its output (or calling a node callback when
 //!   one is passed). A method of it sends the very command `send` takes, so a handler written
 //!   either way makes one call made one way.
+//! * A client's `config` is the RESOLVED configuration a v3 client reports: every option it
+//!   was built with, with `region` normalised into the async provider a v3 client normalises
+//!   it into — `await client.config.region()` answers the Region the client's calls are
+//!   addressed to, which for a client built with none is the one the runtime exported to the
+//!   run.
 //! * A client's `config.credentials` is the PROVIDER a v3 client normalises whatever it was
 //!   built with into — an async function answering the credentials its calls are signed with,
 //!   which for a client built with none is the default chain's: the reserved credential
@@ -511,17 +516,31 @@ function notMade(answered) {
 
 function Client(configuration) {
     var held = configuration === undefined || configuration === null ? {} : configuration;
-    this.config = {
-        region: held.region === undefined ? globalThis.process.env.AWS_REGION : held.region,
+    var region = held.region === undefined ? globalThis.process.env.AWS_REGION : held.region;
+    // The RESOLVED configuration, which is what a v3 client reports as its own: every option
+    // it was built with, with the two a client normalises turned into the PROVIDERS it
+    // normalises them into ([`credentialProvider`], [`regionProvider`]) — so an option this
+    // seam does not read is still the option the handler passed, and `config.region` and
+    // `config.credentials` are read the way a v3 client's are, by calling them.
+    this.config = Object.assign({}, held, {
+        region: regionProvider(region),
         credentials: credentialProvider(held.credentials),
         endpoint: held.endpoint,
         serviceId: SERVICE
-    };
+    });
     // The credentials the client was built WITH, exactly as they were given: what a call is
     // signed with is decided from these ([`signedWith`]), and not from the provider above,
     // which a handler may read and which resolves the environment's for a client built with
     // none.
     this.builtWith = held.credentials;
+    // The Region this client's calls are addressed to, resolved when the client was built.
+    // Held beside the configuration because `config.region` is a provider, and answered to
+    // the host as text ([`Client.prototype.send`]); it is not an option of the SDK's own
+    // client, so it is not a member a handler reads off one.
+    Object.defineProperty(this, 'inRegion', {
+        value: typeof region === 'string' ? region : '',
+        enumerable: false
+    });
 }
 
 Object.defineProperty(Client, 'name', { value: '__CLIENT_NAME__' });
@@ -567,6 +586,19 @@ function credentialProvider(credentials) {
         }
         return Promise.resolve(resolved);
     };
+}
+
+// WHAT `client.config.region` IS: a v3 client normalises the Region it was built with into a
+// PROVIDER too — an async function answering the Region its calls are addressed to — which is
+// what `await client.config.region()` reads. A client built with none is given the provider of
+// the default chain, which in a Lambda execution environment answers the reserved Region
+// variable the runtime exported to the run.
+function regionProvider(region) {
+    if (typeof region === 'function') {
+        return region;
+    }
+    var resolved = typeof region === 'string' ? region : '';
+    return function () { return Promise.resolve(resolved); };
 }
 
 // WHICH CREDENTIALS a client's calls are signed with, as the document the runtime signs with:
@@ -631,7 +663,7 @@ Client.prototype.send = function (command) {
             reject(new TypeError('The argument must be a command of this client'));
             return;
         }
-        var region = typeof self.config.region === 'string' ? self.config.region : '';
+        var region = typeof self.inRegion === 'string' ? self.inRegion : '';
         var answered;
         try {
             answered = JSON.parse(host().awsCall(
