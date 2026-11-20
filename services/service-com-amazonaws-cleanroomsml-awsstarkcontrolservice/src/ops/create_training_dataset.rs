@@ -178,6 +178,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
+        // `roleArn` names the role Clean Rooms ML ACTS AS: it assumes that role and reads the
+        // training data under it, so the role is resolved before anything is persisted. A
+        // role the service cannot take on, and one it can take on but whose permissions
+        // withhold the read of the Glue table this create points at, are both reported as
+        // insufficient access ([`crate::state::role_authorization`]) — which is what
+        // `AccessDeniedException` models — and nothing is created.
+        if let Some(denied) = crate::state::role_authorization::withheld_training_data_access(
+            ctx,
+            &region,
+            &input.role_arn,
+            &input.training_data,
+        )
+        .await
+        {
+            return Err(CreateTrainingDatasetErrorModeled::AccessDeniedException(
+                AccessDeniedException { message: denied },
+            )
+            .into());
+        }
+
         // Clean Rooms ML reads the records of the Glue table a dataset points at out of the
         // Amazon S3 location that table stores its data at, so a create whose location holds
         // nothing to train on is refused before anything is persisted — which is why this is

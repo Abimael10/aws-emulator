@@ -178,6 +178,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+
+        // `roleArn` names the role Clean Rooms ML ACTS AS when it runs this algorithm's
+        // containers, so — as in `CreateTrainingDataset` — the role is resolved before
+        // anything is persisted and a role this service cannot take on is reported as
+        // insufficient access ([`crate::state::role_authorization`]).
+        if let Some(denied) =
+            crate::state::role_authorization::unassumable_role(ctx, &region, &input.role_arn).await
+        {
+            return Err(
+                CreateConfiguredModelAlgorithmErrorModeled::AccessDeniedException(
+                    AccessDeniedException { message: denied },
+                )
+                .into(),
+            );
+        }
+
         let mut store = state.lock();
 
         // The store is bounded: past its quota a create is refused rather than adding

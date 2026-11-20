@@ -22,10 +22,13 @@
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   generated routing table. THIS SERVICE takes it for authorization: a call that names
+//!   the IAM role this service acts as, and carries none, is answered
+//!   `AccessDeniedException` (403) there, because the role is resolved ahead of request
+//!   validation; see [`role_arn_authorization`].
 //! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//!   before any handler ran. THIS SERVICE takes it: a member ABSENT from the request is
+//!   stated with no value token at all; see [`validation`].
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -50,6 +53,13 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// The role-ARN authorization this service takes ahead of request validation: a call that
+/// names no role is an authorization failure, not a validation one.
+mod role_arn_authorization;
+
+/// How this service words a request the framework refused before any handler ran.
+mod validation;
+
 /// The `com-amazonaws-cleanroomsml-awsstarkcontrolservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -60,6 +70,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The codec every modelled answer of this service is serialized by, built ONCE
     /// here because [`Service::override_protocol`] hands back a borrow of it.
     protocol: service_common::date_time_json::DateTimeRestJson,
+    /// The 403 answer for a call that names no IAM role to act as. Held here so
+    /// [`Service::override_operation`] can hand out a reference to it; it carries no state,
+    /// because the denial is built from the request alone.
+    deny_absent_role_arn: role_arn_authorization::DenyAbsentRoleArn,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -70,7 +84,18 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             protocol: service_common::date_time_json::DateTimeRestJson::new(),
+            deny_absent_role_arn: role_arn_authorization::DenyAbsentRoleArn,
         }
+    }
+
+    /// Does `req` call an operation that takes an IAM role to act as, without naming one?
+    ///
+    /// The read itself is [`role_arn_authorization::absent_role_arn`], the one the refusal is
+    /// built from too, so the gate and the message it answers with cannot disagree about
+    /// which request is refused.
+    fn names_no_role_to_act_as(&self, req: &aws_smithy_runtime_api::http::Request) -> bool {
+        role_arn_authorization::absent_role_arn(self.entry.wire_protocol(req).protocol(), req)
+            .is_some()
     }
 }
 
@@ -96,26 +121,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Authorization comes before request validation: a call that names the IAM role this
+        // service acts as, and carries none, has no principal whose policies could allow it,
+        // so it is refused `AccessDeniedException` (403) here rather than falling to the
+        // modelled required-member rejection (400) the framework's pre-handler walk would
+        // answer with. See [`role_arn_authorization`]. Every other request resolves through
+        // the generated routing table.
+        self.names_no_role_to_act_as(req)
+            .then_some(&self.deny_absent_role_arn as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // This service states a member ABSENT from the request with no value token at all —
+        // there was no value to state — and every other clause with the value the request
+        // carried. The rendering, and the envelope around it, are the shared ones in
+        // `service_common::validation_message` — see [`validation`]. Code and message are
+        // replaced together, and the code stays the modelled `ValidationException` (HTTP 400)
+        // a client branches on.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

@@ -37,6 +37,11 @@ use std::time::{Duration, SystemTime};
 /// holds anything to train on.
 pub mod training_data_location;
 
+/// Whether the IAM role a create hands this service lets it do the create's work: whether
+/// the service can assume that role at all, and whether the permissions in force on it admit
+/// the read the create would make under it.
+pub mod role_authorization;
+
 // Clean Rooms' own store, which is where a membership lives: Clean Rooms ML
 // resources are created under a membership, and a membership is a Clean Rooms
 // resource, so this service reads one from the service that owns it rather than
