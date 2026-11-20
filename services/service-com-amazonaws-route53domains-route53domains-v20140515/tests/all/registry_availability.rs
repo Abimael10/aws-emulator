@@ -18,6 +18,12 @@
 //! are pinned here too: the TLD it does not delegate, a blank name, and the envelope
 //! every constraint violation is reported in.
 //!
+//! `GetDomainSuggestions` is pinned here as well, because a suggestion is the registry
+//! answering for a name it derived rather than one the caller named: the last section of
+//! this suite holds the derivation, the bound on how many names come back, and the
+//! requirement that a suggestion's own `Availability` and `Price` are the ones
+//! `CheckDomainAvailability` gives for that same name.
+//!
 //! Every test drives the real wire path through the shared harness in
 //! `tests/all/domain_lifecycle.rs`.
 
@@ -779,4 +785,514 @@ async fn a_nested_element_set_states_every_value_the_model_declares() {
         listed, declared,
         "the nested set must list every declared `OperationType`, got {message:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The rule: a suggestion is a registrable name derived from the requested one
+// ---------------------------------------------------------------------------
+
+/// A `GetDomainSuggestions` request body.
+fn suggestion_request(name: &str, count: i64, only_available: bool) -> Value {
+    json!({
+        "DomainName": name,
+        "SuggestionCount": count,
+        "OnlyAvailable": only_available,
+    })
+}
+
+/// `GetDomainSuggestions` for `request`, asserting a 200 and returning `SuggestionsList`.
+async fn suggest(emulator: &Emulator, case: &str, request: &Value) -> Vec<Value> {
+    let (status, body) = emulator.call("GetDomainSuggestions", request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected GetDomainSuggestions to answer 200, got {status} {body}"
+    );
+    body["SuggestionsList"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The `DomainName` of every suggestion, in the order the answer listed them.
+fn suggested_names(suggestions: &[Value]) -> Vec<String> {
+    suggestions
+        .iter()
+        .map(|suggestion| {
+            suggestion["DomainName"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_suggestion_is_a_registrable_name_derived_from_the_requested_one() {
+    // Rows differ along the TLD the caller asked under (generic, country-code, a
+    // two-label suffix, one the price table does not carry), the shape of the label, the
+    // number of names asked for (both documented bounds among them) and the case of the
+    // request.
+    let cases: [(&str, i64); 6] = [
+        ("sim-probe-suggest.com", 1),
+        ("sim-probe-suggest.com", 7),
+        ("z0-9.io", 50),
+        ("sim-probe-suggest.co.uk", 12),
+        // A TLD outside the published rate table is still a TLD a registry delegates.
+        ("sim-probe-suggest.shop", 5),
+        // Domain names are not case sensitive.
+        ("SIM-PROBE-SUGGEST.COM", 7),
+    ];
+    let emulator = Emulator::new();
+
+    for (requested, count) in cases {
+        let case = format!("{requested} x{count}");
+        let lowered = requested.to_lowercase();
+        let (label, tld) = lowered.split_once('.').expect("a label and a suffix");
+        // `OnlyAvailable` false, so nothing is filtered out and the bound on the answer is
+        // the only thing that limits it.
+        let suggestions = suggest(
+            &emulator,
+            &case,
+            &suggestion_request(requested, count, false),
+        )
+        .await;
+        let names = suggested_names(&suggestions);
+
+        assert_eq!(
+            names.len(),
+            usize::try_from(count).expect("a positive count"),
+            "case {case:?}: at most, and here exactly, the requested number of \
+             suggestions, got {names:?}"
+        );
+        let unique: std::collections::BTreeSet<&String> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "case {case:?}: a suggestion must not repeat, got {names:?}"
+        );
+
+        for name in &names {
+            assert_ne!(
+                name, &lowered,
+                "case {case:?}: the requested name is never suggested back, got {names:?}"
+            );
+            let (suggested_label, _) = name.split_once('.').unwrap_or((name.as_str(), ""));
+            assert!(
+                suggested_label.contains(label),
+                "case {case:?}: a suggestion is derived from the requested label \
+                 {label:?}, got {name:?}"
+            );
+            // Registrable: a caller can take any suggestion straight to the registry.
+            let body = check(&emulator, name).await;
+            assert!(
+                body["Availability"].is_string(),
+                "case {case:?}: suggestion {name:?} must be a name the registry answers \
+                 for, got {body}"
+            );
+        }
+        assert!(
+            names.iter().any(|name| name.ends_with(&format!(".{tld}")))
+                || names
+                    .iter()
+                    .any(|name| name.starts_with(&format!("{label}."))),
+            "case {case:?}: suggestions keep either the requested label or the requested \
+             suffix, got {names:?}"
+        );
+
+        // The same question twice is the same answer, in the same order: the list is
+        // computed from the requested name, not from anything that varies per call.
+        let again = suggest(
+            &emulator,
+            &case,
+            &suggestion_request(requested, count, false),
+        )
+        .await;
+        assert_eq!(
+            suggested_names(&again),
+            names,
+            "case {case:?}: the same request must answer the same list"
+        );
+        let other_case = suggest(
+            &emulator,
+            &case,
+            &suggestion_request(&requested.to_uppercase(), count, false),
+        )
+        .await;
+        assert_eq!(
+            suggested_names(&other_case),
+            names,
+            "case {case:?}: domain names are not case sensitive, so the same name in \
+             another case answers the same list"
+        );
+    }
+}
+
+#[tokio::test]
+async fn suggestions_are_unchecked_and_unpriced_unless_only_available_is_true() {
+    // `DomainSuggestion.Availability` and `.Price` are each "populated only if you
+    // specified true for OnlyAvailable in the request", and with false Route 53 "returns
+    // domain names without checking whether they're available" — so a name the registry
+    // already holds is among them. Rows differ along the requested name, including one
+    // whose label is held by a third party under every generic suffix.
+    let emulator = Emulator::new();
+
+    for requested in ["example.io", "sim-probe-unchecked.com", "z0-9.dev"] {
+        let suggestions = suggest(
+            &emulator,
+            requested,
+            &suggestion_request(requested, 30, false),
+        )
+        .await;
+        assert!(
+            !suggestions.is_empty(),
+            "case {requested:?}: expected suggestions, got none"
+        );
+        for suggestion in &suggestions {
+            assert!(
+                suggestion.get("Availability").is_none_or(Value::is_null),
+                "case {requested:?}: Availability is populated only for OnlyAvailable \
+                 true, got {suggestion}"
+            );
+            assert!(
+                suggestion.get("Price").is_none_or(Value::is_null),
+                "case {requested:?}: Price is populated only for OnlyAvailable true, \
+                 got {suggestion}"
+            );
+        }
+    }
+
+    // Nothing was filtered: the names a third party holds are suggested too, and the same
+    // request with `OnlyAvailable` true leaves exactly those out.
+    let unchecked = suggested_names(
+        &suggest(
+            &emulator,
+            "example.io unchecked",
+            &suggestion_request("example.io", 30, false),
+        )
+        .await,
+    );
+    let available = suggested_names(
+        &suggest(
+            &emulator,
+            "example.io available",
+            &suggestion_request("example.io", 30, true),
+        )
+        .await,
+    );
+    for held in ["example.com", "example.net", "example.org"] {
+        assert!(
+            unchecked.contains(&held.to_string()),
+            "case {held:?}: an unchecked answer suggests a held name too, got {unchecked:?}"
+        );
+        assert!(
+            !available.contains(&held.to_string()),
+            "case {held:?}: an OnlyAvailable answer leaves a held name out, got {available:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_only_available_suggestion_carries_the_registrys_own_answer_for_it() {
+    // Rows differ along the TLD asked under and the number asked for; every suggestion is
+    // then checked against `CheckDomainAvailability` for that same name, which is the one
+    // answer the registry has for it.
+    let cases: [(&str, i64); 4] = [
+        ("sim-probe-match.com", 1),
+        ("sim-probe-match.io", 9),
+        ("sim-probe-match.co.uk", 20),
+        ("example.net", 15),
+    ];
+    let emulator = Emulator::new();
+
+    for (requested, count) in cases {
+        let case = format!("{requested} x{count}");
+        let suggestions = suggest(
+            &emulator,
+            &case,
+            &suggestion_request(requested, count, true),
+        )
+        .await;
+        assert!(
+            !suggestions.is_empty(),
+            "case {case:?}: expected suggestions, got none"
+        );
+        assert!(
+            suggestions.len() <= usize::try_from(count).expect("a positive count"),
+            "case {case:?}: never more than the requested number, got {}",
+            suggestions.len()
+        );
+
+        for suggestion in &suggestions {
+            let name = suggestion["DomainName"].as_str().unwrap_or_default();
+            let checked = check(&emulator, name).await;
+            assert_eq!(
+                suggestion["Availability"].as_str(),
+                Some("AVAILABLE"),
+                "case {case:?}: an OnlyAvailable suggestion is AVAILABLE, got {suggestion}"
+            );
+            assert_eq!(
+                suggestion["Availability"], checked["Availability"],
+                "case {case:?}: suggestion {name:?} must carry the registry's own \
+                 answer, got {suggestion} against {checked}"
+            );
+            assert_eq!(
+                suggestion["Price"], checked["Price"],
+                "case {case:?}: suggestion {name:?} must carry the standard price of its \
+                 TLD, got {suggestion} against {checked}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn registering_a_suggested_name_takes_it_out_of_the_available_suggestions() {
+    // The filter reads the registrar's store, so a name this account registers stops
+    // being suggested as available — and is still suggested when nothing is checked.
+    let emulator = Emulator::new();
+    let requested = "sim-probe-pick.com";
+    let before = suggested_names(
+        &suggest(
+            &emulator,
+            requested,
+            &suggestion_request(requested, 50, true),
+        )
+        .await,
+    );
+    let taken = before
+        .first()
+        .cloned()
+        .expect("at least one available suggestion");
+
+    let (status, body) = emulator
+        .call(
+            "RegisterDomain",
+            &registration(&taken, 1, &person_contact()),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {taken:?}: expected RegisterDomain to succeed, got {status} {body}"
+    );
+    // Read it back through the implemented reader: the suggestion is now a registration.
+    let (status, detail) = emulator
+        .call("GetDomainDetail", &json!({ "DomainName": taken }))
+        .await;
+    assert_eq!(
+        (status, detail["DomainName"].as_str()),
+        (200, Some(taken.as_str())),
+        "case {taken:?}: expected GetDomainDetail to report the registration, got {status} {detail}"
+    );
+
+    let after = suggested_names(
+        &suggest(
+            &emulator,
+            requested,
+            &suggestion_request(requested, 50, true),
+        )
+        .await,
+    );
+    assert!(
+        !after.contains(&taken),
+        "case {taken:?}: a registered name is no longer an available suggestion, got {after:?}"
+    );
+    let unchecked = suggested_names(
+        &suggest(
+            &emulator,
+            requested,
+            &suggestion_request(requested, 50, false),
+        )
+        .await,
+    );
+    assert!(
+        unchecked.contains(&taken),
+        "case {taken:?}: an unchecked answer suggests it all the same, got {unchecked:?}"
+    );
+
+    // Deleting it puts it back among the available suggestions.
+    let (status, body) = emulator
+        .call("DeleteDomain", &json!({ "DomainName": taken }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {taken:?}: expected DeleteDomain to succeed, got {status} {body}"
+    );
+    let restored = suggested_names(
+        &suggest(
+            &emulator,
+            requested,
+            &suggestion_request(requested, 50, true),
+        )
+        .await,
+    );
+    assert_eq!(
+        restored, before,
+        "case {taken:?}: deleting the registration restores the earlier suggestions"
+    );
+}
+
+#[tokio::test]
+async fn only_standard_prices_selects_nothing_out_of_the_suggestions() {
+    // Every name this registry quotes is priced at the standard rate of its TLD, so the
+    // member that keeps premium-priced names out ("If true, Route 53 returns only domain
+    // names that are priced at the standard registration rate for their TLD") cannot
+    // change the answer. Rows differ along the value the member carries, absent included.
+    let emulator = Emulator::new();
+    let requested = "sim-probe-standard.com";
+    let baseline = suggested_names(
+        &suggest(
+            &emulator,
+            requested,
+            &suggestion_request(requested, 10, true),
+        )
+        .await,
+    );
+
+    for only_standard in [Some(true), Some(false), None] {
+        let mut request = suggestion_request(requested, 10, true);
+        if let Some(flag) = only_standard {
+            request["OnlyStandardPrices"] = json!(flag);
+        }
+        let case = format!("OnlyStandardPrices {only_standard:?}");
+        let names = suggested_names(&suggest(&emulator, &case, &request).await);
+        assert_eq!(
+            names, baseline,
+            "case {case:?}: every suggested name is priced at its TLD's standard rate, \
+             so the answer is the same"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rule: a suggestion request outside what the model documents is refused
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_suggestion_count_outside_the_documented_range_is_refused() {
+    // `SuggestionCount`: "Specify a value between 1 and 50." The model declares no
+    // `@range`, so the service enforces it. Rows differ along which side of the range the
+    // value falls and how far outside it sits — each published bound, one past it, and a
+    // value far beyond.
+    let refused: [i64; 5] = [0, -1, 51, 100, 1000];
+    let emulator = Emulator::new();
+
+    for count in refused {
+        let (status, body) = emulator
+            .call(
+                "GetDomainSuggestions",
+                &suggestion_request("sim-probe-count.com", count, true),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "InvalidInput".to_string()),
+            "case {count}: expected 400 InvalidInput, got {status} {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(
+                format!("Invalid request. Problems: SuggestionCount {count} must be between 1 and 50")
+                    .as_str()
+            ),
+            "case {count}: the refusal names the member, the value and the bounds, got {body}"
+        );
+    }
+
+    // Both published bounds are accepted.
+    for count in [1_i64, 50] {
+        let case = format!("count {count}");
+        let suggestions = suggest(
+            &emulator,
+            &case,
+            &suggestion_request("sim-probe-count.com", count, true),
+        )
+        .await;
+        assert!(
+            !suggestions.is_empty()
+                && suggestions.len() <= usize::try_from(count).expect("a positive count"),
+            "case {case:?}: a count inside the documented range is answered, got {} \
+             suggestions",
+            suggestions.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_request_that_leaves_the_suggestion_count_out_is_refused_as_well() {
+    // `SuggestionCount` is modelled `@required`, so a body that leaves it out never
+    // reaches the handler at all: the boundary refuses the absent member in this service's
+    // validation envelope, under the one client-input error it declares.
+    let emulator = Emulator::new();
+    let (status, body) = emulator
+        .call(
+            "GetDomainSuggestions",
+            &json!({ "DomainName": "sim-probe-count.com", "OnlyAvailable": true }),
+        )
+        .await;
+    assert_eq!(
+        (status, error_code(&body)),
+        (400, "InvalidInput".to_string()),
+        "expected 400 InvalidInput, got {status} {body}"
+    );
+    assert_eq!(
+        body["message"].as_str(),
+        Some(
+            one_violation(
+                "Value null at 'suggestionCount' failed to satisfy constraint: Member must \
+                 not be null"
+            )
+            .as_str()
+        ),
+        "an absent required member is refused as absent, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_name_the_registry_cannot_answer_for_is_refused_by_the_suggestions_too() {
+    // The requested name is resolved by the one rule every domain-scoped operation
+    // applies, so `GetDomainSuggestions` refuses what `CheckDomainAvailability` refuses
+    // and in the same words. Rows differ along the problem: a suffix no registry
+    // delegates, a name below the level a registrar sells, and a member carrying no name.
+    let cases: [(&str, &str, &str); 4] = [
+        (
+            "sim-probe.doesnotexisttld",
+            "UnsupportedTLD",
+            "The doesnotexisttld TLD is not supported",
+        ),
+        (
+            "sim-probe.invalid",
+            "UnsupportedTLD",
+            "The invalid TLD is not supported",
+        ),
+        (
+            "a.b.example.com",
+            "UnsupportedTLD",
+            "The b.example.com TLD is not supported",
+        ),
+        (
+            "",
+            "InvalidInput",
+            "Invalid request. Problems: Domain name cannot be blank",
+        ),
+    ];
+    let emulator = Emulator::new();
+
+    for (requested, code, message) in cases {
+        let (status, body) = emulator
+            .call(
+                "GetDomainSuggestions",
+                &suggestion_request(requested, 5, true),
+            )
+            .await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, code.to_string()),
+            "case {requested:?}: expected 400 {code}, got {status} {body}"
+        );
+        assert_eq!(
+            body["message"].as_str(),
+            Some(message),
+            "case {requested:?}: expected the same words `CheckDomainAvailability` uses, \
+             got {body}"
+        );
+    }
 }

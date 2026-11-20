@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDomainSuggestions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDomainSuggestions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers with names DERIVED from the one the caller asked about: the requested label
+//! under the other top-level domains this registrar offers, and variants of that label,
+//! each a name a registry would accept and none of them the requested name itself
+//! (`crate::state::suggestion_candidates` states the derivation).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDomainSuggestions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `OnlyAvailable` decides what a suggestion carries: with `true` the answer holds only
+//! names the registry does not already hold, each reported `AVAILABLE` with the standard
+//! price of its TLD; with `false` names are returned without checking the registry at all,
+//! so neither member is populated. At most `SuggestionCount` names come back, and fewer
+//! when fewer derive; a count outside the 1-to-50 range the member documents is refused
+//! with the modelled `InvalidInput`.
+//!
+//! This operation is a pure read: it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +133,29 @@ impl From<GetDomainSuggestionsErrorModeled> for GetDomainSuggestionsError {
     }
 }
 
+/// How this operation refuses a `DomainName` it cannot resolve: `InvalidInput` for a
+/// malformed name, `UnsupportedTLD` for a TLD the registrar does not offer. Both are
+/// errors this operation's model declares.
+fn refuse_domain_name(
+    raw: &str,
+    err: crate::state::DomainNameError,
+) -> GetDomainSuggestionsError {
+    match err {
+        crate::state::DomainNameError::Invalid => {
+            GetDomainSuggestionsErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::invalid_domain_name_message(raw)),
+            })
+            .into()
+        }
+        crate::state::DomainNameError::UnsupportedTld => {
+            GetDomainSuggestionsErrorModeled::UnsupportedTLD(UnsupportedTLD {
+                message: Some(crate::state::unsupported_tld_message(raw)),
+            })
+            .into()
+        }
+    }
+}
+
 /// The `GetDomainSuggestions` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,18 +192,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDomainSuggestions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDomainSuggestionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDomainSuggestions"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let name = crate::state::resolve_domain_name(&input.domain_name)
+            .map_err(|err| refuse_domain_name(&input.domain_name, err))?;
+
+        // `SuggestionCount` carries no `@range` in the model, so the documented rule —
+        // "Specify a value between 1 and 50" — is this handler's to enforce, as the
+        // client-input error the operation models.
+        let wanted = crate::state::wanted_suggestions(input.suggestion_count).ok_or_else(|| {
+            GetDomainSuggestionsErrorModeled::InvalidInput(InvalidInput {
+                message: Some(crate::state::suggestion_count_message(input.suggestion_count)),
+            })
+        })?;
+
+        // The names to offer are derived from the requested one alone, so they are
+        // computed before the store is locked: the only thing the registry is asked is
+        // whether it holds one of them.
+        let candidates = crate::state::suggestion_candidates(&name);
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::state::state_unavailable(Self::NAME))?;
+        let registry = state.lock();
+
+        // `OnlyStandardPrices` selects nothing out here: it keeps out "domain names with
+        // premium pricing", and every name this registry quotes is priced at the standard
+        // rate of its TLD (`crate::state::standard_registration_price`), so the same names
+        // are suggested whichever way the member is set.
+        let mut suggestions: Vec<DomainSuggestion> = Vec::new();
+        for candidate in candidates {
+            if suggestions.len() >= wanted {
+                break;
+            }
+            if !input.only_available {
+                // "If OnlyAvailable is false, Route 53 returns domain names without
+                // checking whether they're available to be registered", and both
+                // `Availability` and `Price` are "populated only if you specified true for
+                // OnlyAvailable in the request".
+                suggestions.push(DomainSuggestion {
+                    domain_name: Some(candidate),
+                    availability: None,
+                    price: None,
+                });
+                continue;
+            }
+            // "If OnlyAvailable is true, Route 53 returns only domain names that are
+            // available" — the registry's own answer, the one `CheckDomainAvailability`
+            // gives for the same name, so a name ANY registrant holds is left out.
+            if registry.is_registered(&candidate) {
+                continue;
+            }
+            let price =
+                crate::state::standard_registration_price(crate::state::tld_of(&candidate));
+            suggestions.push(DomainSuggestion {
+                domain_name: Some(candidate),
+                availability: Some(crate::state::AVAILABILITY_AVAILABLE.to_string()),
+                price: Some(price),
+            });
+        }
+
+        Ok(GetDomainSuggestionsOutput {
+            suggestions_list: Some(suggestions),
+        })
     }
 }

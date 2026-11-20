@@ -9,7 +9,8 @@
 //! What the REGISTRY knows rather than what the account holds — the names registered
 //! outside this account, and the standard registration price of a TLD — lives in the
 //! [`registry`] child module and is re-exported here, so a handler reaches all of it
-//! through `crate::state`.
+//! through `crate::state`. How a SUGGESTED name is derived from a name a caller asked
+//! about lives beside it in [`suggestions`], re-exported the same way.
 //!
 //! The domain-model helpers live here too — name normalisation, the documented name
 //! syntax, the public-suffix rule that decides what a registry delegates, the delegation
@@ -25,6 +26,12 @@ pub use registry::{
     AVAILABILITY_UNAVAILABLE, CURRENCY_USD, DEFAULT_STANDARD_REGISTRATION_RATE,
     PRICE_TYPE_STANDARD, STANDARD_REGISTRATION_RATES, TRANSFERABLE_DOMAIN_IN_OWN_ACCOUNT,
     TRANSFERABLE_UNTRANSFERABLE,
+};
+
+mod suggestions;
+pub use suggestions::{
+    suggestion_candidates, suggestion_count_message, wanted_suggestions, MAX_SUGGESTION_COUNT,
+    MIN_SUGGESTION_COUNT,
 };
 
 use crate::ops::types::{ContactDetail, Nameserver};
