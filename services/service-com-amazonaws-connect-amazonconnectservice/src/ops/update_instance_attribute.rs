@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateInstanceAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateInstanceAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateInstanceAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation stores
+//!
+//! One value per (instance, `InstanceAttributeType`) feature toggle, on that instance's
+//! [`crate::state::InstanceRecord`] — which is where `DescribeInstanceAttribute` reads it
+//! back from. A toggle takes one of the two booleans the modelled `Attribute` is a toggle
+//! for ([`crate::state::is_instance_attribute_toggle`]), so any other value is the bad
+//! parameter it is rather than a stored setting.
+//!
+//! The two call directions are not stored beside the instance's own
+//! `InboundCallsEnabled` / `OutboundCallsEnabled` flags but IN them, so setting the
+//! `INBOUND_CALLS` or `OUTBOUND_CALLS` toggle is what `DescribeInstance` then reports.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +187,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateInstanceAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateInstanceAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateInstanceAttribute"))
+        let _ = ctx;
+        // The path label is checked BEFORE anything else, by the one rule every
+        // operation addressing an instance applies
+        // (`crate::state::instance_label_refusal`): a label carrying no identifier at
+        // all is a request that addresses nothing, answered as the modelled
+        // `InvalidRequestException` (HTTP 400) whatever the store holds.
+        if let Some(refusal) = crate::state::instance_label_refusal(&input.instance_id) {
+            return Err(
+                UpdateInstanceAttributeErrorModeled::InvalidRequestException(refusal).into(),
+            );
+        }
+
+        // The value is checked BEFORE any state is resolved: a value that is not a
+        // toggle setting at all is a client-input fault whatever the store holds, and
+        // resolving first would report a missing resource for a request that was never
+        // valid. `AttributeType` needs no check of its own here — it is an enum the
+        // request boundary admits only the modelled members of.
+        if !crate::state::is_instance_attribute_toggle(&input.value) {
+            return Err(UpdateInstanceAttributeErrorModeled::InvalidParameterException(
+                crate::state::invalid_parameter(crate::state::INSTANCE_ATTRIBUTE_VALUE_PARAMETER),
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateInstanceAttributeErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Amazon Connect store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The toggle belongs to an instance, so there is nothing to set until that
+        // instance exists — including an identifier that named one until a delete
+        // retired it.
+        let instance = store.instances.get_mut(&input.instance_id).ok_or_else(|| {
+            UpdateInstanceAttributeErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+        })?;
+
+        instance.set_instance_attribute(&input.attribute_type, &input.value);
+
+        // The modelled output is empty: the stored value is what
+        // `DescribeInstanceAttribute` answers with. The request's `ClientToken` needs no
+        // record of its own — setting a toggle to a value is idempotent in itself, so a
+        // retry carrying the same token leaves the same value stored.
+        Ok(UpdateInstanceAttributeOutput)
     }
 }

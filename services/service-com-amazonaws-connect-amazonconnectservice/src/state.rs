@@ -43,6 +43,17 @@ pub use chat_contacts::{
     MAX_ATTRIBUTES_BYTES, REQUIRED_MESSAGING_CONTENT_TYPE, SUPPORTED_MESSAGING_CONTENT_TYPES,
 };
 
+/// The instance's feature toggles: what `UpdateInstanceAttribute` writes and
+/// `DescribeInstanceAttribute` reads back. Its own file because it is one concern of its
+/// own, and it is re-exported so a handler reaches it through `crate::state` like
+/// everything else here.
+mod instance_attributes;
+pub use instance_attributes::{
+    default_instance_attribute_value, instance_attribute_toggle, is_instance_attribute_toggle,
+    ATTRIBUTES_ENABLED_BY_DEFAULT, INBOUND_CALLS_ATTRIBUTE, INSTANCE_ATTRIBUTE_DISABLED,
+    INSTANCE_ATTRIBUTE_ENABLED, INSTANCE_ATTRIBUTE_VALUE_PARAMETER, OUTBOUND_CALLS_ATTRIBUTE,
+};
+
 /// The tagging plane's lookup from a resource ARN to the tag map that resource carries:
 /// one concern of its own, so its own file. It declares no name of its own — it extends
 /// [`ComAmazonawsConnectAmazonconnectserviceState`] — so there is nothing to re-export.
@@ -970,6 +981,14 @@ pub struct InstanceRecord {
     /// Bounded without a quota of its own: one record per `AttachmentScope`, and that
     /// enum is finite.
     pub attached_files_configurations: BTreeMap<String, AttachedFilesConfigurationRecord>,
+    /// The feature toggles `UpdateInstanceAttribute` has changed on this instance, keyed
+    /// by `InstanceAttributeType`. A type nobody has updated holds no entry and reports
+    /// its default, and the two call directions are never keyed here because they are the
+    /// instance's own flags (see [`Self::instance_attribute_value`]).
+    ///
+    /// Bounded without a quota of its own: the request boundary admits only the values
+    /// `InstanceAttributeType` declares, and that enum is finite.
+    pub instance_attributes: BTreeMap<String, String>,
 }
 
 impl InstanceRecord {
@@ -1010,6 +1029,7 @@ impl InstanceRecord {
             chat_contacts: BTreeMap::new(),
             storage_configs: BTreeMap::new(),
             attached_files_configurations: BTreeMap::new(),
+            instance_attributes: BTreeMap::new(),
         }
     }
 

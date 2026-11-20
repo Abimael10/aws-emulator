@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInstanceAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInstanceAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInstanceAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Looks the instance up by id and projects its `AttributeType` toggle onto the modelled
+//! `Attribute` shape ([`crate::state::InstanceRecord::instance_attribute`]). Every
+//! attribute type the model declares has a value from the moment the instance exists —
+//! an updated one, the instance's own call-direction flag, or that type's default — and
+//! all three are derived from what is already stored, so this read writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +148,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInstanceAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInstanceAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInstanceAttribute"))
+        let _ = ctx;
+        // The path label is checked BEFORE any state is resolved, by the one rule every
+        // operation addressing an instance applies
+        // (`crate::state::instance_label_refusal`): a label carrying no identifier at
+        // all is a request that addresses nothing, answered as the modelled
+        // `InvalidRequestException` (HTTP 400) rather than as a missing resource.
+        if let Some(refusal) = crate::state::instance_label_refusal(&input.instance_id) {
+            return Err(
+                DescribeInstanceAttributeErrorModeled::InvalidRequestException(refusal).into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeInstanceAttributeErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Amazon Connect store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // A toggle belongs to an instance, so there is nothing to report until that
+        // instance exists — including an identifier that named one until a delete
+        // retired it.
+        let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
+            DescribeInstanceAttributeErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+        })?;
+
+        Ok(DescribeInstanceAttributeOutput {
+            attribute: Some(instance.instance_attribute(&input.attribute_type)),
+        })
     }
 }

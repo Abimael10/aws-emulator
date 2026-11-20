@@ -89,15 +89,16 @@ async fn each_service_sharing_the_connect_signing_name_serves_its_own_path_space
     // Contact Lens owns `/realtime-contact-analysis`: its one operation is implemented,
     // and with no analysis session seeded it answers its own modeled
     // `ResourceNotFoundException`. Amazon Connect owns `/instance` (and the rest of its
-    // model's path space): `ListInstances` and `DescribeInstance` are implemented, so
-    // they answer from Connect's own store, while an operation still carrying the
-    // scaffold header (`DescribeInstanceAttribute`) answers the scaffold's
-    // `NotImplemented`. Asserting WHAT the response carries, not just the status, is
-    // what excludes the two routing failures: the router answers `UnknownService` (404)
-    // when nobody claims a request and `AmbiguousService` (500) when both do, so a row
-    // naming a service's own error — or a member only its output has — can only pass
-    // when exactly one service claimed it.
-    let rows: [(&str, &str, &str, &'static str, u16, Expect); 4] = [
+    // model's path space): `ListInstances`, `DescribeInstance` and
+    // `DescribeInstanceAttribute` are implemented, so they answer from Connect's own
+    // store, while an operation still carrying the scaffold header
+    // (`ListInstanceAttributes`) answers the scaffold's `NotImplemented`. Asserting WHAT
+    // the response carries, not just the status, is what excludes the two routing
+    // failures: the router answers `UnknownService` (404) when nobody claims a request
+    // and `AmbiguousService` (500) when both do, so a row naming a service's own error —
+    // or a member only its output has — can only pass when exactly one service claimed
+    // it.
+    let rows: [(&str, &str, &str, &'static str, u16, Expect); 5] = [
         (
             "contact lens analysis segments",
             "POST",
@@ -130,6 +131,14 @@ async fn each_service_sharing_the_connect_signing_name_serves_its_own_path_space
             "amazon connect instance attribute describe",
             "GET",
             "/instance/inst-1/attribute/INBOUND_CALLS",
+            "",
+            404,
+            Expect::Error("ResourceNotFoundException"),
+        ),
+        (
+            "amazon connect instance attributes list",
+            "GET",
+            "/instance/inst-1/attributes",
             "",
             501,
             Expect::Error("NotImplemented"),
