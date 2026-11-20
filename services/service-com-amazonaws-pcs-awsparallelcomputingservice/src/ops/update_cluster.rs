@@ -2,10 +2,12 @@
 
 //! @op UpdateCluster
 //! Applies an update to a STORED cluster: refuses a scheduler version the service cannot
-//! move a cluster to, refuses a cluster whose own status — or whose queues and compute
-//! node groups — the service has not settled, merges the requested Slurm options into the
-//! stored record, and reports the cluster `UPDATING`, which the service owes `ACTIVE`
-//! again from the next request on. `GetCluster` reads back exactly what this wrote.
+//! move the cluster to — one that labels no release, and one that is not NEWER than the
+//! release the cluster is on — refuses a cluster whose own status, or whose queues and
+//! compute node groups, the service has not settled, merges the requested Slurm options
+//! into the stored record, and reports the cluster `UPDATING`, which the service owes
+//! `ACTIVE` again from the next request on. `GetCluster` reads back exactly what this
+//! wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -188,7 +190,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same rule the create path holds it to: the value must label a scheduler
         // release, and the "Valid Values" the documentation prints are not a gate. The
         // update path's own wording names no version. Refused before the store is touched,
-        // so the stored cluster is left exactly as it was.
+        // so the stored cluster is left exactly as it was. Whether that label is one this
+        // cluster can be moved TO is decided once the stored record is in hand, below.
         if let Some(scheduler) = input.scheduler.as_ref() {
             if let Some(refusal) =
                 crate::state::update_scheduler_version_violation(&scheduler.version)
@@ -253,6 +256,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::not_active(kind, &child_id),
             )
             .into());
+        }
+
+        // "The scheduler version to update the cluster to. You can only update to a newer
+        // version" (`UpdateSchedulerRequest$version`): the requested release is compared
+        // with the one the cluster is ON, and an update that would leave it on the same
+        // release or move it back to an older one is refused before anything is written.
+        if let Some(scheduler) = input.scheduler.as_ref() {
+            if let Some(refusal) = crate::state::scheduler_version_order_violation(
+                &cluster.scheduler.version,
+                &scheduler.version,
+            ) {
+                return Err(UpdateClusterErrorModeled::ValidationException(refusal).into());
+            }
         }
 
         // A member the request carries is applied; one it omits leaves the stored value

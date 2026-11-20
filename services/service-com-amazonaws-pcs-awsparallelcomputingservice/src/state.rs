@@ -1323,19 +1323,77 @@ pub fn create_scheduler_version_violation(
     )))
 }
 
+/// The sentence `UpdateCluster` answers for a scheduler version it will not move a cluster
+/// to, whichever of the update path's two rules the value failed: the service's own FIXED
+/// wording, naming neither the scheduler type, the version the request asked for, nor the
+/// one the cluster is on.
+const UNSUPPORTED_UPDATE_SCHEDULER_VERSION: &str =
+    "AWS PCS doesn't support the scheduler version you provided.";
+
 /// The modelled `ValidationException` (HTTP 400) `UpdateCluster` refuses a scheduler version
 /// with, or `None` when the service carries on with it.
 ///
 /// The same rule as [`create_scheduler_version_violation`] — the value must label a scheduler
 /// release, and the printed "Valid Values" are not a gate — answered in the update path's own
-/// fixed sentence, which names no type and no version.
+/// fixed sentence, which names no type and no version. Whether that label is one the cluster
+/// can be moved TO is the update path's second rule,
+/// [`scheduler_version_order_violation`].
 pub fn update_scheduler_version_violation(version: &str) -> Option<ValidationException> {
     if names_a_scheduler_release(version) {
         return None;
     }
     Some(service_validation(
-        "AWS PCS doesn't support the scheduler version you provided.".to_string(),
+        UNSUPPORTED_UPDATE_SCHEDULER_VERSION.to_string(),
     ))
+}
+
+/// The modelled `ValidationException` (HTTP 400) an update that would not move the cluster
+/// FORWARD is refused with, or `None` when the requested release is newer than the stored
+/// one.
+///
+/// THE RULE: `UpdateSchedulerRequest$version` is "The scheduler version to update the cluster
+/// to. You can only update to a newer version" — so an update is served only when the
+/// requested label orders strictly AFTER the label the resource is already on. A request
+/// naming the same release, or an older one, is a move the service does not perform: it is
+/// refused and the stored version is left exactly where it was. This is an ORDERING rule over
+/// the labels, not a set of releases ([`create_scheduler_version_violation`] says why no such
+/// set is a gate here).
+pub fn scheduler_version_order_violation(
+    stored: &str,
+    requested: &str,
+) -> Option<ValidationException> {
+    (!names_a_newer_release(stored, requested))
+        .then(|| service_validation(UNSUPPORTED_UPDATE_SCHEDULER_VERSION.to_string()))
+}
+
+/// Whether `requested` labels a release NEWER than `stored`.
+///
+/// A release label is made of the numeric components [`names_a_scheduler_release`] admits, so
+/// two labels order by those components read left to right as NUMBERS: `9.1` is older than
+/// `24.11` though it sorts after it as text, and `25.5` and `25.05` label one release. A label
+/// carrying fewer components than the other is read with zero for each component it omits, so
+/// `25.05` and `25.05.0` label one release too and only a nonzero patch component is newer
+/// than the bare `major.minor`.
+fn names_a_newer_release(stored: &str, requested: &str) -> bool {
+    let stored = scheduler_release_components(stored);
+    let requested = scheduler_release_components(requested);
+    let width = stored.len().max(requested.len());
+    let read_to_width = |mut components: Vec<u64>| {
+        components.resize(width, 0);
+        components
+    };
+    read_to_width(requested) > read_to_width(stored)
+}
+
+/// The numeric components of a scheduler release label, each component that reads as no
+/// number taken as zero — only a label [`names_a_scheduler_release`] accepts is ever stored
+/// or applied, and every component of one of those is one to
+/// [`SCHEDULER_VERSION_COMPONENT_DIGITS`] ASCII digits.
+fn scheduler_release_components(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map(|component| component.parse::<u64>().unwrap_or_default())
+        .collect()
 }
 
 /// Whether `version` labels a scheduler release: [`SCHEDULER_VERSION_COMPONENTS`]

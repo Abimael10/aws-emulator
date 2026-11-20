@@ -23,6 +23,11 @@ mod children_must_be_active;
 #[path = "cluster_update_and_endpoints/compute_node_group_update.rs"]
 mod compute_node_group_update;
 
+// Which scheduler releases an `UpdateCluster` can move a cluster to — the ORDERING rule the
+// member's own documentation states — is its own suite, declared the same way.
+#[path = "cluster_update_and_endpoints/scheduler_version_ordering.rs"]
+mod scheduler_version_ordering;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 
@@ -37,6 +42,15 @@ use crate::cluster_lifecycle::{call, emulator};
 /// `@length`, so the printed list is prose rather than a wire constraint.
 const RELEASE_LABELS: &[&str] = &[
     "24.11", "25.05", "25.11", "26.05", "23.11", "25.05.1", "25.5", "9999.1",
+];
+
+/// Release labels in ASCENDING order, so an update can walk them one after another: "You can
+/// only update to a newer version" (`UpdateSchedulerRequest$version`), so only a label newer
+/// than the one a cluster is on is applied. The rows mix labels the printed "Valid Values"
+/// name with ones it does not (a patch release and a far-future major), since the printed
+/// list is prose rather than a wire constraint.
+const ASCENDING_RELEASE_LABELS: &[&str] = &[
+    "24.05", "24.11", "25.05", "25.05.1", "25.11", "26.05", "9999.1",
 ];
 
 /// Values that label no scheduler release at all: an empty value, a word, a label with a
@@ -308,13 +322,14 @@ async fn create_cluster_accepts_every_scheduler_release_label() {
 }
 
 #[tokio::test]
-async fn update_cluster_accepts_every_scheduler_release_label() {
+async fn update_cluster_applies_every_newer_scheduler_release_label() {
     let router = emulator();
     let name = "update-versions";
+    // Older than every row below, so each one in turn is an update to a NEWER release.
     let (status, created) = call(
         &router,
         "CreateCluster",
-        &create_cluster(name, "24.11", "IPV4", None),
+        &create_cluster(name, "23.11", "IPV4", None),
     )
     .await;
     assert_eq!(status, 200, "case create: got {created}");
@@ -323,9 +338,10 @@ async fn update_cluster_accepts_every_scheduler_release_label() {
         .unwrap_or_default()
         .to_string();
 
-    // The update path holds `version` to the same rule, so every release label is applied
-    // and reads back — including the ones no printed list names.
-    for version in RELEASE_LABELS {
+    // The update path holds `version` to the shape rule the create path holds it to, so a
+    // release label newer than the stored one is applied and reads back — including the ones
+    // no printed list names.
+    for version in ASCENDING_RELEASE_LABELS {
         let (status, updated) = call(
             &router,
             "UpdateCluster",
@@ -360,7 +376,7 @@ async fn update_cluster_accepts_every_scheduler_release_label() {
     }
 
     // The version the cluster is left on by the loop above.
-    let settled_version = RELEASE_LABELS.last().copied().unwrap_or_default();
+    let settled_version = ASCENDING_RELEASE_LABELS.last().copied().unwrap_or_default();
 
     // A value that labels no release is refused, and the cluster is untouched.
     for version in NOT_RELEASE_LABELS {
