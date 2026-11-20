@@ -870,7 +870,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kms_key_arn: input.kms_key_arn.clone(),
             metrics_config: input.metrics_config.clone(),
             logging_config: input.logging_config.clone(),
-            scaling_config: input.scaling_config.clone(),
+            // A `ScalingConfig` that limits nothing is no scaling configuration, for the
+            // same reason as the criteria above: it is the value a later update REMOVES the
+            // configuration with (see [`crate::state::scaling_config_sets_no_limit`]), so a
+            // mapping asked for with it is stored with none and reports the member not at
+            // all.
+            scaling_config: input
+                .scaling_config
+                .clone()
+                .filter(|stated| !crate::state::scaling_config_sets_no_limit(stated)),
             destination_config: input.destination_config.clone(),
             // The error-handling options the model scopes to stream sources, each with
             // the default its own member documents: "The default value is -1, which sets

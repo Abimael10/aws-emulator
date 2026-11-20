@@ -8,11 +8,11 @@
 //! members the request states, leaves every member it omits at the value the store holds,
 //! and is ACCEPTED rather than applied — the operation answers 202 with the mapping in
 //! `Updating`, and the move to the state its `Enabled` setting asks for is owed by the
-//! clock. While a mapping is still settling (out of its create or out of an earlier
-//! update), or while its deletion is still owed, it is not available to take another
-//! change and a write to it is refused with the modelled `ResourceInUseException` — so two
-//! concurrent updates of one mapping have exactly one winner. A UUID no mapping is held
-//! under, and a `FunctionName` that names no function, are refused with the modelled
+//! clock. The window a mapping is NOT available to take a change in is the one its create
+//! opens, which is the model's own example of `ResourceInUseException`; a mapping that has
+//! settled out of it takes every further update, so two updates in a row are both accepted
+//! and the last one is the change that stands. A UUID no mapping is held under, and a
+//! `FunctionName` that names no function, are refused with the modelled
 //! `ResourceNotFoundException` without changing anything.
 //!
 //! Every row drives real HTTP requests through the router — over the ONE mapping harness
@@ -24,12 +24,9 @@
 //! settings its create stated.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_lambda_awsgirapiservice::state::{
-    ComAmazonawsLambdaAwsgirapiserviceState, EVENT_SOURCE_MAPPING_SETTLE_DELAY,
-};
+use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsgirapiserviceState;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
@@ -52,11 +49,6 @@ const STATE_DISABLED: &str = "Disabled";
 /// A UUID of the length `UUIDString` requires (`@length(min: 36, max: 36)`) that no mapping
 /// is held under.
 const UNHELD_UUID: &str = "11111111-2222-3333-4444-555555555555";
-
-/// How long past a due instant this suite waits before calling. The transitions are owed by
-/// the CLOCK, so nothing here sleeps on the emulator's behalf: it waits past the instant the
-/// call made due.
-const SLACK: Duration = Duration::from_millis(100);
 
 /// `UpdateEventSourceMapping` on the mapping `uuid` names.
 async fn update_mapping(router: &MultiServiceRouter, uuid: &str, body: &Value) -> Answer {
@@ -241,7 +233,19 @@ async fn an_update_replaces_the_members_it_states_and_settles_by_the_clock() {
             );
         }
 
-        tokio::time::sleep(EVENT_SOURCE_MAPPING_SETTLE_DELAY + SLACK).await;
+        // The settle out of the create window is owed by the CLOCK, so this waits for the
+        // mapping to REPORT the state its create asked for rather than for a span of its own.
+        await_mapping_state(
+            &router,
+            label,
+            &uuid,
+            if created_state_for(&case.create_extras) == STATE_CREATING {
+                STATE_ENABLED
+            } else {
+                STATE_DISABLED
+            },
+        )
+        .await;
         let updated = update_mapping(&router, &uuid, &case.update).await;
         assert_eq!(
             updated.status,
@@ -297,24 +301,15 @@ async fn an_update_replaces_the_members_it_states_and_settles_by_the_clock() {
         }
 
         // And once it is due, the mapping is in the state its `Enabled` setting asks for.
-        tokio::time::sleep(EVENT_SOURCE_MAPPING_SETTLE_DELAY + SLACK).await;
-        let settled = get_mapping(&router, &uuid).await;
-        assert_eq!(
-            (settled.status, settled.string("State")),
-            (200, Some(case.settles_into.to_string())),
-            "case {label:?}: the mapping must settle into {}, got {} {}",
-            case.settles_into,
-            settled.status,
-            settled.text()
-        );
+        await_mapping_state(&router, label, &uuid, case.settles_into).await;
     }
 }
 
 #[tokio::test]
-async fn of_two_concurrent_updates_of_one_mapping_exactly_one_wins() {
-    // Each row races two updates of one mapping. They differ in what the two writers ask
-    // for, so the winner is observable in the stored mapping rather than only in the
-    // status codes.
+async fn of_two_updates_of_one_settled_mapping_the_last_one_stands() {
+    // Each row sends two updates of one mapping with no settle in between. They differ in
+    // what the two writers ask for, so which change stands is observable in the stored
+    // mapping rather than only in the status codes.
     for (label, function, first, second) in [
         (
             "two writers setting different batch sizes",
@@ -347,63 +342,45 @@ async fn of_two_concurrent_updates_of_one_mapping_exactly_one_wins() {
         let uuid = created
             .string("UUID")
             .unwrap_or_else(|| panic!("case {label:?}: the create answers a UUID"));
-        tokio::time::sleep(EVENT_SOURCE_MAPPING_SETTLE_DELAY + SLACK).await;
+        await_mapping_state(&router, label, &uuid, STATE_ENABLED).await;
 
         let mut answers = Vec::new();
         for body in [&first, &second] {
             answers.push(update_mapping(&router, &uuid, body).await);
         }
         let statuses: Vec<u16> = answers.iter().map(|answer| answer.status).collect();
-        let winners = answers.iter().filter(|answer| answer.status == 202).count();
-        assert_eq!(
-            winners, 1,
-            "case {label:?}: expected exactly one winner among the racers, got statuses \
-             {statuses:?}"
-        );
-
-        let loser = answers
-            .iter()
-            .find(|answer| answer.status != 202)
-            .unwrap_or_else(|| panic!("case {label:?}: one racer must be refused"));
         assert!(
-            loser.error_code().contains("ResourceInUseException"),
-            "case {label:?}: the loser is refused as the resource being unavailable, got {}",
-            loser.error_code()
-        );
-        assert_eq!(
-            loser
-                .string("message")
-                .or_else(|| loser.string("Message"))
-                .as_deref(),
-            Some("Cannot update the event source mapping because it is in use."),
-            "case {label:?}: the refusal is the fixed in-use sentence, got {:?}",
-            loser.text()
+            answers.iter().all(|answer| answer.status == 202),
+            "case {label:?}: a settled mapping takes both updates, got statuses {statuses:?} \
+             and {:?}",
+            answers
+                .iter()
+                .map(Answer::text)
+                .collect::<Vec<String>>()
         );
 
-        // The stored mapping is the WINNER's.
-        let winner = answers
-            .iter()
-            .find(|answer| answer.status == 202)
-            .unwrap_or_else(|| panic!("case {label:?}: one racer must succeed"));
+        // The stored mapping is the LAST writer's.
+        let last = answers
+            .last()
+            .unwrap_or_else(|| panic!("case {label:?}: both updates answered"));
         let held = stored(&engine, &uuid)
             .unwrap_or_else(|| panic!("case {label:?}: the mapping must still be held"));
-        let winner_batch_size = i32::try_from(
-            winner
-                .json()
+        let last_batch_size = i32::try_from(
+            last.json()
                 .get("BatchSize")
                 .and_then(Value::as_i64)
                 .unwrap_or_default(),
         )
         .unwrap_or_default();
         assert_eq!(
-            held.0, winner_batch_size,
-            "case {label:?}: the stored mapping must be the winner's, got {held:?}"
+            held.0, last_batch_size,
+            "case {label:?}: the stored mapping must be the last writer's, got {held:?}"
         );
         let reading = get_mapping(&router, &uuid).await;
         assert_eq!(
             reading.string("State"),
             Some(STATE_UPDATING.to_string()),
-            "case {label:?}: the winner's change is still being applied, got {}",
+            "case {label:?}: the last change accepted is still being applied, got {}",
             reading.text()
         );
     }

@@ -48,20 +48,32 @@
 //! after this update, so a mapping on a queue is never left with a batch it has no window to
 //! gather (see [`crate::state::queue_batch_window_refusal`]).
 //!
+//! A setting whose own documentation gives an EMPTY value a meaning is read that way rather
+//! than stored as it arrived: "To delete the filter criteria, specify an empty FilterCriteria
+//! object" and "(Amazon SQS only) The scaling configuration for the event source. To remove
+//! the configuration, pass an empty value" (`ScalingConfig`) — so a `FilterCriteria` carrying
+//! no filter and a `ScalingConfig` limiting nothing each REMOVE what the mapping carried, and
+//! every reader of it then reports the member not at all (see
+//! [`crate::state::criteria_carry_no_filter`] and
+//! [`crate::state::scaling_config_sets_no_limit`]).
+//!
 //! The operation answers 202 Accepted, so the change is NOT in effect when the call
 //! returns: the mapping moves into `Updating` — one of the states
 //! `EventSourceMappingConfiguration$State` enumerates — and the move to the state its
 //! `Enabled` setting asks for is owed by the CLOCK (see
 //! [`crate::state::EventSourceMappingRecord::begin_update`]). Nothing sleeps for it.
 //!
-//! That window is what makes a mapping UNAVAILABLE to a second write:
+//! The window a mapping is UNAVAILABLE to an update in is the one its own CREATE opens:
 //! `ResourceInUseException` is "The operation conflicts with the resource's availability.
 //! For example, you tried to update an event source mapping in the CREATING state, or you
-//! tried to delete an event source mapping currently UPDATING" — so an update that
-//! arrives while the mapping is still settling (whether from its create or from an
-//! earlier update) is refused with that modelled error rather than applied on top. Two
-//! concurrent updates of one mapping therefore have exactly one winner, and the loser is
-//! told to retry.
+//! tried to delete an event source mapping currently UPDATING" — so an update that arrives
+//! while the mapping is still being stood up is refused with that modelled error (see
+//! [`crate::state::EventSourceMappingRecord::is_creating`]), while the window an accepted
+//! change is being applied in is the one a DELETE is refused inside. A mapping that has
+//! settled out of its create therefore takes every further update, one after another and
+//! without waiting for the one before it to settle, and the last change accepted is the one
+//! that stands — which is what makes a setting reconfigurable and clearable at all. A value
+//! a member states is decided against its own constraints whatever the mapping is doing.
 //!
 //! A mapping whose DELETION has already been accepted is a different case: it is not an
 //! unavailable mapping but one on its way out, with nothing left to change, so an update of
@@ -439,10 +451,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                 ));
             }
-            // "The operation conflicts with the resource's availability": a mapping that is
-            // still settling — through its create or through an earlier update — is still
-            // there, but not available to take another change. See the module docs.
-            if record.is_settling() {
+            // "The operation conflicts with the resource's availability": the window a
+            // mapping is not available to be UPDATED in is the one its own create opens.
+            // See the module docs.
+            if record.is_creating() {
                 // The refusal is a FIXED sentence: it states that the mapping is in use,
                 // and names neither the mapping nor the state it is settling through.
                 return Err(resource_in_use(
@@ -660,8 +672,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.logging_config.is_some() {
             record.logging_config = input.logging_config.clone();
         }
-        if input.scaling_config.is_some() {
-            record.scaling_config = input.scaling_config.clone();
+        if let Some(scaling_config) = input.scaling_config.clone() {
+            // A scaling configuration the request states replaces the stored one — and one
+            // that limits nothing is what REMOVES it ("To remove the configuration, pass an
+            // empty value"), so the mapping is left with no scaling configuration rather
+            // than with a structure that limits nothing, and every reader of it reports the
+            // member not at all.
+            record.scaling_config = Some(scaling_config)
+                .filter(|stated| !crate::state::scaling_config_sets_no_limit(stated));
         }
         if input.maximum_batching_window_in_seconds.is_some() {
             record.maximum_batching_window_in_seconds = input.maximum_batching_window_in_seconds;

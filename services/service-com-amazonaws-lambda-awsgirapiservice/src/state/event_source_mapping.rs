@@ -354,6 +354,22 @@ pub fn metrics_config_refusal(
     })
 }
 
+/// Whether `scaling_config` configures NO scaling limit at all — the value that REMOVES a
+/// mapping's scaling configuration: "(Amazon SQS only) The scaling configuration for the
+/// event source. To remove the configuration, pass an empty value" (`ScalingConfig`).
+///
+/// What a scaling configuration configures is the one member it carries —
+/// `ScalingConfig$MaximumConcurrency`, which "limits the number of concurrent instances that
+/// the Amazon SQS event source can invoke" — so one carrying no value for it limits nothing.
+/// The calls that STATE a scaling configuration read such a value as no configuration rather
+/// than storing a structure that limits nothing, and every reader of the mapping then reports
+/// the member not at all. The same rule `FilterCriteria` carrying no filter is held to
+/// ([`crate::state::criteria_carry_no_filter`]).
+#[must_use]
+pub fn scaling_config_sets_no_limit(scaling_config: &crate::ops::types::ScalingConfig) -> bool {
+    scaling_config.maximum_concurrency.is_none()
+}
+
 /// Whether the event source supports reading from a stated instant, from
 /// `StartingPosition`'s own documentation: "AT_TIMESTAMP is supported only for Amazon
 /// Kinesis streams, Amazon DocumentDB, Amazon MSK, and self-managed Apache Kafka."
@@ -708,6 +724,25 @@ impl EventSourceMappingRecord {
         )
     }
 
+    /// Whether this mapping is still being STOOD UP by its own create — the `Creating`
+    /// window, which the clock closes at [`Self::settled_due`].
+    ///
+    /// What it is for: `ResourceInUseException` is "The operation conflicts with the
+    /// resource's availability. For example, you tried to update an event source mapping in
+    /// the CREATING state, or you tried to delete an event source mapping currently
+    /// UPDATING" — so the window a mapping is not available to be UPDATED in is the one its
+    /// create opens, while the one it is not available to be DELETED in is the one an
+    /// accepted update opens ([`Self::is_updating`]). A mapping that is applying a change it
+    /// already acknowledged still takes a further one, and the last change accepted is the
+    /// one that stands.
+    ///
+    /// Read it only after [`Self::materialize`], so a window the clock has already closed
+    /// is not read as still open.
+    #[must_use]
+    pub fn is_creating(&self) -> bool {
+        self.state == EVENT_SOURCE_MAPPING_STATE_CREATING
+    }
+
     /// Accept an `UpdateEventSourceMapping` of this mapping.
     ///
     /// The operation answers 202 Accepted, so the change is not in effect at the instant
@@ -776,9 +811,11 @@ impl EventSourceMappingRecord {
     /// `Updating` window [`Self::begin_update`] opens and the clock closes at
     /// [`Self::settled_due`].
     ///
-    /// What it is for: `ResourceInUseException` names that window as one a mapping is NOT
-    /// available in ("you tried to delete an event source mapping currently UPDATING"), so
-    /// a mapping inside it is immutable until the change it acknowledged has settled.
+    /// What it is for: `ResourceInUseException` names that window as the one a mapping is NOT
+    /// available to be DELETED in ("you tried to delete an event source mapping currently
+    /// UPDATING"), so a teardown asked for inside it is refused until the change the mapping
+    /// acknowledged has settled. A further UPDATE inside it is accepted — the window an
+    /// update is refused inside is the create's ([`Self::is_creating`]).
     /// Read it only after [`Self::materialize`], so a window the clock has already closed
     /// is not read as still open.
     #[must_use]
