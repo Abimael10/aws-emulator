@@ -1565,6 +1565,218 @@ async fn a_conflict_reports_the_message_that_restates_its_own_members() {
     }
 }
 
+/// One refusal case: the call that provokes it, the error code it must carry and the
+/// `Message` AWS words for it.
+///
+/// `expected_message` is spelled out by the rows themselves rather than taken from the
+/// handler's own helper, so a change to the wording this service renders fails here.
+struct MessageCase {
+    case: &'static str,
+    operation: &'static str,
+    request: serde_json::Value,
+    code: &'static str,
+    expected_message: String,
+}
+
+/// `ConflictException`'s message as this service renders it: the fixed prefix and the
+/// three quoted clauses, filled from the exception's own members.
+fn conflict_text(reason: &str, resource_type: &str, resource_id: &str) -> String {
+    format!(
+        "Conflict Occurred - Reason=\"{reason}\" ResourceType=\"{resource_type}\" \
+         ResourceId=\"{resource_id}\""
+    )
+}
+
+/// `ResourceNotFoundException`'s message as this service renders it: the same convention
+/// over the two members that exception carries.
+fn not_found_text(resource_type: &str, resource_id: &str) -> String {
+    format!("Resource Not Found - ResourceType=\"{resource_type}\" ResourceId=\"{resource_id}\"")
+}
+
+/// The longest name `ConfigurationSetName` accepts (len 1..64, pattern `^[A-Za-z0-9_-]+$`,
+/// per `smithy_query(query="operation",operation="CreateConfigurationSet")`), so one row
+/// drives the template with an id at the modelled maximum.
+fn longest_configuration_set_name() -> String {
+    let name = "Zz_-".repeat(16);
+    assert_eq!(
+        name.len(),
+        64,
+        "case \"longest name\": the row must sit on the modelled maximum, got {name:?}"
+    );
+    name
+}
+
+#[tokio::test]
+async fn every_conflict_and_not_found_message_restates_the_members_it_carries() {
+    let emulator = Emulator::new();
+
+    // Two sets whose names sit on the modelled bounds (1 and 64 characters), so the
+    // rendered id is not one shape of name only.
+    let longest = longest_configuration_set_name();
+    for name in ["s", longest.as_str()] {
+        emulator
+            .ok(
+                "CreateConfigurationSet",
+                serde_json::json!({"ConfigurationSetName": name}),
+            )
+            .await;
+    }
+    let protected_id = {
+        let mut request = number_request("GB", "PROMOTIONAL", "VOICE", "LONG_CODE");
+        request["DeletionProtectionEnabled"] = serde_json::Value::Bool(true);
+        request_number(&emulator, request).await
+    };
+    let leased_id = request_number(
+        &emulator,
+        number_request("US", "TRANSACTIONAL", "SMS", "SIMULATOR"),
+    )
+    .await;
+
+    // One row per refusal this slice can report: both message templates, four of the
+    // modelled `ResourceType` values and two of the modelled `ConflictExceptionReason`
+    // values (`smithy_query(query="shape",shape="ResourceType,ConflictExceptionReason")`),
+    // over ids of every form this service renders — a name at each modelled bound, a name
+    // the caller gave as an ARN, and a generated id.
+    let cases: Vec<MessageCase> = vec![
+        MessageCase {
+            case: "a second configuration set of a one-character name",
+            operation: "CreateConfigurationSet",
+            request: serde_json::json!({"ConfigurationSetName": "s"}),
+            code: "ConflictException",
+            expected_message: conflict_text(
+                "RESOURCE_ALREADY_EXISTS",
+                "configuration-set",
+                "s",
+            ),
+        },
+        MessageCase {
+            case: "a second configuration set of the longest name",
+            operation: "CreateConfigurationSet",
+            request: serde_json::json!({"ConfigurationSetName": longest}),
+            code: "ConflictException",
+            expected_message: conflict_text(
+                "RESOURCE_ALREADY_EXISTS",
+                "configuration-set",
+                &longest,
+            ),
+        },
+        MessageCase {
+            case: "releasing a deletion-protected number",
+            operation: "ReleasePhoneNumber",
+            request: serde_json::json!({"PhoneNumberId": protected_id.clone()}),
+            code: "ConflictException",
+            expected_message: conflict_text(
+                "DELETION_PROTECTION_ENABLED",
+                "phone-number",
+                &protected_id,
+            ),
+        },
+        MessageCase {
+            case: "deleting a configuration set that was never created",
+            operation: "DeleteConfigurationSet",
+            request: serde_json::json!({"ConfigurationSetName": "absent-set"}),
+            code: "ResourceNotFoundException",
+            expected_message: not_found_text("configuration-set", "absent-set"),
+        },
+        MessageCase {
+            case: "naming an absent configuration set by ARN",
+            operation: "SetDefaultMessageType",
+            request: serde_json::json!({
+                "ConfigurationSetName": configuration_set_arn("absent-by-arn"),
+                "MessageType": "TRANSACTIONAL",
+            }),
+            // The store is keyed by name, so the ARN resolves to the name it names and
+            // that is the id the refusal reports.
+            code: "ResourceNotFoundException",
+            expected_message: not_found_text("configuration-set", "absent-by-arn"),
+        },
+        MessageCase {
+            case: "releasing a number id that was never leased",
+            operation: "ReleasePhoneNumber",
+            request: serde_json::json!({"PhoneNumberId": "phone-number-0000"}),
+            code: "ResourceNotFoundException",
+            expected_message: not_found_text("phone-number", "phone-number-0000"),
+        },
+        MessageCase {
+            case: "sending through an absent configuration set",
+            operation: "SendTextMessage",
+            request: serde_json::json!({
+                "DestinationPhoneNumber": "+14255550123",
+                "OriginationIdentity": leased_id.clone(),
+                "MessageBody": "hello",
+                "ConfigurationSetName": "absent-set",
+            }),
+            code: "ResourceNotFoundException",
+            expected_message: not_found_text("configuration-set", "absent-set"),
+        },
+        MessageCase {
+            case: "sending through an absent protect configuration",
+            operation: "SendTextMessage",
+            request: serde_json::json!({
+                "DestinationPhoneNumber": "+14255550123",
+                "OriginationIdentity": leased_id.clone(),
+                "MessageBody": "hello",
+                "ProtectConfigurationId": "protect-0000",
+            }),
+            code: "ResourceNotFoundException",
+            expected_message: not_found_text("protect-configuration", "protect-0000"),
+        },
+        MessageCase {
+            case: "sending from an origination identity that was never leased",
+            operation: "SendTextMessage",
+            request: serde_json::json!({
+                "DestinationPhoneNumber": "+14255550123",
+                "OriginationIdentity": "phone-number-0000",
+                "MessageBody": "hello",
+            }),
+            code: "ResourceNotFoundException",
+            expected_message: not_found_text("phone-number", "phone-number-0000"),
+        },
+    ];
+
+    for MessageCase {
+        case,
+        operation,
+        request,
+        code,
+        expected_message,
+    } in cases
+    {
+        let (status, body) = emulator.call(operation, request).await;
+        assert_eq!(
+            (
+                status,
+                error_code(&body).as_str(),
+                body.get("Message").and_then(serde_json::Value::as_str),
+            ),
+            (400, code, Some(expected_message.as_str())),
+            "case {case:?}: expected the message AWS words for this refusal, \
+             got {status} with {body}"
+        );
+
+        // The invariant behind the wording: the message restates the members the
+        // exception itself carries, so a reader of either is told the same thing.
+        let reason = body.get("Reason").and_then(serde_json::Value::as_str);
+        let resource_type = body
+            .get("ResourceType")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a ResourceType in {body}"));
+        let resource_id = body
+            .get("ResourceId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a ResourceId in {body}"));
+        let rendered = match reason {
+            Some(reason) => conflict_text(reason, resource_type, resource_id),
+            None => not_found_text(resource_type, resource_id),
+        };
+        assert_eq!(
+            body.get("Message").and_then(serde_json::Value::as_str),
+            Some(rendered.as_str()),
+            "case {case:?}: the message must restate this error's own members, got {body}"
+        );
+    }
+}
+
 /// The ARN this emulator stamps into a configuration set's record, for the region these
 /// tests sign for.
 fn configuration_set_arn(name: &str) -> String {
