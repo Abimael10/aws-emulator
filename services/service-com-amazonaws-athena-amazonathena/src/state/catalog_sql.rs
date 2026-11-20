@@ -32,10 +32,14 @@ pub mod data;
 pub mod ddl;
 /// Why an unregistered relation fails on the relation: the database the catalog carries.
 mod default_database;
+/// The type one expression of a statement has, resolved against the catalog at plan time.
+pub mod expression_types;
 /// What Athena says about text its query grammar cannot read as a statement.
 pub mod grammar;
 /// The `CREATE DATABASE` clauses Hive's DDL grammar takes beyond the general parser.
 pub mod hive_database;
+/// Whether a catalog column's declared type names a type, and the name a query reports.
+pub mod hive_types;
 /// What one submitted statement is, and the plan for running it.
 pub mod statement;
 
@@ -94,7 +98,9 @@ pub const ERROR_TYPE_GENERIC_USER: i32 = 1000;
 
 /// The `AthenaError$ErrorType` Athena publishes for a table DEFINITION the caller got
 /// wrong: a `CREATE EXTERNAL TABLE` whose storage the catalog cannot register the table
-/// on, such as a `LOCATION` that is not a folder.
+/// on, such as a `LOCATION` that is not a folder, and a catalog entry a read cannot plan
+/// against because what it declares is not a table definition Athena can read — the class
+/// whose messages carry the `HIVE_INVALID_METADATA` prefix.
 pub const ERROR_TYPE_TABLE_DEFINITION: i32 = 1100;
 
 /// The `AthenaError$ErrorType` Athena publishes for a `LOCATION` the object store does not
@@ -108,6 +114,10 @@ pub const ERROR_TYPE_TABLE_DEFINITION: i32 = 1100;
 /// own rather than the table-definition one ([`ERROR_TYPE_TABLE_DEFINITION`]) because what
 /// the statement declares is a location that is NOT THERE, not a location of the wrong
 /// shape.
+///
+/// The same class, and the same recorded type, for a READ whose table location cannot be
+/// dereferenced ([`Failure::location_not_readable`]): the catalog never resolves a location
+/// it records, so the location that is not there is reported when a query goes to read it.
 pub const ERROR_TYPE_LOCATION_NOT_FOUND: i32 = 1306;
 
 /// Athena's message for a `CREATE EXTERNAL TABLE` whose `LOCATION` denotes a file: fixed
@@ -119,6 +129,23 @@ const LOCATION_ON_FILE: &str = "Cannot create table on file, please specify a di
 /// bucket nor the statement's table. Recorded, with the classification beside it; see
 /// [`ERROR_TYPE_LOCATION_NOT_FOUND`].
 const LOCATION_BUCKET_ABSENT: &str = "The bucket specified in the ddl statement does not exist";
+
+/// What Athena's message for a failure of its FILESYSTEM class opens with: the class a read
+/// that cannot dereference a table's storage location belongs to. Fixed text; the detail
+/// after it names the location that could not be read ([`Failure::location_not_readable`]).
+const HIVE_FILESYSTEM_ERROR: &str = "HIVE_FILESYSTEM_ERROR";
+
+/// What Athena's message for an unreadable table LOCATION says after that prefix: in Hive's
+/// terms the data directory of a table is its partition — an unpartitioned table has exactly
+/// one, its location — so a location a read cannot list is a partition location that is not
+/// there. Fixed text in front of the location the catalog entry declares, which is the only
+/// variable part.
+const LOCATION_DOES_NOT_EXIST: &str = "Partition location does not exist";
+
+/// What Athena's message for a failure of its INVALID-METADATA class opens with: the class a
+/// catalog entry a read cannot be planned against belongs to. Fixed text; the detail after
+/// it names what about the entry cannot be read ([`Failure::invalid_column_type`]).
+const HIVE_INVALID_METADATA: &str = "HIVE_INVALID_METADATA";
 
 /// Athena's message for a read of a table the catalog marks as an Iceberg table and holds
 /// no metadata location for: fixed text with no variable part — it names neither the
@@ -414,6 +441,40 @@ impl Failure {
         )
     }
 
+    /// A read cannot DEREFERENCE the location a table's catalog entry declares — the
+    /// storage it names is not there — so no split of that table can be listed, let alone
+    /// opened.
+    ///
+    /// Athena's FILESYSTEM class, which is what a location that cannot be read is: an
+    /// access decision about storage the reader is not allowed to read is a different class
+    /// and a different remediation. Fixed text, with `location` — the table's own, as the
+    /// catalog recorded it — as the only variable part.
+    pub fn location_not_readable(location: &str) -> Self {
+        Self::classified(
+            format!("{HIVE_FILESYSTEM_ERROR}: {LOCATION_DOES_NOT_EXIST}: {location}"),
+            ERROR_CATEGORY_USER,
+            ERROR_TYPE_LOCATION_NOT_FOUND,
+        )
+    }
+
+    /// A read cannot be PLANNED against a table's catalog entry because the type text one
+    /// of its columns carries names no type ([`hive_types::names_a_type`]).
+    ///
+    /// Athena's INVALID-METADATA class: the catalog stores a column's type as text and
+    /// never reads it, so an entry carrying a type nothing can read is found when a query
+    /// plans a read of it. Fixed text, with the column and the type text it carries — both
+    /// off the catalog entry — as the variable parts.
+    pub fn invalid_column_type(column: &str, data_type: &str) -> Self {
+        Self::classified(
+            format!(
+                "{HIVE_INVALID_METADATA}: Invalid column type for column {column}: \
+                 {data_type}"
+            ),
+            ERROR_CATEGORY_USER,
+            ERROR_TYPE_TABLE_DEFINITION,
+        )
+    }
+
     /// A statement reads a table the catalog marks as an Iceberg table and holds no
     /// Iceberg metadata location for, so there is no table metadata to read it through.
     pub fn iceberg_without_metadata_location() -> Self {
@@ -425,7 +486,7 @@ impl Failure {
     }
 
     /// This failure as the outcome of a run that produced nothing.
-    fn outcome(self) -> Outcome {
+    pub fn outcome(self) -> Outcome {
         Outcome::Failed {
             message: self.message,
             reason: self.reason,
@@ -1014,6 +1075,20 @@ fn resolved_sql<Eng: Send + Sync + 'static>(
         }
         return Err(miss);
     }
+
+    // What TYPE each column the statement can read has is settled here, while the catalog's
+    // answer about those columns is in hand: an expression whose type the catalog fixes is
+    // resolved in the parse before the engine is handed anything, because the engine holds
+    // only the storage class of the values it was given (see [`expression_types`]). The
+    // columns a Lake Formation grant hides are not among them — a statement cannot read
+    // their type any more than their cells.
+    let column_types = expression_types::ColumnTypes::of(
+        resolution
+            .sources
+            .iter()
+            .flat_map(data::DataSource::visible_columns),
+    );
+    expression_types::resolve(&mut statement, &column_types);
 
     Ok(Prepared {
         sql: statement::rewritten(&mut statement, &rewrites),

@@ -22,6 +22,7 @@ use ::service_com_amazonaws_glue_awsglue::state as glue_state;
 use ::service_com_amazonaws_s3_amazons3::state as s3_state;
 
 use super::ddl;
+use super::hive_types;
 use super::statement::{self, DeclaredColumn, Relation};
 use super::Failure;
 use crate::state::lake_formation::ReadScope;
@@ -360,6 +361,17 @@ impl DataSource {
                 ))
             })?;
         let columns = ddl::table_columns(table);
+        // What the entry DECLARES has to be readable as a table definition before a read of
+        // it can be planned: the catalog stores a column's type as the text a client wrote
+        // and never reads it, so a column whose type text names no type at all
+        // ([`hive_types`]) is an entry this read cannot be planned against — reported as
+        // such, rather than read as a column of some fallback type.
+        if let Some(column) = columns
+            .iter()
+            .find(|column| !hive_types::names_a_type(&column.data_type))
+        {
+            return Err(Failure::invalid_column_type(&column.name, &column.data_type));
+        }
         Ok(Self {
             relation: relation.clone(),
             local_name: relation.local_name(),
@@ -518,9 +530,10 @@ impl DataSource {
             )));
         };
         let Some(bucket) = objects.bucket(&bucket_name) else {
-            return Err(Failure::user(format!(
-                "Permission denied on S3 path: s3://{bucket_name}/{prefix}"
-            )));
+            // The storage the entry names is not there at all, so no split of this table can
+            // be listed: a failure of the FILESYSTEM class, which is not an access decision
+            // about storage the reader may not read.
+            return Err(Failure::location_not_readable(location));
         };
         for (key, object) in bucket.objects() {
             if !under_prefix(key, &prefix) || is_hidden(key) {
@@ -803,7 +816,7 @@ impl DataSource {
 /// Whether a column of Hive type `data_type` holds a TIMESTAMP, whose values are reported
 /// to the precision that type carries (see [`timestamp_text`]).
 fn is_timestamp(data_type: &str) -> bool {
-    named_type(data_type) == "timestamp"
+    glue_state::base_hive_type(data_type) == "timestamp"
 }
 
 /// How many digits of a second a timestamp carries: Athena's `timestamp` is a value to
@@ -881,7 +894,7 @@ const TYPE_BLOB: &str = "blob";
 /// character, date, time and complex types — to character data, which is the text the
 /// object holds it as.
 pub fn engine_type(data_type: &str) -> &'static str {
-    match named_type(data_type).as_str() {
+    match glue_state::base_hive_type(data_type).as_str() {
         "boolean" => TYPE_BOOLEAN,
         "tinyint" | "smallint" | "int" | "integer" => TYPE_INTEGER,
         "bigint" => TYPE_BIGINT,
@@ -889,18 +902,6 @@ pub fn engine_type(data_type: &str) -> &'static str {
         "binary" | "varbinary" => TYPE_BLOB,
         _ => TYPE_TEXT,
     }
-}
-
-/// The TYPE one Hive type name names, without the precision, length or element type that
-/// qualifies it: `varchar(20)` is a character type and `array<string>` an array.
-fn named_type(data_type: &str) -> String {
-    let data_type = data_type.trim().to_ascii_lowercase();
-    data_type
-        .split(['(', '<'])
-        .next()
-        .unwrap_or(&data_type)
-        .trim()
-        .to_string()
 }
 
 /// The value the table property `name` carries, whatever case the catalog recorded the

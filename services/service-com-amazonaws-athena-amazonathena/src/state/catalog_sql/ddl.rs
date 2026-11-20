@@ -25,6 +25,7 @@ use super::statement::{
     Schema, StorageFormat, ViewStatement,
 };
 use super::{Failure, StoredResultSet};
+use super::hive_types;
 
 /// The `TableType` of a table whose data lives outside the catalog, which is what a
 /// `CREATE EXTERNAL TABLE` defines.
@@ -869,29 +870,16 @@ pub fn show_create_view(
 
 /// The name Athena's QUERY ENGINE has for the type a catalog column is declared with.
 ///
-/// The catalog records a column in Hive's type names and the engine computes in its own,
-/// and the two differ where each names the same type differently: Hive's unbounded
-/// character type is the engine's `varchar`, its single-precision number the engine's
-/// `real`, its binary type the engine's `varbinary` and its `int` the engine's `integer`.
-/// A type the two name alike keeps its name, and the precision or length that qualifies a
-/// type is kept as written, because it is part of the type either engine names.
+/// The catalog records a column in Hive's type names and the engine computes in its own, and
+/// the pairs where the two differ are held in ONE place ([`hive_types::reported_type`]) — the
+/// same reading a query's own type resolution uses, so a view's recorded column type and the
+/// type a read of that column reports can never be two different names. A type text that
+/// reports no single name there — a collection or record type, whose name is written out of
+/// its element types, and text that names no type at all — is recorded as the catalog holds
+/// it.
 pub fn engine_type_name(data_type: &str) -> String {
-    let declared = data_type.trim().to_ascii_lowercase();
-    let (named, qualifier) = match declared.split_once('(') {
-        Some((named, rest)) => (named.trim().to_string(), Some(format!("({rest}"))),
-        None => (declared.clone(), None),
-    };
-    let engine = match named.as_str() {
-        "string" => "varchar",
-        "float" => "real",
-        "binary" => "varbinary",
-        "int" => "integer",
-        named => named,
-    };
-    match qualifier {
-        Some(qualifier) => format!("{engine}{qualifier}"),
-        None => engine.to_string(),
-    }
+    hive_types::reported_type(data_type)
+        .unwrap_or_else(|| data_type.trim().to_ascii_lowercase())
 }
 
 /// The SQL a view's stored `ViewOriginalText` carries: the original statement out of the
@@ -1202,7 +1190,8 @@ mod tests {
 
     /// A column's type has one name in the catalog and one in the query engine, and a
     /// view's own definition records the ENGINE's: the rows differ along whether the two
-    /// names agree, and whether a precision or a length qualifies the type.
+    /// names agree, whether a precision or a length qualifies the type, and whether the type
+    /// text names a type this reader reports a single name for at all.
     #[test]
     fn a_catalog_column_type_has_the_engines_own_name() {
         // (the Hive type the catalog records, the name the engine has for it)
@@ -1223,6 +1212,10 @@ mod tests {
             ("char(3)", "char(3)"),
             ("decimal(10,2)", "decimal(10,2)"),
             ("STRING", "varchar"),
+            // A type whose name is written out of its element types, and text that names no
+            // type at all, are recorded as the catalog holds them.
+            ("array<string>", "array<string>"),
+            ("struct<id:int>", "struct<id:int>"),
         ];
 
         for (declared, expected) in cases {

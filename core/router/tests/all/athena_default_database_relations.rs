@@ -94,6 +94,12 @@ const START_QUERY_SYNC: &str = "arn:aws:states:::athena:startQueryExecution.sync
 const START_ACTION: &str = "athena:StartQueryExecution";
 const REPORT_ACTION: &str = "athena:GetQueryExecution";
 
+/// The Data Catalog reads the statement itself performs, which Athena performs with the
+/// identity the query was submitted under — so the role a task runs the query as has to
+/// hold them before the statement reaches the relation it names at all. The pairing is the
+/// one AWS's own `AmazonAthenaFullAccess` grants (`athena:*` beside `glue:Get*`).
+const CATALOG_READ_ACTION: &str = "glue:Get*";
+
 /// The workgroup a query runs in when the request names none.
 const DEFAULT_WORK_GROUP: &str = "primary";
 
@@ -489,6 +495,7 @@ async fn a_sync_athena_task_fails_with_athenas_own_query_execution_document() {
                 logs_only(),
                 allow(START_ACTION, &work_group_arn),
                 allow(REPORT_ACTION, &work_group_arn),
+                allow(CATALOG_READ_ACTION, "*"),
             ],
         }),
     )

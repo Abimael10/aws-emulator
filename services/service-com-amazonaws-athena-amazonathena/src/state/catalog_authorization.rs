@@ -1,0 +1,514 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! Whether IAM lets the CALLER's query reach the AWS Glue Data Catalog, and what a query it
+//! does not reach reports.
+//!
+//! Athena is a query service over a data catalog, and the metadata every statement needs is
+//! read from that catalog with the CALLER's own identity — "running queries against an
+//! external catalog requires `GetDataCatalog` permission to the catalog"
+//! (`StartQueryExecution`), and the catalog's own actions are the Glue ones AWS's own
+//! `AmazonAthenaFullAccess` policy grants beside `athena:*` (`glue:Get*`, `glue:List*` and
+//! the writes a DDL statement performs). So a principal allowed to SUBMIT a query in a
+//! workgroup ([`super::authorization`]) is not thereby allowed to read or write the catalog
+//! the statement addresses: those actions are decided on their own, out of the same
+//! identity-based policies, and a statement whose catalog actions the caller does not hold
+//! runs no further.
+//!
+//! Three pieces:
+//!
+//! 1. **which actions** — what the statement NEEDS of the catalog, read off the plan
+//!    ([`needed`]): a statement that reads relations resolves each one's database and table,
+//!    and a statement the catalog itself performs performs that statement's own write or
+//!    read. Each action is named on the resources Glue publishes it on, in the order the
+//!    catalog is reached: a database before the table in it, and the catalog before both.
+//! 2. **the decision** — [`super::authorization::first_refusal`], the SAME evaluation of the
+//!    caller's identity-based policies this service's own gate uses, so one principal's
+//!    documents answer alike for every action asked about.
+//! 3. **what the caller is told** — [`insufficient_permissions`]: a query whose catalog
+//!    access is refused is not refused at SUBMISSION. Athena takes the submission, mints the
+//!    execution and settles it FAILED with this reason, because the catalog is reached while
+//!    the statement is planned rather than while the request is validated. So the refusal is
+//!    a `StateChangeReason` and an `AthenaError$ErrorMessage` of a terminal execution, and
+//!    `GetQueryResults` on it answers with the error a query that did not finish
+//!    successfully answers with. IAM's own sentence inside it is the shared one
+//!    ([`::service_common::iam_authorization`]), so it is worded here exactly as every other
+//!    gate of this tree words the same decision.
+//!
+//! Only the account's own Glue Data Catalog is gated here. A catalog whose metadata an
+//! external metastore serves is not Glue's to authorize, and a catalog name this account
+//! registered nothing for fails to resolve on its own
+//! ([`super::catalog_sql::Failure::catalog_not_found`]).
+
+use ::service_common::iam_authorization as iam;
+
+use super::authorization::{self, RefusedBy};
+use super::catalog_sql::statement::{CatalogStatement, Plan, Reading, Relation};
+
+/// The IAM action prefix of the AWS Glue Data Catalog, which is also the namespace every
+/// Glue ARN carries.
+const GLUE: &str = "glue";
+
+/// The Glue action that reads ONE database's definition, which resolving a relation's
+/// database is.
+const GET_DATABASE: &str = "GetDatabase";
+
+/// The Glue action that LISTS a catalog's databases, which `SHOW DATABASES` is.
+const GET_DATABASES: &str = "GetDatabases";
+
+/// The Glue action that reads ONE table's definition, which resolving a relation is.
+const GET_TABLE: &str = "GetTable";
+
+/// The Glue action that LISTS a database's tables, which `SHOW TABLES` and `SHOW VIEWS`
+/// are.
+const GET_TABLES: &str = "GetTables";
+
+/// The Glue action that writes a database, which `CREATE DATABASE` is.
+const CREATE_DATABASE: &str = "CreateDatabase";
+
+/// The Glue action that removes a database, which `DROP DATABASE` is.
+const DELETE_DATABASE: &str = "DeleteDatabase";
+
+/// The Glue action that writes a table, which `CREATE EXTERNAL TABLE` and `CREATE VIEW` are
+/// — a view is a table entry of the catalog.
+const CREATE_TABLE: &str = "CreateTable";
+
+/// The Glue action that removes a table, which `DROP TABLE` and `DROP VIEW` are.
+const DELETE_TABLE: &str = "DeleteTable";
+
+/// The resource portion of the ARN of the catalog itself.
+const CATALOG_RESOURCE: &str = "catalog";
+
+/// The resource type a Glue database is addressed by in an ARN.
+const DATABASE_RESOURCE_TYPE: &str = "database";
+
+/// The resource type a Glue table is addressed by in an ARN.
+const TABLE_RESOURCE_TYPE: &str = "table";
+
+/// Why the caller's query may not reach the Data Catalog, as the execution's
+/// `StateChangeReason`, or `None` when every catalog action the statement needs is allowed.
+///
+/// Call it from the handler, BEFORE the statement is run: the answer rests on the request's
+/// own credential, which the run itself has no context to read. A statement that reaches no
+/// catalog at all needs no decision and is never refused here.
+pub fn refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    reading: &Reading,
+) -> Option<String> {
+    let region = authorization::region_from_request(ctx.parts());
+    let asked = needed(engine, reading, &region);
+    if asked.is_empty() {
+        return None;
+    }
+    let refused = authorization::first_refusal(engine, ctx, &asked)?;
+    Some(insufficient_permissions(&refused))
+}
+
+/// The `(action, resource)` pairs the statement `reading` planned performs against the Data
+/// Catalog, in the order it performs them.
+///
+/// Every pair names a Glue action and one ARN that action is performed on: Glue publishes a
+/// database as `database/<name>` and a table as `table/<database>/<name>` under the
+/// catalog's own ARN, and an action on either is performed on the catalog as well — so a
+/// policy scoped to one database covers the statements that address it and no other.
+fn needed<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    reading: &Reading,
+    region: &str,
+) -> Vec<(String, String)> {
+    let mut asked: Vec<(String, String)> = Vec::new();
+    match &reading.plan {
+        // Text that is no statement of this language, and a statement the engine runs over
+        // nothing the catalog holds, reach no catalog.
+        Plan::Engine => {}
+        Plan::Relations(relational) => {
+            for relation in &relational.relations {
+                // The catalog's own reporting schema is not a catalog entry: a statement
+                // reads it to be told what the catalog holds, and what it is shown is each
+                // database and table the reads below are decided on.
+                if relation.is_information_schema() || !holds_metadata(engine, relation) {
+                    continue;
+                }
+                // Resolving a relation reads the database it names and then the table in it,
+                // which is the order the plan reaches them in.
+                push(&mut asked, GET_DATABASE, database_arns(region, &relation.database));
+                push(&mut asked, GET_TABLE, table_arns(region, relation));
+            }
+        }
+        Plan::Catalog(statement) => {
+            let (action, resources) = catalog_statement_action(statement, region);
+            push(&mut asked, action, resources);
+        }
+    }
+    asked
+}
+
+/// The Glue action one statement the catalog itself performs IS, with the resources it is
+/// performed on.
+///
+/// Each pairing is the one AWS documents between an Athena statement and the Data Catalog
+/// action it performs: a database definition is a `CreateDatabase`, a drop a
+/// `DeleteDatabase`, a table or view definition a `CreateTable`, a drop of either a
+/// `DeleteTable`, and a listing the plural read of what it lists. A statement that READS one
+/// entry is the singular read of that entry.
+fn catalog_statement_action(
+    statement: &CatalogStatement,
+    region: &str,
+) -> (&'static str, Vec<String>) {
+    match statement {
+        CatalogStatement::CreateDatabase(database) => (
+            CREATE_DATABASE,
+            database_arns(region, &database.target.database),
+        ),
+        CatalogStatement::DropDatabase { target, .. } => {
+            (DELETE_DATABASE, database_arns(region, &target.database))
+        }
+        CatalogStatement::ShowDatabases { .. } => {
+            (GET_DATABASES, vec![catalog_arn(region)])
+        }
+        CatalogStatement::CreateExternalTable(table) => {
+            (CREATE_TABLE, table_arns(region, &table.target))
+        }
+        CatalogStatement::CreateView(view) => (CREATE_TABLE, table_arns(region, &view.target)),
+        CatalogStatement::DropTable { target, .. }
+        | CatalogStatement::DropView { target, .. } => {
+            (DELETE_TABLE, table_arns(region, target))
+        }
+        CatalogStatement::ShowCreateView { target } => (GET_TABLE, table_arns(region, target)),
+        CatalogStatement::ShowRelations { schema, .. } => {
+            (GET_TABLES, database_arns(region, &schema.database))
+        }
+    }
+}
+
+/// Add one action on each of `resources` to `asked`, skipping a pair already asked about —
+/// a statement that names one relation twice asks about it once.
+fn push(asked: &mut Vec<(String, String)>, action: &str, resources: Vec<String>) {
+    for resource in resources {
+        let pair = (format!("{GLUE}:{action}"), resource);
+        if !asked.contains(&pair) {
+            asked.push(pair);
+        }
+    }
+}
+
+/// Whether this emulator serves the metadata of the data catalog `relation` lives in as the
+/// account's own Glue Data Catalog, which is the only catalog whose actions are Glue's.
+fn holds_metadata<Eng: Send + Sync + 'static>(engine: &Eng, relation: &Relation) -> bool {
+    super::catalog_sql::catalog_id(engine, &relation.catalog).is_some()
+}
+
+/// The ARNs an action on the database `database` is performed on: the catalog, and the
+/// database itself.
+fn database_arns(region: &str, database: &str) -> Vec<String> {
+    vec![
+        catalog_arn(region),
+        glue_arn(region, &format!("{DATABASE_RESOURCE_TYPE}/{database}")),
+    ]
+}
+
+/// The ARNs an action on one table is performed on: the catalog, the database that holds it,
+/// and the table itself.
+fn table_arns(region: &str, relation: &Relation) -> Vec<String> {
+    let mut arns = database_arns(region, &relation.database);
+    arns.push(glue_arn(
+        region,
+        &format!(
+            "{TABLE_RESOURCE_TYPE}/{}/{}",
+            relation.database, relation.table
+        ),
+    ));
+    arns
+}
+
+/// The ARN of the account's own Glue Data Catalog in `region`.
+fn catalog_arn(region: &str) -> String {
+    glue_arn(region, CATALOG_RESOURCE)
+}
+
+/// One Glue ARN, built through the one place this emulator forms an ARN, so the account
+/// segment is the canonical one every service of it presents.
+fn glue_arn(region: &str, resource: &str) -> String {
+    ::engine::emulator_arn(GLUE, region, resource)
+}
+
+/// What Athena says in front of IAM's own sentence when a query could not be planned
+/// because the caller may not reach the catalog: the fixed text that says the QUERY is what
+/// was refused, which is what tells this refusal from the one the request itself gets.
+const QUERY_NOT_EXECUTED: &str = "Insufficient permissions to execute the query.";
+
+/// What closes the default-deny form of that reason: the separator that would precede the
+/// CONDITION clause IAM appends where a condition decided the deny. Where none did, the
+/// clause is empty and the separator is all that follows — which is how the refusal is
+/// recorded, down to that character.
+const CONDITION_CLAUSE_SEPARATOR: &str = " ";
+
+/// The reason a query whose catalog access IAM refused settles FAILED with.
+///
+/// Athena states it as the sentence that says the QUERY could not be executed, followed by
+/// IAM's OWN sentence about the refusal — who asked, which action, which resource, and which
+/// of IAM's two ways of reaching a deny refused it. That sentence and both of its reason
+/// clauses are the shared ones ([`::service_common::iam_authorization`]), so this service and
+/// every other one that reaches the same decision word it alike; what belongs to Athena is
+/// the sentence in front of it and the separator it closes with.
+fn insufficient_permissions(refused: &authorization::Refusal) -> String {
+    let authorization::Refusal {
+        principal,
+        action,
+        resource,
+        how,
+    } = refused;
+    let (because, closing) = match how {
+        RefusedBy::NoAllow => (
+            iam::no_identity_policy_allows(action),
+            CONDITION_CLAUSE_SEPARATOR,
+        ),
+        RefusedBy::ExplicitDeny => (iam::IDENTITY_POLICY_EXPLICIT_DENY.to_string(), ""),
+    };
+    let refusal = iam::not_authorized_by_identity_policy(principal, action, resource, &because);
+    format!("{QUERY_NOT_EXECUTED} {refusal}{closing}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::catalog_sql::statement::{self, QueryContext};
+
+    /// The context the statements below resolve an unqualified name against.
+    fn context() -> QueryContext {
+        QueryContext {
+            catalog: crate::state::GLUE_DATA_CATALOG_NAME.to_string(),
+            database: "logs".to_string(),
+        }
+    }
+
+    /// The `(action, resource)` pairs the statement `sql` needs of the catalog, with the
+    /// catalog resolution left out — what the statement itself asks for.
+    fn asked(sql: &str) -> Vec<(String, String)> {
+        let reading = statement::read(sql, &context());
+        let region = "us-east-1";
+        match &reading.plan {
+            Plan::Engine => Vec::new(),
+            Plan::Relations(relational) => {
+                let mut asked = Vec::new();
+                for relation in &relational.relations {
+                    if relation.is_information_schema() {
+                        continue;
+                    }
+                    push(
+                        &mut asked,
+                        GET_DATABASE,
+                        database_arns(region, &relation.database),
+                    );
+                    push(&mut asked, GET_TABLE, table_arns(region, relation));
+                }
+                asked
+            }
+            Plan::Catalog(statement) => {
+                let mut asked = Vec::new();
+                let (action, resources) = catalog_statement_action(statement, region);
+                push(&mut asked, action, resources);
+                asked
+            }
+        }
+    }
+
+    /// The actions of `asked`, in order and without their resources.
+    fn actions(sql: &str) -> Vec<String> {
+        asked(sql)
+            .into_iter()
+            .map(|(action, _)| action)
+            .collect::<Vec<String>>()
+            .into_iter()
+            .fold(Vec::new(), |mut kept: Vec<String>, action| {
+                if kept.last() != Some(&action) {
+                    kept.push(action);
+                }
+                kept
+            })
+    }
+
+    /// RULE: what a statement needs of the Data Catalog is read off its PLAN — the rows span
+    /// the statement kinds that reach the catalog (a read of relations, each definition, each
+    /// drop, each listing) and the ones that reach none.
+    #[test]
+    fn the_catalog_actions_asked_about_are_the_ones_the_statement_performs() {
+        // (case, the statement, the Glue actions it needs, in order)
+        let cases: Vec<(&str, &str, Vec<&str>)> = vec![
+            (
+                "a read of one relation",
+                "SELECT * FROM logs.events",
+                vec!["glue:GetDatabase", "glue:GetTable"],
+            ),
+            (
+                "a count over an unqualified relation",
+                "SELECT count(*) FROM events",
+                vec!["glue:GetDatabase", "glue:GetTable"],
+            ),
+            (
+                "a join over two relations",
+                "SELECT * FROM logs.events e JOIN logs.hits h ON e.id = h.id",
+                vec!["glue:GetDatabase", "glue:GetTable"],
+            ),
+            (
+                "a projection the catalog resolves nothing for",
+                "SELECT 1 AS one",
+                Vec::new(),
+            ),
+            (
+                "a database definition",
+                "CREATE DATABASE shop",
+                vec!["glue:CreateDatabase"],
+            ),
+            (
+                "a database dropped",
+                "DROP DATABASE shop",
+                vec!["glue:DeleteDatabase"],
+            ),
+            (
+                "the databases listed",
+                "SHOW DATABASES",
+                vec!["glue:GetDatabases"],
+            ),
+            (
+                "an external table defined",
+                "CREATE EXTERNAL TABLE logs.events (id bigint) LOCATION 's3://b/e/'",
+                vec!["glue:CreateTable"],
+            ),
+            (
+                "a table dropped",
+                "DROP TABLE logs.events",
+                vec!["glue:DeleteTable"],
+            ),
+            (
+                "a view defined",
+                "CREATE VIEW logs.recent AS SELECT 1 AS n",
+                vec!["glue:CreateTable"],
+            ),
+            (
+                "a view dropped",
+                "DROP VIEW logs.recent",
+                vec!["glue:DeleteTable"],
+            ),
+            (
+                "a view's definition read",
+                "SHOW CREATE VIEW logs.recent",
+                vec!["glue:GetTable"],
+            ),
+            (
+                "the tables of a database listed",
+                "SHOW TABLES IN logs",
+                vec!["glue:GetTables"],
+            ),
+        ];
+
+        for (case, sql, expected) in &cases {
+            let actual = actions(sql);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected the actions {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a Glue action is performed on the catalog, on the database it addresses and —
+    /// for a table action — on the table, so the ARNs asked about are those, in that order;
+    /// and a statement reading two relations asks about each table of its own, once.
+    #[test]
+    fn the_resources_asked_about_are_the_catalog_the_database_and_the_table() {
+        let account = ::engine::emulator_account_id();
+        let actual = asked("SELECT * FROM logs.events");
+        let expected: Vec<(String, String)> = vec![
+            (
+                "glue:GetDatabase".to_string(),
+                format!("arn:aws:glue:us-east-1:{account}:catalog"),
+            ),
+            (
+                "glue:GetDatabase".to_string(),
+                format!("arn:aws:glue:us-east-1:{account}:database/logs"),
+            ),
+            (
+                "glue:GetTable".to_string(),
+                format!("arn:aws:glue:us-east-1:{account}:catalog"),
+            ),
+            (
+                "glue:GetTable".to_string(),
+                format!("arn:aws:glue:us-east-1:{account}:database/logs"),
+            ),
+            (
+                "glue:GetTable".to_string(),
+                format!("arn:aws:glue:us-east-1:{account}:table/logs/events"),
+            ),
+        ];
+        assert_eq!(
+            actual, expected,
+            "case \"a read of one relation\": expected {expected:?}, got {actual:?}"
+        );
+
+        // Two relations of one database: the database is asked about once, and each table
+        // of its own.
+        let joined = asked("SELECT * FROM logs.events e JOIN logs.hits h ON e.id = h.id");
+        for table in ["table/logs/events", "table/logs/hits"] {
+            let arn = format!("arn:aws:glue:us-east-1:{account}:{table}");
+            assert!(
+                joined.contains(&("glue:GetTable".to_string(), arn.clone())),
+                "case \"a join over two relations\": expected a read of {arn:?}, got {joined:?}"
+            );
+        }
+        let databases = joined
+            .iter()
+            .filter(|(action, resource)| {
+                action == "glue:GetDatabase" && resource.ends_with(":database/logs")
+            })
+            .count();
+        assert_eq!(
+            databases, 1,
+            "case \"a join over two relations\": expected the database asked about once, got \
+             {databases} in {joined:?}"
+        );
+    }
+
+    /// RULE: the reason names the caller, the action and the resource IAM refused, and which
+    /// of IAM's two ways of reaching a deny refused it.
+    #[test]
+    fn the_reason_names_the_caller_the_action_and_the_resource() {
+        let principal =
+            "arn:aws:sts::000000000000:assumed-role/limited/athena-session".to_string();
+        let action = "glue:GetDatabase".to_string();
+        let resource = "arn:aws:glue:us-east-1:000000000000:catalog".to_string();
+        // (case, how IAM refused, the reason the execution reports)
+        let cases: Vec<(&str, RefusedBy, String)> = vec![
+            (
+                "no policy allows the action",
+                RefusedBy::NoAllow,
+                format!(
+                    "Insufficient permissions to execute the query. User: {principal} is not \
+                     authorized to perform: {action} on resource: {resource} because no \
+                     identity-based policy allows the {action} action "
+                ),
+            ),
+            (
+                "a statement denies it explicitly",
+                RefusedBy::ExplicitDeny,
+                format!(
+                    "Insufficient permissions to execute the query. User: {principal} is not \
+                     authorized to perform: {action} on resource: {resource} with an explicit \
+                     deny in an identity-based policy"
+                ),
+            ),
+        ];
+
+        for (case, how, expected) in &cases {
+            let actual = insufficient_permissions(&authorization::Refusal {
+                principal: principal.clone(),
+                action: action.clone(),
+                resource: resource.clone(),
+                how: *how,
+            });
+            assert_eq!(
+                &actual, expected,
+                "case {case:?}: expected the reason {expected:?}, got {actual:?}"
+            );
+        }
+    }
+}

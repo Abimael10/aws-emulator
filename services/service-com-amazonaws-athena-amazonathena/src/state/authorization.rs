@@ -34,6 +34,10 @@
 //! IAM's rules refused — and closes with the sentence that tells the caller what to do about
 //! it. So the decision is shared and the wording is not.
 //!
+//! The same three pieces answer one more question, for a different service's actions: what
+//! the caller may do in the AWS Glue Data Catalog a query addresses, which Athena reaches on
+//! the caller's behalf ([`first_refusal`], worded by [`super::catalog_authorization`]).
+//!
 //! Only the store LOOKUPS and this service's own wording live here; the decision does not.
 //! That is the split every other gate in this tree makes, and the lookups stay in this crate
 //! for the reason those keep theirs there: hoisting them into `service-common` would make
@@ -151,33 +155,96 @@ pub fn authorize<Eng: Send + Sync + 'static>(
 ) -> Result<(), AccessDenied> {
     let action = format!("{ACTION_PREFIX}:{operation}");
     let caller = caller(engine, ctx);
+    match refused(&caller, &action, resource) {
+        None => Ok(()),
+        Some(_) => Err(not_authorized(&action)),
+    }
+}
+
+/// Why IAM refuses the caller of this request one of the actions `asked`, or `None` when it
+/// permits every one of them.
+///
+/// `asked` are `(action, resource)` pairs IN THE ORDER the service performs them, each
+/// action spelled in full (`<prefix>:<ActionName>`): the FIRST one refused is what a caller
+/// is told about, because that is where the work stopped. The caller is resolved once for
+/// the whole list.
+///
+/// The SAME decision [`authorize`] takes, for the actions of ANOTHER service this service
+/// performs on the caller's behalf: Athena reaches the AWS Glue Data Catalog with the
+/// caller's own identity, so what a query may read there is decided out of the caller's
+/// identity-based policies rather than out of this service's permissions (see
+/// [`super::catalog_authorization`], which words that refusal).
+pub fn first_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    asked: &[(String, String)],
+) -> Option<Refusal> {
+    let caller = caller(engine, ctx);
+    asked.iter().find_map(|(action, resource)| {
+        refused(&caller, action, resource).map(|how| Refusal {
+            principal: caller.arn.clone(),
+            action: action.clone(),
+            resource: resource.clone(),
+            how,
+        })
+    })
+}
+
+/// One action on one resource that IAM refused, and whom to.
+#[derive(Debug, Clone)]
+pub struct Refusal {
+    /// The principal the request speaks for, as `sts:GetCallerIdentity` reports it.
+    pub principal: String,
+    /// The action that was refused, spelled in full.
+    pub action: String,
+    /// The ARN of the resource it was asked about.
+    pub resource: String,
+    /// What refused it.
+    pub how: RefusedBy,
+}
+
+/// What refused an action: IAM's two ways of reaching a deny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedBy {
+    /// No readable statement allows the action, so it falls to IAM's default deny.
+    NoAllow,
+    /// A readable statement DENIES it explicitly, which no allow can lift.
+    ExplicitDeny,
+}
+
+/// Whether the documents in force on `caller` refuse `action` on `resource`, and how.
+///
+/// The one decision this gate takes, wherever it is taken from: an explicit `Deny` wins,
+/// otherwise an `Allow` about the request grants it, with neither the request falls to
+/// IAM's default deny, and a permissions boundary caps whatever was granted.
+fn refused(caller: &Caller, action: &str, resource: &str) -> Option<RefusedBy> {
     // The principal spellings travel with the request because that is what a statement's
     // `Principal` element would be matched against; an identity-based document states no
     // such element, and Athena publishes no resource-based policy (see the module docs), so
     // the decision below rests on the action and the resource.
-    let request = iam::Request::new(&action, resource, &caller.principals);
+    let request = iam::Request::new(action, resource, &caller.principals);
     let identity_said = iam::identity_decision(&caller.documents, &request);
     // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be read
     // refuses the request whatever else the principal carries — including a grant this
     // emulator cannot read, which only lifts the DEFAULT deny of a request no readable
     // statement allows (see the module docs).
     if identity_said == Decision::Denied {
-        return Err(not_authorized(&action));
+        return Some(RefusedBy::ExplicitDeny);
     }
     let granted =
         iam::is_allowed(identity_said, Decision::NotStated) || caller.identity_is_unbounded();
     if !granted {
-        return Err(not_authorized(&action));
+        return Some(RefusedBy::NoAllow);
     }
     // "A permissions boundary sets the maximum permissions that an identity-based policy can
     // grant" (IAM, permissions boundaries): a grant the boundary does not also allow is not
     // a permission the principal has. The account's own credential carries none.
     if let Some(boundary) = &caller.boundary {
         if iam::identity_decision(::std::slice::from_ref(boundary), &request) != Decision::Allowed {
-            return Err(not_authorized(&action));
+            return Some(RefusedBy::NoAllow);
         }
     }
-    Ok(())
+    None
 }
 
 /// The refusal Athena states an authorization failure with: the action the caller asked for,

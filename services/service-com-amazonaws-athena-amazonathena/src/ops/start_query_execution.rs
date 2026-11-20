@@ -6,7 +6,10 @@
 //! `EXECUTE <statement_name> USING <arguments>` submission, the query statement the named
 //! workgroup's prepared statement holds, with those arguments bound to its placeholders —
 //! persists the execution and the result set it produced, and answers with the id it minted —
-//! the same id, and no second execution, for a repeated `ClientRequestToken`. The state the
+//! the same id, and no second execution, for a repeated `ClientRequestToken`. The metadata
+//! the statement needs of the AWS Glue Data Catalog is reached with the CALLER's identity,
+//! so a submission whose catalog actions the caller's policies do not allow is taken and
+//! settles FAILED carrying that refusal (`crate::state::catalog_authorization`). The state the
 //! submission put the execution in is published onto the account's default EventBridge bus,
 //! and the states it reaches afterwards are published as they fall due, with no further call
 //! from anybody (`crate::state::query_events`).
@@ -345,6 +348,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             addressed_catalogs(&reading, &query_context, registered),
         )
         .await;
+        // WHETHER this caller may reach the Data Catalog at all is IAM's answer, resolved
+        // here for the same reason: Athena reads and writes the catalog a statement
+        // addresses with the CALLER's own identity, and the run itself carries no request
+        // context to evaluate the caller's policies from. A statement that reaches no
+        // catalog needs no decision (see `crate::state::catalog_authorization`).
+        let catalog_refusal =
+            crate::state::catalog_authorization::refusal(&*self.engine, ctx, &reading);
 
         let id = crate::state::new_query_execution_id();
         let submitted_at = SystemTime::now();
@@ -474,53 +484,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             handle
         };
 
-        let completion = match reading.statements {
-            // One statement, or text this parser could not read at all — in which case
-            // the engine is the one that reports why.
-            Some(1) | None => {
-                let sql = statement_sql.clone();
-                let parameters = bound_parameters.clone();
-                let engine = ::std::sync::Arc::clone(&self.engine);
-                // The statement runs on a blocking thread: the catalog's store, the
-                // object store and the SQL engine are all synchronous, and the engine is
-                // CPU-bound, so none of that work belongs on an async worker. The bounds
-                // one run is held to are installed by `catalog_sql::execute`.
-                let run = ::tokio::task::spawn_blocking(move || {
-                    catalog_sql::execute(
-                        &*engine,
-                        &prepared,
-                        &sql,
-                        reading,
-                        &catalog_sql::Submission {
-                            context: &query_context,
-                            parameters: &parameters,
-                            access: &access,
-                            now: SystemTime::now(),
+        let completion = match catalog_refusal {
+            // The catalog this statement addresses is not one this caller may reach, so
+            // nothing is planned against it and nothing is read: the execution this
+            // submission minted settles FAILED carrying IAM's refusal, which is where
+            // Athena reports a catalog permission the caller does not hold.
+            Some(reason) => query_engine::Completion {
+                outcome: catalog_sql::Failure::user(reason).outcome(),
+                engine_time: Duration::ZERO,
+                planning_time: Duration::ZERO,
+            },
+            None => match reading.statements {
+                // One statement, or text this parser could not read at all — in which case
+                // the engine is the one that reports why.
+                Some(1) | None => {
+                    let sql = statement_sql.clone();
+                    let parameters = bound_parameters.clone();
+                    let engine = ::std::sync::Arc::clone(&self.engine);
+                    // The statement runs on a blocking thread: the catalog's store, the
+                    // object store and the SQL engine are all synchronous, and the engine is
+                    // CPU-bound, so none of that work belongs on an async worker. The bounds
+                    // one run is held to are installed by `catalog_sql::execute`.
+                    let run = ::tokio::task::spawn_blocking(move || {
+                        catalog_sql::execute(
+                            &*engine,
+                            &prepared,
+                            &sql,
+                            reading,
+                            &catalog_sql::Submission {
+                                context: &query_context,
+                                parameters: &parameters,
+                                access: &access,
+                                now: SystemTime::now(),
+                            },
+                        )
+                    })
+                    .await;
+                    run.unwrap_or_else(|_| query_engine::Completion {
+                        outcome: query_engine::Outcome::Failed {
+                            message: UNREPORTED_RUN.to_string(),
+                            reason: None,
+                            cause: query_engine::FailureCause::Emulator,
                         },
-                    )
-                })
-                .await;
-                run.unwrap_or_else(|_| query_engine::Completion {
+                        engine_time: Duration::ZERO,
+                        planning_time: Duration::ZERO,
+                    })
+                }
+                // A query execution runs ONE statement, so text carrying another count is a
+                // query that fails rather than one that runs its first statement and drops
+                // the rest.
+                Some(count) => query_engine::Completion {
                     outcome: query_engine::Outcome::Failed {
-                        message: UNREPORTED_RUN.to_string(),
+                        message: one_statement_only(count),
                         reason: None,
                         cause: query_engine::FailureCause::Emulator,
                     },
                     engine_time: Duration::ZERO,
                     planning_time: Duration::ZERO,
-                })
-            }
-            // A query execution runs ONE statement, so text carrying another count is a
-            // query that fails rather than one that runs its first statement and drops
-            // the rest.
-            Some(count) => query_engine::Completion {
-                outcome: query_engine::Outcome::Failed {
-                    message: one_statement_only(count),
-                    reason: None,
-                    cause: query_engine::FailureCause::Emulator,
                 },
-                engine_time: Duration::ZERO,
-                planning_time: Duration::ZERO,
             },
         };
 

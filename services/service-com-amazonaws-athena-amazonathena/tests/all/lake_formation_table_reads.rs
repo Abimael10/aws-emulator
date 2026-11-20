@@ -224,8 +224,10 @@ async fn s3_put(router: &MultiServiceRouter, case: &str, path: &str, body: &str)
 
 /// Record the IAM user an access key id belongs to, as `iam:CreateUser` and
 /// `iam:CreateAccessKey` record one, with an inline policy allowing this service's actions
-/// — the reader has to be allowed to START a query before Lake Formation decides what it
-/// may read.
+/// and the Data Catalog reads a query performs with the caller's identity — the reader has
+/// to be allowed to START a query and to READ the catalog's metadata before Lake Formation
+/// decides which cells of a table it may see, which is the pairing AWS's own
+/// `AmazonAthenaFullAccess` grants (`athena:*` beside `glue:Get*`).
 fn given_reader(engine: &Arc<engine::InMemoryEngine>) {
     let minted = ::aws_smithy_types::DateTime::from_secs(0);
     let store = iam::service_state(&**engine).expect("the IAM store");
@@ -254,6 +256,7 @@ fn given_reader(engine: &Arc<engine::InMemoryEngine>) {
                         "Version": "2012-10-17",
                         "Statement": [
                             { "Effect": "Allow", "Action": "athena:*", "Resource": "*" },
+                            { "Effect": "Allow", "Action": "glue:Get*", "Resource": "*" },
                         ],
                     })
                     .to_string(),

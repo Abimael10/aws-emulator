@@ -154,6 +154,10 @@ pub use capacity_assignments::*;
 /// Whether IAM lets a request perform the action it asks for on the workgroup it names.
 pub mod authorization;
 
+/// Whether IAM lets the caller's query reach the AWS Glue Data Catalog the statement
+/// addresses.
+pub mod catalog_authorization;
+
 /// Whether Lake Formation lets the caller read a Data Catalog table, and which cells of it.
 pub mod lake_formation;
 
