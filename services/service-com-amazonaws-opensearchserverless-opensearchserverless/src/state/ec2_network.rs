@@ -94,6 +94,10 @@ const SUBNET_REFUSAL_PREFIX: &str = "InvalidSubnetID.";
 /// [`super::index_collection_not_found_message`] words for a collection — with the id
 /// SINGLE-QUOTED and a trailing period. The only variable part is the value the request
 /// carried.
+///
+/// NOT re-grounded against the recording: the wire corpus elides this refusal's recorded
+/// `message` (`<shaped-not-asserted>`), so the sentence the real service words for it is not
+/// readable from here and this one is left as it stands rather than replaced by a guess.
 pub fn vpc_absent_message(vpc_id: &str) -> String {
     format!("The Vpc with Id '{vpc_id}' does not exist.")
 }

@@ -1524,17 +1524,25 @@ impl CapacityKind {
 /// All three operations model `description` and `policy` as OPTIONAL on a request whose
 /// `type`/`name` already identify the policy, and none is documented as clearing the
 /// stored value, so a member the request did not name keeps what is stored — the same
-/// partial-write rule [`AccountSettingsRecord::apply`] follows. The other two members are
-/// server-derived: every write mints a fresh `policyVersion`
-/// (see [`mint_policy_version`])
-/// and stamps `lastModifiedDate`.
+/// partial-write rule [`AccountSettingsRecord::apply`] follows.
+///
+/// `lastModifiedDate` is stamped by every write. `policyVersion` is NOT: it is the version
+/// of the POLICY DOCUMENT — the member it is named after and sits beside
+/// (`AccessPolicyDetail$policyVersion` is "The version of the policy", and
+/// `Update*Policy$policyVersion` "the version of the policy being updated") — so a write
+/// that leaves the document as it stands leaves the version it already carries, and only one
+/// that replaces the document stores the fresh version ([`mint_policy_version`]) the caller
+/// passes in. That is what a client holding the version AWS reported reads back after a write
+/// of the policy's other members, and it is what keeps one logical write from being two
+/// versions.
 #[derive(Debug, Clone)]
 pub struct PolicyWrite {
     /// The `description` the request named, or `None` when it named none.
     pub description: Option<String>,
     /// The PARSED `policy` document the request named, or `None` when it named none.
     pub policy: Option<::aws_smithy_types::Document>,
-    /// The freshly minted `PolicyVersion` this write stores.
+    /// The freshly minted `PolicyVersion` this write stores IF it replaces the document;
+    /// a write that does not replace the document keeps the stored version instead.
     pub policy_version: String,
     /// The epoch-millisecond instant of the write, which becomes `lastModifiedDate`.
     pub written_at: i64,
@@ -1554,10 +1562,14 @@ impl PolicyWrite {
         if self.description.is_some() {
             *description = self.description;
         }
+        // The version moves with the DOCUMENT and with nothing else: a request naming no
+        // document, or naming the one already stored, replaces no document at all.
         if let Some(document) = self.policy {
-            *policy = document;
+            if document != *policy {
+                *policy = document;
+                *policy_version = self.policy_version;
+            }
         }
-        *policy_version = self.policy_version;
         *last_modified_date = self.written_at;
     }
 }

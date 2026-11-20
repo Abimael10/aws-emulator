@@ -599,6 +599,11 @@ struct VersionedFamily {
     identity: fn() -> Value,
     /// The create request, including the identity members.
     create: fn() -> (&'static str, Value),
+    /// Another policy document of this family's own form, which an accepted write names to
+    /// REPLACE the created one — what consumes the version, since `policyVersion` is the
+    /// version of the policy document. `None` for the family whose write carries no
+    /// document (`UpdateSecurityConfig`).
+    rewrite: Option<&'static str>,
 }
 
 /// The four families whose update takes a version, from the model: three policy types plus
@@ -619,6 +624,9 @@ fn versioned_families() -> Vec<VersionedFamily> {
                     json!({ "type": "data", "name": "locked-access", "policy": DATA_POLICY }),
                 )
             },
+            rewrite: Some(
+                r#"{"Rules":[{"ResourceType":"index","Resource":["index/demo/rewritten"],"Permission":["aoss:ReadDocument"]}],"Principal":["arn:aws:iam::000000000000:role/Reader"]}"#,
+            ),
         },
         VersionedFamily {
             case: "an encryption security policy",
@@ -636,6 +644,9 @@ fn versioned_families() -> Vec<VersionedFamily> {
                     }),
                 )
             },
+            rewrite: Some(
+                r#"{"Rules":[{"ResourceType":"collection","Resource":["collection/rewritten*"]}],"AWSOwnedKey":true}"#,
+            ),
         },
         VersionedFamily {
             case: "a retention lifecycle policy",
@@ -653,6 +664,9 @@ fn versioned_families() -> Vec<VersionedFamily> {
                     }),
                 )
             },
+            rewrite: Some(
+                r#"{"Rules":[{"ResourceType":"index","Resource":["index/demo/rewritten"],"MinIndexRetention":"48h"}]}"#,
+            ),
         },
         VersionedFamily {
             case: "a saml security configuration",
@@ -670,6 +684,7 @@ fn versioned_families() -> Vec<VersionedFamily> {
                     }),
                 )
             },
+            rewrite: None,
         },
     ]
 }
@@ -696,10 +711,14 @@ async fn a_consumed_version_is_refused_as_invalid_input_on_every_versioned_updat
         }
         let versions = text(&created, family.version_member);
 
-        // The first update consumes the creation version and mints a fresh one.
+        // The first update consumes the creation version and mints a fresh one, which is
+        // what REPLACING the policy document does.
         let mut request = identity.clone();
         request[family.version_member] = json!(versions.clone());
         request["description"] = json!("the winner");
+        if let Some(policy) = family.rewrite {
+            request["policy"] = json!(policy);
+        }
         let (status, code, answer) = call(&router, family.update, request).await;
         assert_eq!(
             status, 200,

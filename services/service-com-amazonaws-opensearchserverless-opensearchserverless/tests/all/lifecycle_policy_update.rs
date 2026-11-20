@@ -141,9 +141,14 @@ fn rows() -> Vec<Row> {
             description: Some(String::new()),
         },
         Row {
-            what: "neither member named, so only the version moves",
+            what: "neither member named, so the record keeps every value it holds",
             policy: None,
             description: None,
+        },
+        Row {
+            what: "the stored document again, beside a new description",
+            policy: Some(CREATED_POLICY.to_string()),
+            description: Some("restated the stored document".to_string()),
         },
     ]
 }
@@ -261,17 +266,30 @@ async fn an_update_lifecycle_policy_is_what_the_following_read_reports() {
                 "case {case}: the stored description must be the written one, got {written}"
             );
 
-            // Every write mints a fresh `policyVersion` and stamps `lastModifiedDate`,
+            // `policyVersion` is the version of the policy DOCUMENT: a write that REPLACES
+            // the document mints a fresh one, and a write that leaves the stored document as
+            // it stands — naming none, or naming the very document already held — reports the
+            // version the policy already carries. `lastModifiedDate` is stamped either way,
             // while the identity and the creation stamp of the record stay put.
             let written_version = text(&written, "policyVersion");
             assert!(
                 is_policy_version(&written_version),
                 "case {case}: policyVersion must match PolicyVersion's length and pattern, got {written_version:?}"
             );
-            assert_ne!(
-                written_version, created_version,
-                "case {case}: a write mints a NEW policyVersion, got the creation version {written_version:?}"
-            );
+            let replaced_document = expected_policy
+                != serde_json::from_str::<Value>(CREATED_POLICY)
+                    .expect("the created document text is JSON");
+            if replaced_document {
+                assert_ne!(
+                    written_version, created_version,
+                    "case {case}: a write that replaces the document mints a NEW policyVersion, got the creation version {written_version:?}"
+                );
+            } else {
+                assert_eq!(
+                    written_version, created_version,
+                    "case {case}: a write that replaces no document keeps the stored policyVersion {created_version:?}, got {written_version:?}"
+                );
+            }
             assert_eq!(
                 (text(&written, "type"), text(&written, "name")),
                 (kind.to_string(), name.clone()),
@@ -353,6 +371,11 @@ async fn an_update_lifecycle_policy_chains_the_version_and_refuses_a_stale_one()
                     "name": name,
                     "policyVersion": current,
                     "description": format!("write {step}"),
+                    // Each write REPLACES the document, which is what moves the version the
+                    // next write is addressed at.
+                    "policy": format!(
+                        r#"{{"Rules":[{{"ResourceType":"index","Resource":["index/demo/chain-{step}"],"MinIndexRetention":"24h"}}]}}"#
+                    ),
                 }),
             )
             .await;
@@ -655,6 +678,9 @@ async fn a_replayed_client_token_on_a_lifecycle_policy_update_answers_the_write_
             "name": name,
             "policyVersion": text(&created, "policyVersion"),
             "description": "the create's token is not this write's",
+            // Naming a document makes the write replace one, which is what mints the fresh
+            // version asserted below.
+            "policy": r#"{"Rules":[{"ResourceType":"index","Resource":["index/demo/scoped"],"MinIndexRetention":"24h"}]}"#,
             "clientToken": "a-caller-supplied-token",
         }),
     )

@@ -13,12 +13,13 @@
 //!
 //! The rule under test: a mutating call WRITES the stored record and answers from what it
 //! wrote, so the next read of that resource reports the written state — a policy write
-//! replaces the members the request names, mints a fresh `policyVersion` and stamps
-//! `lastModifiedDate`; a group write replaces the members the request names and stamps
+//! replaces the members the request names, stamps `lastModifiedDate`, and mints a fresh
+//! `policyVersion` exactly when it REPLACES the policy document (the version is the
+//! document's); a group write replaces the members the request names and stamps
 //! `lastModifiedDate`; and a delete makes the record absent, so the read raises the
 //! modelled not-found error. The tables span what the rule generalises over: all three
 //! policy `type` values across both policy families, which members the request names (both,
-//! each alone, neither, an empty description), the JSON form and whitespace of the document
+//! each alone, neither, the stored document restated, an empty description), the JSON form and whitespace of the document
 //! text, capacity limits raised / lowered / dropped / at their published bounds, the
 //! `PolicyName` length bounds, and the `ClientToken` length bounds — not the one request
 //! the issue quoted.
@@ -84,6 +85,11 @@ const CREATED_DESCRIPTION: &str = "the description the create stored";
 /// is what refuses it.
 const STALE_VERSION: &str = "000000000000000000000000";
 
+/// The `policy` of a row that names the document the create ALREADY stored, which is the
+/// family's own `base_policy`: the row is written this way because the text differs per
+/// family while a row is one static table entry.
+const RESTATES_STORED_DOCUMENT: &str = "<the stored document>";
+
 /// One write row: which members the request names, and the document text it carries when it
 /// names one. A member this row leaves `None` is one the request does not name.
 struct Row {
@@ -115,6 +121,11 @@ fn rows() -> Vec<Row> {
             description: Some("updated description"),
         },
         Row {
+            what: "the stored document again, beside a new description",
+            policy: Some(RESTATES_STORED_DOCUMENT),
+            description: Some("updated description"),
+        },
+        Row {
             what: "an empty description",
             policy: None,
             // `PolicyDescription` is @length(min: 0, max: 1000): the lower bound.
@@ -132,7 +143,7 @@ fn rows() -> Vec<Row> {
             description: None,
         },
         Row {
-            what: "neither member named, so only the version moves",
+            what: "neither member named, so the record keeps every value it holds",
             policy: None,
             description: None,
         },
@@ -187,12 +198,18 @@ async fn a_policy_update_is_what_the_following_read_reports() {
             let created_version = text(&created, "policyVersion");
             let created_date = at(&created, "createdDate").as_i64().unwrap_or_default();
 
+            // The document the row names, with the restating row resolved to the one the
+            // create stored.
+            let named_policy: Option<&str> = match row.policy {
+                Some(RESTATES_STORED_DOCUMENT) => Some(family.base_policy),
+                other => other,
+            };
             let mut request = json!({
                 "type": family.kind,
                 "name": name,
                 "policyVersion": created_version,
             });
-            if let Some(policy) = row.policy {
+            if let Some(policy) = named_policy {
                 request["policy"] = json!(policy);
             }
             if let Some(description) = row.description {
@@ -202,8 +219,9 @@ async fn a_policy_update_is_what_the_following_read_reports() {
 
             // A member the request named is the stored value now; one it did not name kept
             // what the create stored.
-            let expected_policy: Value = serde_json::from_str(row.policy.unwrap_or(family.base_policy))
-                .expect("every row's document text is JSON");
+            let expected_policy: Value =
+                serde_json::from_str(named_policy.unwrap_or(family.base_policy))
+                    .expect("every row's document text is JSON");
             assert_eq!(
                 at(&written, "policy"),
                 &expected_policy,
@@ -215,17 +233,30 @@ async fn a_policy_update_is_what_the_following_read_reports() {
                 "case {case}: the stored description must be the written one, got {written}"
             );
 
-            // Every write mints a fresh `policyVersion` and stamps `lastModifiedDate`,
+            // `policyVersion` is the version of the policy DOCUMENT: a write that REPLACES
+            // the document mints a fresh one, and a write that leaves the stored document as
+            // it stands — naming none, or naming the very document already held — reports the
+            // version the policy already carries. `lastModifiedDate` is stamped either way,
             // while the identity and the creation stamp of the record stay put.
             let written_version = text(&written, "policyVersion");
             assert!(
                 is_policy_version(&written_version),
                 "case {case}: policyVersion must match PolicyVersion's length and pattern, got {written_version:?}"
             );
-            assert_ne!(
-                written_version, created_version,
-                "case {case}: a write mints a NEW policyVersion, got the creation version {written_version:?}"
-            );
+            let replaced_document = expected_policy
+                != serde_json::from_str::<Value>(family.base_policy)
+                    .expect("the family's own document text is JSON");
+            if replaced_document {
+                assert_ne!(
+                    written_version, created_version,
+                    "case {case}: a write that replaces the document mints a NEW policyVersion, got the creation version {written_version:?}"
+                );
+            } else {
+                assert_eq!(
+                    written_version, created_version,
+                    "case {case}: a write that replaces no document keeps the stored policyVersion {created_version:?}, got {written_version:?}"
+                );
+            }
             assert_eq!(
                 (text(&written, "type"), text(&written, "name")),
                 (family.kind.to_string(), name.clone()),
@@ -297,6 +328,11 @@ async fn a_policy_update_chains_the_version_and_refuses_a_stale_one() {
                     "name": name,
                     "policyVersion": current,
                     "description": format!("write {step}"),
+                    // Each write REPLACES the document, which is what moves the version the
+                    // next write is addressed at.
+                    "policy": format!(
+                        r#"{{"Rules":[{{"ResourceType":"collection","Resource":["collection/chain-{step}"]}}]}}"#
+                    ),
                 }),
             )
             .await;
@@ -395,6 +431,158 @@ async fn a_policy_update_chains_the_version_and_refuses_a_stale_one() {
             family.update,
             family.kind
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `policyVersion` is the version of the POLICY DOCUMENT: a write that replaces no document
+// reports — and stores — the version the policy already carries, however many other members
+// it writes.
+// ---------------------------------------------------------------------------
+
+/// What a write names beside the identity members, and whether that write replaces the
+/// policy document the create stored.
+struct VersionRow {
+    what: &'static str,
+    /// Whether the write names the document the create ALREADY stored.
+    restates_document: bool,
+    /// The description the write names, if any.
+    description: Option<&'static str>,
+    /// Whether the write replaces the document, which is what moves the version.
+    replaces_document: bool,
+}
+
+/// The rows: every combination of naming the document (not at all, the stored one again, a
+/// different one) with naming a description or not.
+const VERSION_ROWS: [VersionRow; 5] = [
+    VersionRow {
+        what: "a new description and no document",
+        restates_document: false,
+        description: Some("a description the write stored"),
+        replaces_document: false,
+    },
+    VersionRow {
+        what: "a new description beside the document already stored",
+        restates_document: true,
+        description: Some("a description beside the stored document"),
+        replaces_document: false,
+    },
+    VersionRow {
+        what: "the document already stored and nothing else",
+        restates_document: true,
+        description: None,
+        replaces_document: false,
+    },
+    VersionRow {
+        what: "neither member",
+        restates_document: false,
+        description: None,
+        replaces_document: false,
+    },
+    VersionRow {
+        what: "a document of its own, beside a new description",
+        restates_document: false,
+        description: Some("a description beside a replaced document"),
+        replaces_document: true,
+    },
+];
+
+/// A document no family's create stores, so a write naming it REPLACES what is stored.
+const REPLACEMENT_DOCUMENT: &str =
+    r#"{"Rules":[{"ResourceType":"collection","Resource":["collection/replaced"]}]}"#;
+
+#[tokio::test]
+async fn a_write_that_replaces_no_document_keeps_the_policy_version() {
+    let router = emulator();
+
+    for family in &FAMILIES {
+        for (index, row) in VERSION_ROWS.iter().enumerate() {
+            // `PolicyName` is @length(min: 3, max: 32) with `^[a-z][a-z0-9-]+$`.
+            let name = format!("keep-{}-{index}", family.kind);
+            let created = accepted(
+                &router,
+                family.create,
+                family.detail,
+                json!({
+                    "type": family.kind,
+                    "name": name,
+                    "policy": family.base_policy,
+                    "description": CREATED_DESCRIPTION,
+                }),
+            )
+            .await;
+            let created_version = text(&created, "policyVersion");
+            let case = format!("{}({}/{name}, {})", family.update, family.kind, row.what);
+
+            let mut request = json!({
+                "type": family.kind,
+                "name": name,
+                "policyVersion": created_version,
+            });
+            if row.restates_document {
+                request["policy"] = json!(family.base_policy);
+            } else if row.replaces_document {
+                request["policy"] = json!(REPLACEMENT_DOCUMENT);
+            }
+            if let Some(description) = row.description {
+                request["description"] = json!(description);
+            }
+            let written = accepted(&router, family.update, family.detail, request).await;
+            let written_version = text(&written, "policyVersion");
+
+            if row.replaces_document {
+                assert_ne!(
+                    written_version, created_version,
+                    "case {case}: a write that replaces the document mints a version of its own, got {written}"
+                );
+            } else {
+                assert_eq!(
+                    written_version, created_version,
+                    "case {case}: expected the stored version {created_version:?} back, got {written}"
+                );
+            }
+
+            // What the write answered is what is stored: the read reports the same version,
+            // and the description the write named.
+            let read = accepted(
+                &router,
+                family.get,
+                family.detail,
+                json!({ "type": family.kind, "name": name }),
+            )
+            .await;
+            assert_eq!(
+                text(&read, "policyVersion"),
+                written_version,
+                "case {case}: the read must report the version the write answered, got {read}"
+            );
+            assert_eq!(
+                at(&read, "description"),
+                &json!(row.description.unwrap_or(CREATED_DESCRIPTION)),
+                "case {case}: the read must report the description the write named, got {read}"
+            );
+
+            // The version the write reported is the one the NEXT write is addressed at: a
+            // policy whose version did not move is still writable at the version its caller
+            // holds.
+            let again = accepted(
+                &router,
+                family.update,
+                family.detail,
+                json!({
+                    "type": family.kind,
+                    "name": name,
+                    "policyVersion": written_version,
+                    "description": "the write after it",
+                }),
+            )
+            .await;
+            assert_eq!(
+                text(&again, "description"),
+                "the write after it",
+                "case {case}: the following write must be accepted at the reported version, got {again}"
+            );
+        }
     }
 }
 

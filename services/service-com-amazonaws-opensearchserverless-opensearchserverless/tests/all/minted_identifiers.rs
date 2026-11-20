@@ -115,6 +115,21 @@ pub(crate) fn policy_document(kind: &str) -> String {
     }
 }
 
+/// Another document of the form `kind` takes, DIFFERENT from [`policy_document`]'s: the one a
+/// write names to replace what the create stored.
+///
+/// A write names it because `policyVersion` is the version of the policy DOCUMENT, so a write
+/// that leaves the stored document alone leaves the version it already carries — only one that
+/// replaces the document mints a token.
+pub(crate) fn rewritten_policy_document(kind: &str) -> String {
+    match kind {
+        "data" => r#"{"Rules":[{"ResourceType":"collection","Resource":["collection/rewritten"],"Permission":["aoss:DescribeCollectionItems"]}],"Principal":["arn:aws:iam::000000000000:role/Reader"]}"#.to_string(),
+        "encryption" => r#"{"Rules":[{"ResourceType":"collection","Resource":["collection/rewritten"]}],"AWSOwnedKey":true}"#.to_string(),
+        "network" => r#"{"Rules":[{"ResourceType":"collection","Resource":["collection/rewritten"]}],"AllowFromPublic":false}"#.to_string(),
+        _ => r#"{"Rules":[{"ResourceType":"index","Resource":["index/demo/*"],"MinIndexRetention":"48h"}]}"#.to_string(),
+    }
+}
+
 /// Call `operation` with `body`, asserting it was accepted, and answer the member of the
 /// response named by `detail`.
 pub(crate) async fn accepted(
@@ -189,6 +204,9 @@ pub(crate) async fn update_versioned(
             "name": name,
             "policyVersion": version,
             "description": "written",
+            // A write mints a fresh `policyVersion` when it replaces the policy DOCUMENT, so
+            // a write whose version is read back names another document than the create's.
+            "policy": rewritten_policy_document(family.kind),
         })
     };
     accepted(router, update, family.detail, request).await

@@ -284,6 +284,114 @@ async fn a_token_bearing_create_leaves_the_policy_every_later_call_addresses() {
 }
 
 #[tokio::test]
+async fn an_idempotently_created_policy_is_read_and_deleted_at_every_name_length() {
+    // The rule over the whole `PolicyName` range: after a create and a retry of it under one
+    // `clientToken`, the `(type, name)` pair is a policy `GetAccessPolicy` answers 200 for and
+    // `DeleteAccessPolicy` removes with an empty 200 — whatever the name's length and whatever
+    // the policy document grants, because neither decides whether the policy is there.
+    //
+    // `PolicyName` is `@length(min: 3, max: 32)` with `^[a-z][a-z0-9-]+$`
+    // (`smithy_query(query="operation", operation="GetAccessPolicy")`), so the rows are its
+    // two bounds and two lengths in between, and the documents are the two spellings a data
+    // access policy takes, granting a different permission to a different principal.
+    let rows: [(&str, String, &str); 4] = [
+        ("the 3-character minimum", "abc".to_string(), LIST_DOCUMENT),
+        (
+            "a 30-character name",
+            format!("probe-idem-{}", "a".repeat(19)),
+            LIST_DOCUMENT,
+        ),
+        (
+            "the 32-character maximum",
+            format!("p{}", "b".repeat(31)),
+            OBJECT_DOCUMENT,
+        ),
+        (
+            "a name of digits and hyphens",
+            "p0-1-2-3".to_string(),
+            OBJECT_DOCUMENT,
+        ),
+    ];
+
+    for (case, name, document) in rows {
+        let router = emulator();
+        let body = json!({
+            "type": "data",
+            "name": &name,
+            "description": DESCRIPTION,
+            "policy": document,
+            "clientToken": format!("token-for-{name}"),
+        });
+
+        let (status, code, created) = call(&router, "CreateAccessPolicy", body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200 from the create, got {status} {code} with {created}"
+        );
+        let (status, code, replayed) = call(&router, "CreateAccessPolicy", body).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200 from the retry under the same clientToken, got {status} \
+             {code} with {replayed}"
+        );
+        assert_eq!(
+            at(&replayed, "accessPolicyDetail"),
+            at(&created, "accessPolicyDetail"),
+            "case {case}: the retry must answer the policy the create stored, got {replayed}"
+        );
+
+        // The read of that pair is served, and reports the stored policy.
+        let (status, code, read) = call(
+            &router,
+            "GetAccessPolicy",
+            json!({ "type": "data", "name": &name }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200 from GetAccessPolicy, got {status} {code} with {read}"
+        );
+        assert_eq!(
+            at(&read, "accessPolicyDetail"),
+            at(&created, "accessPolicyDetail"),
+            "case {case}: the read must report the policy the create stored, got {read}"
+        );
+
+        // And the delete of that pair is served with an EMPTY body: `DeleteAccessPolicy`
+        // models no output members.
+        let (status, code, deleted) = call(
+            &router,
+            "DeleteAccessPolicy",
+            json!({ "type": "data", "name": &name }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200 from DeleteAccessPolicy, got {status} {code} with {deleted}"
+        );
+        assert_eq!(
+            deleted,
+            json!({}),
+            "case {case}: a served delete answers an empty body, got {deleted}"
+        );
+
+        // Only a pair nothing is stored under is refused, and as the modelled not-found.
+        let (status, code, gone) = call(
+            &router,
+            "GetAccessPolicy",
+            json!({ "type": "data", "name": &name }),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case {case}: expected {CLIENT_ERROR} ResourceNotFoundException after the delete, \
+             got {status} {code} with {gone}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn one_token_spent_on_two_pairs_creates_both_policies() {
     let router = emulator();
     let token = "a-token-two-creates-share";
