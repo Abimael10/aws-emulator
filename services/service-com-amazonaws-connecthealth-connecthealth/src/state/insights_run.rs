@@ -20,23 +20,25 @@
 //! `outputDataConfig.s3OutputPath` is "S3 URI where the insights output will be stored",
 //! and `GetPatientInsightsJob` reports `insightsOutput.uri` once the job has run. So the
 //! completion of a job is not the status field alone: RECORDED behaviour is that the
-//! object at that URI EXISTS once the job reports the terminal success status. The job's
-//! completion therefore leaves a DELIVERY due ([`InsightsDelivery`]), which the job's own
-//! reader makes before it reports ([`deliver_job_output`]) — so the read that finds the
-//! delivery owed writes the object before it answers, and a delivery the object store
-//! REFUSES takes the job to the modelled failure status instead. The guarantee is that
-//! reader's: a SECOND read arriving while the first still holds the claim is answered the
-//! terminal status the clock already applied, whose object the holder of the claim is in
-//! the middle of writing. One read of a job polled to completion therefore finds its
-//! object; two concurrent reads of the same instant may not.
+//! object at that URI EXISTS once the job reports the terminal success status, as does the
+//! processing-metadata object beside it under the same per-patient prefix
+//! ([`super::patient_insights_output_uri`]). The job's completion therefore leaves a
+//! DELIVERY due ([`InsightsDelivery`]), which the job's own reader makes before it reports
+//! ([`deliver_job_output`]) — so the read that finds the delivery owed writes the objects
+//! before it answers, and a delivery the object store REFUSES takes the job to the
+//! modelled failure status instead. The guarantee is that reader's: a SECOND read arriving
+//! while the first still holds the claim is answered the terminal status the clock already
+//! applied, whose objects the holder of the claim is in the middle of writing. One read of
+//! a job polled to completion therefore finds its objects; two concurrent reads of the
+//! same instant may not.
 //!
-//! What that object CARRIES is bounded by what this emulator can establish. The insights
+//! What those objects CARRY is bounded by what this emulator can establish. The insights
 //! themselves are the product of a clinical summarisation model, and this emulator runs
-//! none, so the document carries the members this service derives — which patient the job
-//! ran for and which kind of summary was asked for — and its one narrative STATES that no
-//! insights were generated ([`INSIGHTS_NOT_GENERATED_NARRATIVE`]), which the job also
-//! reports in `statusDetails`. Nothing here composes prose that would read like a summary
-//! no model wrote.
+//! none, so the summary document carries the members this service derives — which job ran,
+//! which patient it ran for, when it finished and which kind of summary was asked for —
+//! and its one narrative STATES that no insights were generated
+//! ([`INSIGHTS_NOT_GENERATED_NARRATIVE`]), which the job also reports in `statusDetails`.
+//! Nothing here composes prose that would read like a summary no model wrote.
 //!
 //! # How it reaches them
 //!
@@ -142,16 +144,21 @@ const DELIVERY_RECLAIM_AFTER: Duration = Duration::from_secs(10);
 /// What a patient insights job's output delivery still owes, and where it goes.
 ///
 /// Derived once, when the job is accepted, from the output location the request configured
-/// and the job's own id, so the object lands at exactly the key `insightsOutput.uri`
-/// reports.
+/// and the job's own id, so the objects land at exactly the keys the job's own location
+/// members name.
 #[derive(Debug, Clone)]
 pub struct InsightsDelivery {
     /// The Region the object store is addressed in: the Region the start was signed for.
     pub region: String,
-    /// The bucket the summary object is written into.
+    /// The bucket the output objects are written into.
     pub bucket: String,
-    /// The key it is written at — the key the reported `insightsOutput.uri` names.
+    /// The key the summary object is written at — the key the reported
+    /// `insightsOutput.uri` names.
     pub key: String,
+    /// The key the processing-metadata object is written at, beside the summary under the
+    /// same per-patient prefix; `None` when that sibling names no object address under the
+    /// same bucket.
+    pub metadata_key: Option<String>,
     /// How far this delivery has got.
     pub state: DeliveryState,
 }
@@ -406,7 +413,7 @@ pub async fn deliver_job_output<Eng: Send + Sync + 'static>(
     let Some(claim) = claimed else {
         return;
     };
-    let stored = write_summary(callback, &claim).await;
+    let stored = write_output(callback, &claim).await;
     let mut store = state.lock();
     if let Some(job) = store
         .live_domain_mut(region, domain_id)
@@ -416,16 +423,15 @@ pub async fn deliver_job_output<Eng: Send + Sync + 'static>(
     }
 }
 
-/// One claimed delivery: where the object goes and what it carries.
+/// One claimed delivery: where the objects go and what they carry.
 struct ClaimedDelivery {
     /// The Region the object store is addressed in.
     region: String,
-    /// The bucket the object is written into.
+    /// The bucket the objects are written into.
     bucket: String,
-    /// The key it is written at.
-    key: String,
-    /// The summary document's bytes, built from the job's own stored record.
-    document: Vec<u8>,
+    /// The objects this delivery writes, in order: each one's key and the document it
+    /// carries, both built from the job's own stored record.
+    objects: Vec<(String, Vec<u8>)>,
 }
 
 /// Claim the delivery of the job named, or `None` when it owes none, when it has already
@@ -447,67 +453,73 @@ fn claim(
     if !job.delivery_is_due() {
         return None;
     }
-    let document = summary_document(job);
+    let summary = summary_document(job);
+    let metadata = processing_metadata_document(job);
     let delivery = job.output_delivery.as_mut()?;
+    let mut objects = vec![(delivery.key.clone(), summary)];
+    if let Some(metadata_key) = delivery.metadata_key.clone() {
+        objects.push((metadata_key, metadata));
+    }
     delivery.state = DeliveryState::InFlight(Instant::now());
     Some(ClaimedDelivery {
         region: delivery.region.clone(),
         bucket: delivery.bucket.clone(),
-        key: delivery.key.clone(),
-        document,
+        objects,
     })
 }
 
-/// The media type the summary document is stored with: it is a JSON document, and a client
-/// reads it straight off the location the job reports.
+/// The media type the output documents are stored with: they are JSON documents, and a
+/// client reads the summary straight off the location the job reports.
 const SUMMARY_CONTENT_TYPE: &str = "application/json";
 
-/// Write the summary object of one claimed delivery, and report whether the object store
-/// took it.
+/// Write the objects of one claimed delivery, and report whether the object store took
+/// them.
 ///
-/// `Some(true)` when the store took the object, `Some(false)` when it ANSWERED a refusal —
-/// the bucket does not exist, or the write is not permitted — which is a job that could not
-/// store its work product. `None` when nothing answered the write at all: no object store
-/// is mounted in this assembly, so nothing is established and the job keeps the transition
-/// the clock owed it.
-async fn write_summary(callback: &EmbeddedEmulator, claim: &ClaimedDelivery) -> Option<bool> {
+/// `Some(true)` when the store took every object, `Some(false)` when it ANSWERED a refusal
+/// of one — the bucket does not exist, or the write is not permitted — which is a job that
+/// could not store its work product. `None` when nothing answered the write at all: no
+/// object store is mounted in this assembly, so nothing is established and the job keeps
+/// the transition the clock owed it.
+async fn write_output(callback: &EmbeddedEmulator, claim: &ClaimedDelivery) -> Option<bool> {
     use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
-    let written = ::service_common::s3_client::s3_client(callback, &claim.region)
-        .put_object()
-        .bucket(&claim.bucket)
-        .key(&claim.key)
-        .content_type(SUMMARY_CONTENT_TYPE)
-        .body(::aws_sdk_s3::primitives::ByteStream::from(
-            claim.document.clone(),
-        ))
-        .send()
-        .await;
-    match written {
-        Ok(_) => Some(true),
-        Err(error) => match error.code() {
-            // The store ANSWERED: this job's output could not be stored where it was
-            // configured to go.
-            Some(code) => {
-                ::tracing::warn!(
-                    bucket = %claim.bucket,
-                    code = %code,
-                    "a patient insights job's output was refused by the emulator's Amazon S3"
-                );
-                Some(false)
-            }
-            // Nothing answered the write — the same reading
-            // `service_common::s3_object_read` gives a read nothing answered.
-            None => {
-                ::tracing::warn!(
-                    bucket = %claim.bucket,
-                    "nothing answered a patient insights job's output write: this emulator \
-                     has no Amazon S3 to store it in"
-                );
-                None
-            }
-        },
+    let client = ::service_common::s3_client::s3_client(callback, &claim.region);
+    for (key, document) in &claim.objects {
+        let written = client
+            .put_object()
+            .bucket(&claim.bucket)
+            .key(key)
+            .content_type(SUMMARY_CONTENT_TYPE)
+            .body(::aws_sdk_s3::primitives::ByteStream::from(document.clone()))
+            .send()
+            .await;
+        match written {
+            Ok(_) => {}
+            Err(error) => match error.code() {
+                // The store ANSWERED: this job's output could not be stored where it was
+                // configured to go.
+                Some(code) => {
+                    ::tracing::warn!(
+                        bucket = %claim.bucket,
+                        code = %code,
+                        "a patient insights job's output was refused by the emulator's Amazon S3"
+                    );
+                    return Some(false);
+                }
+                // Nothing answered the write — the same reading
+                // `service_common::s3_object_read` gives a read nothing answered.
+                None => {
+                    ::tracing::warn!(
+                        bucket = %claim.bucket,
+                        "nothing answered a patient insights job's output write: this emulator \
+                         has no Amazon S3 to store it in"
+                    );
+                    return None;
+                }
+            },
+        }
     }
+    Some(true)
 }
 
 /// The `SummaryType` the summary document states for the `insightsType` a job was started
@@ -528,28 +540,38 @@ fn summary_type(insights_type: &str) -> String {
 /// The document a completed job stores at the location it reports.
 ///
 /// What this emulator can establish about a patient insights job is WHICH patient it ran
-/// for, WHICH kind of summary was asked for, and that its output object is where the job
-/// says it is. The INSIGHTS themselves are the product of a clinical summarisation model,
-/// and this emulator runs none: there is no engine here that reads a patient's record and
-/// writes a clinical narrative about it. So the document carries only members this service
-/// DERIVES — `TotalCount` (this job is about the one patient it was started for),
-/// `PatientId` (the id the start resolved) and `SummaryType` (from the modelled
-/// `insightsType`) — and its one narrative STATES that no insights were generated
-/// ([`INSIGHTS_NOT_GENERATED_NARRATIVE`]) rather than composing prose that would read like
-/// a summary nothing produced. The same statement is what the job reports in
-/// `statusDetails`, so a caller polling the job meets it without fetching the object.
+/// for, WHICH job ran, WHEN it finished, WHICH kind of summary was asked for, and that its
+/// output object is where the job says it is. The INSIGHTS themselves are the product of a
+/// clinical summarisation model, and this emulator runs none: there is no engine here that
+/// reads a patient's record and writes a clinical narrative about it. So the document
+/// carries only members this service DERIVES — `TotalCount` (this job is about the one
+/// patient it was started for), `GeneratedAt` (the instant the job completed),
+/// `HccIncluded` ([`HCC_INCLUDED`]), `JobId`, `PatientId` (the id the start resolved) and
+/// `SummaryType` (from the modelled `insightsType`) — and its one narrative STATES that no
+/// insights were generated ([`INSIGHTS_NOT_GENERATED_NARRATIVE`]) rather than composing
+/// prose that would read like a summary nothing produced. The same statement is what the
+/// job reports in `statusDetails`, so a caller polling the job meets it without fetching
+/// the object.
 ///
-/// The member names are RECORDED: `TotalCount`, `PatientSummaries[].PatientSummary` with
-/// `PatientId`, `SummaryType` and `Sections[].ClinicalNarrative[].Text`.
+/// The member names are RECORDED: `TotalCount`, `GeneratedAt`, `HccIncluded` and
+/// `PatientSummaries[].PatientSummary` with `JobId`, `PatientId`, `SummaryType`,
+/// `GeneratedAt` and `Sections[].ClinicalNarrative[].Text`.
 fn summary_document(job: &PatientInsightsJob) -> Vec<u8> {
     let spec = &job.spec;
+    // The instant the job's completion FELL DUE, read off the record, so the document a
+    // job stored states the same instant however late the read that stored it came.
+    let generated_at = super::to_date_time_text(job.updated_at);
     let document = ::serde_json::json!({
-        "TotalCount": 1,
+        "TotalCount": PATIENTS_PER_JOB,
+        "GeneratedAt": generated_at,
+        "HccIncluded": HCC_INCLUDED,
         "PatientSummaries": [
             {
                 "PatientSummary": {
+                    "JobId": job.job_id,
                     "PatientId": spec.patient_context.patient_id,
                     "SummaryType": summary_type(&spec.insights_context.insights_type),
+                    "GeneratedAt": generated_at,
                     "Sections": [
                         {
                             "SectionName": INSIGHTS_NOT_GENERATED_SECTION,
@@ -565,6 +587,39 @@ fn summary_document(job: &PatientInsightsJob) -> Vec<u8> {
     // A document this service built from values it holds, so it serializes.
     ::serde_json::to_vec(&document).unwrap_or_default()
 }
+
+/// The document a completed job stores beside its summary, at
+/// [`super::PROCESSING_METADATA_OBJECT_NAME`].
+///
+/// It states the RUN rather than the insights: which job ran, for which patient, when it
+/// finished, and how much of its input it got through — all of it read off the job's own
+/// record. Nothing here is prose and nothing is generated: the counts are
+/// [`PATIENTS_PER_JOB`], the one patient record the job ran for.
+fn processing_metadata_document(job: &PatientInsightsJob) -> Vec<u8> {
+    let document = ::serde_json::json!({
+        "jobId": job.job_id,
+        "patientId": job.spec.patient_context.patient_id,
+        "generatedAt": super::to_date_time_text(job.updated_at),
+        "documentProcessing": {
+            "total": PATIENTS_PER_JOB,
+            "processed": PATIENTS_PER_JOB,
+        },
+    });
+    ::serde_json::to_vec(&document).unwrap_or_default()
+}
+
+/// How many patient records ONE patient insights job runs over: the one
+/// `patientContext.patientId` the start named, which is the count the summary document
+/// states as `TotalCount` and the processing document as the documents it got through.
+const PATIENTS_PER_JOB: u64 = 1;
+
+/// Whether the stored summary document carries hierarchical-condition-category coding.
+///
+/// RECORDED behaviour is that the document states this of itself. It is FALSE here for the
+/// same reason the narrative states what it does: HCC coding is the product of a
+/// risk-adjustment model, and this emulator runs none, so the document says it carries
+/// none rather than claiming coding nothing produced.
+const HCC_INCLUDED: bool = false;
 
 /// The section the stored document carries in place of generated insights.
 pub const INSIGHTS_NOT_GENERATED_SECTION: &str = "InsightsNotGenerated";
@@ -590,6 +645,34 @@ pub const INSIGHTS_NOT_GENERATED_NARRATIVE: &str =
 pub const INSIGHTS_NOT_GENERATED_DETAIL: &str = INSIGHTS_NOT_GENERATED_NARRATIVE;
 
 impl PatientInsightsJob {
+    /// The delivery this job's completion will make: the objects it writes and where they
+    /// go, derived from the locations the job itself reports
+    /// ([`PatientInsightsJob::output_location`],
+    /// [`PatientInsightsJob::processing_metadata_uri`]) through the workspace's one reading
+    /// of an `s3://` URI — so each object lands at exactly the key its own location names,
+    /// and the summary lands at the key `insightsOutput.uri` reports.
+    ///
+    /// `None` for a job whose configured output location names no object address at all:
+    /// there is nothing to deliver, and nothing is written at a bare prefix instead.
+    pub fn owed_delivery(&self, region: &str) -> Option<InsightsDelivery> {
+        let (bucket, key) =
+            ::service_common::s3_uri::object_address(&self.output_location()?.uri)?;
+        // The sibling object goes into the SAME bucket as the summary: a location naming
+        // another bucket, or no object at all, is not one this delivery writes.
+        let metadata_key = self
+            .processing_metadata_uri()
+            .and_then(|uri| ::service_common::s3_uri::object_address(&uri))
+            .filter(|(metadata_bucket, _)| *metadata_bucket == bucket)
+            .map(|(_, metadata_key)| metadata_key);
+        Some(InsightsDelivery {
+            region: region.to_string(),
+            bucket,
+            key,
+            metadata_key,
+            state: DeliveryState::Owed,
+        })
+    }
+
     /// Whether this job still owes the delivery its completion makes.
     ///
     /// A job owes it from the instant the clock completed it — the terminal transition is

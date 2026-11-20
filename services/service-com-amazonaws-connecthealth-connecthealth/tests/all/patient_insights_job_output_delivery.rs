@@ -29,7 +29,12 @@
 //!    `statusDetails`. That statement is FIXED: it is the same for two jobs started with
 //!    different patients, encounters and output paths, because nothing of a request goes
 //!    into it.
-//! 3. A job whose output the object store REFUSES does not report success: it reaches the
+//! 3. Those work products sit at `<s3OutputPath>/<jobId>/<patientId>/summary.json` and
+//!    `.../processing-metadata.json`, so Amazon S3's own `GetObject` serves the summary
+//!    with the modelled 200 and the object's metadata, the summary states which job ran,
+//!    for which patient, when it was generated and that it carries no HCC coding, and
+//!    nothing of the job is left at a bare prefix key.
+//! 4. A job whose output the object store REFUSES does not report success: it reaches the
 //!    modelled `FAILED` status, says so in `statusDetails`, and reports no output location.
 //!
 //! The rows differ along what each rule generalises over: which kind of identifier resolves
@@ -744,4 +749,274 @@ async fn a_job_whose_output_the_store_refuses_reports_the_modelled_failure() {
                 });
         }
     }
+}
+
+/// One row of the output-object table: how the patient is seeded, which id the job is
+/// started with, and where its output goes.
+struct ObjectRow {
+    case: &'static str,
+    /// The logical id the `Patient` resource is stored at.
+    logical_id: &'static str,
+    /// The id the job is started with — either the resource's logical id or the business
+    /// identifier it carries — which is also the id its output prefix carries.
+    patient_id: &'static str,
+    /// The output path the start configures.
+    s3_output_path: &'static str,
+}
+
+/// The rows: every shape of configured output path the modelled pattern allows beside
+/// every form of patient id a start may carry, because the rule derives one location from
+/// both.
+fn object_rows() -> Vec<ObjectRow> {
+    vec![
+        ObjectRow {
+            case: "a prefix with a trailing separator, resolved by the logical id",
+            logical_id: "patient-logical-1001",
+            patient_id: "patient-logical-1001",
+            s3_output_path: "s3://clinic-objects/output/",
+        },
+        ObjectRow {
+            case: "a bucket root with no key, resolved by the business identifier",
+            logical_id: "patient-logical-1002",
+            patient_id: "mrn-55021",
+            s3_output_path: "s3://clinic-objects",
+        },
+        ObjectRow {
+            case: "a deep prefix, with a UUID-shaped patient id",
+            logical_id: "3f9d41c6-5b7a-4e21-9d64-1b0c8e77a512",
+            patient_id: "3f9d41c6-5b7a-4e21-9d64-1b0c8e77a512",
+            s3_output_path: "s3://clinic-objects/2026/02/insights/",
+        },
+        ObjectRow {
+            case: "a one-segment prefix with no trailing separator, with a \
+                   one-character patient id",
+            logical_id: "x",
+            patient_id: "x",
+            s3_output_path: "s3://clinic-objects/runs",
+        },
+    ]
+}
+
+/// The bucket every row of the table below writes into.
+const OBJECT_BUCKET: &str = "clinic-objects";
+
+/// RULE: a patient insights job that reaches the modelled terminal success status has
+/// WRITTEN its work products into the configured output location, at
+/// `<s3OutputPath>/<jobId>/<patientId>/summary.json` and `.../processing-metadata.json` —
+/// so Amazon S3's own `GetObject` serves the summary the job reports with the modelled 200
+/// and the object's metadata, and nothing of the job is left at a bare prefix key.
+///
+/// The rows differ along what the rule derives a location from: the shape of the
+/// configured path (a bucket root, a prefix with and without a trailing separator, a deep
+/// prefix) and the form of the patient id (a logical id, a business identifier, a
+/// UUID-shaped id, a one-character id).
+#[tokio::test]
+async fn a_succeeded_job_has_written_both_output_objects_where_a_client_reads_them() {
+    let emulator = Insights::new();
+    emulator
+        .s3()
+        .create_bucket()
+        .bucket(OBJECT_BUCKET)
+        .send()
+        .await
+        .expect("the output bucket must be created");
+    let endpoint = emulator.active_datastore("clinic-objects-store").await;
+    let domain_id = emulator.domain("clinic-insights-objects").await;
+
+    for row in object_rows() {
+        let case = row.case;
+        emulator
+            .seed_patient(
+                &endpoint,
+                row.logical_id,
+                &patient_resource(row.patient_id, None, None),
+            )
+            .await;
+
+        let (status, started) = emulator
+            .call(
+                "POST",
+                &format!("/domain/{domain_id}/patient-insights-job"),
+                Some(&job_body(row.patient_id, &endpoint, row.s3_output_path)),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the start must be accepted, got {status} with {started}"
+        );
+        let job_id = string_at(&started, "jobId");
+
+        let done = poll_until_terminal(&emulator, case, &domain_id, &job_id).await;
+        assert_eq!(
+            string_at(&done, "jobStatus"),
+            "SUCCEEDED",
+            "case {case:?}: a job whose output was stored must report the modelled success \
+             status, got {done}"
+        );
+
+        // Where the rule says the objects are, spelled out here from the row's own values
+        // rather than read back off the service.
+        let prefix = format!(
+            "{}/{job_id}/{}",
+            row.s3_output_path.trim_end_matches('/'),
+            row.patient_id
+        );
+        let summary_uri = format!("{prefix}/summary.json");
+        let metadata_uri = format!("{prefix}/processing-metadata.json");
+        assert_eq!(
+            string_at(&done["insightsOutput"], "uri"),
+            summary_uri,
+            "case {case:?}: the job must report the summary object it wrote, got {done}"
+        );
+
+        // The summary object, served by the service that OWNS it.
+        let (summary, headers) = get_object(&emulator, case, &summary_uri).await;
+        assert_eq!(
+            headers.content_type.as_deref(),
+            Some("application/json"),
+            "case {case:?}: the summary object must be served as the JSON document it is"
+        );
+        assert!(
+            headers.etag.as_deref().is_some_and(|etag| !etag.is_empty()),
+            "case {case:?}: the served object must carry an entity tag, got {:?}",
+            headers.etag
+        );
+        assert!(
+            headers.last_modified,
+            "case {case:?}: the served object must carry when it was last modified"
+        );
+
+        let generated_at = string_at(&summary, "GeneratedAt");
+        assert!(
+            is_date_time(&generated_at),
+            "case {case:?}: GeneratedAt must be a date-time, got {generated_at:?}"
+        );
+        assert_eq!(
+            summary["TotalCount"].as_u64(),
+            Some(1),
+            "case {case:?}: the document must count the one patient it is about, got {summary}"
+        );
+        assert_eq!(
+            summary["HccIncluded"].as_bool(),
+            Some(false),
+            "case {case:?}: the document must state that it carries no HCC coding, \
+             got {summary}"
+        );
+        let patient_summary = &summary["PatientSummaries"][0]["PatientSummary"];
+        for (member, expected) in [
+            ("JobId", job_id.as_str()),
+            ("PatientId", row.patient_id),
+            ("SummaryType", PRE_VISIT.1),
+            ("GeneratedAt", generated_at.as_str()),
+        ] {
+            assert_eq!(
+                patient_summary[member].as_str(),
+                Some(expected),
+                "case {case:?}: PatientSummary.{member} must be {expected:?}, got {summary}"
+            );
+        }
+        assert!(
+            patient_summary["Sections"]
+                .as_array()
+                .is_some_and(|sections| !sections.is_empty()),
+            "case {case:?}: the document must carry its narrative sections, got {summary}"
+        );
+
+        // And the processing-metadata object beside it, which states the RUN.
+        let (metadata, headers) = get_object(&emulator, case, &metadata_uri).await;
+        assert_eq!(
+            headers.content_type.as_deref(),
+            Some("application/json"),
+            "case {case:?}: the processing-metadata object must be served as the JSON \
+             document it is"
+        );
+        assert_eq!(
+            string_at(&metadata, "jobId"),
+            job_id,
+            "case {case:?}: the processing document must name the job that ran, got {metadata}"
+        );
+        assert_eq!(
+            string_at(&metadata, "patientId"),
+            row.patient_id,
+            "case {case:?}: the processing document must name the patient it ran for, \
+             got {metadata}"
+        );
+        for member in ["total", "processed"] {
+            assert_eq!(
+                metadata["documentProcessing"][member].as_u64(),
+                Some(1),
+                "case {case:?}: documentProcessing.{member} must count the one record the job \
+                 ran over, got {metadata}"
+            );
+        }
+
+        // Exactly those two objects, and nothing at a bare prefix key: a client that
+        // deletes what the job wrote empties the location it configured.
+        let (_, summary_key) = object_address(case, &summary_uri);
+        let (_, metadata_key) = object_address(case, &metadata_uri);
+        let key_prefix = summary_key.trim_end_matches("summary.json").to_string();
+        let listed = emulator
+            .s3()
+            .list_objects_v2()
+            .bucket(OBJECT_BUCKET)
+            .prefix(&key_prefix)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the listing must answer: {error}"));
+        let mut keys: Vec<String> = listed
+            .contents()
+            .iter()
+            .filter_map(|object| object.key().map(str::to_string))
+            .collect();
+        keys.sort();
+        let mut expected = vec![metadata_key, summary_key];
+        expected.sort();
+        assert_eq!(
+            keys, expected,
+            "case {case:?}: the job must leave exactly its two output objects under \
+             {key_prefix:?}, got {keys:?}"
+        );
+    }
+}
+
+/// The object metadata a `GetObject` answer carries, as far as this suite asserts on it.
+struct ObjectMetadata {
+    content_type: Option<String>,
+    etag: Option<String>,
+    last_modified: bool,
+}
+
+/// `GetObject` of the object `uri` names, through the service that owns it, asserting the
+/// modelled success and answering the JSON document it served with that object's metadata.
+async fn get_object(emulator: &Insights, case: &str, uri: &str) -> (Value, ObjectMetadata) {
+    let (bucket, key) = object_address(case, uri);
+    let fetched = emulator
+        .s3()
+        .get_object()
+        .bucket(&bucket)
+        .key(&key)
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: the object at {uri} must exist: {error}"));
+    let metadata = ObjectMetadata {
+        content_type: fetched.content_type().map(str::to_string),
+        etag: fetched.e_tag().map(str::to_string),
+        last_modified: fetched.last_modified().is_some(),
+    };
+    let body = fetched
+        .body
+        .collect()
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: the object must be readable: {error}"))
+        .into_bytes();
+    let document: Value = ::serde_json::from_slice(&body)
+        .unwrap_or_else(|error| panic!("case {case:?}: the document must be JSON: {error}"));
+    (document, metadata)
+}
+
+/// Whether `text` is an RFC 3339 / ISO 8601 date-time, read by the same parser a generated
+/// client reads a date-time member with.
+fn is_date_time(text: &str) -> bool {
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .is_ok()
 }

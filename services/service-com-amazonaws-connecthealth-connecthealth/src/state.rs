@@ -616,8 +616,8 @@ pub struct PatientInsightsJob {
     /// The text reported for the CURRENT status; `None` while there is nothing to say
     /// about it.
     pub status_details: Option<String>,
-    /// Where this job's insights were written: the location under the output path the
-    /// start configured, derived once by [`patient_insights_output_uri`] when the job
+    /// Where this job's insights were written: the SUMMARY object under the output path
+    /// the start configured, derived once by [`patient_insights_output_uri`] when the job
     /// reaches its terminal success status. `None` until then, and `None` for a job that
     /// ended without producing output.
     pub insights_output: Option<InsightsOutput>,
@@ -639,19 +639,34 @@ pub struct PatientInsightsJob {
 }
 
 impl PatientInsightsJob {
-    /// Where this job's output goes: the location derived from the output path the start
-    /// persisted and this job's own id ([`patient_insights_output_uri`]).
+    /// Where this job's output goes: the SUMMARY object derived from the output path the
+    /// start persisted, this job's own id and the patient it ran for
+    /// ([`patient_insights_output_uri`]).
     ///
     /// The ONE derivation of that location, so the member the reader answers with, the key
     /// the completion writes the object at and the location a test asserts cannot drift
-    /// apart.
-    pub fn output_location(&self) -> InsightsOutput {
-        InsightsOutput {
-            uri: patient_insights_output_uri(
-                &self.spec.output_data_config.s3_output_path,
-                &self.job_id,
-            ),
-        }
+    /// apart. `None` when no object location can be derived inside the bound the member it
+    /// fills declares, which is a job with no output location to report.
+    pub fn output_location(&self) -> Option<InsightsOutput> {
+        self.output_object_uri(SUMMARY_OBJECT_NAME)
+            .map(|uri| InsightsOutput { uri })
+    }
+
+    /// Where this job's PROCESSING-METADATA object goes: the sibling of
+    /// [`Self::output_location`] under the same per-patient prefix, which is the second
+    /// object a completed job's run leaves behind.
+    pub fn processing_metadata_uri(&self) -> Option<String> {
+        self.output_object_uri(PROCESSING_METADATA_OBJECT_NAME)
+    }
+
+    /// One of this job's output objects, by the name it sits under.
+    fn output_object_uri(&self, object_name: &str) -> Option<String> {
+        patient_insights_output_uri(
+            &self.spec.output_data_config.s3_output_path,
+            &self.job_id,
+            &self.spec.patient_context.patient_id,
+            object_name,
+        )
     }
 }
 
@@ -683,7 +698,7 @@ impl PatientInsightsJob {
                 }
                 JobStatus::InProgress => {
                     self.status = JobStatus::Succeeded;
-                    self.insights_output = Some(self.output_location());
+                    self.insights_output = self.output_location();
                     self.next_transition_at = None;
                 }
                 // A terminal status owes nothing; a due instant left on one is dropped
@@ -1537,31 +1552,55 @@ pub fn patient_insights_job_arn(domain_arn: &str, job_id: &str) -> String {
     format!("{domain_arn}/patient-insights-job/{job_id}")
 }
 
-/// Where a completed patient insights job's output sits: UNDER the `s3OutputPath` the
-/// start configured, in a prefix of the job's own id.
+/// The object a completed patient insights job stores its generated summary as, which is
+/// the object its reported output location names.
 ///
-/// The configured path is where the caller asked for output, and the job's id is what
-/// keeps two jobs configured with the same path from reporting the same location, so the
-/// reported URI is the configured path (with any trailing separator collapsed) followed
-/// by `<jobId>/`. It is DERIVED from stored values only — the path the request persisted
-/// and the id this service minted — so the same job reports the same location on every
-/// read.
+/// RECORDED behaviour: a job's work products sit at `<jobId>/<patientId>/summary.json`
+/// under the configured output path, and the summary is the object a client reads the
+/// insights out of.
+pub const SUMMARY_OBJECT_NAME: &str = "summary.json";
+
+/// The object a completed patient insights job stores the metadata of its run as, beside
+/// its summary under the same per-patient prefix.
 ///
-/// `InsightsOutput$uri` is an `S3Uri`, so the result must satisfy that shape's
-/// [`MAX_S3_URI_LEN`]: a configured path with no room left for a job prefix is reported
-/// unchanged rather than lengthened past the bound its own member declares.
+/// RECORDED behaviour, and the sibling of [`SUMMARY_OBJECT_NAME`]: a completed job leaves
+/// BOTH objects behind, so a client tearing the configured output location down finds
+/// exactly these two keys under the job's prefix.
+pub const PROCESSING_METADATA_OBJECT_NAME: &str = "processing-metadata.json";
+
+/// Where ONE of a completed patient insights job's output objects sits: UNDER the
+/// `s3OutputPath` the start configured, in a prefix of the job's own id and of the patient
+/// the job ran for, at `object_name`.
+///
+/// The configured path is where the caller asked for output; the job's id is what keeps
+/// two jobs configured with the same path apart, and the patient's id what keeps one
+/// patient's objects apart from another's. So a location is the configured path (with any
+/// trailing separator collapsed) followed by `<jobId>/<patientId>/<object name>`. It is
+/// DERIVED from stored values only — the path and the patient the request persisted and
+/// the id this service minted — so the same job reports the same location on every read,
+/// and it names an OBJECT rather than a prefix, which is what a client then reads.
+///
+/// `InsightsOutput$uri` is an `S3Uri`, so a result must satisfy that shape's
+/// [`MAX_S3_URI_LEN`]: a configured path with no room left for an object location under it
+/// has `None` — there is no location inside the bound the member it fills declares, so
+/// such a job reports none and delivers nothing, rather than reporting one past that bound
+/// or one naming a bare prefix.
 ///
 /// The fit is measured in CHARACTERS, as `@length` on a string is defined and as every
 /// other modelled bound this module keeps counts it, so a path whose characters are
-/// multi-byte is reported under its job prefix exactly like an ASCII path of the same
-/// length: a value's encoding is not what the bound it fills constrains.
-pub fn patient_insights_output_uri(s3_output_path: &str, job_id: &str) -> String {
-    let derived = format!("{}/{job_id}/", s3_output_path.trim_end_matches('/'));
-    if derived.chars().count() <= MAX_S3_URI_LEN {
-        derived
-    } else {
-        s3_output_path.to_string()
-    }
+/// multi-byte addresses its objects exactly like an ASCII path of the same character
+/// count: a value's encoding is not what the bound it fills constrains.
+pub fn patient_insights_output_uri(
+    s3_output_path: &str,
+    job_id: &str,
+    patient_id: &str,
+    object_name: &str,
+) -> Option<String> {
+    let derived = format!(
+        "{}/{job_id}/{patient_id}/{object_name}",
+        s3_output_path.trim_end_matches('/')
+    );
+    (derived.chars().count() <= MAX_S3_URI_LEN).then_some(derived)
 }
 
 /// The web-app URL of a `Domain`, derived from the domain's own id and region.
@@ -1598,6 +1637,19 @@ pub fn region_of(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
 /// A stored instant as the modelled timestamp type.
 pub fn to_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     ::aws_smithy_types::DateTime::from(at)
+}
+
+/// A stored instant as the date-time TEXT a document this service WRITES carries — an
+/// RFC 3339 / ISO 8601 date-time string, the form every timestamp of this service's own
+/// API travels in.
+///
+/// Used by the documents a completed patient insights job stores
+/// ([`crate::state::insights_run`]), whose members are a document's rather than a modelled
+/// shape's and so are rendered here rather than by the protocol.
+pub fn to_date_time_text(at: SystemTime) -> String {
+    to_timestamp(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
 }
 
 /// How a page scope spells "no filter was asked for", which is a collection of its own:

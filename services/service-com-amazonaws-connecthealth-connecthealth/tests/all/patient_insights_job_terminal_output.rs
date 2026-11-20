@@ -8,12 +8,13 @@
 //! that walk, over a table rather than one request:
 //!
 //! 1. A job the service accepted reaches the modelled terminal SUCCESS status, and a
-//!    successful job reports an `insightsOutput` whose `uri` is UNDER the
-//!    `outputDataConfig.s3OutputPath` the start configured and identifies the job that
-//!    wrote it, whatever shape that configured path has.
+//!    successful job reports an `insightsOutput` whose `uri` names the SUMMARY OBJECT it
+//!    wrote under the `outputDataConfig.s3OutputPath` the start configured —
+//!    `<path>/<jobId>/<patientId>/summary.json` — whatever shape that configured path has.
 //! 2. The reported `uri` satisfies the modelled `S3Uri` shape it fills — both its
-//!    `@length` bound and its pattern — including for a configured path at the published
-//!    bound, where no job prefix fits inside it.
+//!    `@length` bound and its pattern — and a configured path at the published bound, with
+//!    no room left for an object location under it, leaves a job with no location to report
+//!    at all rather than one past that bound.
 //! 3. The location is a STORED property of the job: two reads report the same `uri`, and
 //!    two jobs sharing one configured output path report different ones.
 //!
@@ -30,28 +31,18 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_connecthealth_connecthealth::state::{
-    MAX_S3_URI_LEN, PATIENT_INSIGHTS_JOB_STEP_SPAN,
+    MAX_S3_URI_LEN, SUMMARY_OBJECT_NAME,
 };
 
 use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
 use crate::patient_insights_job_lifecycle::{
-    get_job, minimal_body, poll_until_terminal, start_path,
+    get_job, minimal_body, poll_until_terminal, start_path, MINIMAL_PATIENT_ID,
 };
 
 /// `S3Uri`'s pattern: `^s3://[a-z0-9][\.\-a-z0-9]{1,61}[a-z0-9](/.*)?$` — so a bucket
 /// field of 3..63 characters, of lowercase letters and digits, which dots and hyphens
 /// may appear inside but not at either end.
 const BUCKET_LEN: (usize, usize) = (3, 63);
-
-/// The two spans a job takes to reach a terminal status (`SUBMITTED` -> `IN_PROGRESS` ->
-/// terminal), plus a quarter span of slack, so both transitions the clock owes have
-/// fallen due by the time a row is read.
-///
-/// `pub(crate)` so the sibling suite that drives the same pair waits the same way rather
-/// than growing its own copy of the span arithmetic.
-pub(crate) fn past_both_spans() -> std::time::Duration {
-    PATIENT_INSIGHTS_JOB_STEP_SPAN * 2 + PATIENT_INSIGHTS_JOB_STEP_SPAN / 4
-}
 
 /// Whether `uri` satisfies the modelled `S3Uri` shape — matched by hand, field by field,
 /// rather than with a regex engine (the sibling suites in this workspace do the same).
@@ -195,45 +186,50 @@ async fn a_completed_job_reports_its_output_under_the_configured_path() {
                 "case {case:?}: a job the service accepted must reach the modelled terminal \
                  success status, got {fetched}"
             );
-            let output = fetched
-                .get("insightsOutput")
-                .cloned()
-                .unwrap_or_else(|| panic!("case {case:?}: a succeeded job must report an \
-                     insightsOutput, got {fetched}"));
-            let uri = string_at(&output, "uri");
-            assert!(
-                is_s3_uri(&uri),
-                "case {case:?}: the reported uri must satisfy the modelled S3Uri shape, \
-                 got {uri:?} ({} characters)",
-                uri.chars().count()
-            );
 
             // Under the configured path: the location starts at the path the start was
             // given, with any trailing separator of that path collapsed into the one
-            // that joins it to what follows.
+            // that joins it to what follows — and it names the summary OBJECT of this job
+            // and this patient, not a prefix. The one case a job reports no location is a
+            // configured path so long that no object location fits inside the modelled
+            // `S3Uri` bound.
             let configured = path.trim_end_matches('/');
-            assert!(
-                uri.starts_with(configured),
-                "case {case:?}: the reported uri must sit under the configured path \
-                 {configured:?}, got {uri:?}"
-            );
-
-            // And it identifies the job that wrote it — except where the configured path
-            // is so long that a job prefix would not fit inside the modelled `S3Uri`
-            // bound, which is the one case the location stays the configured path.
-            let room = configured_has_room(path, job_id);
+            let room = configured_has_room(path, job_id, MINIMAL_PATIENT_ID, SUMMARY_OBJECT_NAME);
+            let output = fetched.get("insightsOutput").cloned();
             if room {
+                let output = output.unwrap_or_else(|| {
+                    panic!("case {case:?}: a succeeded job must report an insightsOutput, \
+                         got {fetched}")
+                });
+                let uri = string_at(&output, "uri");
+                assert!(
+                    is_s3_uri(&uri),
+                    "case {case:?}: the reported uri must satisfy the modelled S3Uri shape, \
+                     got {uri:?} ({} characters)",
+                    uri.chars().count()
+                );
+                assert!(
+                    uri.starts_with(configured),
+                    "case {case:?}: the reported uri must sit under the configured path \
+                     {configured:?}, got {uri:?}"
+                );
                 assert_eq!(
                     uri,
-                    format!("{configured}/{job_id}/"),
-                    "case {case:?}: the reported uri must name the job under the configured \
-                     path, got {uri:?}"
+                    format!("{configured}/{job_id}/{MINIMAL_PATIENT_ID}/{SUMMARY_OBJECT_NAME}"),
+                    "case {case:?}: the reported uri must name this job's summary object \
+                     under the configured path, got {uri:?}"
                 );
+                assert!(
+                    reported.insert(uri.clone()),
+                    "case {case:?}: two jobs must not report the same output location, \
+                     got {uri:?} twice"
+                );
+                uris.push(uri);
             } else {
-                assert_eq!(
-                    &uri, path,
-                    "case {case:?}: a configured path with no room for a job prefix must be \
-                     reported unchanged, got {uri:?}"
+                assert!(
+                    output.is_none(),
+                    "case {case:?}: a configured path with no room for an object location \
+                     inside the modelled bound leaves nothing to report, got {fetched}"
                 );
             }
 
@@ -248,23 +244,15 @@ async fn a_completed_job_reports_its_output_under_the_configured_path() {
             // Nothing answered the output write in this assembly — it mounts no object
             // store — so the delivery the job's completion owes is still owed and there is
             // nothing to report about its status. The suite that DOES mount one
-            // (`patient_insights_job_output_delivery`) is where the stored object and the
+            // (`patient_insights_job_output_delivery`) is where the stored objects and the
             // detail a made delivery states are asserted.
             assert!(
                 fetched.get("statusDetails").is_none(),
                 "case {case:?}: a job whose output write nothing answered has no status \
                  detail, got {fetched}"
             );
-            if room {
-                assert!(
-                    reported.insert(uri.clone()),
-                    "case {case:?}: two jobs must not report the same output location, \
-                     got {uri:?} twice"
-                );
-            }
-            uris.push(uri);
         }
-        if configured_has_room(path, &ids[0]) {
+        if configured_has_room(path, &ids[0], MINIMAL_PATIENT_ID, SUMMARY_OBJECT_NAME) {
             assert_ne!(
                 uris[0], uris[1],
                 "case {case:?}: two jobs sharing the configured path {path:?} must report \
@@ -274,13 +262,25 @@ async fn a_completed_job_reports_its_output_under_the_configured_path() {
     }
 }
 
-/// Whether a job prefix fits under `path` inside the modelled `S3Uri` bound — counted in
-/// characters, the unit the modelled `@length` is measured in.
+/// Whether an object location fits under `path` inside the modelled `S3Uri` bound — the
+/// configured path, the job's id, the patient's id, the object's name and the three
+/// separators that join them, counted in characters, the unit the modelled `@length` is
+/// measured in.
 ///
 /// `pub(crate)` so the sibling suite that spans character widths states the room rule
 /// once rather than twice.
-pub(crate) fn configured_has_room(path: &str, job_id: &str) -> bool {
-    path.trim_end_matches('/').chars().count() + job_id.chars().count() + 2 <= MAX_S3_URI_LEN
+pub(crate) fn configured_has_room(
+    path: &str,
+    job_id: &str,
+    patient_id: &str,
+    object_name: &str,
+) -> bool {
+    path.trim_end_matches('/').chars().count()
+        + job_id.chars().count()
+        + patient_id.chars().count()
+        + object_name.chars().count()
+        + 3
+        <= MAX_S3_URI_LEN
 }
 
 #[tokio::test]

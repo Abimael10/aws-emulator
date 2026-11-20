@@ -42,7 +42,7 @@ use service_com_amazonaws_connecthealth_connecthealth::ops::types::{
 };
 use service_com_amazonaws_connecthealth_connecthealth::state::{
     self, patient_insights_output_uri, JobStatus, PatientInsightsJob, PatientInsightsJobSpec,
-    MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN, PATIENT_INSIGHTS_JOB_STEP_SPAN,
+    MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN, SUMMARY_OBJECT_NAME,
 };
 
 use crate::domain_subscription_lifecycle::{error_code, string_at, Emulator};
@@ -115,7 +115,7 @@ fn is_job_arn(arn: &str, region: &str, domain_id: &str, job_id: &str) -> bool {
 /// request rather than each growing its own copy of a valid body.
 pub(crate) fn minimal_body() -> Value {
     json!({
-        "patientContext": { "patientId": "patient-0001" },
+        "patientContext": { "patientId": MINIMAL_PATIENT_ID },
         "insightsContext": { "insightsType": "PRE_VISIT" },
         "encounterContext": { "encounterReason": "Annual checkup" },
         "userContext": { "role": "CLINICIAN", "userId": "clinician-0001" },
@@ -123,6 +123,12 @@ pub(crate) fn minimal_body() -> Value {
         "outputDataConfig": { "s3OutputPath": "s3://clinic-output/insights/" },
     })
 }
+
+/// The patient [`minimal_body`] names, which is the id a completed job's output location
+/// carries a prefix of.
+///
+/// `pub(crate)` so the sibling suites that assert that location spell the patient once.
+pub(crate) const MINIMAL_PATIENT_ID: &str = "patient-0001";
 
 /// `n` distinct S3 sources, for the row that fills the modelled `S3Sources` list.
 fn s3_sources(n: usize) -> Value {
@@ -170,9 +176,9 @@ async fn domain_of(emulator: &Emulator, name: &str) -> String {
     )
 }
 
-/// How long a poll of a job's status keeps looking: many times over the spans
-/// [`PATIENT_INSIGHTS_JOB_STEP_SPAN`] owes a job, so a loaded host has room while a fast
-/// one never waits at all.
+/// How long a poll of a job's status keeps looking: many times over the spans the clock
+/// owes a job (`state::PATIENT_INSIGHTS_JOB_STEP_SPAN`), so a loaded host has room while a
+/// fast one never waits at all.
 pub(crate) const JOB_POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Look at a job through its own reader until `reached` holds of the `jobStatus` it
@@ -415,25 +421,29 @@ async fn the_clock_moves_a_submitted_job_to_the_modelled_success_status() {
         "a job read straight after the start must be SUBMITTED, got {fetched}"
     );
 
-    // Real elapsed time is required (the handlers read `SystemTime::now()`), and the
-    // workspace `tokio` dependency does not enable the `time` feature, so these are
-    // plain blocking sleeps rather than `tokio::time::sleep(..).await`. A little past
-    // each span, so the transition the clock owes has fallen due.
-    let past_a_span = PATIENT_INSIGHTS_JOB_STEP_SPAN + PATIENT_INSIGHTS_JOB_STEP_SPAN / 4;
-    std::thread::sleep(past_a_span);
-    let fetched = get_job(&emulator, "one span in", &domain_id, &job_id).await;
+    // Real elapsed time is required (the handlers read `SystemTime::now()`), so each
+    // transition is waited for by LOOKING at the job until it has fallen due, never by
+    // sleeping for a span: the CONDITION is what a caller observes, and a fixed wait would
+    // make the outcome depend on how fast the host runs.
+    let fetched = poll_until(
+        &emulator,
+        "one span in",
+        &domain_id,
+        &job_id,
+        |status| status != "SUBMITTED",
+    )
+    .await;
     assert_eq!(
         string_at(&fetched, "jobStatus"),
         "IN_PROGRESS",
-        "one span after the start the job must have been picked up, got {fetched}"
+        "the first status after SUBMITTED must be the one the clock owes next, got {fetched}"
     );
     assert!(
         fetched.get("statusDetails").is_none(),
         "a job still running has nothing to report about its status, got {fetched}"
     );
 
-    std::thread::sleep(past_a_span);
-    let done = get_job(&emulator, "two spans in", &domain_id, &job_id).await;
+    let done = poll_until_terminal(&emulator, "two spans in", &domain_id, &job_id).await;
     assert_eq!(
         string_at(&done, "jobStatus"),
         "SUCCEEDED",
@@ -442,8 +452,16 @@ async fn the_clock_moves_a_submitted_job_to_the_modelled_success_status() {
     let configured = string_at(&body["outputDataConfig"], "s3OutputPath");
     assert_eq!(
         member("two spans in", &done, "insightsOutput"),
-        json!({ "uri": patient_insights_output_uri(&configured, &job_id) }),
-        "a completed job must report its output under the configured path, got {done}"
+        json!({
+            "uri": patient_insights_output_uri(
+                &configured,
+                &job_id,
+                MINIMAL_PATIENT_ID,
+                SUMMARY_OBJECT_NAME,
+            )
+            .expect("the configured path leaves room for the object location"),
+        }),
+        "a completed job must report its summary object under the configured path, got {done}"
     );
     assert_ne!(
         member("two spans in", &done, "updatedTime"),

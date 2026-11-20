@@ -95,8 +95,10 @@
 //! reading straight after this call still sees `SUBMITTED`.
 //!
 //! An accepted job runs to completion: the read that finds its completion due stores its
-//! output object where the job reports it before it answers (`crate::state::insights_run`),
-//! so a caller polling the job to completion finds that object. What it carries is bounded
+//! output objects where the job reports them before it answers
+//! (`crate::state::insights_run`) — the summary at `insightsOutput.uri` and the
+//! processing-metadata object beside it — so a caller polling the job to completion finds
+//! them. What the summary carries is bounded
 //! by what this emulator can establish — it runs no clinical summarisation model, so the
 //! document names the patient and the kind of summary asked for and STATES that no insights
 //! were generated, which the job also reports in `statusDetails`. Every member around it is
@@ -393,18 +395,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             next_transition_at: Some(now + crate::state::PATIENT_INSIGHTS_JOB_STEP_SPAN),
             spec,
         };
-        // Where this job's output object goes, derived from the location the job itself
-        // reports (`crate::state::PatientInsightsJob::output_location`) through the
-        // workspace's one reading of an `s3://` URI — so the object lands at exactly the
-        // key `insightsOutput.uri` names. A configured location naming no object address
-        // leaves nothing to deliver.
-        job.output_delivery = ::service_common::s3_uri::object_address(&job.output_location().uri)
-            .map(|(bucket, key)| crate::state::InsightsDelivery {
-                region: region.clone(),
-                bucket,
-                key,
-                state: crate::state::DeliveryState::Owed,
-            });
+        // Where this job's output objects go, derived from the locations the job itself
+        // reports (`crate::state::PatientInsightsJob::owed_delivery`) through the
+        // workspace's one reading of an `s3://` URI — so the summary lands at exactly the
+        // key `insightsOutput.uri` names and its processing-metadata sibling beside it. A
+        // configured location naming no object address leaves nothing to deliver.
+        job.output_delivery = job.owed_delivery(&region);
         // `or_insert` hands back the record it STORED, so every field rendered below is
         // read out of the store rather than echoed from the request.
         let stored = domain.patient_insights_jobs.entry(job_id).or_insert(job);
