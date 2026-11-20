@@ -4636,6 +4636,9 @@ pub const ADDONS_LISTING: &str = "addons";
 /// The scope `ListNodegroups`'s tokens carry, over one cluster's node group
 /// names. See [`CLUSTERS_LISTING`].
 pub const NODEGROUPS_LISTING: &str = "node-groups";
+/// The scope `ListFargateProfiles`'s tokens carry, over one cluster's Fargate
+/// profile names. See [`CLUSTERS_LISTING`].
+pub const FARGATE_PROFILES_LISTING: &str = "fargate-profiles";
 /// The scope `ListCertificateAuthorities`'s tokens carry, over one cluster's
 /// certificate-authority order keys
 /// ([`CertificateAuthorityRecord::page_key`]). See [`CLUSTERS_LISTING`].

@@ -237,7 +237,7 @@ async fn an_unknown_cluster_is_reported_before_the_body_is_refused() {
 // ---------------------------------------------------------------------------
 
 /// The table spans what the rule generalises over: which listing of a cluster's
-/// resources was called (four, including one whose label member the model calls
+/// resources was called (five, including one whose label member the model calls
 /// `name` rather than `clusterName`), which published bound the value broke, and
 /// whether the cluster it is addressed to exists at all.
 ///
@@ -253,6 +253,7 @@ async fn a_page_size_outside_its_bounds_is_refused_before_the_cluster() {
     let listings = [
         ("ListNodegroups", "/node-groups"),
         ("ListAddons", "/addons"),
+        ("ListFargateProfiles", "/fargate-profiles"),
         ("ListCapabilities", "/capabilities"),
         ("ListUpdates", "/updates"),
     ];

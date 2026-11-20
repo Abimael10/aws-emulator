@@ -7,8 +7,8 @@
 //! `DescribeFargateProfile` answers from the same store, so the profile is readable
 //! in `DELETING` until the clock has finished the removal
 //! (`crate::state::FARGATE_PROFILE_DELETION_DELAY`), after which that read reports it
-//! gone. (`ListFargateProfiles` reads the same store, but is still a scaffolded 501,
-//! so this crate lists no profile at all yet.)
+//! gone. `ListFargateProfiles` reads the same store, so it still lists the profile
+//! for that span and stops listing it once the removal has finished.
 //!
 //! The rules it enforces:
 //!

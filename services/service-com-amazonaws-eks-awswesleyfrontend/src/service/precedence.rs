@@ -83,14 +83,16 @@ use crate::ops::types::{
     AccessDeniedException, AssociateIdentityProviderConfigInput, CreateAccessEntryInput,
     CreateAddonInput, CreateCapabilityInput, CreateClusterInput, CreateFargateProfileInput,
     CreateNodegroupInput, CreatePodIdentityAssociationInput, DeleteAddonInput, DescribeAddonInput,
-    InvalidParameterException, ListAddonsInput, ListCapabilitiesInput, ListNodegroupsInput,
-    ListUpdatesInput, ResourceNotFoundException, UpdateAddonInput, UpdateClusterConfigInput,
+    InvalidParameterException, ListAddonsInput, ListCapabilitiesInput, ListFargateProfilesInput,
+    ListNodegroupsInput, ListUpdatesInput, ResourceNotFoundException, UpdateAddonInput,
+    UpdateClusterConfigInput,
     ASSOCIATE_IDENTITY_PROVIDER_CONFIG_INPUT_SCHEMA, CREATE_ACCESS_ENTRY_INPUT_SCHEMA,
     CREATE_ADDON_INPUT_SCHEMA, CREATE_CAPABILITY_INPUT_SCHEMA, CREATE_CLUSTER_INPUT_SCHEMA,
     CREATE_FARGATE_PROFILE_INPUT_SCHEMA, CREATE_NODEGROUP_INPUT_SCHEMA,
     CREATE_POD_IDENTITY_ASSOCIATION_INPUT_SCHEMA, DELETE_ADDON_INPUT_SCHEMA,
     DESCRIBE_ADDON_INPUT_SCHEMA, LIST_ADDONS_INPUT_SCHEMA, LIST_CAPABILITIES_INPUT_SCHEMA,
-    LIST_NODEGROUPS_INPUT_SCHEMA, LIST_UPDATES_INPUT_SCHEMA, SCHEMA_ACCESS_DENIED_EXCEPTION,
+    LIST_FARGATE_PROFILES_INPUT_SCHEMA, LIST_NODEGROUPS_INPUT_SCHEMA, LIST_UPDATES_INPUT_SCHEMA,
+    SCHEMA_ACCESS_DENIED_EXCEPTION,
     SCHEMA_INVALID_PARAMETER_EXCEPTION, SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
     UPDATE_ADDON_INPUT_SCHEMA, UPDATE_CLUSTER_CONFIG_INPUT_SCHEMA,
 };
@@ -419,7 +421,9 @@ fn cluster_label_member(key: &str) -> Option<&'static str> {
         "CreateNodegroup" | "CreateCapability" | "CreateFargateProfile" | "CreateAddon"
         | "UpdateAddon" | "DescribeAddon" | "DeleteAddon" | "CreateAccessEntry"
         | "CreatePodIdentityAssociation" | "AssociateIdentityProviderConfig"
-        | "ListNodegroups" | "ListAddons" | "ListCapabilities" => Some(CLUSTER_NAME_MEMBER),
+        | "ListNodegroups" | "ListAddons" | "ListCapabilities" | "ListFargateProfiles" => {
+            Some(CLUSTER_NAME_MEMBER)
+        }
         _ => None,
     }
 }
@@ -682,6 +686,17 @@ fn addressed_by_input(
             LIST_CAPABILITIES_INPUT_SCHEMA,
             req,
             |input: &ListCapabilitiesInput, violations| {
+                addresses_cluster(CLUSTER_NAME_MEMBER, &input.cluster_name)
+                    .with_page_size_refusal(super::parameter_contract::page_size_refusal(
+                        violations,
+                    ))
+            },
+        ),
+        "ListFargateProfiles" => addressed_with(
+            protocol,
+            LIST_FARGATE_PROFILES_INPUT_SCHEMA,
+            req,
+            |input: &ListFargateProfilesInput, violations| {
                 addresses_cluster(CLUSTER_NAME_MEMBER, &input.cluster_name)
                     .with_page_size_refusal(super::parameter_contract::page_size_refusal(
                         violations,

@@ -197,11 +197,6 @@ async fn an_accepted_delete_leaves_the_child_deleting_until_the_removal_falls_du
         name: &'static str,
         taken_status: u16,
         taken_code: &'static str,
-        /// Whether the matching List is served at all: `ListFargateProfiles` is
-        /// still a scaffolded 501 in this emulator, so the profile row asserts the
-        /// reads that ARE served and leaves the listing to that operation's own
-        /// issue.
-        listed: bool,
     }
     let rows = [
         Row {
@@ -210,7 +205,6 @@ async fn an_accepted_delete_leaves_the_child_deleting_until_the_removal_falls_du
             name: "ng-removal",
             taken_status: 409,
             taken_code: "ResourceInUseException",
-            listed: true,
         },
         Row {
             case: "a Fargate profile",
@@ -218,7 +212,6 @@ async fn an_accepted_delete_leaves_the_child_deleting_until_the_removal_falls_du
             name: "fp-removal",
             taken_status: 400,
             taken_code: "InvalidRequestException",
-            listed: false,
         },
     ];
 
@@ -254,15 +247,13 @@ async fn an_accepted_delete_leaves_the_child_deleting_until_the_removal_falls_du
             "DELETING",
             "case {case:?}: expected status DELETING from the read, got {read:?}"
         );
-        if row.listed {
-            let listed = list_children(&router, row.child, cluster).await;
-            assert!(
-                lists(&listed, row.child, row.name),
-                "case {case:?}: the listing must carry {:?} while it is being deleted, got \
-                 {listed:?}",
-                row.name
-            );
-        }
+        let listed = list_children(&router, row.child, cluster).await;
+        assert!(
+            lists(&listed, row.child, row.name),
+            "case {case:?}: the listing must carry {:?} while it is being deleted, got \
+             {listed:?}",
+            row.name
+        );
         let again = delete_child(&router, row.child, cluster, row.name).await;
         assert_eq!(
             again.status, 200,
@@ -296,15 +287,13 @@ async fn an_accepted_delete_leaves_the_child_deleting_until_the_removal_falls_du
             "case {case:?}: expected ResourceNotFoundException once the removal finished, \
              got {gone:?}"
         );
-        if row.listed {
-            let listed = list_children(&router, row.child, cluster).await;
-            assert!(
-                !lists(&listed, row.child, row.name),
-                "case {case:?}: the listing must drop {:?} once the removal finished, got \
-                 {listed:?}",
-                row.name
-            );
-        }
+        let listed = list_children(&router, row.child, cluster).await;
+        assert!(
+            !lists(&listed, row.child, row.name),
+            "case {case:?}: the listing must drop {:?} once the removal finished, got \
+             {listed:?}",
+            row.name
+        );
         let recreated = create_child(&router, row.child, cluster, row.name).await;
         assert_eq!(
             recreated.status, 200,

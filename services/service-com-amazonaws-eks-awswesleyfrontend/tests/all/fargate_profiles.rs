@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end cover for the EKS Fargate profile slice: `CreateFargateProfile` and
-//! `DescribeFargateProfile`, driven over the wire through the same
-//! `MultiServiceRouter` the production binary mounts.
+//! End-to-end cover for the EKS Fargate profile slice: `CreateFargateProfile`,
+//! `DescribeFargateProfile` and `ListFargateProfiles`, driven over the wire through
+//! the same `MultiServiceRouter` the production binary mounts.
 //!
-//! Three rules, each asserted over a TABLE of inputs rather than over one recorded
+//! Four rules, each asserted over a TABLE of inputs rather than over one recorded
 //! request:
 //!
 //! 1. a profile read back through `DescribeFargateProfile` is the record the create
@@ -18,7 +18,11 @@
 //!    depends on the kind of cluster the request named: the same payload earns the
 //!    parameter refusal whether the cluster is one Amazon EKS manages or one
 //!    `RegisterCluster` connected, and only a request whose payload is sound is
-//!    answered with the connected-cluster `ClientException`.
+//!    answered with the connected-cluster `ClientException`;
+//! 4. `ListFargateProfiles` names exactly the profiles the store holds for the
+//!    cluster the request addresses in the Region it is signed for, in profile-name
+//!    order, at most `maxResults` to a page, with an opaque `nextToken` that resumes
+//!    after the last name returned and is absent on the last page.
 //!
 //! The rows differ along what each rule generalises over — which optional members
 //! are supplied, selector count and label shape, subnet-list length, tag map, the
@@ -32,13 +36,16 @@
 use std::time::Duration;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    CONNECTED_CLUSTER_REFUSAL_MESSAGE, FARGATE_PROFILE_ACTIVATION_DELAY,
-    MAX_FARGATE_PROFILES_PER_CLUSTER, MAX_SELECTORS_PER_FARGATE_PROFILE,
+    cluster_name_refusal, cluster_not_found_message, encode_page_token, encode_scoped_page_token,
+    max_results_range_message, CONNECTED_CLUSTER_REFUSAL_MESSAGE,
+    FARGATE_PROFILE_ACTIVATION_DELAY, INVALID_NEXT_TOKEN_MESSAGE, MAX_FARGATE_PROFILES_PER_CLUSTER,
+    MAX_LIST_MAX_RESULTS, MAX_SELECTORS_PER_FARGATE_PROFILE, MIN_LIST_MAX_RESULTS,
+    NODEGROUPS_LISTING,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cluster_lifecycle::REGION;
-use crate::wire::{call, emulator, encode_label, error_code, Answer};
+use crate::wire::{call, emulator, encode_label, error_code, read_until, Answer};
 
 /// A role of the account this emulator serves, so the pass-role authorization
 /// (403, pinned by `pass_role_authorization`) is never what answers a row here.
@@ -794,5 +801,478 @@ async fn profiles_are_bounded_per_cluster_and_go_with_the_cluster() {
         recreated.status, 200,
         "and the name is free again, got {recreated:?} ({})",
         recreated.message()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULE 4: `ListFargateProfiles` names exactly the profiles the store holds for the
+// cluster the request addresses in the Region it is signed for, in profile-name
+// order, at most `maxResults` to a page, with an opaque `nextToken` that resumes
+// after the last name returned and is absent on the last page.
+// ---------------------------------------------------------------------------
+
+async fn list_profiles_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    cluster: &str,
+    query: &str,
+) -> Answer {
+    let collection = format!("/clusters/{}/fargate-profiles", encode_label(cluster));
+    let uri = if query.is_empty() {
+        collection
+    } else {
+        format!("{collection}?{query}")
+    };
+    call(router, region, "GET", &uri, "").await
+}
+
+async fn list_profiles(router: &MultiServiceRouter, cluster: &str, query: &str) -> Answer {
+    list_profiles_in(router, REGION, cluster, query).await
+}
+
+/// The profile names one answer carries, as a client reads them.
+fn listed_names(answer: &Answer) -> Vec<String> {
+    answer.body["fargateProfileNames"]
+        .as_array()
+        .map(|names| {
+            names
+                .iter()
+                .map(|name| name.as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `nextToken` one answer carries, or `None` on a last page.
+fn page_token(answer: &Answer) -> Option<String> {
+    answer.body["nextToken"].as_str().map(str::to_owned)
+}
+
+/// Create `names` as profiles of `cluster` in `region`, in the order given — which
+/// is deliberately NOT the order the listing must answer them in.
+async fn create_profiles_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    cluster: &str,
+    names: &[&str],
+) {
+    for name in names {
+        let answer = create_profile_in(router, region, cluster, &minimal_request(name)).await;
+        assert_eq!(
+            answer.status, 200,
+            "setup: the profile {name:?} of {cluster:?} in {region} must be created, got \
+             {answer:?} ({})",
+            answer.message()
+        );
+    }
+}
+
+/// [`create_profiles_in`] in the Region the rest of this suite works in.
+async fn create_profiles(router: &MultiServiceRouter, cluster: &str, names: &[&str]) {
+    create_profiles_in(router, REGION, cluster, names).await
+}
+
+/// Walk EVERY page of the listing of `cluster` at `page_size` (absent for the
+/// default page), answering the names in the order the pages gave them.
+///
+/// The walk follows the token the previous page returned, which is the only thing a
+/// client has to resume from, and stops on the page that returns none.
+async fn walk_pages(
+    router: &MultiServiceRouter,
+    case: &str,
+    cluster: &str,
+    page_size: Option<i64>,
+) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(size) = page_size {
+            query.push(format!("maxResults={size}"));
+        }
+        if let Some(carried) = &token {
+            query.push(format!("nextToken={carried}"));
+        }
+        let answer = list_profiles(router, cluster, &query.join("&")).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: every page must be served, got {answer:?} ({})",
+            answer.message()
+        );
+        let names = listed_names(&answer);
+        if let Some(size) = page_size {
+            assert!(
+                names.len() <= size as usize,
+                "case {case:?}: a page holds at most {size} names, got {names:?}"
+            );
+        }
+        let next = page_token(&answer);
+        assert!(
+            next.is_none() || !names.is_empty(),
+            "case {case:?}: a page that resumes must have returned something, got {answer:?}"
+        );
+        seen.extend(names);
+        // A page count bounded by the store: the cluster cannot hold more than its
+        // quota, so a walk that asks for more pages than that is not terminating.
+        assert!(
+            seen.len() <= MAX_FARGATE_PROFILES_PER_CLUSTER,
+            "case {case:?}: the walk must terminate within the cluster's quota, got {seen:?}"
+        );
+        match next {
+            Some(carried) => token = Some(carried),
+            None => return seen,
+        }
+    }
+}
+
+/// The table spans what the rule generalises over: how many profiles a cluster
+/// holds (none, one, several), which cluster of the Region holds them, and which
+/// Region holds a cluster of the SAME name.
+#[tokio::test]
+async fn the_listing_names_the_profiles_of_its_own_cluster_and_region_in_order() {
+    let router = emulator();
+    let other_region = "eu-west-1";
+    let cluster = "fp-listing";
+    let neighbour = "fp-listing-neighbour";
+    create_cluster_in(&router, REGION, cluster).await;
+    create_cluster_in(&router, REGION, neighbour).await;
+    create_cluster_in(&router, other_region, cluster).await;
+
+    // A cluster that holds none: an empty listing, not a refusal and not a token.
+    for (case, region, named) in [
+        ("the addressed cluster", REGION, cluster),
+        ("a sibling cluster of the Region", REGION, neighbour),
+        ("the same name in another Region", other_region, cluster),
+    ] {
+        let answer = list_profiles_in(&router, region, named, "").await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: a cluster with no profile still has a listing, got {answer:?}"
+        );
+        assert_eq!(
+            listed_names(&answer),
+            Vec::<String>::new(),
+            "case {case:?}: expected no names, got {answer:?}"
+        );
+        assert_eq!(
+            page_token(&answer),
+            None,
+            "case {case:?}: nothing is left to resume from, got {answer:?}"
+        );
+    }
+
+    // Created in an order that is NOT the order the listing answers them in, so the
+    // ordering asserted below is the listing's and not the creates'.
+    create_profiles(&router, cluster, &["zeta", "alpha", "mu", "beta"]).await;
+    create_profiles(&router, neighbour, &["neighbour-only"]).await;
+    create_profiles_in(&router, other_region, cluster, &["other-region-only"]).await;
+
+    for (case, region, named, expected) in [
+        (
+            "the addressed cluster",
+            REGION,
+            cluster,
+            vec!["alpha", "beta", "mu", "zeta"],
+        ),
+        (
+            "a sibling cluster of the Region",
+            REGION,
+            neighbour,
+            vec!["neighbour-only"],
+        ),
+        (
+            "the same name in another Region",
+            other_region,
+            cluster,
+            vec!["other-region-only"],
+        ),
+    ] {
+        let answer = list_profiles_in(&router, region, named, "").await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: the listing must be served, got {answer:?}"
+        );
+        assert_eq!(
+            listed_names(&answer),
+            expected,
+            "case {case:?}: expected exactly {expected:?} in profile-name order, got {answer:?}"
+        );
+        assert_eq!(
+            page_token(&answer),
+            None,
+            "case {case:?}: a whole page leaves nothing to resume from, got {answer:?}"
+        );
+    }
+
+    // Every name the listing answers reads back as a profile of THAT cluster, so the
+    // listing is the store's and not a list of labels.
+    for name in listed_names(&list_profiles(&router, cluster, "").await) {
+        let read = describe_profile(&router, cluster, &name).await;
+        assert_eq!(
+            read.status, 200,
+            "case {name:?}: a listed name must read back, got {read:?}"
+        );
+        assert_eq!(
+            profile(&read)["clusterName"].as_str(),
+            Some(cluster),
+            "case {name:?}: the listed profile belongs to the cluster listed, got {read:?}"
+        );
+    }
+}
+
+/// The table spans the page sizes the rule generalises over: the default (no
+/// `maxResults` at all), one, a size that divides the store, one that does not, the
+/// exact count, more than the count, and both published bounds of the member.
+#[tokio::test]
+async fn a_page_holds_at_most_max_results_and_the_token_resumes_after_it() {
+    let router = emulator();
+    let cluster = "fp-paging";
+    create_cluster_in(&router, REGION, cluster).await;
+    let stored: Vec<String> = (0..7).map(|index| format!("fp-page-{index}")).collect();
+    let created: Vec<&str> = stored.iter().rev().map(String::as_str).collect();
+    create_profiles(&router, cluster, &created).await;
+
+    for page_size in [
+        None,
+        Some(1),
+        Some(2),
+        Some(3),
+        Some(7),
+        Some(8),
+        Some(MIN_LIST_MAX_RESULTS),
+        Some(MAX_LIST_MAX_RESULTS),
+    ] {
+        let case = match page_size {
+            Some(size) => format!("maxResults={size}"),
+            None => "no maxResults".to_string(),
+        };
+        let seen = walk_pages(&router, &case, cluster, page_size).await;
+        assert_eq!(
+            seen, stored,
+            "case {case:?}: paging must yield every profile name once, in the listing's \
+             order; got {seen:?}"
+        );
+    }
+
+    // One past each published bound is refused with the page-size sentence, which
+    // names no resource — the page the caller asked for is wrong on its own.
+    for size in [MIN_LIST_MAX_RESULTS - 1, MAX_LIST_MAX_RESULTS + 1] {
+        let case = format!("maxResults={size}");
+        let answer = list_profiles(&router, cluster, &case).await;
+        assert_eq!(
+            (answer.status, error_code(&answer).as_str()),
+            (400, "InvalidParameterException"),
+            "case {case:?}: a page size outside its bounds is refused, got {answer:?}"
+        );
+        assert_eq!(
+            answer.message(),
+            max_results_range_message(),
+            "case {case:?}: expected the page-size sentence, got {:?}",
+            answer.message()
+        );
+    }
+}
+
+/// The listing follows the STORE: a profile appears when it is created, is still
+/// named while the removal its delete accepted is running, and is gone once the
+/// clock has finished it.
+#[tokio::test]
+async fn the_listing_follows_the_store_as_profiles_come_and_go() {
+    let router = emulator();
+    let cluster = "fp-listing-lifecycle";
+    create_cluster_in(&router, REGION, cluster).await;
+    create_profiles(&router, cluster, &["fp-keep", "fp-go", "fp-stay"]).await;
+
+    let listed = list_profiles(&router, cluster, "").await;
+    assert_eq!(
+        listed_names(&listed),
+        vec!["fp-go", "fp-keep", "fp-stay"],
+        "every created profile is named, got {listed:?}"
+    );
+
+    let deleted = call(
+        &router,
+        REGION,
+        "DELETE",
+        &format!(
+            "/clusters/{}/fargate-profiles/{}",
+            encode_label(cluster),
+            encode_label("fp-go")
+        ),
+        "",
+    )
+    .await;
+    assert_eq!(
+        deleted.status, 200,
+        "the delete must be accepted, got {deleted:?} ({})",
+        deleted.message()
+    );
+    assert_eq!(
+        profile(&deleted)["status"].as_str(),
+        Some("DELETING"),
+        "the delete answers the profile on its way out, got {deleted:?}"
+    );
+    // WHILE THE REMOVAL RUNS the profile is still a profile of its cluster, so the
+    // listing still names it.
+    let during = list_profiles(&router, cluster, "").await;
+    assert!(
+        listed_names(&during).contains(&"fp-go".to_string()),
+        "a profile whose removal is still running is still named, got {during:?}"
+    );
+
+    // ONCE THE CLOCK HAS FINISHED IT the listing drops it — waited for by LOOKING
+    // AGAIN, never by waiting out the span.
+    let after = read_until(
+        "a finished removal",
+        "the listing drops the removed profile",
+        || list_profiles(&router, cluster, ""),
+        |answer| !listed_names(answer).contains(&"fp-go".to_string()),
+    )
+    .await;
+    assert_eq!(
+        listed_names(&after),
+        vec!["fp-keep", "fp-stay"],
+        "the other profiles are untouched by the removal, got {after:?}"
+    );
+}
+
+/// A `nextToken` this listing did not issue is a bad parameter, not an empty page.
+/// The rows differ along HOW the token is foreign: outside this encoding's
+/// alphabet, an odd length, a well-formed encoding carrying no provenance tag, and
+/// the two a scope-less check would wave through — tokens other listings of this
+/// same service mint.
+#[tokio::test]
+async fn a_next_token_this_listing_did_not_issue_is_refused() {
+    let router = emulator();
+    let cluster = "fp-tokens";
+    create_cluster_in(&router, REGION, cluster).await;
+    create_profiles(&router, cluster, &["fp-token-a", "fp-token-b"]).await;
+
+    let untagged: String = "fp-token-a".bytes().map(|byte| format!("{byte:02x}")).collect();
+    let clusters_listing = encode_page_token(cluster);
+    let nodegroups_listing = encode_scoped_page_token(NODEGROUPS_LISTING, "fp-token-a");
+    for case in [
+        "not-hex",
+        "zz",
+        "abc",
+        "ffffffffff",
+        untagged.as_str(),
+        clusters_listing.as_str(),
+        nodegroups_listing.as_str(),
+    ] {
+        let answer = list_profiles(&router, cluster, &format!("nextToken={case}")).await;
+        assert_eq!(
+            (answer.status, error_code(&answer).as_str()),
+            (400, "InvalidParameterException"),
+            "case {case:?}: a foreign nextToken is refused, got {answer:?}"
+        );
+        assert_eq!(
+            answer.message(),
+            INVALID_NEXT_TOKEN_MESSAGE,
+            "case {case:?}: expected this plane's page-token sentence, got {:?}",
+            answer.message()
+        );
+        assert_eq!(
+            answer.body["clusterName"].as_str(),
+            Some(cluster),
+            "case {case:?}: the refusal names the cluster the listing was addressed to, \
+             got {answer:?}"
+        );
+    }
+
+    // The CONTROL: the token THIS listing issued is honoured, so the rows above are
+    // the provenance check and not a blanket refusal.
+    let first = list_profiles(&router, cluster, "maxResults=1").await;
+    let token = page_token(&first).expect("a first page of two leaves a token");
+    let second = list_profiles(&router, cluster, &format!("maxResults=1&nextToken={token}")).await;
+    assert_eq!(
+        (second.status, listed_names(&second)),
+        (200, vec!["fp-token-b".to_string()]),
+        "the token this listing issued resumes after the name it was minted from, got \
+         {second:?}"
+    );
+}
+
+/// The listing resolves the cluster it is addressed to exactly as the read of one
+/// profile does: a label no cluster of this API could carry is the bad parameter it
+/// is, a cluster this Region does not hold is the 404 that names it, and a cluster
+/// `RegisterCluster` connected has no Amazon EKS-managed Fargate plane to list.
+#[tokio::test]
+async fn the_listing_resolves_the_cluster_before_it_lists_anything() {
+    let router = emulator();
+    let other_region = "eu-west-1";
+    let managed = "fp-listing-managed";
+    let connected = "fp-listing-connected";
+    let elsewhere = "fp-listing-elsewhere";
+    create_cluster_in(&router, REGION, managed).await;
+    register_cluster(&router, connected).await;
+    create_cluster_in(&router, other_region, elsewhere).await;
+
+    for (case, label) in [
+        ("a cluster ARN where a bare name belongs", {
+            format!(
+                "arn:aws:eks:{REGION}:{}:cluster/{managed}",
+                engine::emulator_account_id()
+            )
+        }),
+        ("a space and a bang", "sim2real probe bad!".to_string()),
+        ("a leading dash", "-leading-dash".to_string()),
+        ("one character past the maximum", "c".repeat(101)),
+    ] {
+        let answer = list_profiles(&router, &label, "").await;
+        assert_eq!(
+            (answer.status, error_code(&answer).as_str()),
+            (400, "InvalidParameterException"),
+            "case {case:?}: a label no cluster could carry is refused, got {answer:?}"
+        );
+        assert_eq!(
+            answer.message(),
+            cluster_name_refusal("clusterName", &label),
+            "case {case:?}: expected the cluster-name sentence, got {:?}",
+            answer.message()
+        );
+    }
+
+    for (case, region, named) in [
+        ("a name no cluster of the Region carries", REGION, "fp-ghost"),
+        ("a cluster only another Region holds", REGION, elsewhere),
+    ] {
+        let answer = list_profiles_in(&router, region, named, "").await;
+        assert_eq!(
+            (answer.status, error_code(&answer).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: an unresolvable cluster has no listing, got {answer:?}"
+        );
+        assert_eq!(
+            answer.message(),
+            cluster_not_found_message(named),
+            "case {case:?}: expected the cluster-not-found sentence, got {:?}",
+            answer.message()
+        );
+        assert_eq!(
+            answer.body["clusterName"].as_str(),
+            Some(named),
+            "case {case:?}: the refusal names the cluster that was not found, got {answer:?}"
+        );
+    }
+
+    let refused = list_profiles(&router, connected, "").await;
+    assert_eq!(
+        (refused.status, error_code(&refused).as_str()),
+        (400, "ClientException"),
+        "a connected cluster has no Amazon EKS-managed Fargate plane to list, got {refused:?}"
+    );
+    assert_eq!(
+        refused.message(),
+        CONNECTED_CLUSTER_REFUSAL_MESSAGE,
+        "expected the connected-cluster refusal sentence, got {:?}",
+        refused.message()
+    );
+
+    // The CONTROL: the cluster Amazon EKS manages is listed.
+    let served = list_profiles(&router, managed, "").await;
+    assert_eq!(
+        served.status, 200,
+        "the managed cluster is listed, got {served:?}"
     );
 }
