@@ -13,7 +13,7 @@
 
 use std::time::SystemTime;
 
-use super::{bus_name_of_arn, EventBus};
+use super::EventBus;
 use crate::ops::types::{
     AccessDeniedException, ConflictException, InvalidInputException, ResourceNotFoundException,
     ResourcePolicySummary,
@@ -138,10 +138,11 @@ pub fn is_named_policy(name: &str) -> bool {
 /// sentence listing the names the service admits, plus the name the request
 /// submitted.
 pub fn unknown_policy_name(policy_name: &str) -> InvalidInputException {
+    let valid: Vec<String> = POLICY_NAMES.iter().map(|name| format!("'{name}'")).collect();
     InvalidInputException {
         message: Some(format!(
-            "PolicyName {policy_name} is not valid; valid values are {}",
-            POLICY_NAMES.join(" and ")
+            "PolicyName '{policy_name}' is not a valid resource policy name. Valid values are {}.",
+            valid.join(" and ")
         )),
     }
 }
@@ -157,8 +158,7 @@ pub fn unknown_policy_name(policy_name: &str) -> InvalidInputException {
 pub fn policy_write_denied(policy_name: &str) -> AccessDeniedException {
     AccessDeniedException {
         message: Some(format!(
-            "The {policy_name} resource policy is written exclusively by AWS Resource Access \
-             Manager"
+            "Only AWS Resource Access Manager can modify the {policy_name} resource policy"
         )),
     }
 }
@@ -167,18 +167,13 @@ pub fn policy_write_denied(policy_name: &str) -> AccessDeniedException {
 /// when the bus exists but holds no policy under the requested name.
 ///
 /// ONE construction, so no two operations word the same refusal differently: a
-/// fixed sentence plus two variable parts, the policy name the request addressed
-/// and the NAME of the bus it addressed it on — the same part of an
-/// `EventBusArn` that [`super::event_bus_not_found`] reports, so a client reads
-/// back the bus it asked about rather than a generated id segment.
-pub fn resource_policy_not_found(
-    policy_name: &str,
-    event_bus_arn: &str,
-) -> ResourceNotFoundException {
-    let bus = bus_name_of_arn(event_bus_arn).unwrap_or(event_bus_arn);
+/// fixed sentence with the policy name the request addressed as its one variable
+/// part. The bus is not named: the request addressed it by ARN, which is what the
+/// caller already holds, and the sentence is about the POLICY that is not there.
+pub fn resource_policy_not_found(policy_name: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!(
-            "Resource policy not found: {policy_name} on event bus {bus}"
+            "No '{policy_name}' resource policy is attached to this event bus"
         )),
     }
 }

@@ -135,7 +135,7 @@ uuid = { version = "1", features = ["v4"] }
 # workspace's own feature set), and the clock its own cases wait on.
 # `iot_mqtt_broker`: `sync` carries the per-connection channel the broker hands a live
 # client's session its deliveries over, and the notification that closes one.
-tokio = { workspace = true, features = ["io-util", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
 # `iot_mqtt_broker`: the MQTT 3.1.1 packet codec the broker reads a client's CONNECT,
 # SUBSCRIBE and PUBLISH with and writes its own CONNACK, SUBACK, PUBLISH and PINGRESP
 # with — the maintained serializer of the protocol, so the wire a stock MQTT client

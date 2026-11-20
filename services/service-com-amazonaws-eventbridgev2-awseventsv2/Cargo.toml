@@ -53,6 +53,10 @@ automod = { workspace = true }
 # because a delivery is asserted where a client sees it: on the queue the
 # subscriber's target names.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# AWS KMS, mounted beside this service on one engine in the encryption-key
+# suite: whether a bus's `KmsKeyIdentifier` names a key that exists is KMS's
+# answer, so the rule can only be asserted with a KMS to ask.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # Decodes the rpcv2Cbor error envelope the refusal suite reads a refusal's error
 # code and whole `Message` out of, rather than scanning the body as text.
 aws-smithy-cbor = "0.62.2"

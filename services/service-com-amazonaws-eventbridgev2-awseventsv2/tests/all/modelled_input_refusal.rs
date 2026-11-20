@@ -191,7 +191,7 @@ impl Wire {
     }
 
     /// Dispatch `body` to `operation` and hand back the status and the response body.
-    async fn send(&self, operation: &str, body: Vec<u8>) -> (u16, bytes::Bytes) {
+    pub(crate) async fn send(&self, operation: &str, body: Vec<u8>) -> (u16, bytes::Bytes) {
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("/service/AWSEventsV2/operation/{operation}"))
@@ -277,7 +277,7 @@ impl Wire {
 }
 
 /// `input` encoded as the body of an `O` request.
-fn encoded<O: Operation>(input: &O::Input) -> Vec<u8> {
+pub(crate) fn encoded<O: Operation>(input: &O::Input) -> Vec<u8> {
     let codec = CborCodec::default();
     let mut serializer = codec.create_serializer();
     serializer
@@ -360,7 +360,7 @@ fn clause(value: &str, member: &str, requirement: &str) -> String {
 }
 
 /// The clause of a member absent from the request, which echoes no value.
-fn absent_clause(member: &str) -> String {
+pub(crate) fn absent_clause(member: &str) -> String {
     format!("Value null at '{member}' failed to satisfy constraint: Member must not be null")
 }
 
@@ -370,7 +370,7 @@ fn must_match(pattern: &str) -> String {
 }
 
 /// The whole `Message` of a constraint refusal: AWS's envelope over `clauses`.
-fn constraint_envelope(clauses: &[String]) -> String {
+pub(crate) fn constraint_envelope(clauses: &[String]) -> String {
     if clauses.len() == 1 {
         return format!("1 validation error detected: {}", clauses[0]);
     }

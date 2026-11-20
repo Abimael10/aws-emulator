@@ -247,12 +247,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if requested_origin != source.origin_type() {
                 return Err(UpdateEventSourceErrorModeled::InvalidInputException(
                     InvalidInputException {
+                        // The fixed text of this error class, with the one variable
+                        // part the model supplies: the `EventSourceType` the stored
+                        // source reports, which is the variant its configuration
+                        // has to stay on. Nothing of the request reaches it.
                         message: Some(format!(
-                            "event source {} forwards {} events and its Configuration cannot be \
-                             changed to {}",
-                            source.arn,
-                            source.origin_type(),
-                            requested_origin
+                            "EventSource type is immutable: the configuration variant must \
+                             remain {}",
+                            source.source_type()
                         )),
                     },
                 )

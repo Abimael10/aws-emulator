@@ -126,10 +126,11 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // enum from the OPERATION's own `errors` list only.
 #[smithy_macros::operation_error(
     "com.amazonaws.eventbridgev2#UpdateEventBus",
-    extra_errors = ["InternalException"]
+    extra_errors = ["AccessDeniedException", "InternalException"]
 )]
 #[derive(Debug)]
 pub enum UpdateEventBusErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConcurrentModificationException(ConcurrentModificationException),
     InternalException(InternalException),
     InvalidStateException(InvalidStateException),
@@ -188,14 +189,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The bus is addressed by ARN, which carries its own region and account,
-        // so nothing here is read from the request's credential scope.
-        let _ = ctx;
+        // so nothing the bus IS gets read from the request's credential scope; the
+        // KMS lookup below is the one thing that does, because an identifier
+        // carrying no Region of its own names a key in the Region the call was
+        // signed for.
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateEventBusErrorModeled::InternalException(InternalException {
                 message: Some("the event bus store is unavailable on this engine".to_string()),
             })
             .into());
         };
+        // The key an encryption configuration names has to be one KMS holds: the
+        // member's own constraints cannot say whether a key EXISTS, and a bus whose
+        // key is not there could encrypt nothing. Asked before the store is
+        // touched, so a refused update writes nothing, and asked of KMS itself, so
+        // the refusal is grounded in what KMS said.
+        if crate::state::kms_key_absent(ctx, input.encryption_configuration.as_ref()).await {
+            return Err(
+                UpdateEventBusErrorModeled::AccessDeniedException(crate::state::kms_key_not_found())
+                    .into(),
+            );
+        }
         let now = ::std::time::SystemTime::now();
 
         let mut state = store.lock();

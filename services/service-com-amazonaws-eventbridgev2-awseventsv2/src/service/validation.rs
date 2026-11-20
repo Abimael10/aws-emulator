@@ -38,6 +38,7 @@
 use aws_smithy_runtime_api::http::{Request as WireRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::Violation;
 use aws_smithy_schema_server::DeserializableStruct;
+use service_common::unstated_members::{stating_every_absence, unstated_members, worth_walking};
 use service_common::validation::refusing_violations;
 use service_common::validation_message::aws_validation_refusal;
 use smithy_server_runtime::{
@@ -78,6 +79,17 @@ fn invalid_input(message: String) -> InvalidInputException {
 /// violation to state.
 fn refusal_message(violations: Vec<Violation>) -> Option<String> {
     aws_validation_refusal(&Refusal::Invalid(violations)).map(|refused| refused.message)
+}
+
+/// The whole `Message` of a refusal of a union-typed member the request did not set exactly
+/// one variant of: the arity rule that member's shape documents, naming the member as the
+/// model spells it.
+///
+/// FIXED text of that error class, with the member name the one variable part: the model is
+/// where it comes from, not the request, and the message is the only thing telling the
+/// caller the union arity was the problem rather than one of the values inside it.
+fn one_variant_required(member: &str) -> String {
+    format!("Exactly one {member} sub-field must be provided")
 }
 
 /// How one operation's input states the idempotency token a create of this service requires,
@@ -135,18 +147,47 @@ impl<Op: Operation> ModelledInputRefusal<Op> {
     /// caller sent. So this front door can find no violation set the framework's own walk
     /// would not, and a long value is quoted as submitted rather than as the elision a
     /// renderer would otherwise carry — and it refuses nothing the model accepts.
-    fn refusal(
+    ///
+    /// Two things that refuse a request are found while it is READ rather than while the
+    /// built value is walked, so the read stops at the first and they reach no violation
+    /// list ([`unstated_members`]): the SECOND and later `@required` members the request
+    /// omits, which AWS states one clause each, and a union member set other than exactly
+    /// once, whose shape documents "Exactly one variant must be set" and which the generated
+    /// read otherwise answers by keeping the last variant or by failing with no violation at
+    /// all.
+    async fn refusal(
         &self,
         protocol: &dyn ServerHttpProtocol,
         req: &WireRequest,
     ) -> Option<InvalidInputException> {
+        // The model's own constraints first, since they answer most refusals on their own.
         let violations = refusing_violations::<Op>(protocol, req);
-        if violations.is_empty() {
-            // The model accepted the request; this service's own requirement on a
-            // create's idempotency token is what is left to state.
-            return self.missing_client_token(protocol, req);
+        // What the request left UNSTATED about the input shapes is found by a walk of its
+        // own, and only TWO violation sets leave anything for it to find
+        // ([`worth_walking`]): exactly ONE absence, where the framework's own read stopped
+        // — so a batch whose entries each break a different requirement would otherwise be
+        // refused with one clause for all of them — and NO violation at all, where a union
+        // member set other than exactly once is what is left, since the union's arity is no
+        // constraint and so appears in no violation. The second of those is also the
+        // request this service SERVES, which therefore pays for one pass of the walk: the
+        // arity cannot be settled from the input schema instead, because a member schema
+        // carries its member's name and not its target shape, so "does this input reach a
+        // union" is not a question the schema can answer. A request with two violations, or
+        // with one that is not an absence, is answered without the walk.
+        if !worth_walking(&violations) {
+            return refusal_message(violations).map(invalid_input);
         }
-        refusal_message(violations).map(invalid_input)
+        let unstated = unstated_members::<Op>(protocol, req).await;
+        let violations = stating_every_absence(violations, &unstated.omitted);
+        if !violations.is_empty() {
+            return refusal_message(violations).map(invalid_input);
+        }
+        if let Some(member) = unstated.unions.first() {
+            return Some(invalid_input(one_variant_required(member)));
+        }
+        // The model accepted the request; this service's own requirement on a
+        // create's idempotency token is what is left to state.
+        self.missing_client_token(protocol, req)
     }
 
     /// This service's refusal of a CREATE that states no idempotency token, or `None` when
@@ -180,7 +221,7 @@ impl<Op: Operation> ErasedOperation for ModelledInputRefusal<Op> {
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
             let protocol = svc.definition().wire_protocol(req).protocol();
-            if let Some(exception) = self.refusal(protocol, req) {
+            if let Some(exception) = self.refusal(protocol, req).await {
                 // Serialized through the service's own protocol, exactly as a
                 // handler-returned `InvalidInputException` is: the same body member
                 // name (`Message`), the same `__type`, and the status the model

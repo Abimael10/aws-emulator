@@ -789,6 +789,11 @@ pub mod temporary_credential_classes;
 /// The ONE token bucket an emulated service meters a caller-driven request rate with, for
 /// every service whose model publishes a rate-and-burst pair.
 pub mod token_bucket;
+/// What a request left UNSTATED about the shapes its operation's input is read into — every
+/// `@required` member it omits and every union member it does not set exactly one variant
+/// of — for a service whose pre-handler refusal states one clause per violation rather than
+/// only the first one the read reached.
+pub mod unstated_members;
 pub mod validation;
 pub mod validation_message;
 /// The web identity tokens this emulator itself issued: the registry a redeemer of one

@@ -133,10 +133,11 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // the scaffold generated the enum from the OPERATION's own `errors` list only.
 #[smithy_macros::operation_error(
     "com.amazonaws.eventbridgev2#CreateEventBus",
-    extra_errors = ["InternalException"]
+    extra_errors = ["AccessDeniedException", "InternalException"]
 )]
 #[derive(Debug)]
 pub enum CreateEventBusErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConcurrentModificationException(ConcurrentModificationException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
     InvalidStateException(InvalidStateException),
@@ -203,6 +204,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx);
+        // The key an encryption configuration names has to be one KMS holds: the
+        // member's own constraints cannot say whether a key EXISTS, and a bus whose
+        // key is not there could encrypt nothing. Asked before the store is
+        // touched, so a refused create mints nothing, and asked of KMS itself, so
+        // the refusal is grounded in what KMS said.
+        if crate::state::kms_key_absent(ctx, input.encryption_configuration.as_ref()).await {
+            return Err(
+                CreateEventBusErrorModeled::AccessDeniedException(crate::state::kms_key_not_found())
+                    .into(),
+            );
+        }
         let now = ::std::time::SystemTime::now();
 
         let mut state = store.lock();

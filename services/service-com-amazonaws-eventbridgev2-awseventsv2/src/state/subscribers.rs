@@ -875,7 +875,8 @@ pub struct DueDelivery {
 ///
 /// The sentence names the KIND of resource that was not found followed by
 /// `" not found: "` and the identifier the request supplied, the same way every
-/// other resource of this service words that refusal.
+/// other resource of this service words that refusal
+/// ([`super::event_bus_not_found`], [`super::event_source_not_found`]).
 pub fn subscriber_not_found(subscriber_arn: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("Subscriber not found: {subscriber_arn}")),

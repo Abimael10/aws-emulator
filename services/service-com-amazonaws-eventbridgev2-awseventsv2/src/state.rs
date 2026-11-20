@@ -36,8 +36,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    EncryptionConfiguration, ResourceNotFoundException, StorageConfiguration,
-    StorageConfigurationOutput,
+    AccessDeniedException, EncryptionConfiguration, ResourceNotFoundException,
+    StorageConfiguration, StorageConfigurationOutput,
 };
 
 /// Region used when the request carries no SigV4 credential scope to read one
@@ -162,6 +162,50 @@ pub fn client_token_missing(client_token: Option<&str>) -> bool {
 /// this service and found it gone names that resource instead (see
 /// [`event_bus_not_found`]).
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource does not exist";
+
+/// The whole `Message` of the `AccessDeniedException` answered for an event bus
+/// whose `KmsKeyIdentifier` names a key this account and Region do not hold.
+///
+/// `AccessDeniedException` documents that "This error is also returned when the
+/// operation cannot use the AWS KMS key for the event bus", and the message says
+/// WHICH of those it was: the reason code, then the sentence of that reason.
+///
+/// FIXED text of that error class: the identifier the caller sent is what the
+/// caller already holds, so nothing of the request is interpolated into it.
+pub const KMS_KEY_NOT_FOUND_MESSAGE: &str =
+    "KMS_KEY_NOT_FOUND: The event bus's KMS key does not exist.";
+
+/// The `AccessDeniedException` every operation that takes a bus's encryption
+/// configuration answers when KMS states the key it names is not there.
+pub fn kms_key_not_found() -> AccessDeniedException {
+    AccessDeniedException {
+        message: Some(KMS_KEY_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// Whether the encryption configuration a request carries names a KMS key this
+/// account and Region do not hold.
+///
+/// The member's `@length` and `@pattern` cannot say whether a key EXISTS — the
+/// identifier may be a key id, an alias, or either one's ARN — so the question is
+/// KMS's, and it is asked of KMS over the emulator's own in-process hop
+/// (`service_common::kms_key`): a key another service of this emulator created
+/// resolves, and one nothing created does not.
+///
+/// `false` — refuse nothing — for a request carrying no encryption configuration,
+/// one whose configuration names no key, and every answer that is NOT KMS stating
+/// the key is not there, so a bus is refused only on what KMS said.
+pub async fn kms_key_absent(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    encryption_configuration: Option<&EncryptionConfiguration>,
+) -> bool {
+    let Some(identifier) = encryption_configuration
+        .and_then(|configuration| configuration.kms_key_identifier.as_deref())
+    else {
+        return false;
+    };
+    ::service_common::kms_key::key_is_absent(ctx, &request_region(ctx), identifier).await
+}
 
 /// How many retired bus ARNs one store remembers (see
 /// [`ComAmazonawsEventbridgev2Awseventsv2State::retired_bus_arns`]).

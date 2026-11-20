@@ -248,12 +248,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // grammar is the workspace's ONE reading of a resource-based policy, so
         // two services handed one document cannot disagree about whether it is a
         // policy. Parsed once here and both readings taken off the parsed value.
-        let document: ::serde_json::Value = ::serde_json::from_str(&input.policy_document)
-            .map_err(|_| {
-                invalid_policy_document(::service_common::iam_policy::PolicyDefect::NotJson)
+        let document: ::serde_json::Value =
+            ::serde_json::from_str(&input.policy_document).map_err(|_| {
+                invalid_policy_document()
             })?;
-        if let Some(defect) = ::service_common::iam_policy::resource_policy_defect_of(&document) {
-            return Err(invalid_policy_document(defect));
+        if ::service_common::iam_policy::resource_policy_defect_of(&document).is_some() {
+            return Err(invalid_policy_document());
         }
 
         // The public-access check of the customer-managed policy, which
@@ -324,22 +324,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The whole `Message` of the `PublicPolicyException` this operation answers.
 ///
 /// FIXED text of that error class: it states what was refused about the document
-/// — that attaching it would open the bus to every caller — and names nothing of
-/// the request, because the document the caller sent is what the caller already
-/// holds.
-const PUBLIC_POLICY_MESSAGE: &str = "The resource policy would grant public access to the event bus";
+/// — that attaching it would open the bus to every caller — what the service did
+/// about it, and the two ways to fix it that `PublicPolicyException` itself
+/// documents ("replace the wildcard principal with specific principals, or add a
+/// condition that limits the callers to specific AWS accounts"). It names nothing
+/// of the request, because the document the caller sent is what the caller
+/// already holds.
+const PUBLIC_POLICY_MESSAGE: &str = "The resource policy could grant public access to the event \
+     bus, so it was not attached. Replace any wildcard principal with specific principals, or \
+     add a condition that limits the callers to specific AWS accounts.";
 
 /// The refusal of a `PolicyDocument` that is not a resource-based policy
 /// document: the modelled `InvalidInputException` for a request parameter that
-/// is "not valid", stating which clause of the policy language the document
-/// broke as the shared grammar words it.
-fn invalid_policy_document(
-    defect: ::service_common::iam_policy::PolicyDefect,
-) -> PutResourcePolicyError {
+/// is "not valid".
+///
+/// FIXED text of that error class: it states that the document is not a policy
+/// and names neither the clause it broke nor any of the document, which is what
+/// the caller already holds. Which clause it was is the shared grammar's
+/// reading (`service_common::iam_policy`), the same one every service handed a
+/// resource-based document takes.
+fn invalid_policy_document() -> PutResourcePolicyError {
     PutResourcePolicyErrorModeled::InvalidInputException(InvalidInputException {
-        message: Some(format!(
-            "PolicyDocument is not a resource policy document: {defect}"
-        )),
+        message: Some(INVALID_POLICY_DOCUMENT_MESSAGE.to_string()),
     })
     .into()
 }
+
+/// The whole `Message` of the refusal [`invalid_policy_document`] answers with.
+const INVALID_POLICY_DOCUMENT_MESSAGE: &str = "The resource policy is invalid";

@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answered with the other one.
         let Some(policy) = bus.resource_policy(policy_name) else {
             return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
-                crate::state::resource_policy_not_found(policy_name, &input.resource_arn),
+                crate::state::resource_policy_not_found(policy_name),
             )
             .into());
         };
