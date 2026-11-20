@@ -1027,6 +1027,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             changed = true;
             record.monitoring_interval = value;
         }
+        // `ReplicaMode`: "the open mode of a replica database", which only a read replica of
+        // the engine families that HAVE an open mode runs in — so it is written only onto
+        // such an instance ([`crate::state::DbInstanceRecord::replica_mode`] is what reports
+        // it, by the same rule). An instance that replicates nothing, or one whose engine
+        // family has no open mode, has no mode to be moved to another: nothing is stored for
+        // it, so no value is kept that a later role change could surface. `ApplyImmediately`
+        // does not gate the change: `PendingModifiedValues` carries no member for it, so it
+        // lands as soon as possible, like the settings around it.
+        if let Some(value) = input.replica_mode {
+            if record.is_read_replica()
+                && crate::state::replica_mode_is_supported_for(&record.engine)
+            {
+                changed = true;
+                record.replica_mode = Some(value);
+            }
+        }
         // `PromotionTier`: the failover order of a cluster member. `PendingModifiedValues`
         // carries no member for it, so the change lands as soon as possible whatever
         // `ApplyImmediately` says, like the settings around it.

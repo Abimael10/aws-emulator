@@ -679,6 +679,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 read_replica_source_db_instance_identifier: None,
                 read_replica_source_db_cluster_identifier: None,
                 read_replica_db_instance_identifiers: Vec::new(),
+                // A restored instance replicates nothing, so it runs in no replica open mode
+                // ([`crate::state::DbInstanceRecord::replica_mode`]).
+                replica_mode: None,
                 // The restored instance is a NEW resource: it gets its own resource id
                 // and its own endpoint host, never the source's.
                 dbi_resource_id: crate::state::mint_dbi_resource_id(mint),

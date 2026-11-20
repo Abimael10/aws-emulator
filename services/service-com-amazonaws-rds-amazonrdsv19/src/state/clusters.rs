@@ -35,6 +35,14 @@ pub struct ClusterMembership {
     /// `DeleteDBClusterEndpoint` took away. Empty for a cluster nobody created one for,
     /// which is what RDS reports for a cluster that has none.
     pub custom_endpoints: Vec<String>,
+    /// `LimitlessDatabase`: "the details for Aurora Limitless Database" — the state of the
+    /// Limitless database of a cluster that operates as one, and `None` for a cluster that
+    /// does not ([`DbClusterRecord::limitless_database`]).
+    ///
+    /// Read from the DB SHARD GROUPS that name this cluster, as the members above are read
+    /// off the instances: whether anything runs on the Limitless database is a fact about
+    /// those records, so a copy on the cluster would still claim one a delete took away.
+    pub limitless_database: Option<LimitlessDatabase>,
 }
 
 /// A stored DB cluster: everything the service persists about it.
@@ -567,6 +575,46 @@ impl DbClusterRecord {
         }
     }
 
+    /// Whether this cluster OPERATES as an Aurora Limitless Database: `ClusterScalabilityType`
+    /// "when set to `limitless`, the cluster operates as an Aurora Limitless Database"
+    /// ([`CLUSTER_SCALABILITY_TYPE_LIMITLESS`]), and a cluster created in the standard mode
+    /// runs none.
+    ///
+    /// The value is matched WITHOUT case, as every other published name this service resolves
+    /// is.
+    pub fn runs_limitless_database(&self) -> bool {
+        self.cluster_scalability_type
+            .eq_ignore_ascii_case(CLUSTER_SCALABILITY_TYPE_LIMITLESS)
+    }
+
+    /// `LimitlessDatabase`: "the details for Aurora Limitless Database", for a cluster that
+    /// operates as one ([`Self::runs_limitless_database`]) and for no other — a cluster that
+    /// runs no Limitless database has no such details, which is what reporting nothing says.
+    ///
+    /// `Status` follows what RUNS on the Limitless database: a DB shard group of this cluster
+    /// is where the Limitless database's compute lives, so the status is
+    /// [`LIMITLESS_DATABASE_STATUS_ACTIVE`] exactly while one of this cluster's shard groups
+    /// is available and [`LIMITLESS_DATABASE_STATUS_NOT_IN_USE`] while none is — a cluster
+    /// whose shard group is still being provisioned, was deleted, or was never created has
+    /// nothing using it. `shard_group_is_available` is that answer, read from the shard-group
+    /// records by the store ([`ClusterMembership::limitless_database`]).
+    ///
+    /// `MinRequiredACU` is left out: Amazon RDS publishes no rule for the minimum capacity it
+    /// reports, and a number chosen here would be a capacity requirement AWS never published.
+    pub fn limitless_database(&self, shard_group_is_available: bool) -> Option<LimitlessDatabase> {
+        self.runs_limitless_database().then(|| LimitlessDatabase {
+            status: Some(
+                if shard_group_is_available {
+                    LIMITLESS_DATABASE_STATUS_ACTIVE
+                } else {
+                    LIMITLESS_DATABASE_STATUS_NOT_IN_USE
+                }
+                .to_string(),
+            ),
+            min_required_acu: None,
+        })
+    }
+
     /// Whether this cluster is in a state a new Aurora Limitless Database DB shard group
     /// can be provisioned on: its status is one of
     /// [`SHARD_GROUP_CLUSTER_STATUSES`] — the shard group goes into the cluster, so the
@@ -890,6 +938,10 @@ impl DbClusterRecord {
             }),
             cluster_create_time: Some(self.cluster_create_time),
             cluster_scalability_type: Some(self.cluster_scalability_type.clone()),
+            // `LimitlessDatabase`: the state of the Limitless database of a cluster that
+            // operates as one, read from the shard-group records that name it
+            // ([`ClusterMembership::limitless_database`]).
+            limitless_database: membership.limitless_database.clone(),
             engine_lifecycle_support: Some(self.engine_lifecycle_support.clone()),
             db_system_id: self.db_system_id.clone(),
             upgrade_rollout_order: Some(DEFAULT_UPGRADE_ROLLOUT_ORDER.to_string()),

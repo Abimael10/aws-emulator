@@ -955,6 +955,16 @@ const AURORA_POSTGRESQL_15: VersionProfile = AURORA_POSTGRESQL_11
 /// version of its major version rather than a capability of every version in it.
 const AURORA_POSTGRESQL_LIMITLESS: VersionProfile = AURORA_POSTGRESQL_15.limitless_database();
 
+/// What a Limitless Database build's own DB parameter group family ends in: Aurora Limitless
+/// Database is a parameter-group family of its OWN inside its major-version line
+/// (`aurora-postgresql16-limitless` beside `aurora-postgresql16`), so a Limitless build's
+/// `DBParameterGroupFamily` is that line's family plus this suffix.
+///
+/// `pub(crate)` because the resolution of which engine a `DBParameterGroupFamily` names reads
+/// a family of this form too (`describe_engine_default_parameters::family_engine`): the two
+/// must not disagree about what is a family.
+pub(crate) const LIMITLESS_PARAMETER_GROUP_FAMILY_SUFFIX: &str = "-limitless";
+
 /// The character sets an Oracle engine reports: `CreateDBInstance`'s `CharacterSetName`
 /// is an Oracle and SQL Server member, and `AL32UTF8` is the Oracle engine's default.
 const ORACLE_CHARACTER_SETS: &[(&str, &str)] = &[
@@ -1633,11 +1643,16 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         DefaultLevel::Neither,
         &AURORA_POSTGRESQL_15,
     ),
+    // The Aurora Limitless Database build of the Aurora PostgreSQL 16 line. Its DB
+    // parameter group family is the LINE's family with the Limitless suffix
+    // ([`LIMITLESS_PARAMETER_GROUP_FAMILY_SUFFIX`]): Aurora Limitless Database has a
+    // parameter-group family of its own, so a cluster created on this build carries the
+    // default group of that family and a caller creates its own groups in it.
     row(
         "aurora-postgresql",
         "16.4-limitless",
         "16",
-        "aurora-postgresql16",
+        "aurora-postgresql16-limitless",
         STATUS_AVAILABLE,
         DefaultLevel::Neither,
         &AURORA_POSTGRESQL_LIMITLESS,

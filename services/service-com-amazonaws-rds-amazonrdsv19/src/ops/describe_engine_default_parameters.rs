@@ -389,8 +389,20 @@ pub(crate) fn family_engine(family: &str) -> Option<&'static str> {
             if version.is_empty() {
                 return VERSIONLESS_FAMILY_ENGINES.contains(engine);
             }
-            version.starts_with(|c: char| c.is_ascii_digit())
+            if version.starts_with(|c: char| c.is_ascii_digit())
                 && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+            {
+                return true;
+            }
+            // A family a published engine version CARRIES is a family of that version's
+            // engine whatever its version part looks like: an Aurora Limitless Database build
+            // publishes a family of its OWN inside its major-version line
+            // (`aurora-postgresql16-limitless`), whose version part is not a bare release. So
+            // the engine-version catalogue's own rows are what admit such a family, rather
+            // than a form written out here that could name a family no build carries.
+            crate::ops::describe_db_engine_versions::published_parameter_group_families()
+                .into_iter()
+                .any(|published| published.eq_ignore_ascii_case(&lowered))
         })
         .max_by_key(|engine| engine.len())
 }
@@ -521,6 +533,14 @@ pub(crate) fn family_version(family: &str) -> Option<&str> {
     let engine = family_engine(family)?;
     let version = family.get(engine.len()..)?;
     let version = version.strip_prefix('-').unwrap_or(version);
+    // A Limitless Database family names a release line of its major version with the
+    // Limitless suffix (`aurora-postgresql16-limitless`), so the release it names is that
+    // line's: the suffix says WHICH family of the line it is, not which release.
+    let version = version
+        .strip_suffix(
+            crate::ops::describe_db_engine_versions::LIMITLESS_PARAMETER_GROUP_FAMILY_SUFFIX,
+        )
+        .unwrap_or(version);
     (!version.is_empty()).then_some(version)
 }
 

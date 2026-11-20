@@ -218,6 +218,15 @@ pub struct DbInstanceRecord {
     /// ([`Self::detach_read_replica`]), so the list never names an instance this store no
     /// longer holds.
     pub read_replica_db_instance_identifiers: Vec<String>,
+    /// The OPEN MODE a read replica of an engine that has one was asked to run in:
+    /// `ReplicaMode`, as `CreateDBInstanceReadReplica` or `ModifyDBInstance` named it, and
+    /// `None` for a replica that named none — which runs in the documented default
+    /// ([`DEFAULT_REPLICA_MODE`]), the mode [`Self::replica_mode`] then reports.
+    ///
+    /// Bounded by the model rather than by a check of this crate's: the member is an ENUM
+    /// (`com.amazonaws.rds#ReplicaMode`), so a request carrying anything but one of its two
+    /// values is refused before a handler runs and the stored text is one of those two.
+    pub replica_mode: Option<String>,
     pub domain: Option<String>,
     /// The CA the instance's server certificate is issued under.
     pub ca_certificate_identifier: String,
@@ -468,6 +477,10 @@ impl DbInstanceRecord {
     pub fn promote_from_read_replica(&mut self) {
         self.read_replica_source_db_instance_identifier = None;
         self.read_replica_source_db_cluster_identifier = None;
+        // The open mode goes with the replication: an instance that replicates nothing is not
+        // open in a REPLICA mode at all, so a later role change does not inherit the mode this
+        // instance ran in while it was a standby ([`Self::replica_mode`]).
+        self.replica_mode = None;
     }
 
     /// Whether this instance REPLICATES another resource, which is what makes it a read
@@ -635,6 +648,27 @@ impl DbInstanceRecord {
                 message: None,
             }]
         })
+    }
+
+    /// `ReplicaMode`: "the open mode of a Db2 or an Oracle read replica. The default is
+    /// `open-read-only`", and only supported for those engine families
+    /// ([`replica_mode_is_supported_for`]).
+    ///
+    /// So it is reported for an instance that IS a read replica of one of those engines —
+    /// the mode the request asked for, else the documented default — and for no other
+    /// instance: an instance that replicates nothing is in no replica mode at all, which is
+    /// what reporting nothing says, and the mode follows the stored relationship rather than
+    /// being copied onto a record a promotion or a switchover has made primary
+    /// ([`Self::promote_from_read_replica`]).
+    pub fn replica_mode(&self) -> Option<String> {
+        if !self.is_read_replica() || !replica_mode_is_supported_for(&self.engine) {
+            return None;
+        }
+        Some(
+            self.replica_mode
+                .clone()
+                .unwrap_or_else(|| DEFAULT_REPLICA_MODE.to_string()),
+        )
     }
 
     /// `PendingModifiedValues`: what this service has accepted for the instance and not
@@ -942,6 +976,9 @@ impl DbInstanceRecord {
             // `StatusInfos`: the replication status of a READ REPLICA, and blank for an
             // instance that is not one ([`Self::status_infos`]).
             status_infos: self.status_infos(),
+            // `ReplicaMode`: the open mode of a read replica of an engine that has one
+            // ([`Self::replica_mode`]).
+            replica_mode: self.replica_mode(),
             license_model: cluster_managed.as_ref().map_or_else(
                 || self.license_model.clone(),
                 |managed| managed.license_model.map(str::to_string),

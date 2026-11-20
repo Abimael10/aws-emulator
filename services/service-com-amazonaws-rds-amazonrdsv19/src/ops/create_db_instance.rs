@@ -880,6 +880,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             read_replica_source_db_instance_identifier: None,
             read_replica_source_db_cluster_identifier: None,
             read_replica_db_instance_identifiers: Vec::new(),
+            // An instance this operation creates replicates nothing, so it runs in no
+            // replica open mode ([`crate::state::DbInstanceRecord::replica_mode`]).
+            replica_mode: None,
             domain: input.domain,
             ca_certificate_identifier: input.ca_certificate_identifier.unwrap_or_else(|| {
                 // No `CACertificateIdentifier`: the instance is created under the CA that

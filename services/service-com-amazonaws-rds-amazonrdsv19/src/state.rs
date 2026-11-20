@@ -88,7 +88,8 @@ use crate::ops::types::{
     DBParameterGroupStatus,
     DBSecurityGroup, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
     DomainMembership, EC2SecurityGroup, Endpoint, EventCategoriesMap, EventSubscription,
-    GlobalCluster, GlobalClusterMember, IPRange, MasterUserSecret, Option2, OptionGroup,
+    GlobalCluster, GlobalClusterMember, IPRange, LimitlessDatabase, MasterUserSecret, Option2,
+    OptionGroup,
     OptionGroupMembership,
     OptionSetting, Outpost, Parameter,
     PendingCloudwatchLogsExports, PendingModifiedValues, RestoreWindow,
@@ -1245,6 +1246,20 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 .into_iter()
                 .filter_map(|endpoint| self.cluster_endpoint_to_wire(endpoint).endpoint)
                 .collect(),
+            // "The details for Aurora Limitless Database": reported for a cluster that
+            // operates as one, with the status read off the DB SHARD GROUPS of this cluster —
+            // the compute the Limitless database runs on — as the members above are read off
+            // the instances and the endpoints ([`DbClusterRecord::limitless_database`]).
+            limitless_database: record.limitless_database(
+                self.shard_groups_in(&record.region)
+                    .into_iter()
+                    .any(|shard_group| {
+                        shard_group
+                            .db_cluster_identifier
+                            .eq_ignore_ascii_case(&record.identifier)
+                            && shard_group.is_available()
+                    }),
+            ),
         }
     }
 

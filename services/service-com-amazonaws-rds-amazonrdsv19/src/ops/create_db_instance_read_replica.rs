@@ -666,6 +666,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 read_replica_source_db_instance_identifier: replicates.instance_source(),
                 read_replica_source_db_cluster_identifier: replicates.cluster_source(),
                 read_replica_db_instance_identifiers: Vec::new(),
+                // `ReplicaMode`: the open mode this replica was asked to run in, kept only
+                // where its engine family HAS one — a replica of any other engine is open for
+                // reads and has no mode, so nothing is stored for it rather than a value
+                // nothing reports ([`crate::state::DbInstanceRecord::replica_mode`]).
+                replica_mode: input
+                    .replica_mode
+                    .clone()
+                    .filter(|_| crate::state::replica_mode_is_supported_for(&source.engine)),
                 // Filled in below, once the core has assigned the engine listener its port.
                 served_endpoint: None,
                 endpoint_port: input.port.unwrap_or(source.endpoint_port),
@@ -1406,6 +1414,9 @@ fn resolve_source_cluster(
         read_replica_source_db_instance_identifier: None,
         read_replica_source_db_cluster_identifier: None,
         read_replica_db_instance_identifiers: Vec::new(),
+        // A DB cluster is in no replica open mode of its own; the replica created from these
+        // settings takes the mode its own request named.
+        replica_mode: None,
         domain: cluster.domain.clone(),
         ca_certificate_identifier: cluster.ca_certificate_identifier.clone(),
         monitoring_interval: cluster.monitoring_interval,

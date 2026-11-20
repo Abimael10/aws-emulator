@@ -206,6 +206,29 @@ pub fn switchover_is_supported_for(engine: &str) -> bool {
     lowered.starts_with("oracle") || lowered.starts_with("custom-oracle")
 }
 
+/// The open mode a read replica of an engine that HAS one runs in when the request named
+/// none: `DBInstance$ReplicaMode` is "the open mode of a Db2 or an Oracle read replica. The
+/// default is `open-read-only`".
+pub const DEFAULT_REPLICA_MODE: &str = "open-read-only";
+
+/// Whether `engine` is one whose read replicas have an OPEN MODE at all.
+///
+/// `ReplicaMode` is "the open mode of a Db2 or an Oracle read replica" and "this attribute is
+/// only supported in RDS for Db2, RDS for Oracle, and RDS Custom for Oracle"
+/// (`smithy_query(query="doc",shape="DBInstance",member="ReplicaMode")`), so it is reported
+/// for a replica of those engine families and for no other: a replica of any other engine is
+/// open for reads and has no mode to report. The Db2 engines are the `db2-` ones the `Engine`
+/// member publishes and the Oracle ones are those [`switchover_is_supported_for`] names, so
+/// the two predicates cannot disagree about which engines are Oracle.
+pub fn replica_mode_is_supported_for(engine: &str) -> bool {
+    let lowered = engine.to_ascii_lowercase();
+    switchover_is_supported_for(&lowered) || lowered.starts_with("db2")
+}
+
+// A `ReplicaMode` outside the two values the member publishes is refused by the enum
+// constraint the model itself declares (`com.amazonaws.rds#ReplicaMode`), before a handler
+// runs, so no handler here restates that value list.
+
 /// The message `SwitchoverReadReplica` answers an `InvalidParameterValue` with for a DB
 /// instance whose database engine the operation does not apply to.
 ///
@@ -1234,6 +1257,23 @@ pub const DEFAULT_DB_CLUSTER_ENGINE_MODE: &str = "provisioned";
 /// (`ClusterScalabilityType`: "When set to `standard` (the default), the cluster uses
 /// normal DB instance creation").
 pub const DEFAULT_CLUSTER_SCALABILITY_TYPE: &str = "standard";
+
+/// The scalability mode that makes a cluster an Aurora Limitless Database one:
+/// `ClusterScalabilityType` "when set to `limitless`, the cluster operates as an Aurora
+/// Limitless Database", which is the cluster a DB shard group is provisioned into.
+pub const CLUSTER_SCALABILITY_TYPE_LIMITLESS: &str = "limitless";
+
+/// `LimitlessDatabase$Status` for a cluster whose Aurora Limitless Database is RUNNING: a
+/// DB shard group of the cluster is available, so the Limitless database is in use.
+///
+/// One of the values the modelled `LimitlessDatabaseStatus` enum publishes
+/// (`smithy_query(query="shape",shape="LimitlessDatabaseStatus")`).
+pub const LIMITLESS_DATABASE_STATUS_ACTIVE: &str = "active";
+
+/// `LimitlessDatabase$Status` for a Limitless cluster NOTHING uses yet: the cluster operates
+/// as an Aurora Limitless Database but no DB shard group of it is up, so there is nothing
+/// running on it — the `not-in-use` value of the same published enum.
+pub const LIMITLESS_DATABASE_STATUS_NOT_IN_USE: &str = "not-in-use";
 
 /// `DBCluster$LocalWriteForwardingStatus` for a cluster that forwards writes from a reader
 /// to its writer, and for one that does not — the two settled values of the published
