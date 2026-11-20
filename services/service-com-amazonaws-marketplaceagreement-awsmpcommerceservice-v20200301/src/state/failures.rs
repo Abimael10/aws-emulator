@@ -38,9 +38,9 @@ pub fn next_request_id() -> String {
 pub const REASON_OTHER: &str = "OTHER";
 
 /// `ValidationException`'s own documentation, which is what the envelope states
-/// when the reason names no member ("The input fails to satisfy the constraints
-/// specified by the service.", `smithy_query(query="shape",
-/// shape="ValidationException")`).
+/// when the reason names neither a member nor the resource whose state refused
+/// the call ("The input fails to satisfy the constraints specified by the
+/// service.", `smithy_query(query="shape", shape="ValidationException")`).
 pub const VALIDATION_MESSAGE_FALLBACK: &str =
     "The input fails to satisfy the constraints specified by the service.";
 
@@ -219,13 +219,26 @@ pub fn member_reason(path: &str, kind: RefusalKind) -> String {
     REASON_OTHER.to_string()
 }
 
+/// The reasons that name the STATE a resource this service resolved is in,
+/// rather than a fault in the value a member carried: the member was read, the
+/// resource it named was found, and the service will not act on it in the state
+/// it is in.
+///
+/// `ValidationExceptionReason` spells every one of them `<STATE>_<RESOURCE>`
+/// (`INACTIVE_AGREEMENT`, `EXPIRED_AGREEMENT_PROPOSAL`,
+/// `SUPERSEDED_AGREEMENT_PROPOSAL`, `smithy_query(query="shape",
+/// shape="ValidationExceptionReason")`), so the state is the leading word and
+/// the resource is the rest — which is what [`validation_message`] words the
+/// class from.
+const RESOURCE_STATES: [&str; 3] = ["INACTIVE", "EXPIRED", "SUPERSEDED"];
+
 /// The `message` a `ValidationException` carrying `reason` states.
 ///
 /// One sentence per reason, built from the reason itself — so the member the
 /// request got wrong is what the sentence names, and every refusal of the same
 /// member reads alike whether the boundary validator or a handler found it. A
-/// reason that names no member states `ValidationException`'s own
-/// documentation.
+/// reason that names neither a member nor a resource states
+/// `ValidationException`'s own documentation.
 pub fn validation_message(reason: &str) -> String {
     /// `INVALID_AGREEMENT_ID` → `agreement id`.
     fn words(stem: &str) -> String {
@@ -241,6 +254,17 @@ pub fn validation_message(reason: &str) -> String {
         words
     }
 
+    /// `INACTIVE_AGREEMENT` → (`INACTIVE`, `AGREEMENT`): the state a
+    /// [`RESOURCE_STATES`] reason names, and the resource it is the state of.
+    fn resource_state(reason: &str) -> Option<(&'static str, &str)> {
+        RESOURCE_STATES.iter().find_map(|state| {
+            reason
+                .strip_prefix(state)
+                .and_then(|rest| rest.strip_prefix('_'))
+                .map(|resource| (*state, resource))
+        })
+    }
+
     if let Some(stem) = reason.strip_prefix("INVALID_") {
         format!("Provided {} is invalid.", words(stem))
     } else if let Some(stem) = reason.strip_prefix("MISSING_") {
@@ -249,6 +273,17 @@ pub fn validation_message(reason: &str) -> String {
         // "Agreement id is required." — the sentence AWS states for this
         // service, for whichever member of whichever operation was left out.
         format!("{} is required.", sentence_case(stem))
+    } else if let Some((state, resource)) = resource_state(reason) {
+        // The resource-state class states the RESOURCE the request named and
+        // the state it is in, which is how AWS words it for this service: a
+        // proposal that is not active is refused "Provided agreement proposal
+        // is inactive.", so the resource this service does resolve and will not
+        // act on — `INACTIVE_AGREEMENT` — reads "Provided agreement is
+        // inactive." The sentence is about the state, so a caller is told WHY
+        // the resource it named was refused rather than being handed
+        // `ValidationException`'s own documentation, which says nothing about
+        // it.
+        format!("Provided {} is {}.", words(resource), words(state))
     } else {
         VALIDATION_MESSAGE_FALLBACK.to_string()
     }

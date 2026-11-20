@@ -14,21 +14,26 @@
 //! one `fields` entry naming `agreementId` — rather than as a conflict over the
 //! resource, which carries no reason a client could branch on. The refusal does
 //! not depend on WHICH operation is called, on WHICH terminal status the
-//! agreement reached, or on HOW it got there, and it stores nothing.
+//! agreement reached, or on HOW it got there, and it stores nothing. Its
+//! `message` states the resource the request resolved and the state it is in,
+//! which is how this service words a refusal of a resource it will not act on.
 //!
 //! The rows differ along what the rule generalises over: the operation called,
-//! the terminal status the agreement carries (`CANCELLED`, `REPLACED`) and the
-//! path that put it there (a direct cancel, an approved cancellation request, a
-//! replacement agreement). The last suite is the complement: the same calls on
-//! an ACTIVE agreement are served, so the guard refuses the condition rather
-//! than the operation.
+//! the terminal status the agreement carries (`CANCELLED`, `REPLACED`,
+//! `EXPIRED`) and the path that put it there (a direct cancel, an approved
+//! cancellation request, a replacement agreement, and the agreement's own end
+//! date passing). The last suite is the complement: the same calls on an ACTIVE
+//! agreement are served, so the guard refuses the condition rather than the
+//! operation.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::agreement_cancellation_requests::cancellation_over;
+use crate::agreement_expiry::{aged_agreement, days};
 use crate::agreement_lifecycle::{
-    accept, agreement_over, call, cancel, create, describe, emulator, term, variable_payment_term,
+    accept, agreement_over, call, cancel, create, describe, emulator, emulator_over_engine, term,
+    upfront_term, variable_payment_term,
 };
 use crate::error_bodies::assert_input_fault;
 
@@ -50,6 +55,24 @@ pub(crate) const PAYMENT_TERM: &str = "vpt-inactive";
 pub(crate) const INACTIVE_AGREEMENT: &str = "INACTIVE_AGREEMENT";
 /// See [`INACTIVE_AGREEMENT`].
 pub(crate) const AGREEMENT_ID: &str = "agreementId";
+
+/// The sentence a refusal carrying [`INACTIVE_AGREEMENT`] states.
+///
+/// This service words a refusal of a resource it RESOLVED and will not act on
+/// after the state that resource is in — a proposal that is not active is
+/// refused "Provided agreement proposal is inactive." — so the agreement this
+/// service does hold reads "Provided agreement is inactive.", naming the
+/// resource and its state rather than `ValidationException`'s own documentation,
+/// which says nothing about either. Spelled out here rather than imported from
+/// the crate, so a handler stating another sentence fails this test instead of
+/// agreeing with it.
+const INACTIVE_AGREEMENT_MESSAGE: &str = "Provided agreement is inactive.";
+
+/// The `AgreementStatus` the clock leaves an agreement in once its own end date
+/// has passed and its terms do not renew it there ("EXPIRED – The agreement
+/// ended on the defined end date", `smithy_query(query="shape",
+/// shape="AgreementStatus")`).
+const EXPIRED: &str = "EXPIRED";
 
 /// How an agreement leaves `ACTIVE`: every path this service has to a terminal
 /// `AgreementStatus`.
@@ -220,6 +243,77 @@ async fn an_inactive_agreement_is_refused_as_the_modelled_input_fault() {
             let answer = call(&router, operation, request_for(operation, &agreement_id)).await;
             let case = format!("{operation} on an agreement that is {} ({how:?})", how.status());
             assert_input_fault(&case, INACTIVE_AGREEMENT, AGREEMENT_ID, &answer);
+        }
+    }
+}
+
+/// Every one of those refusals STATES the state the agreement is in: the
+/// sentence names the resource the request resolved and what about its state
+/// refused the call, for every path out of `ACTIVE` and every operation.
+///
+/// The rows span the class the sentence is about: each path a CALL takes an
+/// agreement out of `ACTIVE` (a direct cancel, an approved cancellation
+/// request, a replacement) plus the one the CLOCK owes at the agreement's own
+/// end date, times the operations that act only on an active agreement — so no
+/// single recorded refusal can satisfy it, and the sentence is shown to be
+/// about the state rather than about which call found it.
+#[tokio::test]
+async fn an_inactive_agreement_refusal_states_the_state_it_is_in() {
+    // The engine is held so the clock-owed row can age its agreement's own
+    // window, which no call can move; everything else goes over the router.
+    let (router, engine) = emulator_over_engine();
+
+    // (how the agreement left ACTIVE, its id)
+    let mut inactive: Vec<(String, String)> = Vec::new();
+    for (proposal, how) in [
+        ("ap-messagedirect", LeftActive::Cancelled),
+        ("ap-messageapproved", LeftActive::CancellationApproved),
+        ("ap-messagereplaced", LeftActive::Replaced),
+    ] {
+        let agreement_id = agreement_that_left_active(&router, proposal, how).await;
+        inactive.push((
+            format!("an agreement that is {} ({how:?})", how.status()),
+            agreement_id,
+        ));
+    }
+
+    // The clock's own path out of ACTIVE: a purchase of the shortest contract
+    // length the rate card publishes, signed longer ago than that, is past its
+    // own end date — so it is inactive without any call having moved it.
+    let expired = aged_agreement(
+        &router,
+        &engine,
+        "ap-messageexpired",
+        vec![
+            upfront_term("cfg", "P1M", &[("Users", 1)]),
+            variable_payment_term(PAYMENT_TERM),
+        ],
+        days(45),
+    )
+    .await;
+    let described = describe(&router, &expired).await;
+    assert_eq!(
+        described.body["status"].as_str(),
+        Some(EXPIRED),
+        "case an agreement the clock ended: it must report {EXPIRED} before the refusal is \
+         tested, got {:?}",
+        described.body
+    );
+    inactive.push(("an agreement the clock ended".to_string(), expired));
+
+    for (how, agreement_id) in inactive {
+        for operation in NEEDS_AN_ACTIVE_AGREEMENT {
+            let answer = call(&router, operation, request_for(operation, &agreement_id)).await;
+            let case = format!("{operation} on {how}");
+            // The envelope the whole class is refused in, so a row that
+            // reported another status, code, reason or member fails here.
+            assert_input_fault(&case, INACTIVE_AGREEMENT, AGREEMENT_ID, &answer);
+            assert_eq!(
+                answer.str_at("/message"),
+                INACTIVE_AGREEMENT_MESSAGE,
+                "case {case:?}: expected the sentence {INACTIVE_AGREEMENT_MESSAGE:?}, got {:?}",
+                answer.body
+            );
         }
     }
 }

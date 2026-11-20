@@ -39,3 +39,37 @@ Smithy citation: CreateAgreementRequestInput.intent -> Intent (enum, values [NEW
 3. Observe HTTP 200 and an agreementRequestId in the response. Real AWS raises ClientError with Code="ValidationException" and Message="Provided intent is invalid."
 4. Control, to show the refusal is enum-specific and not blanket: call client.create_agreement_request(intent="NEW", requestedTerms=[{"id": "sim2real-term-x"}], agreementProposalIdentifier="ap-sim2realnonexistentproposal") and observe it is not refused with ValidationException / "Provided agreement proposal is inactive." either.
 5. Replay: behavioral check marketplace-agreement.create-agreement-request-invalid-intent-rejected.
+
+## Resolution
+
+* **Cause 1 of 1 (an `intent` outside the enum is accepted) — already enforced when this
+  was fixed.** A value outside `Intent` is refused before the handler's own cross-member
+  rules: HTTP 400 `ValidationException`, `reason` `INVALID_INTENT`, `message`
+  "Provided intent is invalid.", one `fields` entry naming `intent`, and nothing minted.
+  The report was filed against `c79cae33`; the boundary enforcement
+  (`src/service.rs`'s `ModelledValidation`) and its suite landed after it. Pinned over the
+  class by `tests/all/intent_enum_values.rs`: every declared value served with the members
+  that intent makes required, and seven values outside the enum — the recorded one among
+  them — refused.
+* **The sentence that refusal class states — fixed here.** The same recording states a
+  resource this service resolved and will not act on as "Provided agreement proposal is
+  inactive.", naming the resource and the state it is in. This service's own refusal of
+  that class — `INACTIVE_AGREEMENT`, raised for an `agreementId` whose agreement has left
+  `ACTIVE` — answered `ValidationException`'s own documentation instead.
+  `state::failures::validation_message` now words a `<STATE>_<RESOURCE>` reason as
+  "Provided <resource> is <state>.", so that refusal reads "Provided agreement is
+  inactive." wherever it is raised. Pinned by
+  `tests/all/inactive_agreement_refusals.rs`.
+* **The control leg (`agreementProposalIdentifier` is not resolved) — still open, as
+  filed.** A well-formed identifier that names no active proposal still mints a quote.
+  This is the cause `20261022T212948Z-marketplace-agreement-intent-enum-and-proposal-validation-skipped.md`
+  records as open (its Cause 2): no component of this emulator publishes an agreement
+  proposal this API can resolve — the component that owns offers and mints the identifier
+  is marketplace-discovery (`GetOffer$agreementProposalId`, "An encoded string to be
+  passed by the acceptor of the terms when creating an agreement"), and the identifiers
+  its published catalogue carries do not satisfy this API's `AgreementProposalId`
+  `@pattern ^(at-|ap-)[A-Za-z0-9]+$`, so no published proposal can reach this handler at
+  all. Refusing every identifier that resolves to nothing before resolvable ones are
+  minted in the owning service would refuse every `NEW`/`REPLACE` create, which is the
+  whole quote -> accept -> agreement flow. The recorded check asserts both legs with the
+  same assertion text, so its replay still reports a divergence on this one.
