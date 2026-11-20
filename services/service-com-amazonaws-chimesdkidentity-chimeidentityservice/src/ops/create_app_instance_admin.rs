@@ -176,10 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // An administrator is an identity OF the app instance it administers, so the
-        // promoted ARN has to be one of its children (`<AppInstanceArn>/user/<id>` for an
-        // `AppInstanceUser`, `/bot/<id>` for an `AppInstanceBot`).
-        let child_prefix = format!("{}/", input.app_instance_arn);
+        // Only the two identity kinds may be promoted, and an administrator is an identity
+        // OF the app instance it administers — so the promoted ARN has to name one of that
+        // instance's identity children: `<AppInstanceArn>/user/<id>` for an
+        // `AppInstanceUser`, `/bot/<id>` for an `AppInstanceBot`. Everything else is
+        // refused rather than recorded, including an ARN that hangs under the same app
+        // instance beneath a segment of its own (a sibling service's resource), which names
+        // no identity and so can administer nothing. The predicate is the crate's one
+        // answer to "does this ARN name an identity of this service".
         let name = {
             let store = state.lock();
             if !store.app_instances.contains_key(&input.app_instance_arn) {
@@ -188,12 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     format!("AppInstance {} does not exist", input.app_instance_arn),
                 ));
             }
-            if !input.app_instance_admin_arn.starts_with(&child_prefix) {
+            if !crate::state::names_identity_of(
+                &input.app_instance_arn,
+                &input.app_instance_admin_arn,
+            ) {
                 return Err(CreateAppInstanceAdminErrorModeled::BadRequestException(
                     BadRequestException {
                         code: Some("BadRequest".to_string()),
                         message: Some(format!(
-                            "AppInstanceAdminArn {} is not an identity of AppInstance {}",
+                            "AppInstanceAdminArn {} is not an AppInstanceUser or AppInstanceBot of AppInstance {}",
                             input.app_instance_admin_arn, input.app_instance_arn
                         )),
                     },

@@ -772,6 +772,22 @@ pub fn names_identity_resource(arn: &str) -> bool {
     }
 }
 
+/// Whether `arn` names an IDENTITY of the `AppInstance` `app_instance_arn` names — an
+/// `AppInstanceUser` (`…/user/<id>`) or an `AppInstanceBot` (`…/bot/<id>`) of that one
+/// instance.
+///
+/// An identity of an app instance is a CHILD of it that this service mints, so the answer
+/// is both halves: the ARN hangs under this instance, and it names one of this service's
+/// identity resources ([`names_identity_resource`]). A child under any other segment hangs
+/// off the same instance but belongs to a sibling service (Chime SDK Messaging's
+/// `…/channel/<id>`) and names no identity; so does the instance's own ARN, and so does a
+/// deeper path under an identity segment.
+pub fn names_identity_of(app_instance_arn: &str, arn: &str) -> bool {
+    arn != app_instance_arn
+        && arn_is_at_or_under(arn, app_instance_arn)
+        && names_identity_resource(arn)
+}
+
 /// Whether `arn` is `prefix` itself or names a resource UNDER it.
 ///
 /// A child ARN of this family is its parent's ARN plus a `/`-separated segment pair
