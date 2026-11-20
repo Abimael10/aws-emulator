@@ -270,6 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // that would leave a source outside that expression is refused rather than
             // applied.
             .or_else(|| crate::state::event_bridge_target_violation(&input.target))
+            // The PAYLOAD the target is handed is bounded by the service rather than by
+            // the model, so an update that would leave a schedule carrying a payload past
+            // that bound is refused rather than applied.
+            .or_else(|| crate::state::target_input_violation(input.target.input.as_deref()))
         {
             return Err(
                 UpdateScheduleErrorModeled::ValidationException(ValidationException { message })

@@ -242,6 +242,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the model declares is a requirement however it is applied, so a source
             // outside that expression is refused here rather than stored.
             .or_else(|| crate::state::event_bridge_target_violation(&input.target))
+            // The PAYLOAD the target is handed is bounded by the service rather than by
+            // the model, so a payload past that bound is refused here rather than stored
+            // on a schedule the service would never have taken.
+            .or_else(|| crate::state::target_input_violation(input.target.input.as_deref()))
         {
             return Err(
                 CreateScheduleErrorModeled::ValidationException(ValidationException { message })

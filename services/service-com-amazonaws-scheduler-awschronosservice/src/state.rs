@@ -21,7 +21,9 @@
 //! [`dead_letter`]. A target that names an API OPERATION rather than a resource — a
 //! UNIVERSAL target — is [`universal_target`]. A target naming an EVENT BUS is a
 //! templated EventBridge target, whose own kind and the parameters it carries are
-//! [`event_bridge_target`].
+//! [`event_bridge_target`]. The SIZE of the payload a target is handed —
+//! `Target$Input`'s service maximum, which the model does not state — is
+//! [`target_input`].
 //!
 //! Whether the CALLER may hand this service the execution role its request names at
 //! all — the `iam:PassRole` every operation that carries a `Target.RoleArn` charges
@@ -34,6 +36,7 @@ mod dead_letter;
 mod event_bridge_target;
 mod occurrence;
 mod schedule_definition;
+mod target_input;
 mod universal_target;
 
 pub mod caller_authorization;
@@ -46,6 +49,7 @@ pub(crate) use event_bridge_target::event_bridge_target_violation;
 pub use invocation::{drive_invocation_clock, Invocations};
 pub use occurrence::Occurrences;
 pub use schedule_definition::*;
+pub use target_input::{target_input_violation, MAX_TARGET_INPUT_BYTES};
 pub use universal_target::universal_target_violation;
 
 use std::collections::{BTreeMap, BTreeSet};
