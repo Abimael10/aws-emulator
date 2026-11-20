@@ -237,7 +237,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateGatewayErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the gateway store is unavailable".to_string()),
@@ -337,6 +336,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.settled_status = crate::state::STATUS_READY.to_string();
         record.settles_at = now + crate::state::GATEWAY_SETTLE_DELAY;
 
-        Ok(record.update_output(now))
+        Ok(record.update_output(now, ctx.parts(), ctx.endpoint().as_str()))
     }
 }

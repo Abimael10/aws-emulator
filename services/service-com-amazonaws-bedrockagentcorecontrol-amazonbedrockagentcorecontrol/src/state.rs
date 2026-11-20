@@ -914,7 +914,6 @@ impl AgentRuntimeEndpointRecord {
 pub struct GatewayRecord {
     pub gateway_id: String,
     pub gateway_arn: String,
-    pub gateway_url: String,
     pub name: String,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
@@ -1012,17 +1011,47 @@ impl GatewayRecord {
         ::service_common::arn::region_of(&self.gateway_arn, ARN_SERVICE)
     }
 
-    /// This gateway as `CreateGateway`'s response envelope.
+    /// The endpoint this gateway ANNOUNCES to the client that made this request:
+    /// the address this emulator ANSWERS on for that client
+    /// ([`published_gateway_url`]), derived from the gateway's own id, the Region
+    /// of its ARN and the protocol it speaks.
+    ///
+    /// Composed per REPORT rather than stored, because which address this emulator
+    /// answers on is a property of the asking client and not of the gateway: a
+    /// create answered for one kind of client would otherwise hand every later
+    /// reader that client's address, which for a reader that resolves none of
+    /// AWS's own hostnames is an address it cannot dial. Every operation that
+    /// announces the endpoint therefore announces one its own caller can reach,
+    /// and a client that reads one gateway twice from the same endpoint sees one
+    /// URL.
+    pub fn announced_url(&self, parts: &::http::request::Parts, served_base: &str) -> String {
+        published_gateway_url(
+            parts,
+            served_base,
+            self.region().unwrap_or_default(),
+            &self.gateway_id,
+            self.protocol_type.as_deref(),
+        )
+    }
+
+    /// This gateway as `CreateGateway`'s response envelope, announced to the
+    /// client that made the request `parts` and `served_base` describe
+    /// ([`Self::announced_url`]).
     ///
     /// `CreateGatewayResponse` and `GetGatewayResponse` declare the SAME members,
     /// so both envelopes are rendered from the one stored record here rather than
     /// in either handler: a member the create reports and the read does not (or
     /// reports differently) would be a difference no stored state justifies.
-    pub fn create_output(&self, now: SystemTime) -> CreateGatewayOutput {
+    pub fn create_output(
+        &self,
+        now: SystemTime,
+        parts: &::http::request::Parts,
+        served_base: &str,
+    ) -> CreateGatewayOutput {
         CreateGatewayOutput {
             gateway_arn: self.gateway_arn.clone(),
             gateway_id: self.gateway_id.clone(),
-            gateway_url: Some(self.gateway_url.clone()),
+            gateway_url: Some(self.announced_url(parts, served_base)),
             created_at: timestamp(self.created_at),
             updated_at: timestamp(self.updated_at),
             status: self.status_at(now).to_string(),
@@ -1054,8 +1083,13 @@ impl GatewayRecord {
 
     /// This gateway as `GetGateway`'s response envelope — the same members
     /// [`Self::create_output`] renders, read off the same record.
-    pub fn get_output(&self, now: SystemTime) -> GetGatewayOutput {
-        let created = self.create_output(now);
+    pub fn get_output(
+        &self,
+        now: SystemTime,
+        parts: &::http::request::Parts,
+        served_base: &str,
+    ) -> GetGatewayOutput {
+        let created = self.create_output(now, parts, served_base);
         GetGatewayOutput {
             gateway_arn: created.gateway_arn,
             gateway_id: created.gateway_id,
@@ -1085,8 +1119,13 @@ impl GatewayRecord {
     /// This gateway as `UpdateGateway`'s response envelope — the same members
     /// [`Self::create_output`] renders, so an update reports exactly the record it
     /// just wrote and a later `GetGateway` cannot differ from it.
-    pub fn update_output(&self, now: SystemTime) -> UpdateGatewayOutput {
-        let created = self.create_output(now);
+    pub fn update_output(
+        &self,
+        now: SystemTime,
+        parts: &::http::request::Parts,
+        served_base: &str,
+    ) -> UpdateGatewayOutput {
+        let created = self.create_output(now, parts, served_base);
         UpdateGatewayOutput {
             gateway_arn: created.gateway_arn,
             gateway_id: created.gateway_id,

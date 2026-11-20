@@ -260,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             store.replayed_gateway_result(Self::NAME, input.client_token.as_deref())
         {
             if let Some(record) = store.gateways.get(&gateway_id) {
-                return Ok(record.create_output(now));
+                return Ok(record.create_output(now, ctx.parts(), ctx.endpoint().as_str()));
             }
         }
 
@@ -319,13 +319,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or_else(|| DEFAULT_PROTOCOL_TYPE.to_string());
         let record = crate::state::GatewayRecord {
             gateway_arn: crate::state::gateway_arn(&region, &gateway_id),
-            gateway_url: crate::state::published_gateway_url(
-                ctx.parts(),
-                ctx.endpoint().as_str(),
-                &region,
-                &gateway_id,
-                Some(&protocol_type),
-            ),
             name: input.name,
             created_at: now,
             updated_at: now,
@@ -363,7 +356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rules: ::std::collections::BTreeMap::new(),
             gateway_id: gateway_id.clone(),
         };
-        let output = record.create_output(now);
+        let output = record.create_output(now, ctx.parts(), ctx.endpoint().as_str());
 
         store
             .gateway_names
