@@ -55,7 +55,7 @@ pub mod registry_address;
 
 pub use logo_asset::{logo_asset_route, logo_url, StoredLogo};
 pub use logo_socket::{ensure_logo_asset_base, LogoAssetSocket};
-pub use registry_address::announced_gallery_endpoint;
+pub use registry_address::announced_gallery_authority;
 pub use policy_document::canonical_policy_document;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -154,13 +154,16 @@ pub fn unsupported_in_region(
     unsupported_for_region(&region, operation)
 }
 
-/// The host AWS serves the public gallery at — the universal prefix a container reference
-/// a client WRITES BY HAND names this gallery by, which is how such a reference is read as
-/// addressing this registry ([`gallery_pull::parse_gallery_reference`]).
+/// The host AWS serves the public gallery at — the fixed labels every public-registry
+/// authority leads with ([`registry_address::GALLERY_HOST_LABELS`]) over AWS's own zone,
+/// which is what a container reference a client WRITES BY HAND names this gallery by and how
+/// such a reference is read as addressing this registry
+/// ([`gallery_pull::parse_gallery_reference`]).
 ///
-/// It is NOT what this service PUBLISHES: a URI this registry hands out has to name an
-/// address this emulator answers on, which this host is not
-/// ([`registry_address`]).
+/// It is not the authority this service PUBLISHES: a URI this registry hands out carries the
+/// same fixed labels, over the zone this emulator answers in rather than AWS's — this name
+/// resolves to the real public registry rather than to this process
+/// ([`registry_address::gallery_authority`]).
 pub const GALLERY_HOST: &str = "public.ecr.aws";
 
 /// The registry alias this emulator's single public registry is assigned.
@@ -865,18 +868,19 @@ impl ComAmazonawsEcrpublicSpencerfrontendserviceState {
         ::engine::emulator_arn(ARN_NAMESPACE, "", &format!("registry/{}", self.registry_id))
     }
 
-    /// The URI of the registry, on the endpoint this emulator serves it at
-    /// (`gallery_endpoint`, read with [`announced_gallery_endpoint`]):
+    /// The URI of the registry, on the authority this emulator publishes it at
+    /// (`gallery_authority`, read with [`announced_gallery_authority`]):
     /// `Registry$registryUri` documents it as "a universal prefix and the registry alias",
-    /// which is the `repositoryUri` form without the trailing repository segment.
-    pub fn registry_uri(&self, gallery_endpoint: &str) -> String {
-        registry_address::registry_uri(gallery_endpoint, &self.registry_alias)
+    /// so it is that authority scoped by this registry's own alias — which is the
+    /// `repositoryUri` form without the trailing repository segment.
+    pub fn registry_uri(&self, gallery_authority: &str) -> String {
+        registry_address::registry_uri(gallery_authority, &self.registry_alias)
     }
 
     /// The `docker pull`-able URI of a repository: this registry's URI
     /// ([`Self::registry_uri`]), then the repository name.
-    pub fn repository_uri(&self, gallery_endpoint: &str, repository_name: &str) -> String {
-        registry_address::repository_uri(&self.registry_uri(gallery_endpoint), repository_name)
+    pub fn repository_uri(&self, gallery_authority: &str, repository_name: &str) -> String {
+        registry_address::repository_uri(&self.registry_uri(gallery_authority), repository_name)
     }
 
     /// This registry's catalog metadata as the modelled `RegistryCatalogData` shape: what

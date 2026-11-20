@@ -186,7 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let store = state.lock();
             (
                 store.registry_id.clone(),
-                registry_of(&store, &crate::state::announced_gallery_endpoint(ctx)),
+                registry_of(&store, &crate::state::announced_gallery_authority(ctx)),
             )
         };
 
@@ -212,8 +212,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// This registry as the modelled `Registry` shape, published on the endpoint this answer
-/// is served at (`gallery_endpoint`).
+/// This registry as the modelled `Registry` shape, published on the authority this answer
+/// is served at (`gallery_authority`).
 ///
 /// `verified` is "whether the account is a verified Amazon Web Services Marketplace
 /// vendor" (`Registry$verified`) — a standing outside this API, which no operation of
@@ -224,16 +224,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `RegistryAlias$defaultRegistryAlias` is the one assigned to the registry itself).
 ///
 /// `registryUri` is the registry-wide prefix a client prepends to a repository name and
-/// points a login at, so it is an ADDRESS: it names the endpoint this emulator serves the
-/// registry at, scoped by that alias (`crate::state::registry_address`).
+/// points a login at, so it is an ADDRESS and a registry NAME at once: the fixed
+/// `public`.`ecr` labels every public-registry authority leads with, over the zone this
+/// emulator answers in, scoped by that alias (`crate::state::registry_address`).
 fn registry_of(
     store: &crate::state::ComAmazonawsEcrpublicSpencerfrontendserviceState,
-    gallery_endpoint: &str,
+    gallery_authority: &str,
 ) -> Registry {
     Registry {
         registry_id: store.registry_id.clone(),
         registry_arn: store.registry_arn(),
-        registry_uri: store.registry_uri(gallery_endpoint),
+        registry_uri: store.registry_uri(gallery_authority),
         verified: false,
         aliases: vec![RegistryAlias {
             name: store.registry_alias.clone(),

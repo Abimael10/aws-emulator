@@ -33,21 +33,36 @@ pub(crate) const REGISTRY_ID: &str = "000000000000";
 /// The ARN prefix of every repository in this partition-wide (region-less) registry.
 pub(crate) const ARN_PREFIX: &str = "arn:aws:ecr-public::000000000000:repository/";
 
-/// The `host[:port]` this emulator is SERVED at, which is what every URI this registry
-/// publishes is built on: a repository's and the registry's own URI are the addresses a
-/// container client dials, so they name the endpoint the emulator answers on rather than
-/// the real gallery host. No call in this target arrives on a socket, so that endpoint is
-/// the authority of the unserved base (`smithy_server_runtime::UNSERVED_URL_BASE`).
+/// The `host[:port]` this emulator is SERVED at, which is the address every URI this
+/// registry publishes is built on: a repository's and the registry's own URI are the
+/// addresses a container client dials, so their authority sits in the zone the emulator
+/// answers in rather than in the one AWS serves its gallery at. No call in this target
+/// arrives on a socket, so that address is the authority of the unserved base
+/// (`smithy_server_runtime::UNSERVED_URL_BASE`).
 pub(crate) fn announced_endpoint() -> &'static str {
     let base = smithy_server_runtime::UNSERVED_URL_BASE;
     base.split_once("://").map_or(base, |(_scheme, authority)| authority)
 }
 
-/// The leading segments of every `repositoryUri`: the endpoint this emulator is served at
-/// and this registry's alias (`state::DEFAULT_REGISTRY_ALIAS`), which is the registry's own
-/// URI with the trailing separator.
+/// The two fixed labels every ECR Public registry authority leads with, as the service
+/// states them (`state::registry_address::GALLERY_HOST_LABELS`).
+pub(crate) const PUBLIC_REGISTRY_LABELS: [&str; 2] =
+    service_com_amazonaws_ecrpublic_spencerfrontendservice::state::registry_address::GALLERY_HOST_LABELS;
+
+/// The public-registry AUTHORITY every URI this registry publishes leads with: the fixed
+/// labels `Registry$registryUri`'s universal prefix carries ([`PUBLIC_REGISTRY_LABELS`])
+/// over the zone this emulator answers in ([`announced_endpoint`]), which for this target is
+/// the unserved base's own name.
+pub(crate) fn published_authority() -> String {
+    let [public, ecr] = PUBLIC_REGISTRY_LABELS;
+    format!("{public}.{ecr}.{}", announced_endpoint())
+}
+
+/// The leading segments of every `repositoryUri`: the authority this registry is published
+/// at and this registry's alias (`state::DEFAULT_REGISTRY_ALIAS`), which is the registry's
+/// own URI with the trailing separator.
 pub(crate) fn uri_prefix() -> String {
-    format!("{}/{DEFAULT_REGISTRY_ALIAS}/", announced_endpoint())
+    format!("{}/{DEFAULT_REGISTRY_ALIAS}/", published_authority())
 }
 
 /// A router with just this service mounted on a fresh engine.
@@ -327,8 +342,8 @@ async fn create_repository_inserts_a_repository_every_valid_name_form_can_be_rea
         assert_eq!(
             uri,
             format!("{}{name}", uri_prefix()),
-            "case {case:?}: expected the repository URI to be served-endpoint/alias/name, \
-             got {uri:?}"
+            "case {case:?}: expected the repository URI to be \
+             public.ecr.<zone>/alias/name, got {uri:?}"
         );
         assert_eq!(
             text(&created, &["repository", "registryId"], &case),

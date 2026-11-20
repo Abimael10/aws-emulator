@@ -12,12 +12,15 @@
 //! gallery serves it is decided HERE, against the repositories and tags this registry holds,
 //! rather than by whoever is starting the container.
 //!
-//! TWO hosts address this gallery, and both have to be read, because a client composes a
-//! reference on whichever of them it was given: the host AWS serves the public gallery at
-//! ([`GALLERY_HOST`]), which is what a reference written by hand names, and an address this
-//! emulator itself answers on ([`registry_address::names_this_emulator`]), which is what a
-//! `repositoryUri` this registry PUBLISHED carries — so the reference a client builds from the
-//! URI the API handed it resolves to the very repository that URI names.
+//! TWO kinds of host address this gallery, and both have to be read, because a client
+//! composes a reference on whichever of them it was given: an authority that NAMES a public
+//! registry ([`registry_address::names_the_public_gallery`]) — the fixed `public`.`ecr`
+//! labels over a zone, which covers both the name AWS serves the gallery at
+//! ([`GALLERY_HOST`]), as a reference written by hand carries it, and the authority this
+//! registry PUBLISHES, over the zone this emulator answers in — and a bare address this
+//! emulator answers on ([`registry_address::names_this_emulator`]), which is the endpoint a
+//! client pointed straight at this emulator reaches it by. So the reference a client builds
+//! from the URI the API handed it resolves to the very repository that URI names.
 //!
 //! Only this registry's own alias is answered: an alias this registry was not assigned names
 //! some other public registry ([`ComAmazonawsEcrpublicSpencerfrontendserviceState::is_this_registry`]
@@ -74,8 +77,8 @@ const DIGEST_SEPARATOR: &str = "@";
 /// container runtime resolves against some other public registry.
 ///
 /// The form is a `repositoryUri` of this registry with a tag or a digest appended:
-/// `<gallery host>/<registry alias>/<repository>[:<tag>|@<digest>]`, where the host is either
-/// the one AWS publishes the gallery at or an address this emulator answers on (see the module
+/// `<gallery authority>/<registry alias>/<repository>[:<tag>|@<digest>]`, where the authority
+/// either names a public registry or is an address this emulator answers on (see the module
 /// docs). A reference naming no tag and no digest asks for [`DEFAULT_IMAGE_TAG`].
 #[must_use]
 pub fn parse_gallery_reference(image: &str) -> Option<GalleryReference> {
@@ -114,13 +117,14 @@ pub fn parse_gallery_reference(image: &str) -> Option<GalleryReference> {
     })
 }
 
-/// Whether the host of a container reference addresses THIS gallery: the host AWS publishes
-/// the public gallery at, or an address this emulator answers on (see the module docs).
+/// Whether the host of a container reference addresses THIS gallery: an authority that names
+/// a public registry — AWS's own gallery name and the authority this registry publishes alike
+/// — or a bare address this emulator answers on (see the module docs).
 ///
-/// A host name carries whatever case the writer used, so the gallery host is compared without
-/// regard to it.
+/// Which public registry such a reference names is decided by the alias segment that follows,
+/// against the one alias this registry was assigned ([`serves_registry_alias`]).
 fn addresses_this_gallery(host: &str) -> bool {
-    host.eq_ignore_ascii_case(GALLERY_HOST) || registry_address::names_this_emulator(host)
+    registry_address::names_the_public_gallery(host) || registry_address::names_this_emulator(host)
 }
 
 /// Why this gallery did not serve a pull.
@@ -221,8 +225,8 @@ mod tests {
     }
 
     /// RULE: a reference is read as this gallery's only when its host addresses this gallery —
-    /// the host AWS publishes it at, or an address this emulator answers on — and the alias,
-    /// repository and tag or digest are read out of the reference itself.
+    /// an authority that names a public registry, or an address this emulator answers on — and
+    /// the alias, repository and tag or digest are read out of the reference itself.
     #[test]
     fn a_gallery_reference_is_read_out_of_the_path() {
         let rows = [
@@ -231,13 +235,18 @@ mod tests {
                 expected: Some(names("alias", "app", Some("1.2"), None)),
             },
             Row {
-                // The address a `repositoryUri` this registry published carries: a client that
-                // appends a tag to the URI it was handed names this registry by it.
+                // The authority a `repositoryUri` this registry published carries: a client
+                // that appends a tag to the URI it was handed names this registry by it.
+                image: "public.ecr.localhost:9297/alias/app:1.2",
+                expected: Some(names("alias", "app", Some("1.2"), None)),
+            },
+            Row {
+                // The endpoint a client pointed straight at this emulator reaches it by.
                 image: "127.0.0.1:9297/alias/app:1.2",
                 expected: Some(names("alias", "app", Some("1.2"), None)),
             },
             Row {
-                image: "emulator.invalid/alias/team/app@sha256:abc",
+                image: "public.ecr.emulator.invalid/alias/team/app@sha256:abc",
                 expected: Some(names("alias", "team/app", None, Some("sha256:abc"))),
             },
             Row {

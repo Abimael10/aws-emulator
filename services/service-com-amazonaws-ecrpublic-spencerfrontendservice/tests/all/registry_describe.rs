@@ -22,7 +22,7 @@ use service_com_amazonaws_ecrpublic_spencerfrontendservice::ops::types::REGISTRY
 use service_com_amazonaws_ecrpublic_spencerfrontendservice::state::REGISTRY_ALIAS_STATUS_ACTIVE;
 
 use crate::repository_image_lifecycle::{
-    announced_endpoint, ok, refused, service, text, ARN_PREFIX, REGISTRY_ID,
+    ok, published_authority, refused, service, text, ARN_PREFIX, REGISTRY_ID,
 };
 
 #[test]
@@ -195,14 +195,15 @@ fn assert_registry_record(record: &Value, case: &str) -> String {
     });
 
     // `registryUri` is the prefix a client prepends to a repository name and points a
-    // login at, so it is an ADDRESS: the endpoint this emulator serves the registry at,
+    // login at, so it is a registry NAME and an ADDRESS at once: the universal prefix every
+    // public registry's authority leads with, over the zone this emulator answers in,
     // scoped by the alias shown in a `docker pull` command — the primary alias — and
     // carrying neither a region nor an account.
     let registry_uri = text(record, &["registryUri"], case);
     assert_eq!(
         registry_uri,
-        format!("{}/{primary}", announced_endpoint()),
-        "case {case:?}: expected the served endpoint scoped by the primary alias, \
+        format!("{}/{primary}", published_authority()),
+        "case {case:?}: expected the public-registry authority scoped by the primary alias, \
          got {registry_uri:?}"
     );
 
