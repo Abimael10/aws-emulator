@@ -350,6 +350,13 @@ impl KeyPhraseAnalyser {
 /// a run with no head at all — a bare figure, a determiner on its own, an adjective in
 /// a predicate — is no key phrase rather than a one-word phrase invented from it.
 ///
+/// A word the analysis read as the PREDICATIVE complement of its clause
+/// (`detect_syntax::AnalysedToken::predicative`) belongs to that clause's predicate
+/// rather than to the noun phrase standing behind it, so it ends the run in front of
+/// it and opens none of its own: the phrase after it begins at its own first word (`is
+/// due next Friday` holds the phrase `next Friday`), which is what keeps a reported
+/// span bounded by the noun phrase it describes.
+///
 /// `Score` is the confidence of that analysis: the joint confidence of the tags that
 /// formed the phrase, which is each token's own `PartOfSpeech.Score` multiplied
 /// together. A phrase every word of which the tagger reads unambiguously comes back
@@ -365,7 +372,9 @@ fn noun_phrases(text: &str) -> Vec<KeyPhrase> {
     let mut head: Option<usize> = None;
     for (position, token) in tokens.iter().enumerate() {
         let tag = token.tag();
-        if crate::ops::detect_syntax::NOUN_PHRASE_MODIFIER_TAGS.contains(&tag) {
+        if !token.predicative()
+            && crate::ops::detect_syntax::NOUN_PHRASE_MODIFIER_TAGS.contains(&tag)
+        {
             first = first.or(Some(position));
             if crate::ops::detect_syntax::NOUN_PHRASE_HEAD_TAGS.contains(&tag) {
                 head = Some(position);

@@ -622,6 +622,131 @@ async fn a_mention_in_an_unambiguous_clause_carries_that_label() {
     }
 }
 
+/// Each mention's `MentionSentiment` is ONE distribution over the four modelled
+/// classes, concentrated on the label it reports: a client aggregating per entity
+/// ("how is this entity spoken of") reads a verdict it can act on, and the classes the
+/// mention's clause carries no evidence for stay far below any threshold it sets.
+///
+/// The rows differ along what the clause around the mention carries: plain fact, one
+/// evaluative word, several, and a document whose two clauses point opposite ways, so
+/// a scorer assigning members from a table of constants would disagree with at least
+/// one row.
+#[tokio::test]
+async fn a_mention_carries_one_distribution_concentrated_on_its_label() {
+    let comprehend = Comprehend::new();
+
+    /// How much of a mention's distribution the label it reports has to carry.
+    const MENTION_CONCENTRATION: f64 = 0.95;
+    /// What a class the mention's clause carries no evidence for may be reported at.
+    const UNSUPPORTED_CLASS_CEILING: f64 = 1e-4;
+
+    for (case, text, expected) in [
+        (
+            "a factual mention",
+            "The invoice arrived on Tuesday.",
+            vec![("invoice", "NEUTRAL"), ("Tuesday", "NEUTRAL")],
+        ),
+        (
+            "one evaluative word",
+            "Acme was wonderful.",
+            vec![("Acme", "POSITIVE")],
+        ),
+        (
+            "several evaluative words",
+            "Acme was wonderful and the staff were excellent and helpful.",
+            vec![("Acme", "POSITIVE")],
+        ),
+        (
+            "two clauses pointing opposite ways",
+            "The food was great but the service was terrible.",
+            vec![("food", "POSITIVE"), ("service", "NEGATIVE")],
+        ),
+    ] {
+        let output = analyse(&comprehend, text).await;
+        assert_invariants(case, text, &output);
+
+        let mentions: Vec<(String, Value)> = output["Entities"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|entity| entity["Mentions"].as_array().cloned().unwrap_or_default())
+            .map(|mention| {
+                (
+                    mention["Text"].as_str().unwrap_or_default().to_string(),
+                    mention["MentionSentiment"].clone(),
+                )
+            })
+            .collect();
+
+        for (mention, label) in expected {
+            let sentiment = mentions
+                .iter()
+                .find(|(text, _)| text == mention)
+                .map(|(_, sentiment)| sentiment.clone())
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: no mention of {mention:?} in {mentions:?}")
+                });
+            assert_eq!(
+                sentiment["Sentiment"].as_str(),
+                Some(label),
+                "case {case:?}: expected {mention:?} to be reported {label}, got {sentiment}"
+            );
+            let member = match label {
+                "POSITIVE" => "Positive",
+                "NEGATIVE" => "Negative",
+                "MIXED" => "Mixed",
+                _ => "Neutral",
+            };
+            let reported = sentiment["SentimentScore"][member]
+                .as_f64()
+                .unwrap_or(f64::NAN);
+            assert!(
+                reported > MENTION_CONCENTRATION,
+                "case {case:?}: expected {mention:?} to carry more than \
+                 {MENTION_CONCENTRATION} on {member}, got {reported} in {sentiment}"
+            );
+            for other in ["Positive", "Negative", "Neutral", "Mixed"] {
+                if other == member {
+                    continue;
+                }
+                let residual = sentiment["SentimentScore"][other]
+                    .as_f64()
+                    .unwrap_or(f64::NAN);
+                assert!(
+                    residual > 0.0 && residual < 1.0 - MENTION_CONCENTRATION,
+                    "case {case:?}: expected {other} on {mention:?} strictly inside \
+                     (0, {}), got {residual} in {sentiment}",
+                    1.0 - MENTION_CONCENTRATION
+                );
+            }
+        }
+
+        // A mention whose clause is plain fact leaves the signed classes negligible,
+        // rather than reporting one of them at a magnitude a client would act on.
+        if case == "a factual mention" {
+            for (mention, _) in &mentions {
+                let sentiment = mentions
+                    .iter()
+                    .find(|(text, _)| text == mention)
+                    .map(|(_, sentiment)| sentiment.clone())
+                    .unwrap_or_default();
+                for signed in ["Positive", "Negative", "Mixed"] {
+                    let score = sentiment["SentimentScore"][signed]
+                        .as_f64()
+                        .unwrap_or(f64::NAN);
+                    assert!(
+                        score < UNSUPPORTED_CLASS_CEILING,
+                        "case {case:?}: {mention:?} stands in a clause of plain fact, so \
+                         expected {signed} below {UNSUPPORTED_CLASS_CEILING}, got {score} \
+                         in {sentiment}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_document_with_no_word_reports_no_entity() {
     let comprehend = Comprehend::new();

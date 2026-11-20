@@ -152,10 +152,24 @@ const CUE_OPEN_CLASS: f64 = 0.2;
 /// overturn one.
 const CUE_CONTEXT: f64 = 1.0;
 
-/// What is left of a reading the context it stands in speaks AGAINST. The reading
-/// does not disappear — the word still has it — so it keeps a third of its weight
-/// and the confidence reported for the reading that won says how much it left behind.
-const CONTEXT_CONTRADICTED: f64 = 1.0 / 3.0;
+/// The SHARE a reading keeps of its own weight when the context it stands in speaks
+/// AGAINST it.
+///
+/// The reading does not disappear — the word still has it, so a context can never make
+/// one impossible — but a position that decides between two readings decides: the word
+/// after a determiner is the noun that phrase is headed by, the auxiliary in front of a
+/// participle accompanies it. What the overturned reading keeps is therefore a
+/// RESIDUAL rather than a fraction of the question: an order of magnitude more than the
+/// weight held back for a reading this lexicon does not carry at all
+/// ([`CUE_UNLISTED_READING`]), because the word really has this one, and no more than
+/// that, because the context settled it.
+///
+/// It is what calibrates a resolved token's reported confidence. A reading that keeps a
+/// large share of its weight makes `PartOfSpeech.Score` report a word whose class the
+/// position settles as a coin toss — three quarters, nine tenths — where the analysis
+/// is not in doubt at all and the share the loser keeps is the only reason the number
+/// is not near 1.
+const CONTEXT_CONTRADICTED: f64 = 1e-4;
 
 /// The weight every WORD keeps for a reading this lexicon does not carry.
 ///
@@ -179,10 +193,11 @@ const SENTENCE_FINAL: &[char] = &['.', '!', '?', '…'];
 const ARTICLES: &[&str] = &["a", "an", "the"];
 
 /// The forms of `be`. A clause whose predicate is one of these carries no other verb,
-/// which is what decides both of the contextual rules around a copula: the form
-/// itself is the clause's main verb rather than an auxiliary accompanying one, and a
-/// participle standing after it is predicative — an adjective rather than a second
-/// verb (`the flight was delayed`, `the screen is broken`).
+/// which is what decides the two contextual rules around a copula: the word standing
+/// in the predicate after it is that predicate's own adjective or verb (`the staff
+/// were rude`, `the flight was delayed`), and the form itself is this tagset's
+/// auxiliary only where that word is the verb — standing in front of a predicate it
+/// carries no other verb than itself.
 const COPULA_FORMS: &[&str] = &[
     "am", "is", "are", "was", "were", "be", "been", "being", "isn't", "aren't", "wasn't",
     "weren't", "ain't", "'s", "'re", "'m",
@@ -214,6 +229,21 @@ const GERUND_ENDING: &str = "ing";
 /// modifier or a noun in a compound. Read by the contextual rules and by the
 /// noun-phrase chunking `BatchDetectKeyPhrases` reports.
 pub(crate) const NOUN_PHRASE_MODIFIER_TAGS: &[&str] = &["DET", "ADJ", "NUM", "NOUN", "PROPN"];
+
+/// The tags of a word that can stand BETWEEN a determiner and the head of the noun
+/// phrase it opens: a modifier, a numeral, or a word read as an adverb, which
+/// [`resolve_determiner_phrases`] re-reads as the head's modifier where only the
+/// word's own suffix spoke for the adverb reading. A noun is not one of them — it can
+/// head the phrase itself, so it ENDS the run rather than standing inside it.
+const PRE_HEAD_MODIFIER_TAGS: &[&str] = &["ADJ", "NUM", "ADV"];
+
+/// The tags a word standing in the predicate of a copula can be read as that
+/// predicate's ADJECTIVE from ([`resolve_predicative`]): the open classes a
+/// describing word belongs to. A name is not one of them — a capitalised span in
+/// predicate position is a predicate nominal (`the manager is John Smith`) — and
+/// neither is any closed class, which opens a predicate rather than describing its
+/// subject.
+const PREDICATIVE_CANDIDATE_TAGS: &[&str] = &["NOUN", "ADJ"];
 
 /// The tags a noun phrase can be headed by.
 pub(crate) const NOUN_PHRASE_HEAD_TAGS: &[&str] = &["NOUN", "PROPN"];
@@ -345,7 +375,9 @@ const NUMBER_WORDS: &[&str] = &[
 ];
 
 /// Frequent adjectives, including the irregular comparatives and superlatives the
-/// `-er`/`-est` rules would miss.
+/// `-er`/`-est` rules would miss, and the ones that modify a time expression
+/// (`next Friday`, `last Tuesday`) or stand in a predicate of their own (`the report
+/// is due`), which no suffix rule reaches.
 const ADJECTIVES: &[&str] = &[
     "good", "bad", "big", "small", "large", "little", "new", "old", "young", "great", "high",
     "low", "long", "short", "early", "late", "right", "wrong", "same", "different", "other",
@@ -359,7 +391,8 @@ const ADJECTIVES: &[&str] = &[
     "quiet", "soft", "sharp", "smooth", "sweet", "salty", "bitter", "tall", "huge", "tiny",
     "safe", "sick", "tired", "busy", "ready", "famous", "modern", "ancient", "foreign", "native",
     "legal", "correct", "simple", "complex", "difficult", "serious", "funny", "strange", "usual",
-    "normal", "perfect", "certain", "likely", "aware", "afraid", "alone",
+    "normal", "perfect", "certain", "likely", "aware", "afraid", "alone", "next", "last",
+    "previous", "current", "recent", "upcoming", "due", "available",
 ];
 
 /// Frequent verbs: the base form plus the irregular inflections the morphological
@@ -660,6 +693,18 @@ impl Tagger {
         readings
     }
 
+    /// Whether a word class of [`LEXICON`] claims `word` for `tag`.
+    ///
+    /// What tells a word English's adverb class really holds (`very`, `hardly`) from
+    /// one only its own `-ly` suffix speaks for (`quarterly`, `monthly`): the first
+    /// keeps that reading wherever it stands, while the second is read by the position
+    /// it stands in.
+    fn claims(&self, word: &str, tag: &str) -> bool {
+        self.lexicon
+            .get(word)
+            .is_some_and(|claimed| claimed.contains(&tag))
+    }
+
     /// Whether `word` is a regular `-s`, `-ed` or `-ing` inflection of a verb the
     /// lexicon holds.
     fn is_inflected_verb(&self, word: &str) -> bool {
@@ -827,6 +872,14 @@ pub(crate) struct AnalysedToken<'a> {
     /// The token's lowercased form, for the contextual rules.
     lowercase: String,
     readings: Readings,
+    /// Whether the context read this token as the PREDICATIVE complement of a copula:
+    /// the adjective a clause predicates of its subject (`the staff were rude`, `the
+    /// report is due`).
+    ///
+    /// Read by the noun-phrase chunking, because such a word belongs to its clause's
+    /// predicate and not to the noun phrase standing behind it: a phrase chunked over
+    /// it would begin one word early and cover text the phrase does not.
+    predicative: bool,
 }
 
 impl AnalysedToken<'_> {
@@ -839,12 +892,18 @@ impl AnalysedToken<'_> {
     pub(crate) fn score(&self) -> f32 {
         self.readings.reported().1
     }
+
+    /// Whether this token is the predicative complement of a copula. See
+    /// [`AnalysedToken::predicative`] and [`resolve_predicative`].
+    pub(crate) fn predicative(&self) -> bool {
+        self.predicative
+    }
 }
 
 /// Segment `text` into tokens, read each one's own evidence, and resolve the readings
 /// the context they stand in speaks for or against.
 ///
-/// Three contextual rules, each over the readings rather than over a decided tag, so
+/// Four contextual rules, each over the readings rather than over a decided tag, so
 /// the confidence a token comes back with says how much the context left to the
 /// reading it overturned:
 ///
@@ -855,18 +914,29 @@ impl AnalysedToken<'_> {
 ///    (`language processing service`) or describing one (`the delayed flight`), while
 ///    a finite verb form in the same position is the clause's predicate (`the service
 ///    finds insights`) and keeps its reading.
-/// 2. A predicative complement. A participle, or a word no word class claims at all,
+/// 1b. The phrase a determiner opens, read as a WHOLE rather than one word at a time,
+///    which is what a phrase carrying modifiers needs: the words between a determiner
+///    and the head of its phrase modify that head, and the word CLOSING the run is
+///    the head whatever class the lexicon claims it for (`the quarterly report is
+///    due` — a report, and a quarterly one).
+/// 2. A predicative complement. An open-class word with no verbal reading of its own,
 ///    standing in the predicate of a form of `be` — straight after it or past the
-///    adverbs between them — with no object and no `by` behind it, is the predicate's
-///    adjective rather than a second verb or a noun (`the flight was delayed`, `the
-///    screen is broken`, `the staff were rude`, `the weather is rather pleasant`) — a
-///    passive, which `by` or an object marks, keeps its verb reading.
+///    adverbs between them — is the predicate's adjective rather than a noun (`the
+///    staff were rude`, `the report is due next Friday`, `the weather is rather
+///    pleasant`), unless a determiner, a pronoun, a name or a `by` behind it makes
+///    that predicate a nominal or an agent phrase. A word that DOES carry a verbal
+///    reading is that predicate's verb instead: a participle after a form of `be` is
+///    the clause's passive or progressive verb (`the flight was delayed`, `the window
+///    was broken by a storm`), which is what makes the form of `be` in front of it
+///    the auxiliary accompanying it.
 /// 3. An auxiliary. An auxiliary or modal is AUX when it ACCOMPANIES a main verb, as
-///    the modelled tag's own documentation says; standing with no verb behind it, it
-///    IS the clause's main verb and its verb reading is the supported one (`the train
-///    was late`, `I have a car`).
+///    the modelled tag's own documentation says — which a participle in the predicate
+///    of a form of `be` is, so the copula of a passive or a progressive is read as its
+///    auxiliary (`the flight was delayed`, `it is raining`). Standing with no verb
+///    behind it, an auxiliary IS the clause's main verb and its verb reading is the
+///    supported one (`the staff were rude`, `I have a car`).
 ///
-/// Rule 1 and rule 2 run before rule 3, because whether an auxiliary accompanies a
+/// Rules 1, 1b and 2 run before rule 3, because whether an auxiliary accompanies a
 /// main verb depends on what the word behind it was resolved to.
 pub(crate) fn analyse(text: &str) -> Vec<AnalysedToken<'_>> {
     let tagger = tagger();
@@ -908,11 +978,13 @@ pub(crate) fn analyse(text: &str) -> Vec<AnalysedToken<'_>> {
             byte_end: end_byte,
             lowercase: piece.to_lowercase(),
             readings,
+            predicative: false,
         });
     }
 
     resolve_proper_names(&mut tokens);
     resolve_relative_pronouns(&mut tokens);
+    resolve_determiner_phrases(&mut tokens);
     resolve_noun_phrases(&mut tokens);
     resolve_auxiliaries(&mut tokens);
     tokens
@@ -1052,15 +1124,166 @@ fn resolve_relative_pronouns(tokens: &mut [AnalysedToken<'_>]) {
     }
 }
 
+/// Rule 1b of [`analyse`]: a determiner opens a noun phrase, and that phrase runs to
+/// its head.
+///
+/// Rule 1 reads the word STRAIGHT after an article. This one reads the whole run a
+/// determiner opens, which is what a phrase carrying modifiers needs: a noun phrase
+/// HAS a head, the words in front of it modify it, and which word that is follows
+/// from the position rather than from the class each word's own evidence claims it
+/// for. Three readings follow:
+///
+/// * The word the run closes on heads the phrase when it can — a noun, a name, or a
+///   word English also lists as a verb in the form that is also a noun (`the
+///   quarterly report is due` names a report rather than an act of reporting). An
+///   INFLECTED verb form in that position is its clause's predicate and keeps its
+///   reading (`a monthly summary reached the board`), and so does a gerund or
+///   participle with a noun behind it, which rule 1 reads as that noun's modifier
+///   (`the running water`, `the delayed flight`).
+/// * Where that word is the clause's predicate instead, the phrase's head is its own
+///   last word, so a modifier reading only the word's own suffix spoke for is
+///   overturned to the noun it heads the phrase as (`a monthly summary`). A word
+///   English's own adjective or adverb class claims keeps that reading, and the
+///   phrase is left without a head rather than given an invented one (`the very
+///   expensive`).
+/// * A word standing directly in front of the head and read as an adverb only because
+///   of its own `-ly` suffix modifies the head rather than a verb (`the quarterly
+///   report`, `a monthly summary`). A word English's adverb class really claims keeps
+///   its reading (`the only option`), which is what [`Tagger::claims`] tells apart.
+fn resolve_determiner_phrases(tokens: &mut [AnalysedToken<'_>]) {
+    let tagger = tagger();
+    for position in 0..tokens.len() {
+        if tokens[position].tag() != "DET" {
+            continue;
+        }
+        // Past the words that can stand between the determiner and its head.
+        let mut end = position + 1;
+        while end < tokens.len() && PRE_HEAD_MODIFIER_TAGS.contains(&tokens[end].tag()) {
+            end += 1;
+        }
+        // Nothing stands between the determiner and the next word: rule 1 reads that
+        // position.
+        if end == position + 1 {
+            continue;
+        }
+        let closing = tokens.get(end).map(|token| token.tag());
+        let head = if closing.is_some_and(|tag| NOUN_PHRASE_HEAD_TAGS.contains(&tag)) {
+            end
+        } else if closing == Some("VERB") && heads_a_noun_phrase(tagger, &tokens[end]) {
+            tokens[end].readings.contradict("VERB");
+            tokens[end].readings.support("NOUN", CUE_CONTEXT);
+            end
+        } else {
+            // The run closes on a word that is not part of the phrase, so the
+            // phrase's head is its own last word.
+            let last = end - 1;
+            let modifier = tokens[last].tag();
+            if !matches!(modifier, "ADJ" | "ADV") || tagger.claims(&tokens[last].lowercase, modifier)
+            {
+                continue;
+            }
+            tokens[last].readings.contradict(modifier);
+            tokens[last].readings.support("NOUN", CUE_CONTEXT);
+            last
+        };
+        if head == position + 1 {
+            // Nothing stands between the determiner and the head, so nothing in the
+            // phrase modifies it.
+            continue;
+        }
+        let before = head - 1;
+        if tokens[before].tag() == "ADV" && !tagger.claims(&tokens[before].lowercase, "ADV") {
+            tokens[before].readings.contradict("ADV");
+            tokens[before].readings.support("ADJ", CUE_CONTEXT);
+        }
+    }
+}
+
+/// Whether a word the lexicon claims as a verb, closing the run a determiner opened,
+/// can be read as the noun that phrase is headed by: the form English converts to a
+/// noun is the BASE one (`the report`, `the play`). An inflected form carries tense
+/// or aspect, so it is its clause's predicate and not a noun of the phrase in front
+/// of it.
+fn heads_a_noun_phrase(tagger: &Tagger, token: &AnalysedToken<'_>) -> bool {
+    !tagger.is_inflected_verb(&token.lowercase)
+        && !token.lowercase.ends_with(GERUND_ENDING)
+        && !PARTICIPLE_ENDINGS
+            .iter()
+            .any(|ending| token.lowercase.ends_with(ending))
+}
+
+/// Rule 2 of [`analyse`]: the predicative complement of a copula, and whether this
+/// token is one.
+///
+/// An open-class word with no verbal reading of its own, standing in the predicate of
+/// a form of `be` — straight after it or past the adverbs between them — is the
+/// adjective that predicate predicates (`the staff were rude`, `the report is due
+/// next Friday`, `the weather is rather pleasant`). Three positions are not that
+/// word:
+///
+/// * A word that DOES carry a verbal reading is the verb of that predicate instead: a
+///   participle after a form of `be` is the clause's passive or progressive verb (`the
+///   flight was delayed`, `the window was broken by a storm`), and reading it as the
+///   predicate's adjective is what would leave the form of `be` in front of it as the
+///   clause's only verb.
+/// * A word of a closed class — the determiner, pronoun or preposition opening the
+///   predicate — is never the adjective of one, whatever stands behind it.
+/// * A predicate NOMINAL rather than an adjective, which a determiner, a pronoun or a
+///   proper name behind the word marks (`the manager is John Smith`, `the delay is a
+///   problem`), as does the `by` of an agent phrase.
+///
+/// The answer is recorded on the token ([`AnalysedToken::predicative`]) as well as in
+/// its readings, because the noun-phrase chunking needs the POSITION and not only the
+/// tag: an adjective of a clause's predicate is not a modifier inside the noun phrase
+/// standing behind it, so a phrase chunked over it covers text the phrase does not.
+fn resolve_predicative(tokens: &mut [AnalysedToken<'_>], position: usize) -> bool {
+    // The readings a predicate's adjective can be read from: the open classes a
+    // describing word belongs to. Punctuation, a figure, a name and the closed-class
+    // words opening a predicate are not candidates, and neither is a word carrying a
+    // verbal reading, which is that predicate's own verb.
+    if !PREDICATIVE_CANDIDATE_TAGS.contains(&tokens[position].tag())
+        || tokens[position].readings.has("VERB")
+    {
+        return false;
+    }
+    // The word carrying the predicate, past the adverbs standing between it and this
+    // one (`is rather pleasant`).
+    let mut before = position;
+    while before > 0 && AUXILIARY_SKIPPABLE_TAGS.contains(&tokens[before - 1].tag()) {
+        before -= 1;
+    }
+    let predicate_of = before
+        .checked_sub(1)
+        .map(|copula| tokens[copula].lowercase.clone())
+        .is_some_and(|word| COPULA_FORMS.contains(&word.as_str()));
+    // A determiner, a pronoun or a name behind it makes the predicate a nominal, and
+    // a `by` behind it an agent phrase; a bare common noun does not, because an
+    // adjective takes adjuncts of its own (`is due next Friday`).
+    let complement = tokens.get(position + 1).is_none_or(|after| {
+        let tag = after.tag();
+        after.lowercase != "by" && tag != "PROPN" && tag != "DET" && tag != "PRON"
+    });
+    if !predicate_of || !complement {
+        return false;
+    }
+    tokens[position].readings.contradict("NOUN");
+    tokens[position].readings.support("ADJ", CUE_CONTEXT);
+    tokens[position].predicative = true;
+    true
+}
+
 /// Rules 1 and 2 of [`analyse`], left to right: a resolved token is the context the
 /// next one is read in.
 fn resolve_noun_phrases(tokens: &mut [AnalysedToken<'_>]) {
     for position in 0..tokens.len() {
-        let tag = tokens[position].tag();
-        // Rule 1 is about a verb reading; rule 2 also covers a word no word class
-        // claims at all, which in the predicate of a copula is its adjective.
-        let open_class = tokens[position].readings.open_class_default;
-        if tag != "VERB" && !open_class {
+        // Rule 2 is asked of EVERY word, because what makes one the predicate's
+        // adjective is the position it stands in rather than the class its own
+        // evidence claims it for.
+        if resolve_predicative(tokens, position) {
+            continue;
+        }
+        // Rule 1 is about a verb reading.
+        if tokens[position].tag() != "VERB" {
             continue;
         }
         let previous = position
@@ -1074,38 +1297,6 @@ fn resolve_noun_phrases(tokens: &mut [AnalysedToken<'_>]) {
             None => continue,
             Some(previous) => previous,
         };
-        // The word carrying the predicate, past the adverbs standing between it and
-        // this one (`is rather pleasant`, `was very delayed`).
-        let mut before = position;
-        while before > 0 && AUXILIARY_SKIPPABLE_TAGS.contains(&tokens[before - 1].tag()) {
-            before -= 1;
-        }
-        let predicate_of = before
-            .checked_sub(1)
-            .map(|copula| tokens[copula].lowercase.clone())
-            .is_some_and(|word| COPULA_FORMS.contains(&word.as_str()));
-        let predicative = predicate_of
-            && (open_class
-                || PARTICIPLE_ENDINGS
-                    .iter()
-                    .any(|ending| tokens[position].lowercase.ends_with(ending)))
-            && next.as_ref().is_none_or(|(tag, word)| {
-                // An object or a `by` phrase behind it makes it a passive verb or a
-                // predicate noun rather than the predicate's adjective.
-                word != "by"
-                    && !NOUN_PHRASE_HEAD_TAGS.contains(tag)
-                    && *tag != "DET"
-                    && *tag != "PRON"
-            });
-        if predicative {
-            tokens[position].readings.contradict("VERB");
-            tokens[position].readings.contradict("NOUN");
-            tokens[position].readings.support("ADJ", CUE_CONTEXT);
-            continue;
-        }
-        if tag != "VERB" {
-            continue;
-        }
         // A gerund or a participle standing in a noun phrase is part of it rather
         // than its clause's verb. A PARTICIPLE between a modifier and a head noun
         // describes the head (`the delayed flight`). A GERUND needs no head behind it:
@@ -1141,6 +1332,12 @@ fn resolve_noun_phrases(tokens: &mut [AnalysedToken<'_>]) {
 }
 
 /// Rule 3 of [`analyse`]: an auxiliary accompanies a main verb, or it is one.
+///
+/// What the word behind it was resolved to is what decides this, which is why rules 1,
+/// 1b and 2 run first: a participle in the predicate of a form of `be` is that
+/// clause's own (passive or progressive) verb, so the form of `be` accompanies a verb
+/// and is read as its auxiliary, while a predicate carrying no verb at all leaves the
+/// form of `be` as the clause's main verb.
 fn resolve_auxiliaries(tokens: &mut [AnalysedToken<'_>]) {
     for position in 0..tokens.len() {
         if !AUXILIARIES.contains(&tokens[position].lowercase.as_str()) {

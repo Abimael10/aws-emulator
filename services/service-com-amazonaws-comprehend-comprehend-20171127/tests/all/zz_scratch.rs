@@ -21,20 +21,25 @@ use serde_json::json;
 use crate::batch_inference_calibration::batch_results;
 use crate::comprehend_client::Comprehend;
 
-/// One document carrying two clauses, each a noun phrase with a determiner, a copula
-/// standing as its clause's main verb, a participle and an adjective in predicative
-/// position, and plainly one language.
+/// One document carrying two clauses, each a noun phrase with a determiner, a form of
+/// `be` standing once as the auxiliary of a passive and once as its clause's main
+/// verb, a participle and an adjective in predicative position, and plainly one
+/// language.
 const DOCUMENT: &str = "The flight was delayed and the staff were rude.";
 
 /// Every syntax token of [`DOCUMENT`], as `(Text, Tag)`.
 const TOKENS: &[(&str, &str)] = &[
     ("The", "DET"),
     ("flight", "NOUN"),
-    ("was", "VERB"),
-    ("delayed", "ADJ"),
+    // The form of `be` accompanies the participle behind it, which is that clause's
+    // own (passive) verb.
+    ("was", "AUX"),
+    ("delayed", "VERB"),
     ("and", "CCONJ"),
     ("the", "DET"),
     ("staff", "NOUN"),
+    // The second clause's predicate carries no verb, so the form of `be` in front of
+    // it accompanies none and IS that clause's verb.
     ("were", "VERB"),
     ("rude", "ADJ"),
     (".", "PUNCT"),

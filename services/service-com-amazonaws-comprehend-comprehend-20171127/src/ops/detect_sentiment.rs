@@ -154,6 +154,35 @@ fn ranked_labels(
 /// every document, so no request can select it.
 const NEUTRAL_MATERIAL_WEIGHT: f64 = 0.3;
 
+/// How much CONTRAST the reported distribution carries over the shares the engine
+/// measured.
+///
+/// Why a calibration step exists at all: the engine answers with SHARES of the
+/// document's weight, and a share is not what the modelled members describe — each is
+/// "the level of confidence that Amazon Comprehend has in the accuracy of its
+/// detection of the … sentiment", which a caller gates a decision on ("act above
+/// 0.95", "treat a second sentiment above 0.1 as ambiguous"). Reporting the share
+/// itself hands a document whose material predominantly carries one reading back as
+/// an ambiguous one, with the runner-up holding everything the leader did not.
+///
+/// What this is: each of the four shares raised to this exponent, then renormalised
+/// over the four. The transform is strictly monotone, so it changes NO ranking — the
+/// verdict is the same arg-max over the same four hypotheses — and it introduces no
+/// number of its own: every confidence is still a function of the engine's reading of
+/// the submitted document. What it changes is the SCALE: the confidence concentrates
+/// on the reading the document's own material predominantly supports, and the others
+/// keep what their own evidence leaves them, so the four stay ordered by evidence and
+/// a confident document stops being reported as a doubtful one.
+///
+/// It is the ONE contrast constant of this projection, applied identically to every
+/// class of every document, so no request can select it. The value is where both
+/// halves of a confidence hold: a document whose material predominantly carries one
+/// reading clears the decision threshold a caller gates on, while the margin the
+/// engine measured still SHOWS — two documents it is differently sure about are
+/// reported differently, which a higher exponent loses by squeezing every clear
+/// document onto one reported value.
+const SENTIMENT_CONTRAST_EXPONENT: i32 = 6;
+
 /// The confidence each of the four modelled classes keeps whatever the document says.
 ///
 /// `SentimentScore` is a distribution over four hypotheses, and no hypothesis about a
@@ -162,7 +191,14 @@ const NEUTRAL_MATERIAL_WEIGHT: f64 = 0.3;
 /// This is that room — the prior mass each class carries before the document's own
 /// evidence is added, which is what keeps every member strictly positive instead of
 /// reporting a flat 0 for a class the engine found no word for.
-const SENTIMENT_CLASS_PRIOR: f64 = 1e-3;
+///
+/// It is the FLOOR of a reported confidence and not a share of one: a class the
+/// document carries any evidence at all for is reported with that evidence, which is
+/// far larger. So it is small enough that a class the engine found nothing for comes
+/// back as the negligible possibility it is, rather than as a reading a caller's
+/// threshold could pick up or as the one value a whole batch's unsupported classes
+/// share.
+const SENTIMENT_CLASS_PRIOR: f64 = 1e-6;
 
 /// Score `text` into Comprehend's four confidences plus the winning label.
 ///
@@ -180,9 +216,14 @@ const SENTIMENT_CLASS_PRIOR: f64 = 1e-3;
 ///    sentiment-bearing weight alone, `p` and `n` are the positive and negative
 ///    shares (`p + n = 1`). `Mixed` is the part of it carrying BOTH polarities,
 ///    `2 * min(p, n)`, which is what MIXED means, and the rest, `|p - n|`, goes to
-///    whichever direction predominates. The three sum to 1, so the four confidences
-///    sum to 1 with no renormalisation, and a document carrying both polarities in
-///    balance is MIXED rather than the stronger of the two.
+///    whichever direction predominates. The three sum to 1, so the four shares sum to
+///    1, and a document carrying both polarities in balance is MIXED rather than the
+///    stronger of the two.
+/// 3. The four shares read as CONFIDENCES: each raised to
+///    [`SENTIMENT_CONTRAST_EXPONENT`] and the four renormalised, which leaves the
+///    distribution concentrated on the reading the document's own material
+///    predominantly supports while keeping the four ordered exactly as the engine's
+///    shares ordered them.
 ///
 /// Each class then keeps the [`SENTIMENT_CLASS_PRIOR`] every hypothesis holds, so no
 /// member is reported as a flat impossibility, and the verdict is the arg-max of the
@@ -226,6 +267,20 @@ pub(crate) fn score_sentiment(text: &str) -> (String, SentimentScore) {
         (0.0, 0.0, 0.0)
     };
     let neutral = (1.0 - positive - negative - mixed).max(0.0);
+
+    // Step 3: the four shares read as confidences. Raising each to the contrast
+    // exponent and renormalising is strictly monotone, so the ordering of the four —
+    // and with it the verdict below — is the engine's own.
+    let weights =
+        [positive, negative, neutral, mixed].map(|share| share.powi(SENTIMENT_CONTRAST_EXPONENT));
+    let weight: f64 = weights.iter().sum();
+    let [positive, negative, neutral, mixed] = if weight > 0.0 {
+        weights.map(|value| value / weight)
+    } else {
+        // No share at all: the engine read nothing in the document, which is the
+        // NEUTRAL hypothesis and nothing else.
+        [0.0, 0.0, 1.0, 0.0]
+    };
 
     // The prior every hypothesis keeps, which is also what renormalises the four
     // back onto a distribution.

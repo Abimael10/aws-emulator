@@ -249,7 +249,35 @@ async fn every_identified_candidate_is_one_the_engine_detected() {
         "expected a fragment the engine cannot place to score below a sentence it \
          can, got {fragment} against {sentence}"
     );
+    // How MUCH text the identification was made from is part of the evidence, so a
+    // document carrying little of it is reported materially below one carrying a lot,
+    // and the branch a client takes when it cannot trust the detected language is
+    // reachable. A whole sentence of one language is past the gate; two words that
+    // two languages both write are not.
+    let short = score_of("two words of two languages");
+    assert!(
+        short < LOW_EVIDENCE_GATE,
+        "expected a two-word document to be reported below the {LOW_EVIDENCE_GATE} a \
+         client trusts a detected language above, got {short}"
+    );
+    for case in [
+        "a full english sentence",
+        "a full german sentence",
+        "a japanese sentence",
+    ] {
+        assert!(
+            score_of(case) > LOW_EVIDENCE_GATE,
+            "case {case:?}: expected a document carrying a whole sentence of one \
+             language to be reported above {LOW_EVIDENCE_GATE}, got {}",
+            score_of(case)
+        );
+    }
 }
+
+/// The confidence a client stops trusting a detected language below: a document that
+/// leaves the identification this much doubt is the one whose fallback branch has to
+/// be reachable.
+const LOW_EVIDENCE_GATE: f64 = 0.9;
 
 // ---------------------------------------------------------------------------
 // 2. BatchDetectSentiment
@@ -403,6 +431,63 @@ async fn the_four_sentiment_confidences_are_a_distribution_the_document_decides(
             );
         }
     }
+
+    // The distribution CONCENTRATES on the verdict rather than splitting between it
+    // and the runner-up: a client gating a decision on the member it acted on reads a
+    // classifier's confidence there, and the readings the document carries nothing for
+    // stay far below any threshold it could set.
+    for (case, _, expected) in SENTIMENT_DOCUMENTS {
+        let verdict = member_of(expected);
+        let leading = confidence(case, verdict);
+        assert!(
+            leading > VERDICT_CONCENTRATION,
+            "case {case:?}: expected the reported {expected} sentiment to carry more \
+             than {VERDICT_CONCENTRATION} of the distribution, got {leading}"
+        );
+        for member in SENTIMENT_MEMBERS {
+            if *member == verdict {
+                continue;
+            }
+            assert!(
+                confidence(case, member) < 1.0 - VERDICT_CONCENTRATION,
+                "case {case:?}: expected {member} below the verdict's residual, got {}",
+                confidence(case, member)
+            );
+        }
+    }
+    // A document the engine read as one-sided leaves the opposite polarity negligible
+    // rather than at a magnitude a threshold would act on.
+    for (case, opposite) in [
+        ("several positive words", "Negative"),
+        ("several negative words", "Positive"),
+        ("plain fact", "Mixed"),
+    ] {
+        assert!(
+            confidence(case, opposite) < UNSUPPORTED_CLASS_CEILING,
+            "case {case:?}: expected {opposite}, which the document carries no \
+             evidence for, below {UNSUPPORTED_CLASS_CEILING}, got {}",
+            confidence(case, opposite)
+        );
+    }
+}
+
+/// How much of the distribution the reported `Sentiment` has to carry: past the 0.95
+/// a client gates an automated decision on, which a verdict sharing its document with
+/// a runner-up of comparable magnitude cannot clear.
+const VERDICT_CONCENTRATION: f64 = 0.95;
+
+/// What a class the document carries NO evidence for may be reported at: the prior
+/// every hypothesis keeps and nothing more, which is orders below any threshold a
+/// client sets.
+const UNSUPPORTED_CLASS_CEILING: f64 = 1e-4;
+
+/// The `SentimentScore` member carrying the confidence of a modelled `SentimentType`.
+fn member_of(sentiment: &str) -> &'static str {
+    SENTIMENT_MEMBERS
+        .iter()
+        .find(|member| member.to_uppercase() == sentiment)
+        .copied()
+        .unwrap_or_else(|| panic!("{sentiment:?} is not a modelled SentimentType value"))
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +500,11 @@ async fn the_four_sentiment_confidences_are_a_distribution_the_document_decides(
 /// the same forms of `be` and the same participles appear as an auxiliary and as a main
 /// verb, as a predicate's adjective and as a passive's verb, so a tagger that read a
 /// word out of a list without its context would disagree with at least one row.
+///
+/// The tag set is the model's own `PartOfSpeechTagType`, whose values name the
+/// Universal Dependencies v2 word classes (<https://universaldependencies.org/u/pos/>):
+/// a function word accompanying the main verb of its clause is `AUX`, and the word it
+/// accompanies keeps `VERB`.
 type SyntaxRow = (&'static str, &'static str, &'static [(&'static str, &'static str)]);
 
 const SYNTAX_DOCUMENTS: &[SyntaxRow] = &[
@@ -439,14 +529,41 @@ const SYNTAX_DOCUMENTS: &[SyntaxRow] = &[
         &[("have", "VERB"), ("a", "DET")],
     ),
     (
-        "a predicative participle is the predicate's adjective",
+        "the same form of have accompanying a participle is an auxiliary",
+        "I have finished the report.",
+        &[("have", "AUX"), ("finished", "VERB")],
+    ),
+    (
+        "a participle in the predicate of a copula is that clause's verb",
         "The flight was delayed.",
-        &[("was", "VERB"), ("delayed", "ADJ")],
+        &[("was", "AUX"), ("delayed", "VERB")],
     ),
     (
         "a passive with an agent keeps its verb reading",
         "The window was broken by a storm.",
         &[("was", "AUX"), ("broken", "VERB"), ("by", "ADP")],
+    ),
+    (
+        "a word with no verbal reading is the predicate's adjective",
+        "The staff were rude.",
+        &[("were", "VERB"), ("rude", "ADJ")],
+    ),
+    (
+        "a word the lexicon claims as a verb closes a determiner-led phrase",
+        "The quarterly report is due next Friday.",
+        &[
+            ("The", "DET"),
+            // Read as the head's modifier: only its own `-ly` suffix speaks for an
+            // adverb reading, and it stands between a determiner and the head.
+            ("quarterly", "ADJ"),
+            ("report", "NOUN"),
+            ("Friday", "PROPN"),
+        ],
+    ),
+    (
+        "an adverb English's own class claims keeps that reading in a phrase",
+        "The only option is clear.",
+        &[("The", "DET"), ("only", "ADV"), ("option", "NOUN")],
     ),
     (
         "a gerund inside a compound is nominal",
@@ -558,7 +675,10 @@ async fn a_tag_is_the_reading_the_token_and_its_context_support() {
     );
 
     // Near certainty only where the evidence is: a word one word class claims and
-    // nothing contradicts, against one whose reading a context had to overturn.
+    // nothing contradicts, against one whose reading a context had to overturn. The
+    // reading the context overturned keeps a residual rather than a share of the
+    // question, so the resolved word is reported BELOW the unambiguous one and still
+    // near the certainty the recorded response reports a resolved token with.
     let (_, determiner) = reading(COPULA_CASE, "The");
     assert!(
         determiner > 0.99,
@@ -566,9 +686,14 @@ async fn a_tag_is_the_reading_the_token_and_its_context_support() {
          {determiner}"
     );
     assert!(
-        main_verb_score < determiner - 0.05,
+        main_verb_score < determiner,
         "expected a reading a context had to resolve to carry a lower confidence, got \
          {main_verb_score} against {determiner}"
+    );
+    assert!(
+        main_verb_score > 0.99,
+        "expected a token whose class its position settles to stay near certainty \
+         rather than being reported as a doubtful reading, got {main_verb_score}"
     );
 
     // The table's confidences are not one repeated constant.
