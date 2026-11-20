@@ -234,7 +234,6 @@ async fn a_cache_subnet_group_holds_only_subnets_the_owner_of_subnets_reports() 
         ),
     ];
 
-    let held: Vec<String> = defaults.iter().chain(client.iter()).cloned().collect();
     for (index, (case, subnet_ids, accepted)) in rows.iter().enumerate() {
         let name = format!("owner-resolved-{index}");
         let created = net
@@ -265,16 +264,17 @@ async fn a_cache_subnet_group_holds_only_subnets_the_owner_of_subnets_reports() 
                 "case {case:?}: expected InvalidParameterValue, got {}",
                 created.body
             );
-            // The refusal names exactly the ids that resolved to nothing.
+            // The refusal enumerates the request's WHOLE subnet list, in the order it was
+            // sent, whichever of them the account holds.
             let message = created.error_message().to_string();
-            for id in subnet_ids {
-                assert_eq!(
-                    message.contains(id.as_str()),
-                    !held.contains(id),
-                    "case {case:?}: the message must name {id:?} only when the account has no \
-                     subnet for it, got {message:?}"
-                );
-            }
+            assert_eq!(
+                message,
+                format!(
+                    "Some input subnets in :[{}] are invalid.",
+                    subnet_ids.join(", ")
+                ),
+                "case {case:?}: the message must name every submitted id, got {message:?}"
+            );
             assert_eq!(
                 described.error_code(),
                 "CacheSubnetGroupNotFoundFault",

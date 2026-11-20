@@ -469,8 +469,8 @@ async fn a_modify_is_refused_with_the_rule_it_broke() {
 /// The two refusals a modify shares with its sibling operations: the not-found names the
 /// name's STORED identity (`CacheSubnetGroupName` "is stored as a lowercase string", so the
 /// service names the group under that one identity whatever case the request spelled), and
-/// the unresolved-subnet sentence names the identifiers the request listed, which are EC2's
-/// own and carry no case rule.
+/// the unresolved-subnet sentence enumerates the whole `SubnetIds` list the request sent,
+/// whose identifiers are EC2's own and carry no case rule.
 #[tokio::test]
 async fn a_refused_modify_is_worded_from_the_stored_identity() {
     let emulator = Emulator::new();
@@ -497,23 +497,18 @@ async fn a_refused_modify_is_worded_from_the_stored_identity() {
         );
     }
 
-    // The unresolved-subnet refusal names exactly the identifiers that resolved to
-    // nothing, in the order the request listed them, and nothing of the ones that did.
-    let refused = modify_group(
-        &emulator,
-        GROUP,
-        None,
-        Some(&[
-            "subnet-00000000deadbeef".to_string(),
-            defaults[0].clone(),
-            "subnet-00000000deadbeee".to_string(),
-        ]),
-    )
-    .await;
+    // The unresolved-subnet refusal enumerates the SUBMITTED list — every identifier the
+    // request named, the ones that resolved included — in the order the request listed them.
+    let submitted = [
+        "subnet-00000000deadbeef".to_string(),
+        defaults[0].clone(),
+        "subnet-00000000deadbeee".to_string(),
+    ];
+    let refused = modify_group(&emulator, GROUP, None, Some(&submitted)).await;
     assert_eq!(
         refused.error_message(),
-        "Some input subnets in :[subnet-00000000deadbeef, subnet-00000000deadbeee] are invalid.",
-        "expected the sentence naming the unresolved ids in request order, got {:?}",
+        format!("Some input subnets in :[{}] are invalid.", submitted.join(", ")),
+        "expected the sentence naming the request's whole subnet list in request order, got {:?}",
         refused.error_message()
     );
 }

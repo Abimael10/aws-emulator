@@ -267,16 +267,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service.
         let resolved = if replaces_subnets {
             let requested: Vec<&str> = requested_subnet_ids.iter().map(String::as_str).collect();
-            match crate::state::ec2_subnets::resolve_requested_subnets(ctx, &region, &requested)
-                .await
-            {
+            match crate::state::ec2_subnets::resolved_or_refusal(ctx, &region, &requested).await {
                 Ok(resolved) => resolved,
-                Err(unresolved) => {
-                    let unresolved: Vec<&str> = unresolved.iter().map(String::as_str).collect();
-                    return Err(invalid_value(crate::state::invalid_subnets_message(
-                        &unresolved,
-                    )));
-                }
+                Err(message) => return Err(invalid_value(message)),
             }
         } else {
             Vec::new()

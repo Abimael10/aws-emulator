@@ -333,18 +333,18 @@ async fn a_subnet_the_account_does_not_have_is_refused_and_nothing_is_created() 
             "case {case}: expected InvalidParameterValue, got {}",
             created.body
         );
-        // The refusal NAMES the offending ids, and only those: the message is
-        // built from the request.
+        // The refusal enumerates the request's WHOLE subnet list, in the order it
+        // was sent: the message reports which subnets the service was asked
+        // about, not which of them it could not resolve.
         let message = created.text("Error/Message").unwrap_or_default();
-        for id in subnet_ids {
-            let invalid = !account_subnets.contains(id);
-            assert_eq!(
-                message.contains(id.as_str()),
-                invalid,
-                "case {case}: expected the message to name {id:?} only when it is invalid, got \
-                 {message:?}"
-            );
-        }
+        assert_eq!(
+            message,
+            format!(
+                "Some input subnets in :[{}] are invalid.",
+                subnet_ids.join(", ")
+            ),
+            "case {case}: expected the sentence naming every submitted id, got {message:?}"
+        );
         // And nothing was created: the group the request asked for is not there.
         assert_eq!(
             described.error_code(),

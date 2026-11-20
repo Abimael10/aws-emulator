@@ -443,16 +443,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it would itself refuse.
         let requested: Vec<&str> = requested_subnets.iter().map(String::as_str).collect();
         let resolved =
-            match crate::state::ec2_subnets::resolve_requested_subnets(ctx, &region, &requested)
-                .await
-            {
+            match crate::state::ec2_subnets::resolved_or_refusal(ctx, &region, &requested).await {
                 Ok(resolved) => resolved,
-                Err(unresolved) => {
-                    let unresolved: Vec<&str> = unresolved.iter().map(String::as_str).collect();
-                    return Err(invalid_value(crate::state::invalid_subnets_message(
-                        &unresolved,
-                    )));
-                }
+                Err(message) => return Err(invalid_value(message)),
             };
         // "All the subnetIds must belong to the same VPC"
         // (`CreateServerlessCache$SubnetIds`): the endpoint is deployed into one

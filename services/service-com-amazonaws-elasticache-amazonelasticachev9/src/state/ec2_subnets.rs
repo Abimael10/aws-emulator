@@ -154,7 +154,8 @@ async fn described(
 /// `region`, in the order the request listed them.
 ///
 /// `Err` carries the identifiers that name NO subnet of the account, in that same order, so
-/// the refusal names exactly what was wrong with the request and nothing is stored.
+/// a caller can tell which of them did not resolve. The refusal a request is answered with
+/// is worded by [`resolved_or_refusal`], which every handler goes through.
 ///
 /// ONE source — the service that owns subnets (see this module's own documentation) — asked
 /// about every identifier the request named at once, deduplicated, so the work does not
@@ -194,6 +195,24 @@ pub async fn resolve_requested_subnets(
     } else {
         Err(unresolved)
     }
+}
+
+/// The subnets a request names, resolved, or the sentence the request is refused with when
+/// any of the identifiers resolves to nothing.
+///
+/// The one entry point for an operation that takes a `SubnetIds`, so the operations that
+/// place a resource in subnets cannot drift apart about which identifiers are acceptable or
+/// how the refusal reports them. The refusal enumerates the SUBMITTED list — see
+/// [`super::invalid_subnets_message`], which is what ElastiCache's sentence reports — so
+/// no caller can word it from the unresolved subset alone.
+pub async fn resolved_or_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    subnet_ids: &[&str],
+) -> Result<Vec<AccountSubnet>, String> {
+    resolve_requested_subnets(ctx, region, subnet_ids)
+        .await
+        .map_err(|_| super::invalid_subnets_message(subnet_ids))
 }
 
 /// The subnets ElastiCache SELECTS for a resource in `region` whose request named none: the

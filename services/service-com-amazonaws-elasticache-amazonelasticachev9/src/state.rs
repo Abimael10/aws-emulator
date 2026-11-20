@@ -1279,10 +1279,18 @@ pub struct AccountSubnet {
     pub has_ipv6_cidr: bool,
 }
 
-/// How ElastiCache words a request naming subnets the account does not have,
-/// built from the offending ids: `Some input subnets in :[<ids>] are invalid.`
-pub fn invalid_subnets_message(subnet_ids: &[&str]) -> String {
-    format!("Some input subnets in :[{}] are invalid.", subnet_ids.join(", "))
+/// How ElastiCache words a request naming subnets the account does not have:
+/// `Some input subnets in :[<ids>] are invalid.`
+///
+/// The variable part is the request's WHOLE subnet list, in the order it was sent and
+/// including the identifiers that did resolve: the sentence reports which subnets the
+/// service was asked about, not which of them it could not find, so a client that diffs
+/// the bracketed list against what it submitted sees its own list back.
+pub fn invalid_subnets_message(requested_subnet_ids: &[&str]) -> String {
+    format!(
+        "Some input subnets in :[{}] are invalid.",
+        requested_subnet_ids.join(", ")
+    )
 }
 
 /// The length bound a LOOKUP applies to an identifier before resolving it:
