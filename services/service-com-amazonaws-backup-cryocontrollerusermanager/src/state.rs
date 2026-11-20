@@ -174,6 +174,16 @@ pub use vault_encryption_key::*;
 mod mpa_approval_team;
 pub use mpa_approval_team::*;
 
+/// The one read projection of a stored backup job, which both backup-job reads
+/// answer from. Re-exported for the reason given on `events`.
+mod backup_job_view;
+pub use backup_job_view::*;
+
+/// Unit coverage for [`modelled_timestamp`]: the arithmetic it does, and the
+/// branches of it no request can reach.
+#[cfg(test)]
+mod timestamp;
+
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupPlanInput,
     BackupPlansListMember, BackupRule,
@@ -2641,6 +2651,64 @@ pub fn resource_type_of(resource_arn: &str) -> Option<String> {
     is_modelled_resource_type(resource_type).then(|| resource_type.to_string())
 }
 
+/// The ONE conversion of a stored instant into the modelled timestamp a response reports:
+/// `at`, truncated to millisecond precision.
+///
+/// Every timestamp this service reports is documented to the SAME precision: "the value of
+/// `CreationDate` is accurate to milliseconds. For example, the value 1516925490.087
+/// represents Friday, January 26, 2018 12:11:30.087 AM" (model doc for
+/// [`RecoveryPointByBackupVault`'s](crate::ops::types::RecoveryPointByBackupVault)
+/// `CreationDate`, repeated on `CompletionDate`, `ExpectedCompletionDate`, `StartBy` and
+/// `LastRestoreTime`). So the serialised form of an instant carries at most three fractional
+/// digits of its second, and a client that round-trips or re-serialises one loses nothing.
+///
+/// The host clock these instants are read from is finer than that, so the conversion — not
+/// the clock — is where the documented precision is applied: every operation in this crate
+/// turns a stored [`SystemTime`] into a wire timestamp through this function, so no response
+/// can carry a precision AWS never emits and two reads of one instant can never disagree
+/// about it.
+///
+/// Total, because every read path reaches it: an instant too far from the epoch to express
+/// as epoch milliseconds is reported at the furthest instant that can be (checked
+/// conversions throughout, no arithmetic that can overflow and nothing that can panic), since
+/// the conversion of a stored instant is not where a request fails.
+#[must_use]
+pub fn modelled_timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
+    let millis = match at.duration_since(UNIX_EPOCH) {
+        Ok(since_epoch) => i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX),
+        // An instant BEFORE the epoch is as many milliseconds the other side of it.
+        Err(before_epoch) => i64::try_from(before_epoch.duration().as_millis())
+            .map(i64::saturating_neg)
+            .unwrap_or(i64::MIN),
+    };
+    ::aws_smithy_types::DateTime::from_millis(millis)
+}
+
+/// The non-unique name of a protected resource, derived from its ARN.
+///
+/// An ARN's resource portion names the resource within its service, with the resource type
+/// and any path in front of the name (`table/orders`, `db:fourth`, `volume/vol-0123`), so
+/// the name is its last segment — which is what AWS Backup reports as the
+/// `ResourceName` of the resource a backup protects ("the non-unique name of the resource
+/// that belongs to the specified backup", the member's model doc). A string that is not an
+/// ARN, and an ARN with an empty resource portion, name no resource and so report no name.
+pub fn resource_name_of(resource_arn: &str) -> Option<String> {
+    let mut fields = resource_arn.split(':');
+    let (Some("arn"), Some(_partition), Some(_service)) =
+        (fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    // Skip region and account; what is left is the resource portion, which may itself
+    // contain `:` or `/` between the type, the path and the name.
+    let resource = fields.skip(2).collect::<Vec<_>>().join(":");
+    let name = resource
+        .split([':', '/'])
+        .next_back()
+        .filter(|name| !name.is_empty())?;
+    Some(name.to_string())
+}
+
 /// The Backup Vault Lock configuration applied to a vault by
 /// `PutBackupVaultLockConfiguration`.
 ///
@@ -2867,16 +2935,6 @@ impl RecoveryPoint {
         ))
     }
 
-    /// The `EncryptionKeyType` this recovery point reports, derived from the key
-    /// it is stored under.
-    pub fn encryption_key_type(&self) -> &'static str {
-        if self.encryption_key_arn.is_some() {
-            ENCRYPTION_KEY_TYPE_CUSTOMER_MANAGED
-        } else {
-            ENCRYPTION_KEY_TYPE_AWS_OWNED
-        }
-    }
-
     /// Which storage class this recovery point is in at `now`, derived from the
     /// stored lifecycle: "The lifecycle defines when a protected resource is
     /// transitioned to cold storage" (model doc for `Lifecycle`), so a point is
@@ -2913,15 +2971,33 @@ pub struct RecoveryPointView {
     pub backup_vault_arn: String,
     pub resource_arn: String,
     pub resource_type: Option<String>,
+    /// The protected resource's non-unique name, read off its ARN
+    /// ([`resource_name_of`]).
+    pub resource_name: Option<String>,
     pub iam_role_arn: String,
     pub status: String,
     pub creation_date: SystemTime,
+    /// When the job that wrote this recovery point was initiated — "the date and
+    /// time when the backup job that created this recovery point was initiated"
+    /// (the member's model doc), read off that job rather than stored twice;
+    /// `None` when the store no longer holds it.
+    pub initiation_date: Option<SystemTime>,
     pub completion_date: Option<SystemTime>,
     pub backup_size_in_bytes: i64,
-    pub lifecycle: Option<Lifecycle>,
-    pub calculated_lifecycle: Option<CalculatedLifecycle>,
+    /// The lifecycle this point is kept under, always reported: the point has one
+    /// whether or not its backup named day counts, so the structure is present
+    /// and its members state what was asked for — nothing, when nothing was.
+    pub lifecycle: Lifecycle,
+    /// The instants that lifecycle makes due, always reported for the same
+    /// reason; a member stays `None` when the lifecycle makes nothing due.
+    pub calculated_lifecycle: CalculatedLifecycle,
+    /// The key this point is encrypted with: the key of the vault holding it,
+    /// which a vault always has.
     pub encryption_key_arn: Option<String>,
-    pub encryption_key_type: String,
+    /// `EncryptionKeyType`, as the vault holding the point reports it — the key
+    /// is that vault's, so the classification of it is too, and a vault type
+    /// that reports none leaves the member unset.
+    pub encryption_key_type: Option<String>,
     pub is_encrypted: bool,
     pub is_parent: bool,
     /// The type of the vault holding the point, read off that vault rather than
@@ -2945,9 +3021,11 @@ pub struct BackupJob {
     pub iam_role_arn: String,
     pub state: String,
     pub status_message: Option<String>,
-    /// The class a failed job's `StatusMessage` belongs to, recorded when the job
-    /// settles `FAILED` for the same reason that message is: `None` for a job that
-    /// has not failed, so neither can be reported without the other.
+    /// The message category the job's terminal state puts it in, recorded by the settle
+    /// that decided that state: the class of its `StatusMessage` for a job that settled
+    /// `FAILED`, and [`MESSAGE_CATEGORY_SUCCESS`] for one that captured its resource.
+    /// `None` for a job still on its way to a terminal state, which is in no category
+    /// yet.
     pub message_category: Option<String>,
     /// Why this job can create no recovery point, decided before the job was
     /// stored ([`job_outcome`]).
@@ -3201,13 +3279,13 @@ impl BackupPlanRecord {
             backup_plan_id: Some(self.plan_id.clone()),
             backup_plan_name: Some(version.name.clone()),
             version_id: Some(version.version_id.clone()),
-            creation_date: Some(::aws_smithy_types::DateTime::from(version.creation_date)),
+            creation_date: Some(modelled_timestamp(version.creation_date)),
             deletion_date: self
                 .version_deletion_date(version)
-                .map(::aws_smithy_types::DateTime::from),
+                .map(modelled_timestamp),
             last_execution_date: self
                 .last_execution_date
-                .map(::aws_smithy_types::DateTime::from),
+                .map(modelled_timestamp),
             creator_request_id: self.creator_request_id.clone(),
             advanced_backup_settings: version.advanced_backup_settings_view(),
         }
@@ -3419,10 +3497,10 @@ impl LegalHoldRecord {
             description: Some(self.description.clone()),
             legal_hold_id: Some(self.id.clone()),
             legal_hold_arn: Some(self.arn.clone()),
-            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            creation_date: Some(modelled_timestamp(self.creation_date)),
             cancellation_date: self
                 .cancellation_date
-                .map(::aws_smithy_types::DateTime::from),
+                .map(modelled_timestamp),
         }
     }
 
@@ -3478,7 +3556,7 @@ impl LegalHoldRecord {
                 // Compared as the epoch offsets the model's timestamps carry,
                 // so a bound outside the span a `SystemTime` can express still
                 // orders against the point's creation instant.
-                let created = ::aws_smithy_types::DateTime::from(point.creation_date).as_secs_f64();
+                let created = modelled_timestamp(point.creation_date).as_secs_f64();
                 created >= range.from_date.as_secs_f64()
                     && created <= range.to_date.as_secs_f64()
             }
@@ -4122,35 +4200,48 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// point's wire view is computed; both recovery-point read operations go
     /// through it.
     pub fn recovery_point_view(&self, point: &RecoveryPoint, now: SystemTime) -> RecoveryPointView {
-        let calculated_lifecycle =
-            point
-                .calculated_lifecycle()
-                .map(|(move_to_cold_storage_at, delete_at)| CalculatedLifecycle {
-                    move_to_cold_storage_at: move_to_cold_storage_at
-                        .map(::aws_smithy_types::DateTime::from),
-                    delete_at: delete_at.map(::aws_smithy_types::DateTime::from),
-                });
+        let (move_to_cold_storage_at, delete_at) = point.calculated_lifecycle().unwrap_or_default();
+        let calculated_lifecycle = CalculatedLifecycle {
+            move_to_cold_storage_at: move_to_cold_storage_at.map(modelled_timestamp),
+            delete_at: delete_at.map(modelled_timestamp),
+        };
+        let vault = self.vault_by_arn(&point.backup_vault_arn);
         RecoveryPointView {
             arn: point.arn.clone(),
             backup_vault_name: point.backup_vault_name.clone(),
             backup_vault_arn: point.backup_vault_arn.clone(),
             resource_arn: point.resource_arn.clone(),
             resource_type: point.resource_type.clone(),
+            resource_name: resource_name_of(&point.resource_arn),
             iam_role_arn: point.iam_role_arn.clone(),
             status: point.status.clone(),
             creation_date: point.creation_date,
+            initiation_date: self.job_initiation_date(&point.created_by_job_id),
             completion_date: point.completion_date,
             backup_size_in_bytes: point.backup_size_in_bytes,
-            lifecycle: point.lifecycle.clone(),
+            lifecycle: point.lifecycle.clone().unwrap_or_default(),
             calculated_lifecycle,
             encryption_key_arn: point.encryption_key_arn.clone(),
-            encryption_key_type: point.encryption_key_type().to_string(),
+            encryption_key_type: vault.and_then(|vault| vault.encryption_key_type.clone()),
             is_encrypted: point.is_encrypted,
             is_parent: point.is_parent,
-            vault_type: self.vault_type_of(&point.backup_vault_arn),
+            vault_type: vault.map(|vault| vault.vault_type.clone()),
             index_status: point.index_status.clone(),
             storage_class: point.storage_class(now).to_string(),
         }
+    }
+
+    /// When the job `job_id` was initiated, whichever kind of job it is: the backup job
+    /// that captured a protected resource, or the copy job that copied one vault's
+    /// recovery point into another. `None` when the store holds no such job.
+    ///
+    /// A job is initiated by the call that creates it, so the instant it was initiated is
+    /// the instant it was stored.
+    pub fn job_initiation_date(&self, job_id: &str) -> Option<SystemTime> {
+        self.backup_jobs
+            .get(job_id)
+            .map(|job| job.creation_date)
+            .or_else(|| self.copy_jobs.get(job_id).map(|job| job.creation_date))
     }
 
     /// How many recovery points the named vault holds, derived from the index.
@@ -4331,7 +4422,8 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// whose backup could not be performed at all carries why
     /// ([`BackupJob::failure`]) and settles `FAILED` with that reason as its
     /// `StatusMessage` and that class as its `MessageCategory`, having transferred
-    /// nothing; every other job settles `COMPLETED`.
+    /// nothing; every other job settles `COMPLETED`, in the message category a job
+    /// that captured its resource is classed in ([`MESSAGE_CATEGORY_SUCCESS`]).
     pub fn settle_job(&mut self, job_id: &str, now: SystemTime) {
         let Some(job) = self.backup_jobs.get_mut(job_id) else {
             return;
@@ -4344,6 +4436,7 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
             job.state = BACKUP_JOB_STATE_COMPLETED.to_string();
             job.percent_done = PERCENT_DONE_COMPLETE.to_string();
             job.bytes_transferred = job.backup_size_in_bytes;
+            job.message_category = Some(MESSAGE_CATEGORY_SUCCESS.to_string());
             return;
         };
         // A failed job produced nothing, so it reports no progress and no bytes
@@ -4431,23 +4524,26 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
                 .clone(),
             resource_arn: Some(job.resource_arn.clone()),
             resource_type: job.resource_type.clone(),
-            creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
-            completion_date: job.completion_date.map(::aws_smithy_types::DateTime::from),
+            // The protected resource's non-unique name, read off its ARN the way
+            // every other read of a job in this service reads it
+            // ([`resource_name_of`]).
+            resource_name: resource_name_of(&job.resource_arn),
+            creation_date: Some(modelled_timestamp(job.creation_date)),
+            completion_date: job.completion_date.map(modelled_timestamp),
             state: Some(job.state.clone()),
             status_message: job.status_message.clone(),
             backup_size_in_bytes: Some(job.backup_size_in_bytes),
             iam_role_arn: Some(job.iam_role_arn.clone()),
             is_parent: job.is_parent,
             // A copy a caller asked for has no backup plan behind it and no
-            // parent or child jobs, and this slice stores no resource name or
-            // message category for one.
+            // parent or child jobs, and this slice records no message category
+            // for one.
             created_by: None,
             created_by_backup_job_id: None,
             parent_job_id: None,
             composite_member_identifier: None,
             number_of_child_jobs: None,
             child_jobs_in_state: None,
-            resource_name: None,
             message_category: None,
         }
     }

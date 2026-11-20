@@ -105,11 +105,11 @@ impl RestoreTestingPlanRecord {
             schedule_expression_timezone: self.schedule_expression_timezone.clone(),
             start_window_hours: self.start_window_hours,
             creator_request_id: self.creator_request_id.clone(),
-            creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
-            last_update_time: self.last_update_time.map(::aws_smithy_types::DateTime::from),
+            creation_time: super::modelled_timestamp(self.creation_time),
+            last_update_time: self.last_update_time.map(super::modelled_timestamp),
             last_execution_time: self
                 .last_execution_time
-                .map(::aws_smithy_types::DateTime::from),
+                .map(super::modelled_timestamp),
         }
     }
 }

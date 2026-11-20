@@ -81,6 +81,15 @@ pub fn backup_action_for(resource_type: Option<&str>) -> Option<&'static str> {
         .map(|(_, action)| *action)
 }
 
+/// The `MessageCategory` a job that COMPLETED reports, as AWS classes a job that captured
+/// its resource with no message.
+///
+/// SOURCE: the example strings the model's own documentation for the member gives
+/// (`smithy_query(query="doc", shape="DescribeBackupJobOutput", member="MessageCategory",
+/// model_path="services/service-com-amazonaws-backup-cryocontrollerusermanager/smithy-model/com-amazonaws-backup-cryocontrollerusermanager.json")`),
+/// of which this is the one naming a success.
+pub const MESSAGE_CATEGORY_SUCCESS: &str = "SUCCESS";
+
 /// The `MessageCategory` a job that failed for the PERMISSIONS of its role reports.
 ///
 /// SOURCE: the example strings the model's own documentation for the member gives

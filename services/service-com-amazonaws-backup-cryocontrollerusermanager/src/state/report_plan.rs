@@ -297,13 +297,13 @@ impl ReportPlanRecord {
             report_delivery_channel: Some(self.report_delivery_channel.clone()),
             report_timing: Some(self.report_timing.clone()),
             deployment_status: Some(self.deployment_status.clone()),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
+            creation_time: Some(super::modelled_timestamp(self.creation_time)),
             last_attempted_execution_time: self
                 .last_attempted_execution_time
-                .map(::aws_smithy_types::DateTime::from),
+                .map(super::modelled_timestamp),
             last_successful_execution_time: self
                 .last_successful_execution_time
-                .map(::aws_smithy_types::DateTime::from),
+                .map(super::modelled_timestamp),
         }
     }
 

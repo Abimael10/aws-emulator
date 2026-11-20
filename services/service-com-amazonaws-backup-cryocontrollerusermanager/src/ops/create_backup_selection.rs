@@ -334,6 +334,6 @@ fn selection_created(record: &crate::state::BackupSelectionRecord) -> CreateBack
     CreateBackupSelectionOutput {
         selection_id: Some(record.selection_id.clone()),
         backup_plan_id: Some(record.plan_id.clone()),
-        creation_date: Some(::aws_smithy_types::DateTime::from(record.creation_date)),
+        creation_date: Some(crate::state::modelled_timestamp(record.creation_date)),
     }
 }

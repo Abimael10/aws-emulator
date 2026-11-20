@@ -783,7 +783,7 @@ fn moved_at(completion_date: Option<SystemTime>, creation_date: SystemTime) -> S
 
 /// `time` as the epoch milliseconds an event's `time` carries.
 pub(super) fn epoch_millis(time: SystemTime) -> i64 {
-    ::aws_smithy_types::DateTime::from(time)
+    super::modelled_timestamp(time)
         .to_millis()
         .unwrap_or_default()
 }
@@ -796,7 +796,7 @@ pub(super) fn insert_instant(
     at: Option<SystemTime>,
 ) {
     let rendered = at.and_then(|at| {
-        ::aws_smithy_types::DateTime::from(at)
+        super::modelled_timestamp(at)
             .fmt(::aws_smithy_types::date_time::Format::DateTime)
             .ok()
     });

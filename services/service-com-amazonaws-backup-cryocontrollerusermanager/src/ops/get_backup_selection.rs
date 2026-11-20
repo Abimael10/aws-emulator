@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             backup_selection: Some(selection.selection.clone()),
             selection_id: Some(selection.selection_id.clone()),
             backup_plan_id: Some(selection.plan_id.clone()),
-            creation_date: Some(::aws_smithy_types::DateTime::from(selection.creation_date)),
+            creation_date: Some(crate::state::modelled_timestamp(selection.creation_date)),
             creator_request_id: selection.creator_request_id.clone(),
         })
     }

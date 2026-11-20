@@ -174,10 +174,10 @@ impl RestoreJobRecord {
             recovery_point_arn: Some(self.recovery_point_arn.clone()),
             source_resource_arn: Some(self.source_resource_arn.clone()),
             backup_vault_arn: Some(self.backup_vault_arn.clone()),
-            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            creation_date: Some(super::modelled_timestamp(self.creation_date)),
             completion_date: self
                 .completion_date
-                .map(::aws_smithy_types::DateTime::from),
+                .map(super::modelled_timestamp),
             status: Some(self.status.clone()),
             status_message: self.status_message.clone(),
             percent_done: Some(self.percent_done().to_string()),
@@ -186,7 +186,7 @@ impl RestoreJobRecord {
             iam_role_arn: self.iam_role_arn.clone(),
             created_resource_arn: self.created_resource_arn.clone(),
             resource_type: self.resource_type.clone(),
-            recovery_point_creation_date: Some(::aws_smithy_types::DateTime::from(
+            recovery_point_creation_date: Some(super::modelled_timestamp(
                 self.recovery_point_creation_date,
             )),
             validation_status: self.validation_status.clone(),

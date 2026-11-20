@@ -34,7 +34,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::plan_and_selection_refusals::{create_role, form_value, router_with_iam};
 use crate::vault_and_backup_job::{
-    call, create_vault, start_job, string_at, ACCOUNT, PAST_SETTLE, REGION,
+    call, create_vault, settled_backup_job, start_job, string_at, ACCOUNT, REGION,
 };
 
 /// The vault every job of this suite is started into.
@@ -380,16 +380,11 @@ async fn a_jobs_terminal_state_follows_what_its_role_is_allowed_to_create() {
         started.push((job_id, point_arn, role_arn));
     }
 
-    std::thread::sleep(PAST_SETTLE);
-
     let mut expected_points = 0;
     for (case, (job_id, point_arn, role_arn)) in cases.iter().zip(&started) {
-        let (status, settled) = call(&router, "GET", &format!("/backup-jobs/{job_id}"), None).await;
-        assert_eq!(
-            status, 200,
-            "case {:?}: expected DescribeBackupJob 200, got {status} {settled:?}",
-            case.name
-        );
+        // The settle falls due on the clock, so each job is looked at again until it reports
+        // the terminal state the clock owes it.
+        let settled = settled_backup_job(&router, case.name, job_id).await;
         assert_eq!(
             settled.get("State").and_then(Value::as_str),
             Some(case.expected_state),
@@ -397,12 +392,13 @@ async fn a_jobs_terminal_state_follows_what_its_role_is_allowed_to_create() {
             case.name,
             case.expected_state
         );
-        // The completion instant is the one the clock made due, whichever terminal
-        // state the job reached.
-        assert_eq!(
-            settled.get("CompletionDate"),
-            settled.get("ExpectedCompletionDate"),
-            "case {:?}: a settled job completed at the instant it came due, got {settled:?}",
+        // A job that has reached a terminal state reports the completion that
+        // happened, and no longer the expectation it carried while it was running.
+        assert!(
+            settled.get("CompletionDate").is_some()
+                && settled.get("ExpectedCompletionDate").is_none(),
+            "case {:?}: a settled job reports its completion and no expected one, got \
+             {settled:?}",
             case.name
         );
 

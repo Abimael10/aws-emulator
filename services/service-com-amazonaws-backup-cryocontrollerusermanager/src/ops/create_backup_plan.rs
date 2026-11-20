@@ -293,7 +293,7 @@ fn plan_created(record: &crate::state::BackupPlanRecord) -> CreateBackupPlanOutp
     CreateBackupPlanOutput {
         backup_plan_id: Some(record.plan_id.clone()),
         backup_plan_arn: Some(record.arn.clone()),
-        creation_date: Some(::aws_smithy_types::DateTime::from(
+        creation_date: Some(crate::state::modelled_timestamp(
             record.current.creation_date,
         )),
         version_id: Some(record.current.version_id.clone()),

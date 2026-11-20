@@ -221,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let output = DeleteBackupPlanOutput {
                 backup_plan_id: Some(plan.plan_id.clone()),
                 backup_plan_arn: Some(plan.arn.clone()),
-                deletion_date: Some(::aws_smithy_types::DateTime::from(now)),
+                deletion_date: Some(crate::state::modelled_timestamp(now)),
                 version_id: Some(plan.current.version_id.clone()),
             };
             // Recording the deletion is the plan's last mutation, so it owes the plan

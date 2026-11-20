@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(CreateBackupVaultOutput {
                 backup_vault_name: Some(existing.name.clone()),
                 backup_vault_arn: Some(existing.arn.clone()),
-                creation_date: Some(::aws_smithy_types::DateTime::from(existing.creation_date)),
+                creation_date: Some(crate::state::modelled_timestamp(existing.creation_date)),
             });
         }
 
@@ -305,7 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let output = CreateBackupVaultOutput {
             backup_vault_name: Some(vault.name.clone()),
             backup_vault_arn: Some(vault.arn.clone()),
-            creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
+            creation_date: Some(crate::state::modelled_timestamp(vault.creation_date)),
         };
         store.insert_vault(vault);
         Ok(output)

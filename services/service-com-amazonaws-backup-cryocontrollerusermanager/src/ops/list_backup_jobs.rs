@@ -369,47 +369,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ListBackupJobs<En
 
         let backup_jobs: Vec<BackupJob> = matching[start..end]
             .iter()
-            .map(|job| BackupJob {
-                account_id: Some(::engine::emulator_account_id().to_string()),
-                backup_job_id: Some(job.job_id.clone()),
-                backup_vault_name: Some(job.backup_vault_name.clone()),
-                backup_vault_arn: Some(job.backup_vault_arn.clone()),
-                // Derived from the stored vault, through the same step
-                // `DescribeBackupJob` derives it with.
-                vault_type: store.vault_type_of(&job.backup_vault_arn),
-                recovery_point_arn: Some(job.recovery_point_arn.clone()),
-                recovery_point_lifecycle: job.lifecycle.clone(),
-                encryption_key_arn: job.encryption_key_arn.clone(),
-                is_encrypted: job.is_encrypted,
-                resource_arn: Some(job.resource_arn.clone()),
-                resource_type: job.resource_type.clone(),
-                creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
-                completion_date: job.completion_date.map(::aws_smithy_types::DateTime::from),
-                expected_completion_date: Some(::aws_smithy_types::DateTime::from(job.settles_at)),
-                start_by: job.start_by.map(::aws_smithy_types::DateTime::from),
-                state: Some(job.state.clone()),
-                status_message: job.status_message.clone(),
-                // Read off the stored job, as `DescribeBackupJob` reads it, so the
-                // listed and the described job report one category.
-                message_category: job.message_category.clone(),
-                percent_done: Some(job.percent_done.clone()),
-                backup_size_in_bytes: Some(job.backup_size_in_bytes),
-                bytes_transferred: Some(job.bytes_transferred),
-                iam_role_arn: Some(job.iam_role_arn.clone()),
-                backup_options: Some(job.backup_options.clone().into_iter().collect()),
-                is_parent: job.is_parent,
-                // Left unset for the reasons `DescribeBackupJob` states: a job
-                // started directly has no backup plan behind it and no parent
-                // or child jobs, and vault lock, backup type and the separate
-                // initiation instant are reached only by operations still at 501
-                // or by machinery this slice
-                // does not have.
-                initiation_date: None,
-                created_by: None,
-                vault_lock_state: None,
-                backup_type: None,
-                parent_job_id: None,
-                resource_name: None,
+            .map(|job| {
+                // The ONE backup-job read projection, so a job this page reports
+                // and the same job read on its own can never disagree about it.
+                let view = store.backup_job_view(job);
+                BackupJob {
+                    account_id: Some(::engine::emulator_account_id().to_string()),
+                    backup_job_id: Some(view.job_id),
+                    backup_vault_name: Some(view.backup_vault_name),
+                    backup_vault_arn: Some(view.backup_vault_arn),
+                    vault_type: view.vault_type,
+                    recovery_point_arn: Some(view.recovery_point_arn),
+                    recovery_point_lifecycle: Some(view.recovery_point_lifecycle),
+                    encryption_key_arn: view.encryption_key_arn,
+                    is_encrypted: view.is_encrypted,
+                    resource_arn: Some(view.resource_arn),
+                    resource_type: view.resource_type,
+                    resource_name: view.resource_name,
+                    creation_date: Some(crate::state::modelled_timestamp(view.creation_date)),
+                    initiation_date: Some(crate::state::modelled_timestamp(view.initiation_date)),
+                    completion_date: view.completion_date.map(crate::state::modelled_timestamp),
+                    expected_completion_date: view
+                        .expected_completion_date
+                        .map(crate::state::modelled_timestamp),
+                    start_by: view.start_by.map(crate::state::modelled_timestamp),
+                    state: Some(view.state),
+                    status_message: view.status_message,
+                    message_category: view.message_category,
+                    percent_done: Some(view.percent_done),
+                    backup_size_in_bytes: Some(view.backup_size_in_bytes),
+                    bytes_transferred: Some(view.bytes_transferred),
+                    iam_role_arn: Some(view.iam_role_arn),
+                    backup_options: view.backup_options,
+                    is_parent: view.is_parent,
+                    // Left unset for the reasons `DescribeBackupJob` states: a
+                    // job started directly has no backup plan behind it and no
+                    // parent or child jobs, and vault lock and backup type are
+                    // reached only by operations still at 501 or by machinery
+                    // this slice does not have.
+                    created_by: None,
+                    vault_lock_state: None,
+                    backup_type: None,
+                    parent_job_id: None,
+                }
             })
             .collect();
         // Every job this report settled is a transition the account's event bus is

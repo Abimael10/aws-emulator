@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             framework_arn: Some(framework.arn.clone()),
             framework_description: framework.description.clone(),
             framework_controls: Some(framework.controls.clone()),
-            creation_time: Some(::aws_smithy_types::DateTime::from(framework.creation_time)),
+            creation_time: Some(crate::state::modelled_timestamp(framework.creation_time)),
             deployment_status: Some(framework.deployment_status.clone()),
             framework_status: Some(framework.framework_status().to_string()),
             idempotency_token: framework.idempotency_token.clone(),

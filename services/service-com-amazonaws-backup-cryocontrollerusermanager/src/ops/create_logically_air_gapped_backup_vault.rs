@@ -282,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(CreateLogicallyAirGappedBackupVaultOutput {
                 backup_vault_name: Some(existing.name.clone()),
                 backup_vault_arn: Some(existing.arn.clone()),
-                creation_date: Some(::aws_smithy_types::DateTime::from(existing.creation_date)),
+                creation_date: Some(crate::state::modelled_timestamp(existing.creation_date)),
                 vault_state: existing.vault_state.clone(),
             });
         }
@@ -368,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let output = CreateLogicallyAirGappedBackupVaultOutput {
             backup_vault_name: Some(vault.name.clone()),
             backup_vault_arn: Some(vault.arn.clone()),
-            creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
+            creation_date: Some(crate::state::modelled_timestamp(vault.creation_date)),
             vault_state: vault.vault_state.clone(),
         };
         store.insert_vault(vault);

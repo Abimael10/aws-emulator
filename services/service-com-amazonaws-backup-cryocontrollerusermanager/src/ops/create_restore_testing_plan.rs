@@ -275,6 +275,6 @@ fn restore_testing_plan_created(
     CreateRestoreTestingPlanOutput {
         restore_testing_plan_arn: record.arn.clone(),
         restore_testing_plan_name: record.name.clone(),
-        creation_time: ::aws_smithy_types::DateTime::from(record.creation_time),
+        creation_time: crate::state::modelled_timestamp(record.creation_time),
     }
 }

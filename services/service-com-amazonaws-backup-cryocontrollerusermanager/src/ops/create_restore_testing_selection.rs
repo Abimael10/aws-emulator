@@ -315,6 +315,6 @@ fn restore_testing_selection_created(
         restore_testing_plan_arn: plan_arn.to_string(),
         restore_testing_plan_name: record.plan_name.clone(),
         restore_testing_selection_name: record.name.clone(),
-        creation_time: ::aws_smithy_types::DateTime::from(record.creation_time),
+        creation_time: crate::state::modelled_timestamp(record.creation_time),
     }
 }

@@ -257,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 backup_plan_arn: Some(record.arn.clone()),
                 // The instant this version was stored, which is the version's own
                 // creation date: a later read of it reports the same instant.
-                creation_date: Some(::aws_smithy_types::DateTime::from(
+                creation_date: Some(crate::state::modelled_timestamp(
                     record.current.creation_date,
                 )),
                 version_id: Some(record.current.version_id.clone()),

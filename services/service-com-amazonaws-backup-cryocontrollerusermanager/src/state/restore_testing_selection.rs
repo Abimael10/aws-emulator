@@ -140,7 +140,7 @@ impl RestoreTestingSelectionRecord {
             restore_metadata_overrides: self.restore_metadata_overrides.clone(),
             validation_window_hours: self.validation_window_hours,
             creator_request_id: self.creator_request_id.clone(),
-            creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
+            creation_time: super::modelled_timestamp(self.creation_time),
         }
     }
 }

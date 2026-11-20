@@ -321,34 +321,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     backup_vault_arn: Some(view.backup_vault_arn),
                     resource_arn: Some(view.resource_arn),
                     resource_type: view.resource_type,
+                    resource_name: view.resource_name,
                     iam_role_arn: Some(view.iam_role_arn),
                     status: Some(view.status),
-                    creation_date: Some(::aws_smithy_types::DateTime::from(view.creation_date)),
-                    completion_date: view
-                        .completion_date
-                        .map(::aws_smithy_types::DateTime::from),
+                    creation_date: Some(crate::state::modelled_timestamp(view.creation_date)),
+                    initiation_date: view.initiation_date.map(crate::state::modelled_timestamp),
+                    completion_date: view.completion_date.map(crate::state::modelled_timestamp),
                     backup_size_in_bytes: Some(view.backup_size_in_bytes),
-                    lifecycle: view.lifecycle,
-                    calculated_lifecycle: view.calculated_lifecycle,
+                    lifecycle: Some(view.lifecycle),
+                    calculated_lifecycle: Some(view.calculated_lifecycle),
                     encryption_key_arn: view.encryption_key_arn,
-                    encryption_key_type: Some(view.encryption_key_type),
+                    encryption_key_type: view.encryption_key_type,
                     is_encrypted: view.is_encrypted,
                     is_parent: view.is_parent,
                     vault_type: view.vault_type,
                     index_status: view.index_status,
                     // Backup plans, composite recovery points, restores,
                     // malware scans and restore-access vaults are all reached
-                    // only by operations still at 501, and a recovery point
-                    // started directly has no initiation instant separate from
-                    // its creation.
-                    initiation_date: None,
+                    // only by operations still at 501.
                     created_by: None,
                     status_message: None,
                     source_backup_vault_arn: None,
                     last_restore_time: None,
                     parent_recovery_point_arn: None,
                     composite_member_identifier: None,
-                    resource_name: None,
                     index_status_message: None,
                     aggregated_scan_result: None,
                 }

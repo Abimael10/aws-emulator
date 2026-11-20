@@ -238,8 +238,8 @@ async fn list_copy_jobs_honours_the_wildcards_its_member_documents() {
 }
 
 /// RULE: the same for `ListBackupJobs`, whose own `ByMessageCategory` documentation names
-/// the wildcard `*`; a backup job that captured its resource is recorded in no category,
-/// so no category value selects one.
+/// the wildcard `*`; a backup job that captured its resource is recorded in the category AWS
+/// classes a success with, so that value selects it and no other category value does.
 #[tokio::test]
 async fn list_backup_jobs_honours_the_wildcards_its_member_documents() {
     let router = router();
@@ -270,9 +270,9 @@ async fn list_backup_jobs_honours_the_wildcards_its_member_documents() {
             backup_job_ids.clone(),
         ),
         (
-            "SUCCESS, an example category no stored backup job is recorded in",
+            "SUCCESS, the example category a job that captured its resource is in",
             "SUCCESS",
-            Vec::new(),
+            backup_job_ids.clone(),
         ),
         (
             "AccessDenied, another example category none is recorded in",

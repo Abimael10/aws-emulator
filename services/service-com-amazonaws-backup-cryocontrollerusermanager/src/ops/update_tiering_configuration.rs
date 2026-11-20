@@ -207,8 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tiering_configuration_name: Some(record.name.clone()),
             // The create's instant, which an update leaves alone, beside the
             // instant this update stored the new body.
-            creation_time: Some(::aws_smithy_types::DateTime::from(record.creation_time)),
-            last_updated_time: Some(::aws_smithy_types::DateTime::from(record.last_updated_time)),
+            creation_time: Some(crate::state::modelled_timestamp(record.creation_time)),
+            last_updated_time: Some(crate::state::modelled_timestamp(record.last_updated_time)),
         })
     }
 }

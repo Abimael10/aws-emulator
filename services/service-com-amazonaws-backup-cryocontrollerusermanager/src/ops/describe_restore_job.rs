@@ -211,8 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     recovery_point_arn: Some(job.recovery_point_arn.clone()),
                     source_resource_arn: Some(job.source_resource_arn.clone()),
                     backup_vault_arn: Some(job.backup_vault_arn.clone()),
-                    creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
-                    completion_date: job.completion_date.map(::aws_smithy_types::DateTime::from),
+                    creation_date: Some(crate::state::modelled_timestamp(job.creation_date)),
+                    completion_date: job.completion_date.map(crate::state::modelled_timestamp),
                     status: Some(job.status.clone()),
                     status_message: job.status_message.clone(),
                     // How much of the restore is done, keyed on the status the job
@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     backup_size_in_bytes: Some(0),
                     iam_role_arn: job.iam_role_arn.clone(),
                     resource_type: job.resource_type.clone(),
-                    recovery_point_creation_date: Some(::aws_smithy_types::DateTime::from(
+                    recovery_point_creation_date: Some(crate::state::modelled_timestamp(
                         job.recovery_point_creation_date,
                     )),
                     // The resource the restore created, as the service that owns it

@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The count of the controls the framework holds, which is what
                 // a listing reports in place of the controls themselves.
                 number_of_controls: i32::try_from(framework.controls.len()).unwrap_or(i32::MAX),
-                creation_time: Some(::aws_smithy_types::DateTime::from(framework.creation_time)),
+                creation_time: Some(crate::state::modelled_timestamp(framework.creation_time)),
                 deployment_status: Some(framework.deployment_status.clone()),
             })
             .collect();

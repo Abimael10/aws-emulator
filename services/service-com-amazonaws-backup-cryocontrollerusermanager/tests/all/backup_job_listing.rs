@@ -24,7 +24,8 @@ use service_com_amazonaws_backup_cryocontrollerusermanager::ComAmazonawsBackupCr
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::vault_and_backup_job::{
-    call, create_vault, error_code, router, start_job, string_at, ACCOUNT, PAST_SETTLE, REGION,
+    call, create_vault, error_code, router, settled_backup_job, start_job, string_at, ACCOUNT,
+    REGION,
 };
 
 /// Seconds in a day, for the day offsets the listing-window cases backdate by.
@@ -116,8 +117,12 @@ async fn every_modelled_filter_narrows_the_listing_to_the_stored_jobs_it_names()
     for (vault, resource, _) in &started {
         ids.push(start_job_on(&router, vault, resource).await);
     }
-    // Past the settle span, so the completion filters have an instant to match.
-    std::thread::sleep(PAST_SETTLE);
+    // The settle falls due on the clock, so each job is looked at again until it reports the
+    // terminal state the clock owes it — which is what gives the completion filters an
+    // instant to match.
+    for id in &ids {
+        settled_backup_job(&router, "the started jobs settle", id).await;
+    }
 
     let all: Vec<String> = ids.clone();
     let none: Vec<String> = Vec::new();
@@ -164,8 +169,13 @@ async fn every_modelled_filter_narrows_the_listing_to_the_stored_jobs_it_names()
             none.clone(),
         ),
         (
-            "ByMessageCategory no stored job carries".to_string(),
+            "ByMessageCategory every settled job is recorded in".to_string(),
             "?messageCategory=SUCCESS".to_string(),
+            all.clone(),
+        ),
+        (
+            "ByMessageCategory no settled job is recorded in".to_string(),
+            "?messageCategory=AccessDenied".to_string(),
             none.clone(),
         ),
         (
@@ -280,7 +290,9 @@ async fn a_listed_job_is_the_stored_job_and_settles_with_it() {
         "case \"before the settle span\": an unsettled job has no CompletionDate, got {body:?}"
     );
 
-    std::thread::sleep(PAST_SETTLE);
+    // The settle falls due on the clock, so the job is looked at again until it reports the
+    // state the clock owes it; the listing then reports that same stored job.
+    let described = settled_backup_job(&router, "after the settle span", &job_id).await;
 
     let (status, listed, _, body) = list_jobs(&router, "").await;
     assert_eq!(
@@ -293,11 +305,6 @@ async fn a_listed_job_is_the_stored_job_and_settles_with_it() {
         "case \"after the settle span\": expected the started job, got {body:?}"
     );
     let job = &body["BackupJobs"][0];
-    let (status, described) = call(&router, "GET", &format!("/backup-jobs/{job_id}"), None).await;
-    assert_eq!(
-        status, 200,
-        "expected DescribeBackupJob 200, got {status} {described:?}"
-    );
     // Every member the two reads share comes from the one stored job.
     for member in [
         "AccountId",
@@ -317,6 +324,11 @@ async fn a_listed_job_is_the_stored_job_and_settles_with_it() {
         "BytesTransferred",
         "IsEncrypted",
         "IsParent",
+        "MessageCategory",
+        "ResourceName",
+        "InitiationDate",
+        "StartBy",
+        "RecoveryPointLifecycle",
     ] {
         assert_eq!(
             job.get(member),
@@ -334,8 +346,15 @@ async fn a_listed_job_is_the_stored_job_and_settles_with_it() {
         resource,
         "the listed job must carry the stored resource ARN, got {job:?}"
     );
+    // A job that captured its resource is recorded in the message category AWS
+    // classes a success with.
+    assert_eq!(
+        job.get("MessageCategory").and_then(Value::as_str),
+        Some("SUCCESS"),
+        "a settled job reports the category of its outcome, got {job:?}"
+    );
     // A member nothing in this slice records is absent, not invented.
-    for member in ["ParentJobId", "CreatedBy", "MessageCategory", "BackupType"] {
+    for member in ["ParentJobId", "CreatedBy", "BackupType", "VaultType"] {
         assert!(
             job.get(member).is_none(),
             "case {member:?}: nothing records it, so it must be absent, got {job:?}"

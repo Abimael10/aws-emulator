@@ -397,7 +397,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
                 return Ok(StartBackupJobOutput {
                     backup_job_id: Some(job.job_id.clone()),
                     recovery_point_arn: Some(job.recovery_point_arn.clone()),
-                    creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+                    creation_date: Some(crate::state::modelled_timestamp(job.creation_date)),
                     is_parent: job.is_parent,
                 });
             }
@@ -444,23 +444,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
             .into_iter()
             .collect();
         // `StartWindowMinutes` is the caller's own deadline for the job to begin,
-        // so it keeps the value the caller gave. Checked arithmetic throughout:
-        // the member's range is enforced above, and an instant this clock cannot
-        // express is simply not due.
+        // so it keeps the value the caller gave; a call that named none gets the
+        // service's own window, since the member "is optional, and the default is
+        // 8 hours" (its model doc) — so the job has a deadline either way and
+        // reports the one in force. Checked arithmetic throughout: the member's
+        // range is enforced above, and an instant this clock cannot express is
+        // simply not due.
         let start_by = input
             .start_window_minutes
-            .and_then(|minutes| u64::try_from(minutes).ok())
-            .and_then(|minutes| minutes.checked_mul(60))
+            .unwrap_or(crate::state::DEFAULT_START_WINDOW_MINUTES)
+            .try_into()
+            .ok()
+            .and_then(|minutes: u64| minutes.checked_mul(60))
             .and_then(|seconds| now.checked_add(::std::time::Duration::from_secs(seconds)));
-        // A recovery point reports the key it is stored under only when the
-        // vault was given one: the key this service creates for a vault whose
-        // create request named none encrypts the vault, and a backup under it
-        // is reported with no key of its own, as the recorded responses for a
-        // default-key vault are.
-        let point_encryption_key_arn = vault
-            .named_encryption_key_arn()
-            .map(ToString::to_string);
-        let is_encrypted = point_encryption_key_arn.is_some();
+        // The recovery point is encrypted by the key of the vault it is landed
+        // in, which every vault has: "if you do not specify a key, Backup creates
+        // a KMS key for you by default" (model doc for `CreateBackupVault`'s
+        // `EncryptionKeyArn`), so the backup is encrypted and the key it reports
+        // is that vault's — whether the create named one or this service made it.
+        let point_encryption_key_arn = Some(vault.encryption_key_arn.clone());
+        // The JOB record reports a key only when the vault was created with one of
+        // its own, as the recorded job reads for a default-key vault do.
+        let job_encryption_key_arn = vault.named_encryption_key_arn().map(ToString::to_string);
+        let job_is_encrypted = job_encryption_key_arn.is_some();
 
         let point = crate::state::RecoveryPoint {
             arn: point_arn.clone(),
@@ -475,8 +481,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
             completion_date: None,
             backup_size_in_bytes: 0,
             lifecycle: input.lifecycle.clone(),
-            encryption_key_arn: point_encryption_key_arn.clone(),
-            is_encrypted,
+            encryption_key_arn: point_encryption_key_arn,
+            is_encrypted: true,
             is_parent: false,
             tags,
             // `Index: ENABLED` asks for a searchable index; it is built by the
@@ -513,8 +519,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
             start_by,
             lifecycle: input.lifecycle,
             backup_options,
-            encryption_key_arn: point_encryption_key_arn,
-            is_encrypted,
+            encryption_key_arn: job_encryption_key_arn,
+            is_encrypted: job_is_encrypted,
             is_parent: false,
             idempotency_token: input.idempotency_token.clone(),
         };
@@ -522,7 +528,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<En
         let output = StartBackupJobOutput {
             backup_job_id: Some(job.job_id.clone()),
             recovery_point_arn: Some(point.arn.clone()),
-            creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+            creation_date: Some(crate::state::modelled_timestamp(job.creation_date)),
             is_parent: job.is_parent,
         };
         // A backup nothing will perform writes NO recovery point, so the vault is

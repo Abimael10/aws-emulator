@@ -248,10 +248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|vault| RestoreAccessBackupVaultListMember {
                 restore_access_backup_vault_arn: Some(vault.arn.clone()),
-                creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
+                creation_date: Some(crate::state::modelled_timestamp(vault.creation_date)),
                 // Set once the access this vault asked for was approved, which
                 // is the instant its creation settled.
-                approval_date: vault.approval_date.map(::aws_smithy_types::DateTime::from),
+                approval_date: vault.approval_date.map(crate::state::modelled_timestamp),
                 vault_state: vault.vault_state.clone(),
                 // A revoke of a restore access vault this emulator holds takes
                 // effect at once, so no revoke request is ever left

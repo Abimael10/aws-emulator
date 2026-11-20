@@ -309,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 restore_access_backup_vault_arn: Some(existing.arn.clone()),
                 restore_access_backup_vault_name: Some(existing.name.clone()),
                 vault_state: existing.vault_state.clone(),
-                creation_date: Some(::aws_smithy_types::DateTime::from(existing.creation_date)),
+                creation_date: Some(crate::state::modelled_timestamp(existing.creation_date)),
             });
         }
 
@@ -385,7 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             restore_access_backup_vault_arn: Some(vault.arn.clone()),
             restore_access_backup_vault_name: Some(vault.name.clone()),
             vault_state: vault.vault_state.clone(),
-            creation_date: Some(::aws_smithy_types::DateTime::from(vault.creation_date)),
+            creation_date: Some(crate::state::modelled_timestamp(vault.creation_date)),
         };
         store.insert_vault(vault);
         Ok(output)

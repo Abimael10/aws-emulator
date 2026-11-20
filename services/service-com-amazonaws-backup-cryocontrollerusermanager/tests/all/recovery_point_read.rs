@@ -36,7 +36,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::recovery_point_deletion::{age_point, listed_points, router_with_engine, start_point};
 use crate::vault_and_backup_job::{
-    call, create_vault, error_code, router, start_job, string_at, ACCOUNT, PAST_SETTLE, REGION,
+    call, create_vault, error_code, router, start_job, string_at, ACCOUNT, PAST_SETTLE,
+    POLL_DEADLINE, POLL_WAIT, REGION,
 };
 use crate::vault_read_visibility::DENIED_MESSAGE;
 
@@ -96,20 +97,43 @@ fn instant_at(body: &Value, member: &str) -> Option<f64> {
     body.get(member).and_then(Value::as_f64)
 }
 
+/// The recovery point `arn` of `vault` once the read reports the completion the clock owes
+/// its backup, looked for again until it does or until [`POLL_DEADLINE`] passes — the same
+/// wait on the CONDITION the job reads make
+/// (`vault_and_backup_job::settled_backup_job`).
+async fn completed_point(
+    router: &MultiServiceRouter,
+    case: &str,
+    vault: &str,
+    arn: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, read) = describe_point(router, vault, arn, None).await;
+        if (status, string_at(&read, "Status").as_str()) == (200, "COMPLETED") {
+            return read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the recovery point to complete within \
+             {POLL_DEADLINE:?}, got {status} {read:?}"
+        );
+        std::thread::sleep(POLL_WAIT);
+    }
+}
+
 /// One row of the read table: what the backup was stored as, and what the read
 /// must report back from the store.
 struct ReadCase {
     name: &'static str,
-    /// The `CreateBackupVault` body, which decides the key the point is stored
-    /// under.
+    /// The `CreateBackupVault` body, which decides the key the vault — and so
+    /// every recovery point landed in it — is encrypted with.
     vault_body: String,
-    /// The key the vault was created with, when the row names one.
-    vault_key: Option<String>,
     resource_arn: String,
     lifecycle: Option<&'static str>,
     resource_type: &'static str,
-    encryption_key_type: &'static str,
-    is_encrypted: bool,
+    /// The protected resource's non-unique name, as its ARN names it.
+    resource_name: &'static str,
     /// Whether the stored lifecycle makes a deletion due.
     delete_at: bool,
     /// Whether it makes a cold-storage transition due.
@@ -131,74 +155,62 @@ async fn a_stored_recovery_point_reads_back_through_describe() {
         ReadCase {
             name: "a DynamoDB table with no lifecycle",
             vault_body: "{}".to_string(),
-            vault_key: None,
             resource_arn: format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/demo"),
             lifecycle: None,
             resource_type: "DynamoDB",
-            encryption_key_type: "AWS_OWNED_KMS_KEY",
-            is_encrypted: false,
+            resource_name: "demo",
             delete_at: false,
             move_to_cold_storage_at: false,
         },
         ReadCase {
             name: "an EFS file system retained for 35 days",
             vault_body: "{}".to_string(),
-            vault_key: None,
             resource_arn: format!(
                 "arn:aws:elasticfilesystem:{REGION}:{ACCOUNT}:file-system/fs-012345"
             ),
             lifecycle: Some(r#"{"DeleteAfterDays":35}"#),
             resource_type: "EFS",
-            encryption_key_type: "AWS_OWNED_KMS_KEY",
-            is_encrypted: false,
+            resource_name: "fs-012345",
             delete_at: true,
             move_to_cold_storage_at: false,
         },
         ReadCase {
             name: "an S3 bucket moved to cold storage then deleted",
             vault_body: "{}".to_string(),
-            vault_key: None,
             resource_arn: "arn:aws:s3:::demo-bucket".to_string(),
             lifecycle: Some(r#"{"MoveToColdStorageAfterDays":30,"DeleteAfterDays":120}"#),
             resource_type: "S3",
-            encryption_key_type: "AWS_OWNED_KMS_KEY",
-            is_encrypted: false,
+            resource_name: "demo-bucket",
             delete_at: true,
             move_to_cold_storage_at: true,
         },
         ReadCase {
             name: "an EBS volume kept indefinitely",
             vault_body: "{}".to_string(),
-            vault_key: None,
             resource_arn: format!("arn:aws:ec2:{REGION}:{ACCOUNT}:volume/vol-01234567"),
             lifecycle: Some(r#"{"DeleteAfterDays":-1}"#),
             resource_type: "EBS",
-            encryption_key_type: "AWS_OWNED_KMS_KEY",
-            is_encrypted: false,
+            resource_name: "vol-01234567",
             delete_at: false,
             move_to_cold_storage_at: false,
         },
         ReadCase {
             name: "an Aurora cluster in a customer-managed-key vault",
             vault_body: format!(r#"{{"EncryptionKeyArn":"{key}"}}"#),
-            vault_key: Some(key.clone()),
             resource_arn: format!("arn:aws:rds:{REGION}:{ACCOUNT}:cluster:aurora-demo"),
             lifecycle: Some(r#"{"DeleteAfterDays":7}"#),
             resource_type: "Aurora",
-            encryption_key_type: "CUSTOMER_MANAGED_KMS_KEY",
-            is_encrypted: true,
+            resource_name: "aurora-demo",
             delete_at: true,
             move_to_cold_storage_at: false,
         },
         ReadCase {
             name: "a resource whose namespace the type catalog does not name",
             vault_body: "{}".to_string(),
-            vault_key: None,
             resource_arn: format!("arn:aws:storagegateway:{REGION}:{ACCOUNT}:gateway/sgw-012345"),
             lifecycle: None,
             resource_type: "storagegateway",
-            encryption_key_type: "AWS_OWNED_KMS_KEY",
-            is_encrypted: false,
+            resource_name: "sgw-012345",
             delete_at: false,
             move_to_cold_storage_at: false,
         },
@@ -212,15 +224,24 @@ async fn a_stored_recovery_point_reads_back_through_describe() {
             status, 200,
             "case {name:?}: setup CreateBackupVault should succeed, got {status} {created:?}"
         );
-        let arn = start_point(&router, "read-rp", &case.resource_arn, case.lifecycle).await;
-        std::thread::sleep(PAST_SETTLE);
-
-        let (status, read) = describe_point(&router, "read-rp", &arn, None).await;
+        // The key the vault is encrypted with, as the vault itself reports it: a
+        // vault always has one, whether the create named it or the service made
+        // it, and a recovery point landed in the vault is encrypted with it.
+        let (status, vault) = call(&router, "GET", "/backup-vaults/read-rp", None).await;
         assert_eq!(
-            (status, error_code(&read).as_str()),
-            (200, "<none>"),
-            "case {name:?}: expected DescribeRecoveryPoint 200, got {status} {read:?}"
+            status, 200,
+            "case {name:?}: setup DescribeBackupVault should succeed, got {status} {vault:?}"
         );
+        let vault_key = string_at(&vault, "EncryptionKeyArn");
+        assert!(
+            !vault_key.is_empty(),
+            "case {name:?}: setup expected the vault's key, got {vault:?}"
+        );
+        let arn = start_point(&router, "read-rp", &case.resource_arn, case.lifecycle).await;
+
+        // The backup's completion falls due on the clock, so the point is looked at again
+        // until the read reports the completion the clock owes it.
+        let read = completed_point(&router, name, "read-rp", &arn).await;
         for (member, expected) in [
             ("RecoveryPointArn", arn.clone()),
             ("BackupVaultName", "read-rp".to_string()),
@@ -230,14 +251,11 @@ async fn a_stored_recovery_point_reads_back_through_describe() {
             ),
             ("ResourceArn", case.resource_arn.clone()),
             ("ResourceType", case.resource_type.to_string()),
+            ("ResourceName", case.resource_name.to_string()),
             ("IamRoleArn", backup_role()),
             ("Status", "COMPLETED".to_string()),
             ("VaultType", "BACKUP_VAULT".to_string()),
             ("StorageClass", "WARM".to_string()),
-            (
-                "EncryptionKeyType",
-                case.encryption_key_type.to_string(),
-            ),
         ] {
             assert_eq!(
                 string_at(&read, member),
@@ -245,16 +263,23 @@ async fn a_stored_recovery_point_reads_back_through_describe() {
                 "case {name:?}: expected {member} {expected:?}, got {read:?}"
             );
         }
+        // A standard `BACKUP_VAULT` reports no `EncryptionKeyType`, and the key
+        // classification of a point is the holding vault's, so the point reports
+        // none either.
+        assert!(
+            read.get("EncryptionKeyType").is_none(),
+            "case {name:?}: a point in a standard BACKUP_VAULT reports no \
+             EncryptionKeyType, got {read:?}"
+        );
         assert_eq!(
             read.get("EncryptionKeyArn").and_then(Value::as_str),
-            case.vault_key.as_deref(),
-            "case {name:?}: the point reports the key it is stored under, got {read:?}"
+            Some(vault_key.as_str()),
+            "case {name:?}: the point reports the key of the vault holding it, got {read:?}"
         );
         assert_eq!(
             read.get("IsEncrypted").and_then(Value::as_bool),
-            Some(case.is_encrypted),
-            "case {name:?}: expected IsEncrypted {}, got {read:?}",
-            case.is_encrypted
+            Some(true),
+            "case {name:?}: a point encrypted with the vault's key reports it, got {read:?}"
         );
         assert_eq!(
             read.get("IsParent").and_then(Value::as_bool),
@@ -267,15 +292,25 @@ async fn a_stored_recovery_point_reads_back_through_describe() {
             "case {name:?}: the emulator copies no bytes, so the size is the stored 0, \
              got {read:?}"
         );
-        let expected_lifecycle: Option<Value> = case
+        // The point is kept under a lifecycle either way: the one the backup named,
+        // or the empty one a backup that named none is kept under.
+        let expected_lifecycle: Value = case
             .lifecycle
-            .map(|body| serde_json::from_str(body).expect("a well-formed Lifecycle literal"));
+            .map_or_else(
+                || Value::Object(serde_json::Map::new()),
+                |body| serde_json::from_str(body).expect("a well-formed Lifecycle literal"),
+            );
         assert_eq!(
             read.get("Lifecycle").cloned(),
-            expected_lifecycle,
+            Some(expected_lifecycle),
             "case {name:?}: the stored Lifecycle must be reported verbatim, got {read:?}"
         );
         let calculated = read.get("CalculatedLifecycle");
+        assert!(
+            calculated.is_some(),
+            "case {name:?}: a point reports the instants its lifecycle makes due, \
+             got {read:?}"
+        );
         assert_eq!(
             calculated
                 .and_then(|calculated| calculated.get("DeleteAt"))

@@ -381,7 +381,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
             if let Some(job) = replay {
                 return Ok(StartCopyJobOutput {
                     copy_job_id: Some(job.copy_job_id.clone()),
-                    creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+                    creation_date: Some(crate::state::modelled_timestamp(job.creation_date)),
                     is_parent: job.is_parent,
                 });
             }
@@ -418,12 +418,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
             .checked_add(crate::state::JOB_SETTLE_AFTER)
             .unwrap_or(now);
         // The copy is encrypted by the key the DESTINATION vault is stored
-        // under, reported only when that vault was created with a key of its
-        // own — as a backup into such a vault is.
+        // under, which every vault has ("if you do not specify a key, Backup
+        // creates a KMS key for you by default", model doc for
+        // `CreateBackupVault`'s `EncryptionKeyArn`) — the same rule a backup
+        // landed in a vault follows. The copy JOB record reports a key only when
+        // that vault was created with one of its own.
         let destination_encryption_key_arn = destination_vault
             .named_encryption_key_arn()
             .map(ToString::to_string);
-        let is_encrypted = destination_encryption_key_arn.is_some();
 
         // The copy itself: the same protected resource, in the destination
         // vault, kept under the lifecycle THIS request asked for (the source
@@ -442,8 +444,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
             completion_date: None,
             backup_size_in_bytes: source_point.backup_size_in_bytes,
             lifecycle: input.lifecycle.clone(),
-            encryption_key_arn: destination_encryption_key_arn.clone(),
-            is_encrypted,
+            encryption_key_arn: Some(destination_vault.encryption_key_arn.clone()),
+            is_encrypted: true,
             is_parent: false,
             tags: source_point.tags.clone(),
             // An index belongs to the recovery point it was built for, so the
@@ -476,7 +478,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
 
         let output = StartCopyJobOutput {
             copy_job_id: Some(job.copy_job_id.clone()),
-            creation_date: Some(::aws_smithy_types::DateTime::from(job.creation_date)),
+            creation_date: Some(crate::state::modelled_timestamp(job.creation_date)),
             is_parent: job.is_parent,
         };
 

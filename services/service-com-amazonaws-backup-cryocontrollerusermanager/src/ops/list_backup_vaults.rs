@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 backup_vault_arn: Some(view.arn),
                 vault_type: Some(view.vault_type),
                 vault_state: view.vault_state,
-                creation_date: Some(::aws_smithy_types::DateTime::from(view.creation_date)),
+                creation_date: Some(crate::state::modelled_timestamp(view.creation_date)),
                 encryption_key_arn: Some(view.encryption_key_arn),
                 encryption_key_type: view.encryption_key_type,
                 creator_request_id: view.creator_request_id,
@@ -251,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 locked: Some(view.locked),
                 min_retention_days: view.min_retention_days,
                 max_retention_days: view.max_retention_days,
-                lock_date: view.lock_date.map(::aws_smithy_types::DateTime::from),
+                lock_date: view.lock_date.map(crate::state::modelled_timestamp),
             })
             .collect();
 

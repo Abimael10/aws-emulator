@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cancel_description: hold.cancel_description.clone(),
             retain_record_until: hold
                 .retain_record_until
-                .map(::aws_smithy_types::DateTime::from),
+                .map(crate::state::modelled_timestamp),
             recovery_point_selection: Some(hold.recovery_point_selection.clone()),
         })
     }

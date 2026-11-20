@@ -50,6 +50,10 @@ const FAILED: &str = "FAILED";
 /// started for does not exist, spelled out here for the same reason.
 const RESOURCE_NOT_FOUND: &str = "RESOURCE_NOT_FOUND";
 
+/// The `MessageCategory` AWS reports for a job that captured its resource, spelled out here
+/// for the same reason.
+const SUCCESS: &str = "SUCCESS";
+
 /// The sentence this service states for "the recovery point named is not one this account
 /// holds" — fixed text, naming no part of the request.
 const RECOVERY_POINT_NOT_FOUND: &str = "Cannot find recovery point";
@@ -290,10 +294,13 @@ async fn a_jobs_terminal_state_follows_whether_its_protected_resource_exists() {
             );
         } else {
             assert_eq!(
-                (settled.get("StatusMessage"), settled.get("MessageCategory")),
-                (None, None),
-                "case {:?}: a job that captured its resource reports neither a status message \
-                 nor a category, got {settled:?}",
+                (
+                    settled.get("StatusMessage"),
+                    string_at(&settled, "MessageCategory").as_str()
+                ),
+                (None, SUCCESS),
+                "case {:?}: a job that captured its resource reports no status message and \
+                 the category of a success, got {settled:?}",
                 case.name
             );
             assert_eq!(

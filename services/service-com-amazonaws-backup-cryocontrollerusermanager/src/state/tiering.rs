@@ -82,8 +82,8 @@ impl TieringConfigurationRecord {
             backup_vault_name: self.backup_vault_name.clone(),
             resource_selection: self.resource_selection.clone(),
             creator_request_id: self.creator_request_id.clone(),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
-            last_updated_time: Some(::aws_smithy_types::DateTime::from(self.last_updated_time)),
+            creation_time: Some(super::modelled_timestamp(self.creation_time)),
+            last_updated_time: Some(super::modelled_timestamp(self.last_updated_time)),
         }
     }
 
@@ -110,8 +110,8 @@ impl TieringConfigurationRecord {
             tiering_configuration_arn: Some(self.arn.clone()),
             tiering_configuration_name: Some(self.name.clone()),
             backup_vault_name: Some(self.backup_vault_name.clone()),
-            creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
-            last_updated_time: Some(::aws_smithy_types::DateTime::from(self.last_updated_time)),
+            creation_time: Some(super::modelled_timestamp(self.creation_time)),
+            last_updated_time: Some(super::modelled_timestamp(self.last_updated_time)),
         }
     }
 }

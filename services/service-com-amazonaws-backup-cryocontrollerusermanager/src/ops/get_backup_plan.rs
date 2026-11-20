@@ -195,7 +195,7 @@ fn upcoming_runs(
         runs.into_iter()
             .take(max_runs)
             .map(|(execution, _, rule)| ScheduledPlanExecutionMember {
-                execution_time: Some(::aws_smithy_types::DateTime::from(execution)),
+                execution_time: Some(crate::state::modelled_timestamp(execution)),
                 rule_id: rule.rule_id.clone(),
                 rule_execution_type: Some(rule_execution_type(rule).to_string()),
             })
@@ -363,17 +363,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             backup_plan_arn: Some(plan.arn.clone()),
             version_id: Some(version.version_id.clone()),
             creator_request_id: plan.creator_request_id.clone(),
-            creation_date: Some(::aws_smithy_types::DateTime::from(version.creation_date)),
+            creation_date: Some(crate::state::modelled_timestamp(version.creation_date)),
             // The deletion instant of the VERSION this read answers from: a
             // version an update superseded reports when it was superseded, and
             // the version in force reports none until the plan's own deletion
             // is recorded.
             deletion_date: plan
                 .version_deletion_date(version)
-                .map(::aws_smithy_types::DateTime::from),
+                .map(crate::state::modelled_timestamp),
             last_execution_date: plan
                 .last_execution_date
-                .map(::aws_smithy_types::DateTime::from),
+                .map(crate::state::modelled_timestamp),
             advanced_backup_settings: version.advanced_backup_settings_view(),
             // Computed from the plan's own rules and the clock, for a caller
             // that asked for a preview at all.

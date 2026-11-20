@@ -277,6 +277,6 @@ fn tiering_configuration_created(
     CreateTieringConfigurationOutput {
         tiering_configuration_arn: Some(record.arn.clone()),
         tiering_configuration_name: Some(record.name.clone()),
-        creation_time: Some(::aws_smithy_types::DateTime::from(record.creation_time)),
+        creation_time: Some(crate::state::modelled_timestamp(record.creation_time)),
     }
 }

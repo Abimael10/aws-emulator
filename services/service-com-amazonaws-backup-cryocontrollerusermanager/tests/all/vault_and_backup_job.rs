@@ -245,6 +245,51 @@ pub(crate) fn name_of_length(length: usize) -> String {
         .collect()
 }
 
+/// How long a wait for a transition the clock owes may take in all, and how long each look
+/// waits before the next.
+///
+/// The wait is on the CONDITION, not on a span: a transition falls due on the emulator's own
+/// clock and a read materialises it, so a case looks again until it is reported. The deadline
+/// is far past the span the emulator uses, so a loaded host does not fail a case, and it
+/// bounds only a transition that never arrives at all.
+///
+/// Shared with the sibling suites for the reason given on [`router`]: this crate has ONE
+/// look-again-until-it-holds wait rather than one per file.
+pub(crate) const POLL_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const POLL_WAIT: Duration = Duration::from_millis(25);
+
+/// The `BackupJobState` values a started job comes to rest in (model enum
+/// `BackupJobState`): everything but the states a job on its way to one is in.
+const TERMINAL_JOB_STATES: &[&str] = &["COMPLETED", "FAILED", "ABORTED", "EXPIRED", "PARTIAL"];
+
+/// The backup job `job_id` once it reports the terminal state the clock owes it, looked for
+/// again until it does or until [`POLL_DEADLINE`] passes.
+pub(crate) async fn settled_backup_job(
+    router: &MultiServiceRouter,
+    case: &str,
+    job_id: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, described) =
+            call(router, "GET", &format!("/backup-jobs/{job_id}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DescribeBackupJob 200, got {status} {described:?}"
+        );
+        let state = string_at(&described, "State");
+        if TERMINAL_JOB_STATES.contains(&state.as_str()) {
+            return described;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the job to settle within {POLL_DEADLINE:?}, \
+             got {described:?}"
+        );
+        std::thread::sleep(POLL_WAIT);
+    }
+}
+
 /// A vault round-trips: create, describe, list, delete, then every read of the
 /// deleted name is refused with 403 `AccessDeniedException` (the access decision
 /// a vault-scoped read makes before it looks the vault up — see
@@ -687,13 +732,9 @@ async fn a_started_job_is_stored_and_settles_from_created_to_completed() {
         "expected the stored BackupOptions, got {described:?}"
     );
 
-    std::thread::sleep(PAST_SETTLE);
-
-    let (status, settled) = call(&router, "GET", &format!("/backup-jobs/{job_id}"), None).await;
-    assert_eq!(
-        status, 200,
-        "expected DescribeBackupJob 200, got {status} {settled:?}"
-    );
+    // The settle falls due on the clock, so the job is looked at again until it reports the
+    // state the clock owes it.
+    let settled = settled_backup_job(&router, "after the settle span", &job_id).await;
     assert_eq!(
         settled.get("State").and_then(Value::as_str),
         Some("COMPLETED"),
@@ -708,11 +749,17 @@ async fn a_started_job_is_stored_and_settles_from_created_to_completed() {
         settled.get("CompletionDate").is_some(),
         "case \"after the settle span\": expected a CompletionDate, got {settled:?}"
     );
-    // The completion instant is the one that came due, not the instant of this read.
+    // The completion instant is the one that came due, not the instant of this read:
+    // it is the instant the job reported as its expected completion while it was
+    // still running, which a settled job no longer reports.
     assert_eq!(
         settled.get("CompletionDate"),
-        settled.get("ExpectedCompletionDate"),
+        described.get("ExpectedCompletionDate"),
         "the completion recorded must be the instant it came due, got {settled:?}"
+    );
+    assert!(
+        settled.get("ExpectedCompletionDate").is_none(),
+        "a job that has completed is expected to complete no longer, got {settled:?}"
     );
 
     // The recovery point settled with it.
