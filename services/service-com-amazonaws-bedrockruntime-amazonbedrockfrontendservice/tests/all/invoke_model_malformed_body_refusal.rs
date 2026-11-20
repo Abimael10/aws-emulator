@@ -17,6 +17,13 @@
 //! that IS the family's request object but omits a member it requires is a different,
 //! member-naming refusal, pinned by [`crate::bedrock_runtime_inference`].
 //!
+//! The dimensions AROUND the body — the invoke surface that took the request, the spelling of
+//! the `modelId`, the media types the request declared, and the calls before and after the
+//! refused one — are pinned beside the other suites of the assembled emulator, in
+//! `core/router/tests/all/bedrock_invoke_malformed_body_sentence_follows_the_family.rs`, which
+//! is where a new suite of this service can be declared without editing this crate's
+//! hand-written `tests/all.rs`.
+//!
 //! The rows differ along what the rule generalises over: the FORM in which the document
 //! fails (each way JSON syntax can break, and each JSON type that is not an object), the
 //! SIZE of the body (one byte, far longer than any prompt), the bytes being non-UTF-8, and
