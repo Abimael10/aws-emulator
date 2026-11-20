@@ -98,10 +98,40 @@ pub async fn call(
     call_as(router, ACCOUNT_KEY_ID, method, path_and_query, body).await
 }
 
+/// The host every call addresses unless a suite names another: the endpoint host AWS
+/// publishes this service at in [`REGION`], which is what an AWS SDK sends.
+pub fn aws_endpoint_host() -> String {
+    format!("pca-connector-ad.{REGION}.amazonaws.com")
+}
+
 /// [`call`] signed with `access_key_id`, which is what names the principal the request
 /// speaks for — the one thing a suite about WHO may call this service has to vary.
 pub async fn call_as(
     router: &MultiServiceRouter,
+    access_key_id: &str,
+    method: &str,
+    path_and_query: &str,
+    body: Option<&Value>,
+) -> (u16, String, Value) {
+    call_at_host(
+        router,
+        &aws_endpoint_host(),
+        access_key_id,
+        method,
+        path_and_query,
+        body,
+    )
+    .await
+}
+
+/// [`call_as`] addressed to `host`, which is what a suite about the address a request
+/// REACHED this emulator on varies: a client configured with one local endpoint URL sends
+/// that endpoint's own host, an AWS SDK sends the service's published endpoint host. The
+/// request still carries its SigV4 credential scope, which is the signal that routes it,
+/// so the host chooses nothing but the address the request arrived on.
+pub async fn call_at_host(
+    router: &MultiServiceRouter,
+    host: &str,
     access_key_id: &str,
     method: &str,
     path_and_query: &str,
@@ -113,10 +143,8 @@ pub async fn call_as(
     };
     let request = http::Request::builder()
         .method(method)
-        .uri(format!(
-            "https://pca-connector-ad.{REGION}.amazonaws.com{path_and_query}"
-        ))
-        .header("host", format!("pca-connector-ad.{REGION}.amazonaws.com"))
+        .uri(format!("https://{host}{path_and_query}"))
+        .header("host", host)
         .header("content-type", "application/json")
         .header(
             "authorization",

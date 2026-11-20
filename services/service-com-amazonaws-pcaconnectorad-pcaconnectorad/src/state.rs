@@ -20,12 +20,18 @@ use crate::ops::types::{AccessRights, TemplateDefinition, TemplateRevision, VpcI
 /// WHO may perform an action on a resource of this service: the identity-based decision
 /// every handler takes before it reads or writes anything.
 mod authorization;
+/// The address a connector ANNOUNCES its certificate-enrollment policy server at, which
+/// a domain-joined object then dials.
+mod enrollment_endpoint;
 /// The tag map of a resource addressed by ARN, which the tagging endpoints read and write.
 mod tagging;
 /// The resource-tagging layer's own refusal classes, which this model declares nowhere.
 mod tagging_refusal;
 
 pub use authorization::{any_connector, any_directory_registration, authorize, ACTION_PREFIX};
+pub use enrollment_endpoint::{
+    announced_enrollment_policy_server_endpoint, enrollment_policy_server_endpoint,
+};
 pub use tagging::{parses_as_arn, Taggable};
 pub use tagging_refusal::TaggingError;
 
@@ -833,16 +839,6 @@ pub fn directory_registration_collection_arn(region: &str) -> String {
 /// `/template/<uuid>`.
 pub fn template_arn(connector_arn: &str, template_id: &str) -> String {
     format!("{connector_arn}/template/{template_id}")
-}
-
-/// The certificate-enrollment policy-server endpoint a connector reports: the
-/// connector's own id as the leading host label, then this service's regional
-/// endpoint host (`<service>.<region>.amazonaws.com`, the spelling every other
-/// endpoint of this service uses), with the AD policy-provider CEP path.
-pub fn enrollment_policy_server_endpoint(connector_id: &str, region: &str) -> String {
-    format!(
-        "https://{connector_id}.{ARN_NAMESPACE}.{region}.amazonaws.com/ADPolicyProvider_CEP_Kerberos/service.svc/CEP"
-    )
 }
 
 /// A fresh resource id: a lowercase hyphenated v4 UUID, the form every ARN this

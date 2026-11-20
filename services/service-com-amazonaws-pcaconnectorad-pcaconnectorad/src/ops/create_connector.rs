@@ -264,8 +264,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             certificate_authority_arn: input.certificate_authority_arn,
             directory_id: input.directory_id,
             vpc_information: input.vpc_information,
+            // The enrollment endpoint is an address a domain-joined object DIALS, so it
+            // is announced on an address this emulator answers on — resolved once here
+            // and stored, so every later read of this connector reports the same value.
             certificate_enrollment_policy_server_endpoint:
-                crate::state::enrollment_policy_server_endpoint(&connector_id, &region),
+                crate::state::announced_enrollment_policy_server_endpoint(
+                    ctx,
+                    &region,
+                    &connector_id,
+                ),
             // A connector AWS answers 202 for is not ready yet; the clock owes it
             // the move to ACTIVE at `active_at`.
             status: crate::state::CONNECTOR_STATUS_CREATING.to_string(),

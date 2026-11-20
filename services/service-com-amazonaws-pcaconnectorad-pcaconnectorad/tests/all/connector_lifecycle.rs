@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call as dispatch, encode_label, register_directory, router, ACCOUNT, REGION,
+    call as dispatch, call_at_host, encode_label, register_directory, router, ACCOUNT,
+    ACCOUNT_KEY_ID, REGION,
 };
 
 // The store bounds the handlers refuse past, imported from the crate so these
@@ -1560,4 +1561,252 @@ async fn the_group_entry_store_is_bounded_per_template_and_refuses_past_its_quot
         status, 200,
         "case another template: the per-template bound must not spill over, got {status} / {parsed}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The address a connector ANNOUNCES its enrollment policy server at
+// ---------------------------------------------------------------------------
+
+/// The path a connector's enrollment policy server is announced under, behind the
+/// reserved segment every address this emulator announces on its own endpoint sits
+/// under and the segment naming this plane: the Region, the connector's id, and the
+/// Active Directory policy-provider CEP path AWS publishes such an endpoint under
+/// (see `state::enrollment_policy_server_endpoint`).
+fn expected_enrollment_endpoint(authority: &str, connector_id: &str) -> String {
+    format!(
+        "https://{authority}/_aws/cep/{REGION}/{connector_id}\
+         /ADPolicyProvider_CEP_Kerberos/service.svc/CEP"
+    )
+}
+
+/// The `host[:port]` of the base this emulator reports while it is served on no port —
+/// which is the position an in-process suite's router is in, and the only address such
+/// an emulator has to name. Taken from the framework's own constant, so this case
+/// cannot drift from the base a handler reads.
+fn unserved_authority() -> String {
+    smithy_server_runtime::UNSERVED_URL_BASE
+        .trim_start_matches("https://")
+        .to_string()
+}
+
+/// One row: the host a request REACHED this emulator on, and the authority the
+/// connector it creates must therefore be announced at.
+struct EnrollmentEndpointCase {
+    name: &'static str,
+    /// The `Host` (and absolute-form URI authority) the create arrives with.
+    host: &'static str,
+    /// The authority the announced endpoint must carry, or `None` when the request
+    /// addressed a host that names a service, where the address to announce is the
+    /// base this emulator itself reports ([`unserved_authority`]).
+    expected_authority: Option<&'static str>,
+    /// A directory of this row's own, pattern-admitted (`^d-[0-9a-f]{10}$`) and named
+    /// by no other case in this suite.
+    directory_id: &'static str,
+}
+
+/// The rows span what the rule generalises over — the FORM of the address a client
+/// reached this emulator on: a loopback name with a port, an IPv4 address with a
+/// port, a bracketed IPv6 literal with a port, and the endpoint hosts AWS publishes
+/// this service at (which name a service, so they are not an address of this
+/// emulator's), in this Region and in another.
+const ENROLLMENT_ENDPOINT_CASES: &[EnrollmentEndpointCase] = &[
+    EnrollmentEndpointCase {
+        name: "a client configured with the local endpoint URL",
+        host: "localhost:9297",
+        expected_authority: Some("localhost:9297"),
+        directory_id: "d-aaaa000011",
+    },
+    EnrollmentEndpointCase {
+        name: "a client that dialled the loopback address on another port",
+        host: "127.0.0.1:34567",
+        expected_authority: Some("127.0.0.1:34567"),
+        directory_id: "d-bbbb000022",
+    },
+    EnrollmentEndpointCase {
+        name: "a client that dialled the IPv6 loopback literal",
+        host: "[::1]:8443",
+        expected_authority: Some("[::1]:8443"),
+        directory_id: "d-cccc000033",
+    },
+    EnrollmentEndpointCase {
+        name: "an SDK addressing this service's published endpoint host",
+        host: "pca-connector-ad.us-west-2.amazonaws.com",
+        expected_authority: None,
+        directory_id: "d-dddd000044",
+    },
+    EnrollmentEndpointCase {
+        name: "an SDK addressing this service's published endpoint host in another Region",
+        host: "pca-connector-ad.eu-west-1.amazonaws.com",
+        expected_authority: None,
+        directory_id: "d-eeee000055",
+    },
+];
+
+impl EnrollmentEndpointCase {
+    fn body(&self) -> Value {
+        json!({
+            "DirectoryId": self.directory_id,
+            "CertificateAuthorityArn": format!(
+                "arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/\
+                 66666666-7777-8888-9999-aaaaaaaaaaaa"
+            ),
+            "VpcInformation": { "SecurityGroupIds": ["sg-0123456789abcdef0"] },
+        })
+    }
+
+    fn authority(&self) -> String {
+        self.expected_authority
+            .map_or_else(unserved_authority, str::to_string)
+    }
+}
+
+/// `CreateConnector` arriving on `host`, answering the ARN it minted. The directory is
+/// registered first, which is the prerequisite the create resolves.
+async fn create_connector_at_host(
+    router: &MultiServiceRouter,
+    host: &str,
+    body: &Value,
+) -> String {
+    let directory_id = body["DirectoryId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a connector body must carry a DirectoryId: {body}"));
+    register_directory(router, directory_id).await;
+    let (status, code, parsed) = call_at_host(
+        router,
+        host,
+        ACCOUNT_KEY_ID,
+        "POST",
+        "/connectors",
+        Some(body),
+    )
+    .await;
+    assert_eq!(
+        status, 202,
+        "host {host}: CreateConnector must answer the modelled 202, \
+         got {status} / {code:?} / {parsed}"
+    );
+    parsed["ConnectorArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("host {host}: CreateConnector returned no ConnectorArn: {parsed}"))
+        .to_string()
+}
+
+/// The `CertificateEnrollmentPolicyServerEndpoint` `ListConnectors` serves for `arn`.
+async fn listed_enrollment_endpoint(router: &MultiServiceRouter, arn: &str) -> String {
+    let (status, listed) = call(router, "GET", "/connectors", None).await;
+    assert_eq!(
+        status, 200,
+        "ListConnectors must answer 200, got {status} / {listed}"
+    );
+    listed["Connectors"]
+        .as_array()
+        .and_then(|summaries| {
+            summaries
+                .iter()
+                .find(|summary| summary["Arn"].as_str() == Some(arn))
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("ListConnectors served no summary for {arn}: {listed}"))
+        ["CertificateEnrollmentPolicyServerEndpoint"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn the_enrollment_endpoint_is_announced_on_an_address_this_emulator_answers_on() {
+    let router = router();
+    let prefix = connector_arn_prefix();
+    let mut announced = BTreeSet::new();
+
+    for case in ENROLLMENT_ENDPOINT_CASES {
+        let arn = create_connector_at_host(&router, case.host, &case.body()).await;
+        let connector_id = arn[prefix.len()..].to_string();
+        let expected = expected_enrollment_endpoint(&case.authority(), &connector_id);
+
+        let (status, read) = get_connector(&router, &arn).await;
+        assert_eq!(
+            status, 200,
+            "case {}: GetConnector must read the connector back, got {status} / {read}",
+            case.name
+        );
+        let from_get = read["Connector"]["CertificateEnrollmentPolicyServerEndpoint"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            from_get, expected,
+            "case {}: GetConnector must announce the enrollment endpoint on the address the \
+             create reached this emulator on: expected {expected:?}, got {from_get:?}",
+            case.name
+        );
+
+        // The same projection of the same record: the list reports what the read does.
+        let from_list = listed_enrollment_endpoint(&router, &arn).await;
+        assert_eq!(
+            from_list, expected,
+            "case {}: ListConnectors must serve the same endpoint GetConnector does: \
+             expected {expected:?}, got {from_list:?}",
+            case.name
+        );
+
+        // Whatever address it is announced on, it is never a host AWS publishes: such a
+        // host resolves nowhere near this process.
+        assert!(
+            !from_list.contains("amazonaws.com"),
+            "case {}: the announced endpoint must name no AWS-published host, got {from_list:?}",
+            case.name
+        );
+        assert!(
+            announced.insert(from_list.clone()),
+            "case {}: two connectors must not share one enrollment endpoint, got {from_list:?}",
+            case.name
+        );
+    }
+
+    assert_eq!(
+        announced.len(),
+        ENROLLMENT_ENDPOINT_CASES.len(),
+        "every case must have announced an endpoint of its own, got {announced:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_enrollment_endpoint_is_fixed_when_the_connector_is_created() {
+    let router = router();
+    let prefix = connector_arn_prefix();
+    // Created on the local endpoint URL a client on this machine dials...
+    let case = &ENROLLMENT_ENDPOINT_CASES[0];
+    let mut body = case.body();
+    body["DirectoryId"] = json!("d-ffff000066");
+    let arn = create_connector_at_host(&router, case.host, &body).await;
+    let expected = expected_enrollment_endpoint(&case.authority(), &arn[prefix.len()..]);
+
+    // ...and read back through requests arriving on every other address: a read reports
+    // the connector's own stored endpoint and recomputes nothing, so the value a client
+    // was handed does not move under it.
+    for other in &ENROLLMENT_ENDPOINT_CASES[1..] {
+        let (status, code, read) = call_at_host(
+            &router,
+            other.host,
+            ACCOUNT_KEY_ID,
+            "GET",
+            &format!("/connectors/{}", encode_label(&arn)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "read from {}: GetConnector must answer 200, got {status} / {code:?} / {read}",
+            other.name
+        );
+        let from_get = read["Connector"]["CertificateEnrollmentPolicyServerEndpoint"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            from_get, expected,
+            "read from {}: the endpoint is fixed when the connector is created: \
+             expected {expected:?}, got {from_get:?}",
+            other.name
+        );
+    }
 }
