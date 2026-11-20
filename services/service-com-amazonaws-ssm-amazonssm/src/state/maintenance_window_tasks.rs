@@ -75,6 +75,30 @@ pub const DEFAULT_PRIORITY: i32 = 0;
 /// Key=WindowTargetIds,Values=" (`RegisterTaskWithMaintenanceWindowRequest$Targets`).
 pub const WINDOW_TARGET_IDS_KEY: &str = "WindowTargetIds";
 
+/// The filter keys a describe of a window's tasks may narrow by: "the supported filter keys
+/// are `WindowTaskId`, `TaskArn`, `Priority`, and `TaskType`"
+/// (`DescribeMaintenanceWindowTasksRequest$Filters`). What a refusal of another key lists, and
+/// the one place that set is written.
+pub const TASK_FILTER_KEYS: &[&str] = &["WindowTaskId", "TaskArn", "Priority", "TaskType"];
+
+/// The page size a describe of a window's tasks serves when the request names none: the
+/// modelled maximum of `MaintenanceWindowMaxResults` (`range 10..100`).
+pub const MAX_TASK_PAGE_SIZE: i32 = 100;
+
+/// The smallest page that read serves, from the same modelled range.
+pub const MIN_TASK_PAGE_SIZE: i32 = 10;
+
+/// The page size a task describe serves (see `super::page_size`).
+pub fn task_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    super::page_size(max_results, MIN_TASK_PAGE_SIZE, MAX_TASK_PAGE_SIZE)
+}
+
+/// Whether `key` is one of the filter keys a task describe takes ([`TASK_FILTER_KEYS`]).
+#[must_use]
+pub fn is_task_filter_key(key: &str) -> bool {
+    TASK_FILTER_KEYS.contains(&key)
+}
+
 /// How many tasks this store holds for ONE maintenance window.
 ///
 /// This is the EMULATOR's own ceiling rather than a quota Systems Manager publishes: a
@@ -252,6 +276,27 @@ impl MaintenanceWindowTaskRecord {
                     .iter()
                     .any(|value| value == window_target_id)
         })
+    }
+
+    /// Whether the filter `key`=`values` selects this task.
+    ///
+    /// Each key narrows by one property of the task, and a filter's values UNION: a task is
+    /// selected when one of that filter's values is its value for the key. `Priority` is an
+    /// integer on the record and a string in the filter, so it is compared as the decimal the
+    /// caller writes it as. A key outside [`TASK_FILTER_KEYS`] selects nothing — its caller
+    /// refuses such a key before anything is asked about the tasks.
+    #[must_use]
+    pub fn matches_filter(&self, key: &str, values: &[String]) -> bool {
+        let held = match key {
+            "WindowTaskId" => self.window_task_id.clone(),
+            "TaskArn" => self.task_arn.clone(),
+            "Priority" => self.priority.to_string(),
+            // `MaintenanceWindowTask` names the register's `TaskType` `Type`, and this filter
+            // key is the register's spelling of it.
+            "TaskType" => self.task_type.clone(),
+            _ => return false,
+        };
+        values.contains(&held)
     }
 
     /// The members a register SUPPLIED, rendered as one canonical string.

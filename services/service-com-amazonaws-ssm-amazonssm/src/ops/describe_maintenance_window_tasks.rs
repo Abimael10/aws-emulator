@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMaintenanceWindowTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMaintenanceWindowTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the tasks registered with one maintenance window — the listing half of this
+//! service's maintenance-window task slice. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMaintenanceWindowTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What `RegisterTaskWithMaintenanceWindow` persisted is what this reports, through the one
+//! store in [`crate::state::maintenance_window_tasks`]: the tasks of the window the request
+//! names, in the order they were registered, narrowed by the filters it carries and served
+//! one page at a time. A window id no window of this endpoint carries names nothing to list,
+//! which is the one refusal (`DoesNotExistException`) — a window that holds no task is
+//! reported as holding none.
+//!
+//! "The supported filter keys are `WindowTaskId`, `TaskArn`, `Priority`, and `TaskType`"
+//! (`Filters`): filters intersect and each filter's values union, so a task is reported when,
+//! for every filter, one of that filter's values is its value for that key. A key outside that
+//! set names no property of a task, so the request is refused as invalid before anything is
+//! read — and so is a `NextToken` this read did not hand out, which is the rule the sibling
+//! target listing of this crate takes as well
+//! ([`crate::ops::describe_maintenance_window_targets`]).
+//!
+//! The placeholder this operation's own doc warns about is not invented here: "the system
+//! inserts a placeholder value of 1, which may be reported in the response to this command" is
+//! what the REGISTER persisted for a targetless task
+//! ([`crate::state::maintenance_window_tasks::held_bound`]), so this listing projects the
+//! stored record and nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +170,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMaintenanceWindowTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMaintenanceWindowTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::maintenance_window_tasks::{
+            is_task_filter_key, task_page_size, TASK_FILTER_KEYS,
+        };
+        use crate::state::INVALID_NEXT_TOKEN;
+
+        // `WindowId`'s presence, length and pattern, the filter list's length and
+        // `MaxResults`'s range are MODELLED constraints the centralized walk has already
+        // refused anything outside of.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeMaintenanceWindowTasksErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the maintenance window store is unavailable".to_string()),
+            })
+        })?;
+
+        let filters = input.filters.as_deref().unwrap_or_default();
+        for filter in filters {
+            // A key outside the documented set names no property of a task, so the filter
+            // cannot be served at all: the key is validated — and the request refused, naming
+            // it — before anything is asked about the window. This operation models no filter
+            // error, so it is a 400 `ValidationException`.
+            let key = filter.key.as_deref().unwrap_or_default();
+            if !is_task_filter_key(key) {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Filter key '{key}' isn't one of the keys this operation narrows \
+                     maintenance window tasks by: {}",
+                    TASK_FILTER_KEYS.join(", ")
+                )));
+            }
+        }
+
+        let page_size =
+            task_page_size(input.max_results).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token this operation hands out is the id of the task the next page starts at, so
+        // a token that is not shaped like a task id was not one of ours — and neither is one
+        // that is, but names no task of this result: a token this read did not hand out is
+        // refused rather than served an empty page, the rule the sibling target listing of
+        // this crate takes too. This operation models no token error, so it is a 400
+        // `ValidationException`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMaintenanceWindowTasks"))
+        // The shape is read by the crate's one reader of the 8-4-4-4-12 hexadecimal form
+        // ([`crate::state::is_activation_id`]): `MaintenanceWindowTaskId` and `ActivationId`
+        // fix the same form, and this service mints both through the one minter of it.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) if crate::state::is_activation_id(token) => Some(token.to_string()),
+            Some(_) => return Err(crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN)),
+        };
+
+        // A window lives in the Region its endpoint names, which is the signed credential
+        // scope's — so the id is resolved against that Region's records.
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        if store
+            .maintenance_window(&region, &input.window_id)
+            .is_none()
+        {
+            return Err(
+                DescribeMaintenanceWindowTasksErrorModeled::DoesNotExistException(
+                    DoesNotExistException {
+                        message: Some(
+                            crate::state::maintenance_windows::maintenance_window_not_found_message(
+                                &input.window_id,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let matching: Vec<&crate::state::maintenance_window_tasks::MaintenanceWindowTaskRecord> =
+            store
+                .maintenance_window_tasks_of(&region, &input.window_id)
+                .into_iter()
+                .filter(|task| {
+                    filters.iter().all(|filter| {
+                        task.matches_filter(
+                            filter.key.as_deref().unwrap_or_default(),
+                            filter.values.as_deref().unwrap_or_default(),
+                        )
+                    })
+                })
+                .collect();
+        let start = match resume_from.as_deref() {
+            None => 0,
+            Some(token) => match matching.iter().position(|task| task.window_task_id == token) {
+                Some(at) => at,
+                // Shaped like a task id, but no task of this result: not a page of it to
+                // resume.
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN))
+                }
+            },
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps that
+        // in-bounds without indexing on a value the request steers.
+        let page = matching.get(start..).unwrap_or_default();
+        let tasks = page
+            .iter()
+            .take(page_size)
+            .map(|task| task.to_maintenance_window_task())
+            .collect();
+        // A task is still waiting past this page: hand the caller the id it resumes at, so the
+        // next request continues where this one stopped.
+        let next_token = page.get(page_size).map(|task| task.window_task_id.clone());
+
+        Ok(DescribeMaintenanceWindowTasksOutput {
+            tasks: Some(tasks),
+            next_token,
+        })
     }
 }
