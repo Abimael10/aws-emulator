@@ -10,7 +10,10 @@
 //! servers this service runs, `DirectoryConnectSettingsDescription$SecurityGroupId` ("the
 //! security group identifier for the AD Connector directory") for an AD Connector — while a
 //! create whose placement the owner of subnets holds nothing for is refused and is given no
-//! group at all.
+//! group at all. The group belongs to the placement, so EVERY reporting read of the directory
+//! names it — the read that names the directory and the one that lists them, at whatever stage
+//! the build has reached — and the owner of security groups resolves that one identifier to
+//! exactly one group.
 //!
 //! The rows differ along what the rule generalises over: the directory type and therefore the
 //! placement member the group is reported in (Managed Microsoft AD, Simple AD, AD Connector),
@@ -38,7 +41,7 @@ use crate::directory_dns_addresses::{ec2_client, network, AccountSubnet, ABSENT_
 // The account's own security-group listing, read through the sibling suite's one reader of it.
 use crate::directory_network_release::groups_held_by_ec2;
 use crate::directory_lifecycle::{
-    create_directory, describe_one, ok, string, PASSWORD, STAGE_ACTIVE,
+    create_directory, describe_all, describe_one, ok, string, PASSWORD, STAGE_ACTIVE,
 };
 use crate::microsoft_ad::create_microsoft_ad;
 
@@ -93,9 +96,13 @@ pub(crate) async fn vpc_of(ec2: &::aws_sdk_ec2::Client, subnet_id: &str) -> Stri
         .to_string()
 }
 
-/// The group `group_id` as EC2 — the service that owns security groups — reports it, failing
-/// the case when it holds none: an id this service reported that EC2 does not have is exactly
-/// what must not pass.
+/// The ONE group `group_id` names in EC2 — the service that owns security groups — failing the
+/// case when it answers any other number.
+///
+/// An id this service reported that EC2 does not have is exactly what must not pass, and a
+/// client that reads the group off the directory then describes that single identifier: it has
+/// to resolve there to exactly one group, since an identifier the owner answers nothing for,
+/// or more than one group for, is not one a rule can be authorized against.
 async fn group_reported_by_ec2(
     ec2: &::aws_sdk_ec2::Client,
     group_id: &str,
@@ -109,12 +116,19 @@ async fn group_reported_by_ec2(
         .unwrap_or_else(|error| {
             panic!("case {case:?}: EC2 must hold the group {group_id}: {error:?}")
         });
-    described
-        .security_groups()
-        .iter()
-        .find(|group| group.group_id() == Some(group_id))
-        .unwrap_or_else(|| panic!("case {case:?}: EC2 must report the group {group_id}"))
-        .clone()
+    let groups = described.security_groups();
+    assert_eq!(
+        groups.len(),
+        1,
+        "case {case:?}: expected EC2 to resolve {group_id} to exactly one group, got {groups:?}"
+    );
+    let group = groups[0].clone();
+    assert_eq!(
+        group.group_id(),
+        Some(group_id),
+        "case {case:?}: expected EC2 to report the group {group_id}, got {group:?}"
+    );
+    group
 }
 
 /// The directory `directory_id`, polled through `DescribeDirectories` until it reports itself
@@ -511,4 +525,128 @@ async fn a_directory_created_without_a_placement_reports_no_security_group() {
         "case {case:?}: expected no placement at all for a directory created without one, got \
          {described}"
     );
+}
+
+/// The description the UNFILTERED `DescribeDirectories` page carries for `directory_id` — the
+/// read a client listing its directories makes, as against the one that names the id.
+async fn described_in_the_page(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    case: &str,
+) -> Value {
+    describe_all(router, case)
+        .await
+        .into_iter()
+        .find(|described| described["DirectoryId"] == json!(directory_id))
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected the unfiltered page to carry {directory_id}")
+        })
+}
+
+/// RULE: the domain controller security group is part of the placement a directory reports, so
+/// EVERY reporting read of a VPC-placed directory names it — the read that names the directory
+/// and the one that lists them, at whatever stage the build has reached — always the same
+/// identifier, of the shape the modelled member admits
+/// (`^(sg-[0-9a-f]{8}|sg-[0-9a-f]{17})$`), and the owner of security groups resolves that one
+/// identifier to exactly one group, in the VPC the directory's servers really sit in.
+///
+/// This is what a client polling for the directory's network footprint depends on: a reader
+/// that reported the group only once the build had settled, or only through one of the two
+/// reads, would leave the poll waiting on a member that never arrives.
+///
+/// The rows differ along what the rule generalises over: the directory type and so the
+/// placement member the group is reported in, the blocks of the chosen subnets, the order the
+/// create names them in, and whether they are a client's own subnets or the account's default
+/// ones.
+#[tokio::test]
+async fn every_reporting_read_of_a_placed_directory_names_the_one_group_ec2_holds_for_it() {
+    let network = network().await;
+    let router = &network.router;
+    let ec2 = ec2_client(&EmbeddedEmulator::from_router(router.clone()));
+
+    let rows: [(&str, Kind, Vec<AccountSubnet>); 4] = [
+        (
+            "a Managed Microsoft AD in two /24 subnets",
+            Kind::MicrosoftAd,
+            vec![network.client[0].clone(), network.client[1].clone()],
+        ),
+        (
+            "a Managed Microsoft AD in a /20 and a /28, named in that order",
+            Kind::MicrosoftAd,
+            vec![network.client[3].clone(), network.client[2].clone()],
+        ),
+        (
+            "a Simple AD in the account's default subnets",
+            Kind::SimpleAd,
+            vec![network.default[0].clone(), network.default[1].clone()],
+        ),
+        (
+            "an AD Connector in a /28 and a /24",
+            Kind::Connector,
+            vec![network.client[2].clone(), network.client[0].clone()],
+        ),
+    ];
+
+    let mut reported: BTreeSet<String> = BTreeSet::new();
+    for (index, (case, kind, subnets)) in rows.iter().enumerate() {
+        let name = format!("polled{index}.example.com");
+        let placement = kind.placement();
+        let directory_id = create_in(router, *kind, &name, &subnets[0].vpc, subnets, case).await;
+
+        // Poll the way a client waiting for the directory's network does, and hold every read
+        // to the rule: the group is named, is of the modelled shape, and is the one the last
+        // read named — whichever stage the build is at, and through either reporting read.
+        let started = std::time::Instant::now();
+        let mut first: Option<String> = None;
+        let mut stages: BTreeSet<String> = BTreeSet::new();
+        loop {
+            let described = describe_one(router, &directory_id, case).await;
+            let listed = described_in_the_page(router, &directory_id, case).await;
+            let stage = string(&described, "Stage", case);
+            let group_id = string(&described[placement], "SecurityGroupId", case);
+            assert_security_group_id(&group_id, case);
+            assert_eq!(
+                string(&listed[placement], "SecurityGroupId", case),
+                group_id,
+                "case {case:?}: expected the listing to name the group the targeted read does, \
+                 got {listed}"
+            );
+            let expected = first.clone().unwrap_or_else(|| group_id.clone());
+            assert_eq!(
+                group_id, expected,
+                "case {case:?}: expected every read to name one group, got {group_id} at stage \
+                 {stage:?} after {expected}"
+            );
+            first = Some(group_id);
+            stages.insert(stage.clone());
+            if stage == STAGE_ACTIVE {
+                break;
+            }
+            assert!(
+                started.elapsed() < POLL_DEADLINE,
+                "case {case:?}: expected {directory_id} to report itself in service within \
+                 {POLL_DEADLINE:?}, stages observed {stages:?}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+        let group_id =
+            first.unwrap_or_else(|| panic!("case {case:?}: the poll above reads at least once"));
+
+        // That one identifier resolves, in the owner of security groups, to exactly one group —
+        // in the VPC the chosen subnets belong to, which is the network the servers are on.
+        let group = group_reported_by_ec2(&ec2, &group_id, case).await;
+        let expected_vpc = vpc_of(&ec2, &subnets[0].id).await;
+        assert_eq!(
+            group.vpc_id(),
+            Some(expected_vpc.as_str()),
+            "case {case:?}: expected the group in the VPC of the chosen subnets \
+             ({expected_vpc}), got {group:?}"
+        );
+
+        // And it is this directory's own: no two of the rows were given one group.
+        assert!(
+            reported.insert(group_id.clone()),
+            "case {case:?}: expected a group of this directory's own, got {group_id} again"
+        );
+    }
 }

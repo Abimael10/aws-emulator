@@ -233,7 +233,11 @@ pub(crate) fn descriptions(body: &Value, case: &str) -> Vec<Value> {
 }
 
 /// Every stored directory, unfiltered and unpaginated.
-async fn describe_all(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
+///
+/// `pub(crate)` because the sibling suites read the same unfiltered page \u2014 the reporting read a
+/// client listing its directories makes \u2014 rather than pairing the call and [`descriptions`] a
+/// second time.
+pub(crate) async fn describe_all(router: &MultiServiceRouter, case: &str) -> Vec<Value> {
     let answer = ok(router, "DescribeDirectories", json!({}), case).await;
     descriptions(&answer, case)
 }
