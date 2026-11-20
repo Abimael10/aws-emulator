@@ -514,6 +514,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target_arn,
             target_is_cluster: source_is_cluster,
             status: crate::state::BLUE_GREEN_STATUS_PROVISIONING.to_string(),
+            // Production is served from the blue environment until a switchover moves it.
+            switched_over: false,
             pending_status: Some(crate::state::PendingStatus::in_a_moment(
                 crate::state::BLUE_GREEN_STATUS_AVAILABLE,
             )),
@@ -628,8 +630,8 @@ async fn open_the_green_endpoint<Eng: Send + Sync + 'static>(
             // The green environment's writer endpoint. Whether a session on it may WRITE is
             // decided by the deployment that pairs it with the blue database — a green
             // database is read-only until the switchover
-            // (`crate::state::ComAmazonawsRdsAmazonrdsv19State::is_a_green_database`) — and
-            // not by the role of the address.
+            // (`crate::state::ComAmazonawsRdsAmazonrdsv19State::serves_reads_only_in_a_blue_green_deployment`)
+            // — and not by the role of the address.
             role: crate::state::EndpointRole::Writer,
             // A DB cluster publishes a reader endpoint beside its writer one.
             reader: green.is_cluster,

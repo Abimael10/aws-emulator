@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SwitchoverBlueGreenDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SwitchoverBlueGreenDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Switches over a blue/green deployment: production moves from the databases in the blue
+//! environment to the ones this service cloned into the green environment. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SwitchoverBlueGreenDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The switchover is an EXCHANGE on the two databases the deployment pairs, which is what
+//! makes it real on every later read and on every session:
+//!
+//! * the blue database is renamed out of the way, to `<name>-old<N>`
+//!   ([`crate::state::switched_over_blue_identifier`]), and keeps its data, its resource id
+//!   and its automated backups — nothing about it is deleted here;
+//! * the green database takes the name production was reached by, so a client that resolves
+//!   production by name reaches the green environment from now on;
+//! * the deployment records that production has moved, which is what decides the side that
+//!   serves reads only
+//!   ([`crate::state::ComAmazonawsRdsAmazonrdsv19State::serves_reads_only_in_a_blue_green_deployment`]):
+//!   the green database before this call, the blue one after it.
+//!
+//! `SwitchoverTimeout` is "the amount of time, in seconds, for the switchover to complete …
+//! If the switchover takes longer than the specified duration, then any changes are rolled
+//! back": this service's switchover is in force when this call answers and the deployment
+//! settles on `SWITCHOVER_COMPLETED` within [`crate::state::STATUS_TRANSITION_DELAY`], which
+//! is shorter than the smallest timeout the member accepts (its modelled `range 30..`), so no
+//! rollback is ever owed and the value is not stored.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +167,329 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SwitchoverBlueGreenDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SwitchoverBlueGreenDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SwitchoverBlueGreenDeployment"))
+        let region = crate::state::request_region(ctx)
+            .map_err(SwitchoverBlueGreenDeploymentError::validation)?;
+        // The identifier is SYSTEM-generated, so a value of another form is refused as a
+        // value this parameter does not accept, before any lookup — the same two layers the
+        // delete and the describe of a deployment keep apart.
+        crate::state::check_blue_green_deployment_identifier(
+            &input.blue_green_deployment_identifier,
+        )
+        .map_err(SwitchoverBlueGreenDeploymentError::invalid_parameter_value)?;
+        let identifier = crate::state::blue_green_deployment_identifier_of(
+            &input.blue_green_deployment_identifier,
+        )
+        .to_ascii_lowercase();
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a switchover nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — so the switchover is judged against the state the deployment and
+        // its two databases are really in: a deployment still provisioning its green
+        // environment is refused.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), identifier.clone());
+        let Some(deployment) = store.blue_green_deployments.get(&key) else {
+            return Err(
+                SwitchoverBlueGreenDeploymentErrorModeled::BlueGreenDeploymentNotFoundFault(
+                    BlueGreenDeploymentNotFoundFault {
+                        message: Some(crate::state::blue_green_deployment_not_found_message(
+                            &input.blue_green_deployment_identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "AVAILABLE - Resources are available in the green environment" is the one status
+        // production can be moved to them from: a deployment still provisioning them, one
+        // already switched over and one on its way out are each in no state this call can be
+        // performed in.
+        if !deployment.is_available() {
+            return Err(invalid_state(format!(
+                "Blue/green deployment {identifier} is in state {} and cannot be switched \
+                 over",
+                deployment.status
+            )));
+        }
+        let target_is_cluster = deployment.target_is_cluster;
+        // Which databases the deployment pairs, as the records that hold them are keyed:
+        // both identifiers are stored lowercased, as every database identifier of this
+        // service is.
+        let blue_identifier =
+            crate::state::arn_resource_name_of(&deployment.source_arn).to_ascii_lowercase();
+        let green_identifier =
+            crate::state::arn_resource_name_of(&deployment.target_arn).to_ascii_lowercase();
+
+        // The exchange is performed on the two DATABASES first: a deployment whose green
+        // environment is not there to take production over, or not running, is the modelled
+        // state fault — "the blue/green deployment can't be switched over … because there is
+        // an invalid configuration in the green environment" — and nothing is written for it.
+        let (source_arn, target_arn) = match target_is_cluster {
+            true => switch_over_clusters(&mut store, &region, &blue_identifier, &green_identifier)?,
+            false => {
+                switch_over_instances(&mut store, &region, &blue_identifier, &green_identifier)?
+            }
+        };
+
+        // And then on the deployment, which is what the rest of the service reads production's
+        // side of the pairing from.
+        let Some(deployment) = store.blue_green_deployments.get_mut(&key) else {
+            return Err(SwitchoverBlueGreenDeploymentError::internal_failure(format!(
+                "blue/green deployment {identifier} was resolved but is no longer stored"
+            )));
+        };
+        deployment.switch_over(source_arn, target_arn);
+        Ok(SwitchoverBlueGreenDeploymentOutput {
+            blue_green_deployment: Some(deployment.to_wire()),
+        })
     }
+}
+
+/// The longest `DBInstanceIdentifier` a renamed DB instance may carry: "must contain from 1
+/// to 63 letters, numbers, or hyphens", the bound every create of an instance holds its
+/// identifier to.
+const MAX_DB_INSTANCE_IDENTIFIER_LEN: usize = 63;
+
+/// Exchange the NAMES of the two DB INSTANCES a deployment pairs, answering the ARNs the
+/// deployment reports for them afterwards (`(Source, Target)`).
+///
+/// The blue instance is renamed out of the way first, so the green one can take the name
+/// production was reached by. Each record keeps everything else it carries — its resource id,
+/// its storage, its automated backups and its own engine listener, which moves with it so a
+/// client's open session is not severed by the rename.
+fn switch_over_instances(
+    store: &mut crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    blue_identifier: &str,
+    green_identifier: &str,
+) -> Result<(String, String), SwitchoverBlueGreenDeploymentError> {
+    let blue_key = (region.to_string(), blue_identifier.to_string());
+    let green_key = (region.to_string(), green_identifier.to_string());
+    for (environment, candidate) in [("blue", &blue_key), ("green", &green_key)] {
+        let Some(record) = store.db_instances.get(candidate) else {
+            return Err(invalid_state(missing_database_message(
+                environment,
+                DB_INSTANCE,
+                &candidate.1,
+            )));
+        };
+        if record.status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
+            return Err(invalid_state(unavailable_database_message(
+                environment,
+                DB_INSTANCE,
+                &candidate.1,
+                &record.status,
+            )));
+        }
+    }
+    let Some(retired_identifier) = crate::state::switched_over_blue_identifier(
+        blue_identifier,
+        MAX_DB_INSTANCE_IDENTIFIER_LEN,
+        &|candidate| {
+            store
+                .db_instances
+                .contains_key(&(region.to_string(), candidate.to_string()))
+        },
+    ) else {
+        return Err(invalid_state(unrenamable_database_message(
+            DB_INSTANCE,
+            blue_identifier,
+        )));
+    };
+    let retired_key = (region.to_string(), retired_identifier.clone());
+
+    let Some(mut blue) = store.db_instances.remove(&blue_key) else {
+        return Err(internal_failure(&blue_key.1));
+    };
+    blue.identifier = retired_identifier.clone();
+    blue.engine_log.record(format!(
+        "DB instance {blue_identifier} renamed to {retired_identifier}: production switched \
+         over to {green_identifier}"
+    ));
+    begin_switchover_of_instance(&mut blue);
+    store.db_instances.insert(retired_key.clone(), blue);
+    store.move_engine_endpoint(&blue_key, &retired_key);
+
+    let Some(mut green) = store.db_instances.remove(&green_key) else {
+        return Err(internal_failure(&green_key.1));
+    };
+    green.identifier = blue_identifier.to_string();
+    green.engine_log.record(format!(
+        "DB instance {green_identifier} renamed to {blue_identifier}: the green environment \
+         took over production from {retired_identifier}"
+    ));
+    begin_switchover_of_instance(&mut green);
+    store.db_instances.insert(blue_key.clone(), green);
+    store.move_engine_endpoint(&green_key, &blue_key);
+
+    Ok((
+        crate::state::db_instance_arn(region, &retired_identifier),
+        crate::state::db_instance_arn(region, blue_identifier),
+    ))
+}
+
+/// [`switch_over_instances`] for a deployment whose two databases are DB CLUSTERS: the same
+/// exchange on the cluster records, each keeping its own engine endpoints.
+fn switch_over_clusters(
+    store: &mut crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    blue_identifier: &str,
+    green_identifier: &str,
+) -> Result<(String, String), SwitchoverBlueGreenDeploymentError> {
+    let blue_key = (region.to_string(), blue_identifier.to_string());
+    let green_key = (region.to_string(), green_identifier.to_string());
+    for (environment, candidate) in [("blue", &blue_key), ("green", &green_key)] {
+        let Some(record) = store.db_clusters.get(candidate) else {
+            return Err(invalid_state(missing_database_message(
+                environment,
+                DB_CLUSTER,
+                &candidate.1,
+            )));
+        };
+        if record.status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+            return Err(invalid_state(unavailable_database_message(
+                environment,
+                DB_CLUSTER,
+                &candidate.1,
+                &record.status,
+            )));
+        }
+    }
+    let Some(retired_identifier) = crate::state::switched_over_blue_identifier(
+        blue_identifier,
+        crate::state::db_cluster_identifier_max_len(
+            store
+                .db_clusters
+                .get(&blue_key)
+                .map_or("", |record| record.engine.as_str()),
+        ),
+        &|candidate| {
+            store
+                .db_clusters
+                .contains_key(&(region.to_string(), candidate.to_string()))
+        },
+    ) else {
+        return Err(invalid_state(unrenamable_database_message(
+            DB_CLUSTER,
+            blue_identifier,
+        )));
+    };
+    let retired_key = (region.to_string(), retired_identifier.clone());
+
+    let Some(mut blue) = store.db_clusters.remove(&blue_key) else {
+        return Err(internal_failure(&blue_key.1));
+    };
+    blue.identifier = retired_identifier.clone();
+    blue.status = crate::state::DB_CLUSTER_STATUS_MODIFYING.to_string();
+    blue.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+        crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+    ));
+    store.db_clusters.insert(retired_key.clone(), blue);
+    store.move_cluster_engine_endpoint(&blue_key, &retired_key);
+
+    let Some(mut green) = store.db_clusters.remove(&green_key) else {
+        return Err(internal_failure(&green_key.1));
+    };
+    green.identifier = blue_identifier.to_string();
+    green.status = crate::state::DB_CLUSTER_STATUS_MODIFYING.to_string();
+    green.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+        crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+    ));
+    store.db_clusters.insert(blue_key.clone(), green);
+    store.move_cluster_engine_endpoint(&green_key, &blue_key);
+
+    Ok((
+        crate::state::db_cluster_arn(region, &retired_identifier),
+        crate::state::db_cluster_arn(region, blue_identifier),
+    ))
+}
+
+/// The status a DB instance reports while this service exchanges the two environments, and
+/// the one the clock settles it back on.
+///
+/// A switchover is a change APPLIED to both databases — each reports `modifying` while it
+/// runs and returns to `available` on its own — so they report the pair every other
+/// modification of an instance reports, [`crate::state::STATUS_TRANSITION_DELAY`] apart, and
+/// the deployment's own `SWITCHOVER_COMPLETED` is due at that same instant. A caller that
+/// reads straight after this call therefore still sees the switchover in progress on both the
+/// deployment and its databases; nothing sleeps for it.
+const SWITCHING_OVER_INSTANCE_STATUS: &str = "modifying";
+
+/// Put the DB instance `record` into that status, with the settled one owed by the clock.
+fn begin_switchover_of_instance(record: &mut crate::state::DbInstanceRecord) {
+    record.status = SWITCHING_OVER_INSTANCE_STATUS.to_string();
+    record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
+        crate::state::DB_INSTANCE_STATUS_AVAILABLE,
+    ));
+}
+
+/// How this operation names a database that is a DB INSTANCE, for the two sentences below.
+const DB_INSTANCE: &str = "DB instance";
+
+/// How it names one that is a DB CLUSTER.
+const DB_CLUSTER: &str = "DB cluster";
+
+/// How this operation reports that a database the deployment pairs is no longer stored, so
+/// there is nothing to exchange: the environment it belonged to, the kind of database and the
+/// name the deployment holds it by.
+fn missing_database_message(environment: &str, subject: &str, identifier: &str) -> String {
+    format!(
+        "Blue/green deployment cannot be switched over: {subject} {identifier} in the \
+         {environment} environment no longer exists"
+    )
+}
+
+/// How it reports that such a database is not running: a switchover is work done ON two
+/// running databases, so every status but the running one is refused, naming the status the
+/// database is really in.
+fn unavailable_database_message(
+    environment: &str,
+    subject: &str,
+    identifier: &str,
+    status: &str,
+) -> String {
+    format!(
+        "Blue/green deployment cannot be switched over: {subject} {identifier} in the \
+         {environment} environment is in state {status}"
+    )
+}
+
+/// How it reports that the blue database cannot be renamed out of the way, because every name
+/// it could be retired under is held by a database of this Region
+/// ([`crate::state::switched_over_blue_identifier`]): the switchover is refused rather than
+/// renaming it onto a record that is not it.
+fn unrenamable_database_message(subject: &str, identifier: &str) -> String {
+    format!(
+        "Blue/green deployment cannot be switched over: {subject} {identifier} in the blue \
+         environment cannot be renamed out of the way because every name it would be retired \
+         under is already in use"
+    )
+}
+
+/// The modelled 400 for a deployment this switchover cannot be performed on: the deployment
+/// is in no state for it, or its green environment is not there to take production over.
+fn invalid_state(message: String) -> SwitchoverBlueGreenDeploymentError {
+    SwitchoverBlueGreenDeploymentErrorModeled::InvalidBlueGreenDeploymentStateFault(
+        InvalidBlueGreenDeploymentStateFault {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// A record this handler read under the state lock and then could not take back out: an
+/// invariant of this emulator's own store rather than anything the request carried, which is
+/// what the 500 channel is for.
+fn internal_failure(identifier: &str) -> SwitchoverBlueGreenDeploymentError {
+    SwitchoverBlueGreenDeploymentError::internal_failure(format!(
+        "{identifier} was resolved for the switchover but is no longer stored"
+    ))
 }

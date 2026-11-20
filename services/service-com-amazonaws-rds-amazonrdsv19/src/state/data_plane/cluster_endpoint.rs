@@ -256,15 +256,16 @@ pub(super) fn cluster_facts(
 /// `DBClusterMembers` reports `IsClusterWriter` for, which is what `FailoverDBCluster`
 /// moves.
 ///
-/// Whatever the role, NO endpoint of a cluster that is the GREEN database of a blue/green
-/// deployment writes: that whole environment is read-only while the deployment pairs it with
-/// the blue one ([`ComAmazonawsRdsAmazonrdsv19State::is_a_green_database`]).
+/// Whatever the role, NO endpoint of a cluster a blue/green deployment pairs with the cluster
+/// production is served from writes: that whole environment is read-only while the deployment
+/// pairs the two ([`ComAmazonawsRdsAmazonrdsv19State::serves_reads_only_in_a_blue_green_deployment`])
+/// — the green environment before the switchover, the blue one after it.
 pub(super) fn serves_reads_only(
     store: &ComAmazonawsRdsAmazonrdsv19State,
     record: &DbClusterRecord,
     role: &EndpointRole,
 ) -> bool {
-    if store.is_a_green_database(&record.region, &record.arn()) {
+    if store.serves_reads_only_in_a_blue_green_deployment(&record.region, &record.arn()) {
         return true;
     }
     match role {

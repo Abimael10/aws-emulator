@@ -272,9 +272,9 @@ impl SessionContext {
                 // update the read replica", and such a replica serves reads only. The
                 // relationship is what says so, so an instance `PromoteReadReplica` has
                 // promoted — which clears it — serves writes from then on, under the same
-                // session. The GREEN database of a blue/green deployment serves reads only
-                // for the same reason, and while the deployment pairs it with the blue one
-                // (`ComAmazonawsRdsAmazonrdsv19State::is_a_green_database`).
+                // session. A database a blue/green deployment pairs serves reads only for the
+                // same reason, on whichever side of the pairing production is not served from
+                // (`ComAmazonawsRdsAmazonrdsv19State::serves_reads_only_in_a_blue_green_deployment`).
                 read_only: serves_reads_only(&store, record),
                 runtime: engine_runtime_of(&store, record),
             },
@@ -574,18 +574,20 @@ pub(super) fn facts_of(record: RecordFacts, database: &Arc<InstanceDatabase>) ->
 /// replaying another's writes rather than taking its own:
 ///
 /// * it is a READ REPLICA of another resource (`DbInstanceRecord::is_read_replica`);
-/// * it is the GREEN database of a blue/green deployment
-///   ([`ComAmazonawsRdsAmazonrdsv19State::is_a_green_database`]).
+/// * a blue/green deployment pairs it with the database production is served from
+///   ([`ComAmazonawsRdsAmazonrdsv19State::serves_reads_only_in_a_blue_green_deployment`]) —
+///   the green database before the deployment is switched over, the blue one after it.
 ///
 /// Read for the login and again for each statement ([`SessionContext::engine_now`]), so a
-/// relationship that ends under a live session — a promotion, a deployment that is gone —
-/// gives that session its writes from then on.
+/// relationship that ends under a live session — a promotion, a switchover, a deployment that
+/// is gone — gives that session its writes from then on.
 #[must_use]
 pub(super) fn serves_reads_only(
     store: &ComAmazonawsRdsAmazonrdsv19State,
     record: &crate::state::DbInstanceRecord,
 ) -> bool {
-    record.is_read_replica() || store.is_a_green_database(&record.region, &record.arn())
+    record.is_read_replica()
+        || store.serves_reads_only_in_a_blue_green_deployment(&record.region, &record.arn())
 }
 
 /// The version string the engine reports for ITSELF, which is not always the engine version

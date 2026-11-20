@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The blue/green deployment records `CreateBlueGreenDeployment`,
-//! `DeleteBlueGreenDeployment` and `DescribeBlueGreenDeployments` share.
+//! `DeleteBlueGreenDeployment`, `DescribeBlueGreenDeployments` and
+//! `SwitchoverBlueGreenDeployment` share.
 //!
 //! A blue/green deployment is a pairing of two databases this service already holds: the
 //! SOURCE (the production database in the blue environment) and the TARGET this service
@@ -9,6 +10,10 @@
 //! databases themselves stay the DB instance / DB cluster records they already are, so a
 //! deployment cannot report a source or a target that disagrees with what a describe of
 //! that database reports.
+//!
+//! The pairing also carries WHICH environment production is served from, which the
+//! switchover moves: it decides which of the two databases takes writes and which one only
+//! serves reads ([`BlueGreenDeploymentRecord::switched_over`]).
 
 use std::time::Instant;
 
@@ -30,9 +35,35 @@ pub const BLUE_GREEN_STATUS_PROVISIONING: &str = "PROVISIONING";
 /// environment."
 pub const BLUE_GREEN_STATUS_AVAILABLE: &str = "AVAILABLE";
 
+/// `BlueGreenDeployment$Status` — "`SWITCHOVER_IN_PROGRESS` - The deployment is being
+/// switched from the blue environment to the green environment."
+pub const BLUE_GREEN_STATUS_SWITCHOVER_IN_PROGRESS: &str = "SWITCHOVER_IN_PROGRESS";
+
+/// `BlueGreenDeployment$Status` — "`SWITCHOVER_COMPLETED` - Switchover from the blue
+/// environment to the green environment is complete."
+pub const BLUE_GREEN_STATUS_SWITCHOVER_COMPLETED: &str = "SWITCHOVER_COMPLETED";
+
 /// `BlueGreenDeployment$Status` — "`DELETING` - The blue/green deployment is being
 /// deleted."
 pub const BLUE_GREEN_STATUS_DELETING: &str = "DELETING";
+
+/// The suffix Amazon RDS renames the blue environment's databases with when a deployment
+/// is switched over: the databases that were production keep their data under
+/// `<name>-old<N>`, while the green environment's databases take the names production was
+/// reached by, so a client's own endpoint keeps naming production.
+const SWITCHED_OVER_SUFFIX: &str = "-old";
+
+/// How many `-old<N>` names [`switched_over_blue_identifier`] tries before it stops.
+///
+/// Every name it skips is one a stored database of this region already holds, and a region
+/// holds at most one database quota's worth of them — so a free name is always inside this
+/// bound, whichever of the two database types the deployment pairs.
+const SWITCHED_OVER_SUFFIX_LIMIT: usize =
+    if super::DB_INSTANCE_QUOTA_PER_REGION > super::DB_CLUSTER_QUOTA_PER_REGION {
+        super::DB_INSTANCE_QUOTA_PER_REGION + 1
+    } else {
+        super::DB_CLUSTER_QUOTA_PER_REGION + 1
+    };
 
 /// The prefix of the identifier Amazon RDS assigns a blue/green deployment
 /// (`bgd-` followed by a lowercase hexadecimal token). The identifier is SYSTEM-generated
@@ -146,6 +177,42 @@ pub fn green_identifier(source_identifier: &str, mint: u64, max_len: usize) -> S
     format!("{prefix}{suffix}")
 }
 
+/// The identifier the BLUE database carries once the deployment is switched over:
+/// `<blue>-old<N>`, with the lowest `N` from 1 that no database of the region is already
+/// named ([`SWITCHED_OVER_SUFFIX`]).
+///
+/// `max_len` is the identifier bound the renamed database's own type carries, and the name is
+/// kept inside it by shortening the part taken from the blue identifier — the same way the
+/// green database's name is kept inside it ([`green_identifier`]). `is_taken` answers whether
+/// a candidate names a database the region already holds, which is why `N` is a number rather
+/// than a fixed `1`: a second deployment of the same source cannot rename its blue database
+/// onto the first one's.
+///
+/// `None` when every name it could take is already held, so a caller REFUSES the rename rather
+/// than renaming the database onto a record that is not it. A region cannot hold more databases
+/// than its own quota ([`SWITCHED_OVER_SUFFIX_LIMIT`]), so a store inside that quota always has
+/// a free name.
+pub fn switched_over_blue_identifier(
+    blue_identifier: &str,
+    max_len: usize,
+    is_taken: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    for nth in 1..=SWITCHED_OVER_SUFFIX_LIMIT {
+        let suffix = format!("{SWITCHED_OVER_SUFFIX}{nth}");
+        let room = max_len.saturating_sub(suffix.len());
+        let mut prefix: String = blue_identifier.chars().take(room).collect();
+        // An identifier "can't end with a hyphen", which a shortened prefix might.
+        while prefix.ends_with('-') {
+            prefix.pop();
+        }
+        let candidate = format!("{prefix}{suffix}");
+        if !is_taken(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// A persisted blue/green deployment.
 #[derive(Debug, Clone)]
 pub struct BlueGreenDeploymentRecord {
@@ -164,6 +231,15 @@ pub struct BlueGreenDeploymentRecord {
     pub target_is_cluster: bool,
     /// `Status`.
     pub status: String,
+    /// Whether PRODUCTION has moved to the green environment, which
+    /// `SwitchoverBlueGreenDeployment` is what moves.
+    ///
+    /// It decides which side of the pairing serves reads only
+    /// ([`super::ComAmazonawsRdsAmazonrdsv19State::serves_reads_only_in_a_blue_green_deployment`]):
+    /// the green database before the switchover, because it is being kept in sync with
+    /// production, and the blue one after it, because production is no longer served from
+    /// there.
+    pub switched_over: bool,
     /// The status change the clock owes this record, if any.
     pub pending_status: Option<PendingStatus>,
     /// `CreateTime`.
@@ -204,6 +280,31 @@ impl BlueGreenDeploymentRecord {
         self.status == BLUE_GREEN_STATUS_DELETING
     }
 
+    /// Whether this deployment can be switched over: "`AVAILABLE` - Resources are
+    /// available in the green environment", which is the one status from which production
+    /// can be moved to them. A deployment still provisioning them, one already switching
+    /// over or switched over, and one on its way out are each in no state this call can be
+    /// performed in.
+    pub fn is_available(&self) -> bool {
+        self.status == BLUE_GREEN_STATUS_AVAILABLE
+    }
+
+    /// Move production to the green environment: the two databases have exchanged names
+    /// (`source_arn` now names the blue database under its `-old<N>` name and `target_arn`
+    /// the green one under the name production is reached by), the green environment takes
+    /// the writes from here on, and the deployment reports `SWITCHOVER_IN_PROGRESS` until
+    /// the clock settles it on `SWITCHOVER_COMPLETED`. Nothing sleeps — the due instant is
+    /// stored.
+    pub fn switch_over(&mut self, source_arn: String, target_arn: String) {
+        self.source_arn = source_arn;
+        self.target_arn = target_arn;
+        self.switched_over = true;
+        self.status = BLUE_GREEN_STATUS_SWITCHOVER_IN_PROGRESS.to_string();
+        self.pending_status = Some(PendingStatus::in_a_moment(
+            BLUE_GREEN_STATUS_SWITCHOVER_COMPLETED,
+        ));
+    }
+
     /// Accept a delete: the deployment reports `DELETING` from now on, and the clock owes
     /// its removal from the store, after which every read of the identifier is the
     /// modelled not-found fault. Nothing sleeps — the due instant is stored.
@@ -217,7 +318,9 @@ impl BlueGreenDeploymentRecord {
     ///
     /// `SwitchoverDetails` pairs the one source resource with the one target resource this
     /// deployment holds, and its status follows the deployment's own: a resource in a
-    /// deployment that is still provisioning is not yet ready to switch over. `Tasks` is
+    /// deployment that is still provisioning is not yet ready to switch over, and one in a
+    /// deployment that has switched over has been switched over itself — every status the
+    /// deployment reports is one `SwitchoverDetail$Status` publishes too. `Tasks` is
     /// LEFT OUT rather than invented — it reports the tasks the real service runs to build
     /// the green environment, and this service has no state for any of them.
     pub fn to_wire(&self) -> BlueGreenDeployment {

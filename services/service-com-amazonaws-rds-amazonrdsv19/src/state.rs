@@ -199,9 +199,11 @@ pub use sns_topics::*;
 pub use blue_green::{
     blue_green_deployment_identifier_of, blue_green_deployment_not_found_message,
     check_blue_green_deployment_identifier, green_identifier,
-    mint_blue_green_deployment_identifier, BlueGreenDeploymentRecord,
-    BLUE_GREEN_DEPLOYMENT_QUOTA_PER_REGION, BLUE_GREEN_IDENTIFIER_PREFIX,
-    BLUE_GREEN_STATUS_AVAILABLE, BLUE_GREEN_STATUS_DELETING, BLUE_GREEN_STATUS_PROVISIONING,
+    mint_blue_green_deployment_identifier, switched_over_blue_identifier,
+    BlueGreenDeploymentRecord, BLUE_GREEN_DEPLOYMENT_QUOTA_PER_REGION,
+    BLUE_GREEN_IDENTIFIER_PREFIX, BLUE_GREEN_STATUS_AVAILABLE, BLUE_GREEN_STATUS_DELETING,
+    BLUE_GREEN_STATUS_PROVISIONING, BLUE_GREEN_STATUS_SWITCHOVER_COMPLETED,
+    BLUE_GREEN_STATUS_SWITCHOVER_IN_PROGRESS,
 };
 pub use custom_engine_versions::{
     check_custom_engine, check_custom_engine_version_name,
@@ -1658,19 +1660,34 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .get(&(region.to_string(), identifier))
     }
 
-    /// Whether the database `arn` is the GREEN database of a blue/green deployment this
-    /// store holds, which is what makes its endpoint serve no writes.
+    /// Whether the database `arn` serves NO WRITES because of a blue/green deployment this
+    /// store holds — which is what makes its endpoint refuse every statement that writes.
     ///
-    /// "The databases in the green environment are read-only" until the deployment is
-    /// switched over: the green environment is kept in sync with production by replaying the
-    /// blue environment's writes, so a client cannot write to it, exactly as it cannot write
-    /// to a read replica. The pairing is what says so, so the database stops being read-only
-    /// when the deployment that made it green is no longer there — which is what a switchover
-    /// and a delete of the deployment both leave behind.
-    pub fn is_a_green_database(&self, region: &str, arn: &str) -> bool {
+    /// One side of a deployment's pairing is replaying the other's writes rather than taking
+    /// its own, and WHICH side that is follows production:
+    ///
+    /// * before the switchover it is the GREEN database. "The databases in the green
+    ///   environment are read-only": the green environment is kept in sync with production by
+    ///   replaying the blue environment's writes, so a client cannot write to it, exactly as
+    ///   it cannot write to a read replica.
+    /// * after the switchover it is the BLUE one. Production has moved to the green
+    ///   environment, and the databases left behind in the blue environment are kept for
+    ///   their data — renamed, retaining their automated backups, and taking no further
+    ///   writes.
+    ///
+    /// The pairing is what says so, so a database stops being read-only when the deployment
+    /// that paired it is no longer there — which is what a delete of the deployment leaves
+    /// behind.
+    pub fn serves_reads_only_in_a_blue_green_deployment(&self, region: &str, arn: &str) -> bool {
         self.blue_green_deployments_in(region)
             .into_iter()
-            .any(|deployment| deployment.target_arn.eq_ignore_ascii_case(arn))
+            .any(|deployment| {
+                let read_only = match deployment.switched_over {
+                    false => &deployment.target_arn,
+                    true => &deployment.source_arn,
+                };
+                read_only.eq_ignore_ascii_case(arn)
+            })
     }
 
     /// The integrations stored in `region`, in name order.

@@ -200,15 +200,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // `DeleteTarget`: "Specifies whether to delete the resources in the green
+        // environment. You can't specify this option if the blue/green deployment status is
+        // SWITCHOVER_COMPLETED." What the rule turns on is that those resources ARE
+        // production once the deployment has been switched over, so the member is refused
+        // from the instant production moves rather than from the instant the switchover's own
+        // transition settles: `SWITCHOVER_IN_PROGRESS` is that same deployment a moment
+        // earlier, with production already served from the green environment, and the status
+        // reaches `SWITCHOVER_COMPLETED` on its own with nothing further asked of the caller.
+        // The refusal names the status the deployment is really in.
+        if input.delete_target == Some(true) && deployment.switched_over {
+            return Err(
+                DeleteBlueGreenDeploymentError::invalid_parameter_combination(format!(
+                    "DeleteTarget can't be specified when the blue/green deployment status is \
+                     {}",
+                    deployment.status
+                )),
+            );
+        }
         let target_is_cluster = deployment.target_is_cluster;
         let target_identifier = crate::state::arn_resource_name_of(&deployment.target_arn)
             .to_ascii_lowercase();
 
-        // `DeleteTarget`: "Specifies whether to delete the resources in the green
-        // environment." Those resources are the real DB instance or DB cluster records this
-        // service cloned, so the delete they are given is the same one their own delete
-        // operation gives them: the status moves to `deleting` and the clock owes their
-        // removal.
+        // Those resources are the real DB instance or DB cluster records this service cloned,
+        // so the delete they are given is the same one their own delete operation gives them:
+        // the status moves to `deleting` and the clock owes their removal.
         if input.delete_target == Some(true) {
             if target_is_cluster {
                 if let Some(cluster) = store
