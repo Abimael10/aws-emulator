@@ -62,9 +62,14 @@
 //!
 //! The pull is attempted at LAUNCH, by the call that places the task: the instants it took
 //! are recorded on the task (`Task$pullStartedAt`/`pullStoppedAt`) and a failure with them
-//! ([`TaskRecord::launch_failure`]); the clock then stops the task at the instant it would
-//! otherwise have started ([`TaskRecord::fail_launch`]), so a caller reading in between
-//! still sees the task come up. It is attempted only for a task whose launch roles have
+//! ([`TaskRecord::launch_failure`]); the clock then stops the task when the attempt that
+//! failed it ENDED ([`TaskRecord::fail_launch`]), so a caller reading in between still sees
+//! the task come up. A failure the fetch was ANSWERED — a registry's refusal, a role, a
+//! secret — ended the moment it was asked for, so that stop falls due where the task's own
+//! start would have been; a placement with no path to the registry answers nothing, so the
+//! attempt ends in the connection timeout the `stoppedReason` reports
+//! ([`FAILED_IMAGE_FETCH_TIMEOUT`]) and the task is coming up, with the interface it was
+//! allocated attached, until it does. It is attempted only for a task whose launch roles have
 //! already been put to IAM ([`TaskRecord::launch_roles_assumed`]), because the pull is made
 //! AS the execution role. The attempt is made once per task: a task that already
 //! carries its pull instants is not pulled again, so a later placement by another call
@@ -107,6 +112,21 @@ use ::service_com_amazonaws_ec2_amazonec2::ComAmazonawsEc2Amazonec2State;
 /// InfrastructureHealth, ServiceSchedulerInitiated, SpotInterruption, TaskFailedToStart,
 /// TerminationNotice, UserInitiated).
 pub const STOP_CODE_TASK_FAILED_TO_START: &str = "TaskFailedToStart";
+
+/// How long the agent spends on an image fetch that cannot REACH the registry before it
+/// gives the attempt up — the wait the `stoppedReason` of such a task reports as having
+/// timed out ([`cannot_pull_container_message`]: "dial tcp ...: i/o timeout").
+///
+/// EMULATOR-CHOSEN — AWS publishes no timeout for the fetch — but what it stands for is not:
+/// a placement with no path to the registry answers NOTHING, so the attempt ends in a
+/// connection timeout, and Amazon ECS has nothing to report about the task until the agent
+/// has spent it. A task is therefore still coming up for this long after its interface was
+/// attached, which is what a client that reads the attachment of a task whose image cannot
+/// be fetched — and joins it to Amazon EC2's record of that interface, which exists only
+/// while the task does — observes. A minute is the scale a connect timeout and the retries
+/// around it really take, and short enough that a client waiting for such a task to stop
+/// gets its answer inside a generous poll budget.
+pub const FAILED_IMAGE_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The destination of the route that carries traffic OFF a VPC: "a route table contains a
 /// set of rules, called routes" and the one for everything not inside the VPC is the
@@ -333,7 +353,12 @@ pub fn evaluate_image_pulls<Eng: Send + Sync + 'static>(engine: &Eng) {
             let store = ec2.lock();
             launches
                 .iter()
-                .map(|launch| ImagePullVerdict::of(launch, unfetchable_image(&store, launch)))
+                .map(|launch| {
+                    ImagePullVerdict::of_unreachable_registry(
+                        launch,
+                        unfetchable_image(&store, launch),
+                    )
+                })
                 .collect()
         }
         None => launches
@@ -406,11 +431,21 @@ pub struct ImagePullVerdict {
     /// emulator holds served: `Container$imageDigest` is "The container image manifest
     /// digest", and the registry that served the pull is what states it.
     pub image_digests: Vec<(String, String)>,
+    /// Whether the failure is one the fetch WAITED for rather than one it was answered: a
+    /// placement with no path to the registry answers nothing, so the attempt ends in a
+    /// connection timeout ([`FAILED_IMAGE_FETCH_TIMEOUT`]), while a registry that refused the
+    /// pull, a role the launch may not assume and a secret the agent could not retrieve are
+    /// each known the moment they are asked for.
+    pub fetch_timed_out: bool,
 }
 
 impl ImagePullVerdict {
     /// The verdict of `launch` with `failure` — the image whose fetch failed and the reason
     /// it did — recorded, and no image fetched yet.
+    ///
+    /// Nothing is waited out here: every failure but the PATH half's is one something
+    /// ANSWERED the moment it was asked for ([`Self::of_unreachable_registry`] is the one
+    /// that is not).
     fn of(launch: &TaskLaunch, failure: Option<(String, String)>) -> Self {
         let (failed_image, failure) = match failure {
             Some((image, reason)) => (Some(image), Some(reason)),
@@ -418,10 +453,22 @@ impl ImagePullVerdict {
         };
         Self {
             task_arn: launch.task_arn.clone(),
+            fetch_timed_out: false,
             failure,
             failed_image,
             image_digests: Vec::new(),
         }
+    }
+
+    /// The same verdict for the PATH half of the fetch ([`unfetchable_image`]), the one
+    /// failure of the four that nothing answers: an image the placement cannot reach is one
+    /// the attempt WAITED for until it timed out ([`FAILED_IMAGE_FETCH_TIMEOUT`]), which is
+    /// what [`Self::fetch_timed_out`] records — so the kind of failure is decided here, where
+    /// it is known, rather than implied by which call site built the verdict.
+    fn of_unreachable_registry(launch: &TaskLaunch, failure: Option<(String, String)>) -> Self {
+        let mut verdict = Self::of(launch, failure);
+        verdict.fetch_timed_out = verdict.failure.is_some();
+        verdict
     }
 }
 
@@ -1014,11 +1061,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     ///
     /// `Task$pullStartedAt` is "the time when the container image pull began" and
     /// `pullStoppedAt` "the time when the container image pull completed": the fetch is made
-    /// in this process, so it began and completed at the instant it was attempted, and both
-    /// are recorded whether or not it succeeded — a pull that failed was still attempted.
-    /// They are recorded for a task whose start fell due while the fetch was being decided
-    /// too: the fetch was made for THAT task, so the instants belong on it however far the
-    /// clock has since taken it.
+    /// in this process, so one that was ANSWERED began and completed at the instant it was
+    /// attempted, and both are recorded whether or not it succeeded — a pull that failed was
+    /// still attempted. A fetch that could not REACH the registry is the one failure nothing
+    /// answers: it ends in a connection timeout, so the attempt is still going here and
+    /// `pullStoppedAt` is stamped at the instant it ends ([`TaskRecord::fail_launch`], which
+    /// the stop then falls due at — [`TaskRecord::launch_failure_due_at`]).
+    /// The instants are recorded for a task whose start fell due while the fetch was being
+    /// decided too: the fetch was made for THAT task, so the instants belong on it however
+    /// far the clock has since taken it.
     ///
     /// Only a task that is still on its way UP takes a FAILURE: one that has started has
     /// already fetched its images, and one that is stopping is on its way out either way.
@@ -1034,8 +1085,14 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 if task.pull_started_at.is_some() || task.desired_status != STATUS_RUNNING {
                     continue;
                 }
+                // Whether the attempt this records is one that is STILL GOING: a fetch with
+                // no path to the registry waits out its connection timeout, and only a task
+                // this failure is the one that blocks is waiting for it.
+                let timed_out = verdict.fetch_timed_out
+                    && task.launch_failure.is_none()
+                    && task.is_pending();
                 task.pull_started_at = Some(at);
-                task.pull_stopped_at = Some(at);
+                task.pull_stopped_at = (!timed_out).then_some(at);
                 // The fetch is made for a container Amazon ECS has CREATED on the capacity
                 // the task was placed on, so each container reports the runtime id it was
                 // created with from here on, whichever way the fetch went
@@ -1064,6 +1121,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                                 .find(|container| container.image.as_deref() == Some(image))
                                 .and_then(|container| container.name.clone())
                         });
+                    // And a fetch nothing answered ends when the agent gives the attempt
+                    // up, which is when the stop it earns falls due
+                    // ([`TaskRecord::launch_failure_due_at`]).
+                    if timed_out {
+                        task.launch_failure_due_at = Some(now + FAILED_IMAGE_FETCH_TIMEOUT);
+                    }
                 }
             }
         }
@@ -1103,7 +1166,10 @@ impl TaskRecord {
     /// The task is on its way out from this instant — `desiredStatus` is `STOPPED`, which
     /// is what a `ListTasks` narrowed to stopped tasks reports it under — and `STOPPED`
     /// itself falls due one [`TRANSITION_SPAN`] later, the same two-step stop every other
-    /// stop of a task is recorded as.
+    /// stop of a task is recorded as. `at` is the instant the ATTEMPT that failed the launch
+    /// ended, which for a fetch nothing answered is the end of its timeout
+    /// ([`Self::launch_failure_due_at`]) and for every other failure the instant the task's
+    /// own start would have been.
     ///
     /// The failure is reported on the CONTAINER it belongs to as well, where the step that
     /// decided it named one ([`TaskRecord::launch_failure_container`]): `Container$reason` is
@@ -1120,6 +1186,14 @@ impl TaskRecord {
         self.stopping_at = Some(DateTime::from(at));
         self.pending_due_at = None;
         self.running_due_at = None;
+        // The ATTEMPT that failed the launch ends here, where it was waited out rather than
+        // answered ([`Self::launch_failure_due_at`]): `pullStoppedAt` is "the time when the
+        // container image pull completed", so a fetch that was still going reports this
+        // instant as the one it ended at.
+        if self.pull_started_at.is_some() && self.pull_stopped_at.is_none() {
+            self.pull_stopped_at = Some(DateTime::from(at));
+        }
+        self.launch_failure_due_at = None;
         self.stopped_due_at = Some(at + TRANSITION_SPAN);
         if let Some(name) = self.launch_failure_container.clone() {
             for container in self

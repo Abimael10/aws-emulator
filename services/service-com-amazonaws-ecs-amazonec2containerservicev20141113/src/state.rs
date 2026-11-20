@@ -4289,6 +4289,20 @@ pub struct TaskRecord {
     /// owns: a role the launch may not assume, or a resource the agent retrieves for the task
     /// as a whole.
     pub launch_failure_container: Option<String>,
+    /// When the ATTEMPT that failed this launch ended, for a failure that was not decided on
+    /// the spot: the fetch of an image no path from this placement reaches fails by
+    /// CONNECTION TIMEOUT ([`cannot_pull_container_message`] words exactly that), so the
+    /// agent spent that timeout on it ([`FAILED_IMAGE_FETCH_TIMEOUT`]) and Amazon ECS has
+    /// nothing to report about the task until it is over — the task is still coming up, with
+    /// the interface it was allocated attached, until this instant, and the stop the failure
+    /// earns falls due here rather than at the instant the task would otherwise have started
+    /// ([`TaskRecord::fail_launch`]).
+    ///
+    /// `None` for a task nothing blocks and for a failure something ANSWERED: a role the
+    /// launch may not assume, a registry that refused the pull, a secret the agent could not
+    /// retrieve — each of those is known the moment it is asked for, so the stop it earns
+    /// falls due where the start would have been.
+    pub launch_failure_due_at: Option<SystemTime>,
     /// Whether the roles THIS launch resolved have been put to the account's IAM records
     /// already ([`evaluate_launch_role_assumptions`]) — `false` for a task that has only
     /// just been placed, whoever placed it.

@@ -75,10 +75,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long a poll keeps trying: the whole start of an `awsvpc` task
 /// ([`AWSVPC_START`]), the registration that start owes, the checks the accelerated
-/// health-check schedule then runs, and for the negative row the two further spans a launch
-/// failure takes — with generous margin, so a loaded machine cannot fail a row the emulator
-/// would satisfy. The deadline is only here so a failure is a failure rather than a hang.
-const POLL_BUDGET: Duration = AWSVPC_START.saturating_add(Duration::from_secs(30));
+/// health-check schedule then runs, and for the negative row the attempt a launch failure
+/// waits out where nothing answers the fetch (`state::FAILED_IMAGE_FETCH_TIMEOUT`) and the
+/// two further spans such a failure takes — with generous margin, so a loaded machine
+/// cannot fail a row the emulator would satisfy. The deadline is only here so a failure is
+/// a failure rather than a hang.
+const POLL_BUDGET: Duration = AWSVPC_START
+    .saturating_add(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::FAILED_IMAGE_FETCH_TIMEOUT,
+    )
+    .saturating_add(Duration::from_secs(30));
 
 /// Where a row places its service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

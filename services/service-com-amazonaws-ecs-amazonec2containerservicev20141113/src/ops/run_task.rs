@@ -935,6 +935,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // field carries ([`crate::state::settle_task_launches`]).
                 launch_failure: None,
                 launch_failure_container: None,
+                launch_failure_due_at: None,
                 // Nothing has put the roles this launch resolved to the account's IAM
                 // records yet: that happens below, with the guard dropped
                 // ([`crate::state::evaluate_launch_role_assumptions`]).

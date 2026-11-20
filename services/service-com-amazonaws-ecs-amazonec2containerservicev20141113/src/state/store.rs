@@ -118,15 +118,29 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 // that HAS taken them materialises the transition at the instant it was
                 // owed at rather than at its own.
                 if due <= now && task.launch_steps_taken() {
-                    task.running_due_at = None;
                     // The images a task's containers run are fetched where the task is
                     // placed, and this placement reaches no registry that holds one
                     // ([`evaluate_image_pulls`]): the containers never start, so Amazon
                     // ECS stops the task instead of running it, with the stop code for a
-                    // task that failed before it started.
+                    // task that failed before it started — at the instant the ATTEMPT that
+                    // failed the launch ended, which for a fetch nothing answered is the end
+                    // of its own timeout ([`TaskRecord::launch_failure_due_at`]). Until then
+                    // the task is still coming up, so the interface it was allocated stays
+                    // attached and the start it is owed waits where that attempt does.
                     match task.launch_failure.clone() {
-                        Some(reason) => task.fail_launch(&reason, due),
+                        Some(reason) => {
+                            let failed_at = task
+                                .launch_failure_due_at
+                                .filter(|ended| *ended > due)
+                                .unwrap_or(due);
+                            if failed_at <= now {
+                                task.fail_launch(&reason, failed_at);
+                            } else {
+                                task.running_due_at = Some(failed_at);
+                            }
+                        }
                         None => {
+                            task.running_due_at = None;
                             task.last_status = STATUS_RUNNING.to_string();
                             task.started_at = Some(DateTime::from(due));
                             // A task placed on its own runs the work it was placed for
@@ -208,6 +222,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     .or(task.stopped_at)
                     .and_then(|at| SystemTime::try_from(at).ok())
                     .unwrap_or(now);
+                // A fetch the agent was still WAITING OUT ended when the task went away,
+                // whichever stop took it away ([`TaskRecord::launch_failure_due_at`]):
+                // `pullStoppedAt` is "the time when the container image pull completed", and
+                // nothing goes on fetching for a task that is on its way out. The stop a
+                // failed launch earns records the same instant for itself
+                // ([`TaskRecord::fail_launch`]); this is every other stop.
+                if task.pull_started_at.is_some() && task.pull_stopped_at.is_none() {
+                    task.pull_stopped_at = Some(DateTime::from(began_at));
+                    task.launch_failure_due_at = None;
+                }
                 let mut released = false;
                 for attachment in &mut task.attachments {
                     released |= attachment.begin_release(began_at);
@@ -4110,6 +4134,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // dropped ([`crate::state::evaluate_image_pulls`]).
             launch_failure: None,
             launch_failure_container: None,
+            launch_failure_due_at: None,
             // Nothing has put the roles this placement resolved to the account's IAM
             // records yet: that is the launching pass's to do, with this store's guard
             // dropped ([`crate::state::evaluate_launch_role_assumptions`]).

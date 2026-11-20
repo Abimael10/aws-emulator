@@ -51,17 +51,21 @@ const CLUSTER: &str = "imagefetch";
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// How long a poll keeps trying before it gives up: the whole start of an `awsvpc` task
-/// ([`AWSVPC_START`]) plus the two further spans a launch failure takes (the fetch is
-/// attempted where the start would have been, and the stop falls due one span after
-/// that) plus the release of the interface the task was allocated, which its stop waits for
-/// (one `state::INTERFACE_RELEASE_STEP_SPAN` per step of
+/// ([`AWSVPC_START`]), the attempt a launch failure waits out where nothing answers the
+/// fetch (`state::FAILED_IMAGE_FETCH_TIMEOUT`) and the two further spans such a launch
+/// takes (the fetch is attempted where the start would have been, and the stop falls due
+/// one span after that) plus the release of the interface the task was allocated, which its
+/// stop waits for (one `state::INTERFACE_RELEASE_STEP_SPAN` per step of
 /// `state::INTERFACE_DETACH_LIFECYCLE`), with margin for a loaded test machine.
 const POLL_BUDGET: Duration = AWSVPC_START
+    .saturating_add(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::FAILED_IMAGE_FETCH_TIMEOUT,
+    )
     .saturating_add(
         service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::INTERFACE_RELEASE_STEP_SPAN
             .saturating_mul(3),
     )
-    .saturating_add(Duration::from_secs(3));
+    .saturating_add(Duration::from_secs(30));
 
 /// An image in a PUBLIC container registry: its registry is no AWS service, so it is
 /// reachable only over the internet.
@@ -594,6 +598,12 @@ async fn a_task_is_stopped_when_its_placement_cannot_reach_the_image_registry() 
         let task_arn = run(&router, family, subnet_id, assign_public_ip, case).await;
         launched.push((case, family, task_arn, fetchable));
     }
+    // The rows that CAN fetch are read first: such a task comes up as fast as any other
+    // placed task, while a row that cannot fetch is one Amazon ECS waits out the fetch of
+    // before it stops the task (`state::FAILED_IMAGE_FETCH_TIMEOUT`) — so reading the
+    // failures first would hold this loop past the work the running tasks were placed to do
+    // (`state::CONTAINER_WORK_SPAN`) and read them after they had finished it.
+    launched.sort_by_key(|(_, _, _, fetchable)| !fetchable);
 
     for (case, family, task_arn, fetchable) in launched {
         let image = match family {
