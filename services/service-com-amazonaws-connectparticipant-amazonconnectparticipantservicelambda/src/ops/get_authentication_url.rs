@@ -10,9 +10,10 @@
 //!
 //! A `SessionId` that names no current authentication session of that chat — unknown,
 //! another contact's, already cancelled, or past the one-minute window the API documents —
-//! is refused `ValidationException`, and a connection token that authenticates nobody is
-//! refused `AccessDeniedException`, exactly as every other operation of this service words
-//! that refusal.
+//! is refused `ValidationException` with the one fixed parameter sentence this service's
+//! authentication operations word every such refusal with, and a connection token that
+//! authenticates nobody is refused `AccessDeniedException`, exactly as every other
+//! operation of this service words that denial.
 //!
 //! ## Shape of an operation
 //!
@@ -190,15 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A session this chat has no current authentication session under is refused with
-        // the one wording that covers every reason it is not the current one, so the
+        // the one fixed sentence that covers every reason it is not the current one, so the
         // refusal tells the caller nothing about which sessions exist for whom.
         let Some(session) = state.authentication_session(&input.session_id, &chat.contact_id, now)
         else {
             return Err(GetAuthenticationUrlErrorModeled::ValidationException(
                 ValidationException {
-                    message: crate::state::unknown_authentication_session_message(
-                        &input.session_id,
-                    ),
+                    message: crate::state::INVALID_REQUEST_PARAMETERS_MESSAGE.to_string(),
                 },
             )
             .into());
@@ -216,13 +215,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // `AuthenticationUrl` is modelled `length 1..2083`, and what the caller asks for
         // is part of what the composed URL carries, so a request whose answer would not
-        // fit is refused — reporting the composed length and the maximum — rather than
-        // answered with a URL the model does not permit.
+        // fit is refused rather than answered with a URL the model does not permit. It is
+        // the request's parameters that are refused, so it carries the same fixed sentence
+        // as every other parameter this operation rejects — the composed length it would
+        // otherwise report is derived from what this store holds for the session.
         let composed_chars = authentication_url.chars().count();
         if composed_chars > crate::state::MAX_AUTHENTICATION_URL_CHARS {
             return Err(GetAuthenticationUrlErrorModeled::ValidationException(
                 ValidationException {
-                    message: crate::state::authentication_url_too_long_message(composed_chars),
+                    message: crate::state::INVALID_REQUEST_PARAMETERS_MESSAGE.to_string(),
                 },
             )
             .into());

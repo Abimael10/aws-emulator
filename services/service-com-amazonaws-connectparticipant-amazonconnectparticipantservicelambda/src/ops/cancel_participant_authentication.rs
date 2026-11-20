@@ -10,9 +10,10 @@
 //!
 //! A `SessionId` that names no current authentication session of that chat — unknown,
 //! another contact's, already cancelled, or past the window — is refused
-//! `ValidationException`, and a connection token that authenticates nobody is refused
-//! `AccessDeniedException`, exactly as every other operation of this service words that
-//! refusal.
+//! `ValidationException` with the one fixed parameter sentence this service's
+//! authentication operations word every such refusal with, and a connection token that
+//! authenticates nobody is refused `AccessDeniedException`, exactly as every other
+//! operation of this service words that denial.
 //!
 //! ## Shape of an operation
 //!
@@ -185,16 +186,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A chat with no current authentication session under that id is refused with the
-        // same wording `GetAuthenticationUrl` uses for it: which member was rejected, and
-        // nothing about which sessions exist for whom.
+        // same fixed sentence `GetAuthenticationUrl` uses for it: nothing of the request,
+        // and nothing about which sessions exist for whom.
         let Some(session) = state.authentication_session_mut(&input.session_id, &contact_id, now)
         else {
             return Err(
                 CancelParticipantAuthenticationErrorModeled::ValidationException(
                     ValidationException {
-                        message: crate::state::unknown_authentication_session_message(
-                            &input.session_id,
-                        ),
+                        message: crate::state::INVALID_REQUEST_PARAMETERS_MESSAGE.to_string(),
                     },
                 )
                 .into(),

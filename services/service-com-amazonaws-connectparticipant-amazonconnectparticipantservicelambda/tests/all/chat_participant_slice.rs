@@ -1591,12 +1591,34 @@ fn query_value<'pairs>(pairs: &'pairs [(String, String)], name: &str) -> Option<
         .map(|(_, value)| value.as_str())
 }
 
-/// The `ValidationException$Message` both authentication operations refuse a `SessionId`
-/// that names no current authentication session of the caller's own chat with, as this
-/// service words such a refusal: the member that was rejected, carrying the id the request
-/// named (`GetAttachment` refuses an attachment of another contact the same way).
-fn no_such_session_message(session_id: &str) -> String {
-    format!("Authentication session with id {session_id} does not exist for this contact")
+/// The `ValidationException$Message` both authentication operations refuse a request whose
+/// parameters they cannot act on with: AWS's fixed parameter-validation sentence, spelled
+/// out here rather than read from the service so the assertion checks the wording instead
+/// of restating the service's own constant.
+const INVALID_PARAMETERS_MESSAGE: &str = "Specified request parameter(s) are invalid.";
+
+/// Assert `body` is the parameter refusal both authentication operations answer with: HTTP
+/// 400, `ValidationException`, AWS's fixed sentence, and no part of the request
+/// (`session_id`, and whatever else `request_values` names) anywhere in the message.
+fn assert_invalid_parameters(case: &str, status: u16, body: &Value, request_values: &[&str]) {
+    assert_eq!(status, 400, "case {case:?}: got {body:?}");
+    assert_eq!(
+        error_type(body),
+        "ValidationException",
+        "case {case:?}: got {body:?}"
+    );
+    let message = error_message(body);
+    assert_eq!(
+        message, INVALID_PARAMETERS_MESSAGE,
+        "case {case:?}: expected {INVALID_PARAMETERS_MESSAGE:?}, got {message:?}"
+    );
+    for value in request_values {
+        assert!(
+            !message.contains(value),
+            "case {case:?}: the refusal must carry nothing of the request, \
+             but {message:?} contains {value:?}"
+        );
+    }
 }
 
 /// One initiated authentication session, and the redirect a caller asks for it with.
@@ -1858,17 +1880,7 @@ async fn reporting_an_authentication_url_leaves_what_a_later_caller_sees_unchang
             cancel_participant_authentication(&harness, &connection_token, case.session_id).await,
         ),
     ] {
-        assert_eq!(status, 400, "case {label:?}: got {body:?}");
-        assert_eq!(
-            error_type(&body),
-            "ValidationException",
-            "case {label:?}: got {body:?}"
-        );
-        assert_eq!(
-            body["Message"].as_str(),
-            Some(no_such_session_message(case.session_id).as_str()),
-            "case {label:?}: got {body:?}"
-        );
+        assert_invalid_parameters(label, status, &body, &[case.session_id, case.redirect_uri]);
     }
 }
 
@@ -1932,17 +1944,7 @@ async fn a_session_id_that_names_no_current_authentication_session_is_refused() 
             ),
         ] {
             let case = format!("{operation} with {label}");
-            assert_eq!(status, 400, "case {case:?}: got {body:?}");
-            assert_eq!(
-                error_type(&body),
-                "ValidationException",
-                "case {case:?}: got {body:?}"
-            );
-            assert_eq!(
-                body["Message"].as_str(),
-                Some(no_such_session_message(session_id).as_str()),
-                "case {case:?}: got {body:?}"
-            );
+            assert_invalid_parameters(&case, status, &body, &[session_id]);
         }
     }
 
@@ -1953,6 +1955,137 @@ async fn a_session_id_that_names_no_current_authentication_session_is_refused() 
     let (status, body) =
         get_authentication_url(&harness, &theirs, other_chats, "https://example.com/cb").await;
     assert_eq!(status, 200, "case the other chat's own session: got {body:?}");
+}
+
+/// Every parameter refusal of the two authentication operations carries ONE fixed sentence,
+/// whatever the request named and whatever the reason: a caller holding no session cannot
+/// tell an unknown id from a cancelled one, from one past its window, or from another
+/// chat's, and the sentence carries nothing of what it submitted.
+#[tokio::test]
+async fn authentication_parameter_refusals_all_carry_one_fixed_sentence() {
+    let harness = router();
+    let my_token = "participant-token-authentication-fixed-message";
+    let their_token = "participant-token-authentication-fixed-message-other";
+    let mine = connect(&harness, my_token).await;
+    connect(&harness, their_token).await;
+    let my_contact = harness.start_chat(my_token);
+    let their_contact = harness.start_chat(their_token);
+    let endpoint = "https://pool-f.auth.us-east-1.amazoncognito.com/oauth2/authorize";
+
+    // Sessions that exist but are not ones this caller may act on, so the rows below cover
+    // reasons that differ in STATE beside rows whose id names no session at all.
+    let cancelled = "11111111-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    initiate_authentication(
+        &harness,
+        cancelled,
+        authentication_session(
+            &my_contact,
+            endpoint,
+            "client-fixed-cancelled",
+            &["openid"],
+            0,
+            true,
+        ),
+    );
+    let past_window = "22222222-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    initiate_authentication(
+        &harness,
+        past_window,
+        authentication_session(&my_contact, endpoint, "client-fixed-late", &["openid"], 61, false),
+    );
+    let other_chats = "33333333-cccc-4ccc-8ccc-cccccccccccc";
+    initiate_authentication(
+        &harness,
+        other_chats,
+        authentication_session(
+            &their_contact,
+            endpoint,
+            "client-fixed-other",
+            &["openid"],
+            0,
+            false,
+        ),
+    );
+
+    // The rows differ in the FORM of the 36-character `SessionId` (modelled @length min 36
+    // / max 36, so every row is a value the model itself permits), in the redirect the
+    // request asks for, and in why the id is not a session this caller may act on.
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "a dashed uuid no session was initiated for",
+            "00000000-0000-4000-8000-000000000000",
+            "https://example.com/cb",
+        ),
+        (
+            "an upper-case hexadecimal id",
+            "ABCDEF0123456789ABCDEF0123456789ABCD",
+            "https://example.com/callback?next=%2Fhome",
+        ),
+        (
+            "an all-digit id",
+            "012345678901234567890123456789012345",
+            "https://sign-in.example.test/after",
+        ),
+        (
+            "a dash-separated label rather than a uuid",
+            "chatauth-session-aaaaaaaaaaaaaaaaaaa",
+            "http://localhost:3000/cb",
+        ),
+        (
+            "an id of punctuation only",
+            "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+            "https://example.com/cb#fragment",
+        ),
+        (
+            "my own session, already cancelled",
+            cancelled,
+            "https://example.com/cb",
+        ),
+        (
+            "my own session, past the documented minute",
+            past_window,
+            "https://example.com/cb",
+        ),
+        (
+            "another chat's current session",
+            other_chats,
+            "https://example.com/cb",
+        ),
+    ];
+
+    let mut refusals: Vec<(String, String)> = Vec::new();
+    for (label, session_id, redirect_uri) in rows {
+        assert_eq!(
+            session_id.chars().count(),
+            36,
+            "case {label:?}: a SessionId is 36 characters, got {}",
+            session_id.chars().count()
+        );
+        for (operation, (status, body)) in [
+            (
+                "GetAuthenticationUrl",
+                get_authentication_url(&harness, &mine, session_id, redirect_uri).await,
+            ),
+            (
+                "CancelParticipantAuthentication",
+                cancel_participant_authentication(&harness, &mine, session_id).await,
+            ),
+        ] {
+            let case = format!("{operation} with {label}");
+            assert_invalid_parameters(&case, status, &body, &[session_id, redirect_uri]);
+            refusals.push((case, error_message(&body)));
+        }
+    }
+
+    // Every row answered the SAME sentence, so no reason is distinguishable from another.
+    let (ref first_case, ref first_message) = refusals[0];
+    for (case, message) in &refusals {
+        assert_eq!(
+            message, first_message,
+            "case {case:?}: expected the sentence {first_case:?} answered ({first_message:?}), \
+             got {message:?}"
+        );
+    }
 }
 
 /// An event this service has no conversation item for is acknowledged with an `Id` and an
@@ -2393,29 +2526,10 @@ async fn a_redirect_that_cannot_be_carried_in_the_authentication_url_is_refused(
             );
             continue;
         }
-        assert_eq!(status, 400, "case {case:?}: got {body:?}");
-        assert_eq!(
-            error_type(&body),
-            "ValidationException",
-            "case {case:?}: got {body:?}"
-        );
-        // The refusal reports the COMPOSED length and the modelled maximum: the fixed text
-        // is asserted exactly, and the length it carries must be one past that maximum.
-        let message = error_message(&body);
-        let prefix =
-            "The AuthenticationUrl for this session, with the RedirectUri this request named, is ";
-        let suffix = " characters long and exceeds its 2083 character maximum";
-        let reported = message
-            .strip_prefix(prefix)
-            .and_then(|rest| rest.strip_suffix(suffix))
-            .unwrap_or_else(|| panic!("case {case:?}: unexpected refusal message {message:?}"));
-        let reported: usize = reported
-            .parse()
-            .unwrap_or_else(|_| panic!("case {case:?}: {reported:?} is not a length"));
-        assert!(
-            reported > 2083,
-            "case {case:?}: expected a composed length past the 2083 maximum, got {reported}"
-        );
+        // A redirect the answer cannot carry is a parameter this operation refuses, so it
+        // carries the same fixed sentence as every other parameter refusal — and neither
+        // the redirect it was handed nor the length it composed appears in it.
+        assert_invalid_parameters(case, status, &body, &[redirect_uri.as_str(), session_id]);
     }
 }
 

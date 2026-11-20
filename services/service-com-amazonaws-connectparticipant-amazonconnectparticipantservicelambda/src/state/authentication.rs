@@ -36,37 +36,16 @@ pub const AUTHENTICATION_SESSION_WINDOW: Duration = Duration::from_secs(60);
 /// operation can answer with.
 pub const MAX_AUTHENTICATION_URL_CHARS: usize = 2083;
 
-/// The `ValidationException$Message` both authentication operations refuse a `SessionId`
-/// that is not their chat's current authentication session with.
+/// The `ValidationException$Message` the two authentication operations refuse a request
+/// whose parameters they cannot act on with.
 ///
-/// Worded the way this service words its other reference refusals — `GetAttachment`'s
-/// "Attachment with id {id} does not exist for this contact" — so the text states WHICH
-/// member was rejected and carries only the id the request itself named. One wording covers
-/// every reason a session is not the current one (unknown, another contact's, already
-/// cancelled, past its window), because a caller that holds no such session is told nothing
-/// about which sessions exist for whom.
-#[must_use]
-pub fn unknown_authentication_session_message(session_id: &str) -> String {
-    format!("Authentication session with id {session_id} does not exist for this contact")
-}
-
-/// The `ValidationException$Message` `GetAuthenticationUrl` refuses a request whose
-/// composed sign-in URL does not fit an `AuthenticationUrl` with.
-///
-/// The whole composed URL is what has to fit, and every part of it contributes — the
-/// stored authorize endpoint, app client and scopes as much as the `RedirectUri` the
-/// request named — so the message reports the composed LENGTH and the maximum the model
-/// declares (`AuthenticationUrl` is `length 1..2083`) rather than blaming one member for a
-/// total it only adds to. Both values are taken from the composed answer and from the
-/// model; nothing in the text is fixed to one request.
-#[must_use]
-pub fn authentication_url_too_long_message(authentication_url_chars: usize) -> String {
-    format!(
-        "The AuthenticationUrl for this session, with the RedirectUri this request named, \
-         is {authentication_url_chars} characters long and exceeds its \
-         {MAX_AUTHENTICATION_URL_CHARS} character maximum"
-    )
-}
+/// The sentence is FIXED: nothing in it comes from the request or from this store. One
+/// wording covers every reason a `SessionId` is not the chat's current authentication
+/// session (unknown, another contact's, already cancelled, past its window) and every
+/// other parameter these operations reject, so the refusal neither names the rejected
+/// value nor says which sessions exist for whom — a caller holding no such session learns
+/// only that what it submitted was invalid.
+pub const INVALID_REQUEST_PARAMETERS_MESSAGE: &str = "Specified request parameter(s) are invalid.";
 
 /// The OAuth 2.0 `response_type` an Amazon Cognito authorize endpoint is sent for the
 /// authorization-code flow the AuthenticateCustomer block completes on the redirect.
