@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes the access a subscription records AWAY: the subscription moves to `REVOKED`,
+//! recording whether the permissions were retained, and the stored record is reported
+//! back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +168,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeSubscription"))
+        use crate::state::{
+            cannot_revoke_message, caller_principal, now_ms, subscription_view, ResourceKind,
+            SUBSCRIPTION_STATUS_REVOKED,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RevokeSubscriptionErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // Authorization comes FIRST: a DataZone permission is held on a domain, so a
+        // caller holds none on an identifier this store serves no domain for, and the
+        // revocation is denied before any resource lookup rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(RevokeSubscriptionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        // The prerequisites, read under the same lock the write takes: a domain already on
+        // its way out holds no subscription to revoke, and a subscription this domain does
+        // not hold is as absent as one nothing created — the liveness and miss notions
+        // `GetSubscription` applies, so the read and the revocation agree about which
+        // subscriptions exist.
+        {
+            let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+                RevokeSubscriptionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::Domain.not_found_message(),
+                    },
+                )
+            })?;
+            if !domain.subscriptions.contains_key(&input.identifier) {
+                return Err(RevokeSubscriptionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: ResourceKind::Subscription.not_found_message(),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Derived from the caller's own credential scope, never from the request body:
+        // whoever took the access away is who updated the subscription.
+        let revoked_by = caller_principal(ctx);
+        // The subscription was found under this same lock just above, so it is still
+        // there; an impossible disappearance is reported as a server fault rather than
+        // answered as though the revocation had been recorded.
+        let lost = || -> Self::Error {
+            RevokeSubscriptionErrorModeled::InternalServerException(InternalServerException {
+                message: "the subscription disappeared while it was being revoked".to_string(),
+            })
+            .into()
+        };
+        let subscription = store
+            .domains
+            .get_mut(&input.domain_identifier)
+            .and_then(|domain| domain.subscriptions.get_mut(&input.identifier))
+            .ok_or_else(lost)?;
+        // Only a subscription that still GRANTS the access has any to take away. One this
+        // operation has ALREADY taken away is reported as it stands rather than revoked a
+        // second time: the operation is `@idempotent` (smithy_query
+        // operation="RevokeSubscription"), so a retried revoke leaves the same record
+        // behind as the one that took the access away, with the instant and the
+        // `retainPermissions` of the call that did. A subscription whose access was given
+        // up some OTHER way is a different matter: the ask conflicts with the status it
+        // carries, which is the `ConflictException` this operation models. Only
+        // `CancelSubscription` leaves such a status, and that operation is still a
+        // scaffold, so no stored subscription carries one yet — the guard is written on
+        // the status rather than on which operation is missing.
+        if subscription.grants_access() {
+            subscription.record_revocation(revoked_by, input.retain_permissions, now);
+        } else if subscription.status != SUBSCRIPTION_STATUS_REVOKED {
+            return Err(RevokeSubscriptionErrorModeled::ConflictException(ConflictException {
+                message: cannot_revoke_message(&input.identifier, &subscription.status),
+            })
+            .into());
+        }
+
+        // Built from the record that was actually stored, so a 200 can never report a
+        // status this call did not persist.
+        let domain = store
+            .domains
+            .get(&input.domain_identifier)
+            .ok_or_else(lost)?;
+        let subscription = domain
+            .subscriptions
+            .get(&input.identifier)
+            .ok_or_else(lost)?;
+        let rendered = subscription_view(domain, subscription).ok_or_else(|| {
+            RevokeSubscriptionErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store lost a listing a subscription records".to_string(),
+            })
+        })?;
+        Ok(RevokeSubscriptionOutput {
+            id: rendered.id,
+            created_by: rendered.created_by,
+            updated_by: rendered.updated_by,
+            domain_id: rendered.domain_id,
+            status: rendered.status,
+            created_at: rendered.created_at,
+            updated_at: rendered.updated_at,
+            subscribed_principal: rendered.subscribed_principal,
+            subscribed_listing: rendered.subscribed_listing,
+            subscription_request_id: rendered.subscription_request_id,
+            retain_permissions: rendered.retain_permissions,
+        })
     }
 }

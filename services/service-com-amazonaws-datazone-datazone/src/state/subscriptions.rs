@@ -31,6 +31,21 @@ pub const SUBSCRIPTION_STATUS_APPROVED: &str = "APPROVED";
 pub const SUBSCRIPTION_STATUS_CANCELLED: &str = "CANCELLED";
 pub const SUBSCRIPTION_STATUS_REVOKED: &str = "REVOKED";
 
+/// The `ConflictException` message `RevokeSubscription` refuses a subscription whose
+/// access has already been given up by a CANCEL with: the ask conflicts with the status
+/// the subscription currently carries.
+///
+/// Fixed text around two variable parts read from the request and the store — the
+/// subscription addressed and the status it carries. The fixed text is this service's own
+/// convention, shared with the `ConflictException` `CreateSubscriptionRequest` refuses a
+/// domain whose status cannot take a request with, rather than text recorded from the
+/// service: no recording exercises this refusal, so a later one can correct the wording.
+/// A repeated REVOKE is not refused with it: `RevokeSubscription` reports an
+/// already-REVOKED subscription as it stands, because the operation is `@idempotent`.
+pub fn cannot_revoke_message(identifier: &str, status: &str) -> String {
+    format!("Subscription {identifier} is {status}, so it cannot be revoked")
+}
+
 /// One stored subscription.
 #[derive(Debug, Clone)]
 pub struct Subscription {
@@ -62,6 +77,55 @@ pub struct Subscription {
     /// Whether the permissions were retained when the access was given up — the
     /// `retainPermissions` a revoke carries. Absent while nothing has given it up.
     pub retain_permissions: Option<bool>,
+}
+
+impl Subscription {
+    /// Whether the access this subscription records still stands, i.e. whether there is
+    /// anything left for a give-up operation to take away.
+    ///
+    /// A subscription exists because a decision granted the access, so only
+    /// [`SUBSCRIPTION_STATUS_APPROVED`] carries it; the other two members both mean the
+    /// access has already been given up. The one rule a give-up operation asks, so
+    /// `RevokeSubscription` and `CancelSubscription` cannot decide it differently.
+    pub fn grants_access(&self) -> bool {
+        self.status == SUBSCRIPTION_STATUS_APPROVED
+    }
+
+    /// Give the access up by REVOKING it: the terminal status, whether the permissions
+    /// were retained, and the caller and instant that took it away.
+    ///
+    /// The one writer of a revocation, so a response can never report a status this
+    /// store did not persist.
+    pub fn record_revocation(
+        &mut self,
+        revoked_by: String,
+        retain_permissions: Option<bool>,
+        now: i64,
+    ) {
+        self.status = SUBSCRIPTION_STATUS_REVOKED.to_string();
+        self.retain_permissions = retain_permissions;
+        self.updated_by = Some(revoked_by);
+        self.updated_at_ms = now;
+    }
+
+    /// This subscription's position in the one total order a listing of subscriptions
+    /// pages over: the instant it was last changed, then its own id.
+    ///
+    /// `updatedAt` is the ordering the model states — `ListSubscriptions`'s `sortBy` is
+    /// `@deprecated` with "Results are always sorted by updatedAt" (smithy_query
+    /// operation="ListSubscriptions") — so the field is not the caller's to pick; only
+    /// `sortOrder` is. Two subscriptions changed in the same millisecond are ordered by
+    /// id after it, which is what makes the key TOTAL, so a page's token (which carries
+    /// this key) resumes after exactly one of them. The separator is a NUL, which no
+    /// `SubscriptionId` admits.
+    ///
+    /// The instant is biased into the unsigned range and zero-padded, so the TEXT order
+    /// of the key is the NUMERIC order of the instant over the whole of `i64` rather
+    /// than over the non-negative instants a clock happens to produce.
+    pub fn order_key(&self) -> String {
+        let position = i128::from(self.updated_at_ms) - i128::from(i64::MIN);
+        format!("{position:020}\u{0}{}", self.id)
+    }
 }
 
 /// The subscription a decision that ACCEPTS `request` materialises, with the id

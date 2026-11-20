@@ -6,11 +6,11 @@
 //!
 //! Every assertion is made on the HTTP answer only — a handler that answered from a
 //! hardcoded value instead of from the store fails here. A FIXTURE reaches into the store
-//! for exactly two things, each because the operation that would do it on the wire is
-//! still a scaffold: a subscription target (`CreateSubscriptionTarget` is addressed by an
-//! `environmentIdentifier`, and no environment resource exists yet) and the ids of the
-//! subscriptions a domain holds (`ListSubscriptions` is a scaffold, so no wire call names
-//! them). Nothing is ASSERTED from the store.
+//! for exactly two things: a subscription target, because the operation that would record
+//! one on the wire is still a scaffold (`CreateSubscriptionTarget` is addressed by an
+//! `environmentIdentifier`, and no environment resource exists yet), and the ids of the
+//! subscriptions a domain holds, which keeps the cases here about the DECISION alone.
+//! Nothing is ASSERTED from the store.
 //!
 //! The rules under test, each asserted over a TABLE of inputs:
 //!
@@ -31,17 +31,31 @@
 //!    further subscription.
 //! 5. A decision addressing a domain this store serves none for is denied, and one
 //!    addressing a request the domain does not hold is a miss.
+//! 6. The access itself is REPORTED: `ListSubscriptions` answers the subscriptions the
+//!    domain holds and only those every filter the request names holds for — the request
+//!    that materialised one, the listing it is on, the principal that holds it (one arm of
+//!    the union per `owning*` member), the project that approves access to the listing,
+//!    and the status, which defaults to `APPROVED` when the request names none.
+//! 7. The access is given UP: `RevokeSubscription` moves a subscription that still grants
+//!    it to `REVOKED`, recording the `retainPermissions` the call carried and the caller
+//!    as `updatedBy`; `GetSubscription` and the listing report exactly that, a repeat
+//!    revoke leaves the record where the first one left it, and an access given up some
+//!    OTHER way conflicts with the status it carries.
 
 use crate::harness::Emulator;
+// Percent-encoding a query-parameter value: the one encoder this test target shares, so
+// nothing here carries a second copy of it.
+use crate::domain_project_lifecycle::urlencode;
 use serde_json::{json, Value};
 // The messages and enum members as the service states them, so a drift between these and
 // what goes on the wire fails here.
 use service_com_amazonaws_datazone_datazone::state::{
-    cannot_reject_message, service_state, SubscriptionTarget,
+    cannot_reject_message, cannot_revoke_message, service_state, SubscriptionTarget,
     SUBSCRIPTION_ALREADY_DECIDED_MESSAGE, SUBSCRIPTION_REQUEST_STATUS_ACCEPTED,
     SUBSCRIPTION_REQUEST_STATUS_PENDING, SUBSCRIPTION_REQUEST_STATUS_REJECTED,
-    SUBSCRIPTION_STATUS_APPROVED,
+    SUBSCRIPTION_STATUS_APPROVED, SUBSCRIPTION_STATUS_CANCELLED, SUBSCRIPTION_STATUS_REVOKED,
 };
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// The principal the harness's SigV4 scope names, which is what the reviewer of every
@@ -74,7 +88,29 @@ async fn catalog(dz: &Emulator, name: &str, asset_type: &str) -> Catalog {
     let domain = dz.available_domain(name).await;
     let producer = dz.project(&domain, "producer").await;
     let consumer = dz.project(&domain, "consumer").await;
+    let (asset, listing) = publish_asset_listing(dz, &domain, &producer, asset_type).await;
 
+    Catalog {
+        domain,
+        consumer,
+        asset_type: asset_type.to_string(),
+        asset,
+        listing,
+        producer,
+    }
+}
+
+/// Publish an asset of its own custom type `asset_type`, owned by `producer`, and answer
+/// the asset and the listing that records it.
+///
+/// One helper rather than one copy per fixture, so every case here subscribes to a listing
+/// built the same way — and a second PRODUCING project gets its own listing through it.
+async fn publish_asset_listing(
+    dz: &Emulator,
+    domain: &str,
+    producer: &str,
+    asset_type: &str,
+) -> (String, String) {
     let created_type = dz
         .call(
             "POST",
@@ -126,14 +162,7 @@ async fn catalog(dz: &Emulator, name: &str, asset_type: &str) -> Catalog {
         published.status, published.body
     );
 
-    Catalog {
-        domain,
-        consumer,
-        asset_type: asset_type.to_string(),
-        asset: created_asset.s("id"),
-        listing: published.s("listingId"),
-        producer,
-    }
+    (created_asset.s("id"), published.s("listingId"))
 }
 
 /// Put a subscription target into `catalog`'s domain, applicable to the asset types
@@ -171,8 +200,9 @@ fn put_subscription_target(
 
 /// The ids of the subscriptions `domain` holds.
 ///
-/// The second fixture seam: `ListSubscriptions` is still a scaffold, so no wire call names
-/// a subscription and a case has to learn the id to address `GetSubscription` with. Only
+/// The second fixture seam: a case has to learn the id to address `GetSubscription` with,
+/// and reading it from the store keeps these cases about the DECISION rather than about
+/// how a listing filters and pages (which `ListSubscriptions` has its own suite for). Only
 /// the IDS come from here — every assertion about a subscription below is made on the HTTP
 /// answer `GetSubscription` gives for it.
 fn stored_subscription_ids(engine: &Arc<engine::InMemoryEngine>, domain: &str) -> Vec<String> {
@@ -878,5 +908,841 @@ async fn a_decision_addressing_nothing_this_store_holds_is_refused() {
         ids.len(),
         1,
         "the accept after the refusals granted the access, got {ids:?}"
+    );
+}
+
+/// A `UserProfileId`-shaped identifier no principal in these fixtures carries, used to show
+/// that an owning filter addressing ANOTHER arm of the principal union keeps nothing. The
+/// shape is the one the model declares for the member (smithy_query query="operation"
+/// operation="ListSubscriptions").
+const UNHELD_USER_ID: &str = "4f1a2b3c-1111-2222-3333-444455556666";
+
+/// A `GroupProfileId`-shaped identifier no principal in these fixtures carries, for the same
+/// reason.
+const UNHELD_GROUP_ID: &str = "5e2b3c4d-9999-8888-7777-666655554444";
+
+/// `ListSubscriptions` with the query string `query` (empty for none).
+async fn list_subscriptions(dz: &Emulator, domain: &str, query: &str) -> crate::harness::Answer {
+    let uri = if query.is_empty() {
+        format!("/v2/domains/{domain}/subscriptions")
+    } else {
+        format!("/v2/domains/{domain}/subscriptions?{query}")
+    };
+    dz.call("GET", &uri, None).await
+}
+
+/// The `items` of a listing answer.
+fn items(body: &Value) -> Vec<Value> {
+    body.get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The `id` of every item of a listing answer, in the order they were reported.
+fn item_ids(body: &Value) -> Vec<String> {
+    items(body).iter().map(|item| member(item, "id")).collect()
+}
+
+/// Ids as a SET: the filter rows are about WHICH subscriptions a filter keeps, not about
+/// their order, which has its own case.
+fn id_set(ids: &[String]) -> BTreeSet<String> {
+    ids.iter().cloned().collect()
+}
+
+/// The subscription the accept of `request` materialised, found through the listing filtered
+/// by that request — the wire call that names it.
+async fn subscription_of(dz: &Emulator, domain: &str, request: &str) -> String {
+    let listed = list_subscriptions(
+        dz,
+        domain,
+        &format!("subscriptionRequestIdentifier={request}"),
+    )
+    .await;
+    assert_eq!(
+        listed.status, 200,
+        "listing the subscriptions of request {request}: expected 200, got {} {:?}",
+        listed.status, listed.body
+    );
+    let ids = item_ids(&listed.body);
+    assert_eq!(
+        ids.len(),
+        1,
+        "an accepted request materialises exactly one subscription, got {ids:?}"
+    );
+    ids[0].clone()
+}
+
+/// `GetSubscription` on one stored subscription.
+async fn read_subscription(dz: &Emulator, domain: &str, id: &str) -> crate::harness::Answer {
+    dz.call(
+        "GET",
+        &format!("/v2/domains/{domain}/subscriptions/{id}"),
+        None,
+    )
+    .await
+}
+
+/// Ask for access to `listing` of `domain` for `principal` and accept it, answering the
+/// request's id and the subscription the accept materialised.
+async fn granted_access(
+    dz: &Emulator,
+    domain: &str,
+    listing: &str,
+    principal: Value,
+    reason: &str,
+) -> (String, String) {
+    let asked = dz
+        .call(
+            "POST",
+            &format!("/v2/domains/{domain}/subscription-requests"),
+            Some(json!({
+                "subscribedPrincipals": [principal],
+                "subscribedListings": [{ "identifier": listing }],
+                "requestReason": reason,
+            })),
+        )
+        .await;
+    assert_eq!(
+        asked.status, 200,
+        "asking for access ({reason:?}): expected 200, got {} {:?}",
+        asked.status, asked.body
+    );
+    let request = asked.s("id");
+    let decided = dz
+        .call(
+            "PUT",
+            &format!("/v2/domains/{domain}/subscription-requests/{request}/accept"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        decided.status, 200,
+        "accepting the ask ({reason:?}): expected 200, got {} {:?}",
+        decided.status, decided.body
+    );
+    let subscription = subscription_of(dz, domain, &request).await;
+    (request, subscription)
+}
+
+/// The fixture the access cases read: a domain holding TWO producing projects, each with a
+/// listing of its own, and four granted accesses plus one ask a reject turned down.
+struct Granted {
+    domain: String,
+    producer_a: String,
+    producer_b: String,
+    consumer: String,
+    listing_a: String,
+    listing_b: String,
+    /// The request whose accept materialised [`Self::project_on_a`].
+    request_project_on_a: String,
+    /// The request a reject turned down, so it materialised nothing.
+    request_rejected: String,
+    /// The consumer PROJECT's access to producer A's listing.
+    project_on_a: String,
+    /// An IAM principal's access to the same listing.
+    iam_on_a: String,
+    /// The consumer project's access to producer B's listing.
+    project_on_b: String,
+    /// The `UserProfileId` of a user profile this domain holds, which holds
+    /// [`Self::user_on_b`]. A GROUP principal has no counterpart here: a group profile is
+    /// created by `CreateGroupProfile`, which is still a scaffold, so no domain holds one
+    /// and only the negative direction of `owningGroupId` is reachable.
+    user: String,
+    /// That user profile's access to producer B's listing.
+    user_on_b: String,
+}
+
+async fn granted(dz: &Emulator, name: &str) -> Granted {
+    let catalog = catalog(dz, name, "AccessTypeA").await;
+    let producer_b = dz.project(&catalog.domain, "producer-b").await;
+    let (_, listing_b) =
+        publish_asset_listing(dz, &catalog.domain, &producer_b, "AccessTypeB").await;
+
+    let as_project = json!({ "project": { "identifier": catalog.consumer } });
+    let as_iam = json!({ "iam": { "identifier": CONSUMER_ROLE } });
+
+    let (request_project_on_a, project_on_a) = granted_access(
+        dz,
+        &catalog.domain,
+        &catalog.listing,
+        as_project.clone(),
+        "the project on A",
+    )
+    .await;
+    let (_, iam_on_a) = granted_access(
+        dz,
+        &catalog.domain,
+        &catalog.listing,
+        as_iam,
+        "the role on A",
+    )
+    .await;
+    let (_, project_on_b) = granted_access(
+        dz,
+        &catalog.domain,
+        &listing_b,
+        as_project.clone(),
+        "the project on B",
+    )
+    .await;
+
+    // A USER principal: a profile of this domain, addressed by the `UserProfileId` the
+    // create reports, so the `owningUserId` arm has a subscription to keep as well as one
+    // to leave out.
+    let profile = dz
+        .call(
+            "POST",
+            &format!("/v2/domains/{}/user-profiles", catalog.domain),
+            Some(json!({ "userIdentifier": "access.consumer", "userType": "IAM_USER" })),
+        )
+        .await;
+    assert_eq!(
+        profile.status, 201,
+        "creating the consuming user profile: expected 201, got {} {:?}",
+        profile.status, profile.body
+    );
+    let user = profile.s("id");
+    let (_, user_on_b) = granted_access(
+        dz,
+        &catalog.domain,
+        &listing_b,
+        json!({ "user": { "identifier": user } }),
+        "the user on B",
+    )
+    .await;
+
+    let request_rejected = member(
+        &ask_for(dz, &catalog, as_project, "the ask that is turned down").await,
+        "id",
+    );
+    let rejected = dz
+        .call(
+            "PUT",
+            &format!(
+                "/v2/domains/{}/subscription-requests/{request_rejected}/reject",
+                catalog.domain
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        rejected.status, 200,
+        "rejecting the fixture's ask: expected 200, got {} {:?}",
+        rejected.status, rejected.body
+    );
+
+    Granted {
+        domain: catalog.domain,
+        producer_a: catalog.producer,
+        producer_b,
+        consumer: catalog.consumer,
+        listing_a: catalog.listing,
+        listing_b,
+        request_project_on_a,
+        request_rejected,
+        project_on_a,
+        iam_on_a,
+        project_on_b,
+        user,
+        user_on_b,
+    }
+}
+
+#[tokio::test]
+async fn a_listing_reports_the_subscriptions_every_named_filter_keeps() {
+    let (dz, _engine) = Emulator::with_engine();
+    let held = granted(&dz, "access-listing-filters").await;
+    let every = vec![
+        held.project_on_a.clone(),
+        held.iam_on_a.clone(),
+        held.project_on_b.clone(),
+        held.user_on_b.clone(),
+    ];
+
+    // The rows differ along which filter the request names, which arm of the principal
+    // union it addresses, whether it names one filter or two at once, and whether what it
+    // names resolves to a subscription at all.
+    let rows: Vec<(&str, String, Vec<String>)> = vec![
+        (
+            "no filter at all, so the default status",
+            String::new(),
+            every.clone(),
+        ),
+        (
+            "the request that materialised one subscription",
+            format!(
+                "subscriptionRequestIdentifier={}",
+                held.request_project_on_a
+            ),
+            vec![held.project_on_a.clone()],
+        ),
+        (
+            "a request a reject turned down, which granted nothing",
+            format!("subscriptionRequestIdentifier={}", held.request_rejected),
+            Vec::new(),
+        ),
+        (
+            "the listing two principals hold access to",
+            format!("subscribedListingId={}", held.listing_a),
+            vec![held.project_on_a.clone(), held.iam_on_a.clone()],
+        ),
+        (
+            "the other producer's listing",
+            format!("subscribedListingId={}", held.listing_b),
+            vec![held.project_on_b.clone(), held.user_on_b.clone()],
+        ),
+        (
+            "the project that holds two of the accesses",
+            format!("owningProjectId={}", held.consumer),
+            vec![held.project_on_a.clone(), held.project_on_b.clone()],
+        ),
+        (
+            "a project that holds none of them",
+            format!("owningProjectId={}", held.producer_a),
+            Vec::new(),
+        ),
+        (
+            "the IAM principal that holds one",
+            format!("owningIamPrincipalArn={}", urlencode(CONSUMER_ROLE)),
+            vec![held.iam_on_a.clone()],
+        ),
+        (
+            "the user profile that holds one",
+            format!("owningUserId={}", urlencode(&held.user)),
+            vec![held.user_on_b.clone()],
+        ),
+        (
+            "a user profile arm no principal here is",
+            format!("owningUserId={UNHELD_USER_ID}"),
+            Vec::new(),
+        ),
+        (
+            "a group profile arm no principal here is",
+            format!("owningGroupId={UNHELD_GROUP_ID}"),
+            Vec::new(),
+        ),
+        (
+            "the project that published the listing two accesses are on",
+            format!("approverProjectId={}", held.producer_a),
+            vec![held.project_on_a.clone(), held.iam_on_a.clone()],
+        ),
+        (
+            "the project that published the other listing",
+            format!("approverProjectId={}", held.producer_b),
+            vec![held.project_on_b.clone(), held.user_on_b.clone()],
+        ),
+        (
+            "a project that published nothing subscribed to",
+            format!("approverProjectId={}", held.consumer),
+            Vec::new(),
+        ),
+        (
+            "the status every access carries",
+            format!("status={SUBSCRIPTION_STATUS_APPROVED}"),
+            every.clone(),
+        ),
+        (
+            "a status no access carries yet",
+            format!("status={SUBSCRIPTION_STATUS_REVOKED}"),
+            Vec::new(),
+        ),
+        (
+            "the status a cancel would leave",
+            format!("status={SUBSCRIPTION_STATUS_CANCELLED}"),
+            Vec::new(),
+        ),
+        (
+            "two filters at once, which keeps their intersection",
+            format!(
+                "owningProjectId={}&subscribedListingId={}",
+                held.consumer, held.listing_a
+            ),
+            vec![held.project_on_a.clone()],
+        ),
+        (
+            "two filters at once whose intersection is empty",
+            format!(
+                "owningProjectId={}&subscribedListingId={}",
+                held.producer_a, held.listing_a
+            ),
+            Vec::new(),
+        ),
+    ];
+
+    for (label, query, expected) in rows {
+        let listed = list_subscriptions(&dz, &held.domain, &query).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {label:?}: expected 200, got {} {:?}",
+            listed.status, listed.body
+        );
+        assert_eq!(
+            id_set(&item_ids(&listed.body)),
+            id_set(&expected),
+            "case {label:?}: expected {expected:?}, got {:?}",
+            listed.body
+        );
+        assert_eq!(
+            listed.body.get("nextToken"),
+            None,
+            "case {label:?}: one page holds every kept subscription, got {:?}",
+            listed.body
+        );
+    }
+}
+
+/// Every member a reported summary carries is the stored subscription's own, and the reader
+/// that did not write it answers the same.
+#[tokio::test]
+async fn a_reported_summary_is_the_stored_subscription() {
+    let (dz, _engine) = Emulator::with_engine();
+    let held = granted(&dz, "access-listing-members").await;
+    let listed = list_subscriptions(&dz, &held.domain, "").await;
+
+    let rows: Vec<(&str, String, String, Value)> = vec![
+        (
+            "the project's access to producer A's listing",
+            held.project_on_a.clone(),
+            held.listing_a.clone(),
+            json!({ "project": { "id": held.consumer, "name": "consumer" } }),
+        ),
+        (
+            "the role's access to the same listing",
+            held.iam_on_a.clone(),
+            held.listing_a.clone(),
+            json!({ "iam": { "principalArn": CONSUMER_ROLE } }),
+        ),
+        (
+            "the project's access to producer B's listing",
+            held.project_on_b.clone(),
+            held.listing_b.clone(),
+            json!({ "project": { "id": held.consumer, "name": "consumer" } }),
+        ),
+    ];
+
+    for (label, id, listing, owner) in rows {
+        let item = items(&listed.body)
+            .into_iter()
+            .find(|item| member(item, "id") == id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {label:?}: the listing reports {id}, got {:?}",
+                    listed.body
+                )
+            });
+        assert_eq!(
+            member(&item, "status"),
+            SUBSCRIPTION_STATUS_APPROVED,
+            "case {label:?}: an accepted ask grants the access, got {item:?}"
+        );
+        assert_eq!(
+            item.get("subscribedListing")
+                .map(|listing| member(listing, "id")),
+            Some(listing),
+            "case {label:?}: the access is on the listing the ask recorded, got {item:?}"
+        );
+        assert_eq!(
+            item.get("subscribedPrincipal"),
+            Some(&owner),
+            "case {label:?}: the access is held by the principal the ask named, got {item:?}"
+        );
+        assert_eq!(
+            item.get("retainPermissions"),
+            None,
+            "case {label:?}: nothing has given the access up, got {item:?}"
+        );
+        assert_eq!(
+            item.get("updatedBy"),
+            None,
+            "case {label:?}: nothing has updated the access, got {item:?}"
+        );
+
+        // The reader that did not write it answers the same record, member for member.
+        let read = read_subscription(&dz, &held.domain, &id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {label:?}: reading {id}: expected 200, got {} {:?}",
+            read.status, read.body
+        );
+        for name in [
+            "id",
+            "status",
+            "createdBy",
+            "createdAt",
+            "updatedAt",
+            "domainId",
+            "subscribedListing",
+            "subscribedPrincipal",
+            "subscriptionRequestId",
+        ] {
+            assert_eq!(
+                read.body.get(name),
+                item.get(name),
+                "case {label:?}: the listing and the read agree about {name}, got {:?}",
+                read.body
+            );
+        }
+    }
+}
+
+/// Revoking an access that still stands moves it to `REVOKED` and records what the call
+/// carried; a repeat leaves the record exactly where the first one left it.
+#[tokio::test]
+async fn a_revocation_takes_the_access_away_and_is_idempotent() {
+    // The rows differ along the `retainPermissions` the call carries — the one member a
+    // revoke takes — including omitting it altogether.
+    let rows: Vec<(&str, Option<bool>)> = vec![
+        ("a revoke retaining the permissions", Some(true)),
+        ("a revoke not retaining them", Some(false)),
+        ("a revoke naming no retainPermissions at all", None),
+    ];
+
+    for (index, (label, retain)) in rows.into_iter().enumerate() {
+        let (dz, _engine) = Emulator::with_engine();
+        let held = granted(&dz, &format!("access-revocation-{index}")).await;
+        let id = held.project_on_b.clone();
+        let before = read_subscription(&dz, &held.domain, &id).await;
+        assert_eq!(
+            before.status, 200,
+            "case {label:?}: the access stands before the revoke, got {} {:?}",
+            before.status, before.body
+        );
+
+        let revoked = dz
+            .call(
+                "PUT",
+                &format!("/v2/domains/{}/subscriptions/{id}/revoke", held.domain),
+                retain.map(|retain| json!({ "retainPermissions": retain })),
+            )
+            .await;
+        assert_eq!(
+            revoked.status, 200,
+            "case {label:?}: the revoke: expected 200, got {} {:?}",
+            revoked.status, revoked.body
+        );
+        assert_eq!(
+            revoked.s("status"),
+            SUBSCRIPTION_STATUS_REVOKED,
+            "case {label:?}: the access is given up, got {:?}",
+            revoked.body
+        );
+        assert_eq!(
+            revoked
+                .body
+                .get("retainPermissions")
+                .and_then(Value::as_bool),
+            retain,
+            "case {label:?}: the revoke records what it carried, got {:?}",
+            revoked.body
+        );
+        assert_eq!(
+            revoked.s("updatedBy"),
+            CALLER,
+            "case {label:?}: whoever revoked it is who updated it, got {:?}",
+            revoked.body
+        );
+        assert_eq!(
+            revoked.body.get("createdAt"),
+            before.body.get("createdAt"),
+            "case {label:?}: a revoke does not move createdAt, got {:?}",
+            revoked.body
+        );
+        assert_eq!(
+            revoked.body.get("subscriptionRequestId"),
+            before.body.get("subscriptionRequestId"),
+            "case {label:?}: the access still names the request it came from, got {:?}",
+            revoked.body
+        );
+
+        // The reader that did not write it reports exactly the revoked record.
+        let read = read_subscription(&dz, &held.domain, &id).await;
+        assert_eq!(
+            (read.status, read.body),
+            (200, revoked.body.clone()),
+            "case {label:?}: the read answers the stored revocation"
+        );
+
+        // The listing follows the status: the default listing no longer holds it, and the
+        // one naming REVOKED holds exactly it.
+        let standing = list_subscriptions(&dz, &held.domain, "").await;
+        assert_eq!(
+            id_set(&item_ids(&standing.body)),
+            id_set(&[
+                held.project_on_a.clone(),
+                held.iam_on_a.clone(),
+                held.user_on_b.clone(),
+            ]),
+            "case {label:?}: the default listing reports only what still stands, got {:?}",
+            standing.body
+        );
+        let given_up = list_subscriptions(
+            &dz,
+            &held.domain,
+            &format!("status={SUBSCRIPTION_STATUS_REVOKED}"),
+        )
+        .await;
+        assert_eq!(
+            item_ids(&given_up.body),
+            vec![id.clone()],
+            "case {label:?}: the revoked listing reports exactly the revoked access, got {:?}",
+            given_up.body
+        );
+
+        // A repeat revoke, carrying the opposite member, leaves the record where the first
+        // one left it: the operation is idempotent.
+        let again = dz
+            .call(
+                "PUT",
+                &format!("/v2/domains/{}/subscriptions/{id}/revoke", held.domain),
+                Some(json!({ "retainPermissions": !retain.unwrap_or(false) })),
+            )
+            .await;
+        assert_eq!(
+            (again.status, again.body),
+            (200, revoked.body),
+            "case {label:?}: a second revoke answers the same record"
+        );
+    }
+}
+
+/// The other side of that rule: an access given up some OTHER way has no revocation left
+/// to take either, and the ask conflicts with the status it carries.
+#[tokio::test]
+async fn a_revoke_of_an_access_given_up_another_way_is_refused() {
+    let (dz, engine) = Emulator::with_engine();
+    let held = granted(&dz, "access-revoke-conflict").await;
+    let id = held.project_on_b.clone();
+
+    // A third fixture seam, for the same reason as the other two: `CancelSubscription` is
+    // still a scaffold, so no wire call leaves a subscription CANCELLED and the status has
+    // to be put there for the conflict this operation models to be reachable at all.
+    {
+        let state = service_state(&*engine).expect("the DataZone store is reachable");
+        let mut store = state.lock();
+        store
+            .domains
+            .get_mut(&held.domain)
+            .expect("the fixture's domain is stored")
+            .subscriptions
+            .get_mut(&id)
+            .expect("the fixture's subscription is stored")
+            .status = SUBSCRIPTION_STATUS_CANCELLED.to_string();
+    }
+
+    let refused = dz
+        .call(
+            "PUT",
+            &format!("/v2/domains/{}/subscriptions/{id}/revoke", held.domain),
+            Some(json!({ "retainPermissions": true })),
+        )
+        .await;
+    assert_eq!(
+        (refused.status, refused.error_code.as_str()),
+        (409, "ConflictException"),
+        "revoking a cancelled access: expected 409 ConflictException, got {} {:?} {:?}",
+        refused.status,
+        refused.error_code,
+        refused.body
+    );
+    assert_eq!(
+        refused.s("message"),
+        cannot_revoke_message(&id, SUBSCRIPTION_STATUS_CANCELLED),
+        "the refusal names the subscription and the status it carries, got {:?}",
+        refused.body
+    );
+
+    // The refused revoke changed nothing about the access it addressed.
+    let read = read_subscription(&dz, &held.domain, &id).await;
+    assert_eq!(
+        (read.status, read.s("status")),
+        (200, SUBSCRIPTION_STATUS_CANCELLED.to_string()),
+        "the refused revoke left the status alone, got {:?}",
+        read.body
+    );
+    assert_eq!(
+        read.body.get("retainPermissions"),
+        None,
+        "the refused revoke recorded nothing, got {:?}",
+        read.body
+    );
+    assert_eq!(
+        read.body.get("updatedBy"),
+        None,
+        "the refused revoke updated nobody, got {:?}",
+        read.body
+    );
+}
+
+/// The order a listing reports, and the pages `maxResults` / `nextToken` cut it into.
+#[tokio::test]
+async fn a_listing_pages_over_one_order() {
+    let (dz, _engine) = Emulator::with_engine();
+    let catalog = catalog(&dz, "access-listing-pages", "PagedType").await;
+
+    // Five accesses on the one listing, so the order and the pages have something to cut.
+    let mut granted_ids = Vec::new();
+    for index in 0..5u32 {
+        let (_, id) = granted_access(
+            &dz,
+            &catalog.domain,
+            &catalog.listing,
+            json!({ "project": { "identifier": catalog.consumer } }),
+            &format!("ask {index}"),
+        )
+        .await;
+        granted_ids.push(id);
+    }
+
+    let ascending = list_subscriptions(&dz, &catalog.domain, "").await;
+    let ordered = item_ids(&ascending.body);
+    assert_eq!(
+        id_set(&ordered),
+        id_set(&granted_ids),
+        "the listing reports every access the accepts granted, got {ordered:?}"
+    );
+    // The order is by `updatedAt`, so the reported instants never go backwards.
+    let instants: Vec<f64> = items(&ascending.body)
+        .iter()
+        .map(|item| item.get("updatedAt").and_then(Value::as_f64).unwrap_or(0.0))
+        .collect();
+    assert!(
+        instants.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the ascending order never goes backwards in updatedAt, got {instants:?}"
+    );
+
+    let descending = list_subscriptions(&dz, &catalog.domain, "sortOrder=DESCENDING").await;
+    let mut reversed = ordered.clone();
+    reversed.reverse();
+    assert_eq!(
+        item_ids(&descending.body),
+        reversed,
+        "DESCENDING walks the same order backwards, got {:?}",
+        descending.body
+    );
+
+    // Each page size cuts the SAME order into pages that concatenate back to it, and the
+    // last page carries no token.
+    for page_size in [1usize, 2, 5, 50] {
+        let mut collected: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let query = match &token {
+                Some(token) => format!("maxResults={page_size}&nextToken={token}"),
+                None => format!("maxResults={page_size}"),
+            };
+            let page = list_subscriptions(&dz, &catalog.domain, &query).await;
+            assert_eq!(
+                page.status, 200,
+                "case page size {page_size}: expected 200, got {} {:?}",
+                page.status, page.body
+            );
+            let ids = item_ids(&page.body);
+            assert!(
+                ids.len() <= page_size,
+                "case page size {page_size}: a page holds at most that many, got {ids:?}"
+            );
+            collected.extend(ids);
+            pages += 1;
+            assert!(
+                pages <= 10,
+                "case page size {page_size}: the pages end, got {collected:?}"
+            );
+            match page.body.get("nextToken").and_then(Value::as_str) {
+                Some(next) => token = Some(next.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(
+            collected, ordered,
+            "case page size {page_size}: the pages concatenate to the one order"
+        );
+    }
+}
+
+/// Every refusal the two access operations owe: a domain this store serves none for is
+/// denied before any lookup, a subscription the domain does not hold is a miss, and a token
+/// this service never issued is invalid input.
+#[tokio::test]
+async fn an_access_call_addressing_nothing_this_store_holds_is_refused() {
+    let (dz, _engine) = Emulator::with_engine();
+    let held = granted(&dz, "access-refusals").await;
+
+    // (label, method, uri, expected status, expected error code)
+    let rows: Vec<(&str, &str, String, u16, &str)> = vec![
+        (
+            "a listing of a domain nothing created",
+            "GET",
+            "/v2/domains/dzd_doesnotexist/subscriptions".to_string(),
+            403,
+            "AccessDeniedException",
+        ),
+        (
+            "a revoke in a domain nothing created",
+            "PUT",
+            format!(
+                "/v2/domains/dzd_doesnotexist/subscriptions/{}/revoke",
+                held.project_on_a
+            ),
+            403,
+            "AccessDeniedException",
+        ),
+        (
+            "a revoke of a subscription the domain does not hold",
+            "PUT",
+            format!(
+                "/v2/domains/{}/subscriptions/notasubscription/revoke",
+                held.domain
+            ),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "a revoke addressing the REQUEST's id rather than the subscription's",
+            "PUT",
+            format!(
+                "/v2/domains/{}/subscriptions/{}/revoke",
+                held.domain, held.request_project_on_a
+            ),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "a listing resuming from a token this service never issued",
+            "GET",
+            format!(
+                "/v2/domains/{}/subscriptions?nextToken=notatoken",
+                held.domain
+            ),
+            400,
+            "ValidationException",
+        ),
+    ];
+
+    for (label, method, uri, status, code) in rows {
+        let refused = dz.call(method, &uri, None).await;
+        assert_eq!(
+            (refused.status, refused.error_code.as_str()),
+            (status, code),
+            "case {label:?}: expected {status} {code}, got {} {:?} {:?}",
+            refused.status,
+            refused.error_code,
+            refused.body
+        );
+    }
+
+    // Every refusal left the accesses alone: each still stands.
+    let listed = list_subscriptions(&dz, &held.domain, "").await;
+    assert_eq!(
+        id_set(&item_ids(&listed.body)),
+        id_set(&[
+            held.project_on_a.clone(),
+            held.iam_on_a.clone(),
+            held.project_on_b.clone(),
+            held.user_on_b.clone(),
+        ]),
+        "the refusals granted and revoked nothing, got {:?}",
+        listed.body
     );
 }

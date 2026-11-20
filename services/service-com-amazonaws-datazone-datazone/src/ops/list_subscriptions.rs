@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSubscriptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSubscriptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the stored subscriptions of one domain — the accesses accepted subscription
+//! requests materialised — keeping those every filter the request names holds for, in the
+//! one order the model states, over `@paginated` `nextToken` pages.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSubscriptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -167,6 +163,62 @@ impl<Eng> ListSubscriptions<Eng> {
     }
 }
 
+/// The `maxResults` range the model declares for this operation (`@range` min 1, max 50
+/// on `MaxResults`). A request naming no `maxResults` gets the top of the range.
+///
+/// A value OUTSIDE the range never reaches this handler — the generated boundary
+/// validator refuses it against the modelled `@range` first — so the clamp below is not a
+/// live defence against `maxResults=0`; it is what lets the page token be computed from
+/// `page_size - 1` without that subtraction ever underflowing.
+const MIN_MAX_RESULTS: usize = 1;
+/// The top of that same range, which is also the page size a request naming none gets.
+const MAX_MAX_RESULTS: usize = 50;
+
+/// Whether `subscription` is held by the principal the request's `owning*` members name.
+///
+/// Each of the four members addresses ONE arm of the `SubscribedPrincipal` union, so a
+/// request naming an owning project keeps only subscriptions a PROJECT holds, and only
+/// the one that project is — a subscription held by a user is not reported for a project
+/// filter, and vice versa. A member the request omits keeps every subscription. The
+/// principal is the one the ask recorded, which is who holds the access.
+fn owned_by_the_named_principal(
+    input: &ListSubscriptionsInput,
+    subscription: &crate::state::Subscription,
+) -> bool {
+    use crate::state::SubscribedPrincipalRef;
+    let (project, user, group, iam) = match &subscription.principal {
+        SubscribedPrincipalRef::Project(id) => (Some(id.as_str()), None, None, None),
+        SubscribedPrincipalRef::User(id) => (None, Some(id.as_str()), None, None),
+        SubscribedPrincipalRef::Group(id) => (None, None, Some(id.as_str()), None),
+        SubscribedPrincipalRef::Iam(arn) => (None, None, None, Some(arn.as_str())),
+    };
+    let names = |asked: &Option<String>, held: Option<&str>| {
+        asked
+            .as_deref()
+            .is_none_or(|asked| held == Some(asked))
+    };
+    names(&input.owning_project_id, project)
+        && names(&input.owning_user_id, user)
+        && names(&input.owning_group_id, group)
+        && names(&input.owning_iam_principal_arn, iam)
+}
+
+/// The project that APPROVES access to what `subscription` is on: the project that owns
+/// the listing revision the subscription records, i.e. the one that published the entity
+/// and whose owners take the decision on a request for it.
+///
+/// `None` when the catalog no longer holds that listing revision, so an
+/// `approverProjectId` filter keeps no subscription whose approver this store cannot
+/// resolve rather than guessing one.
+fn approving_project_id(
+    domain: &crate::state::Domain,
+    subscription: &crate::state::Subscription,
+) -> Option<String> {
+    let listing = domain.listings.get(&subscription.listing.listing_id)?;
+    let revision = listing.revisions.get(&subscription.listing.revision)?;
+    Some(revision.owning_project_id.clone())
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListSubscriptions<Eng>
 {
@@ -184,18 +236,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSubscriptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSubscriptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSubscriptions"))
+        let _ = ctx;
+        use crate::state::{
+            decode_page_token, encode_page_token, now_ms, subscription_view, ResourceKind,
+            Subscription, SORT_ORDER_DESCENDING, SUBSCRIPTION_STATUS_APPROVED,
+        };
+        use std::collections::BTreeMap;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSubscriptionsErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        // The only write a reporting operation makes: materialise the domain lifecycle
+        // steps the clock already owed at this instant.
+        store.settle_clock(now_ms());
+
+        // Authorization comes FIRST, before this handler inspects anything else the
+        // request carries: a DataZone permission is held on a domain, so a caller holds
+        // none on an identifier this store serves no domain for, and the listing is
+        // denied before any pagination token is decoded or any resource looked up,
+        // rather than reported as a miss.
+        if !store.authorizes_domain(&input.domain_identifier) {
+            return Err(ListSubscriptionsErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::not_permitted_message(Self::NAME),
+                },
+            )
+            .into());
+        }
+
+        // A token this service never issued satisfies `PaginationToken`'s modelled
+        // length, so it is refused HERE — by the handler, after authorization — and not
+        // by the validation stage.
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
+                ListSubscriptionsErrorModeled::ValidationException(ValidationException {
+                    message: "nextToken is not a token this service issued".to_string(),
+                })
+            })?),
+            None => None,
+        };
+        let page_size = input
+            .max_results
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(MAX_MAX_RESULTS)
+            .clamp(MIN_MAX_RESULTS, MAX_MAX_RESULTS);
+        let descending = input.sort_order.as_deref() == Some(SORT_ORDER_DESCENDING);
+        // The status a request naming none asks for: "if not provided, by default, Amazon
+        // DataZone returns only APPROVED subscriptions" (smithy_query query="doc"
+        // shape="ListSubscriptionsInput" member="status"), so a listing is never a
+        // listing of every status.
+        let status = input.status.as_deref().unwrap_or(SUBSCRIPTION_STATUS_APPROVED);
+
+        let domain = store.live_domain(&input.domain_identifier).ok_or_else(|| {
+            ListSubscriptionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: ResourceKind::Domain.not_found_message(),
+            })
+        })?;
+
+        // One total order over the subscriptions every filter keeps: by the key
+        // [`Subscription::order_key`] states, which is the ordering the model declares for
+        // this listing. Collecting into a `BTreeMap` is what sorts it, and the key is what
+        // a page's token carries, so the next page resumes exactly after the subscription
+        // this one ended on however the stored map has changed.
+        let ordered: BTreeMap<String, &Subscription> = domain
+            .subscriptions
+            .values()
+            .filter(|subscription| subscription.status == status)
+            .filter(|subscription| {
+                input
+                    .subscription_request_identifier
+                    .as_deref()
+                    .is_none_or(|request| subscription.subscription_request_id == request)
+            })
+            .filter(|subscription| {
+                input
+                    .subscribed_listing_id
+                    .as_deref()
+                    .is_none_or(|listing| subscription.listing.listing_id == listing)
+            })
+            .filter(|subscription| owned_by_the_named_principal(&input, subscription))
+            .filter(|subscription| {
+                input.approver_project_id.as_deref().is_none_or(|project| {
+                    approving_project_id(domain, subscription).as_deref() == Some(project)
+                })
+            })
+            .map(|subscription| (subscription.order_key(), subscription))
+            .collect();
+        let mut ordered: Vec<(String, &Subscription)> = ordered.into_iter().collect();
+        // `DESCENDING` walks the same sequence backwards.
+        if descending {
+            ordered.reverse();
+        }
+        // Resume AFTER the key the previous page ended on, in whichever direction this
+        // page runs — located by comparison, so a subscription materialised or revoked
+        // between two pages cannot make the next page skip or repeat a different one.
+        let start = match resume_after.as_deref() {
+            Some(after) => ordered.partition_point(|(key, _)| {
+                if descending {
+                    key.as_str() >= after
+                } else {
+                    key.as_str() <= after
+                }
+            }),
+            None => 0,
+        };
+        let remaining = &ordered[start..];
+
+        let mut items = Vec::with_capacity(remaining.len().min(page_size));
+        for (_, subscription) in remaining.iter().take(page_size) {
+            // Rendered through the one view every operation that reports a subscription
+            // uses, so this listing and `GetSubscription` cannot describe one stored
+            // access differently.
+            let rendered = subscription_view(domain, subscription).ok_or_else(|| {
+                ListSubscriptionsErrorModeled::InternalServerException(InternalServerException {
+                    message: "the DataZone store lost a listing a subscription records"
+                        .to_string(),
+                })
+            })?;
+            items.push(SubscriptionSummary {
+                id: rendered.id,
+                created_by: rendered.created_by,
+                updated_by: rendered.updated_by,
+                domain_id: rendered.domain_id,
+                status: rendered.status,
+                created_at: rendered.created_at,
+                updated_at: rendered.updated_at,
+                subscribed_principal: rendered.subscribed_principal,
+                subscribed_listing: rendered.subscribed_listing,
+                subscription_request_id: rendered.subscription_request_id,
+                retain_permissions: rendered.retain_permissions,
+            });
+        }
+        // A token only when a subscription is left over, and it names the key this page
+        // ended on, so the next call resumes exactly after it.
+        let next_token = remaining
+            .get(page_size)
+            .and(remaining.get(page_size - 1))
+            .map(|(key, _)| encode_page_token(key));
+
+        Ok(ListSubscriptionsOutput { items, next_token })
     }
 }
