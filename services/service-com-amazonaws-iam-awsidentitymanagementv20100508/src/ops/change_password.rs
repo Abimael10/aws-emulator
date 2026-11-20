@@ -322,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // every other IAM refusal under that code is ([`crate::scaffolded`]).
         //
         // The text is NOT the authorization channel's wording
-        // ([`crate::state::authorization::not_authorized`]), which reports a decision
+        // ([`crate::state::authorization`]'s refusal wording), which reports a decision
         // made about the caller's identity-based policies and names the principal, the
         // action and the resource it was made on: this refusal is about the credential
         // material the request carried, not about what the caller is permitted to do,

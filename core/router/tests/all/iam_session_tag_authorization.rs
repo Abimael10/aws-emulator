@@ -240,9 +240,10 @@ fn assert_withheld(case: &str, role_name: &str, session_name: &str, status: u16,
         Some("AccessDenied"),
         "case {case:?}: {session_name} expected the error code AccessDenied, got {body}"
     );
-    // The sentence this suite set up, which is the whole refusal
-    // (`iam_authorization_details_pointer.rs`, which owns that reader).
-    crate::iam_authorization_details_pointer::assert_refusal_sentence(
+    // The sentence this suite set up, closed by the pointer at this refusal's own
+    // authorization details (`iam_authorization_details_pointer.rs`, which owns that
+    // reader).
+    crate::iam_authorization_details_pointer::assert_identity_refusal(
         case,
         &element(body, "Message"),
         &withheld_message(role_name, session_name),

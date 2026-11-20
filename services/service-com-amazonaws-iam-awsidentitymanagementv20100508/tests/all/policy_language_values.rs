@@ -14,10 +14,11 @@
 //! and AWS's sentence for the clause it broke, and NOTHING is stored.
 //!
 //! The sentence is the clause's, not the operation's — with ONE exception recorded on both
-//! sides: an `Effect` the language does not define is worded `The policy failed legacy
-//! parsing` by the INLINE-policy validator and `Syntax errors in policy.` by the
-//! MANAGED-policy one, so each row below carries the two sentences its clause is refused
-//! with.
+//! sides: an `Effect` that is one of the language's two words spelled in another case is
+//! worded `The policy failed legacy parsing` by the INLINE-policy validator and `Syntax
+//! errors in policy.` by the MANAGED-policy one, so each row below carries the two sentences
+//! its clause is refused with. An `Effect` that is no spelling of either word at all is no
+//! effect the parser can read, and both validators word that as a syntax error.
 //!
 //! SOURCE for the published values: the "IAM JSON policy elements" reference — `Version`
 //! is `2012-10-17` or the legacy `2008-10-17`, `Effect` is `Allow` or `Deny`, and a
@@ -68,9 +69,16 @@ struct RefusedCase {
 /// with — recorded for a `CreatePolicy` whose statement declares one.
 const MANAGED_UNREADABLE_EFFECT: &str = "Syntax errors in policy.";
 
-/// The sentence the INLINE-policy validator words that same clause with — recorded for a
-/// `PutRolePolicy` whose statement declares an effect spelled in another case.
-const INLINE_UNREADABLE_EFFECT: &str = "The policy failed legacy parsing";
+/// The sentence the INLINE-policy validator words one of the language's two words spelled in
+/// another CASE with — recorded for a `PutRolePolicy` whose statement declares an effect
+/// spelled in another case. The word is one the policy parser reads, so the refusal reports
+/// the parse of the policy as having failed.
+const INLINE_MISCASED_EFFECT: &str = "The policy failed legacy parsing";
+
+/// The sentence BOTH validators word an `Effect` that is no spelling of either word with: a
+/// value outside the two words is no effect the parser can read, so the document is reported
+/// as unreadable as a policy.
+const UNREADABLE_EFFECT: &str = "Syntax errors in policy.";
 
 /// Every clause of the language a document can declare a value outside, each with the
 /// sentence that clause is refused with.
@@ -90,25 +98,25 @@ const REFUSED: &[RefusedCase] = &[
     RefusedCase {
         case: "an effect written in another case",
         document: r#"{"Version":"2012-10-17","Statement":[{"Sid":"InvokeApi","Effect":"allow","Action":"execute-api:Invoke","Resource":"arn:aws:execute-api:us-west-2:000000000000:a1b2c3d4e5/beta/GET/*"}]}"#,
-        message: INLINE_UNREADABLE_EFFECT,
+        message: INLINE_MISCASED_EFFECT,
         managed_message: MANAGED_UNREADABLE_EFFECT,
     },
     RefusedCase {
         case: "an effect the language does not define",
         document: r#"{"Statement":[{"Effect":"Permit","Action":"s3:GetObject","Resource":"*"}]}"#,
-        message: INLINE_UNREADABLE_EFFECT,
+        message: UNREADABLE_EFFECT,
         managed_message: MANAGED_UNREADABLE_EFFECT,
     },
     RefusedCase {
         case: "an effect that is not a string",
         document: r#"{"Statement":[{"Effect":true,"Action":"s3:GetObject","Resource":"*"}]}"#,
-        message: INLINE_UNREADABLE_EFFECT,
+        message: UNREADABLE_EFFECT,
         managed_message: MANAGED_UNREADABLE_EFFECT,
     },
     RefusedCase {
         case: "the second statement's effect",
         document: r#"{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"},{"Effect":"DENY","Action":"s3:PutObject","Resource":"*"}]}"#,
-        message: INLINE_UNREADABLE_EFFECT,
+        message: INLINE_MISCASED_EFFECT,
         managed_message: MANAGED_UNREADABLE_EFFECT,
     },
     RefusedCase {

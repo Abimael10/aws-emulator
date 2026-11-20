@@ -4213,6 +4213,35 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsIamAwsidentitymanagementv20100508State>)
 }
 
+/// Hand this service's store the handle to the store the AUTHORIZATION DETAILS of its
+/// refusals are filed in ([`authorization::details`]), which the service that serves
+/// `GetRequestAuthorizationDetails` owns.
+///
+/// Both stores live in the one engine, and this is where that engine is in reach, so the
+/// handle is taken here and held beside this service's own store for the gate — which is
+/// handed that state and no engine — to file a refusal's detail through.
+///
+/// Called ONCE, when the service is built from the engine (`crate::service::EmulatedService`),
+/// not per request: the attach takes this store's lock, and a request path that took it again
+/// while a handler held it would wedge that request. Idempotent — every touch resolves the
+/// same handle onto the same engine, so the first one is kept — and a no-op for an engine
+/// this store cannot be reached through.
+pub fn attach_authorization_details<Eng: Send + Sync + 'static>(engine: &Eng) {
+    let Some(engine) = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()
+    else {
+        return;
+    };
+    let store =
+        ::engine::InMemoryEngine::state::<ComAmazonawsIamAwsidentitymanagementv20100508State>(
+            engine,
+        );
+    store.lock().authorization_details.attach(
+        ::engine::InMemoryEngine::state::<
+            ::service_com_amazonaws_iamtoolbox_authrequestservice::ComAmazonawsIamtoolboxAuthrequestserviceState,
+        >(engine),
+    );
+}
+
 /// How many characters an account property key may carry: `accountPropertyKeyType` is
 /// length 1..50 (`smithy_query(query="shape", shape="accountPropertiesMapType")`). A map
 /// KEY's own constraints are outside the framework's constraint walk, so the operation
@@ -4723,11 +4752,13 @@ pub(crate) fn names_something(element: Option<&::serde_json::Value>) -> bool {
 /// policy document asks (`::service_common::iam_policy::PolicyValueDefect`), which carries
 /// the sentence AWS answers an INLINE policy write with. IAM words one of them differently
 /// for a MANAGED policy: an `Effect` the language does not define is reported as an error
-/// in the policy's syntax ([`SYNTAX_ERRORS_IN_POLICY`]) where the inline write is refused
-/// the parse-stage sentence — recorded behaviour for a `CreatePolicy` whose statement
-/// declares an effect outside the two the language defines, beside the recorded inline
-/// write that carries the other sentence for the same clause. Every other clause is worded
-/// alike for both, so this is the one mapping and not a second table.
+/// in the policy's syntax ([`SYNTAX_ERRORS_IN_POLICY`]) whichever way the document misses
+/// the two words it defines — where the inline write answers the parse-stage sentence for
+/// one of those words spelled in another case — recorded behaviour for a `CreatePolicy`
+/// whose statement declares an effect outside the two the language defines, beside the
+/// recorded inline write that carries the other sentence for the miscased spelling. Every
+/// other clause is worded alike for both, so this is the one mapping and not a second
+/// table.
 ///
 /// The ONE definition of that wording, shared by both operations that write a managed
 /// policy's document: `CreatePolicy` and `CreatePolicyVersion`.
@@ -4735,7 +4766,8 @@ pub fn managed_policy_value_message(
     defect: &::service_common::iam_policy::PolicyValueDefect,
 ) -> String {
     match defect {
-        ::service_common::iam_policy::PolicyValueDefect::UnreadableEffect => {
+        ::service_common::iam_policy::PolicyValueDefect::UnreadableEffect
+        | ::service_common::iam_policy::PolicyValueDefect::MiscasedEffect => {
             SYNTAX_ERRORS_IN_POLICY.to_string()
         }
         other => other.message(),

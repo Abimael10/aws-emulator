@@ -6,26 +6,29 @@
 //! RULE: every `AccessDenied` the identity service answers an authorization decision with
 //! is ONE sentence — `User: ` + the principal that signed the request + ` is not authorized
 //! to perform: ` + the action + ` on resource: ` + the resource the decision was made on +
-//! ` ` + the clause saying why the decision went that way — and it ENDS at that clause.
-//! Nothing is appended to it: no page to read the decision on, no handle for the request,
-//! nothing about the evaluation behind it. Nothing selects that away either — not which
+//! ` ` + the clause saying why the decision went that way — CLOSED by the pointer at that
+//! decision's own authorization details: `. Go to <the console address of those details> for
+//! complete details, or call the GetRequestAuthorizationDetails API with the following
+//! authorization id: <id>`, naming an id the service mints for that one refused request and
+//! gives twice. The message ends there, and nothing selects the pointer away — not which
 //! action the call asked for, not whether the request addresses one entity, a collection or
 //! the account itself, not whether it reads or writes, not which document decided (an
 //! absent grant, an explicit `Deny`), not the Region it was signed for, and not how often
-//! the same call is made.
+//! the same call is made. A service that is NOT the identity service words its own refusal
+//! with the sentence alone.
 //!
-//! It takes TWO services to state the rule, which is why the suite lives here: the sentence
-//! is the WHOLE refusal whichever service answers it, so one principal — created and
-//! granted through the identity service's own API — is refused by the identity service over
-//! awsQuery and by the secret store over awsJson1_1, and the two refusals differ in nothing
-//! but the action they name and the envelope their protocol carries them in.
+//! It takes TWO services to state the rule, which is why the suite lives here: one principal
+//! — created and granted through the identity service's own API — is refused by the identity
+//! service over awsQuery and by the secret store over awsJson1_1, and the two refusals
+//! differ in the action they name, the envelope their protocol carries them in, and whether
+//! the identity service's authorization-details pointer closes them.
 //!
 //! The per-service halves live beside their services: the identity service's wording table
 //! is its crate's `tests/all/access_denied_message_wording.rs`, and the envelope each
 //! protocol gives a denial is `iam_secretsmanager_denial_envelope_by_protocol.rs` beside
 //! this file. This file is where the refusal's TAIL is pinned: a reader looking for an
-//! authorization-details pointer in a refusal — a console page, a handle to read the
-//! decision under — finds here that there is none to find.
+//! authorization-details pointer in a refusal of the identity service finds here that it is
+//! there, and that the id it names is a fresh one per refused request.
 
 use std::sync::Arc;
 
@@ -222,15 +225,74 @@ fn user_arn(user_name: &str) -> String {
 /// Assert that `message` is exactly `sentence`: the refusal names the decision and ends at
 /// the clause saying why.
 ///
-/// The ONE reader of a refusal's wording in this test crate: a suite about something else —
-/// which protocol carried the denial, which document narrowed it — states the sentence it
-/// set up and calls this, rather than writing the rule out again.
+/// The ONE reader of such a refusal's wording in this test crate: a suite about something
+/// else — which protocol carried the denial, which document narrowed it — states the
+/// sentence it set up and calls this, rather than writing the rule out again. A refusal of
+/// the IDENTITY service carries one clause more ([`assert_identity_refusal`]).
 pub(crate) fn assert_refusal_sentence(case: &str, message: &str, sentence: &str) {
     assert_eq!(
         message, sentence,
         "case {case:?}: expected the refusal to be worded {sentence:?} and to end there, got \
          {message:?}"
     );
+}
+
+/// What a refusal of the IDENTITY service closes with, before the authorization id it names.
+///
+/// Written out here rather than taken from the service under test, so the suites assert
+/// AWS's text; the identity service is global, so the console Region is the partition's own
+/// whichever Region the refused request addressed.
+const POINTER_PREFIX: &str =
+    ". Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1\
+     #/authorization-details/";
+
+/// What separates that console address from the authorization id given a second time.
+const POINTER_API: &str =
+    " for complete details, or call the GetRequestAuthorizationDetails API with the \
+     following authorization id: ";
+
+/// `message` with the identity service's authorization-details pointer taken off: the
+/// sentence naming the decision, which is the part two refusals of the SAME call share — the
+/// pointer names an id minted per refused request, so it is what they differ in by design.
+pub(crate) fn sentence_of(message: &str) -> String {
+    message
+        .split_once(POINTER_PREFIX)
+        .map_or_else(|| message.to_string(), |(sentence, _)| sentence.to_string())
+}
+
+/// Assert that `message` is the refusal the IDENTITY service answers: `sentence`, closed by
+/// the pointer at that decision's authorization details — and answer the authorization id
+/// the pointer names.
+///
+/// The id is minted per refused request, so it is read out of the message rather than
+/// predicted; it is asserted to be spelled in the alphabet the authorization-details read
+/// admits and to be the SAME id in the console address and in the API pointer. Every other
+/// character of the message is asserted.
+///
+/// The ONE reader of an identity-service refusal in this test crate, for the same reason
+/// [`assert_refusal_sentence`] is the one reader of a refusal without that clause.
+pub(crate) fn assert_identity_refusal(case: &str, message: &str, sentence: &str) -> String {
+    let (before, id) = message.split_once(POINTER_API).unwrap_or_else(|| {
+        panic!(
+            "case {case:?}: expected the refusal to point at its authorization details, got \
+             {message:?}"
+        )
+    });
+    assert!(
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit()),
+        "case {case:?}: expected the authorization id to be spelled in lowercase \
+         alphanumerics, got {id:?} in {message:?}"
+    );
+    assert_eq!(
+        before,
+        format!("{sentence}{POINTER_PREFIX}{id}"),
+        "case {case:?}: expected the refusal to be worded {sentence:?} and to close with the \
+         pointer at its authorization details, got {message:?}"
+    );
+    id.to_string()
 }
 
 /// One refused call: what the caller holds, the awsQuery call it makes, and the sentence
@@ -374,11 +436,12 @@ async fn caller(
     mint_access_key(router, case, user_name).await
 }
 
-/// RULE: every authorization refusal the identity service answers names the decision and
-/// ends at the clause saying why — whichever action was asked for, on whichever resource
-/// form, reading or writing, and whichever document decided.
+/// RULE: every authorization refusal the identity service answers names the decision, says
+/// why it went that way and then points at that decision's authorization details — whichever
+/// action was asked for, on whichever resource form, reading or writing, and whichever
+/// document decided — and every refusal names an authorization id of its own.
 #[tokio::test]
-async fn every_identity_refusal_names_the_decision_and_ends_at_the_reason() {
+async fn every_identity_refusal_names_the_decision_the_reason_and_its_details() {
     let router = build_router();
     // The role the tag-write rows address: a fixture, never the caller, so the refusals
     // are about the caller's own permissions.
@@ -400,6 +463,7 @@ async fn every_identity_refusal_names_the_decision_and_ends_at_the_reason() {
     )
     .await;
 
+    let mut minted: Vec<String> = Vec::new();
     for (row, case) in rows().into_iter().enumerate() {
         let user_name = format!("worded{row}");
         let access_key_id = caller(
@@ -436,13 +500,21 @@ async fn every_identity_refusal_names_the_decision_and_ends_at_the_reason() {
             case.named_as,
             case.reason,
         );
-        assert_refusal_sentence(case.case, &message, &expected);
+        minted.push(assert_identity_refusal(case.case, &message, &expected));
     }
+
+    let distinct: std::collections::BTreeSet<&String> = minted.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        minted.len(),
+        "expected each refusal to point at its own authorization details, got {minted:?}"
+    );
 }
 
 /// RULE: every part of the sentence is a fact of the request and of the documents in force,
 /// so the SAME refused call made again — and made in another Region, since the identity
-/// service is global — answers the identical message.
+/// service is global — answers the identical sentence and pointer clause, with a FRESH
+/// authorization id each time: the id names the details of one refused request.
 #[tokio::test]
 async fn the_same_refused_call_is_worded_identically_in_every_region() {
     let router = build_router();
@@ -455,6 +527,7 @@ async fn the_same_refused_call_is_worded_identically_in_every_region() {
         user_arn("repeated"),
         no_allow("iam:ListUsers"),
     );
+    let mut minted: Vec<String> = Vec::new();
     for region in [REGION, REGION, "eu-west-1", "ap-southeast-2"] {
         let (status, body) =
             iam_in_region(&router, &access_key_id, region, "ListUsers", &[]).await;
@@ -462,14 +535,26 @@ async fn the_same_refused_call_is_worded_identically_in_every_region() {
             status, 403,
             "case {case:?} in {region}: expected HTTP 403, got {status}: {body}"
         );
-        assert_refusal_sentence(&format!("{case} in {region}"), &message_of(&body), &expected);
+        minted.push(assert_identity_refusal(
+            &format!("{case} in {region}"),
+            &message_of(&body),
+            &expected,
+        ));
     }
+    let distinct: std::collections::BTreeSet<&String> = minted.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        minted.len(),
+        "expected every refusal of the same call to name its own authorization id, got \
+         {minted:?}"
+    );
 }
 
-/// RULE: the sentence is the whole refusal whichever service answers it, so one principal
-/// refused by the identity service and by the secret store — over two protocols, against
-/// the very same documents — is answered two messages differing only in the action they
-/// name.
+/// RULE: the sentence naming the decision is the refusal whichever service answers it, and
+/// the identity service closes its own with the pointer at that decision's authorization
+/// details — so one principal refused by the identity service and by the secret store, over
+/// two protocols and against the very same documents, is answered two messages differing in
+/// the action they name and in that one clause.
 #[tokio::test]
 async fn both_services_word_the_same_principals_refusal_the_same_way() {
     let router = build_router();
@@ -487,10 +572,11 @@ async fn both_services_word_the_same_principals_refusal_the_same_way() {
         user_arn("both"),
         no_allow("iam:ListUsers"),
     );
-    assert_refusal_sentence(case, &message_of(&body), &expected);
+    assert_identity_refusal(case, &message_of(&body), &expected);
 
     // The secret store's refusal of the same principal, over its own protocol: the same
-    // sentence shape, and nothing after the reason either.
+    // sentence shape, and nothing after the reason — the authorization-details pointer is
+    // the identity service's own.
     let (status, body) = secrets(
         &router,
         &access_key_id,

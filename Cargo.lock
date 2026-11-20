@@ -14943,6 +14943,7 @@ dependencies = [
  "roxmltree",
  "sec1 0.7.3",
  "serde_json",
+ "service-com-amazonaws-iamtoolbox-authrequestservice",
  "service-common",
  "sha1 0.10.7",
  "sha2 0.10.9",

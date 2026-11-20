@@ -615,10 +615,10 @@ fn a_pod_identity_credential_from_the_published_endpoint_carries_the_roles_permi
                             listed.text
                         );
                         // An authorization refusal of the identity service IS the sentence
-                        // naming the decision and ends at the clause saying why, which the
-                        // suite that owns that reader pins
+                        // naming the decision, closed by the pointer at that decision's own
+                        // authorization details, which the suite that owns that reader pins
                         // (`iam_authorization_details_pointer.rs`).
-                        crate::iam_authorization_details_pointer::assert_refusal_sentence(
+                        crate::iam_authorization_details_pointer::assert_identity_refusal(
                             case,
                             &element(&listed.text, "Message"),
                             &refusal(&session_arn, &reason),

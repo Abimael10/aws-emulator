@@ -11,9 +11,9 @@
 //! deny). A refused call is answered HTTP 403 with the error code `AccessDenied`
 //! ([`crate::scaffolded::Scaffolded::access_denied`]) and a message built from the three
 //! things the decision was made about — the principal, the action and the resource —
-//! closed by why the decision went that way ([`not_authorized`]) and by nothing else: the
-//! sentence ENDS at that clause, whichever action was asked for and whichever document
-//! decided it.
+//! closed by why the decision went that way and then by the pointer at that decision's own
+//! authorization detail ([`details`]), which is where the sentence ENDS, whichever action
+//! was asked for and whichever document decided it.
 //!
 //! The five pieces, each held in exactly one place:
 //!
@@ -139,6 +139,11 @@ pub mod actions;
 /// request speaks for", resolved from the same access key id this gate judges the call on
 /// and read by every operation of this service whose `UserName` is optional.
 pub mod caller_identity;
+
+/// Where the detail of a refusal is filed and how its message points a caller at it: the
+/// authorization id minted per refused request, the clause naming it, and the record it
+/// resolves to.
+pub mod details;
 
 pub use actions::*;
 
@@ -682,6 +687,7 @@ fn authorize_request(
     let SigningPrincipal {
         caller,
         arn: principal,
+        identity,
         policies,
         scope,
     } = signer;
@@ -766,6 +772,8 @@ fn authorize_request(
     } else {
         format!("because no permissions boundary allows the {action} action")
     };
+    let explicit_deny =
+        decided == Decision::Denied || scoped == Decision::Denied || capped == Decision::Denied;
     // Audit record for the refusal: the acting principal, what it asked for and the
     // decision, so the refusal is reviewable after the fact. The policy documents
     // themselves are not logged.
@@ -775,33 +783,74 @@ fn authorize_request(
         principal = %principal,
         action = %action,
         resource = %resource,
-        explicit_deny = decided == Decision::Denied
-            || scoped == Decision::Denied
-            || capped == Decision::Denied,
+        explicit_deny,
         "the policies in force on the caller do not permit this call"
     );
-    // AWS's refusal ends at the reason: nothing of the request beyond the three things the
-    // decision was made about, and nothing of the evaluation behind it, is reported back.
-    Err(not_authorized(&principal, action, named_as, &reason))
+    // The refusal states the decision and then points at its DETAIL: the authorization id
+    // the message names is minted here and the record it resolves to is filed under it
+    // ([`details::record_denial`]), out of what this decision was made from.
+    Err(not_authorized_detailed(
+        store,
+        &details::DeniedRequest {
+            principal: &principal,
+            identity: &identity,
+            action,
+            resource,
+            context: &context,
+            explicit_deny,
+            boundary: boundary.as_deref(),
+            session_policies: scope.documents.len(),
+        },
+        named_as,
+        &reason,
+    ))
 }
 
 /// The `AccessDenied` text AWS words a call it will not perform for its caller with:
 /// what the refusal is about — the principal that signed the request, the action it
-/// asked for and the resource it asked for it on — closed by `reason`, which says why.
-/// The sentence ENDS there: nothing of the evaluation that decided the call, and nothing
-/// else about the request, follows it.
+/// asked for and the resource it asked for it on — closed by `reason`, which says why,
+/// and then by the POINTER at the detail of that decision ([`details::pointer_clause`]),
+/// naming the authorization id its record is filed under ([`details::record_denial`]) — so a
+/// caller that reads the id out of the message and calls the API the message names is served
+/// the detail of this very decision.
 ///
 /// ONE wording for the code, so a refusal an operation reaches for a reason of its own
 /// is worded exactly as the policy decision above is, differing only in that reason.
-/// Every part of it is a fact of the request and of the account's state, so the same
-/// refused call is worded the same on every run and in every Region.
+/// Every part of it besides that id is a fact of the request and of the account's state, so
+/// the same refused call is worded the same on every run and in every Region; the id is
+/// minted per request, so it is the one part two refusals of the same call differ in.
 /// [`not_authorized_without_reason`] is the OTHER wording this service answers: the one
 /// for a refusal no evaluation of the policies in force explains, which therefore has no
-/// reason to state.
-pub fn not_authorized(principal: &str, action: &str, named_as: &str, reason: &str) -> AccessDenied {
+/// reason to state and no decision to point at.
+fn not_authorized_detailed(
+    store: &IamState,
+    denied: &details::DeniedRequest<'_>,
+    named_as: &str,
+    reason: &str,
+) -> AccessDenied {
+    let authorization_id = details::record_denial(store, denied);
+    worded(
+        denied.principal,
+        denied.action,
+        named_as,
+        reason,
+        &authorization_id,
+    )
+}
+
+/// The sentence [`not_authorized_detailed`] answers, closed by the pointer at the
+/// authorization detail filed under `authorization_id`.
+fn worded(
+    principal: &str,
+    action: &str,
+    named_as: &str,
+    reason: &str,
+    authorization_id: &str,
+) -> AccessDenied {
     AccessDenied::new(format!(
         "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
-         {reason}"
+         {reason}{}",
+        details::pointer_clause(authorization_id)
     ))
 }
 
@@ -901,6 +950,9 @@ pub fn delegation_permission_check(
         arn: principal,
         policies,
         scope,
+        // A permission check reports a verdict rather than refusing, so it files no
+        // authorization detail and has no use for the identity the documents came from.
+        identity: _,
     } = signer;
 
     let principals = [principal];
@@ -972,6 +1024,10 @@ struct SigningPrincipal<'a> {
     /// ARN, which is what `sts:GetCallerIdentity` reports for the credential and so what
     /// the caller reads back for the key it signed with.
     arn: String,
+    /// The ARN of the IAM IDENTITY whose documents were collected — the same ARN for a
+    /// long-term key, and the ROLE's for a session of it, whose policies such a credential
+    /// has. What the detail of a refusal reports the evaluated policies as attached to.
+    identity: String,
     /// The identity-based documents in force on it, and the attachments whose documents
     /// the account does not hold.
     policies: PrincipalPolicies,
@@ -1001,6 +1057,7 @@ fn signing_principal<'a>(
         return Some(SigningPrincipal {
             caller: Caller::User(user),
             arn: user.arn.clone(),
+            identity: user.arn.clone(),
             policies,
             // A long-term key is the identity's own credential: no mint scoped it.
             scope: ScopingPolicies::default(),
@@ -1022,6 +1079,7 @@ fn signing_principal<'a>(
             session_tags: &session.tags,
         },
         arn: session.session_arn.clone(),
+        identity: role.arn.clone(),
         policies,
         // What the CREDENTIAL itself was scoped to, resolved at the instant of the request
         // so a managed session policy edited since the mint scopes by what it says NOW.
@@ -1067,9 +1125,23 @@ fn class_refusal(
         explicit_deny = false,
         "a credential of this class cannot call IAM"
     );
-    Some(not_authorized(
-        &principal,
-        action,
+    // The detail of this refusal is filed like every other: the ban is a fact about the
+    // credential, so the record carries the decision it produced — nothing allowed the call —
+    // and the policies in force on the principal the credential speaks for.
+    Some(not_authorized_detailed(
+        store,
+        &details::DeniedRequest {
+            principal: &principal,
+            identity: &principal,
+            action,
+            resource,
+            // No document was read for this decision, so it was made in no condition
+            // context: the class of the credential is all it rests on.
+            context: &[],
+            explicit_deny: false,
+            boundary: None,
+            session_policies: 0,
+        },
         named_as,
         &format!("because no identity-based policy allows the {action} action"),
     ))

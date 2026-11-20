@@ -439,7 +439,7 @@ async fn a_session_policy_narrows_the_session_whichever_form_it_was_passed_in() 
                     let message = message_of(&body);
                     // The sentence this row set up, which is the whole refusal
                     // (`iam_authorization_details_pointer.rs` owns that reader).
-                    crate::iam_authorization_details_pointer::assert_refusal_sentence(
+                    crate::iam_authorization_details_pointer::assert_identity_refusal(
                         &case,
                         &message,
                         &not_authorized(
@@ -505,7 +505,7 @@ async fn a_session_policy_cannot_grant_past_the_roles_own_policies() {
                 "case {case:?}: a scope cannot grant past the role, got {status}: {body}"
             );
             let message = message_of(&body);
-            crate::iam_authorization_details_pointer::assert_refusal_sentence(
+            crate::iam_authorization_details_pointer::assert_identity_refusal(
                 &case,
                 &message,
                 &not_authorized(

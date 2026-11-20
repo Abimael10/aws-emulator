@@ -507,12 +507,15 @@ fn reason_of(
 ) -> String {
     let head =
         format!("User: {principal} is not authorized to perform: {iam_action} on resource: {named_as} ");
-    message
+    let tail = message
         .strip_prefix(&head)
         .unwrap_or_else(|| {
             panic!("case {case:?}: expected the refusal to open {head:?}, got {message:?}")
-        })
-        .to_string()
+        });
+    // The reason clause runs to the pointer at this refusal's own authorization details,
+    // which closes every refusal of this service and names an id minted per request; that
+    // the message ends there is the rule the suite owning that reader pins.
+    crate::iam_authorization_details_pointer::sentence_of(tail)
 }
 
 /// Assert that `body` is the refusal of `operation` on `target` that `cause` decides, and

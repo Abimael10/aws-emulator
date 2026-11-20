@@ -377,12 +377,18 @@ pub(crate) const HARNESS_REGION: &str = "us-east-1";
 /// Assert that `actual` is the whole `AccessDenied` message AWS words for a refused IAM
 /// call: the sentence naming the principal that signed it, the action it asked for and
 /// the resource the decision was made on, closed by `reason` (an explicit deny, or no
-/// policy allowing the action) — and nothing else.
+/// policy allowing the action) — and then by the pointer at the authorization detail of
+/// that decision ([`AUTHORIZATION_DETAILS_POINTER`]), which is where the message ENDS.
 ///
-/// The sentence IS the whole message, which `tests/all/access_denied_message_wording.rs`
-/// is the table for; every other suite asserts the parts it set up — the principal, the
-/// action, the resource and the reason — through this one assertion, and is answered the
-/// message back for a caller comparing two refusals.
+/// The sentence plus that pointer IS the whole message, which
+/// `tests/all/access_denied_message_wording.rs` is the table for; every other suite
+/// asserts the parts it set up — the principal, the action, the resource and the reason —
+/// through this one assertion, and is answered the message back for a caller comparing two
+/// refusals.
+///
+/// The authorization id inside the pointer is minted per refused request, so it is read
+/// out of `actual` ([`authorization_details_id`], which asserts its form) rather than
+/// predicted; every other character of the message is asserted.
 pub(crate) fn assert_access_denied_message(
     case: &str,
     actual: &str,
@@ -391,16 +397,72 @@ pub(crate) fn assert_access_denied_message(
     named_as: &str,
     reason: &str,
 ) -> String {
+    let authorization_id = authorization_details_id(case, actual);
     let expected = format!(
         "User: {principal} is not authorized to perform: {action} on resource: {named_as} \
-         {reason}"
+         {reason}{}",
+        authorization_details_pointer(&authorization_id)
     );
     assert_eq!(
         actual, expected,
         "case {case:?}: expected the refusal to name the principal, the action and the \
-         resource and to end with the reason {expected:?}, got {actual:?}"
+         resource, the reason {reason:?} and the authorization-details pointer {expected:?}, \
+         got {actual:?}"
     );
     expected
+}
+
+/// What an IAM refusal's message closes with, before the authorization id: the console
+/// address of the decision's authorization detail and the API to read that detail from.
+///
+/// Written out here rather than taken from the service under test, so the suites assert
+/// AWS's text and not the emulator's. IAM is a global service, so the console Region is
+/// the partition's own (`us-east-1`) whichever Region the refused request addressed.
+pub(crate) const AUTHORIZATION_DETAILS_POINTER: &str =
+    ". Go to https://us-east-1.console.aws.amazon.com/iam/home?region=us-east-1\
+     #/authorization-details/";
+
+/// What follows the authorization id in the console address of that pointer.
+pub(crate) const AUTHORIZATION_DETAILS_API: &str =
+    " for complete details, or call the GetRequestAuthorizationDetails API with the \
+     following authorization id: ";
+
+/// The pointer clause a refusal naming `authorization_id` closes with, in full.
+pub(crate) fn authorization_details_pointer(authorization_id: &str) -> String {
+    format!(
+        "{AUTHORIZATION_DETAILS_POINTER}{authorization_id}{AUTHORIZATION_DETAILS_API}\
+         {authorization_id}"
+    )
+}
+
+/// The authorization id the pointer clause of `message` names, asserted to be there, to be
+/// spelled in the alphabet the modelled `authorizationId` admits
+/// (`^[0123456789abcdefghijklmnopqrstuvwxyz]+$`, from the IAM Toolbox model's
+/// `GetRequestAuthorizationDetailsInput$authorizationId`), and to be the SAME id in the
+/// console address and in the API pointer.
+pub(crate) fn authorization_details_id(case: &str, message: &str) -> String {
+    let Some(tail) = message.split_once(AUTHORIZATION_DETAILS_API) else {
+        panic!(
+            "case {case:?}: expected the refusal to point at the authorization details of \
+             the decision, got {message:?}"
+        );
+    };
+    let id = tail.1.to_string();
+    assert!(
+        !id.is_empty()
+            && id
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit()),
+        "case {case:?}: expected the authorization id to be spelled in lowercase \
+         alphanumerics, got {id:?} in {message:?}"
+    );
+    assert!(
+        tail.0
+            .ends_with(&format!("{AUTHORIZATION_DETAILS_POINTER}{id}")),
+        "case {case:?}: expected the console address to name the same authorization id \
+         {id:?}, got {message:?}"
+    );
+    id
 }
 
 /// Resolve the references the response serializer emits.

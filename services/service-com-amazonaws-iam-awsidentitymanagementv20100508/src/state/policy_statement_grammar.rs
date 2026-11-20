@@ -21,7 +21,13 @@
 //! MANAGED policy: the element is what carries the permissions, so a document whose list is
 //! empty grants nothing and is refused where one with a complete statement is stored. An
 //! INLINE policy and a trust document are not held to that: `Statement` present and empty is
-//! a document the top-level grammar admits.
+//! a document the top-level grammar admits. What the two IDENTITY readings ARE held to is
+//! that a statement is a statement: the element carries "a statement … or an array of
+//! individual statements", each an object of policy elements, so a `Statement` carrying a
+//! string, a number or a list with a scalar in it describes none and is refused as an error
+//! in the policy's syntax. A TRUST document is not held to that either — recorded behaviour
+//! of a trust-policy write is that such a document is stored — so its reading holds the
+//! statements it can read to the principal clause and refuses nothing for the rest.
 //!
 //! Which of the three readings below an operation asks is therefore the KIND of document it
 //! stores, and the no-principal clause is common to all the identity ones:
@@ -119,19 +125,26 @@ pub fn identity_policy_document_defect(document: &str) -> Option<PolicyDocumentD
 ///
 /// An inline policy is an identity-based policy too — "an inline policy … is embedded in
 /// the identity" and grants that identity its permissions — so it is the top-level grammar
-/// every policy document is held to ([`super::policy_document_defect`]) plus the clause no
-/// identity-based document may break: a statement of it states no principal. The ONE
-/// definition of that, shared by the three operations that embed one.
+/// every policy document is held to ([`super::policy_document_defect`]), plus the two things
+/// that hold of a STATEMENT of such a document whatever else it says: a statement is a JSON
+/// object (the grammar's `Statement` element is "a statement … or an array of individual
+/// statements", each of which is an object of policy elements), and no statement of an
+/// identity-based policy states a principal. A `Statement` element carrying anything else —
+/// a string, a number, a list with a scalar in it — describes no statement at all, which is
+/// an error in the policy's syntax rather than a missing or a prohibited element.
+///
+/// The ONE definition of that, shared by the three operations that embed one.
 pub fn inline_policy_document_defect(document: &str) -> Option<PolicyDocumentDefect> {
     let statements = match declared_statements(document) {
         Ok(statements) => statements,
         Err(defect) => return Some(defect),
     };
-    statements
-        .iter()
-        .filter_map(::serde_json::Value::as_object)
-        .any(states_principal)
-        .then_some(PolicyDocumentDefect::StatesPrincipal)
+    statements.iter().find_map(|statement| {
+        let Some(elements) = statement.as_object() else {
+            return Some(PolicyDocumentDefect::Syntax);
+        };
+        states_principal(elements).then_some(PolicyDocumentDefect::StatesPrincipal)
+    })
 }
 
 /// Whether one statement NAMES A PRINCIPAL, in either spelling the grammar admits
@@ -145,7 +158,12 @@ fn states_principal(elements: &::serde_json::Map<String, ::serde_json::Value>) -
 /// Why `document` is no document a role's TRUST policy can hold, or `None` when it is one.
 ///
 /// The top-level grammar plus the one element a resource-based policy's statements must
-/// name: the principal the role trusts. The ONE definition of the rule, shared by both
+/// name: the principal the role trusts. A `Statement` element that carries something other
+/// than a statement or a list of statements is NOT refused here, unlike for an
+/// identity-based document ([`inline_policy_document_defect`]): recorded behaviour of a
+/// trust-policy write is that such a document is stored
+/// (`tests/all/role_lifecycle.rs`), so this validator reads the statements it can and holds
+/// each of them to the principal clause. The ONE definition of the rule, shared by both
 /// operations that write the member — `CreateRole` and `UpdateAssumeRolePolicy` — so a
 /// document one of them refuses is refused by the other.
 pub fn trust_policy_document_defect(document: &str) -> Option<PolicyDocumentDefect> {
@@ -246,12 +264,12 @@ mod tests {
         }
     }
 
-    /// RULE: an INLINE policy's document is held to the top-level grammar and to the one
-    /// clause no identity-based document may break — a statement of it states no principal
-    /// — and to nothing below that.
+    /// RULE: an INLINE policy's document is held to the top-level grammar, to a statement
+    /// being a statement at all, and to the one clause no identity-based document may break
+    /// — a statement of it states no principal — and to nothing below that.
     #[test]
     fn an_inline_policy_is_held_to_naming_no_principal() {
-        let rows: [(&str, &str, Option<PolicyDocumentDefect>); 6] = [
+        let rows: [(&str, &str, Option<PolicyDocumentDefect>); 12] = [
             (
                 "a complete statement",
                 r#"{"Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#,
@@ -269,6 +287,38 @@ mod tests {
                 "no Statement element",
                 r#"{"Version":"2012-10-17"}"#,
                 Some(PolicyDocumentDefect::NoStatements),
+            ),
+            // A `Statement` element that is not a statement and not a list of statements:
+            // the shapes a caller reaches by serializing something other than a policy.
+            (
+                "a Statement element carrying a string",
+                r#"{"Version":"2012-10-17","Statement":"Allow"}"#,
+                Some(PolicyDocumentDefect::Syntax),
+            ),
+            (
+                "a Statement element carrying a number",
+                r#"{"Statement":17}"#,
+                Some(PolicyDocumentDefect::Syntax),
+            ),
+            (
+                "a Statement element carrying null",
+                r#"{"Statement":null}"#,
+                Some(PolicyDocumentDefect::Syntax),
+            ),
+            (
+                "a statement list carrying a string",
+                r#"{"Statement":["Allow"]}"#,
+                Some(PolicyDocumentDefect::Syntax),
+            ),
+            (
+                "a statement list carrying a list",
+                r#"{"Statement":[[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]]}"#,
+                Some(PolicyDocumentDefect::Syntax),
+            ),
+            (
+                "a complete statement beside one that is no object",
+                r#"{"Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"},true]}"#,
+                Some(PolicyDocumentDefect::Syntax),
             ),
             (
                 "a principal written as an object",
@@ -295,7 +345,7 @@ mod tests {
     /// top-level grammar is the one every policy document is held to.
     #[test]
     fn a_trust_policy_is_held_to_naming_a_principal() {
-        let rows: [(&str, &str, Option<PolicyDocumentDefect>); 7] = [
+        let rows: [(&str, &str, Option<PolicyDocumentDefect>); 9] = [
             (
                 "a service principal",
                 r#"{"Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#,
@@ -328,6 +378,18 @@ mod tests {
                 "a principal element naming nothing",
                 r#"{"Statement":[{"Effect":"Allow","Principal":[],"Action":"sts:AssumeRole"}]}"#,
                 Some(PolicyDocumentDefect::NoPrincipals),
+            ),
+            // A `Statement` carrying something that is no statement: an identity-based
+            // document is refused for it, a trust document is not (see the reading above).
+            (
+                "a Statement element carrying a string",
+                r#"{"Version":"2012-10-17","Statement":"Allow"}"#,
+                None,
+            ),
+            (
+                "a statement list carrying a number",
+                r#"{"Statement":[42]}"#,
+                None,
             ),
         ];
 

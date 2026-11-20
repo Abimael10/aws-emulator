@@ -342,6 +342,12 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // The store the AUTHORIZATION DETAILS of this service's refusals are filed in belongs
+        // to IAM Toolbox and lives in this same engine; the handle to it is taken ONCE here,
+        // where the engine is in reach, and held beside this service's own store for the
+        // authorization gate to file a refusal's detail through
+        // (`crate::state::attach_authorization_details`).
+        crate::state::attach_authorization_details(&*engine);
         Self {
             entry: RequestIdEnvelopeDefinition::new(AuthenticationRefusalDefinition::new(
                 management_events::AuditedDefinition::new(

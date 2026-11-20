@@ -901,6 +901,16 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// preference is a different record from one set to the version it already had; both
     /// report [`super::account_summary::DEFAULT_GLOBAL_ENDPOINT_TOKEN_VERSION`].
     pub global_endpoint_token_version: Option<i32>,
+    /// The store the AUTHORIZATION DETAILS of this account's refusals are filed in: the
+    /// handle to the state of the service that owns and serves them
+    /// ([`super::authorization::details`]), taken from the shared engine where this store is
+    /// taken ([`service_state`]).
+    ///
+    /// It holds no record itself — the records live in the owning service's store, which is
+    /// what `GetRequestAuthorizationDetails` reads — so an account's own collections are
+    /// unchanged by it, and a process that never reached this service through its engine
+    /// simply has nothing attached.
+    pub authorization_details: super::authorization::details::AuthorizationDetailsStore,
 }
 
 impl Default for ComAmazonawsIamAwsidentitymanagementv20100508State {
@@ -1003,6 +1013,8 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
             service_specific_credential_id_seq: 0,
             password_salt_seq: 0,
             global_endpoint_token_version: None,
+            authorization_details:
+                super::authorization::details::AuthorizationDetailsStore::default(),
         }
     }
 }

@@ -381,19 +381,17 @@ fn error_message(wire: Wire, body: &str) -> String {
     }
 }
 
-/// The sentence a decision is worded in: the whole message, whichever service answered it.
+/// The sentence a decision is worded in, taken out of the message whichever service
+/// answered it.
 ///
-/// A refusal ends at the clause saying why the decision went that way — nothing of where
-/// the decision could be read or under which handle follows it — which is the rule
-/// `iam_authorization_details_pointer.rs` is the table for; this suite is about the
-/// ENVELOPE each protocol carries that sentence in, so it only reads it back.
-fn sentence_of(case: &str, call: &Call, message: &str) -> String {
-    assert!(
-        !message.contains(". Go to "),
-        "case {case:?}: expected the refusal of {} to end at the reason, got {message:?}",
-        call.iam_action
-    );
-    message.to_string()
+/// A refusal of the IDENTITY service closes with the pointer at that decision's own
+/// authorization details, which names an id minted per request, while another service's
+/// refusal ends at the clause saying why — the rule
+/// `iam_authorization_details_pointer.rs` is the table for. This suite is about the ENVELOPE
+/// each protocol carries the sentence in, so it reads the sentence back and leaves that
+/// clause to the suite that owns it.
+fn sentence_of(_case: &str, _call: &Call, message: &str) -> String {
+    crate::iam_authorization_details_pointer::sentence_of(message)
 }
 
 /// Create the user a row is about, put its document in force, mint its long-term key, and

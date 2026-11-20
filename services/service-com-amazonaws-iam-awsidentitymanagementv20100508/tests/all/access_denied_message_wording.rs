@@ -5,12 +5,14 @@
 //! The rule under test: the message names what the decision was made about — `User: ` +
 //! the ARN of the principal that signed the request + ` is not authorized to perform: ` +
 //! the IAM action the call was decided on + ` on resource: ` + the resource it was decided
-//! against + ` ` + why the decision went that way — and ENDS there. That sentence is the
-//! WHOLE message of every refusal this service answers from the authorization gate:
-//! nothing is appended to it — not by which action was asked for, not by the Region the
-//! request addressed, not by which documents the caller held, not by the resource form,
-//! not by whether the call reads or writes, not by how often it is made, and not by WHY
-//! the decision went the way it did.
+//! against + ` ` + why the decision went that way — and then POINTS at the detail of that
+//! decision: the console address of its authorization details and the API to read them
+//! from, naming an authorization id minted for that one request. That sentence plus that
+//! pointer is the WHOLE message of every refusal this service answers from the
+//! authorization gate: nothing else is appended to it — not by which action was asked for,
+//! not by the Region the request addressed, not by which documents the caller held, not by
+//! the resource form, not by whether the call reads or writes, not by how often it is made,
+//! and not by WHY the decision went the way it did.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: which
 //! operation is refused, whether the resource is an ARN, a path-scoped collection, the
@@ -33,8 +35,8 @@ use crate::identity_policy_enforcement::{principal, statement};
 use crate::permissions_boundary_ceiling::statements;
 use crate::role_lifecycle::borrowed;
 use crate::user_lifecycle::{
-    account_id, assert_access_denied_message, call, call_signed_by, call_signed_in_region, element,
-    error_code, router, router_with_engine,
+    account_id, assert_access_denied_message, authorization_details_id, call, call_signed_by,
+    call_signed_in_region, element, error_code, router, router_with_engine,
 };
 
 /// The reason clause for a call no statement in force allows — the implicit deny.
@@ -557,10 +559,11 @@ async fn managed_policy(router: &MultiServiceRouter) -> String {
 }
 
 /// RULE: a refusal's message names the principal, the action and the resource the decision
-/// was made on, closed by why it went that way and by nothing else — whichever action was
-/// asked for and whichever way the decision went.
+/// was made on, closed by why it went that way and then by the pointer at that decision's
+/// authorization detail — whichever action was asked for and whichever way the decision
+/// went.
 #[tokio::test]
-async fn a_refusal_names_the_decision_and_ends_at_the_reason() {
+async fn a_refusal_names_the_decision_the_reason_and_the_authorization_detail() {
     let router = router();
     target_user(&router).await;
     let policy_arn = managed_policy(&router).await;
@@ -599,9 +602,11 @@ async fn a_refusal_names_the_decision_and_ends_at_the_reason() {
     }
 }
 
-/// RULE: every part of the message is a fact of the request and of the documents in
-/// force, so repeating the same refused call — and making it in another Region — answers
-/// the identical message: the sentence naming the decision and nothing besides.
+/// RULE: every part of the message besides the per-request authorization id is a fact of
+/// the request and of the documents in force, so repeating the same refused call — and
+/// making it in another Region — answers the identical sentence and the identical pointer
+/// clause, with a FRESH authorization id each time: the id names the record of one
+/// decision, so two refusals of the same call are pointed at two records.
 #[tokio::test]
 async fn the_same_refused_call_is_worded_identically_every_time() {
     let router = router();
@@ -643,8 +648,9 @@ async fn the_same_refused_call_is_worded_identically_every_time() {
         }
     }
 
-    // Every one of the three: the sentence is the whole message, the same one every time
-    // and in every Region.
+    // Every one of the three: the sentence and the pointer clause are the whole message,
+    // the same ones every time and in every Region, and the authorization id inside the
+    // pointer is a new one on every attempt.
     for (action, iam_action, named_as, messages) in [
         (
             "ListUsers",
@@ -665,18 +671,26 @@ async fn the_same_refused_call_is_worded_identically_every_time() {
             &keyings,
         ),
     ] {
-        let sentence = format!(
-            "User: {caller} is not authorized to perform: {iam_action} on resource: \
-             {named_as} {}",
-            no_allow(iam_action),
-        );
+        let mut minted: Vec<String> = Vec::new();
         for (attempt, message) in messages.iter().enumerate() {
-            assert_eq!(
-                message, &sentence,
-                "case {action} attempt {attempt}: expected every refusal of the same call \
-                 to be worded {sentence:?}, got {message:?}"
+            let case = format!("{action} attempt {attempt}");
+            assert_access_denied_message(
+                &case,
+                message,
+                &caller,
+                iam_action,
+                &named_as,
+                &no_allow(iam_action),
             );
+            minted.push(authorization_details_id(&case, message));
         }
+        let distinct: std::collections::BTreeSet<&String> = minted.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            minted.len(),
+            "case {action}: expected every refusal to point at its own authorization \
+             detail, got {minted:?}"
+        );
     }
 }
 
@@ -715,15 +729,13 @@ async fn the_message_is_the_same_sentence_whichever_region_the_call_addressed() 
             "case {region:?}: expected the withheld call to be refused, got {status}: {body}"
         );
         let message = element(&body, "Message");
-        let sentence = format!(
-            "User: arn:aws:iam::{account}:user/{user_name} is not authorized to perform: \
-             iam:GetUser on resource: user {TARGET} {}",
-            no_allow("iam:GetUser"),
-            account = account_id(),
-        );
-        assert_eq!(
-            message, sentence,
-            "case {region:?}: expected the refusal sentence {sentence:?}, got {message:?}"
+        assert_access_denied_message(
+            region,
+            &message,
+            &format!("arn:aws:iam::{}:user/{user_name}", account_id()),
+            "iam:GetUser",
+            &format!("user {TARGET}"),
+            &no_allow("iam:GetUser"),
         );
     }
 }
@@ -1183,9 +1195,10 @@ async fn a_session_scoped_refusal_is_worded_like_every_other() {
     }
 }
 
-/// RULE: every part of a session-scoped refusal is a fact of the request and of the
-/// documents in force — so the same refused call, repeated and made from elsewhere,
-/// answers the identical message.
+/// RULE: every part of a session-scoped refusal besides the per-request authorization id is
+/// a fact of the request and of the documents in force — so the same refused call, repeated
+/// and made from elsewhere, answers the identical sentence and pointer clause, and a fresh
+/// authorization id each time.
 #[tokio::test]
 async fn a_session_scoped_refusal_is_worded_identically_from_every_region() {
     let (router, engine) = router_with_engine();
@@ -1229,10 +1242,13 @@ async fn a_session_scoped_refusal_is_worded_identically_from_every_region() {
             &format!("role {role_name}"),
             &Withheld::NoSessionAllow.reason("iam:ListRoleTags"),
         );
-        answered.push(message);
+        answered.push(authorization_details_id(region, &message));
     }
-    assert!(
-        answered.windows(2).all(|pair| pair[0] == pair[1]),
-        "expected one wording for the same refused call, got {answered:?}"
+    let distinct: std::collections::BTreeSet<&String> = answered.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        answered.len(),
+        "expected each refusal of the same call to point at its own authorization detail, \
+         got {answered:?}"
     );
 }

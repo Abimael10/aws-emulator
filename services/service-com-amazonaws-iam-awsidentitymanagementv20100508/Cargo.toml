@@ -25,6 +25,11 @@ roxmltree = "0.20"
 # `service-common` carries the ONE reading of the UTC offset an RFC 3339 / `xs:dateTime`
 # timestamp declares, which the metadata document's `validUntil` is read through.
 service-common = { path = "../common" }
+# The authorization details of a refused request are owned and served by IAM Toolbox
+# (`GetRequestAuthorizationDetails`), which a refusal's message points its caller at: this
+# service writes the record of its own refusals into that service's store, through the seam
+# that store publishes (`src/state/authorization/details.rs`).
+service-com-amazonaws-iamtoolbox-authrequestservice = { path = "../service-com-amazonaws-iamtoolbox-authrequestservice" }
 tracing = { workspace = true }
 # Reads the X.509 certificate an `UploadServerCertificate` request carries: the instant it
 # expires, and whether the body is a certificate at all.

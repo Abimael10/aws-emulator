@@ -583,12 +583,23 @@ pub const POLICY_PARSE_FAILED: &str = "The policy failed legacy parsing";
 pub enum PolicyValueDefect {
     /// `Version` is declared as something other than one of [`POLICY_VERSIONS`].
     UnsupportedVersion,
-    /// A statement declares an `Effect` that is not one of [`POLICY_EFFECTS`].
+    /// A statement declares an `Effect` that IS one of [`POLICY_EFFECTS`] but spelled in
+    /// another case (`allow`, `DENY`).
     ///
-    /// The two values are compared LITERALLY: the language defines `Allow` and `Deny`, so a
-    /// statement whose effect is spelled in any other case declares an effect the language
-    /// does not define. A statement that declares NO effect is not this clause — what a
-    /// statement is REQUIRED to carry is [`PolicyDefect::MissingEffect`].
+    /// The language's two values are compared LITERALLY, so such a document declares no
+    /// effect the language defines and is refused — but the word is still one the policy
+    /// parser reads, which is why AWS reports it as the PARSE of the policy having failed
+    /// ([`POLICY_PARSE_FAILED`]) rather than as the document not being a policy. A statement
+    /// that declares NO effect is not this clause — what a statement is REQUIRED to carry is
+    /// [`PolicyDefect::MissingEffect`].
+    MiscasedEffect,
+    /// A statement's `Effect` is no spelling of either word at all: another word, or a value
+    /// that is not a string (a list, a number, an object, `null`).
+    ///
+    /// The language defines the element's value as one of two words, so a value outside them
+    /// is not an effect the parser can read at all and the document is reported as
+    /// unreadable as a policy ([`SYNTAX_ERRORS_IN_POLICY`]) — the same reading a `Version`
+    /// outside the published ones gets ([`Self::UnsupportedVersion`]).
     UnreadableEffect,
     /// A statement's resource element names a value that is neither an ARN
     /// ([`ARN_PREFIX`]) nor [`ANY_RESOURCE`], so it names no resource. The value is carried
@@ -603,8 +614,10 @@ impl PolicyValueDefect {
     /// document: the other two are fixed text.
     pub fn message(&self) -> String {
         match self {
-            Self::UnsupportedVersion => SYNTAX_ERRORS_IN_POLICY.to_string(),
-            Self::UnreadableEffect => POLICY_PARSE_FAILED.to_string(),
+            Self::UnsupportedVersion | Self::UnreadableEffect => {
+                SYNTAX_ERRORS_IN_POLICY.to_string()
+            }
+            Self::MiscasedEffect => POLICY_PARSE_FAILED.to_string(),
             Self::NonResourceValue(value) => {
                 format!("Resource {value} must be in ARN format or \"{ANY_RESOURCE}\".")
             }
@@ -652,8 +665,23 @@ pub fn identity_policy_value_defect(text: &str) -> Option<PolicyValueDefect> {
 /// of its ARNs asks — admits only an ARN.
 fn identity_statement_value_defect(statement: &::serde_json::Value) -> Option<PolicyValueDefect> {
     if let Some(effect) = statement.as_object()?.get("Effect") {
-        if !POLICY_EFFECTS.contains(&effect.as_str().unwrap_or_default()) {
-            return Some(PolicyValueDefect::UnreadableEffect);
+        // What the element declares is read against the language's two words, and HOW it
+        // misses them decides the clause: one of the words in another case is a document the
+        // policy parser reads and refuses, while anything else — another word, or a value
+        // that is not a word at all — is a document it cannot read as a policy. The two are
+        // different facts about the document, and AWS words them differently.
+        let declared = effect.as_str().unwrap_or_default();
+        if !POLICY_EFFECTS.contains(&declared) {
+            return Some(
+                if POLICY_EFFECTS
+                    .iter()
+                    .any(|defined| defined.eq_ignore_ascii_case(declared))
+                {
+                    PolicyValueDefect::MiscasedEffect
+                } else {
+                    PolicyValueDefect::UnreadableEffect
+                },
+            );
         }
     }
     // The resource elements are read through the one walk of them this module already
@@ -1984,7 +2012,7 @@ mod tests {
         // breaks, which published value it declares instead, the form the resource element
         // takes (a string or a list), which spelling of that element names the value, and
         // where in a two-statement document the offending value sits.
-        let rows: [(&str, String, Option<PolicyValueDefect>); 14] = [
+        let rows: [(&str, String, Option<PolicyValueDefect>); 19] = [
             (
                 "every value the language defines",
                 identity("{\"Effect\":\"Allow\",\"Action\":\"svc:DoThing\",\"Resource\":\"arn:aws:svc:::thing\"}"),
@@ -2023,11 +2051,38 @@ mod tests {
             (
                 "an effect written in another case",
                 identity("{\"Effect\":\"allow\",\"Action\":\"svc:A\",\"Resource\":\"*\"}"),
-                Some(PolicyValueDefect::UnreadableEffect),
+                Some(PolicyValueDefect::MiscasedEffect),
+            ),
+            (
+                "the other word in another case",
+                identity("{\"Effect\":\"DENY\",\"Action\":\"svc:A\",\"Resource\":\"*\"}"),
+                Some(PolicyValueDefect::MiscasedEffect),
             ),
             (
                 "an effect the language does not define",
                 identity("{\"Effect\":\"Permit\",\"Action\":\"svc:A\",\"Resource\":\"*\"}"),
+                Some(PolicyValueDefect::UnreadableEffect),
+            ),
+            // An effect that is no word at all: the element cannot be read as an effect,
+            // whichever type carries it.
+            (
+                "an effect written as a list",
+                identity("{\"Effect\":[\"Allow\"],\"Action\":\"svc:A\",\"Resource\":\"*\"}"),
+                Some(PolicyValueDefect::UnreadableEffect),
+            ),
+            (
+                "an effect written as a number",
+                identity("{\"Effect\":1,\"Action\":\"svc:A\",\"Resource\":\"*\"}"),
+                Some(PolicyValueDefect::UnreadableEffect),
+            ),
+            (
+                "an effect written as null",
+                identity("{\"Effect\":null,\"Action\":\"svc:A\",\"Resource\":\"*\"}"),
+                Some(PolicyValueDefect::UnreadableEffect),
+            ),
+            (
+                "an effect written as the empty string",
+                identity("{\"Effect\":\"\",\"Action\":\"svc:A\",\"Resource\":\"*\"}"),
                 Some(PolicyValueDefect::UnreadableEffect),
             ),
             (
@@ -2081,6 +2136,11 @@ mod tests {
             (
                 "an effect the language does not define",
                 PolicyValueDefect::UnreadableEffect,
+                "Syntax errors in policy.".to_string(),
+            ),
+            (
+                "an effect spelled in another case",
+                PolicyValueDefect::MiscasedEffect,
                 "The policy failed legacy parsing".to_string(),
             ),
             (

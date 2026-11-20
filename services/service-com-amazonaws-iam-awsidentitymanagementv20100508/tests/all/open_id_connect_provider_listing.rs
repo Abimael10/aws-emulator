@@ -31,8 +31,8 @@ use crate::open_id_connect_providers::{client_ids, expected_arn, issuer_of, list
 use crate::role_lifecycle::{borrowed, param};
 use crate::saml_provider_listing::split_element;
 use crate::user_lifecycle::{
-    account_id, assert_access_denied_message, call, call_signed_by, element, elements, error_code,
-    router,
+    account_id, assert_access_denied_message, authorization_details_id, call, call_signed_by,
+    element, elements, error_code, router,
 };
 
 /// How many characters a provider URL may carry: `OpenIDConnectProviderUrlType` is len
@@ -599,9 +599,10 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                 );
 
                 // A refusal is not a one-shot: the same call is refused the same way
-                // again, and still reports nothing. Every part of the message is a fact of
-                // the request and of the documents in force, so the second denial reads
-                // identically.
+                // again, and still reports nothing. Every part of the message besides the
+                // per-request authorization id is a fact of the request and of the
+                // documents in force, so the second denial reads identically up to that id
+                // — which is minted per refused request, so it is a new one.
                 let (again_status, again) =
                     call_signed_by(&router, Some(&access_key_id), "ListOpenIDConnectProviders", &[])
                         .await;
@@ -619,10 +620,11 @@ async fn the_listing_is_decided_against_the_callers_identity_policies() {
                     &provider_collection(),
                     &reason,
                 );
-                assert_eq!(
-                    second, message,
-                    "case {case_name:?}: the same refused call must be worded alike every \
-                     time, got {again}"
+                assert_ne!(
+                    authorization_details_id(case_name, &second),
+                    authorization_details_id(case_name, &message),
+                    "case {case_name:?}: each refusal must point at its own authorization \
+                     detail, got {again}"
                 );
                 assert!(
                     listed_arns(&again).is_empty(),

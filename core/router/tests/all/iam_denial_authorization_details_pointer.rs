@@ -23,7 +23,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::iam_authorization_details_pointer::assert_refusal_sentence;
+use crate::iam_authorization_details_pointer::{assert_identity_refusal, sentence_of};
 use crate::query_wire::{element, elements, form_encode};
 
 /// The account every generated emulator presents (`engine::EMULATOR_ACCOUNT_ID`).
@@ -163,7 +163,9 @@ fn refusal(session_name: &str, entity: &str, iam_action: &str) -> String {
     )
 }
 
-/// Make one refused listing as `access_key_id` and answer the message its refusal carried.
+/// Make one refused listing as `access_key_id` and answer the SENTENCE its refusal carried:
+/// the refusal closes with the pointer at that one request's authorization details, whose id
+/// is minted per request, so the sentence is what two refusals of one call share.
 async fn refusal_of(
     router: &MultiServiceRouter,
     case: &str,
@@ -189,12 +191,12 @@ async fn refusal_of(
         .into_iter()
         .next()
         .unwrap_or_else(|| panic!("case {case:?}: no <Message> in {body}"));
-    assert_refusal_sentence(
+    assert_identity_refusal(
         case,
         &message,
         &refusal(session_name, entity, &format!("iam:{action}")),
     );
-    message
+    sentence_of(&message)
 }
 
 /// RULE: a refusal's wording is a function of the request and of the principal it speaks
