@@ -332,12 +332,19 @@ pub(super) const TLS_CIPHER_HEADER: &str = "x-emulator-elbv2-tls-cipher";
 pub(super) const TLS_SERVER_NAME_HEADER: &str = "x-emulator-elbv2-tls-server-name";
 pub(super) const TLS_CERTIFICATE_ARN_HEADER: &str = "x-emulator-elbv2-tls-certificate-arn";
 
+/// The chain the CLIENT presented during that handshake, where the listener asked for one
+/// ([`super::client_certificates`]), URL-encoded as the family a target reads it under
+/// carries it. A fact of the connection like the four above, observed where the handshake ran
+/// and stated here, so what a target is told is never what a client wrote.
+pub(super) const TLS_CLIENT_CERTIFICATE_HEADER: &str = "x-emulator-elbv2-mtls-clientcert";
+
 /// Every header above, for the leg that sets them and the read that takes them off.
-pub(super) const TLS_HEADERS: [&str; 4] = [
+pub(super) const TLS_HEADERS: [&str; 5] = [
     TLS_PROTOCOL_HEADER,
     TLS_CIPHER_HEADER,
     TLS_SERVER_NAME_HEADER,
     TLS_CERTIFICATE_ARN_HEADER,
+    TLS_CLIENT_CERTIFICATE_HEADER,
 ];
 
 /// The address the CONNECTION this request arrived over was opened from, as the end that
@@ -739,6 +746,9 @@ pub(super) struct ConnectionTls {
     pub(super) server_name: Option<String>,
     /// The ARN of the certificate the listener presented for that name.
     pub(super) certificate_arn: Option<String>,
+    /// The chain the CLIENT presented, for a handshake whose listener asked for one and a
+    /// client that answered with a certificate ([`super::client_certificates`]).
+    pub(super) client_certificate: Option<String>,
 }
 
 impl ConnectionTls {
@@ -757,6 +767,7 @@ impl ConnectionTls {
             ssl_cipher: read(TLS_CIPHER_HEADER),
             server_name: read(TLS_SERVER_NAME_HEADER),
             certificate_arn: read(TLS_CERTIFICATE_ARN_HEADER),
+            client_certificate: read(TLS_CLIENT_CERTIFICATE_HEADER),
         };
         headers.retain(|(held, _)| !TLS_HEADERS.contains(&held.as_str()));
         observed
@@ -1028,7 +1039,14 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         // A load balancer the clock still owes its move out of `provisioning` is not serving
         // traffic on the name it published yet. Read, never written: this plane moves no
         // status.
-        let (published_name, drops_invalid_header_fields, mitigation, xff_processing) = {
+        let (
+            published_name,
+            drops_invalid_header_fields,
+            mitigation,
+            xff_processing,
+            client_certificates,
+            traces_requests,
+        ) = {
             let store = state.lock();
             let Some(record) = store.load_balancers.get(&load_balancer_arn) else {
                 return rendered(&Served::status(PROVISIONING_STATUS));
@@ -1045,6 +1063,8 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                 super::invalid_header_fields::drops_invalid_header_fields(record),
                 super::request_framing::mitigation(record),
                 super::forwarded_for::processing(record),
+                super::client_certificates::handling(listener),
+                super::request_tracing::traces(record),
             )
         };
         // The host the CLIENT addressed, for a request this plane did not receive from the
@@ -1149,6 +1169,19 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                     xff_processing,
                     &connecting_address,
                 );
+                // And what it tells that target about the certificate the client presented
+                // to its listener ([`super::client_certificates`]), which is cleared of
+                // whatever the client itself sent under those names either way.
+                super::client_certificates::handed_to_target(
+                    &mut request.headers,
+                    &client_certificates,
+                    request.tls.client_certificate.as_deref(),
+                );
+                // And the trace of the request itself ([`super::request_tracing`]): the
+                // target is told which chain the load balancer served it on.
+                if traces_requests {
+                    super::request_tracing::stamped(&mut request.headers, now);
+                }
                 break super::lambda_target::served(ctx, &forwarded, &request, body).await;
             }
             // The listener forwarded the request to a target of this account, so what answers
@@ -1166,6 +1199,19 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                     xff_processing,
                     &connecting_address,
                 );
+                // And what it tells that target about the certificate the client presented
+                // to its listener ([`super::client_certificates`]), which is cleared of
+                // whatever the client itself sent under those names either way.
+                super::client_certificates::handed_to_target(
+                    &mut request.headers,
+                    &client_certificates,
+                    request.tls.client_certificate.as_deref(),
+                );
+                // And the trace of the request itself ([`super::request_tracing`]): the
+                // target is told which chain the load balancer served it on.
+                if traces_requests {
+                    super::request_tracing::stamped(&mut request.headers, now);
+                }
                 break super::instance_target::served(engine, &forwarded, &request);
             }
             // The listener handed the connection to a load balancer of its own, which is
@@ -1201,6 +1247,10 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                     xff_processing,
                     &connecting_address,
                 );
+                // What the NEXT load balancer's listener tells its target about the client
+                // certificate is that listener's own reading, made when the request reaches
+                // its target on the next pass of this loop
+                // ([`super::client_certificates`]).
                 connecting_address = host_only(&published_name).to_string();
                 client_address = None;
             }

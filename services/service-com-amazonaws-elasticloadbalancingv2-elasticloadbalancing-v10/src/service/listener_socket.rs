@@ -164,6 +164,7 @@ const HEADERS_NOT_FORWARDED: &[&str] = &[
     crate::service::data_plane::TLS_CIPHER_HEADER,
     crate::service::data_plane::TLS_SERVER_NAME_HEADER,
     crate::service::data_plane::TLS_CERTIFICATE_ARN_HEADER,
+    crate::service::data_plane::TLS_CLIENT_CERTIFICATE_HEADER,
 ];
 
 /// Serves ONE load balancer's socket: it terminates TLS under that load balancer's own
@@ -255,6 +256,9 @@ struct NegotiatedTls {
     server_name: Option<String>,
     /// The ARN of the certificate presented for that name.
     certificate_arn: Option<String>,
+    /// The chain the CLIENT presented, for a listener that asked for one and a client that
+    /// answered with a certificate ([`crate::service::client_certificates`]).
+    client_certificate: Option<String>,
 }
 
 /// What one request's FRAMING is judged against: the framings the client wrote on this
@@ -407,7 +411,11 @@ impl ListenerSocket {
             .iter()
             .map(|(_arn, material)| Arc::clone(material))
             .collect();
-        let (conn, negotiated) = match tls_server_config(&presented, plan.ssl_policy.as_deref()) {
+        let (conn, negotiated) = match tls_server_config(
+            &presented,
+            plan.ssl_policy.as_deref(),
+            plan.asks_for_client_certificates,
+        ) {
             // The account's own certificates, as the listener names them.
             Some(config) => {
                 let acceptor = ::tokio_rustls::TlsAcceptor::from(config);
@@ -479,7 +487,13 @@ impl ListenerSocket {
     /// terminates no TLS has no certificate to present and no rules to evaluate, so there
     /// is nothing to serve on it.
     fn plan(&self, load_balancer_arn: &str, tls: bool) -> Option<ConnectionPlan> {
-        let (load_balancer_name, listener_port, ssl_policy, certificate_arns) = {
+        let (
+            load_balancer_name,
+            listener_port,
+            ssl_policy,
+            certificate_arns,
+            asks_for_client_certificates,
+        ) = {
             let store = self.state.lock();
             let record = store.load_balancers.get(load_balancer_arn)?;
             // Every listener of this load balancer that answers a connection of this kind,
@@ -513,6 +527,14 @@ impl ListenerSocket {
                 listener.port,
                 listener.ssl_policy.clone(),
                 listener.presented_certificate_arns(),
+                // Whether this listener's mutual-authentication mode has it ASK the client
+                // for a certificate, which is the only way one is presented at all
+                // ([`crate::service::client_certificates`]).
+                listener
+                    .effective_mutual_authentication()
+                    .and_then(|attributes| attributes.mode)
+                    .as_deref()
+                    == Some(crate::service::client_certificates::PASSTHROUGH_MODE),
             )
         };
         Some(ConnectionPlan {
@@ -520,6 +542,7 @@ impl ListenerSocket {
             listener_port,
             ssl_policy,
             certificates: self.material_of(&certificate_arns),
+            asks_for_client_certificates,
         })
     }
 
@@ -575,6 +598,12 @@ where
             .and_then(|suite| cipher_name(suite.suite())),
         certificate_arn: chosen_certificate(certificates, server_name.as_deref()),
         server_name,
+        // What the CLIENT presented, for a listener that asked: the chain itself, which only
+        // the end that ran the handshake holds
+        // ([`crate::service::client_certificates::presented_chain`]).
+        client_certificate: connection
+            .peer_certificates()
+            .and_then(crate::service::client_certificates::presented_chain),
     }
 }
 
@@ -678,6 +707,9 @@ struct ConnectionPlan {
     /// beside the ARN it is held under. Empty for a connection in the clear, and for a TLS
     /// listener this emulator holds no presentable key material for.
     certificates: Vec<(String, Arc<CertificateKeyMaterial>)>,
+    /// Whether the addressed listener asks the client for a certificate of its own
+    /// ([`crate::service::client_certificates`]).
+    asks_for_client_certificates: bool,
 }
 
 /// The TLS server configuration a listener presenting `certificates` under the security
@@ -690,14 +722,20 @@ struct ConnectionPlan {
 /// covers. The protocol versions are the ones the listener's security policy negotiates
 /// ([`negotiated_versions`]), so a client reads the version that policy allows rather than
 /// whatever this library would prefer.
+///
+/// `asks_for_client_certificates` is the listener's own mutual-authentication mode: a listener
+/// that hands a client certificate to its target asks every client for one
+/// ([`crate::service::client_certificates`]), and every other listener asks for none.
 fn tls_server_config(
     certificates: &[Arc<CertificateKeyMaterial>],
     ssl_policy: Option<&str>,
+    asks_for_client_certificates: bool,
 ) -> Option<Arc<::rustls::ServerConfig>> {
     ::service_common::acm_certificate_termination::server_config(
         certificates,
         &negotiated_versions(ssl_policy),
-        None,
+        asks_for_client_certificates
+            .then(crate::service::client_certificates::PresentedWithoutValidation::asking),
     )
 }
 
@@ -922,6 +960,10 @@ fn forwarded(
             crate::service::data_plane::TLS_CERTIFICATE_ARN_HEADER,
             negotiated.certificate_arn.clone(),
         ),
+        (
+            crate::service::data_plane::TLS_CLIENT_CERTIFICATE_HEADER,
+            negotiated.client_certificate.clone(),
+        ),
     ] {
         if let Some(value) = value {
             builder = builder.header(name, value);
@@ -1033,11 +1075,11 @@ mod tests {
         // caller falls back to the core's own TLS server rather than failing the handshake.
         let certificates = vec![material(&["a.example.com"])];
         assert!(
-            tls_server_config(&certificates, None).is_none(),
+            tls_server_config(&certificates, None, false).is_none(),
             "case material that loads no key: expected no configuration of this service's own"
         );
         assert!(
-            tls_server_config(&[], None).is_none(),
+            tls_server_config(&[], None, false).is_none(),
             "case a listener with no certificate: expected no configuration of this service's own"
         );
     }
@@ -1205,9 +1247,15 @@ mod tests {
     #[test]
     fn the_leg_states_what_the_handshake_negotiated_and_nothing_a_client_wrote() {
         // The rows span what the observation generalises over: a connection that negotiated
-        // everything (protocol, cipher, a server name and a certificate), one whose client
-        // asked for no name, and a connection in the clear, which negotiated nothing.
-        let cases: &[(&str, NegotiatedTls, [Option<&str>; 4])] = &[
+        // everything (protocol, cipher, a server name, a certificate and a certificate the
+        // CLIENT presented), one whose client asked for no name and presented none, and a
+        // connection in the clear, which negotiated nothing.
+        //
+        // The presented chain is URL-encoded PEM, which is what the handshake hands this leg
+        // ([`crate::service::client_certificates::presented_chain`]).
+        const PRESENTED: &str = "-----BEGIN%20CERTIFICATE-----%0AMIIBkTCB%2Bw%3D%3D%0A\
+                                 -----END%20CERTIFICATE-----%0A";
+        let cases: &[(&str, NegotiatedTls, [Option<&str>; 5])] = &[
             (
                 "a client that asked for a name",
                 NegotiatedTls {
@@ -1216,12 +1264,14 @@ mod tests {
                     server_name: Some("api.example.com".to_string()),
                     certificate_arn: Some("arn:aws:acm:us-west-2:111122223333:certificate/c1"
                         .to_string()),
+                    client_certificate: Some(PRESENTED.to_string()),
                 },
                 [
                     Some(TLS_1_3),
                     Some("TLS_AES_128_GCM_SHA256"),
                     Some("api.example.com"),
                     Some("arn:aws:acm:us-west-2:111122223333:certificate/c1"),
+                    Some(PRESENTED),
                 ],
             ),
             (
@@ -1232,18 +1282,20 @@ mod tests {
                     server_name: None,
                     certificate_arn: Some("arn:aws:acm:us-west-2:111122223333:certificate/c2"
                         .to_string()),
+                    client_certificate: None,
                 },
                 [
                     Some(TLS_1_2),
                     Some("ECDHE-RSA-AES128-GCM-SHA256"),
                     None,
                     Some("arn:aws:acm:us-west-2:111122223333:certificate/c2"),
+                    None,
                 ],
             ),
             (
                 "a connection in the clear",
                 NegotiatedTls::default(),
-                [None, None, None, None],
+                [None, None, None, None, None],
             ),
         ];
         for (case, negotiated, expected) in cases {

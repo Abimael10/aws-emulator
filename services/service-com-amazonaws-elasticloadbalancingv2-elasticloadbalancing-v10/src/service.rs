@@ -126,6 +126,13 @@ pub mod request_head;
 
 pub mod forwarded_for;
 
+/// The client certificate an HTTPS listener asks for, and what the target it forwards to is
+/// told about the one a client presented.
+pub mod client_certificates;
+
+/// The trace identifier a load balancer stamps on every request it forwards.
+pub mod request_tracing;
+
 pub mod target_group_selection;
 
 pub mod user_authentication;

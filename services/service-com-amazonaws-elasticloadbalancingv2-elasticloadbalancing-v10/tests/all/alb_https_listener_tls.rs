@@ -355,14 +355,35 @@ pub(crate) async fn dial(published: &str) -> tokio::net::TcpStream {
 /// presents, and a client that refused an unexpected one would report a handshake failure
 /// instead of naming the certificate it got.
 pub(crate) fn client_config() -> Arc<rustls::ClientConfig> {
+    client_config_presenting(None)
+}
+
+/// [`client_config`] for a client that PRESENTS a certificate of its own, which is what a
+/// client of a listener in mutual-authentication passthrough mode does
+/// (`alb_mutual_authentication_passthrough`): the certificate and the key are the minted
+/// material, read with the same PEM reader this service loads key material with.
+///
+/// `None` presents none, which is every other client of an HTTPS listener.
+pub(crate) fn client_config_presenting(presented: Option<&Minted>) -> Arc<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .expect("the provider supports the default protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AssertedAfterwards(provider)));
+    let Some(presented) = presented else {
+        return Arc::new(builder.with_no_client_auth());
+    };
+    let chain = vec![rustls::pki_types::CertificateDer::from(
+        presented.der.clone(),
+    )];
+    let key = rustls_pemfile::private_key(&mut presented.private_key_pem.as_bytes())
+        .expect("the minted key reads as PEM")
+        .expect("the minted material carries a private key");
     Arc::new(
-        rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
-            .with_safe_default_protocol_versions()
-            .expect("the provider supports the default protocol versions")
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AssertedAfterwards(provider)))
-            .with_no_client_auth(),
+        builder
+            .with_client_auth_cert(chain, key)
+            .expect("the minted certificate and key make a client identity"),
     )
 }
 
