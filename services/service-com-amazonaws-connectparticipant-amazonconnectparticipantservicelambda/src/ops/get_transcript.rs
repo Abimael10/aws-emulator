@@ -11,7 +11,9 @@
 //! where the previous page stopped: on a continuation the cursor's `SortOrder`,
 //! `ScanDirection` and start position win over any supplied alongside the token, while
 //! `MaxResults` is taken from the continuation request, so a caller may re-page the same
-//! scan at a different page size. This operation only reads state.
+//! scan at a different page size. The member is reported on EVERY page: the last page of a
+//! scan carries the terminal token ([`TERMINAL_NEXT_TOKEN`]) rather than dropping it. This
+//! operation only reads state.
 //!
 //! ## Shape of an operation
 //!
@@ -306,11 +308,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(|&index| transcript_item(&state, &session.transcript[index]))
             .collect();
-        // A continuation is reported only when the next page would make progress: a page
-        // size of 0 consumes nothing, so it reports no `NextToken` rather than a token
+        // `NextToken` is reported on every page. A page the scan continues past carries the
+        // cursor that resumes it; the page that ends the scan carries the terminal token, so
+        // a client always reads the member and reads from it that there is no further page.
+        // A page size of 0 consumes nothing, so it ends the scan rather than issuing a token
         // that would hand back the same empty page for ever.
-        let next_token =
-            (max_results > 0 && page_end < scan.len()).then(|| cursor.at(page_end).encode());
+        let next_token = Some(if max_results > 0 && page_end < scan.len() {
+            cursor.at(page_end).encode()
+        } else {
+            TERMINAL_NEXT_TOKEN.to_string()
+        });
 
         Ok(GetTranscriptOutput {
             initial_contact_id: Some(session.initial_contact_id.clone()),
@@ -336,6 +343,15 @@ const DEFAULT_MAX_RESULTS: usize = 10;
 /// `MaxResults`'s modelled range is 0..100; the boundary validator already refuses
 /// anything above it, and this keeps a page bounded if it ever does not.
 const MAX_RESULTS_CEILING: usize = 100;
+
+/// The `NextToken` the page that ends a scan reports: the empty string.
+///
+/// A paginated read reports its pagination token on every page, with the terminal page
+/// carrying a token that continues nothing — so a client reads the member whether or not
+/// more items remain, rather than having to tell an absent member from an exhausted scan.
+/// It is not a token this service issues a continuation from: `NextToken` is modelled with
+/// a minimum length of 1, so feeding it back is refused as the input it is.
+const TERMINAL_NEXT_TOKEN: &str = "";
 
 /// The longest `NextToken` this service can have issued: a cursor's JSON is a fixed set
 /// of members (a UUID contact id, two enum values, two indices and a flag), hex-encoded,
@@ -544,9 +560,11 @@ fn transcript_item(
                 })
                 .collect()
         }),
-        // Message receipts: the metadata is reported only for an item some recipient has
-        // acknowledged, which is the only information `MessageMetadata` carries here.
-        message_metadata: (!stored.receipts.is_empty()).then(|| MessageMetadata {
+        // Message receipts: an item a receipt can be recorded against reports its own
+        // metadata on every read, carrying its id and the receipts recorded so far — an
+        // EMPTY list while no recipient has acknowledged it, which is what tells a client
+        // "no receipts yet" apart from an item that has no receipts at all.
+        message_metadata: carries_message_metadata(stored).then(|| MessageMetadata {
             message_id: Some(stored.id.clone()),
             receipts: Some(
                 stored
@@ -567,4 +585,19 @@ fn transcript_item(
         related_contact_id: None,
         contact_id: Some(stored.contact_id.clone()),
     }
+}
+
+/// Whether a stored item reports `MessageMetadata`.
+///
+/// `Item$MessageMetadata` is "The metadata related to the message. Currently this supports
+/// only information related to message receipts", so it belongs to the items a message
+/// receipt can name: what a participant SENT into the conversation — a message, and the
+/// attachment that is a message whose content is a file. A chat EVENT is not a message and
+/// is acknowledged by nothing, so it reports none; an item that somehow carries a receipt
+/// reports it whatever its type, because the receipt is observable through this member
+/// alone.
+fn carries_message_metadata(stored: &crate::state::TranscriptItem) -> bool {
+    !stored.receipts.is_empty()
+        || stored.item_type == crate::state::CHAT_ITEM_TYPE_MESSAGE
+        || stored.item_type == crate::state::CHAT_ITEM_TYPE_ATTACHMENT
 }

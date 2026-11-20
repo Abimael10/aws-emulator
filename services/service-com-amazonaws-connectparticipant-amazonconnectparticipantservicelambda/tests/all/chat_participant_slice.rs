@@ -213,6 +213,10 @@ fn receipt_content(message_id: &str) -> String {
 }
 
 /// One `GetTranscript` page: the items and the continuation token.
+///
+/// A page reports `NextToken` whether or not the scan continues past it, so this asserts
+/// the member is PRESENT and answers a continuation only for a token that continues the
+/// scan: the terminal token (the empty string) is the end of the pages.
 async fn get_transcript(
     router: &MultiServiceRouter,
     connection_token: &str,
@@ -227,7 +231,8 @@ async fn get_transcript(
     let next = body
         .get("NextToken")
         .and_then(Value::as_str)
-        .map(str::to_string);
+        .unwrap_or_else(|| panic!("GetTranscript {request} reported no NextToken: {body:?}"));
+    let next = (!next.is_empty()).then(|| next.to_string());
     (items, next)
 }
 
@@ -489,9 +494,17 @@ async fn a_sent_message_comes_back_from_the_transcript_that_stored_it() {
         !participant_id.is_empty(),
         "case round trip: expected the item attributed to a participant, got {items:?}"
     );
-    assert!(
-        items[0].get("MessageMetadata").is_none(),
-        "case round trip: a message nobody acknowledged carries no MessageMetadata, got {items:?}"
+    let metadata = items[0]
+        .get("MessageMetadata")
+        .unwrap_or_else(|| panic!("case round trip: expected MessageMetadata, got {items:?}"));
+    assert_eq!(
+        (
+            metadata["MessageId"].as_str(),
+            metadata["Receipts"].as_array().map(Vec::len)
+        ),
+        (Some(message_id.as_str()), Some(0)),
+        "case round trip: a message nobody acknowledged names itself and carries no \
+         receipts, got {metadata:?}"
     );
     let initial_contact_id = transcript["InitialContactId"].as_str().unwrap_or_default();
     assert!(
@@ -1066,9 +1079,9 @@ async fn paging_a_transcript_visits_every_item_exactly_once() {
     }
 
     // `MaxResults` is modelled with range 0..100, so an explicit 0 is a valid page size
-    // and is honoured as one: an empty page. No `NextToken` comes back with it, because a
-    // page that consumes nothing cannot make progress and a continuation would hand back
-    // the same empty page for ever.
+    // and is honoured as one: an empty page. It ends the scan, because a page that consumes
+    // nothing cannot make progress and a continuation would hand back the same empty page
+    // for ever — so it carries the terminal `NextToken` rather than one of ours.
     let (status, body) = post(
         &router,
         "/participant/transcript",
@@ -1082,9 +1095,11 @@ async fn paging_a_transcript_visits_every_item_exactly_once() {
         Some(0),
         "case MaxResults 0: expected an empty page, got {body:?}"
     );
-    assert!(
-        body.get("NextToken").is_none(),
-        "case MaxResults 0: expected no NextToken for a page that cannot progress, got {body:?}"
+    assert_eq!(
+        body.get("NextToken").and_then(Value::as_str),
+        Some(""),
+        "case MaxResults 0: expected the terminal NextToken for a page that cannot \
+         progress, got {body:?}"
     );
 }
 
@@ -2520,4 +2535,263 @@ async fn an_authentication_session_is_current_for_exactly_the_documented_minute(
         !cancelled.is_current(initiated_at),
         "case a cancelled session: expected is_current == false, got true"
     );
+}
+
+/// One row of [`every_transcript_page_reports_its_pagination_token`]: how much the chat
+/// holds and how large a page it is read at, which together decide how many pages the scan
+/// has.
+#[derive(Debug, Clone, Copy)]
+struct PageCase {
+    /// What this row is.
+    case: &'static str,
+    /// How many messages the chat holds before the scan.
+    messages: usize,
+    /// The `MaxResults` the scan is requested with; `None` leaves the member out, which the
+    /// model documents as a page of 10.
+    max_results: Option<i64>,
+    /// How many pages the whole scan takes at that page size.
+    pages: usize,
+}
+
+/// `GetTranscript` reports `NextToken` on EVERY page: a continuation while the scan has
+/// more to serve, and the terminal token (the empty string) on the page that ends it.
+#[tokio::test]
+async fn every_transcript_page_reports_its_pagination_token() {
+    let router = router();
+
+    // The rows differ in how many items the scan covers and in the page size it is sliced
+    // at, so they span a scan that fits one page, one that takes several, the documented
+    // default page size, and a scan with nothing in it at all.
+    let cases: &[PageCase] = &[
+        PageCase { case: "one message, default page size", messages: 1, max_results: None, pages: 1 },
+        PageCase { case: "three messages, one per page", messages: 3, max_results: Some(1), pages: 3 },
+        PageCase { case: "three messages, two per page", messages: 3, max_results: Some(2), pages: 2 },
+        PageCase { case: "three messages in one page", messages: 3, max_results: Some(3), pages: 1 },
+        PageCase { case: "twelve messages, default page size", messages: 12, max_results: None, pages: 2 },
+        PageCase { case: "three messages, the largest page", messages: 3, max_results: Some(100), pages: 1 },
+        PageCase { case: "an empty transcript", messages: 0, max_results: Some(5), pages: 1 },
+    ];
+
+    for (
+        index,
+        PageCase {
+            case,
+            messages,
+            max_results,
+            pages: expected_pages,
+        },
+    ) in cases.iter().copied().enumerate()
+    {
+        let token = connect(&router, &format!("participant-token-pages-{index}")).await;
+        for index in 0..messages {
+            send_message(&router, &token, &format!("{case} message {index}")).await;
+        }
+
+        let mut request = json!({"SortOrder": "ASCENDING", "ScanDirection": "FORWARD"});
+        if let Some(max_results) = max_results {
+            request["MaxResults"] = json!(max_results);
+        }
+        let mut pages = 0usize;
+        let mut served = 0usize;
+        loop {
+            let (status, body) =
+                post(&router, "/participant/transcript", Some(&token), &request).await;
+            assert_eq!(status, 200, "case {case:?}: got {body:?}");
+            pages += 1;
+            served += body["Transcript"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: no Transcript in {body:?}"))
+                .len();
+            let next = body
+                .get("NextToken")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: page {pages} reported no NextToken: {body:?}")
+                });
+            if next.is_empty() {
+                break;
+            }
+            assert!(
+                pages < expected_pages,
+                "case {case:?}: page {pages} of {expected_pages} reported a continuation \
+                 {next:?} after serving {served} of {messages} items"
+            );
+            // A continuation re-states `MaxResults`, which is taken from the continuation
+            // request, so every page of one row is sliced at that row's page size.
+            request = json!({"NextToken": next});
+            if let Some(max_results) = max_results {
+                request["MaxResults"] = json!(max_results);
+            }
+        }
+        assert_eq!(
+            (pages, served),
+            (expected_pages, messages),
+            "case {case:?}: expected {expected_pages} page(s) covering {messages} item(s), \
+             got {pages} page(s) covering {served}"
+        );
+
+        // The terminal token continues nothing: `NextToken` is modelled with a minimum
+        // length of 1, so handing it back is refused rather than restarting the scan.
+        let (status, body) = post(
+            &router,
+            "/participant/transcript",
+            Some(&token),
+            &json!({"NextToken": ""}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the terminal NextToken to be refused as input, \
+             got {body:?}"
+        );
+    }
+}
+
+/// One row of [`message_metadata_is_reported_for_the_items_a_receipt_can_name`]: a kind of
+/// transcript item, and whether `Item$MessageMetadata` belongs to it.
+#[derive(Debug, Clone, Copy)]
+struct MetadataCase {
+    /// What this row is.
+    case: &'static str,
+    /// `Item$Type`, from `CHAT_ITEM_TYPE_VALUES`.
+    item_type: &'static str,
+    /// Whether an item of that type reports `MessageMetadata` while nobody has
+    /// acknowledged it.
+    metadata: bool,
+}
+
+/// Every transcript item a message receipt can name reports its own `MessageMetadata` —
+/// naming itself, and carrying an EMPTY receipt list until a recipient acknowledges it.
+#[tokio::test]
+async fn message_metadata_is_reported_for_the_items_a_receipt_can_name() {
+    let harness = router();
+    let participant_token = "participant-token-metadata";
+    let token = connect(&harness, participant_token).await;
+
+    // The rows are the item types a transcript holds: the MESSAGE `SendMessage` appends,
+    // the ATTACHMENT a confirmed upload appends, and a chat EVENT, which is not a message
+    // and which no receipt names. (`CHAT_ITEM_TYPE_VALUES` in the service's shared types.)
+    let cases: &[MetadataCase] = &[
+        MetadataCase { case: "a sent message", item_type: "MESSAGE", metadata: true },
+        MetadataCase { case: "a confirmed attachment", item_type: "ATTACHMENT", metadata: true },
+        MetadataCase { case: "a chat event", item_type: "EVENT", metadata: false },
+    ];
+
+    let mut expected: Vec<(MetadataCase, String)> = Vec::new();
+    for case in cases.iter().copied() {
+        let id = match case.item_type {
+            "MESSAGE" => send_message(&harness, &token, "metadata message").await,
+            // The upload flow has its own suite (`tests/all/attachments.rs`); what this
+            // suite needs is an item of each TYPE in the transcript, so the other two are
+            // appended through the very state calls `CompleteAttachmentUpload` and a chat
+            // event append with.
+            other => append_stored_item(&harness, participant_token, other),
+        };
+        expected.push((case, id));
+    }
+
+    let (items, _) = get_transcript(
+        &harness,
+        &token,
+        &json!({"MaxResults": 100, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}),
+    )
+    .await;
+    for (MetadataCase { case, item_type, metadata }, id) in &expected {
+        let item = items
+            .iter()
+            .find(|item| item["Id"].as_str() == Some(id.as_str()))
+            .unwrap_or_else(|| panic!("case {case:?}: no {item_type} item in {items:?}"));
+        let reported = item.get("MessageMetadata");
+        assert_eq!(
+            reported.is_some(),
+            *metadata,
+            "case {case:?}: expected MessageMetadata presence {metadata}, got {item:?}"
+        );
+        if let Some(reported) = reported {
+            assert_eq!(
+                (
+                    reported["MessageId"].as_str(),
+                    reported["Receipts"].as_array().map(Vec::len)
+                ),
+                (Some(id.as_str()), Some(0)),
+                "case {case:?}: expected the item's own Id and an empty receipt list, \
+                 got {reported:?}"
+            );
+        }
+    }
+
+    // An acknowledgement is observable through that same member: the list that was empty
+    // now carries the recipient's receipt.
+    let message_id = expected
+        .iter()
+        .find(|(case, _)| case.item_type == "MESSAGE")
+        .map(|(_, id)| id.clone())
+        .expect("the message row");
+    let (status, body) = post(
+        &harness,
+        "/participant/event",
+        Some(&token),
+        &json!({"ContentType": "application/vnd.amazonaws.connect.event.message.delivered",
+                "Content": receipt_content(&message_id)}),
+    )
+    .await;
+    assert_eq!(status, 200, "case a delivered receipt: got {body:?}");
+    let (items, _) = get_transcript(
+        &harness,
+        &token,
+        &json!({"MaxResults": 100, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}),
+    )
+    .await;
+    let item = items
+        .iter()
+        .find(|item| item["Id"].as_str() == Some(message_id.as_str()))
+        .unwrap_or_else(|| panic!("case a delivered receipt: the message is not in {items:?}"));
+    let receipts = item["MessageMetadata"]["Receipts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case a delivered receipt: expected Receipts on {item:?}"));
+    assert_eq!(
+        receipts.len(),
+        1,
+        "case a delivered receipt: one recipient acknowledged it, got {receipts:?}"
+    );
+    assert_eq!(
+        receipts[0]["RecipientParticipantId"].as_str(),
+        item["ParticipantId"].as_str(),
+        "case a delivered receipt: expected the acknowledging participant, got {receipts:?}"
+    );
+}
+
+/// Append an item of `item_type` to the transcript of the chat `participant_token` names,
+/// through the state calls the service's own appenders use, and answer its `Id`.
+fn append_stored_item(harness: &Harness, participant_token: &str, item_type: &str) -> String {
+    let store = harness.store();
+    let mut state = store.lock();
+    let contact_id = state
+        .participant_tokens
+        .get(participant_token)
+        .cloned()
+        .expect("the chat the participant token names");
+    let session = state
+        .sessions
+        .get_mut(&contact_id)
+        .expect("the session the started chat registered");
+    let now = SystemTime::now();
+    match item_type {
+        "ATTACHMENT" => session.append_attachment(
+            participant::state::new_id(),
+            "image/png".to_string(),
+            now,
+        ),
+        other => {
+            session
+                .append(
+                    other,
+                    Some("{}".to_string()),
+                    "application/vnd.amazonaws.connect.event.typing".to_string(),
+                    None,
+                    now,
+                )
+                .0
+        }
+    }
 }
