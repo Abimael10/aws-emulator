@@ -7,13 +7,17 @@
 //! ## What an update changes, and what it leaves alone
 //!
 //! The input models every member of `Webhook` a caller may change (the branch filter,
-//! the filter groups, the build type and the pull-request build policy) and carries no
-//! sentinel for "leave this one as it is", and CodeBuild offers no other call for
-//! dropping a webhook's filters. So the request IS the webhook's configuration
-//! afterwards: a configuration member the request omits is cleared. The members the
-//! input does not model (the payload URL, `manualCreation`, the scope configuration and
-//! the status) identify the webhook that was created and are left exactly as they were,
-//! and the secret changes only when `rotateSecret` asks for it.
+//! the filter groups, the build type and the pull-request build policy), and every one
+//! of them is OPTIONAL: an update is PARTIAL. A configuration member the request
+//! CARRIES replaces the stored one; a member it OMITS leaves the stored one exactly as
+//! it was. So the shortest form of the call — `projectName` alone, which is how a
+//! caller rotates a secret or re-reads the record without rewriting it — changes no
+//! configuration at all and reports the webhook as it stands, and a member with an
+//! empty value of its own (an empty branch filter, an empty list of filter groups) is
+//! cleared by SENDING that empty value rather than by leaving the member out. The
+//! members the input does not model (the payload URL, `manualCreation`, the scope
+//! configuration and the status) identify the webhook that was created and are left
+//! exactly as they were, and the secret changes only when `rotateSecret` asks for it.
 //!
 //! ## What an update needs before it changes anything
 //!
@@ -245,16 +249,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        if let Some(message) =
-            crate::state::webhook_build_type_violation(&source_type, input.build_type.as_deref())
-        {
-            return Err(refuse(
-                Self::NAME,
-                ctx,
-                crate::state::AuditOutcome::ValidationRefused,
-                &project_arn,
-                invalid_input(message),
-            ));
+        // The build-type rule pairs the build type a request SETS with the project's
+        // stored source type, so it is judged only when this request carries one. An
+        // update that names no build type sets none: the stored value — accepted when
+        // the call that set it was served — stands, and an absent member is no build
+        // type to judge. (On a create an absent member IS a setting, the default
+        // repository-event webhook, which is why that handler judges it there.)
+        if let Some(requested) = input.build_type.as_deref() {
+            if let Some(message) =
+                crate::state::webhook_build_type_violation(&source_type, Some(requested))
+            {
+                return Err(refuse(
+                    Self::NAME,
+                    ctx,
+                    crate::state::AuditOutcome::ValidationRefused,
+                    &project_arn,
+                    invalid_input(message),
+                ));
+            }
         }
 
         // An update rewrites the hook the repository provider holds as well as the
@@ -378,11 +390,10 @@ fn refuse(
 
 /// Apply one `UpdateWebhook` request's configuration to the stored webhook.
 ///
-/// The request is the webhook's configuration afterwards (see the module docs), so each
-/// configuration member is REPLACED by what the request carries — cleared when it
-/// carries none. The input is DESTRUCTURED rather than read member by member, so a
-/// member the model gains later fails to compile here instead of being silently
-/// dropped.
+/// An update is partial (see the module docs): every configuration member the request
+/// carries REPLACES the stored one, and every member it omits leaves the stored one
+/// alone. The input is DESTRUCTURED rather than read member by member, so a member the
+/// model gains later fails to compile here instead of being silently dropped.
 fn apply_update(webhook: &mut Webhook, input: UpdateWebhookInput) {
     let UpdateWebhookInput {
         // The webhook is identified by the project it belongs to.
@@ -394,10 +405,22 @@ fn apply_update(webhook: &mut Webhook, input: UpdateWebhookInput) {
         build_type,
         pull_request_build_policy,
     } = input;
-    webhook.branch_filter = branch_filter;
-    webhook.filter_groups = filter_groups;
-    webhook.build_type = build_type;
-    webhook.pull_request_build_policy = pull_request_build_policy;
+    replace_if_carried(&mut webhook.branch_filter, branch_filter);
+    replace_if_carried(&mut webhook.filter_groups, filter_groups);
+    replace_if_carried(&mut webhook.build_type, build_type);
+    replace_if_carried(
+        &mut webhook.pull_request_build_policy,
+        pull_request_build_policy,
+    );
+}
+
+/// Store what the request carried for one configuration member, and leave the stored
+/// value as it is when the request carried nothing for it: the one partial-update step
+/// every configuration member of this input takes.
+fn replace_if_carried<T>(stored: &mut Option<T>, carried: Option<T>) {
+    if carried.is_some() {
+        *stored = carried;
+    }
 }
 
 /// The modelled refusal of a request this operation cannot serve as sent.

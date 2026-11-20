@@ -9,11 +9,12 @@
 //! from the project the request names, and reported by a later read exactly as it was
 //! persisted — bar the `secret`, which the call that MINTS it reports and a read
 //! withholds (see `tests/all/webhook_secret_is_minted_once.rs`). An update rewrites that
-//! record's configuration from the request it
-//! carries — the request IS the configuration afterwards, so a member it omits is
-//! cleared — while the members identifying the created webhook, and its secret unless
-//! `rotateSecret` asks for a new one, are left alone. Every table below spans a
-//! catalogue the model declares, not one recorded request.
+//! record's configuration from the request it carries, member by member: an update is
+//! PARTIAL, so a member the request carries is stored and a member it omits keeps the
+//! value the webhook already had — while the members identifying the created webhook,
+//! and its secret unless `rotateSecret` asks for a new one, are left alone (the suite
+//! that owns the partial-update rule itself is `tests/all/webhook_partial_update.rs`).
+//! Every table below spans a catalogue the model declares, not one recorded request.
 
 use std::sync::Arc;
 
@@ -665,7 +666,11 @@ async fn creating_a_webhook_touches_the_projects_last_modified() {
 /// The configuration members `UpdateWebhook` models, from
 /// `smithy_query(query="operation", operation="UpdateWebhook")`: everything in its input
 /// beside the `projectName` that identifies the webhook and the `rotateSecret` flag.
-const CONFIGURATION_MEMBERS: &[&str] = &[
+///
+/// `pub(crate)` here and below: `tests/all/webhook_partial_update.rs` judges the same
+/// webhook configuration against the same rule, so the member lists and the merge step
+/// live here once rather than in a copy per suite.
+pub(crate) const CONFIGURATION_MEMBERS: &[&str] = &[
     "branchFilter",
     "filterGroups",
     "buildType",
@@ -674,10 +679,10 @@ const CONFIGURATION_MEMBERS: &[&str] = &[
 
 /// The members that identify the webhook CodeBuild created, which no update may touch:
 /// `UpdateWebhook`'s input models none of them.
-const IDENTITY_MEMBERS: &[&str] = &["url", "payloadUrl", "manualCreation", "status"];
+pub(crate) const IDENTITY_MEMBERS: &[&str] = &["url", "payloadUrl", "manualCreation", "status"];
 
 /// A webhook configuration that sets every member [`CONFIGURATION_MEMBERS`] names, so a
-/// later update can be seen to replace — and to clear — each one. The enum values are
+/// later update can be seen to replace — or to leave alone — each one. The enum values are
 /// the model's: `WebhookFilterType`, `WebhookBuildType`,
 /// `PullRequestBuildCommentApproval` and `PullRequestBuildApproverRole`.
 fn full_configuration() -> Value {
@@ -724,7 +729,7 @@ async fn update_webhook(
 }
 
 /// Assert that `webhook` reports the same configuration as `expected`, member by member.
-fn assert_same_configuration(case: &str, webhook: &Value, expected: &Value) {
+pub(crate) fn assert_same_configuration(case: &str, webhook: &Value, expected: &Value) {
     for member in CONFIGURATION_MEMBERS {
         assert_eq!(
             webhook[*member], expected[*member],
@@ -772,14 +777,27 @@ fn rewind_secret_stamp(engine: &Arc<engine::InMemoryEngine>, project: &str) -> O
     Some(rewound)
 }
 
-/// Every configuration member the input models, set on its own and all at once: the
-/// request is the webhook's configuration afterwards, so each member it carries is
-/// stored and each one it omits is cleared, while the members identifying the created
-/// webhook are left exactly as they were.
+/// The configuration a webhook created with `created` carries once an update that sent
+/// `request` has been applied: an update is partial, so it is every member the request
+/// carries over every member it omits.
+pub(crate) fn configuration_after(created: &Value, request: &Value) -> Value {
+    let mut expected = created.clone();
+    if let (Value::Object(target), Value::Object(members)) = (&mut expected, request.clone()) {
+        target.extend(members);
+    }
+    expected
+}
+
+/// Every configuration member the input models, set on its own and all at once: each
+/// member the request carries is stored, each member it omits keeps the value the
+/// webhook already had, and a member with an empty value of its own is cleared by
+/// SENDING that empty value — while the members identifying the created webhook are
+/// left exactly as they were.
 #[tokio::test]
-async fn an_update_replaces_the_configuration_it_models() {
+async fn an_update_replaces_only_the_configuration_it_carries() {
     // One row per member of [`CONFIGURATION_MEMBERS`], plus a request that carries no
-    // configuration at all and one that carries every member.
+    // configuration at all, one that carries every member, and the two members that
+    // have an empty value of their own sent empty.
     let cases: &[(&str, Value)] = &[
         (
             "branchFilter alone",
@@ -802,6 +820,8 @@ async fn an_update_replaces_the_configuration_it_models() {
         ),
         ("no configuration at all", json!({})),
         ("every member at once", full_configuration()),
+        ("an empty branchFilter", json!({"branchFilter": ""})),
+        ("an empty filterGroups list", json!({"filterGroups": []})),
     ];
 
     for (index, (case, request)) in cases.iter().enumerate() {
@@ -815,6 +835,7 @@ async fn an_update_replaces_the_configuration_it_models() {
             &full_configuration(),
         );
 
+        let expected = configuration_after(&full_configuration(), request);
         let (status, body) = update_webhook(&router, &project, request.clone()).await;
         assert_eq!(
             status, 200,
@@ -822,7 +843,7 @@ async fn an_update_replaces_the_configuration_it_models() {
         );
         let updated = body["webhook"].clone();
 
-        assert_same_configuration(case, &updated, request);
+        assert_same_configuration(case, &updated, &expected);
         for member in IDENTITY_MEMBERS {
             assert_eq!(
                 updated[*member], created[*member],
@@ -835,7 +856,7 @@ async fn an_update_replaces_the_configuration_it_models() {
         // Round trip: the project reports exactly the configuration the update stored,
         // and a second read reports the same again.
         let stored = read_project(&router, &project).await["webhook"].clone();
-        assert_same_configuration(&format!("{case}: read back"), &stored, request);
+        assert_same_configuration(&format!("{case}: read back"), &stored, &expected);
         let again = read_project(&router, &project).await["webhook"].clone();
         assert_eq!(
             again, stored,

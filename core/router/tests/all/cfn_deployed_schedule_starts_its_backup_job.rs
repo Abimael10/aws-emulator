@@ -42,11 +42,14 @@
 //!
 //! The rows of the first table differ along exactly what the rule generalises over: the FORM the
 //! `ScheduleExpression` states the cadence in (`rate` with a singular and with a plural unit, and
-//! `cron` naming its own instants), each of which has its first firing fall due the same span
-//! after the rule can reach a target. The second table differs along what the policies in force
-//! on the EXECUTION role say about the task's one call — the action it needs, and another action
-//! of the same service that grants nothing about it — with both chains deployed by ONE template
-//! so the permitted chain is the positive control that says the stack's schedule really fired.
+//! `cron` naming its own instants). A `rate` rule's first firing falls due the span this emulator
+//! holds a new rule for, while a `cron` expression NAMES the instants it fires at — so the cron
+//! row states a cadence that recurs within the suite's patience, the way
+//! `crate::events_schedule_rule_starts_its_state_machine` states its own. The second table differs
+//! along what the policies in force on the EXECUTION role say about the task's one call — the
+//! action it needs, and another action of the same service that grants nothing about it — with
+//! both chains deployed by ONE template so the permitted chain is the positive control that says
+//! the stack's schedule really fired.
 //!
 //! What is NOT asserted here, because it is asserted elsewhere:
 //! `crate::events_schedule_rule_starts_its_state_machine` pins the scheduled-event envelope and
