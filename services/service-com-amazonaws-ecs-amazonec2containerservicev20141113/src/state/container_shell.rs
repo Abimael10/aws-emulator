@@ -381,6 +381,10 @@ impl ContainerProgram {
     /// The program the argument vector `entry_point` followed by `command` runs, or `None`
     /// when the launch named no vector at all — a container whose image's own entry point
     /// is what would run, which this emulator does not hold and therefore does not invent.
+    /// The command an IMAGE of this emulator's own catalog declares is resolved by the caller
+    /// and handed in as `command`
+    /// (`super::container_servers::image_declared_command`), so what arrives here is always a
+    /// vector something named.
     ///
     /// `entryPoint` comes first because that is the order the container runtime exec's
     /// them: "the entry point ... command is passed as the arguments to the entry point".

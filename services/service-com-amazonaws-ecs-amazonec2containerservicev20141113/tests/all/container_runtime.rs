@@ -51,8 +51,10 @@ const STREAM_PREFIX: &str = "run";
 /// The one container of every task definition below.
 const CONTAINER: &str = "app";
 
-/// The image the containers start from; irrelevant to these rules, so one value.
-const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
+/// The image the containers start from: one this emulator holds no image of, so what every row
+/// below observes is the container's own program and its own layer, with nothing an image
+/// shipped into it (`container_servers::image_shipped_files`).
+const IMAGE: &str = "public.ecr.aws/amazonlinux/amazonlinux:2023";
 
 /// How often a poll re-reads the emulator.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);

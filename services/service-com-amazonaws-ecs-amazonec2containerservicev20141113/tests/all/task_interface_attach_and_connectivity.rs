@@ -60,8 +60,11 @@ use crate::task_lifecycle::container;
 /// The cluster every task below runs in.
 const CLUSTER: &str = "attachprogress";
 
-/// The image the containers start from; irrelevant to these rules, so one value.
-const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
+/// The image the containers start from: one this emulator holds no server for, so a container
+/// of it runs no program of its own and a task of it finishes its own work — which is what one
+/// row below is about. An image whose own command is a server in the foreground would hold such
+/// a task `RUNNING` instead (`container_servers::image_declared_command`).
+const IMAGE: &str = "public.ecr.aws/amazonlinux/amazonlinux:2023";
 
 /// How often a poll re-reads a task. Well inside one step of the interface's progression,
 /// so every status it passes through is seen.

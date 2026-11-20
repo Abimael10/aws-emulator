@@ -97,8 +97,12 @@ const SECURITY_GROUP: &str = "sg-0ec50000000000001";
 
 /// The image every container names. Nothing here is about the registry, so one value does; the
 /// VPC the tasks are placed in has a route to it ([`crate::ec2_network::register_internet_route`])
-/// and the Fargate placements take a public address, so the fetch is reachable.
-const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
+/// and the Fargate placements take a public address, so the fetch is reachable. An image this
+/// emulator holds no program for, so a task of it runs through to `STOPPED` on its own, which
+/// is the whole run a row below follows: an image whose own command is a server in the
+/// foreground would hold such a task `RUNNING`
+/// (`container_servers::image_declared_command`).
+const IMAGE: &str = "public.ecr.aws/amazonlinux/amazonlinux:2023";
 
 /// How often a poll re-reads a target queue.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);

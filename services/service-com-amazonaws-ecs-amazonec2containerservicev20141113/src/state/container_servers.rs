@@ -11,8 +11,12 @@
 //! across the tasks that are associated with the service" — so a task of a load-balanced
 //! service has to ANSWER on that port, and what answers is the server the container's own
 //! program started. The program is the container's `entryPoint`/`command`, "the command that's
-//! passed to the container" ([`super::container_shell`]), and a web server image's documented
-//! command is exactly an invocation of its server in the foreground.
+//! passed to the container" ([`super::container_shell`]) — and, where the revision overrides
+//! neither, the command the IMAGE itself declares, which `ContainerOverride$command` names as
+//! "the default command from the Docker image" ([`image_declared_command`]). A web server
+//! image's documented command is exactly an invocation of its server in the foreground, so a
+//! container of such an image serves whether its revision wrote that invocation out or left the
+//! image's own.
 //!
 //! So: a command of this catalog ([`IMAGE_WEB_SERVERS`], or the interpreter's own HTTP server
 //! module through [`::service_common::static_web_servers`]) starts a server
@@ -30,8 +34,18 @@
 //! The document it serves is the container's OWN FILESYSTEM ([`super::container_filesystem`]):
 //! the file the request's path names under the directory the server serves — the bytes the
 //! container's own program wrote there — or the status a static server answers when that
-//! directory holds no such file. Nothing is invented for a path nothing wrote, and a port no
-//! server of the container listens on is a port nothing answers at.
+//! directory holds no such file. A path nothing wrote and the image ships nothing at is a path
+//! nothing answers for, and a port no server of the container listens on is a port nothing
+//! answers at.
+//!
+//! A container's filesystem is the one its IMAGE provides, and a web server image provides the
+//! directory its shipped configuration serves WITH a page inside it
+//! (`::service_common::static_web_servers::WebServerPackage::default_document`), so a container
+//! that runs that image's own server and writes nothing of its own still answers its root with
+//! that page — which is why a target group health-checking `/` finds such a container serving
+//! and one health-checking a path the image ships nothing at does not
+//! ([`StartingServer::served_documents`]). A program that writes its own document at that path
+//! REPLACES the shipped one.
 //!
 //! WHICH directory is read off the container's filesystem too: a server ships with one document
 //! root in one image and another in the next (the Apache HTTP Server image serves
@@ -115,6 +129,15 @@ pub struct ImageWebServer {
     /// The document root the server's OWN image serves, where that differs from the package's —
     /// and `None` where the image serves the same directory.
     pub image_document_root: Option<&'static str>,
+    /// The REPOSITORIES the server's official image is published under, as the path of a
+    /// reference naming it carries past the registry host ([`image_repository_path`]): a
+    /// container of one of them runs that image, and a repository of someone else's that only
+    /// happens to end in the same word does not.
+    pub repositories: &'static [&'static str],
+    /// The command that image DECLARES, which is what runs in a container whose task
+    /// definition overrides neither the entry point nor the command
+    /// ([`image_declared_command`]).
+    pub image_command: &'static [&'static str],
 }
 
 /// The web servers a container of this emulator can run.
@@ -122,14 +145,23 @@ pub struct ImageWebServer {
 /// The names are the two servers' own programs plus the foreground commands their official
 /// images are documented to run — `nginx -g 'daemon off;'` for the `nginx` image, and
 /// `httpd-foreground` for the `httpd` one, with `apache2-foreground` the same wrapper under the
-/// name the Debian-family image carries. The Apache HTTP Server's own image serves
-/// `/usr/local/apache2/htdocs` where the distribution's package serves `/var/www/html`, and the
-/// `nginx` image serves the same directory its package does, so it names no root of its own.
+/// name the Debian-family image carries. Each image DECLARES exactly that command, which is
+/// what a container of it runs when its task definition names none. The Apache HTTP Server's
+/// own image serves `/usr/local/apache2/htdocs` where the distribution's package serves
+/// `/var/www/html`, and the `nginx` image serves the same directory its package does, so it
+/// names no root of its own.
+///
+/// The repositories are where each official image is published: the Docker official image (both
+/// spellings of its repository, the bare name and the `library/` path a reference may carry in
+/// full), the same image in the public gallery's mirror of those images, and — for nginx — the
+/// publisher's own repository there.
 pub const IMAGE_WEB_SERVERS: &[ImageWebServer] = &[
     ImageWebServer {
         invocations: &["nginx", "nginx-debug"],
         package: "nginx",
         image_document_root: None,
+        repositories: &["nginx", "library/nginx", "docker/library/nginx", "nginx/nginx"],
+        image_command: &["nginx", "-g", "daemon off;"],
     },
     ImageWebServer {
         invocations: &[
@@ -141,8 +173,48 @@ pub const IMAGE_WEB_SERVERS: &[ImageWebServer] = &[
         ],
         package: "httpd",
         image_document_root: Some("/usr/local/apache2/htdocs"),
+        repositories: &["httpd", "library/httpd", "docker/library/httpd"],
+        image_command: &["httpd-foreground"],
     },
 ];
+
+/// The command the IMAGE `image` declares, for a container whose task definition overrides
+/// neither its entry point nor its command — `None` for every reference this emulator holds no
+/// image of, whose own program it therefore does not invent.
+///
+/// `ContainerDefinition$command` is "the command that's passed to the container" and
+/// `ContainerOverride$command` "the command to send to the container that overrides the DEFAULT
+/// COMMAND FROM THE DOCKER IMAGE or the task definition" — so an image HAS a command of its
+/// own, and a revision that names none runs it. For the official image of a server of this
+/// catalog that command is documented: it is the foreground invocation the image's own
+/// documentation tells a user to keep ([`IMAGE_WEB_SERVERS`]), which is why it is the same text
+/// a revision writes by hand.
+#[must_use]
+pub fn image_declared_command(image: &str) -> Option<Vec<String>> {
+    let repository = image_repository_path(image);
+    IMAGE_WEB_SERVERS
+        .iter()
+        .find(|server| server.repositories.contains(&repository))
+        .map(|server| server.image_command.iter().map(|&word| word.to_string()).collect())
+}
+
+/// The REPOSITORY one image reference names: what is left of it once the registry host the
+/// reference resolves to ([`super::image_pull::registry_host`]) and the tag or digest selecting
+/// which image of that repository to fetch are taken off.
+fn image_repository_path(image: &str) -> &str {
+    let image = image.trim();
+    // A digest and a tag both name WHICH image of the repository to fetch, not the repository.
+    let path = image.split_once('@').map_or(image, |(path, _)| path);
+    let path = path
+        .strip_prefix(super::image_pull::registry_host(image))
+        .map_or(path, |rest| rest.trim_start_matches('/'));
+    // The tag is what follows a `:` in the LAST segment of the path: a `:` anywhere else
+    // belongs to a registry's port, which this reference's host already carried away.
+    match path.rsplit_once(':') {
+        Some((repository, tag)) if !tag.contains('/') => repository,
+        _ => path,
+    }
+}
 
 /// The option a small server's invocation names its PORT with, and the one it names the
 /// directory it serves with.
@@ -276,6 +348,39 @@ pub fn server_started_by(
         ),
         lists_directories: false,
     })
+}
+
+/// The files the IMAGE `image` SHIPS, by absolute path — the filesystem a container of it runs
+/// over before its own program has written anything.
+///
+/// A container's own layer "sits over a filesystem the image provides"
+/// ([`super::container_filesystem`]), and for an official web server image part of what that
+/// image provides is documented: the directory its shipped configuration serves, and the page
+/// that server's own distribution ships inside it
+/// ([`::service_common::static_web_servers::WebServerPackage::default_document`]). So a
+/// container of such an image serves its root, and a program of it can read, copy or replace
+/// that page the way the image's own documentation has one do.
+///
+/// Empty for every reference this emulator holds no image of: what such an image provides is
+/// not known, and nothing is invented for it.
+#[must_use]
+pub fn image_shipped_files(image: &str) -> Vec<(String, String)> {
+    let repository = image_repository_path(image);
+    IMAGE_WEB_SERVERS
+        .iter()
+        .filter(|server| server.repositories.contains(&repository))
+        .filter_map(|server| {
+            let package = ::service_common::static_web_servers::package_named(server.package)?;
+            let root = server.image_document_root.unwrap_or(package.document_root);
+            Some((
+                format!(
+                    "{root}/{}",
+                    ::service_common::static_web_servers::INDEX_DOCUMENT
+                ),
+                package.default_document.to_string(),
+            ))
+        })
+        .collect()
 }
 
 /// The port an invocation names with [`SERVED_PORT_OPTION`], in either of the forms that option
@@ -415,13 +520,16 @@ impl ServesHttp for ContainerStaticServer {
     }
 
     /// Whether the documents this server answers out of are ones this emulator holds: the files
-    /// the container's own program wrote into the directory the server serves.
+    /// the container's own program wrote into the directory the server serves, and the page the
+    /// IMAGE shipped into the document root its configuration serves
+    /// ([`StartingServer::served_documents`]).
     ///
-    /// A server over a document root holding NONE of them serves what the image that ships the
-    /// server put there, and a container's own layer "sits over a filesystem the image provides
-    /// and this emulator holds none of" ([`super::container_filesystem`]) — so what such a
-    /// server answers says nothing about the container, and a reader that judges the container
-    /// by a status reads no verdict into it.
+    /// A server over a document root holding NONE of them — a directory the invocation itself
+    /// pointed it at, which nothing wrote into — serves whatever stood there, and a container's
+    /// own layer "sits over a filesystem the image provides and this emulator holds none of"
+    /// ([`super::container_filesystem`]) beyond what that image ships. So what such a server
+    /// answers says nothing about the container, and a reader that judges the container by a
+    /// status reads no verdict into it.
     fn holds_what_it_serves(&self) -> bool {
         !self.files.is_empty()
     }
@@ -649,6 +757,74 @@ mod tests {
             assert_eq!(
                 read, wanted,
                 "case {case:?}: expected {wanted:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// RULE: a reference names an image of this catalog exactly when its REPOSITORY is one that
+    /// image is published under, whatever tag or digest selects which image of it to fetch and
+    /// whichever registry serves it — and such an image declares the command a container of it
+    /// runs when its revision names none.
+    ///
+    /// The rows span what the reading generalises over: the bare repository name, the same with
+    /// a tag and with a digest, the `library/` spelling a full reference carries, the public
+    /// gallery's mirror of those images and a publisher's own repository there, a registry
+    /// carrying a port, the other server of the catalog, a repository of someone else's that
+    /// only ends in the same word, and a reference this emulator holds no image for.
+    #[test]
+    fn an_image_of_the_catalog_declares_the_command_a_container_of_it_runs() {
+        let nginx = Some(vec!["nginx", "-g", "daemon off;"]);
+        let httpd = Some(vec!["httpd-foreground"]);
+        let rows: &[(&str, &str, Option<Vec<&str>>)] = &[
+            ("the bare repository name", "nginx", nginx.clone()),
+            ("the same with a tag", "nginx:alpine", nginx.clone()),
+            (
+                "the same with a digest",
+                "nginx@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                nginx.clone(),
+            ),
+            (
+                "the `library/` spelling a full reference carries",
+                "docker.io/library/nginx:1.27",
+                nginx.clone(),
+            ),
+            (
+                "the public gallery's mirror of the official image",
+                "public.ecr.aws/docker/library/nginx:alpine",
+                nginx.clone(),
+            ),
+            (
+                "the publisher's own repository in that gallery",
+                "public.ecr.aws/nginx/nginx:stable",
+                nginx.clone(),
+            ),
+            (
+                "a registry carrying a port of its own",
+                "registry.example.com:5000/library/nginx:1.27",
+                nginx.clone(),
+            ),
+            ("the other server of the catalog", "httpd:2.4", httpd.clone()),
+            (
+                "the same under its full reference",
+                "docker.io/library/httpd",
+                httpd.clone(),
+            ),
+            (
+                "a repository of someone else's that only ends in the same word",
+                "111122223333.dkr.ecr.us-east-1.amazonaws.com/team/nginx:latest",
+                None,
+            ),
+            ("a reference this emulator holds no image for", "my/app:1", None),
+            ("no reference at all", "", None),
+        ];
+        for (case, image, expected) in rows {
+            let read = image_declared_command(image);
+            let wanted = expected
+                .as_ref()
+                .map(|words| words.iter().map(|&word| word.to_string()).collect::<Vec<_>>());
+            assert_eq!(
+                read, wanted,
+                "case {case:?}: expected {wanted:?} for {image:?}, got {read:?}"
             );
         }
     }

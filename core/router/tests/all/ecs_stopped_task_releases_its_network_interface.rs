@@ -48,8 +48,11 @@ const CLUSTER: &str = "interfacerelease";
 
 /// The container every revision runs. Held in a PUBLIC registry, reached over the internet
 /// gateway the network below carries, so the image fetch succeeds and the task runs — which
-/// is when its interface is in place.
-const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
+/// is when its interface is in place. An image this emulator holds no program for, so a task
+/// of it finishes its own work, which one row below is about: an image whose own command is a
+/// server in the foreground would hold such a task `RUNNING`
+/// (`container_servers::image_declared_command`).
+const IMAGE: &str = "public.ecr.aws/amazonlinux/amazonlinux:2023";
 
 /// The destination of the route that carries the VPC's traffic to its internet gateway.
 const INTERNET_DESTINATION: &str = "0.0.0.0/0";

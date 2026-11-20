@@ -94,9 +94,12 @@ const POLL: Duration = Duration::from_millis(100);
 /// `Task$lastStatus` of a task whose containers have started.
 const RUNNING: &str = "RUNNING";
 
-/// The image every container below names. Nothing is asserted about it: this emulator holds
-/// no image, which is exactly the point of the rows whose containers name no program.
-const IMAGE: &str = "public.ecr.aws/docker/library/nginx:alpine";
+/// The image every container below names: one this emulator holds no program for, which is
+/// exactly the point of the rows whose containers name no program — nothing of such a
+/// container runs, so its log stream carries nothing. (An image whose own command this
+/// emulator does hold, a web server's, would have its program run and write its own output:
+/// `container_servers::image_declared_command`.)
+const IMAGE: &str = "public.ecr.aws/amazonlinux/amazonlinux:2023";
 
 /// The port the containers declare and the bound target group forwards to.
 const CONTAINER_PORT: i64 = 80;

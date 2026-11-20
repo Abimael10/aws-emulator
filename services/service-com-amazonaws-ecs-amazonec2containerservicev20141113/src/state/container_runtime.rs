@@ -196,6 +196,10 @@ pub struct ContainerLaunch {
     /// `ContainerDefinition$workingDirectory`, which the program's relative paths are
     /// resolved against.
     working_directory: Option<String>,
+    /// The files its IMAGE ships, written into its own layer before its program runs
+    /// ([`super::container_servers::image_shipped_files`]) — empty for an image this emulator
+    /// holds none of.
+    shipped_files: Vec<(String, String)>,
     /// The private address of the elastic network interface the TASK was allocated, which is
     /// where a server this container's program starts is reached
     /// ([`super::container_servers`]) — `None` for a task that holds no interface of its own,
@@ -344,7 +348,24 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 let command = override_for
                     .and_then(|over| over.command.as_deref())
                     .or(stored.command.as_deref());
-                let program = ContainerProgram::resolve(stored.entry_point.as_deref(), command);
+                // A container whose revision overrides NEITHER the entry point nor the command
+                // runs the command its IMAGE declares — the "default command from the Docker
+                // image" that same member's own documentation names
+                // ([`super::container_servers::image_declared_command`]). An image this
+                // emulator holds none of leaves such a container no program at all, exactly as
+                // it did before.
+                let declared = (stored.entry_point.is_none() && command.is_none())
+                    .then(|| {
+                        stored
+                            .image
+                            .as_deref()
+                            .and_then(super::container_servers::image_declared_command)
+                    })
+                    .flatten();
+                let program = ContainerProgram::resolve(
+                    stored.entry_point.as_deref(),
+                    command.or(declared.as_deref()),
+                );
                 // The address the task's own interface holds, which is both where a server
                 // this container starts is reached and what the container's HOSTNAME is read
                 // from ([`container_hostname`]).
@@ -409,6 +430,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     // the storage each names is resolved where the run is started.
                     mounts: mount_requests(&definition, stored, task),
                     working_directory: stored.working_directory.clone(),
+                    // What this container's IMAGE provides, written into its layer before its
+                    // program runs: a container's own layer sits over the image's filesystem,
+                    // and for an image of this emulator's own catalog part of that filesystem
+                    // is documented ([`super::container_servers::image_shipped_files`]).
+                    shipped_files: stored
+                        .image
+                        .as_deref()
+                        .map(super::container_servers::image_shipped_files)
+                        .unwrap_or_default(),
                     // Where a server this container's program starts is reached: the address
                     // of the interface the task holds, read off the task itself.
                     address,
@@ -632,6 +662,19 @@ pub fn settle_container_runtime<Eng: Send + Sync + 'static>(
         let filesystem = ContainerFilesystem::new(
             launch.working_directory.as_deref(),
             mounted_volumes(&**engine, &state, &launch.mounts),
+        );
+        // What the container's IMAGE provides, in place before its program runs — which is
+        // what makes a container of a web server image serve its root without a program of
+        // its own having written one, and what lets a program read or copy that page. A write
+        // the layer refuses changes nothing: the file is simply not there, exactly as it is
+        // for an image this emulator holds none of.
+        let filesystem = launch.shipped_files.iter().fold(
+            filesystem,
+            |mut filesystem, (path, contents)| {
+                use ::service_common::posix_shell_files::ShellFiles as _;
+                let _ = filesystem.write(path, contents, false);
+                filesystem
+            },
         );
         let handle = runtime.spawn(async move {
             run_container(run_state, callback, launch, filesystem, serving).await

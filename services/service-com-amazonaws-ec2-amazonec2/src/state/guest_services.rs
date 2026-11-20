@@ -246,8 +246,16 @@ impl GuestServices {
             };
             self.held().installed.insert(package.name.to_string());
             // What installing a web server leaves on the machine: the directory its shipped
-            // configuration serves, so the commands around it can write the page it serves.
+            // configuration serves, so the commands around it can write the page it serves —
+            // and the page the distribution SHIPS inside that directory, which is what a
+            // server that was installed and started, and nothing else, answers its root with.
+            // A page the machine already holds there is left alone: what a program wrote is
+            // the page that machine serves.
             files.make_directories(package.document_root);
+            let index = format!("{}/{INDEX_DOCUMENT}", package.document_root);
+            if files.read(&index).is_none() {
+                files.write(&index, package.default_document);
+            }
             output.push(format!("Installed: {}", package.name));
         }
         if packages.is_empty() {

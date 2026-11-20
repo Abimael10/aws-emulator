@@ -14,6 +14,13 @@
 //! those answers live, so the two cannot drift apart — a reading corrected here is corrected
 //! for both.
 //!
+//! What a server is configured to do includes what it SHIPS: a distribution installs a server
+//! together with the directory its configuration serves and a page inside it
+//! ([`WebServerPackage::default_document`]), so a server that was installed and started, and
+//! nothing else, answers its root with that page rather than with nothing. A program that
+//! writes its own page at that path replaces it, which is what every tutorial's `echo … >
+//! index.html` does.
+//!
 //! What is NOT here is where each service puts the answer: an instance records it on its own
 //! guest's runtime and a container publishes it at its task's address, because that is the part
 //! that differs. Nothing here starts a process, opens a socket or reaches a host path: it reads
@@ -29,7 +36,43 @@ pub struct WebServerPackage {
     pub port: i32,
     /// The directory its shipped configuration serves.
     pub document_root: &'static str,
+    /// The document it ships INSIDE that directory, under [`INDEX_DOCUMENT`]: the page a
+    /// freshly installed server answers its root with, before anything of the machine or the
+    /// container has written a page of its own there ([`DEFAULT_DOCUMENTS`]).
+    pub default_document: &'static str,
 }
+
+/// The document the Apache HTTP Server's own distribution ships at its document root: the
+/// one-line page its source tree carries as `docs/docroot/index.html`, which is what a server
+/// installed from it — the distribution's package, or the official container image — answers a
+/// request for its root with until something replaces it.
+pub const APACHE_DEFAULT_DOCUMENT: &str = "<html><body><h1>It works!</h1></body></html>\n";
+
+/// The document nginx's own distribution ships at its document root, as its source tree
+/// carries it (`html/index.html`) and its package and official container image install it.
+pub const NGINX_DEFAULT_DOCUMENT: &str = "<!DOCTYPE html>\n\
+     <html>\n\
+     <head>\n\
+     <title>Welcome to nginx!</title>\n\
+     <style>\n\
+     html { color-scheme: light dark; }\n\
+     body { width: 35em; margin: 0 auto;\n\
+     font-family: Tahoma, Verdana, Arial, sans-serif; }\n\
+     </style>\n\
+     </head>\n\
+     <body>\n\
+     <h1>Welcome to nginx!</h1>\n\
+     <p>If you see this page, the nginx web server is successfully installed and\n\
+     working. Further configuration is required.</p>\n\
+     \n\
+     <p>For online documentation and support please refer to\n\
+     <a href=\"http://nginx.org/\">nginx.org</a>.<br/>\n\
+     Commercial support is available at\n\
+     <a href=\"http://nginx.com/\">nginx.com</a>.</p>\n\
+     \n\
+     <p><em>Thank you for using nginx.</em></p>\n\
+     </body>\n\
+     </html>\n";
 
 /// The web servers a program of this emulator can start.
 ///
@@ -40,21 +83,29 @@ pub struct WebServerPackage {
 /// family's package carries; and the `nginx` package serves `/usr/share/nginx/html` on the
 /// same port. A package name carrying a version suffix (`httpd24`, `nginx1`) names the same
 /// server ([`package_named`]).
+///
+/// Each ships a PAGE in that directory as well as the directory itself, which is what a server
+/// that was installed and started, and nothing else, answers its root with: the two spellings
+/// of the Apache HTTP Server are the same server, so they ship the same document
+/// ([`APACHE_DEFAULT_DOCUMENT`]), and nginx ships its own ([`NGINX_DEFAULT_DOCUMENT`]).
 pub const WEB_SERVER_PACKAGES: &[WebServerPackage] = &[
     WebServerPackage {
         name: "httpd",
         port: 80,
         document_root: "/var/www/html",
+        default_document: APACHE_DEFAULT_DOCUMENT,
     },
     WebServerPackage {
         name: "apache2",
         port: 80,
         document_root: "/var/www/html",
+        default_document: APACHE_DEFAULT_DOCUMENT,
     },
     WebServerPackage {
         name: "nginx",
         port: 80,
         document_root: "/usr/share/nginx/html",
+        default_document: NGINX_DEFAULT_DOCUMENT,
     },
 ];
 
@@ -197,6 +248,30 @@ mod tests {
             assert_eq!(
                 read, *expected,
                 "case {case:?}: expected {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// RULE: every server of the catalog ships a page inside the directory its configuration
+    /// serves, so one that was installed and started — and had nothing else written for it —
+    /// has a document at its root to answer with.
+    ///
+    /// The rows span the catalog: both spellings of the one server, which ship the same page,
+    /// and the other server, which ships its own.
+    #[test]
+    fn every_server_ships_the_page_its_document_root_holds() {
+        let rows: &[(&str, &str, &str)] = &[
+            ("the Amazon Linux family's Apache package", "httpd", "It works!"),
+            ("the Debian family's name for it", "apache2", "It works!"),
+            ("the other server", "nginx", "Welcome to nginx!"),
+        ];
+        for (case, name, marker) in rows {
+            let package = package_named(name)
+                .unwrap_or_else(|| panic!("case {case:?}: the catalog must hold {name:?}"));
+            assert!(
+                package.default_document.contains(marker),
+                "case {case:?}: expected the shipped page to carry {marker:?}, got {:?}",
+                package.default_document
             );
         }
     }
