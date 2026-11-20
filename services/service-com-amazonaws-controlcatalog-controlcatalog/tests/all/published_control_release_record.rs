@@ -236,7 +236,120 @@ const PUBLISHED_RECORDS: &[PublishedRecord] = &[
                       allowed frequency.",
         release_time: 1_779_840_000,
     },
+    // The remaining controls an AWS Config managed rule implements. They widen the class
+    // the table spans in the ways the published text varies: a description that opens with
+    // "Rule checks whether" rather than restating the name, a name and description the
+    // rule words around the KMS key a resource may be encrypted with, TWO controls
+    // published over one rule (`CLOUD_TRAIL_ENABLED`) whose descriptions differ only in the
+    // account scope each governs, a description whose last sentence is a bare verdict
+    // ("Otherwise, NON_COMPLIANT."), a description shorter than its name's sentence, a
+    // Control Tower description that states a protection rather than a check criterion,
+    // and a control whose published name and description are a sentence each while its
+    // release instant is shared with four other controls.
+    PublishedRecord {
+        identifier: "4x11tie7h25sws4g7ilakhcb7",
+        name: "Rule checks whether AWS account is part of AWS Organizations",
+        description: "Rule checks whether AWS account is part of AWS Organizations. The \
+                      rule is NON_COMPLIANT if the AWS account is not part of AWS \
+                      Organizations or AWS Organizations master account ID does not match \
+                      rule parameter MasterAccountId.",
+        release_time: 1_594_166_400,
+    },
+    PublishedRecord {
+        identifier: "497wrm2xnk1wxlf4obrdo7mej",
+        name: "Checks if Amazon CloudWatch Log Groups are encrypted with any AWS KMS key \
+               or a specified AWS KMS key Id",
+        description: "Checks if Amazon CloudWatch Log Groups are encrypted with any AWS \
+                      KMS key or a specified AWS KMS key Id. The rule is NON_COMPLIANT if \
+                      a CloudWatch Log Group is not encrypted with a KMS key or is \
+                      encrypted with a KMS key not supplied in the rule parameter.",
+        release_time: 1_563_408_000,
+    },
+    PublishedRecord {
+        identifier: "8sdhbqfe2fsmh3b1i2b24xaic",
+        name: "Detect whether an AWS account has at least one AWS CloudTrail trail enabled \
+               for a governed AWS Region.",
+        description: "Detects whether an AWS account has AWS CloudTrail enabled has at \
+                      least one AWS CloudTrail trail enabled for a governed AWS Region. \
+                      This rule is NON_COMPLIANT if no CloudTrail trails are enabled in an \
+                      AWS account for a governed AWS Region.",
+        release_time: 1_657_584_000,
+    },
+    PublishedRecord {
+        identifier: "1ln29qglgkigm9ajfka6u2p2u",
+        name: "Detect whether a shared AWS account in the Security organizational unit has \
+               at least one AWS CloudTrail trail enabled for a governed AWS Region.",
+        description: "This control detects whether a shared AWS account in the Security \
+                      organizational unit has at least one AWS CloudTrail trail enabled \
+                      for a governed AWS Region. This rule is NON_COMPLIANT if no \
+                      CloudTrail trails are enabled in an AWS account for a governed AWS \
+                      Region.",
+        release_time: 1_657_584_000,
+    },
+    PublishedRecord {
+        identifier: "85z4kpyxbo5nepzfwbfwwxjx7",
+        name: "Checks if AWS CloudTrail creates a signed digest file with logs",
+        description: "Checks if AWS CloudTrail creates a signed digest file with logs. AWS \
+                      recommends that the file validation must be enabled on all trails. \
+                      The rule is NON_COMPLIANT if the validation is not enabled.",
+        release_time: 1_534_982_400,
+    },
+    PublishedRecord {
+        identifier: "503uicglhjkokaajywfpt6ros",
+        name: "Enable encryption for EBS volumes attached to EC2 instances",
+        description: "Secure EBS volumes attached to EC2 instances through encryption.",
+        release_time: 1_542_240_000,
+    },
+    PublishedRecord {
+        identifier: "9xv17a25orapqa36e19o5b8lp",
+        name: "Checks if Amazon GuardDuty is enabled in your AWS account and AWS Region",
+        description: "Checks if Amazon GuardDuty is enabled in your AWS account and AWS \
+                      Region. If you provide an AWS account for centralization, the rule \
+                      evaluates the GuardDuty results in the centralized account. The rule \
+                      is COMPLIANT when GuardDuty is enabled.",
+        release_time: 1_534_809_600,
+    },
+    PublishedRecord {
+        identifier: "dmb52g7tw004w9iede1pgb1fj",
+        name: "Checks if the account password policy for AWS Identity and Access \
+               Management (IAM) users meets the specified requirements indicated in the \
+               parameters",
+        description: "Checks if the account password policy for AWS Identity and Access \
+                      Management (IAM) users meets the specified requirements indicated in \
+                      the parameters. The rule is NON_COMPLIANT if the account password \
+                      policy does not meet the specified requirements.",
+        release_time: 1_474_416_000,
+    },
+    PublishedRecord {
+        identifier: "9utgo6tl86bg3e9jaq073vmqw",
+        name: "Checks if the root user access key is available",
+        description: "Checks if the root user access key is available. The rule is \
+                      COMPLIANT if the user access key does not exist. Otherwise, \
+                      NON_COMPLIANT.",
+        release_time: 1_534_377_600,
+    },
+    PublishedRecord {
+        identifier: "7z1uzm6s8qk7ym7m0sm56cq0u",
+        name: "Disallow access to IAM users without MFA",
+        description: "Protect your account by requiring multi-factor authentication (MFA) \
+                      for any AWS Identity and Access Management (IAM) user using the \
+                      account. MFA adds an extra authentication code on top of a user name \
+                      and password.",
+        release_time: 1_564_444_800,
+    },
+    PublishedRecord {
+        identifier: "6rilu41n0gb9w6mxrkyewoer4",
+        name: "Disallow Internet connection via SSH",
+        description: "Reduces a server's exposure to risk by removing unfettered \
+                      connectivity to remote console services such as SSH.",
+        release_time: 1_542_240_000,
+    },
 ];
+
+/// The implementation type the catalog publishes for a control an AWS Config managed rule
+/// implements, as the catalog spells it
+/// (`smithy_query(query="shape", shape="ImplementationType")`).
+const CONFIG_RULE: &str = "AWS::Config::ConfigRule";
 
 /// Every control the catalog serves, keyed by its ARN, listed with `max_results` as the
 /// page size and `body` as the request.
@@ -492,6 +605,78 @@ async fn a_controls_published_record_is_stable_across_reads_and_filters() {
                 create_time(&case, control),
                 create_time(&case, expected),
                 "case {case}: a control's release instant must not change between reads"
+            );
+        }
+    }
+}
+
+/// Every control an AWS Config managed rule implements carries the catalog's own published
+/// name, description and release instant when the implementation-TYPE filter selects it,
+/// at any page size: the published record belongs to the control ARN, not to the rule
+/// behind it, the page it landed on or the filter that found it.
+#[tokio::test]
+async fn controls_an_aws_config_rule_implements_carry_their_published_record() {
+    let emulator = Emulator::new();
+    let whole_catalog = listing_by_arn(&emulator, None, "{}").await;
+    let body = format!(r#"{{"Filter":{{"Implementations":{{"Types":["{CONFIG_RULE}"]}}}}}}"#);
+
+    // The rows of the published table an AWS Config managed rule implements, read off the
+    // served `Implementation` rather than listed again here.
+    let config_rule_rows: Vec<&PublishedRecord> = PUBLISHED_RECORDS
+        .iter()
+        .filter(|row| {
+            whole_catalog
+                .get(&catalog_arn(row.identifier))
+                .and_then(|control| control["Implementation"]["Type"].as_str())
+                == Some(CONFIG_RULE)
+        })
+        .collect();
+    assert!(
+        config_rule_rows.len() >= 10,
+        "case config rules: the published table must record the controls an AWS Config \
+         managed rule implements for the rule to be tested, got {}",
+        config_rule_rows.len()
+    );
+
+    // Page sizes spanning one control per page, a partial page and the modeled maximum of
+    // `MaxListControlsResults` (@range 1..100).
+    for page_size in [None, Some(1u32), Some(7), Some(100)] {
+        let selected = listing_by_arn(&emulator, page_size, &body).await;
+
+        // The filter narrows to the surface it names: without this the test would pass
+        // against a filter that ignored its input.
+        for (arn, control) in &selected {
+            assert_eq!(
+                control["Implementation"]["Type"].as_str(),
+                Some(CONFIG_RULE),
+                "case {arn} maxResults={page_size:?}: the type filter must select only \
+                 controls that surface implements, got {:?}",
+                control["Implementation"]
+            );
+        }
+
+        for row in &config_rule_rows {
+            let arn = catalog_arn(row.identifier);
+            let case = format!("{} type-filtered maxResults={page_size:?}", row.identifier);
+            let control = selected
+                .get(&arn)
+                .unwrap_or_else(|| panic!("case {case}: the type filter must select {arn}"));
+            assert_published_record(&case, control, row);
+
+            // The same record reads back through GetControl, which is the read a client
+            // makes with an ARN harvested from the filtered page.
+            let read_back = emulator
+                .ok("/get-control", &format!(r#"{{"ControlArn":"{arn}"}}"#))
+                .await;
+            assert_eq!(
+                (
+                    read_back["Name"].as_str(),
+                    read_back["Description"].as_str(),
+                    create_time(&case, &read_back),
+                ),
+                (Some(row.name), Some(row.description), row.release_time),
+                "case {case}: GetControl must report the same published record, got \
+                 {read_back:?}"
             );
         }
     }

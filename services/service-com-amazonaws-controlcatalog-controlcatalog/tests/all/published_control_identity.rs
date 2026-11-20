@@ -216,8 +216,8 @@ const PUBLISHED_CONTROLS: &[PublishedControl] = &[
     PublishedControl {
         alias: "CONFIG.LOGS.DT.1",
         identifier: "497wrm2xnk1wxlf4obrdo7mej",
-        name: "Checks if a log group in Amazon CloudWatch Logs is encrypted with a AWS Key \
-               Management Service (KMS) managed Customer Master Keys (CMK)",
+        name: "Checks if Amazon CloudWatch Log Groups are encrypted with any AWS KMS key \
+               or a specified AWS KMS key Id",
         severity: "MEDIUM",
         parameter_requirement_summary: "OPTIONAL",
         governed_resources: &["AWS::Logs::LogGroup"],
@@ -226,7 +226,8 @@ const PUBLISHED_CONTROLS: &[PublishedControl] = &[
     PublishedControl {
         alias: "AWS-GR_DETECT_CLOUDTRAIL_ENABLED_ON_MEMBER_ACCOUNTS",
         identifier: "8sdhbqfe2fsmh3b1i2b24xaic",
-        name: "Detect whether CloudTrail is enabled on member accounts",
+        name: "Detect whether an AWS account has at least one AWS CloudTrail trail enabled \
+               for a governed AWS Region.",
         severity: "HIGH",
         parameter_requirement_summary: "OPTIONAL",
         governed_resources: &["AWS::CloudTrail::Trail"],
@@ -235,7 +236,8 @@ const PUBLISHED_CONTROLS: &[PublishedControl] = &[
     PublishedControl {
         alias: "AWS-GR_DETECT_CLOUDTRAIL_ENABLED_ON_SHARED_ACCOUNTS",
         identifier: "1ln29qglgkigm9ajfka6u2p2u",
-        name: "Detect whether CloudTrail is enabled on shared accounts",
+        name: "Detect whether a shared AWS account in the Security organizational unit has \
+               at least one AWS CloudTrail trail enabled for a governed AWS Region.",
         severity: "HIGH",
         parameter_requirement_summary: "OPTIONAL",
         governed_resources: &["AWS::CloudTrail::Trail"],
@@ -244,7 +246,7 @@ const PUBLISHED_CONTROLS: &[PublishedControl] = &[
     PublishedControl {
         alias: "CONFIG.CLOUDTRAIL.DT.9",
         identifier: "85z4kpyxbo5nepzfwbfwwxjx7",
-        name: "Checks whether AWS CloudTrail creates a signed digest file with logs",
+        name: "Checks if AWS CloudTrail creates a signed digest file with logs",
         severity: "HIGH",
         parameter_requirement_summary: "NONE",
         governed_resources: &["AWS::CloudTrail::Trail"],
@@ -262,7 +264,7 @@ const PUBLISHED_CONTROLS: &[PublishedControl] = &[
     PublishedControl {
         alias: "CONFIG.GUARDDUTY.DT.9",
         identifier: "9xv17a25orapqa36e19o5b8lp",
-        name: "Checks whether Amazon GuardDuty is enabled in your AWS account and region",
+        name: "Checks if Amazon GuardDuty is enabled in your AWS account and AWS Region",
         severity: "HIGH",
         parameter_requirement_summary: "OPTIONAL",
         governed_resources: &["AWS::GuardDuty::Detector"],
@@ -271,8 +273,9 @@ const PUBLISHED_CONTROLS: &[PublishedControl] = &[
     PublishedControl {
         alias: "CONFIG.IAM.DT.1",
         identifier: "dmb52g7tw004w9iede1pgb1fj",
-        name: "Checks if the account password policy for IAM users meets the specified \
-               requirements",
+        name: "Checks if the account password policy for AWS Identity and Access \
+               Management (IAM) users meets the specified requirements indicated in the \
+               parameters",
         severity: "MEDIUM",
         parameter_requirement_summary: "OPTIONAL",
         // The account's own password policy, which no available resource type represents.
