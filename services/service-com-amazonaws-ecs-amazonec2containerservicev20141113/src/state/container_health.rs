@@ -141,6 +141,23 @@ pub const HEALTH_CHECK_EXEC_FORM: &str = "CMD";
 /// `CMD-SHELL` to run the command with the container's default shell."
 pub const HEALTH_CHECK_SHELL_FORM: &str = "CMD-SHELL";
 
+/// How long after a container starts running its FIRST health-check execution falls due.
+///
+/// EMULATOR-CHOSEN, and deliberately NOT the `interval`: that member is "the time period in
+/// seconds between each health check execution", which is the spacing between two
+/// executions of a check and says nothing about the one that has no predecessor. The agent
+/// "monitors and reports on the health checks specified in the task definition" from the
+/// moment the container it probes is running, and the reading until it has is the one
+/// `UNKNOWN` states ("The container health check is being evaluated"), so the move out of
+/// that reading is a transition of this emulator's own: it takes the same span as this
+/// emulator's other transient steps, short enough that a client that starts a container and
+/// then polls it learns the verdict rather than watching `UNKNOWN` for the interval the
+/// definition happens to have chosen. Every execution AFTER it is one `interval` on, which
+/// is the spacing the member does document ([`ContainerHealthRecord::record`]), and this
+/// span is never longer than that spacing: the interval a record holds is clamped to at
+/// least [`MIN_HEALTH_CHECK_INTERVAL`], the smallest the member admits.
+pub const FIRST_HEALTH_PROBE_SPAN: Duration = Duration::from_secs(3);
+
 /// How many health-check probes this store runs at once. THIS NUMBER IS THE EMULATOR'S, not
 /// an AWS quota: every probe is an in-process task of this emulator, so without a ceiling a
 /// caller running tasks without end would start work without end. Sized like the container
@@ -184,6 +201,18 @@ pub struct ContainerHealthRecord {
     /// container is considered healthy and any subsequent failures count toward the maximum
     /// number of retries").
     pub succeeded: bool,
+    /// WHEN the FIRST execution succeeded — the instant this container reached `HEALTHY` —
+    /// and `None` for one whose check has never passed.
+    ///
+    /// Kept for good once it is set, where [`Self::unhealthy_at`] holds only the reading the
+    /// container reports NOW: this is the instant the container is known to have been
+    /// healthy at, which is what the SCHEDULER dates its own reaction to a passing check by
+    /// ([`super::circuit_breaker`], where `DeploymentCircuitBreaker$resetOnHealthyTask`
+    /// resets a rollout's failure count from the instant a task of it "reaches a healthy
+    /// state"). A later failing execution leaves it where it is — the container WAS healthy
+    /// then — and what the rollout makes of a task it went on to LOSE is that rollout's
+    /// question rather than this reading's ([`TaskRecord::reached_healthy_state_at`]).
+    pub healthy_at: Option<SystemTime>,
     /// When the start period ENDS, for a container that declared one — set from the instant
     /// the container started running.
     pub start_period_ends_at: Option<SystemTime>,
@@ -237,6 +266,7 @@ impl ContainerHealthRecord {
             unhealthy_at: None,
             failures: 0,
             succeeded: false,
+            healthy_at: None,
             start_period_ends_at: None,
             next_probe_due_at: None,
             probe_in_flight: false,
@@ -247,16 +277,17 @@ impl ContainerHealthRecord {
     /// which is when the agent begins probing it and when the grace period the definition
     /// asked for begins.
     ///
-    /// The first execution falls due one `interval` on, which is the only spacing the member
-    /// documents ("the time period in seconds between each health check execution"), so a
-    /// container reports `UNKNOWN` until its first probe has run. Idempotent: a container
-    /// whose schedule has already started keeps it.
+    /// The first execution falls due one [`FIRST_HEALTH_PROBE_SPAN`] on — the `interval` is
+    /// "the time period in seconds between each health check execution", so it spaces the
+    /// executions that FOLLOW one rather than holding off the one that begins the schedule —
+    /// and the container reports `UNKNOWN` until that execution has produced a result.
+    /// Idempotent: a container whose schedule has already started keeps it.
     pub fn begin(&mut self, now: SystemTime) {
         if self.next_probe_due_at.is_some() || self.probe_in_flight {
             return;
         }
         self.start_period_ends_at = self.start_period.map(|period| now + period);
-        self.next_probe_due_at = Some(now + self.interval);
+        self.next_probe_due_at = Some(now + FIRST_HEALTH_PROBE_SPAN);
     }
 
     /// Whether an execution is due as of `now`.
@@ -280,6 +311,9 @@ impl ContainerHealthRecord {
         if passed {
             self.failures = 0;
             self.succeeded = true;
+            // Dated at the FIRST execution that passed: that is the instant the container
+            // reached a healthy state, and a later execution does not move it.
+            self.healthy_at = self.healthy_at.or(Some(now));
             self.status = HEALTH_HEALTHY.to_string();
             // A check that passes clears the failures it counted, so the reading is no
             // longer a failed one and nothing is owed for it.

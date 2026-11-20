@@ -150,6 +150,49 @@ impl TaskRecord {
             .flatten()
             .and_then(|at| SystemTime::try_from(at).ok())
     }
+
+    /// WHEN this task reached a HEALTHY state — the instant that resets the failure count of
+    /// the rollout that placed it ([`circuit_breaker_resets_on_healthy_task`]) — and `None`
+    /// for a task that has not reached one.
+    ///
+    /// `DeploymentCircuitBreaker$resetOnHealthyTask` resets the count on "a task that
+    /// reaches a healthy state", and `Deployment$failedTasks` states the same reset over the
+    /// tasks a deployment has "successfully running". What that state IS follows from what
+    /// the task reports health by:
+    ///
+    /// * a task whose essential containers declare health checks reaches it when those
+    ///   checks have PASSED, which is the only reading that says the revision runs
+    ///   (`Task$healthStatus` is "determined by the health of the essential containers in
+    ///   the task"); one still being evaluated has reached nothing, and the instant is the
+    ///   one its probes passed at ([`ContainerHealthRecord::healthy_at`]);
+    /// * a task whose essential containers declare NO check reaches it by STARTING: a
+    ///   container with no check reports `UNKNOWN` for ever, so a reset keyed on a passing
+    ///   check would never come for it, and "successfully running" is all such a task can
+    ///   ever report.
+    ///
+    /// A task the rollout LOST is never one of them, whatever it reported on the way: a task
+    /// that "fails any of its defined health checks and is stopped" is one of the failures
+    /// `Deployment$failedTasks` counts, so it cannot also be the healthy task that clears
+    /// one — which is why a reading its container kept ([`ContainerHealthRecord::healthy_at`])
+    /// does not make a stopped task reset anything.
+    pub fn reached_healthy_state_at(&self) -> Option<SystemTime> {
+        if self.failed_for_deployment() {
+            return None;
+        }
+        let started = self
+            .started_at
+            .and_then(|at| SystemTime::try_from(at).ok())?;
+        let mut reached = started;
+        for container in self.containers.iter().filter(|container| container.essential) {
+            let Some(health) = container.health.as_ref() else {
+                continue;
+            };
+            // An essential container whose check has never passed is one this task is still
+            // being evaluated on, so the task has reached no healthy state at all.
+            reached = reached.max(health.healthy_at?);
+        }
+        Some(reached)
+    }
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -264,18 +307,18 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .copied()
             .filter(|task| task.started_by.as_deref() == Some(deployment_id))
             .collect();
-        // The task that RESET the count: "Once a service deployment has one or more
-        // successfully running tasks, the failed task count resets to zero"
-        // (`Deployment$failedTasks`), so the start that counts here is the start of a task
-        // the rollout did not then lose — a task that started and failed anyway is the
-        // failure it is counted as, not the healthy task that clears one.
+        // The instant that RESET the count: `DeploymentCircuitBreaker$resetOnHealthyTask`
+        // resets it on "a task that reaches a healthy state", which `Deployment$failedTasks`
+        // states as the deployment having "one or more successfully running tasks"
+        // ([`TaskRecord::reached_healthy_state_at`]) — so a task of this rollout that is
+        // merely up, and whose checks have not spoken yet, resets nothing: it has not shown
+        // that the revision runs. A task that started and failed anyway is the failure it is
+        // counted as, not the healthy task that clears one.
         let healthy_at = resets_on_healthy_task
             .then(|| {
                 placed
                     .iter()
-                    .filter(|task| !task.failed_for_deployment())
-                    .filter_map(|task| task.started_at)
-                    .filter_map(|at| SystemTime::try_from(at).ok())
+                    .filter_map(|task| task.reached_healthy_state_at())
                     .max()
             })
             .flatten();

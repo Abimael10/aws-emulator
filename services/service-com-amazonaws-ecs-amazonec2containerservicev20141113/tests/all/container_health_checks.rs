@@ -18,14 +18,21 @@
 //! > `dependsOn` names a `HEALTHY` condition does not START until the container it names is
 //! > healthy (`ContainerDependency$condition`: `HEALTHY` "validates that the dependent
 //! > container passes its Docker health check before permitting other containers to start").
+//! > `HealthCheck$interval` is "the time period in seconds between each health check
+//! > execution", so it spaces the executions that FOLLOW one: a container is evaluated once
+//! > it runs, whatever interval its check declares.
 //!
 //! The table spans what the rule generalises over: the FORM the command takes (`CMD-SHELL`
 //! and `CMD`, the two forms `HealthCheck$command` documents), the outcome it produces
-//! (passing, failing), how many retries it takes to be believed, whether a grace period is
+//! (passing, failing), how many retries it takes to be believed, the interval its executions
+//! are spaced by (the smallest and the largest the member admits), whether a grace period is
 //! declared, and whether a health check is declared at all. One recording of one passing
-//! check is one row of it.
+//! check is one row of it. The rows at the LARGEST interval are the ones that pin the last
+//! clause of the rule: their verdict arrives because the first execution is not held off by
+//! the spacing the member documents, so a row declaring 300 seconds reports it inside this
+//! suite's poll budget rather than five minutes later.
 //!
-//! The two tests at the END of this suite are what the SERVICE SCHEDULER makes of those same
+//! The tests at the END of this suite are what the SERVICE SCHEDULER makes of those same
 //! readings, which is a rule of its own:
 //!
 //! > A task of a service whose own scheduler places its tasks is STOPPED and REPLACED once an
@@ -40,8 +47,15 @@
 //! > service scheduler can't launch the task, the task doesn't transition to a `RUNNING`
 //! > state, or if it fails any of its defined health checks and is stopped"), so a revision
 //! > whose containers never pass their probe is a rollout the deployment circuit breaker
-//! > fails and rolls back. A STANDALONE task has no scheduler maintaining a count, so it is
-//! > not stopped for an unhealthy container at all — which is what the table above pins.
+//! > fails and rolls back. Those failures ACCUMULATE: the breaker's count resets only when a
+//! > task of the rollout reaches a healthy state (`DeploymentCircuitBreaker$resetOnHealthyTask`:
+//! > "a task that reaches a healthy state resets the failure count to `0`", and
+//! > `Deployment$failedTasks`: "once a service deployment has one or more successfully running
+//! > tasks, the failed task count resets to zero"), so a replacement that is merely up, with
+//! > its own check still being evaluated, resets nothing and the count climbs to whatever
+//! > threshold the breaker computes. A STANDALONE task has no scheduler maintaining a count,
+//! > so it is not stopped for an unhealthy container at all — which is what the table above
+//! > pins.
 //!
 //! Nothing here reaches into the state struct: every value asserted is read back through
 //! `DescribeTasks`, so a status that is not computed from persisted state cannot pass.
@@ -63,6 +77,13 @@ const CLUSTER: &str = "healthchecks";
 /// documents ("You may specify between 5 and 300 seconds"), so a row's verdict lands inside
 /// a poll budget without naming a value AWS refuses.
 const INTERVAL_SECONDS: i64 = 5;
+
+/// The LONGEST `HealthCheck$interval` the member documents ("You may specify between 5 and
+/// 300 seconds"), which the rows that run at it are there for: that member spaces the
+/// executions that FOLLOW one, so a container whose check declares the longest interval AWS
+/// admits still reports the verdict of its FIRST execution rather than reporting `UNKNOWN`
+/// for the whole span.
+const MAX_INTERVAL_SECONDS: i64 = 300;
 
 /// The `HealthCheck$startPeriod` the grace-period case declares, in the same documented
 /// range ("You can specify between 0 and 300 seconds") and FOUR intervals long, so a failing
@@ -121,9 +142,19 @@ fn container_with(name: &str, health_check: Value) -> Value {
 /// One `healthCheck` object: the command array, the interval, how many retries a failure
 /// takes to be believed, and the grace period when the row declares one.
 fn health_check(command: Value, retries: i64, start_period: Option<i64>) -> Value {
+    health_check_every(command, INTERVAL_SECONDS, retries, start_period)
+}
+
+/// The same, for a row that names the `interval` its executions are spaced by.
+fn health_check_every(
+    command: Value,
+    interval: i64,
+    retries: i64,
+    start_period: Option<i64>,
+) -> Value {
     let mut check = json!({
         "command": command,
-        "interval": INTERVAL_SECONDS,
+        "interval": interval,
         "timeout": 2,
         "retries": retries,
     });
@@ -277,6 +308,18 @@ fn rows() -> Vec<Row> {
             case: "a probe whose command this container cannot run at all",
             family: "healthnocommand",
             check: health_check(json!(["CMD-SHELL", "/usr/bin/nothing-here"]), 1, None),
+            expected: "UNHEALTHY",
+        },
+        Row {
+            case: "a passing probe whose interval is the longest the member allows",
+            family: "healthlongpass",
+            check: health_check_every(json!(["CMD-SHELL", "exit 0"]), MAX_INTERVAL_SECONDS, 1, None),
+            expected: "HEALTHY",
+        },
+        Row {
+            case: "a failing probe believed on its first execution, at that same interval",
+            family: "healthlongfail",
+            check: health_check_every(json!(["CMD-SHELL", "exit 1"]), MAX_INTERVAL_SECONDS, 1, None),
             expected: "UNHEALTHY",
         },
         Row {
@@ -942,6 +985,172 @@ async fn a_rollout_whose_container_never_passes_its_probe_is_failed_and_rolled_b
         "case {case:?}: expected the breaker to have counted its threshold's worth of \
          failures, got {record}"
     );
+}
+
+/// The failure threshold the DEFAULT breaker computes for a service of one task: the
+/// `ThresholdConfiguration` default is "a type of BOUNDED_PERCENT with a value of 50", and
+/// that type "calculates the failure threshold by multiplying `value` by the latest service
+/// desired count, then clamping the result to a minimum of `3` and a maximum of `200`" — so
+/// a one-task service takes THREE consecutively failed tasks, one per health-check verdict.
+const DEFAULT_THRESHOLD: i64 = 3;
+
+#[tokio::test]
+async fn consecutive_failed_health_checks_accumulate_until_the_default_threshold_is_reached() {
+    let router = service();
+    let case = "a never-healthy revision under the default breaker threshold";
+    cluster_with_capacity(&router, CLUSTER, case).await;
+    let family = "breakerdefault";
+    let name = "breakerdefault";
+
+    let healthy = register_revision(
+        &router,
+        family,
+        json!([container_with(
+            "app",
+            health_check(json!(["CMD-SHELL", "exit 0"]), 1, None),
+        )]),
+        case,
+    )
+    .await;
+    create_service(
+        &router,
+        name,
+        &healthy,
+        // The breaker the recorded client configures: enabled, rolling back, and with NO
+        // threshold configuration, so the threshold is the documented default formula's.
+        json!({ "enable": true, "rollback": true }),
+        case,
+    )
+    .await;
+
+    let deadline = Instant::now() + SERVICE_POLL_BUDGET;
+    loop {
+        let service_view = describe_service(&router, name, case).await;
+        let deployment = primary_deployment(&service_view, case);
+        if string(&deployment, "rolloutState", case) == "COMPLETED"
+            && count(&service_view, "runningCount", case) == 1
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the first rollout to complete with its task running, \
+             got {service_view}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    let failing = register_revision(
+        &router,
+        family,
+        json!([container_with(
+            "app",
+            health_check(json!(["CMD-SHELL", "exit 1"]), 1, None),
+        )]),
+        case,
+    )
+    .await;
+    let updated = ok(
+        &router,
+        "UpdateService",
+        json!({ "cluster": CLUSTER, "service": name, "taskDefinition": failing }),
+        case,
+    )
+    .await;
+    let rollout_arn = string(&updated["service"], "currentServiceDeployment", case);
+
+    // Every task of this rollout fails its check, so NONE of them reaches a healthy state
+    // and nothing resets the count: the failures the breaker has counted only ever climb,
+    // up to the threshold that fails the rollout.
+    //
+    // The rollout's OWN record is what this waits on rather than the `deployments[]` entry:
+    // that entry is superseded by the rollback the breaker starts, while the record keeps
+    // what the breaker counted and where the failure left the rollout. The entry is still
+    // read on every look, for the count that must never go DOWN while it is there.
+    let deadline = Instant::now() + SERVICE_POLL_BUDGET;
+    let mut counted = 0;
+    loop {
+        let service_view = describe_service(&router, name, case).await;
+        let rollout = list(&service_view, "deployments", case)
+            .into_iter()
+            .find(|deployment| deployment["taskDefinition"].as_str() == Some(failing.as_str()));
+        if let Some(rollout) = rollout {
+            let failed_tasks = count(&rollout, "failedTasks", case);
+            assert!(
+                failed_tasks >= counted,
+                "case {case:?}: expected the failures counted against a rollout no task of \
+                 which ever became healthy never to go down, had {counted} and got {rollout}"
+            );
+            counted = failed_tasks;
+            if rollout["rolloutState"].as_str() == Some("FAILED") {
+                assert_eq!(
+                    string(&rollout, "rolloutStateReason", case),
+                    "ECS deployment circuit breaker: tasks failed to start.",
+                    "case {case:?}: expected the reason to name the circuit breaker, got \
+                     {rollout}"
+                );
+            }
+        }
+        let record = describe_rollout(&router, &rollout_arn, case).await;
+        if record["deploymentCircuitBreaker"]["status"].as_str() == Some("TRIGGERED") {
+            assert!(
+                count(&record["deploymentCircuitBreaker"], "failureCount", case)
+                    >= DEFAULT_THRESHOLD,
+                "case {case:?}: expected at least the default threshold's worth of failures \
+                 counted against the rollout the breaker fired on, got {record}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the rollout of the never-healthy revision to be failed \
+             by the breaker, counted {counted} failures and got {service_view}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // ... and the service is taken back to the revision that completed.
+    let deadline = Instant::now() + SERVICE_POLL_BUDGET;
+    loop {
+        let service_view = describe_service(&router, name, case).await;
+        let deployment = primary_deployment(&service_view, case);
+        if string(&service_view, "taskDefinition", case) == healthy
+            && string(&deployment, "rolloutState", case) == "COMPLETED"
+            && count(&service_view, "runningCount", case) == 1
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the service to be rolled back to the revision that \
+             completed, got {service_view}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // The rollout the breaker fired on ends ROLLED BACK, by the breaker: where the failure
+    // left it, read off the resource that keeps it.
+    let record = describe_rollout(&router, &rollout_arn, case).await;
+    assert_eq!(
+        string(&record, "status", case),
+        "ROLLBACK_SUCCESSFUL",
+        "case {case:?}: expected the failed rollout to end rolled back, got {record}"
+    );
+}
+
+/// One service deployment as `DescribeServiceDeployments` reports it now.
+async fn describe_rollout(router: &MultiServiceRouter, arn: &str, case: &str) -> Value {
+    let body = ok(
+        router,
+        "DescribeServiceDeployments",
+        json!({ "serviceDeploymentArns": [arn] }),
+        case,
+    )
+    .await;
+    list(&body, "serviceDeployments", case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the rollout back, got {body}"))
 }
 
 // ---------------------------------------------------------------------------------------
