@@ -18,6 +18,14 @@
 //! holds no channel under addresses nothing to start or stop, so it is refused
 //! and stores nothing.
 //!
+//! That refusal is the service's not-found envelope — HTTP 404 under the
+//! not-found error type, the fixed channel-miss sentence under the one wire key
+//! `message`, and a `requestId` naming the response — and never the 400
+//! `BadRequestException` the model declares for a request that carries
+//! unexpected data, which is a different claim: a name addressing no channel is
+//! a well-formed request for a resource that is simply absent. The last test
+//! below pins that envelope over the class of absent names.
+//!
 //! The tables span the class the rule generalises over: every channel the
 //! lifecycle table spans (both playback modes, every tier, one and several
 //! outputs in each playlist form, audiences present and absent, time-shift at
@@ -25,11 +33,14 @@
 //! name), crossed with sequences that differ in which call comes first, how the
 //! two alternate and how many times each is repeated.
 
+use std::collections::BTreeSet;
+
 use serde_json::{json, Value};
 
 use crate::channel_lifecycle::{
     encode, table, Emulator, Reply, CHANNEL_NOT_FOUND_MESSAGE, NOT_FOUND_CODE, NOT_FOUND_STATUS,
 };
+use crate::error_envelope::ERROR_BODY_MEMBERS;
 
 /// The two calls under test. `ChannelState`'s modelled values are `RUNNING |
 /// STOPPED` (`shared_types::CHANNEL_STATE_VALUES`), and the operations' own
@@ -305,5 +316,176 @@ async fn a_name_the_account_holds_no_channel_under_is_refused() {
                 missing.status, missing.body
             );
         }
+    }
+}
+
+/// The channel the envelope table holds, so every refusal it makes is about the
+/// name the request addressed and not about an empty store.
+const HELD: &str = "held-channel";
+
+/// The channel the envelope table creates and then deletes, so one row
+/// addresses a name the account held until it was released.
+const RELEASED: &str = "released-channel";
+
+/// The names the envelope table spans: each addresses no channel, and they
+/// differ in HOW they are absent (never used, released by a delete, one
+/// character or one case away from the held name) and in the form of the name
+/// itself (digits only, punctuation, a character needing percent-encoding,
+/// non-ASCII, many times the held name's length) — so what the refusal reports
+/// is the absence, and nothing about how the name is spelled.
+///
+/// None of them occurs in [`CHANNEL_NOT_FOUND_MESSAGE`], so a row can also show
+/// that the sentence is fixed text with the requested name nowhere in it.
+fn absent_names() -> Vec<(&'static str, String)> {
+    vec![
+        ("a name never used", "never-created".to_string()),
+        ("the held name in another case", HELD.to_uppercase()),
+        ("the held name with one more character", format!("{HELD}x")),
+        ("a prefix of the held name", HELD[.."held".len()].to_string()),
+        ("a name of digits only", "12345".to_string()),
+        ("a name carrying dots and underscores", "a.b_c-1".to_string()),
+        ("a name needing percent-encoding", "two words".to_string()),
+        ("a non-ASCII name", "canal-ünïcode".to_string()),
+        ("a name many times the held name's length", "n".repeat(120)),
+        (
+            "a name the account held until it was deleted",
+            RELEASED.to_string(),
+        ),
+    ]
+}
+
+/// Assert `reply` is the not-found envelope a channel miss is answered with,
+/// and return the `requestId` it named.
+fn assert_channel_miss(case: &str, which: Call, name: &str, reply: &Reply) -> String {
+    assert_eq!(
+        reply.status, NOT_FOUND_STATUS,
+        "case {case:?}: expected {which:?} on {name:?} to answer HTTP {NOT_FOUND_STATUS}, got \
+         {} {:?}",
+        reply.status, reply.body
+    );
+    // The error type a client branches on — the service's not-found code, never
+    // the model's `BadRequestException`.
+    assert_eq!(
+        reply.error_code, NOT_FOUND_CODE,
+        "case {case:?}: expected {which:?} on {name:?} to answer the error type \
+         {NOT_FOUND_CODE:?}, got {:?}",
+        reply.error_code
+    );
+
+    // The body carries exactly the envelope's members, so the text travels
+    // under `message` and under no second key.
+    let members: BTreeSet<String> = reply
+        .body
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    assert_eq!(
+        members,
+        ERROR_BODY_MEMBERS
+            .iter()
+            .map(|member| (*member).to_string())
+            .collect::<BTreeSet<String>>(),
+        "case {case:?}: expected {which:?} on {name:?} to carry the error body's members, got \
+         {:?}",
+        reply.body
+    );
+    assert!(
+        reply.string("/__type").contains(NOT_FOUND_CODE),
+        "case {case:?}: expected the body to discriminate on {NOT_FOUND_CODE:?}, got {:?}",
+        reply.body
+    );
+
+    assert_eq!(
+        reply.message(),
+        CHANNEL_NOT_FOUND_MESSAGE,
+        "case {case:?}: expected {which:?} on {name:?} to read {CHANNEL_NOT_FOUND_MESSAGE:?}, \
+         got {:?}",
+        reply.body
+    );
+    // The sentence is fixed text: the requested name is not interpolated.
+    assert!(
+        !reply.message().contains(name),
+        "case {case:?}: expected the sentence to carry no part of {name:?}, got {:?}",
+        reply.message()
+    );
+
+    let request_id = reply.request_id();
+    assert!(
+        service_common::query_error_envelope::is_request_id(&request_id),
+        "case {case:?}: expected {which:?} on {name:?} to name its request, got {request_id:?} \
+         in {:?}",
+        reply.body
+    );
+    request_id
+}
+
+#[tokio::test]
+async fn a_channel_miss_is_refused_with_the_not_found_envelope() {
+    let emulator = Emulator::new();
+    let (_, _, request) = table().remove(0);
+
+    // One channel the account holds, and one whose name it holds until the
+    // delete releases it.
+    create(&emulator, "the held channel", HELD, &request).await;
+    let held_before = emulator.describe(HELD).await.body.clone();
+    create(&emulator, "the released channel", RELEASED, &request).await;
+    assert_eq!(
+        emulator.delete(RELEASED).await.status,
+        200,
+        "the channel whose name is released must be deleted"
+    );
+
+    let mut request_ids: Vec<String> = Vec::new();
+    for (row, name) in absent_names() {
+        for which in [Call::Start, Call::Stop] {
+            // Retried: the refusal's text is a property of the refusal, so it
+            // repeats byte for byte, while the id names ONE response.
+            for attempt in 1..=2 {
+                let case = format!("{row} / {which:?} / attempt {attempt}");
+                let reply = call(&emulator, &name, which).await;
+                request_ids.push(assert_channel_miss(&case, which, &name, &reply));
+            }
+
+            let case = format!("{row} / {which:?}");
+            // The refused call stored nothing: the name is still free...
+            let missing = emulator.describe(&name).await;
+            assert_eq!(
+                missing.status, NOT_FOUND_STATUS,
+                "case {case:?}: expected the refused call to store no channel, got {} {:?}",
+                missing.status, missing.body
+            );
+            // ...and the channel the account does hold did not move.
+            let held_now = emulator.describe(HELD).await;
+            assert_eq!(
+                held_now.body, held_before,
+                "case {case:?}: expected the held channel to stand as it was, got {:?}",
+                held_now.body
+            );
+        }
+    }
+
+    // One id per response: no two of these refusals named the same request.
+    let distinct: BTreeSet<&String> = request_ids.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        request_ids.len(),
+        "expected every refusal to name its own request, got {request_ids:?}"
+    );
+
+    // The 404 answers the ABSENCE, not the route: both calls are served for the
+    // name the account does hold.
+    for which in [Call::Start, Call::Stop] {
+        let served = call(&emulator, HELD, which).await;
+        assert_eq!(
+            served.status, 200,
+            "case {which:?}: expected the held channel to be served, got {} {:?}",
+            served.status, served.body
+        );
+        assert_eq!(
+            emulator.describe(HELD).await.string("/ChannelState"),
+            which.state(),
+            "case {which:?}: expected the held channel to reach {:?}",
+            which.state()
+        );
     }
 }
