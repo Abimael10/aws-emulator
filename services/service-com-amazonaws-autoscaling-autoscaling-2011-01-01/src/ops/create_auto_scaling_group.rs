@@ -896,6 +896,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             instances: Vec::new(),
             cooldown_until: None,
             pending_capacity: None,
+            // A group is created owing no launch: the capacity its own create launches is
+            // launched below, and a launch that could not place it is what leaves it owing.
+            owes_launch: false,
             // The hooks the request's own lifecycle hook specifications created, taken
             // against the same rules as a later `PutLifecycleHook`.
             lifecycle_hooks,

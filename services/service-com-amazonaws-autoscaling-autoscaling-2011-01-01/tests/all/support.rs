@@ -14,6 +14,7 @@ use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_ec2_amazonec2::state as ec2;
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as elbv2_service;
+use service_com_amazonaws_iam_awsidentitymanagementv20100508 as iam_service;
 
 /// The region every suite signs for, so the ARNs the service stamps are checked
 /// against the region the request names rather than a default.
@@ -154,6 +155,19 @@ pub fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     router.register_service(autoscaling::EmulatedService::new(Arc::clone(&engine)));
     router.register_service(ec2_service::EmulatedService::new(Arc::clone(&engine)));
     router.register_service(elbv2_service::EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
+}
+
+/// [`emulator`] with IAM mounted beside the three, on that same engine.
+///
+/// The one copy for a suite whose subject reaches an IAM record as well — the instance
+/// profile a group's launch source names is IAM's resource, so a launch that resolves it
+/// resolves it where it lives. The suites that mounted their own four-service router before
+/// this existed are to be folded onto it by their own issues; nothing new should write
+/// another one.
+pub fn emulator_with_iam() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (mut router, engine) = emulator();
+    router.register_service(iam_service::EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
 }
 

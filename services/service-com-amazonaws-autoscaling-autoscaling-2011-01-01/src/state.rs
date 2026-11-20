@@ -34,7 +34,10 @@
 //! * the warm pool of a group holds the instances it maintains, so the difference
 //!   between its size and that target is launched or taken out as the clock makes it
 //!   due, and an instance it just launched is reported `Warmed:Pending` before it
-//!   reaches the pool's own state ([`warm_pools`]).
+//!   reaches the pool's own state ([`warm_pools`]);
+//! * a group holds the capacity it is configured for OWED until its members provide it,
+//!   so capacity a launch could not place is launched again as soon as nothing stands in
+//!   the way of placing it ([`StoredGroup::owes_launch`]).
 //!
 //! # The instances a group holds
 //!
@@ -506,6 +509,28 @@ pub fn failed_launch_description(status_message: &str) -> String {
     format!("Launching a new EC2 instance. Status Reason: {status_message}")
 }
 
+/// What the activity of a launch the group made to MEET its desired capacity records as
+/// the reason it began: the difference between the capacity the group is configured for
+/// and the capacity its members provide, which is what an instance a group short of its
+/// capacity launches is launched in response to.
+///
+/// Reads as the subject of [`capacity_shortfall_cause`], the counterpart of
+/// [`AutoScalingState::capacity_change_cause`] for a launch that moves no size: the
+/// desired capacity stands where the change that asked for it left it, and what rises is
+/// the capacity in service.
+pub const CAPACITY_SHORTFALL_REASON: &str =
+    "an instance was launched in response to a difference between desired and actual capacity";
+
+/// The cause a launch that brought a group UP to its desired capacity records: what asked
+/// for it, and the capacity it moved the group between — one sentence, the way Amazon EC2
+/// Auto Scaling words this class of activity ("… in response to a difference between desired
+/// and actual capacity, increasing the capacity from 1 to 2."), so the clause naming the
+/// capacities follows the reason on a comma rather than on the colon
+/// [`AutoScalingState::capacity_change_cause`] states a capacity CHANGE with.
+pub fn capacity_shortfall_cause(from: i32, to: i32) -> String {
+    format!("{CAPACITY_SHORTFALL_REASON}, increasing the capacity from {from} to {to}.")
+}
+
 /// What the activities of a termination request record as the reason they began: a
 /// caller named the instance, which is what tells the activity log a manual termination
 /// apart from the scale-in a capacity change chose for itself.
@@ -946,6 +971,23 @@ pub struct StoredGroup {
     pub cooldown_until: Option<SystemTime>,
     /// A capacity change waiting for [`Self::cooldown_until`].
     pub pending_capacity: Option<PendingCapacity>,
+    /// Whether a launch into this group could NOT place what it was asked for, so the
+    /// capacity the group is short of is still OWED.
+    ///
+    /// A group maintains the capacity it is configured for, so a launch that placed nothing
+    /// does not abandon it: the group is marked here, and the capacity it is short of is
+    /// launched again as soon as nothing stands in the way of placing it
+    /// ([`AutoScalingState::materialize_due`]). HOW MUCH is never stored — it is counted
+    /// from the group's own members at the instant the launch is made — so the mark says
+    /// only that a launch was stopped.
+    ///
+    /// Set by the one launch path a group's own instances come from, and cleared both by a
+    /// launch that placed everything it was asked for and by the group reaching its
+    /// capacity. A launch of NOTHING leaves it alone, since it says nothing about what the
+    /// group could place. So an instance that left the group AFTER a launch that worked —
+    /// one a launch lifecycle hook abandoned, say — leaves no mark and is not relaunched
+    /// here: that is the business of whatever took it out.
+    pub owes_launch: bool,
     /// The group's lifecycle hooks, keyed by `LifecycleHookName`: the ONE collection
     /// every reader and writer of a hook of this group reaches
     /// ([`lifecycle_hooks`]), so deleting the group takes its hooks with it.
@@ -1890,7 +1932,8 @@ impl AutoScalingState {
 
     /// Materialise everything the clock has already made due at `now`: deferred
     /// capacity changes whose cooldown has elapsed, the replacements a running
-    /// instance refresh owes, instance lifecycle transitions, activity
+    /// instance refresh owes, instance lifecycle transitions, the capacity a group was
+    /// left owing, activity
     /// completions, and the size each group's warm pool maintains.
     ///
     /// Every handler calls this first — including the reporting ones, which may
@@ -2002,6 +2045,10 @@ impl AutoScalingState {
                     || i.is_retained()
             });
         }
+        // The capacity the groups are still OWED, launched now that nothing stands in the
+        // way of placing it ([`Self::converge_capacity`]). After the pass above, so the
+        // shortfall is counted from the instances this instant leaves each group with.
+        self.converge_capacity(engine, now);
         // The warm pools the groups maintain: the transitions of their instances, and the
         // difference between each pool's size and the size it maintains, which the clock
         // owes exactly as it owes a group's own ([`warm_pools`]).
@@ -2270,6 +2317,108 @@ impl AutoScalingState {
         }
     }
 
+    /// Launch the capacity each group is still OWED, now that nothing stands in the way of
+    /// placing it.
+    ///
+    /// A group's `DesiredCapacity` is the capacity it MAINTAINS rather than an instruction
+    /// one call carries out — "Amazon EC2 Auto Scaling launches instances until the desired
+    /// capacity is totally fulfilled" (`LaunchTemplateOverrides$WeightedCapacity`) — so
+    /// capacity a launch COULD NOT PLACE stays owed ([`StoredGroup::owes_launch`]) and is
+    /// launched as soon as it can be: a group whose launch was stopped by an attachment it
+    /// could not register its instance into reaches its capacity once the client has
+    /// repaired that attachment, with no further capacity change from anybody.
+    ///
+    /// A debt the CLOCK owes, which is why [`Self::materialize_due`] retires it and a
+    /// REPORTING operation materialises it: the launch was owed at `now` whether or not
+    /// anybody called.
+    ///
+    /// HOW MUCH is counted HERE, from the group's own members against the capacity it is
+    /// configured for ([`StoredGroup::launches_needed`]) rather than from anything stored
+    /// when the launch failed — so a group that is owed a launch converges on the capacity
+    /// it is short of at this instant, whatever has happened to it since. A group whose
+    /// members already provide that capacity is simply no longer owed anything. Neither is
+    /// anything launched for a group whose `Launch` process is suspended (that process is
+    /// what adds instances to a group, [`suspended_processes`]), one with no zone to place an
+    /// instance in, or one still holding a capacity change for its cooldown, which is the
+    /// change that will converge it.
+    ///
+    /// An attempt that places NOTHING records no activity: the capacity stays owed and is
+    /// attempted again, while the failure a client reads is the one the call that asked for
+    /// the capacity recorded for it.
+    fn converge_capacity<Eng: Send + Sync + 'static>(&mut self, engine: &Eng, now: SystemTime) {
+        // A group that is no longer short of capacity owes no launch: it owes one only while
+        // its members do not provide the capacity it is configured for.
+        for group in self.groups.values_mut() {
+            if group.owes_launch && group.launches_needed(group.desired_capacity) <= 0 {
+                group.owes_launch = false;
+            }
+        }
+        // What each group is owed, read before anything is launched so no group is borrowed
+        // across the launch below.
+        let owed: Vec<(String, String, usize, i32, i32)> = self
+            .groups
+            .values()
+            .filter(|group| {
+                group.owes_launch
+                    && group.pending_capacity.is_none()
+                    && !group.availability_zones.is_empty()
+                    && !group.is_process_suspended(PROCESS_LAUNCH)
+            })
+            .filter_map(|group| {
+                // The same shortfall a capacity change launches, bounded the same way
+                // ([`Self::apply_capacity`]): what it takes to fulfil the capacity, and
+                // never more than the group can still hold.
+                let needed = group
+                    .launches_needed(group.desired_capacity)
+                    .clamp(0, MAX_GROUP_CAPACITY)
+                    .min(group.launch_headroom());
+                let count = usize::try_from(needed).unwrap_or(0);
+                (count > 0).then(|| {
+                    (
+                        group.name.clone(),
+                        group.arn.clone(),
+                        count,
+                        group.active_capacity_units(),
+                        group.desired_capacity,
+                    )
+                })
+            })
+            .collect();
+        for (name, arn, count, from, desired) in owed {
+            let due = now + LIFECYCLE_TRANSITION;
+            let launch = self.launch_into_group(
+                engine,
+                &GroupLaunch {
+                    group_name: &name,
+                    count,
+                    launched_at: now,
+                    due,
+                    // The capacity a group maintains is launched from the group's own launch
+                    // source and placed across the whole of its configuration, exactly as
+                    // the capacity change that asked for it would have launched it.
+                    desired_configuration: None,
+                    destination: LaunchDestination::Group,
+                    placement: None,
+                },
+            );
+            let cause = capacity_shortfall_cause(from, desired);
+            for instance_id in launch.launched_ids {
+                self.record_instance_lifecycle_change(
+                    engine,
+                    &InstanceLifecycleChange {
+                        kind: InstanceLifecycle::Launched,
+                        group_name: &name,
+                        group_arn: &arn,
+                        instance_id: &instance_id,
+                        cause: &cause,
+                        start_time: now,
+                        due,
+                    },
+                );
+            }
+        }
+    }
+
     /// Leave the group in the cooldown `seconds` names, counted from `applied_at` — the
     /// cooldown the CHANGE carries rather than the group's `DefaultCooldown`, which
     /// [`Self::apply_capacity`] has just started.
@@ -2411,7 +2560,32 @@ impl AutoScalingState {
     /// the client left it — it is the client's to remove
     /// (`DetachLoadBalancerTargetGroups`), and a group that reported an attachment the
     /// client never detached cannot refuse that detach.
+    ///
+    /// A launch into the group that could not place what it was asked for leaves the group
+    /// OWING it ([`StoredGroup::owes_launch`]): a group maintains the capacity it is
+    /// configured for, so the capacity nothing was placed for is launched again as soon as
+    /// nothing stands in the way of placing it ([`Self::converge_capacity`]). A launch that
+    /// placed everything it was asked for leaves the group owing nothing, and a launch of
+    /// NOTHING leaves the mark exactly as it was, since it says nothing about what the group
+    /// could place. A launch into a warm pool owes the group nothing either — that pool's
+    /// size is maintained by its own reconcile ([`warm_pools`]).
     fn launch_into_group<Eng: Send + Sync + 'static>(
+        &mut self,
+        engine: &Eng,
+        request: &GroupLaunch<'_>,
+    ) -> GroupLaunchOutcome {
+        let outcome = self.place_launch(engine, request);
+        if request.destination == LaunchDestination::Group && request.count > 0 {
+            if let Some(group) = self.groups.get_mut(request.group_name) {
+                group.owes_launch = outcome.unplaced > 0;
+            }
+        }
+        outcome
+    }
+
+    /// Place one launch: the whole of [`Self::launch_into_group`] except the capacity it
+    /// leaves owed, which that call records for every one of the ways this one answers.
+    fn place_launch<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
         request: &GroupLaunch<'_>,
