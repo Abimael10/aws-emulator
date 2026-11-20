@@ -49,20 +49,24 @@ macro_rules! params {
 
 /// The message Secrets Manager words `ResourceNotFoundException` with for a secret it
 /// cannot resolve: fixed text, with no variable part naming the secret that was asked for.
-const SECRET_NOT_FOUND: &str = "Secrets Manager can't find the specified secret.";
+///
+/// `pub(crate)` so the sibling suite that asserts the same refusal over the other axes of
+/// the rule reads this one definition rather than writing a second copy of it.
+pub(crate) const SECRET_NOT_FOUND: &str = "Secrets Manager can't find the specified secret.";
 
 /// `ResourceNotFoundException` is modelled at HTTP 400 by this service's Smithy model
 /// (`smithy_query(query="operation",operation="DescribeSecret")` on the Secrets Manager
-/// model).
-const NOT_FOUND_STATUS: u16 = 400;
+/// model). `pub(crate)` for the same reason as [`SECRET_NOT_FOUND`].
+pub(crate) const NOT_FOUND_STATUS: u16 = 400;
 
 /// How long a poll below waits for a condition another service's clock makes true: long
 /// enough that a loaded machine reaches it, because what is asserted is that it happens at
-/// all and never how fast.
-const DEADLINE: Duration = Duration::from_secs(60);
+/// all and never how fast. `pub(crate)` for the same reason as [`SECRET_NOT_FOUND`].
+pub(crate) const DEADLINE: Duration = Duration::from_secs(60);
 
-/// How long a poll waits before looking again.
-const POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// How long a poll waits before looking again. `pub(crate)` for the same reason as
+/// [`SECRET_NOT_FOUND`].
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The settings a Multi-AZ DB cluster requires, as `CreateDBCluster` documents them for
 /// that cluster type ("This setting is required to create a Multi-AZ DB cluster").
