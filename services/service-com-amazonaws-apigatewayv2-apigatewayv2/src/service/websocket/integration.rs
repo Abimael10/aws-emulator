@@ -41,6 +41,7 @@ use ::smithy_server_runtime::EmbeddedEmulator;
 
 use super::dispatch::{self, TemplateCall, Unserved};
 use super::event::{self, Call, Connection};
+use super::request_model;
 use crate::service::invoke::{lambda, proxy_response};
 use crate::state::{Api, ComAmazonawsApigatewayv2Apigatewayv2State as ServiceStore};
 use crate::state::{DeployedConfiguration, Integration, Route, Stage};
@@ -69,6 +70,10 @@ pub struct Selected {
     /// The integration the route targets, or `None` for a route that targets none — which
     /// has nothing to call at all.
     pub integration: Option<Integration>,
+    /// The model a MESSAGE this route serves has to satisfy, for a route that names one this
+    /// stage can apply ([`super::request_model`]). `None` for every other call: a connection
+    /// request and a close carry no message body to check.
+    pub request_model: Option<request_model::PendingCheck>,
 }
 
 impl Selected {
@@ -78,6 +83,7 @@ impl Selected {
             route_key: route.route_key.clone(),
             two_way: dispatch::is_two_way(route),
             integration: dispatch::targeted_integration(deployed, route).cloned(),
+            request_model: None,
         }
     }
 }
@@ -105,12 +111,19 @@ pub fn select_route_key(deployed: &DeployedConfiguration, route_key: &str) -> Op
 
 /// The route that serves the message `body`, selected for performing, or `None` when the api
 /// routes it nowhere ([`super::dispatch::message_route`]).
+///
+/// A MESSAGE is the one call a route's own `RequestModels` are about, so the check that
+/// message owes is read here, under the same lock the route was selected under
+/// ([`super::request_model::pending`]).
 pub fn select_message(
     api: &Api,
     deployed: &DeployedConfiguration,
     body: &str,
 ) -> Option<Selected> {
-    dispatch::message_route(api, deployed, body).map(|route| Selected::of(deployed, route))
+    dispatch::message_route(api, deployed, body).map(|route| Selected {
+        request_model: request_model::pending(deployed, route, body),
+        ..Selected::of(deployed, route)
+    })
 }
 
 /// Perform `selected`'s integration for one `call` of `connection`, and answer what it

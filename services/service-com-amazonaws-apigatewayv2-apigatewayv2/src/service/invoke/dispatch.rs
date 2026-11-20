@@ -23,13 +23,13 @@
 //!   ([`super::service_action`]);
 //! * `HTTP_PROXY` is "for integrating the route or method request with an HTTP endpoint,
 //!   with the client request passed through as-is". The endpoint is a URI the CALLER can
-//!   reach, and this emulator forwards no request to a destination its own configuration
+//!   reach, and this emulator relays no request to a destination an api's own configuration
 //!   names — a forward target a `CreateIntegration` chooses is exactly what must not become
 //!   a request this process makes, and the caller's own credential must not travel to one —
-//!   so the caller is sent there instead: `307 Temporary Redirect` to the upstream, the
-//!   redirect that preserves the request's method and body (RFC 7231 §6.4.7), so the client
-//!   makes exactly the request the gateway would have forwarded and nothing about the
-//!   upstream's answer is invented;
+//!   so the caller is sent there instead ([`super::http_proxy`]): `307 Temporary Redirect` to
+//!   the upstream, the redirect that preserves the request's method and body (RFC 7231
+//!   §6.4.7), so the client makes exactly the request the gateway would have relayed and
+//!   nothing about the upstream's answer is invented;
 //! * `AWS`, `HTTP` and `MOCK` are not an HTTP api's: `MOCK` "is not permitted for APIs with
 //!   a protocol type of HTTP", and the two non-proxy types take request and response
 //!   templates a WebSocket api's integration carries.
@@ -94,7 +94,7 @@ use super::proxy_response;
 use super::request_authorizer::{self, Outcome};
 use super::response_parameters;
 use super::service_action::{self, Unperformed};
-use super::{redirect, INTERNAL_MESSAGE};
+use super::{http_proxy, INTERNAL_MESSAGE};
 use crate::state::route_throttle::Limits;
 use crate::state::{Authorizer, Integration};
 
@@ -253,17 +253,17 @@ async fn answered<Eng: Send + Sync + 'static>(
         return lambda_proxy(ctx, &dispatch, &integration, &upstream, integration_latency).await;
     }
     if integration.integration_type == crate::state::HTTP_PROXY_INTEGRATION_TYPE {
-        // An `HTTP_PROXY` upstream is a URI the CALLER can reach, and this emulator opens no
-        // outbound connection and forwards no request to a destination its own configuration
-        // names, so the caller is sent there instead. See the module docs.
+        // An `HTTP_PROXY` upstream is a URI the CALLER can reach, and this emulator relays no
+        // request to a destination an api's own configuration names, so the caller is sent
+        // there instead. See the module docs and [`super::http_proxy`].
         ::tracing::info!(
             api_id = %dispatch.request.api_id,
             stage = %dispatch.request.stage_name,
             route_key = %dispatch.route_key,
-            "sending the caller to this route's HTTP_PROXY upstream rather than forwarding \
-             the request to it"
+            "sending the caller to this route's HTTP_PROXY upstream rather than relaying the \
+             request to it"
         );
-        return redirect(&upstream);
+        return http_proxy::sent_to_the_upstream(&upstream);
     }
     ::tracing::warn!(
         api_id = %dispatch.request.api_id,
@@ -294,7 +294,7 @@ pub fn unperformable<Eng: Send + Sync + 'static>(engine: &Eng, dispatch: &Dispat
     if let Some(integration) = dispatch.integration.as_ref() {
         if integration.integration_type == crate::state::HTTP_PROXY_INTEGRATION_TYPE {
             if let Some(upstream) = resolved_uri(dispatch, integration) {
-                return Performed::gateway(redirect(&upstream));
+                return Performed::gateway(http_proxy::sent_to_the_upstream(&upstream));
             }
         }
     }

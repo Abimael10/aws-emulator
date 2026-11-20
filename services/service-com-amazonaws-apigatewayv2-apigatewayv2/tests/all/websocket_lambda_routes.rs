@@ -2244,3 +2244,256 @@ async fn a_replaced_route_selection_expression_redirects_later_frames() {
         );
     }
 }
+
+/// The MODEL the modelled route below declares: one REQUIRED member, of type `string`.
+///
+/// Written in the dialect `Model$Schema` documents a model is written in — "for
+/// application/json models, this should be JSON schema draft 4 model".
+const MESSAGE_MODEL_SCHEMA: &str = r#"{
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "title": "Message",
+    "type": "object",
+    "required": ["text"],
+    "properties": { "text": { "type": "string" } }
+}"#;
+
+/// The name that model is created under, which is the value the route's `RequestModels`
+/// carries.
+const MESSAGE_MODEL: &str = "Message";
+
+/// The sentence API Gateway's own frame carries for a message its route's model REFUSED.
+const INVALID_BODY_FRAME: &str = "Invalid request body";
+
+/// The route key the modelled route serves, and the one beside it that declares no model at
+/// all — the control that shows the refusal comes from the MODEL and not from the body.
+const MODELLED_ROUTE: &str = "sendmsg";
+const UNMODELLED_ROUTE: &str = "ping";
+
+/// Create the model `name` on `api_id` from `schema` — the `Model` a route names in its
+/// `RequestModels`.
+async fn given_model(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+    name: &str,
+    schema: &str,
+) {
+    created(
+        emulator,
+        case,
+        "CreateModel",
+        &format!("/v2/apis/{api_id}/models"),
+        json!({
+            "name": name,
+            "contentType": "application/json",
+            "schema": schema
+        }),
+    )
+    .await;
+}
+
+/// [`given_route`] for a route that declares a request MODEL: its `RequestModels` names
+/// `model` under the `$default` key its `ModelSelectionExpression` selects — the two members
+/// `Route$RequestModels` and `Route$ModelSelectionExpression` describe, "supported only for
+/// WebSocket APIs".
+async fn given_modelled_route(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+    route_key: &str,
+    function_arn: &str,
+    model: &str,
+) {
+    let integration = created(
+        emulator,
+        case,
+        "CreateIntegration",
+        &format!("/v2/apis/{api_id}/integrations"),
+        json!({
+            "integrationType": "AWS_PROXY",
+            "integrationUri": function_arn,
+            "integrationMethod": "POST"
+        }),
+    )
+    .await;
+    let integration_id = integration
+        .get("integrationId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let route = created(
+        emulator,
+        case,
+        "CreateRoute",
+        &format!("/v2/apis/{api_id}/routes"),
+        json!({
+            "routeKey": route_key,
+            "target": format!("integrations/{integration_id}"),
+            "requestModels": { "$default": model },
+            "modelSelectionExpression": "\\$default"
+        }),
+    )
+    .await;
+    let route_id = route
+        .get("routeId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    // A two-way route: "to define a two-way route, create a route response", which is what
+    // makes the function's own reply reach the client.
+    created(
+        emulator,
+        case,
+        "CreateRouteResponse",
+        &format!("/v2/apis/{api_id}/routes/{route_id}/routeresponses"),
+        json!({ "routeResponseKey": "$default" }),
+    )
+    .await;
+}
+
+/// One row: the frame the client sends, and whether the route's own model admits it.
+struct Modelled {
+    case: &'static str,
+    sent: &'static str,
+    /// `true` when the message reaches the route's backend, `false` when the gateway refuses
+    /// it with [`INVALID_BODY_FRAME`].
+    admitted: bool,
+}
+
+#[tokio::test]
+async fn a_frame_its_routes_model_refuses_is_answered_by_the_gateway() {
+    // RULE: a route's `RequestModels` names the `Model` a message it serves has to satisfy,
+    // so a frame that does not satisfy that schema is the CLIENT's error: API Gateway answers
+    // its own `Invalid request body` frame instead of the route's reply, while a frame the
+    // model admits — and the same frame on a route that declares no model — is served by the
+    // route's integration as always.
+    //
+    // The rows differ along HOW the body stands to the model: admitted, admitted with a member
+    // the model does not forbid, a member of two other types, a required member the frame does
+    // not carry, and the refused body sent to the route that declares no model.
+    let cases: [Modelled; 6] = [
+        Modelled {
+            case: "a body the model admits",
+            sent: r#"{"action":"sendmsg","text":"hello"}"#,
+            admitted: true,
+        },
+        Modelled {
+            case: "a body carrying a member the model does not forbid",
+            sent: r#"{"action":"sendmsg","text":"hello","note":"extra"}"#,
+            admitted: true,
+        },
+        Modelled {
+            case: "a member the model types as a string sent as a number",
+            sent: r#"{"action":"sendmsg","text":12345}"#,
+            admitted: false,
+        },
+        Modelled {
+            case: "the same member sent as an object",
+            sent: r#"{"action":"sendmsg","text":{"said":"hello"}}"#,
+            admitted: false,
+        },
+        Modelled {
+            case: "a required member the frame does not carry",
+            sent: r#"{"action":"sendmsg"}"#,
+            admitted: false,
+        },
+        Modelled {
+            case: "the refused body on a route that declares no model",
+            sent: r#"{"action":"ping","text":12345}"#,
+            admitted: true,
+        },
+    ];
+
+    let case = "a route whose RequestModels names a model";
+    let (emulator, engine) = emulator();
+    let api = given_api(&emulator, case).await;
+    let function = given_function(
+        &emulator,
+        &engine,
+        case,
+        "modelled-route",
+        &echoing_handler("backend"),
+    )
+    .await;
+    given_model(
+        &emulator,
+        case,
+        &api.api_id,
+        MESSAGE_MODEL,
+        MESSAGE_MODEL_SCHEMA,
+    )
+    .await;
+    given_modelled_route(
+        &emulator,
+        case,
+        &api.api_id,
+        MODELLED_ROUTE,
+        &function,
+        MESSAGE_MODEL,
+    )
+    .await;
+    given_route(
+        &emulator,
+        case,
+        &api.api_id,
+        UNMODELLED_ROUTE,
+        &function,
+        true,
+        None,
+    )
+    .await;
+    given_stage(&emulator, case, &api.api_id).await;
+
+    let mut socket: ClientSocket = upgraded(case, &api.authority).await;
+    // ONE budget for the whole table, like every other table of this suite: what it waits out
+    // is the function runtime starting, which happens once.
+    let patience = std::time::Instant::now() + DECISION_WAIT;
+    for row in cases {
+        if row.admitted {
+            let answered = route_reply(case, row.case, &mut socket, row.sent, patience).await;
+            assert_eq!(
+                member(&answered, "/fn"),
+                json!("backend"),
+                "case {case:?} / {}: a body the route's model admits must reach its backend, \
+                 got {answered}",
+                row.case
+            );
+            assert_eq!(
+                member(&answered, "/event/body"),
+                json!(row.sent),
+                "case {case:?} / {}: the backend must be handed the body as sent, got \
+                 {answered}",
+                row.case
+            );
+            continue;
+        }
+        let answered = parsed(
+            case,
+            row.case,
+            &exchanged_reply(row.case, &mut socket, row.sent).await,
+        );
+        assert_eq!(
+            member(&answered, "/message"),
+            json!(INVALID_BODY_FRAME),
+            "case {case:?} / {}: a body the route's model refuses must be answered the \
+             gateway's own frame, got {answered}",
+            row.case
+        );
+        assert_eq!(
+            member(&answered, "/fn"),
+            Value::Null,
+            "case {case:?} / {}: a refused body must not be answered by the route's backend, \
+             got {answered}",
+            row.case
+        );
+        // The refusal is of the MESSAGE and not of the connection: the frame names the
+        // connection it was sent on, which stays open for the rows that follow.
+        assert_ne!(
+            member(&answered, "/connectionId"),
+            Value::Null,
+            "case {case:?} / {}: the gateway's frame names the connection it refused a \
+             message on, got {answered}",
+            row.case
+        );
+    }
+}

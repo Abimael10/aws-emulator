@@ -111,10 +111,11 @@
 //!   `PayloadFormatVersion` defines ([`proxy_event`]) and answers with the response that
 //!   version defines ([`proxy_response`]);
 //! * an `HTTP_PROXY` route's endpoint is a URI the CALLER can reach, and this emulator
-//!   forwards no request to a destination its own configuration names: the caller is sent
-//!   there instead, `307 Temporary Redirect` to the upstream the integration resolved, which
-//!   preserves the request's method and body, so the client makes exactly the request the
-//!   gateway would have forwarded and nothing about the upstream's answer is invented;
+//!   relays no request to a destination an api's own configuration names: the caller is sent
+//!   there instead ([`http_proxy`]), `307 Temporary Redirect` to the upstream the integration
+//!   resolved, which preserves the request's method and body, so the client makes exactly the
+//!   request the gateway would have relayed and nothing about the upstream's answer is
+//!   invented;
 //! * `MOCK` — the one type that answers without a backend — "is not permitted for APIs with
 //!   a protocol type of HTTP" ([`crate::state::WEBSOCKET_ONLY_INTEGRATION_TYPES`]), so it
 //!   cannot be configured here, and the two non-proxy types (`AWS`, `HTTP`) take the request
@@ -153,6 +154,10 @@
 //! `crate::service`'s own docs state that rule.
 
 mod dispatch;
+/// What an `HTTP_PROXY` route ANSWERS: the upstream its integration resolved, and the
+/// redirect that sends the caller there rather than this emulator relaying a request to a
+/// destination an api's own configuration names.
+mod http_proxy;
 /// What the stage LOGS about a request it served: its access-log record, rendered by the
 /// stage's own `$context` format. `pub(crate)` only for the stream NAMING a stage's records
 /// go to and the reading of which statuses carry an error to name, which the WEBSOCKET
@@ -274,14 +279,6 @@ use proxy_event::FORWARDED_FOR_HEADER;
 
 /// How that chain separates its elements: one comma-separated field value (RFC 9110 §5.3).
 const FORWARDED_FOR_SEPARATOR: &str = ", ";
-
-/// The status a caller is sent to an upstream with: the redirect that preserves the
-/// request's method and body (RFC 7231 §6.4.7), so the client repeats the request the
-/// gateway would have forwarded.
-const TEMPORARY_REDIRECT_STATUS: u16 = 307;
-
-/// The header that redirect carries the upstream in (RFC 7231 §7.1.2).
-const LOCATION_HEADER: &str = "location";
 
 /// The request header that makes a request CROSS-ORIGIN: the origin the user agent took it
 /// from (RFC 6454 §7). A request carrying none asks for no CORS decoration, so none is
@@ -1925,25 +1922,6 @@ fn preflight_answer() -> RtResponse {
         ),
         SdkBody::empty(),
     )
-}
-
-/// `307 Temporary Redirect` to `location`, with no body of its own: the answer for an
-/// upstream the CALLER can reach and this emulator does not connect to.
-fn redirect(location: &str) -> RtResponse {
-    let mut response = RtResponse::new(
-        StatusCode::try_from(TEMPORARY_REDIRECT_STATUS).unwrap_or(
-            StatusCode::try_from(UNPLACEABLE_STATUS).expect("500 is a valid status code"),
-        ),
-        SdkBody::empty(),
-    );
-    let headers = response.headers_mut();
-    if headers.try_insert(LOCATION_HEADER, location.to_string()).is_err() {
-        // A stored `IntegrationUri` that cannot be a header value names no reachable
-        // upstream, so there is nowhere to send the caller.
-        return json_response(UNPLACEABLE_STATUS, INTERNAL_MESSAGE, None);
-    }
-    let _ = headers.try_insert("content-length", "0");
-    response
 }
 
 /// Now, as whole seconds since the epoch — the `NumericDate` a token's `exp` and `nbf` are

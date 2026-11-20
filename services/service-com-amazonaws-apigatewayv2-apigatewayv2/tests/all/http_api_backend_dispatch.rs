@@ -9,8 +9,8 @@
 //! defines and mapping the response that version defines — so the status, headers and body a
 //! client receives are the function's, while an integration that produced no response is the
 //! gateway's `500`, one that did not answer within its own `TimeoutInMillis` is its `503`,
-//! and an `HTTP_PROXY` upstream — a URI the caller can reach, which this emulator forwards no
-//! request to — is the `307` that sends the caller there.**
+//! and an `HTTP_PROXY` upstream — a URI the caller can reach, which this emulator relays no
+//! request to — is the `307` that sends the caller there, whichever address it names.**
 //!
 //! Nothing here is a value this emulator fills in: every assertion below is on something a
 //! function RAN and returned, which is why AWS Lambda is mounted beside this service on one
@@ -68,7 +68,7 @@ const INTEGRATION_FAULT: u16 = 500;
 const INTEGRATION_FAULT_MESSAGE: &str = "Internal Server Error";
 
 /// The redirect an `HTTP_PROXY` upstream is answered with: the caller is sent to the
-/// backend rather than this emulator forwarding the request to it.
+/// backend rather than this emulator relaying the request to it.
 const TEMPORARY_REDIRECT: u16 = 307;
 
 /// The status and sentence it answers for an integration that ran and did not answer within
@@ -1337,8 +1337,8 @@ async fn first_integration_id(emulator: &MultiServiceRouter, api_id: &str) -> St
 
 #[tokio::test]
 async fn an_http_proxy_route_sends_the_caller_to_the_endpoint_it_names() {
-    // An `HTTP_PROXY` upstream is a URI the CALLER can reach, and this emulator forwards no
-    // request to a destination its own configuration names, so the caller is sent there:
+    // An `HTTP_PROXY` upstream is a URI the CALLER can reach, and this emulator relays no
+    // request to a destination an api's own configuration names, so the caller is sent there:
     // `307`, with the upstream the integration resolved in `Location`. The rows differ along
     // where the upstream comes from — the integration's literal URI, and one a stage variable
     // selects — and the row that resolves to no backend at all.
@@ -1564,4 +1564,231 @@ async fn an_events_multi_valued_maps_report_one_entry_per_occurrence_of_a_field(
             );
         }
     }
+}
+
+// What an `HTTP_PROXY` route ANSWERS, beside the Lambda invocation above.
+//
+// RULE: `Integration$IntegrationType` gives `HTTP_PROXY` as "for integrating the route or
+// method request with an HTTP endpoint, with the client request passed through as-is", so the
+// endpoint such a route fronts is a URI the CALLER can reach — and this emulator relays no
+// request to a destination an api's own configuration names, WHICHEVER address that names:
+// the caller is sent there with the redirect that preserves its method and body, and nothing
+// of that endpoint's own answer appears in what the client reads.
+//
+// The table above drives upstreams nothing in this emulator serves. The rows below add the
+// case that makes the rule visible rather than incidental: an upstream this emulator DOES
+// serve — a second api of its own, whose `AWS_PROXY` route echoes the event it was handed —
+// whose answer the client would be reading if the gateway had relayed the request to it. That
+// endpoint is dialled by the CALLER at the end of the case, which is what shows it was served
+// here all along.
+
+/// The header the echoing handler answers with, which is what shows whether the ORIGIN's own
+/// response reached the client — it must not, because the gateway sent the caller there
+/// instead of relaying the request.
+const BACKEND_HEADER: &str = "x-backend";
+
+/// An upstream NOTHING in this emulator serves, for the row that varies that.
+const UNSERVED_UPSTREAM: &str = "https://nothing.example.test/echo";
+
+/// The handler behind the origin api's route: it reports back what it was handed — the
+/// request's headers (lower-cased, as a `2.0` proxy event states them), its path, its query
+/// string and its verb — under a response header of its own.
+const ECHO_RELAYED_REQUEST: &str = r#"
+import json
+
+
+def lambda_handler(event, context):
+    context_http = (event.get("requestContext") or {}).get("http") or {}
+    return {
+        "statusCode": 200,
+        "headers": {"content-type": "application/json", "x-backend": "seen"},
+        "body": json.dumps(
+            {
+                "headers": event.get("headers") or {},
+                "rawPath": event.get("rawPath"),
+                "rawQueryString": event.get("rawQueryString"),
+                "method": context_http.get("method"),
+            }
+        ),
+    }
+"#;
+
+/// The ORIGIN a row points its `HTTP_PROXY` route at: an api of this emulator whose
+/// `AWS_PROXY` route runs [`ECHO_RELAYED_REQUEST`], deployed on the stage that serves its
+/// root. Answers the URL an `HTTP_PROXY` integration names it by — the invoke URL of that
+/// route, which is the address the api announces plus the route's own path.
+async fn given_origin_api(
+    emulator: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    function: &str,
+) -> String {
+    let arn = given_function(emulator, engine, case, function, ECHO_RELAYED_REQUEST).await;
+    let (_, host) = given_api(
+        emulator,
+        case,
+        lambda_integration(&arn, "2.0"),
+        "ANY /echo",
+        json!({ "stageName": "$default", "autoDeploy": true }),
+    )
+    .await;
+    format!("https://{host}/echo")
+}
+
+/// An api with one `HTTP_PROXY` route over `upstream` and a `$default` stage that
+/// auto-deploys. Answers the host its `ApiEndpoint` names.
+async fn given_proxy_api(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    route_key: &str,
+    upstream: &str,
+) -> String {
+    let (_, host) = given_api(
+        emulator,
+        case,
+        json!({
+            "integrationType": "HTTP_PROXY",
+            "integrationUri": upstream,
+            "payloadFormatVersion": "1.0"
+        }),
+        route_key,
+        json!({ "stageName": "$default", "autoDeploy": true }),
+    )
+    .await;
+    host
+}
+
+/// One row: what a failing assertion calls it, the request the client makes, and whether the
+/// upstream its route fronts is one THIS EMULATOR serves.
+struct Sent {
+    case: &'static str,
+    method: &'static str,
+    route_key: &'static str,
+    /// The path within the stage, query string included.
+    path: &'static str,
+    body: &'static [u8],
+    /// `true` for the origin api of this emulator, `false` for an address nothing here
+    /// serves.
+    served_here: bool,
+}
+
+#[tokio::test]
+async fn an_http_proxy_upstream_this_emulator_serves_is_still_the_callers_to_reach() {
+    // The rows differ along what the rule generalises over: whether the upstream is an
+    // endpoint this emulator serves at all, and the verb, the path and the body the client
+    // sent — each of which is answered the same way, because the gateway relays none of them
+    // to the endpoint the api's configuration names.
+    let cases: [Sent; 4] = [
+        Sent {
+            case: "an upstream this emulator serves, reached by a GET",
+            method: "GET",
+            route_key: "GET /relay",
+            path: "/relay",
+            body: b"",
+            served_here: true,
+        },
+        Sent {
+            case: "the same upstream, reached by a POST carrying a body",
+            method: "POST",
+            route_key: "POST /relay",
+            path: "/relay",
+            body: b"{\"sent\":true}",
+            served_here: true,
+        },
+        Sent {
+            case: "the same upstream, reached with a query string",
+            method: "GET",
+            route_key: "GET /relay",
+            path: "/relay?page=2",
+            body: b"",
+            served_here: true,
+        },
+        Sent {
+            case: "an upstream nothing in this emulator serves",
+            method: "GET",
+            route_key: "GET /relay",
+            path: "/relay",
+            body: b"",
+            served_here: false,
+        },
+    ];
+    for row in cases {
+        let case = row.case;
+        let (emulator, engine) = emulator_with_lambda();
+        let origin = given_origin_api(&emulator, &engine, case, "relay-origin").await;
+        let upstream = if row.served_here {
+            origin.clone()
+        } else {
+            UNSERVED_UPSTREAM.to_string()
+        };
+        let host = given_proxy_api(&emulator, case, row.route_key, &upstream).await;
+        let answer = send_with_body(
+            &emulator,
+            &host,
+            row.method,
+            row.path,
+            &[("content-type", "application/json")],
+            row.body.to_vec(),
+        )
+        .await;
+        assert_eq!(
+            answer.status, TEMPORARY_REDIRECT,
+            "case {case:?}: expected the caller to be sent to the upstream, got {}",
+            answer.summary()
+        );
+        assert_eq!(
+            answer.location.as_deref(),
+            Some(upstream.as_str()),
+            "case {case:?}: expected {upstream:?} in Location, got {}",
+            answer.summary()
+        );
+        // Nothing of the upstream's own answer is in it: the gateway made no request to that
+        // endpoint, so there is no response of its to report.
+        let answered = answer.header(BACKEND_HEADER);
+        assert_eq!(
+            answered, None,
+            "case {case:?}: no header of the upstream's own answer may reach the client, got \
+             {answered:?}"
+        );
+        assert!(
+            answer.text.is_empty(),
+            "case {case:?}: the redirect carries no body of its own, got {:?}",
+            answer.text
+        );
+    }
+
+    // And the origin really is served HERE: dialled by the caller itself — which is what the
+    // redirect asks of it — the same address answers that api's own route.
+    //
+    // Asked again until that answer arrives, or [`DECISION_WAIT`] passes: the FIRST invocation
+    // of a function starts its runtime, which on a loaded host the gateway answers its own
+    // `500` for while it is starting ([`INTEGRATION_FAULT`]). The wait is for the origin's own
+    // answer — a condition — and nothing here asserts on the clock.
+    let case = "the origin dialled by the caller";
+    let (emulator, engine) = emulator_with_lambda();
+    let origin = given_origin_api(&emulator, &engine, case, "relay-origin").await;
+    let authority = origin
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split_once("/echo"))
+        .map(|(authority, _)| authority.to_string())
+        .unwrap_or_else(|| panic!("case {case:?}: the origin names an endpoint, got {origin:?}"));
+    let deadline = std::time::Instant::now() + DECISION_WAIT;
+    let answer = loop {
+        let answer = send(&emulator, &authority, "GET", "/echo", &[]).await;
+        if answer.status == 200 {
+            break answer;
+        }
+        assert!(
+            answer.status == INTEGRATION_FAULT && std::time::Instant::now() < deadline,
+            "case {case:?}: expected the origin api's own route to answer, got {}",
+            answer.summary()
+        );
+        tokio::time::sleep(LOOK_INTERVAL).await;
+    };
+    assert_eq!(
+        answer.header(BACKEND_HEADER).as_deref(),
+        Some("seen"),
+        "case {case:?}: expected the origin's own response header, got {}",
+        answer.summary()
+    );
 }

@@ -119,6 +119,9 @@ pub mod non_proxy;
 // (or a quoted static value) onto an integration request parameter, and this module is the
 // one reader of it.
 pub mod parameters;
+// The schema a message served by a route has to satisfy: the `Model` the route's
+// `RequestModels` names, and the refusal a frame that does not satisfy it earns.
+pub mod request_model;
 pub mod transport;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};

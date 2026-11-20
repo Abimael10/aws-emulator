@@ -75,7 +75,7 @@ use ::tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use ::tokio_tungstenite::tungstenite::{Error as SocketError, Message};
 
 use super::event::{Call, Connection};
-use super::{access_logs, dispatch, event, integration};
+use super::{access_logs, dispatch, event, integration, request_model};
 // The `AWS/ApiGateway` series this stage publishes about the traffic it serves: a frame
 // carried over this socket leaves no response a later caller can read, so the connections,
 // the messages, the backend latency and the failures are reported there as they happen.
@@ -1438,6 +1438,44 @@ async fn served_frame(
     };
     let route = per_route.as_deref();
     metrics.message(route);
+    // The model the route declares for a message it serves is applied BEFORE the integration:
+    // a frame that does not satisfy it is the client's own error, so the backend is not called
+    // for it at all and the client reads the gateway's own refusal frame. The check runs with
+    // no store lock held and off this worker ([`request_model::PendingCheck::rejected`]) — it
+    // is bounded work a caller's own stored schema decides the shape of — and the reason stays
+    // in this emulator's log.
+    let owed = selected.request_model.clone();
+    let rejected = match owed {
+        Some(check) => {
+            let model = check.model_name.clone();
+            check.rejected(body.to_string()).await.map(|reason| (model, reason))
+        }
+        None => None,
+    };
+    if let Some((model, reason)) = rejected {
+        tracing::info!(
+            %api_id,
+            %connection_id,
+            route_key = %selected.route_key,
+            %model,
+            reason = %reason,
+            "refusing a WebSocket message: its body does not satisfy the model its route \
+             declares"
+        );
+        metrics.served(route, CallOutcome::ClientError);
+        let frame = gateway_frame(
+            request_model::INVALID_BODY_MESSAGE,
+            connection_id,
+            &request_id,
+        );
+        return answer(
+            Some(frame.into_bytes()),
+            &selected.route_key,
+            per_route.clone(),
+            Some(request_model::INVALID_BODY_STATUS),
+            Some(request_model::INVALID_BODY_MESSAGE.to_string()),
+        );
+    }
     let began = Instant::now();
     let performed =
         integration::perform(callback, connection, &selected, &call, &request_id).await;

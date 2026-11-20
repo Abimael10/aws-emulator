@@ -1430,23 +1430,25 @@ impl Api {
         (Some(released), Some(message))
     }
 
-    /// The configuration a deployment of this api FREEZES: the routes and integrations it
-    /// holds right now, each with the responses that belong to it.
+    /// The configuration a deployment of this api FREEZES: the routes, the integrations and
+    /// the models it holds right now, each integration with the responses that belong to it.
     ///
     /// A deployment is "an immutable representation of an API that can be called by users"
-    /// (the `Deployment` shape's own doc), so releasing one captures the api's routes and
-    /// integrations rather than referring to them: a later change to either leaves every
-    /// deployment already released exactly as it was, and a stage serving one of those
-    /// serves what it froze ([`Deployment::configuration`]).
+    /// (the `Deployment` shape's own doc), so releasing one captures the api's routes,
+    /// integrations and models rather than referring to them: a later change to any of them
+    /// leaves every deployment already released exactly as it was, and a stage serving one of
+    /// those serves what it froze ([`Deployment::configuration`]).
     ///
     /// What one snapshot holds is bounded by the quotas the creates enforce
-    /// ([`MAX_ROUTES_PER_API`] routes and [`MAX_INTEGRATIONS_PER_API`] integrations), and
-    /// how many an api can hold by [`MAX_DEPLOYMENTS_PER_API`], so neither a loop of
-    /// configuration changes nor a loop of deployments grows this store without end.
+    /// ([`MAX_ROUTES_PER_API`] routes, [`MAX_INTEGRATIONS_PER_API`] integrations and
+    /// [`MAX_MODELS_PER_API`] models), and how many an api can hold by
+    /// [`MAX_DEPLOYMENTS_PER_API`], so neither a loop of configuration changes nor a loop of
+    /// deployments grows this store without end.
     pub fn deployable_configuration(&self) -> DeployedConfiguration {
         DeployedConfiguration {
             routes: self.routes.clone(),
             integrations: self.integrations.clone(),
+            models: self.models.clone(),
         }
     }
 
@@ -3067,8 +3069,9 @@ pub struct Deployment {
     pub configuration: DeployedConfiguration,
 }
 
-/// The api configuration one [`Deployment`] froze: the routes and integrations the api
-/// held when that deployment was released, each with the responses that belong to it.
+/// The api configuration one [`Deployment`] froze: the routes, the integrations and the
+/// models the api held when that deployment was released, each integration with the responses
+/// that belong to it.
 ///
 /// Two stages of one api can therefore serve two different configurations of it — the one
 /// each one's own deployment froze — which is what pinning a stage to a deployment is for.
@@ -3080,6 +3083,15 @@ pub struct DeployedConfiguration {
     /// The integrations the deployment froze, keyed by `IntegrationId` exactly as
     /// [`Api::integrations`] keys them.
     pub integrations: BTreeMap<String, Integration>,
+    /// The models the deployment froze, keyed by `ModelId` exactly as [`Api::models`] keys
+    /// them.
+    ///
+    /// A route of a WebSocket api names one of them by NAME in its `RequestModels` ("the
+    /// request models for the route. Supported only for WebSocket APIs"), and that is the
+    /// schema a message served by the route has to satisfy, so the document is frozen with
+    /// the route that selects it: a stage pinned to an older deployment validates against the
+    /// schema as it stood then.
+    pub models: BTreeMap<String, Model>,
 }
 
 impl Deployment {
