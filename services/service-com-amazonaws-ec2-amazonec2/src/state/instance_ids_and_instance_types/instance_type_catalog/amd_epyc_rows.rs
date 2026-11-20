@@ -322,4 +322,80 @@ pub(super) static AMD_EPYC_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = 
         .ipv4_per_interface(15)
         .processor("AMD", 2.2)
         .host_features(false, false),
+    // R5ad — memory optimized on the same 1st generation AMD EPYC (7571) at a sustained
+    // 2.2 GHz, with local NVMe devices. Its EBS figures are the R5a ladder's, the two families
+    // sharing one hardware generation: the three sizes below the `4xlarge` publish a baseline
+    // they burst above, up to that size's dedicated 2,880 Mbps and 16,000 IOPS, and from it the
+    // bandwidth is dedicated per size up to 13,570 Mbps and 60,000 IOPS on the size that holds
+    // the whole host. What the `d` adds is the local store, published per type as a count and a
+    // size that follow no ratio — one device up to the `2xlarge`, two from the `4xlarge` and
+    // four from the `16xlarge` — and it is counted against the attachment pool its EBS volumes
+    // come out of, so the volume limit each size reports is what those devices leave. The
+    // family is NOT offered on a Dedicated Host, its hardware generation carries no local PTP
+    // clock and does not migrate an instance on a user-initiated reboot, and the cores of an
+    // EPYC are configured two at a time.
+    PublishedInstanceTypeFacts::of("r5ad.large")
+        .cores_in_steps_of(2)
+        .ebs(650, 3_600, 2_880, 16_000)
+        .instance_store(1, 75)
+        .network("Up to 10 Gigabit")
+        .processor("AMD", 2.2)
+        .dedicated_hosts(false)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("r5ad.xlarge")
+        .cores_in_steps_of(2)
+        .ebs(1_085, 6_000, 2_880, 16_000)
+        .instance_store(1, 150)
+        .network("Up to 10 Gigabit")
+        .processor("AMD", 2.2)
+        .dedicated_hosts(false)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("r5ad.2xlarge")
+        .cores_in_steps_of(2)
+        .ebs(1_580, 8_333, 2_880, 16_000)
+        .instance_store(1, 300)
+        .network("Up to 10 Gigabit")
+        .processor("AMD", 2.2)
+        .dedicated_hosts(false)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("r5ad.4xlarge")
+        .cores_in_steps_of(2)
+        .ebs(2_880, 16_000, 2_880, 16_000)
+        .instance_store(2, 300)
+        .network("Up to 10 Gigabit")
+        .processor("AMD", 2.2)
+        .dedicated_hosts(false)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("r5ad.8xlarge")
+        .cores_in_steps_of(2)
+        .ebs(4_750, 20_000, 4_750, 20_000)
+        .instance_store(2, 600)
+        .network("Up to 10 Gigabit")
+        .processor("AMD", 2.2)
+        .dedicated_hosts(false)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("r5ad.12xlarge")
+        .cores_in_steps_of(2)
+        .ebs(6_780, 30_000, 6_780, 30_000)
+        .instance_store(2, 900)
+        .network("10 Gigabit")
+        .processor("AMD", 2.2)
+        .dedicated_hosts(false)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("r5ad.16xlarge")
+        .cores_in_steps_of(2)
+        .ebs(9_500, 40_000, 9_500, 40_000)
+        .instance_store(4, 600)
+        .network("12 Gigabit")
+        .processor("AMD", 2.2)
+        .dedicated_hosts(false)
+        .host_features(false, false),
+    PublishedInstanceTypeFacts::of("r5ad.24xlarge")
+        .cores_in_steps_of(2)
+        .ebs(13_570, 60_000, 13_570, 60_000)
+        .instance_store(4, 900)
+        .network("20 Gigabit")
+        .processor("AMD", 2.2)
+        .dedicated_hosts(false)
+        .host_features(false, false),
 ];

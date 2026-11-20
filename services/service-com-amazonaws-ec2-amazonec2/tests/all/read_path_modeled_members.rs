@@ -254,7 +254,10 @@ async fn an_instance_type_reports_the_members_its_name_yields() {
         },
         TypeCase {
             case: "a type that runs on the Xen hypervisor",
-            instance_type: "t2.micro",
+            // A pre-Nitro family the catalog holds no per-type row for, so every member below
+            // is the derivation's: the burstable Xen family's own row publishes a processor
+            // frequency, an attachment total and a reboot-migration answer of its own.
+            instance_type: "c3.large",
             cards: 1,
             nitro_clock: "unsupported",
             hypervisor_feature: "unsupported",

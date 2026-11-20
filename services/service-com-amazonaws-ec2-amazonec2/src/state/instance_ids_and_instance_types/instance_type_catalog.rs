@@ -28,6 +28,10 @@ use crate::ops::types::{
 };
 
 mod amd_epyc_rows;
+mod burstable_xen_rows;
+mod dense_hdd_storage_rows;
+mod eighth_generation_intel_rows;
+mod general_purpose_nvme_rows;
 mod gpu_rows;
 mod previous_generation_rows;
 
@@ -4615,15 +4619,21 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
 /// Every published row the catalog holds, whichever table it sits in.
 ///
 /// The rows of the families above, then the rows each child module holds for the families it
-/// groups — the AMD EPYC families, the accelerated ones and the previous generation ones. A
-/// row is reached by its instance type alone, so which table it is written in is nothing but
-/// where the figures of one group of families are kept together.
+/// groups — the AMD EPYC families, the accelerated ones, the previous generation ones, the
+/// burstable family on pre-Nitro hardware, the dense HDD storage ones, the eighth generation
+/// Intel ones and the general purpose families with local NVMe devices. A row is reached by its
+/// instance type alone, so which table it is written in is nothing but where the figures of one
+/// group of families are kept together.
 fn published_rows() -> impl Iterator<Item = &'static PublishedInstanceTypeFacts> {
     PUBLISHED_INSTANCE_TYPE_FACTS
         .iter()
         .chain(amd_epyc_rows::AMD_EPYC_INSTANCE_TYPE_FACTS)
         .chain(gpu_rows::GPU_INSTANCE_TYPE_FACTS)
         .chain(previous_generation_rows::PREVIOUS_GENERATION_INSTANCE_TYPE_FACTS)
+        .chain(burstable_xen_rows::BURSTABLE_XEN_INSTANCE_TYPE_FACTS)
+        .chain(dense_hdd_storage_rows::DENSE_HDD_STORAGE_INSTANCE_TYPE_FACTS)
+        .chain(eighth_generation_intel_rows::EIGHTH_GENERATION_INTEL_INSTANCE_TYPE_FACTS)
+        .chain(general_purpose_nvme_rows::GENERAL_PURPOSE_NVME_INSTANCE_TYPE_FACTS)
 }
 
 /// The published facts of `instance_type`, or `None` where the catalog holds no row for it

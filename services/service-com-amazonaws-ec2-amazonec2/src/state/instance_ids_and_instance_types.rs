@@ -1596,11 +1596,15 @@ pub(super) const PREVIOUS_GENERATION_FAMILIES: [&str; 16] = [
 ];
 
 /// The PREVIOUS generation families AWS offers IPv6 addresses on: "IPv6 is supported on all
-/// current generation instance types" and on these three alone, which is a shorter list than
-/// the previous generation families offered Amazon EBS encryption ([`FIRST_EBS_ENCRYPTION_GENERATION`]
+/// current generation instance types" and on these alone, which is a shorter list than the
+/// previous generation families offered Amazon EBS encryption ([`FIRST_EBS_ENCRYPTION_GENERATION`]
 /// reads that one) — so a previous generation family of the same age as one of these, M3
 /// among them, has no IPv6 address to report while its volumes can still be encrypted.
-pub(super) const IPV6_PREVIOUS_GENERATION_FAMILIES: [&str; 3] = ["c3", "i2", "r3"];
+///
+/// The dense HDD storage family `d2` is on it beside the three the page names: the recorded
+/// catalog reports that family as previous generation AND reports IPv6 addresses per interface
+/// for it, so the two facts are read apart here the way the doc comment above says.
+pub(super) const IPV6_PREVIOUS_GENERATION_FAMILIES: [&str; 4] = ["c3", "d2", "i2", "r3"];
 
 /// The families that run on the Nitro System from BEFORE their fifth generation, as the
 /// EC2 User Guide's list of "instances built on the Nitro System" names them. The
@@ -1727,8 +1731,19 @@ pub(super) const CONNECTION_TRACKING_TIMEOUTS: (i32, i32, i32) = (432_000, 30, 1
 pub(super) const FREE_TIER_INSTANCE_TYPES: [&str; 2] = ["t2.micro", "t3.micro"];
 
 /// The instance types that run 32-bit AMIs, each of which also runs 64-bit ones: the
-/// four previous generation sizes the EC2 User Guide lists for `i386`.
-pub(super) const I386_INSTANCE_TYPES: [&str; 4] = ["c1.medium", "m1.medium", "m1.small", "t1.micro"];
+/// sizes the EC2 User Guide lists for `i386` — the four previous generation ones and the
+/// four smallest sizes of the long-lived burstable family, which is current generation and
+/// still offered them.
+pub(super) const I386_INSTANCE_TYPES: [&str; 8] = [
+    "c1.medium",
+    "m1.medium",
+    "m1.small",
+    "t1.micro",
+    "t2.medium",
+    "t2.micro",
+    "t2.nano",
+    "t2.small",
+];
 
 /// The previous generation families whose AMIs are paravirtual and never HVM (EC2 User
 /// Guide, "Linux AMI virtualization types").
