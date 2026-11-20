@@ -246,11 +246,13 @@ pub fn schedule_expression_timezone_violation(timezone: Option<&str>) -> Option<
         .map(|_| invalid_timezone(timezone))
 }
 
-/// How this service states a window whose boundaries are in the wrong order.
+/// How this service states an EMPTY invocation window, whichever boundary the
+/// request stated it with: the window has ONE violation — the instant it opens at
+/// does not come before the instant it closes at — so it has one sentence, and the
+/// sentence carries nothing from the request or from state. A request stating only
+/// an `EndDate` is held to the same text as one stating both boundaries, since the
+/// start it is judged against is implicit rather than different.
 const START_DATE_BEFORE_END_DATE: &str = "The StartDate you specify must come before the EndDate.";
-
-/// How this service states a window that closed before it was asked for.
-const END_DATE_IN_THE_FUTURE: &str = "EndDate must be in the future.";
 
 /// Refuse a `StartDate`/`EndDate` pair that names an EMPTY invocation window —
 /// one holding no instant at which the schedule could invoke its target.
@@ -260,20 +262,19 @@ const END_DATE_IN_THE_FUTURE: &str = "EndDate must be in the future.";
 /// request, since nothing bounds it earlier; it closes at `EndDate` ("before
 /// which the schedule can invoke its target"). So a pair whose start is after its
 /// end is refused, and an end already behind the clock is refused when no start
-/// was given.
+/// was given — one window rule, stated by [`START_DATE_BEFORE_END_DATE`] either
+/// way.
 pub fn schedule_window_violation(
     start_date: Option<DateTime>,
     end_date: Option<DateTime>,
     now: SystemTime,
 ) -> Option<String> {
     let end_date = end_date?;
-    match start_date {
-        Some(start_date) => {
-            (instant(start_date) > instant(end_date)).then(|| START_DATE_BEFORE_END_DATE.to_string())
-        }
-        None => (instant(end_date) <= instant(DateTime::from(now)))
-            .then(|| END_DATE_IN_THE_FUTURE.to_string()),
-    }
+    let holds_no_instant = match start_date {
+        Some(start_date) => instant(start_date) > instant(end_date),
+        None => instant(end_date) <= instant(DateTime::from(now)),
+    };
+    holds_no_instant.then(|| START_DATE_BEFORE_END_DATE.to_string())
 }
 
 /// One wire instant as the pair that orders it: `DateTime` carries no ordering of
@@ -430,6 +431,14 @@ mod tests {
                 "case {case:?}: expected holds_an_instant={holds_an_instant}, got \
                  {violation:?}"
             );
+            // One window rule, one sentence: a window stated by an end alone is
+            // refused with the same text as one stated by both boundaries.
+            if let Some(message) = violation {
+                assert_eq!(
+                    message, START_DATE_BEFORE_END_DATE,
+                    "case {case:?}: expected {START_DATE_BEFORE_END_DATE:?}, got {message:?}"
+                );
+            }
         }
     }
 
