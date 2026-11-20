@@ -1069,20 +1069,27 @@ fn repository_arn(name: &str) -> String {
     format!("arn:aws:ecr:{REGION}:{ACCOUNT_ID}:repository/{name}")
 }
 
-/// `<registry host>/<name>` — the URI `Fn::GetAtt <repository>.RepositoryUri` reports and
-/// a container image reference is built on. `Repository$repositoryUri` is "The URI for the
-/// repository. You can use this URI for container image `push` and `pull` operations", whose
-/// format is `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`. The stack's
-/// value is the one the repository's owning service reported, so this is the URI Amazon ECR
-/// itself reports for a repository of this account's registry.
+/// `<registry endpoint>/<name>` — the URI `Fn::GetAtt <repository>.RepositoryUri` reports
+/// and a container image reference is built on. `Repository$repositoryUri` is "The URI for
+/// the repository. You can use this URI for container image `push` and `pull` operations", an
+/// ADDRESS a container client dials, so the stack's value is the one the repository's owning
+/// service reported: the endpoint this emulator answers registry requests at
+/// ([`registry_endpoint`]) followed by the repository's name.
 fn repository_uri(name: &str) -> String {
-    format!("{}/{name}", registry_host())
+    format!("{}/{name}", registry_endpoint())
 }
 
-/// The host of this account's Amazon ECR registry in the Region the stack is created in,
-/// which every repository URI the registry reports is built on.
-fn registry_host() -> String {
-    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com")
+/// The endpoint Amazon ECR announces its registry at to the provisioning call this harness
+/// makes, which every repository URI it reports is built on.
+///
+/// The emulator of these suites is served on no port at all, so the address it reports for
+/// itself is the host of the base it publishes then
+/// (`smithy_server_runtime::UNSERVED_URL_BASE`, a name RFC 6761 reserves so that nothing
+/// resolves it) — never a host AWS answers on.
+fn registry_endpoint() -> String {
+    smithy_server_runtime::UNSERVED_URL_BASE
+        .trim_start_matches("https://")
+        .to_string()
 }
 
 /// `arn:aws:ecs:<region>:<account>:task-definition/<family>:1` — what `Ref` of an
@@ -1364,12 +1371,12 @@ fn cases() -> Vec<Case> {
                 // case letters"), a task definition's as its family.
                 form(
                     "RepositoryUri",
-                    "<this account's registry host>/warehouse-registry-<id>",
+                    "<the address this emulator answers registry requests at>/warehouse-registry-<id>",
                     |value| {
                         value
                             .strip_prefix(&format!(
                                 "{}/warehouse-registry-",
-                                registry_host()
+                                registry_endpoint()
                             ))
                             .is_some_and(|id| {
                                 !id.is_empty() && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())

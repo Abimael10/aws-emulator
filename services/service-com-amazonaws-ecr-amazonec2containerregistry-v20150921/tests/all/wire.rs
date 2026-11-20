@@ -54,12 +54,16 @@ pub fn announced_registry_url() -> String {
 /// so a wrong registry id in the implementation fails these tests.
 pub const REGISTRY_ID: &str = "000000000000";
 
-/// The host of the registry this account owns in `region`, in the registry URL format the
-/// model states (`AuthorizationData$proxyEndpoint`: "The Amazon ECR registry URL format is
+/// The host of the registry this account owns in `region`, in the spelling AWS PUBLISHES
+/// (`AuthorizationData$proxyEndpoint`: "The Amazon ECR registry URL format is
 /// `https://aws_account_id.dkr.ecr.region.amazonaws.com`"), with the DNS suffix `region`'s
 /// own partition is served under — the `dnsSuffix` each partition publishes in the AWS SDK
 /// partition metadata (`endpoints.json`), spelled out here rather than imported so a wrong
 /// suffix in the implementation fails these tests.
+///
+/// It is a host AWS answers on and this emulator does not, so nothing this service REPORTS
+/// carries it: it is the spelling a client's OWN reference may be written in, which a pull
+/// reads back.
 pub fn registry_host_in(region: &str) -> String {
     let suffix = match region {
         region if region.starts_with("cn-") => "amazonaws.com.cn",
@@ -73,18 +77,17 @@ pub fn registry_host_in(region: &str) -> String {
     format!("{REGISTRY_ID}.dkr.ecr.{region}.{suffix}")
 }
 
-/// The URI Amazon ECR reports for the repository `name` of this account's registry in
-/// `region` (`Repository$repositoryUri`: "The URI for the repository. You can use this URI
-/// for container image `push` and `pull` operations"): that registry's host
-/// ([`registry_host_in`]) followed by the repository's own name.
-pub fn repository_uri_in(region: &str, name: &str) -> String {
-    format!("{}/{name}", registry_host_in(region))
-}
-
-/// The URI Amazon ECR reports for the repository `name` created by a call this harness
-/// signs ([`REGION`]).
+/// The URI Amazon ECR reports for the repository `name` to a caller of this harness
+/// (`Repository$repositoryUri`: "The URI for the repository. You can use this URI for
+/// container image `push` and `pull` operations"): the endpoint this emulator answers that
+/// caller's registry requests at ([`ANNOUNCED_REGISTRY_ENDPOINT`]) followed by the
+/// repository's own name — the address a `docker push` of the value reaches.
+///
+/// One endpoint serves every Region's registry, so the value does not depend on the Region
+/// the call was signed for; which registry holds the repository is reported by `registryId`
+/// and the ARN beside it.
 pub fn repository_uri(name: &str) -> String {
-    repository_uri_in(REGION, name)
+    format!("{ANNOUNCED_REGISTRY_ENDPOINT}/{name}")
 }
 
 /// The `X-Amz-Target` prefix this service routes on (`OPERATIONS.md`, "Wire protocol").

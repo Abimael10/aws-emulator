@@ -1040,8 +1040,10 @@ pub(crate) fn return_values(
         // "Ref returns the repository name"; Fn::GetAtt: Arn, RepositoryUri. The URI is
         // the registry host of the account and Region plus the repository's name
         // ("The format is `aws_account_id.dkr.ecr.region.amazonaws.com/repository-name`"),
-        // which is what a container image reference built from this stack's output pulls
-        // from — and exactly what Amazon ECR's own `CreateRepository` answers.
+        // which is the form a client's own reference is written in. A repository this stack
+        // PROVISIONS reports the URI Amazon ECR itself answered instead — the address that
+        // registry announces for a push and a pull, read off the create
+        // (`super::super::provisioner`) — so this stands in only until that call has run.
         ECR_REPOSITORY => {
             // "A repository name must start with a letter and can only contain lowercase
             // letters, numbers, hyphens, underscores, and forward slashes"

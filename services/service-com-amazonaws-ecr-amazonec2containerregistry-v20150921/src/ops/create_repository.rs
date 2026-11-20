@@ -2,9 +2,11 @@
 
 //! @op CreateRepository
 //! Creates a repository in this emulator's registry: the record is persisted in
-//! [`crate::state`] and every member of the returned `Repository` — its ARN, its URI,
-//! its creation instant and its settings — is computed once here and read back by
-//! every later operation. A second create of the same name is refused.
+//! [`crate::state`] and every member of the returned `Repository` — its ARN, its creation
+//! instant and its settings — is computed once here and read back by every later operation,
+//! beside the URI it is pushed and pulled at, which is the address this emulator answers the
+//! reading caller's registry requests at ([`crate::state::registry_address`]). A second
+//! create of the same name is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -312,6 +314,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for, since a registry is one account's in one Region, and the record is keyed by
         // it (`crate::state::registry_address`).
         let region = crate::state::request_region(ctx.parts());
+        // The repository is REPORTED at the endpoint this emulator answers this caller's
+        // registry requests at, which is the address a `docker push` of the URI reaches
+        // (`crate::state::registry_address`).
+        let registry_endpoint = crate::state::announced_registry_endpoint(ctx);
         let name = input.repository_name;
 
         // Whether this registry can hold the repository at all is judged BEFORE the key is
@@ -377,7 +383,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // the last value for it rather than two entries for one key.
                     repo.merge_tags(tags);
 
-                    let repository = repo.to_repository();
+                    let repository = repo.to_repository(&registry_endpoint);
                     store
                         .repositories
                         .insert(crate::state::repository_key(&region, &name), repo);

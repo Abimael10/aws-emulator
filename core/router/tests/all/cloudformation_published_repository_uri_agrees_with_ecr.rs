@@ -13,10 +13,10 @@
 //!
 //! Amazon ECR's `Repository$repositoryUri` is read here because it is such a value: "The URI
 //! for the repository. You can use this URI for container image `push` and `pull`
-//! operations", composed by that registry from the repository it holds. Two crates have to
-//! agree for one of these templates to publish it — CloudFormation makes the create and
-//! Amazon ECR serves it — so the suite lives here; a crate-local test sees one side of that
-//! call only.
+//! operations", which is the ADDRESS that registry publishes itself at for the repository it
+//! holds. Two crates have to agree for one of these templates to publish it —
+//! CloudFormation makes the create and Amazon ECR serves it — so the suite lives here; a
+//! crate-local test sees one side of that call only.
 //!
 //! Each row deploys one stack and reads the repository back through Amazon ECR's own
 //! `DescribeRepositories`, then checks every value the stack published for it against that
@@ -51,19 +51,23 @@ const POLL_ATTEMPTS: usize = 80;
 /// The account id every emulated ARN carries (`engine::emulator_account_id`).
 const ACCOUNT: &str = ::engine::EMULATOR_ACCOUNT_ID;
 
-/// The URI Amazon ECR reports a repository of this account's registry in `region` at: the
-/// registry URL format the model states (`AuthorizationData$proxyEndpoint`: "The Amazon ECR
-/// registry URL format is `https://aws_account_id.dkr.ecr.region.amazonaws.com`") with the
-/// DNS suffix that Region's partition is served under — the `dnsSuffix` each partition
-/// publishes in the AWS SDK partition metadata (`endpoints.json`) — followed by the
-/// repository's own name.
-fn repository_uri(region: &str, repository: &str) -> String {
-    let suffix = if region.starts_with("cn-") {
-        "amazonaws.com.cn"
-    } else {
-        "amazonaws.com"
-    };
-    format!("{ACCOUNT}.dkr.ecr.{region}.{suffix}/{repository}")
+/// The URI Amazon ECR reports a repository at: an ADDRESS a container client dials, so it is
+/// the endpoint this emulator answers registry requests at followed by the repository's own
+/// name ("The URI for the repository. You can use this URI for container image `push` and
+/// `pull` operations").
+///
+/// The emulator of these suites is served on no port at all, so the address it reports for
+/// itself is the host of the base it publishes then
+/// (`smithy_server_runtime::UNSERVED_URL_BASE`, a name RFC 6761 reserves so that nothing
+/// resolves it) — the same value in every Region, because one endpoint serves every Region's
+/// registry here, which is exactly where CloudFormation's own stand-in for the attribute
+/// (the registry host AWS publishes, `aws_account_id.dkr.ecr.region.amazonaws.com`) differs
+/// from what the owning service answers.
+fn repository_uri(repository: &str) -> String {
+    format!(
+        "{}/{repository}",
+        smithy_server_runtime::UNSERVED_URL_BASE.trim_start_matches("https://")
+    )
 }
 
 /// The emulator with the two services this suite exercises, mounted on ONE engine exactly as
@@ -472,10 +476,10 @@ async fn a_stack_publishes_the_repository_values_amazon_ecr_itself_reports() {
             row.case
         );
 
-        // The URI that service reports names the registry that holds the repository: this
-        // account, the Region's own registry host, and the repository's own name.
+        // The URI that service reports is an address this emulator answers registry requests
+        // on, with the repository's own name as its path.
         let held_uri = held["repositoryUri"].as_str().unwrap_or_default().to_string();
-        let expected_uri = repository_uri(row.region, &repository);
+        let expected_uri = repository_uri(&repository);
         assert_eq!(
             held_uri, expected_uri,
             "case {:?}: expected Amazon ECR to report the repository URI {expected_uri:?}, got \

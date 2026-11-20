@@ -297,12 +297,16 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
     format!("arn:aws:ecs:{REGION}:{ACCOUNT_ID}:task-definition/{family}:{revision}")
 }
 
-/// `<registry host>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which is
+/// `<registry endpoint>/<repository>` — the URI Amazon ECR REPORTS for `repository`, which is
 /// the address a container client pushes and pulls it at (`Repository$repositoryUri`: "You
-/// can use this URI for container image `push` and `pull` operations"): the host of the
-/// registry that holds it — this account, the `dkr` and `ecr` labels, the Region and its
-/// partition's DNS suffix, as the registry URL format the model states
-/// (`AuthorizationData$proxyEndpoint`) spells it — followed by the repository's own name.
+/// can use this URI for container image `push` and `pull` operations"): the endpoint this
+/// emulator answers registry requests at, followed by the repository's own name.
+///
+/// The emulator of these suites is served on no port at all, so the address that registry
+/// reports for itself is the host of the base it publishes then
+/// (`smithy_server_runtime::UNSERVED_URL_BASE`, a name RFC 6761 reserves so that nothing
+/// resolves it) — never the registry host AWS publishes, which resolves nowhere near this
+/// process.
 ///
 /// It is also the URI every row's registered image carries. A declaration that reaches the
 /// repository's `RepositoryUri` attribute resolves to it directly; one that spells the
@@ -311,7 +315,10 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
 /// re-points to the value the owning service assigned — so either way the image names the
 /// registry this emulator serves that repository in, which is where the image is pulled from.
 pub(crate) fn published_repository_uri(repository: &str) -> String {
-    format!("{ACCOUNT_ID}.dkr.ecr.{REGION}.amazonaws.com/{repository}")
+    format!(
+        "{}/{repository}",
+        smithy_server_runtime::UNSERVED_URL_BASE.trim_start_matches("https://")
+    )
 }
 
 /// One deployment: the template, and what each owning service must then hold.

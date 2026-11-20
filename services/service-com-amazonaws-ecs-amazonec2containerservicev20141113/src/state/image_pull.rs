@@ -448,8 +448,12 @@ fn withheld_registry_auth<Eng: Send + Sync + 'static>(
     use ::service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::registry_pull;
 
     let pulls_from_this_registry = launch.images.iter().any(|image| {
-        registry_pull::parse_reference(&reference_into_this_registry(image, &launch.task_arn))
-            .is_some()
+        registry_pull::parse_reference(&reference_into_this_registry(
+            engine,
+            image,
+            &launch.task_arn,
+        ))
+        .is_some()
     });
     if !pulls_from_this_registry {
         return None;
@@ -591,7 +595,7 @@ fn fetch_image<Eng: Send + Sync + 'static>(
     // Amazon ECR answers for every account's registry its own reading of a reference names,
     // this one's included, so whose registry it is comes back from there rather than being
     // decided here.
-    let addressed = reference_into_this_registry(image, &launch.task_arn);
+    let addressed = reference_into_this_registry(engine, image, &launch.task_arn);
     if let Some(served) = registry_pull::serve_reference_pull(
         engine,
         &addressed,
@@ -655,11 +659,17 @@ fn fetch_image<Eng: Send + Sync + 'static>(
 ///
 /// One address serves every Region's registry, so such a reference names no Region of its
 /// own: the Region is the one the TASK runs in, which its own ARN carries. The host is
-/// composed with THAT Region's partition suffix, read through Amazon ECR's own reading of it
-/// (`registry_dns_suffix`), which is the inverse of the walk that registry resolves the
-/// rewritten reference by — so a task of any partition's Region resolves, not only one of the
-/// commercial partition.
-fn reference_into_this_registry<'image>(
+/// composed by Amazon ECR's own composer of its published spelling (`registry_host`, which
+/// carries that Region's partition suffix), the inverse of the walk that registry resolves
+/// the rewritten reference by — so a task of any partition's Region resolves, not only one of
+/// the commercial partition.
+///
+/// That one address serves BOTH registries this emulator holds, so a reference this emulator's
+/// PUBLIC gallery answers for is left exactly as it is too
+/// ([`addresses_this_emulators_gallery`]): rewriting it would turn a pull from the gallery
+/// into a pull of the same-named path from the private registry.
+fn reference_into_this_registry<'image, Eng: Send + Sync + 'static>(
+    engine: &Eng,
     image: &'image str,
     task_arn: &str,
 ) -> ::std::borrow::Cow<'image, str> {
@@ -670,6 +680,7 @@ fn reference_into_this_registry<'image>(
     };
     if ecr_store::registry_pull::parse_registry_reference(image).is_some()
         || !addresses_this_emulators_registry(authority)
+        || addresses_this_emulators_gallery(engine, image)
     {
         return ::std::borrow::Cow::Borrowed(image);
     }
@@ -677,9 +688,8 @@ fn reference_into_this_registry<'image>(
         return ::std::borrow::Cow::Borrowed(image);
     };
     ::std::borrow::Cow::Owned(format!(
-        "{}{ECR_REGISTRY_INFIX}{region}.{}/{path}",
-        ecr_store::registry_id(),
-        ecr_store::registry_dns_suffix(region)
+        "{}/{path}",
+        ecr_store::registry_host(ecr_store::registry_id(), region)
     ))
 }
 
@@ -881,9 +891,42 @@ fn serves_only_an_authenticated_principal(image: &str) -> bool {
 /// the emulator was started. A reference to a registry of the developer's own addressed by
 /// IP reads as this registry too, which is the same answer this emulator gives such an
 /// address everywhere else: it is the only registry it serves.
+///
+/// The host of the base this emulator reports while it is served on NO port at all
+/// (`smithy_server_runtime::UNSERVED_URL_BASE`, a name RFC 6761 reserves so that nothing
+/// resolves it) is such an address as well: it is what the endpoint reading above answers
+/// then, so it is what Amazon ECR announces then, and its first label would otherwise read
+/// as a service's.
 fn addresses_this_emulators_registry(host: &str) -> bool {
-    ::service_common::data_plane_addressing::is_host_shaped(host)
-        && !::service_common::data_plane_addressing::names_a_service(host)
+    if !::service_common::data_plane_addressing::is_host_shaped(host) {
+        return false;
+    }
+    let unserved = ::service_common::data_plane_addressing::url_authority(
+        ::smithy_server_runtime::UNSERVED_URL_BASE,
+    );
+    host.eq_ignore_ascii_case(unserved)
+        || !::service_common::data_plane_addressing::names_a_service(host)
+}
+
+/// Whether this emulator's PUBLIC gallery is the registry `image` addresses: a reference
+/// carrying the registry alias that gallery was ASSIGNED, at the host AWS publishes for it or
+/// at an address this emulator answers on.
+///
+/// One address serves both registries this emulator holds, and a private repository's name may
+/// itself carry `/` ("project-a/nginx-web-app"), so the first path segment alone does not say
+/// which registry a reference addresses. The gallery's own readings answer it — its reference
+/// form ([`gallery_pull::parse_gallery_reference`]) and whether the alias is the one it was
+/// assigned ([`gallery_pull::serves_registry_alias`]) — so this service writes no rule of its
+/// own about either registry's reference layout.
+fn addresses_this_emulators_gallery<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    image: &str,
+) -> bool {
+    use ::service_com_amazonaws_ecrpublic_spencerfrontendservice::state::gallery_pull;
+
+    gallery_pull::parse_gallery_reference(image).is_some_and(|reference| {
+        gallery_pull::serves_registry_alias(engine, &reference.registry_alias)
+    })
 }
 
 /// The route table that APPLIES to `subnet_id`: the one a caller explicitly associated
