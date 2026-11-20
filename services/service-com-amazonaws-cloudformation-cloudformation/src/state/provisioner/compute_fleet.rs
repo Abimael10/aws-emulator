@@ -609,27 +609,62 @@ const UPDATE_AUTO_SCALING_GROUP_MEMBERS: &[(&str, QueryMember)] = &[
     ("TerminationPolicies", QueryMember::List("member")),
 ];
 
-/// The `AWS::AutoScaling::AutoScalingGroup` properties no member of
-/// `UpdateAutoScalingGroup` carries, so a declaration that changes one is asking for a change
-/// Amazon EC2 Auto Scaling cannot make to a group that exists: the instance a group was built
-/// from, the load balancers and target groups it is attached to (each its own
-/// `Attach…`/`Detach…` call), its lifecycle hooks (`PutLifecycleHook`), its traffic sources
-/// and its tags (`CreateOrUpdateTags`/`DeleteTags`).
-const AUTO_SCALING_GROUP_CREATE_ONLY_PROPERTIES: &[&str] = &[
+/// The `AWS::AutoScaling::AutoScalingGroup` properties no call this arm makes applies to a
+/// group that EXISTS, so a declaration that changes one is asking for a change this emulator
+/// does not make to the group: the instance a group was built from, which is only ever a
+/// group's SOURCE, and the attachments and the tag set, each of which Amazon EC2 Auto Scaling
+/// changes through a pair of calls of its own (`AttachLoadBalancers`/`DetachLoadBalancers`,
+/// `AttachLoadBalancerTargetGroups`/`DetachLoadBalancerTargetGroups`,
+/// `AttachTrafficSources`/`DetachTrafficSources`, `CreateOrUpdateTags`/`DeleteTags`) that no
+/// arm here is written on. Such a change is REFUSED rather than reported applied: the group
+/// would be left as it is, and a stack reporting the change as applied would be reporting a
+/// group it does not have.
+///
+/// Named for what it decides — which changes no arm here applies — rather than "create-only",
+/// because CloudFormation itself does change a group's tags and attachments: what is missing is
+/// an arm for them, not a call of that service's.
+///
+/// The group's lifecycle HOOKS are not among them: that property has its own pair of calls
+/// and this arm applies a changed declaration of it through them
+/// ([`reconcile_lifecycle_hooks`]).
+const AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES: &[&str] = &[
     "InstanceId",
-    "LifecycleHookSpecificationList",
     "LoadBalancerNames",
     "Tags",
     "TargetGroupARNs",
     "TrafficSources",
 ];
 
+/// The `AWS::AutoScaling::AutoScalingGroup` properties an UPDATE does not write into the
+/// `UpdateAutoScalingGroup` request: the group's NAME and its `VPCZoneIdentifier`, which this
+/// arm pushes itself; the lifecycle hooks, which reach that service through their own two calls
+/// ([`reconcile_lifecycle_hooks`]); and the tag set, the attachments and the source instance,
+/// which no member of that call carries at all. A declaration that CHANGES one of the last
+/// group is refused before anything is sent ([`AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES`]), so
+/// what is left out here is only a property this revision restates unchanged — which asks
+/// nothing of the update.
+const AUTO_SCALING_GROUP_PROPERTIES_NOT_UPDATED: &[&str] = &[
+    "AutoScalingGroupName",
+    "InstanceId",
+    "LifecycleHookSpecificationList",
+    "LoadBalancerNames",
+    "Tags",
+    "TargetGroupARNs",
+    "TrafficSources",
+    "VPCZoneIdentifier",
+];
+
 /// Apply a CHANGED `AWS::AutoScaling::AutoScalingGroup` declaration to the group that
 /// exists, through `UpdateAutoScalingGroup` — "updates the configuration for the specified
 /// Auto Scaling group".
 ///
-/// A declaration that changes a property no member of that call carries is REFUSED
-/// ([`AUTO_SCALING_GROUP_CREATE_ONLY_PROPERTIES`]): the group would be left as it is, and a
+/// A changed `LifecycleHookSpecificationList` is applied too, through the calls that write
+/// and remove ONE hook of a group that exists ([`reconcile_lifecycle_hooks`]): the group's
+/// hooks are a property of it that the owning service changes after the group was created,
+/// not part of what `UpdateAutoScalingGroup` carries.
+///
+/// A declaration that changes a property no call here applies is REFUSED
+/// ([`AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES`]): the group would be left as it is, and a
 /// stack reporting the change as applied would be reporting a group it does not have.
 pub(super) async fn update_auto_scaling_group(
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -637,7 +672,7 @@ pub(super) async fn update_auto_scaling_group(
     resource: &StoredResource,
     declared: &Value,
 ) -> Result<Option<Created>, Refusal> {
-    if let Some(property) = AUTO_SCALING_GROUP_CREATE_ONLY_PROPERTIES
+    if let Some(property) = AUTO_SCALING_GROUP_CHANGES_NO_ARM_APPLIES
         .iter()
         .find(|property| resource.properties.get(**property) != declared.get(**property))
     {
@@ -654,13 +689,16 @@ pub(super) async fn update_auto_scaling_group(
         declared,
         UPDATE_AUTO_SCALING_GROUP_MEMBERS,
         AUTO_SCALING_GROUP_RENAMED_PROPERTIES,
-        AUTO_SCALING_GROUP_PROPERTIES_NOT_SENT,
+        AUTO_SCALING_GROUP_PROPERTIES_NOT_UPDATED,
         AUTOSCALING_GROUP,
     )?;
-    parameters.push((
-        "AutoScalingGroupName".to_string(),
-        resource.physical_resource_id.clone(),
-    ));
+    let name = resource.physical_resource_id.clone();
+    // The hook calls this revision owes, built BEFORE anything is sent, exactly as the
+    // update's own parameters are: a specification this arm cannot carry refuses the whole
+    // update with the group untouched rather than half-way through it
+    // ([`lifecycle_hook_changes`]).
+    let hooks = lifecycle_hook_changes(&name, &resource.properties, declared)?;
+    parameters.push(("AutoScalingGroupName".to_string(), name.clone()));
     if let Some(subnets) = comma_separated_subnets(declared) {
         parameters.push(("VPCZoneIdentifier".to_string(), subnets));
     }
@@ -673,7 +711,192 @@ pub(super) async fn update_auto_scaling_group(
         &parameters,
     )
     .await?;
+    reconcile_lifecycle_hooks(ctx, region, hooks).await?;
     Ok(Some(Created::attributes(BTreeMap::new())))
+}
+
+/// The property an `AWS::AutoScaling::AutoScalingGroup` declares its lifecycle hooks in,
+/// which is the member of the same name `CreateAutoScalingGroup` takes — "one or more
+/// lifecycle hooks to add to the Auto Scaling group before instances are launched".
+const LIFECYCLE_HOOK_SPECIFICATION_LIST: &str = "LifecycleHookSpecificationList";
+
+/// The member that NAMES one hook, in the specification the type declares and in each of the
+/// two calls that write and remove a hook of a group that exists.
+const LIFECYCLE_HOOK_NAME: &str = "LifecycleHookName";
+
+/// The members of one `LifecycleHookSpecification` beside the hook's name, every one of which
+/// `PutLifecycleHook` takes under the SAME name.
+///
+/// Source: `smithy_query(query="shape",shape="LifecycleHookSpecification")` read against
+/// `smithy_query(query="operation",operation="PutLifecycleHook")` on Amazon EC2 Auto Scaling's
+/// own model — the specification's members are the hook's name, its `LifecycleTransition`, its
+/// `NotificationMetadata`, its `HeartbeatTimeout`, its `DefaultResult`, its
+/// `NotificationTargetARN` and its `RoleARN`, and that call takes each of them.
+const PUT_LIFECYCLE_HOOK_MEMBERS: &[&str] = &[
+    "DefaultResult",
+    "HeartbeatTimeout",
+    "LifecycleTransition",
+    "NotificationMetadata",
+    "NotificationTargetARN",
+    "RoleARN",
+];
+
+/// The hook specifications a declaration states, in declaration order.
+///
+/// A declaration that spells ONE specification without the sequence syntax is the one-entry
+/// list of itself, exactly as it is for every other list property ([`push_list`]), and a
+/// declaration that states the property as an EMPTY list asks for a group with no hook at all.
+fn declared_lifecycle_hooks(properties: &Value) -> Vec<Value> {
+    match properties.get(LIFECYCLE_HOOK_SPECIFICATION_LIST) {
+        Some(Value::Array(entries)) => entries.clone(),
+        None | Some(Value::Null) => Vec::new(),
+        Some(single) => vec![single.clone()],
+    }
+}
+
+/// The name one specification gives its hook, or `None` where it states none: a specification
+/// that names no hook is sent exactly as it was declared, so the owning service's own
+/// validation of that required member is what answers for it rather than a reading invented
+/// here.
+fn lifecycle_hook_name(specification: &Value) -> Option<String> {
+    specification
+        .get(LIFECYCLE_HOOK_NAME)
+        .map(attribute_text)
+        .filter(|name| !name.is_empty())
+}
+
+/// The hook calls one revision of a group's `LifecycleHookSpecificationList` owes Amazon EC2
+/// Auto Scaling: the awsQuery parameters of each `DeleteLifecycleHook` and then of each
+/// `PutLifecycleHook`, in the order they are to be made.
+type LifecycleHookCalls = Vec<(&'static str, Vec<(String, String)>)>;
+
+/// The most hooks of one group this walk writes or removes, and so the most calls one stack
+/// update fans out into per direction: "if you exceed your maximum limit of lifecycle hooks,
+/// which by default is 50 per Auto Scaling group, the call fails" (`PutLifecycleHook`).
+///
+/// A declaration stating MORE than that asks for a group no account can have, and the owning
+/// service refuses the first hook past its own ceiling — so the walk stops one specification
+/// past the bound rather than fanning out the rest: the resource fails either way, with that
+/// service's own message, and the number of in-process calls one template can ask for is
+/// bounded here rather than by the template's size. The group cannot hold more than this many
+/// hooks either, so no more removals than this can be owed.
+const MAX_DECLARED_LIFECYCLE_HOOKS: usize = 50;
+
+/// The calls that take the group's hooks from the ones the PREVIOUS revision declared to the
+/// ones THIS one does, or the refusal a specification this arm cannot carry earns.
+///
+/// Built before the update sends anything, as every other refusal of a declaration here is
+/// ([`query_members`]): a specification carrying a member that call does not take refuses the
+/// update with the group untouched. What the owning service itself refuses mid-sequence — a
+/// transition it does not admit, its per-group ceiling on hooks — fails the resource with that
+/// service's own message, and the deployment reports the resource as failed and rolls the stack
+/// back, exactly as it does for any other arm whose chain of calls stops part-way.
+///
+/// A hook the previous revision declared that this one no longer does is DELETED, and so is one
+/// it KEEPS by name whose specification dropped a member ([`drops_a_member`]); every declared
+/// specification is then written through the upsert `PutLifecycleHook` is — the same write the
+/// specifications a group is CREATED with land through. A hook no revision of this declaration
+/// states is left alone: it is not this resource's to take away. The deletes come first, so a
+/// revision that renames a hook cannot run into that service's per-group ceiling on hooks on
+/// the way through.
+///
+/// The declared specifications are indexed by hook NAME once, so what the two revisions have to
+/// be compared over is one walk of each list rather than one walk of the new list per entry of
+/// the old one, and each hook's name is read off its specification once. Both lists are bounded
+/// by [`MAX_DECLARED_LIFECYCLE_HOOKS`], so the work and the calls this builds are bounded for
+/// any template.
+fn lifecycle_hook_changes(
+    name: &str,
+    deployed: &Value,
+    declared: &Value,
+) -> Result<LifecycleHookCalls, Refusal> {
+    let group = || ("AutoScalingGroupName".to_string(), name.to_string());
+    let wanted = declared_lifecycle_hooks(declared);
+    // One specification per hook NAME, so the comparison below is a lookup rather than a scan.
+    // A declaration that names one hook twice states its last specification for it, which is
+    // the hook that specification would leave behind.
+    let wanted_by_name: BTreeMap<String, &Value> = wanted
+        .iter()
+        .take(MAX_DECLARED_LIFECYCLE_HOOKS + 1)
+        .filter_map(|specification| {
+            lifecycle_hook_name(specification).map(|hook| (hook, specification))
+        })
+        .collect();
+    let mut calls: LifecycleHookCalls = Vec::new();
+    for held in declared_lifecycle_hooks(deployed)
+        .iter()
+        .take(MAX_DECLARED_LIFECYCLE_HOOKS)
+    {
+        let Some(hook) = lifecycle_hook_name(held) else {
+            continue;
+        };
+        let kept = wanted_by_name.get(&hook);
+        if kept.is_none_or(|specification| drops_a_member(held, specification)) {
+            calls.push((
+                "DeleteLifecycleHook",
+                vec![group(), (LIFECYCLE_HOOK_NAME.to_string(), hook)],
+            ));
+        }
+    }
+    for specification in wanted.iter().take(MAX_DECLARED_LIFECYCLE_HOOKS + 1) {
+        let mut parameters = vec![group()];
+        for (member, value) in specification.as_object().into_iter().flatten() {
+            // A member that call does not take is REFUSED rather than dropped, exactly as a
+            // property outside the create's catalogue is ([`query_members`]): a hook written
+            // without what its specification asked for is configured differently from what
+            // the template declared.
+            if member != LIFECYCLE_HOOK_NAME
+                && !PUT_LIFECYCLE_HOOK_MEMBERS.contains(&member.as_str())
+            {
+                return Err(property_not_sent(AUTOSCALING_GROUP, member));
+            }
+            parameters.push((member.clone(), attribute_text(value)));
+        }
+        calls.push(("PutLifecycleHook", parameters));
+    }
+    Ok(calls)
+}
+
+/// Whether the specification `held` stated a member the revision's `wanted` no longer does.
+///
+/// Such a hook is DELETED before it is written again: `PutLifecycleHook` "creates or updates a
+/// lifecycle hook" and leaves a member the request omits at the value the hook already carries,
+/// so the upsert alone cannot take a member AWAY — and a group keeping a value its template no
+/// longer declares is configured differently from what the template describes. Written again
+/// from the specification alone, every member the revision dropped takes the value a hook
+/// created without it carries, which is the same reading the in-place arms of the other
+/// services make of a property a revision dropped ([`ec2_in_place::update_ec2_vpc`]).
+fn drops_a_member(held: &Value, wanted: &Value) -> bool {
+    held.as_object()
+        .into_iter()
+        .flatten()
+        .any(|(member, _)| wanted.get(member).is_none())
+}
+
+/// Make the hook calls [`lifecycle_hook_changes`] built, through the two calls Amazon EC2 Auto
+/// Scaling publishes for ONE hook of a group that exists: `PutLifecycleHook` "creates or
+/// updates a lifecycle hook for the specified Auto Scaling group" and `DeleteLifecycleHook`
+/// "deletes the specified lifecycle hook".
+///
+/// Idempotent, like every other in-place arm: a revision that restates the hooks it already
+/// declared re-writes exactly those hooks, which is what that upsert is for.
+async fn reconcile_lifecycle_hooks(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    calls: LifecycleHookCalls,
+) -> Result<(), Refusal> {
+    for (action, parameters) in &calls {
+        call_query(
+            ctx,
+            AUTOSCALING_SIGNING_NAME,
+            region,
+            AUTOSCALING_API_VERSION,
+            action,
+            parameters,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Apply a CHANGED `AWS::EC2::LaunchTemplate` declaration to the template that exists, by

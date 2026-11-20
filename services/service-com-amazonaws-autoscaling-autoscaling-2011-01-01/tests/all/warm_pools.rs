@@ -1038,11 +1038,14 @@ async fn an_unsatisfiable_request_is_refused() {
             status: 400,
             code: "ValidationError",
             // `PoolState` targets the model's own `WarmPoolState` enum, so the boundary
-            // validator refuses a value outside it and states the set it had to satisfy.
+            // validator refuses a value outside it and states the set it had to satisfy —
+            // in the order this service's front door lists a value set in, which is the
+            // table order every enumerated type of its model is stated in
+            // (`service::enum_value_sets`) rather than the model's declaration order.
             message: format!(
                 "1 validation error detected: Value 'Warmed' at 'poolState' failed to satisfy \
                  constraint: Member must satisfy enum value set: [{}]",
-                POOL_STATES.join(", ")
+                service_common::validation_message::hashed_enum_order(&POOL_STATES).join(", ")
             ),
         },
         Refusal {

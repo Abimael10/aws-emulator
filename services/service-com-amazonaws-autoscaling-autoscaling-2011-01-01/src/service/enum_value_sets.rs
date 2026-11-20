@@ -14,9 +14,11 @@
 //! * The ORDER they are listed in. The front door holds the values of a set in a HASH
 //!   TABLE keyed on each value's own text and enumerates the table rather than the type's
 //!   declaration, so the list is neither the model's declaration order nor a sort of it.
-//!   That derivation is `service_common`'s ([`hashed_enum_order`]), shared with every other
-//!   emulated service whose recorded refusals list a value set that way, so it is not
-//!   restated here.
+//!   That derivation is `service_common`'s ([`in_hashed_enum_order`]), shared with every
+//!   other emulated service whose recorded refusals list a value set that way, so it is not
+//!   restated here. The table is the front door's, so the order belongs to EVERY enumerated
+//!   type of this model and not to the one type a set is published for: a refusal of any
+//!   enumerated member states its values in that order.
 //!
 //! The rows are this service's data; everything done WITH them is
 //! `service_common::validation_message`'s — [`in_stated_enum_order`] is its reader — so the
@@ -24,11 +26,9 @@
 //! writes them (`aws_smithy_schema_server::envelope`) and only the value set moves. A row
 //! is matched on the value SET the model declares, so every member targeting that type — of
 //! any operation, at any depth — states the one set, and a type this service publishes no
-//! set of is stated exactly as the model declares it.
+//! set of states exactly the values the model declares, in that same table order.
 
-use std::sync::LazyLock;
-
-use service_common::validation_message::{hashed_enum_order, in_stated_enum_order};
+use service_common::validation_message::{in_hashed_enum_order, in_stated_enum_order};
 use smithy_server_runtime::Violation;
 
 /// The values the model this emulator ships declares for the enumerated type a
@@ -49,8 +49,9 @@ const METRIC_TYPE_DECLARED: &[&str] = &[
 /// shipped model does not declare.
 ///
 /// SOURCE: the service's own refusal of a value outside the set, which lists five values —
-/// these — where the model declares four. The ORDER is not written out: it is
-/// [`hashed_enum_order`]'s over this set, which is the order that refusal lists them in.
+/// these — where the model declares four. The ORDER is not written out here either: the
+/// front door's table decides it ([`in_hashed_enum_order`]), exactly as it does for every
+/// other set, so these are the five values in the order the model would have declared them.
 ///
 /// Stating a value the shipped model does not declare does not ADMIT it: which values a
 /// member accepts is the enum the member targets, checked by the framework's own constraint
@@ -66,18 +67,19 @@ const METRIC_TYPE_PUBLISHED: &[&str] = &[
     "ASGAverageCPUUtilizationHighResolution",
 ];
 
-/// [`METRIC_TYPE_PUBLISHED`] in the order the service states it, derived ONCE: the order
-/// belongs to the value set, so it is the same for every request.
-static METRIC_TYPE_STATED: LazyLock<Vec<&'static str>> =
-    LazyLock::new(|| hashed_enum_order(METRIC_TYPE_PUBLISHED));
-
-/// `violations` with every value set this service publishes stated as the service states
-/// it; every other violation, and every set no row publishes, is passed through unchanged.
+/// `violations` with every enumerated type's value set as the service STATES it: the set
+/// this service publishes beyond the model where it publishes one, listed in the order the
+/// front door's table is walked. Every violation of another class is passed through
+/// unchanged.
+///
+/// The two steps are in that order because the published set is a set: which values are
+/// stated is decided first, and the order is then derived from the values that end up being
+/// stated — so a published set and a model-declared one are listed by the one derivation.
 pub(crate) fn in_published_order(violations: &[Violation]) -> Vec<Violation> {
-    let published = [(METRIC_TYPE_DECLARED, METRIC_TYPE_STATED.as_slice())];
+    let published = [(METRIC_TYPE_DECLARED, METRIC_TYPE_PUBLISHED)];
     violations
         .iter()
-        .map(|violation| in_stated_enum_order(violation, &published))
+        .map(|violation| in_hashed_enum_order(&in_stated_enum_order(violation, &published)))
         .collect()
 }
 
@@ -110,7 +112,12 @@ mod tests {
     /// and the position and the echoed value are kept.
     #[test]
     fn the_published_set_is_stated_whatever_order_it_arrives_in() {
-        let expected: Vec<String> = METRIC_TYPE_STATED.iter().map(|v| (*v).to_string()).collect();
+        let expected: Vec<String> = service_common::validation_message::hashed_enum_order(
+            METRIC_TYPE_PUBLISHED,
+        )
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect();
         for presented in [
             // The model's declaration order, a sort of it, and its reverse.
             vec![
@@ -155,15 +162,30 @@ mod tests {
         }
     }
 
-    /// A value set no row publishes is stated as the model declares it.
+    /// A value set no row publishes holds exactly the values the model declares — and is
+    /// listed in the same table order a published one is, that order being the front door's
+    /// rather than any one type's.
     #[test]
-    fn an_unpublished_value_set_is_stated_as_the_model_declares_it() {
+    fn an_unpublished_value_set_is_stated_in_the_tables_order() {
         let declared = ["Stopped", "Running", "Hibernated"];
+        let expected: Vec<String> =
+            service_common::validation_message::hashed_enum_order(&declared)
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect();
         let moved = in_published_order(&[enum_violation("poolState", "Warmed", &declared)]);
         assert_eq!(
             stated(&moved[0]),
-            declared,
-            "case an unpublished value set: it must be stated as presented"
+            expected,
+            "case an unpublished value set: it must be stated in the table's order"
+        );
+        let mut members = stated(&moved[0]);
+        members.sort_unstable();
+        let mut admitted: Vec<String> = declared.iter().map(|v| (*v).to_string()).collect();
+        admitted.sort_unstable();
+        assert_eq!(
+            members, admitted,
+            "case an unpublished value set: it must hold exactly the declared values"
         );
     }
 

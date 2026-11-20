@@ -78,6 +78,23 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "ApplicationInsights",
         SdkDiagnostic::Attempts,
     ),
+    // Amazon EC2 Auto Scaling's SDK names it `AutoScaling` — that model's own
+    // `awsService.cloudFormationName`, which is its `sdkId` (`Auto Scaling`,
+    // `smithy_query(query="service_info")` on that service's model) with the space closed up,
+    // exactly as Application Auto Scaling's above is. The shape is the ATTEMPT-counting one, as
+    // the recorded `ResourceStatusReason` of an `AWS::AutoScaling::AutoScalingGroup` whose
+    // declared `DeletionProtection` that service does not accept, and of one whose deletion
+    // protection blocks the delete, each carry it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, checks
+    // `autoscaling__cloudformation.deploy-cfn-asg-invalid-deletion-protection-value-rejected`
+    // and
+    // `autoscaling__cloudformation.deploy-cfn-asg-deletion-protection-blocks-delete-until-cleared`,
+    // whose reasons read `Resource handler returned message: "<the service's sentence>
+    // (Service: AutoScaling, Status Code: 400, Request ID: …) (SDK Attempt Count: …)"
+    // (RequestToken: …, HandlerErrorCode: …)`). Every type this emulator provisions over this
+    // signing name is that service's (the group and its scaling policy,
+    // [`provisioner::compute_fleet`] and [`provisioner::auto_scaling_policies`]).
+    ("autoscaling", "AutoScaling", SdkDiagnostic::Attempts),
     // Amazon Braket's SDK names it by that model's own `sdkId` (`Braket`), and words its
     // diagnostic with the refused OPERATION and that service's error code in it, as the
     // recorded `ResourceStatusReason` of a failed `AWS::Braket::SpendingLimit` carries it (in
