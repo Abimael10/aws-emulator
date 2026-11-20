@@ -1086,14 +1086,13 @@ fn not_deletable_sentence(status: &str) -> String {
     )
 }
 
-/// The whole `ConflictException` message a stop of a job in `status` is refused with,
-/// spelled out here for the same reason.
-fn not_stoppable_sentence(status: &str) -> String {
-    format!(
-        "Cannot stop batch evaluation in status {status}. \
-         Only PENDING or IN_PROGRESS evaluations can be stopped."
-    )
-}
+/// The whole `ConflictException` message a stop of a job with no run left to end is
+/// refused with, spelled out here for the same reason. It is FIXED text: the refusal
+/// reports neither the status that blocked it nor the job it refused, so one sentence
+/// stands for every job and every status a stop cannot be served in.
+const BATCH_EVALUATION_STOP_CONFLICT_SENTENCE: &str =
+    "Failed to update the resource as a concurrent request modified the resource. \
+     Retry the request after the other request has completed.";
 
 /// A delete is decided by the status the job is in, over the WHOLE status enum: a job that
 /// has finished is deletable and one that is still on its way somewhere is not, with the
@@ -1125,14 +1124,6 @@ fn the_statuses_a_batch_evaluation_can_be_deleted_or_stopped_in() {
                 not_deletable_sentence(status),
                 "case {status:?}: expected the refusal to name the status the job is in, got {:?}",
                 agentcore::state::batch_evaluation_not_deletable_message(status)
-            );
-        }
-        if !stoppable {
-            assert_eq!(
-                agentcore::state::batch_evaluation_not_stoppable_message(status),
-                not_stoppable_sentence(status),
-                "case {status:?}: expected the refusal to name the status the job is in, got {:?}",
-                agentcore::state::batch_evaluation_not_stoppable_message(status)
             );
         }
     }
@@ -1457,9 +1448,9 @@ async fn stopping_a_running_batch_evaluation_carries_it_to_stopped() {
     }
 }
 
-/// A stop of a job with no run left to end is refused 409 `ConflictException` naming the
-/// status it is in, and an id no job is held for is refused 404: a row per status a stop
-/// cannot be served in.
+/// A stop of a job with no run left to end is refused 409 `ConflictException` with this
+/// plane's fixed conflict sentence, and an id no job is held for is refused 404: a row per
+/// status a stop cannot be served in.
 #[tokio::test]
 async fn stopping_a_batch_evaluation_with_no_run_left_is_refused() {
     let span = agentcore::state::BATCH_EVALUATION_TRANSITION_SPAN;
@@ -1528,8 +1519,8 @@ async fn stopping_a_batch_evaluation_with_no_run_left_is_refused() {
         );
         assert_eq!(
             text(&body, "message"),
-            not_stoppable_sentence(expected_status),
-            "case {case:?}: expected the refusal to name status {expected_status}, got {body:?}"
+            BATCH_EVALUATION_STOP_CONFLICT_SENTENCE,
+            "case {case:?}: expected the plane's fixed stop-conflict sentence, got {body:?}"
         );
 
         // The refused stop changed nothing.
@@ -1558,6 +1549,124 @@ async fn stopping_a_batch_evaluation_with_no_run_left_is_refused() {
         BATCH_EVALUATION_NOT_FOUND_SENTENCE,
         "expected the plane's fixed not-found sentence, got {body:?}"
     );
+}
+
+/// The stop refusal's WORDING does not vary: a stop this plane has no run left to end is
+/// refused with ONE sentence, whatever the job was named, whatever id was minted for it
+/// and whichever status with no run left it holds. The rows differ along every part a
+/// message templated from the request or from the store would have carried — the name, the
+/// id that follows from it and the status that blocked the call — and each row asserts the
+/// refusal carries none of them.
+#[tokio::test]
+async fn a_refused_stop_is_worded_the_same_whatever_job_and_status_it_refuses() {
+    let span = agentcore::state::BATCH_EVALUATION_TRANSITION_SPAN;
+    // The longest `batchEvaluationName` the model admits: 48 characters, the first a letter
+    // (source: smithy_query query="shape" shape="BatchEvaluationName", pattern
+    // ^[a-zA-Z][a-zA-Z0-9_]{0,47}$).
+    let longest_name = format!("Z{}y9", "y9_".repeat(15));
+    // The name the row starts its job under, whether it stops the job before the refused
+    // stop, where it then puts the job's lifecycle clock, and the status that leaves the
+    // job in.
+    let cases: [(&str, &str, bool, Duration, Duration, &str); 4] = [
+        (
+            "the shortest name the model admits, run already finished",
+            "Qx",
+            false,
+            span * 2 + GENEROUS_MARGIN,
+            Duration::ZERO,
+            "COMPLETED",
+        ),
+        (
+            "the longest name the model admits, a stop still taking effect",
+            &longest_name,
+            true,
+            Duration::ZERO,
+            GENEROUS_MARGIN,
+            "STOPPING",
+        ),
+        (
+            "mixed case and digits, already stopped",
+            "Nightly_Regression_42",
+            true,
+            span + GENEROUS_MARGIN,
+            Duration::ZERO,
+            "STOPPED",
+        ),
+        (
+            "an underscored name, run already finished",
+            "weekly_quality_sweep",
+            false,
+            span * 2 + GENEROUS_MARGIN,
+            Duration::ZERO,
+            "COMPLETED",
+        ),
+    ];
+
+    for (case, name, stop_first, aged_by, deferred_by, expected_status) in cases {
+        let (router, engine) = emulator();
+        let (status, started) = start_batch_evaluation(&router, minimal_request(name)).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: expected HTTP 202 from StartBatchEvaluation, got {status} with {started:?}"
+        );
+        let id = text(&started, "batchEvaluationId").to_string();
+        if stop_first {
+            let (status, stopped) = stop_batch_evaluation(&router, &id).await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: expected the first stop to be accepted, got {status} with {stopped:?}"
+            );
+        }
+        age_batch_evaluation(&engine, &id, aged_by);
+        defer_batch_evaluation(&engine, &id, deferred_by);
+
+        let (_, read) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            text(&read, "status"),
+            expected_status,
+            "case {case:?}: expected the job to be {expected_status} before the refused stop, got {read:?}"
+        );
+
+        let (status, body) = stop_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: expected HTTP 409, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {body:?}"
+        );
+        let message = text(&body, "message").to_string();
+        assert_eq!(
+            message, BATCH_EVALUATION_STOP_CONFLICT_SENTENCE,
+            "case {case:?}: expected the plane's fixed stop-conflict sentence, got {message:?}"
+        );
+        for (part, value) in [
+            ("the status that blocked the stop", expected_status),
+            ("the job's id", id.as_str()),
+            ("the job's name", name),
+        ] {
+            assert!(
+                !message.contains(value),
+                "case {case:?}: expected the refusal to interpolate nothing, \
+                 but it carries {part} ({value:?}): {message:?}"
+            );
+        }
+
+        // The refused stop changed nothing a later caller sees.
+        let (_, after) = get_batch_evaluation(&router, &id).await;
+        assert_eq!(
+            text(&after, "status"),
+            expected_status,
+            "case {case:?}: expected the refused stop to change no status, got {after:?}"
+        );
+        assert_eq!(
+            text(&after, "batchEvaluationName"),
+            name,
+            "case {case:?}: expected the refused stop to leave the job as it was, got {after:?}"
+        );
+    }
 }
 
 /// The documented lifecycle end to end: start, a delete refused while the job runs, a

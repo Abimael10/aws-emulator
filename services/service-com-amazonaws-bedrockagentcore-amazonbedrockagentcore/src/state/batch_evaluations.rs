@@ -20,7 +20,9 @@
 //!
 //! `StopBatchEvaluation` and `DeleteBatchEvaluation` are the two calls that end a job, and
 //! both are decided by the status it is in when they arrive. A stop is accepted only while
-//! there is still work to end ([`BATCH_EVALUATION_STOPPABLE_STATUSES`]) and from then on
+//! there is still work to end ([`BATCH_EVALUATION_STOPPABLE_STATUSES`]) — a stop of a job
+//! with no work left is refused with this plane's fixed conflict sentence
+//! ([`BATCH_EVALUATION_NOT_STOPPABLE_MESSAGE`]) — and from then on
 //! the job is on the STOP's clock — `STOPPING`, then `STOPPED` one span later. A delete is
 //! accepted only once the job has finished ([`BATCH_EVALUATION_TERMINAL_STATUSES`]), and
 //! it removes the record, so the id it addressed afterwards resolves to nothing at all.
@@ -132,8 +134,6 @@ pub fn batch_evaluation_not_deletable_message(status: &str) -> String {
 /// The statuses a batch evaluation job can be STOPPED in: a stop ends work that is still
 /// owed, so there has to be some. Every other value of `BatchEvaluationStatus` names a
 /// job whose run is already over or already ending.
-///
-/// The order is the order [`batch_evaluation_not_stoppable_message`] lists them in.
 pub const BATCH_EVALUATION_STOPPABLE_STATUSES: [&str; 2] = [
     BATCH_EVALUATION_STATUS_PENDING,
     BATCH_EVALUATION_STATUS_IN_PROGRESS,
@@ -147,18 +147,19 @@ pub fn batch_evaluation_status_is_stoppable(status: &str) -> bool {
     BATCH_EVALUATION_STOPPABLE_STATUSES.contains(&status)
 }
 
-/// The message a stop of a batch evaluation job that has no work left to end is refused
-/// with, worded as the delete's own refusal is: the status the job is in at the instant of
-/// the call — its only variable part — and then the statuses a job can be stopped in
-/// ([`BATCH_EVALUATION_STOPPABLE_STATUSES`]).
-#[must_use]
-pub fn batch_evaluation_not_stoppable_message(status: &str) -> String {
-    let [first, last] = BATCH_EVALUATION_STOPPABLE_STATUSES;
-    format!(
-        "Cannot stop batch evaluation in status {status}. \
-         Only {first} or {last} evaluations can be stopped."
-    )
-}
+/// The whole `ConflictException` message a stop of a batch evaluation job that has no work
+/// left to end is refused with — FIXED text, exactly as this plane's not-found sentence
+/// ([`BATCH_EVALUATION_NOT_FOUND_MESSAGE`]) is.
+///
+/// The batch-evaluation API words a conflicting change after the resource the request
+/// failed to change and the retry that would succeed, so nothing of the request or of the
+/// store appears in it: not the `batchEvaluationId` the call spelled, not the status the
+/// job is in and not the statuses a stop is still possible in
+/// ([`BATCH_EVALUATION_STOPPABLE_STATUSES`], which decides the refusal but is not reported
+/// by it).
+pub const BATCH_EVALUATION_NOT_STOPPABLE_MESSAGE: &str =
+    "Failed to update the resource as a concurrent request modified the resource. \
+     Retry the request after the other request has completed.";
 
 /// The message a lookup of a batch evaluation job that this plane holds none for is
 /// refused with — the whole `ResourceNotFoundException` message, which is FIXED text: the

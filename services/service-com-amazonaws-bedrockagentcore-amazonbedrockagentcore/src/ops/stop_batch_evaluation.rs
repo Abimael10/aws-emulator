@@ -10,7 +10,9 @@
 //!   and the stop is accepted with 202, reporting `STOPPING` — the job reaches `STOPPED`
 //!   one lifecycle span later, with no further call needed to make it so;
 //! * a job whose run is already over or already ending is refused `ConflictException`
-//!   (409) naming that status, and is left exactly as it was;
+//!   (409) carrying this plane's fixed conflict sentence
+//!   ([`crate::state::BATCH_EVALUATION_NOT_STOPPABLE_MESSAGE`]), and is left exactly as it
+//!   was;
 //! * a `batchEvaluationId` this plane holds no job for is refused
 //!   `ResourceNotFoundException` (404).
 //!
@@ -213,7 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // written.
             return Err(StopBatchEvaluationErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(crate::state::batch_evaluation_not_stoppable_message(status)),
+                    message: Some(
+                        crate::state::BATCH_EVALUATION_NOT_STOPPABLE_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
