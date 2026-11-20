@@ -8,8 +8,9 @@
 //! 1. One error code is worded ONE way per KIND of call: a CONSTANT where the
 //!    service's text names nothing from the request (`ParentCommitIdOutdatedException`,
 //!    `ParentCommitIdRequiredException`, `NoChangeException`,
-//!    `SameFileContentException`, `BlobIdDoesNotExistException`), and a TEMPLATE
-//!    whose single slot is a named request value where it does — the resolved
+//!    `SameFileContentException`), and a TEMPLATE
+//!    whose single slot is a named request value where it does — the object name
+//!    the single-object read was asked for for `BlobIdDoesNotExistException`, the resolved
 //!    commit specifier for `CommitDoesNotExistException` raised where a
 //!    `CommitName` member was resolved, and the object name for the same code
 //!    raised where a `CommitId` member was looked up — and the template is the
@@ -408,12 +409,12 @@ async fn no_change_and_same_file_content_messages_are_constants() {
     }
 }
 
-/// Rule 1, `BlobIdDoesNotExistException` — the message is the same constant
-/// whichever repository the lookup ran in and whichever object name it was asked
-/// for: a well-formed object name that no object carries states only that the blob
-/// is not in the repository, naming neither the id nor the repository.
+/// Rule 1, `BlobIdDoesNotExistException` — the single-object read words the code
+/// as a template whose one slot is the object name the request asked for: the
+/// sentence is the same whichever repository the lookup ran in, and it names the
+/// id that was not found and never the repository.
 #[tokio::test]
-async fn blob_id_does_not_exist_message_is_a_constant() {
+async fn blob_id_does_not_exist_message_names_the_requested_id() {
     let router = emulator();
 
     // Two repositories, one holding a blob and one holding none, so the same

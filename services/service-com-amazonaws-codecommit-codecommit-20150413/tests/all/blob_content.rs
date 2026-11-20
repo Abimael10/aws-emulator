@@ -5,10 +5,12 @@
 //!
 //! The rule under test: `GetBlob` answers with the bytes the named repository holds
 //! under the requested git object name, byte for byte and unchanged by being read,
-//! and refuses every other request with the error the model declares for it. The
-//! tables below span the class the rule covers — content kind and size, object-name
-//! case, which repository holds the object, and each way a request can be at fault —
-//! rather than one recorded request.
+//! and refuses every other request with the error the model declares for it — and a
+//! refusal for a well-formed object name the repository holds no object for NAMES
+//! that object name, so a caller can tell which id was missing. The tables below
+//! span the class the rule covers — content kind and size, object-name case, which
+//! repository holds the object, and each way a request can be at fault — rather than
+//! one recorded request.
 //!
 //! The harness (`emulator`, `ok`, `error`, `string_at`, `base64`, `from_base64` and
 //! the independent `git_blob_id` object-name oracle) is the shared one in
@@ -19,7 +21,21 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::harness::error_with_message;
 use crate::repository_lifecycle::{base64, emulator, error, from_base64, git_blob_id, ok, string_at};
+
+/// The status `BlobIdDoesNotExistException` models (`errorKind: client`,
+/// `httpError: 400`, `smithy_query(query="operation",operation="GetBlob")`).
+const CLIENT_ERROR_STATUS: u16 = 400;
+
+/// What `GetBlob` says when the repository holds no object under the requested
+/// name: fixed text either side of ONE slot, which is the object name the request
+/// carried, spelled as it carried it. Written here as a literal rather than read
+/// from the crate, so a change to the crate's wording cannot change what this
+/// suite expects.
+fn blob_id_does_not_exist(blob_id: &str) -> String {
+    format!("AWS CodeCommit could not find the blob {blob_id} in the repository.")
+}
 
 /// One row of the content table: a file written into the repository, and the bytes
 /// `GetBlob` must answer with for the object name that write reported.
@@ -398,5 +414,182 @@ async fn get_blob_is_refused_with_the_modeled_error() {
         from_base64(&string_at(&got, "/content")),
         content,
         "a refused read must leave the stored object readable"
+    );
+}
+
+/// The refusal of a well-formed object name the repository holds no object for
+/// IDENTIFIES that object name: the message is a template whose single slot is
+/// the `blobId` the request carried, verbatim, so a caller resolving several
+/// object names in one pass can tell which one was missing.
+///
+/// The rows span what the rule generalises over — how the absent name was arrived
+/// at (the content-addressed name of content never written, of empty content, of
+/// 64 KiB of content, the name another repository holds), each end of the
+/// object-name range, and the case it is spelled in (an object name is
+/// hexadecimal, so its case does not change which object it names, and the
+/// message still reports the spelling the request used) — and each row is asked
+/// of a repository that holds objects AND of one that holds none, so a template
+/// that named the repository would differ between them.
+#[tokio::test]
+async fn an_absent_object_name_is_refused_by_the_name_that_was_asked_for() {
+    let router = emulator();
+
+    // One repository with content in it and one with none. Neither name is a
+    // substring of the message's fixed text, so the assertions below can check
+    // that the repository reaches no part of it.
+    let held = b"held content\n".to_vec();
+    let holder = "holder-repo";
+    let empty = "empty-repo";
+    ok(
+        &router,
+        "CreateRepository",
+        &json!({ "repositoryName": holder }),
+    )
+    .await;
+    let put = ok(
+        &router,
+        "PutFile",
+        &json!({
+            "repositoryName": holder,
+            "branchName": "main",
+            "filePath": "held.txt",
+            "fileContent": base64(&held),
+        }),
+    )
+    .await;
+    let held_id = string_at(&put, "/blobId");
+    ok(
+        &router,
+        "CreateRepository",
+        &json!({ "repositoryName": empty }),
+    )
+    .await;
+
+    // The object the holder DOES hold reads back, so every row below is refused
+    // on the lookup rather than on the repository or on the object name's form.
+    let read = ok(
+        &router,
+        "GetBlob",
+        &json!({ "repositoryName": holder, "blobId": held_id }),
+    )
+    .await;
+    assert_eq!(
+        from_base64(&string_at(&read, "/content")),
+        held,
+        "the object the repository holds must read back, got {read}"
+    );
+
+    // Content written to a THIRD repository, so its object name is well formed
+    // and stored somewhere, but not in either repository asked below.
+    let elsewhere = b"written elsewhere\n".to_vec();
+    ok(
+        &router,
+        "CreateRepository",
+        &json!({ "repositoryName": "other-repo" }),
+    )
+    .await;
+    ok(
+        &router,
+        "PutFile",
+        &json!({
+            "repositoryName": "other-repo",
+            "branchName": "main",
+            "filePath": "elsewhere.txt",
+            "fileContent": base64(&elsewhere),
+        }),
+    )
+    .await;
+
+    let absent: Vec<(&str, String)> = vec![
+        ("the name of content never written", git_blob_id(b"never written\n")),
+        ("the name of empty content", git_blob_id(b"")),
+        (
+            "the name of 64 KiB never written",
+            git_blob_id(&(0..=255u8).cycle().take(64 * 1024).collect::<Vec<u8>>()),
+        ),
+        ("the lowest object name", "0".repeat(40)),
+        ("the highest object name", "f".repeat(40)),
+        (
+            "an object name in mixed case",
+            "AbCdEf0123456789aBcDeF0123456789AbCdEf01".to_string(),
+        ),
+        (
+            "the name of content only another repository holds",
+            git_blob_id(&elsewhere),
+        ),
+    ];
+
+    let mut messages: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (label, blob_id) in &absent {
+        for repository in [holder, empty] {
+            let (code, message) = error_with_message(
+                &router,
+                "GetBlob",
+                &json!({ "repositoryName": repository, "blobId": blob_id }),
+                CLIENT_ERROR_STATUS,
+            )
+            .await;
+            assert_eq!(
+                code, "BlobIdDoesNotExistException",
+                "case ({label}, {repository}): expected code BlobIdDoesNotExistException, \
+                 got {code:?}"
+            );
+            let expected = blob_id_does_not_exist(blob_id);
+            assert_eq!(
+                message, expected,
+                "case ({label}, {repository}): expected message {expected:?}, got {message:?}"
+            );
+            // The slot carries the id the REQUEST spelled, so the caller can match
+            // the refusal to the id it asked for.
+            assert!(
+                message.contains(blob_id.as_str()),
+                "case ({label}, {repository}): the message must name the requested object \
+                 name {blob_id:?}, got {message:?}"
+            );
+            // The repository is not part of the sentence.
+            assert!(
+                !message.contains(repository),
+                "case ({label}, {repository}): the message must not name the repository, \
+                 got {message:?}"
+            );
+            // Asking again says exactly the same thing: the refusal reports state,
+            // it does not change it.
+            let (again_code, again_message) = error_with_message(
+                &router,
+                "GetBlob",
+                &json!({ "repositoryName": repository, "blobId": blob_id }),
+                CLIENT_ERROR_STATUS,
+            )
+            .await;
+            assert_eq!(
+                (again_code.as_str(), again_message.as_str()),
+                (code.as_str(), message.as_str()),
+                "case ({label}, {repository}): the refusal must be repeatable, got \
+                 {again_code:?} {again_message:?}"
+            );
+            messages.insert(message);
+        }
+    }
+
+    // One sentence per absent object name, not one sentence for all of them: the
+    // rows above are distinct ids, so they produce distinct messages.
+    let distinct_ids: std::collections::BTreeSet<&String> =
+        absent.iter().map(|(_, blob_id)| blob_id).collect();
+    assert_eq!(
+        messages.len(),
+        distinct_ids.len(),
+        "each absent object name must get its own sentence, got {messages:?}"
+    );
+
+    // Every refusal above left the holder's object exactly as it was.
+    let after = ok(
+        &router,
+        "GetBlob",
+        &json!({ "repositoryName": holder, "blobId": held_id }),
+    )
+    .await;
+    assert_eq!(
+        after, read,
+        "the refusals must leave the stored object readable, got {after} then {read}"
     );
 }
