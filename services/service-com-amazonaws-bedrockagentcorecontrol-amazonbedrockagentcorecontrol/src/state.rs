@@ -1639,6 +1639,12 @@ pub mod capacity_providers;
 /// it. Re-exported, so a handler names `crate::state::…` for it exactly as it does
 /// for the resources beside it.
 pub mod payment_managers;
+/// The payment connectors one payment manager holds: the record
+/// `CreatePaymentConnector` persists, the status it reports and the address an
+/// end user completes a service-orchestrated authorization at. Re-exported, so a
+/// handler names `crate::state::…` for it exactly as it does for the manager
+/// that holds the connectors.
+pub mod payment_connectors;
 /// The API key credential providers of this account's token vault: the record a
 /// create persists, the ARNs it mints and the Secrets Manager secret the API key
 /// itself lives in. Re-exported, so a handler names `crate::state::…` for it
@@ -1725,6 +1731,7 @@ pub use listings::*;
 pub use oauth2_credential_providers::*;
 pub use online_evaluation_configs::*;
 pub use memory_strategies::*;
+pub use payment_connectors::*;
 pub use payment_credential_providers::*;
 pub use payment_managers::*;
 pub use policies::*;

@@ -422,7 +422,7 @@ pub fn consent_portal_route(uri: &str) -> Option<&str> {
 /// The PATH of a request target, whether it arrived in origin form (`/a/b?q`) or in absolute
 /// form (`https://host/a/b?q`), which is how a request that carries its endpoint in the URI
 /// spells the same address.
-fn request_target_path(uri: &str) -> &str {
+pub(super) fn request_target_path(uri: &str) -> &str {
     let path = uri.split(['?', '#']).next().unwrap_or(uri);
     match path.split_once("://") {
         Some((_scheme, authority_and_path)) => authority_and_path
@@ -474,6 +474,9 @@ pub fn consent_portal_not_found_page() -> String {
 
 /// `value` as text inside an HTML element: the `html-escape` crate's own escaping, so no
 /// stored string can open or close an element of the page it is written into.
-fn escaped(value: &str) -> String {
+///
+/// `pub(super)` so every page this service publishes escapes with the one helper
+/// ([`super::payment_connectors`] renders the other one).
+pub(super) fn escaped(value: &str) -> String {
     ::html_escape::encode_safe(value).into_owned()
 }

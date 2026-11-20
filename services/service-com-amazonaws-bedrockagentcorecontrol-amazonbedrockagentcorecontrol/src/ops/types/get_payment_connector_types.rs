@@ -18,7 +18,15 @@ pub struct GetPaymentConnectorInput {
     pub payment_connector_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#GetPaymentConnectorResponse")]
+/// `GetPaymentConnectorResponse`. Its schema and codec come from
+/// [`agentcore_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt`, `lastUpdatedAt` and `credentialsUpdatedAt` target `DateTimestamp`,
+/// which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="GetPaymentConnector")`), and the derive
+/// does not put that trait on a member schema — see `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GetPaymentConnectorOutput {
     pub payment_connector_id: String,
@@ -33,4 +41,65 @@ pub struct GetPaymentConnectorOutput {
     pub authorization_url: Option<String>,
     pub credentials_updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+agentcore_schema_and_codec!(
+    GetPaymentConnectorOutput,
+    GET_PAYMENT_CONNECTOR_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#GetPaymentConnectorResponse",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "GetPaymentConnectorResponse",
+    (
+        M_PAYMENT_CONNECTOR_ID,
+        payment_connector_id,
+        "paymentConnectorId",
+        0,
+        req,
+        string
+    ),
+    (M_NAME, name, "name", 1, req, string),
+    (M_DESCRIPTION, description, "description", 2, opt, string),
+    (M_TYPE, r#type, "type", 3, req, string),
+    (
+        M_PROVISION_MODE,
+        provision_mode,
+        "provisionMode",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_CREDENTIAL_PROVIDER_CONFIGURATIONS,
+        credential_provider_configurations,
+        "credentialProviderConfigurations",
+        5,
+        req,
+        list_of_union(CredentialsProviderConfiguration)
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 6, req, date_time),
+    (
+        M_LAST_UPDATED_AT,
+        last_updated_at,
+        "lastUpdatedAt",
+        7,
+        req,
+        date_time
+    ),
+    (M_STATUS, status, "status", 8, req, string),
+    (
+        M_AUTHORIZATION_URL,
+        authorization_url,
+        "authorizationUrl",
+        9,
+        opt,
+        string
+    ),
+    (
+        M_CREDENTIALS_UPDATED_AT,
+        credentials_updated_at,
+        "credentialsUpdatedAt",
+        10,
+        opt,
+        date_time
+    ),
+);
 

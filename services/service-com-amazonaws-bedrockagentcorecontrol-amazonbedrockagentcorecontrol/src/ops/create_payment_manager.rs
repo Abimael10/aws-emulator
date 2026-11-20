@@ -276,6 +276,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             }),
             tags: crate::state::sorted_map(input.tags),
+            // A manager is created with no payment connectors: only
+            // `CreatePaymentConnector` adds one.
+            payment_connectors: crate::state::PaymentConnectorStore::default(),
             created_at: now,
             updated_at: now,
             // A new payment manager is created, not ready: the transition to READY is

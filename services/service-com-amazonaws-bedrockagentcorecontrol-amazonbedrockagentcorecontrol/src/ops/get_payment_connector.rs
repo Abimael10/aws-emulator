@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPaymentConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPaymentConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPaymentConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored payment connector OF a payment manager, exactly as
+//! [`crate::ops::create_payment_connector`] persisted it in [`crate::state`], with the
+//! status the clock owes it materialised at the instant of the read.
+//!
+//! A connector is addressed only THROUGH its manager, so either half of the pair naming
+//! nothing is this operation's modelled 404: a manager this account does not hold is
+//! reported as the missing manager, and a connector id that manager holds nothing under
+//! as the missing connector.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +185,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPaymentConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPaymentConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPaymentConnector"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetPaymentConnectorErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment manager store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // A READ: the record is reported as it stands, and the status it reports is the
+        // one the clock already made due, which no read performs.
+        let manager = store
+            .payment_managers
+            .get(&input.payment_manager_id)
+            .ok_or_else(|| {
+                GetPaymentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_manager_not_found(&input.payment_manager_id),
+                )
+            })?;
+        let connector = manager
+            .payment_connectors
+            .get(&input.payment_connector_id)
+            .ok_or_else(|| {
+                GetPaymentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_connector_not_found(&input.payment_connector_id),
+                )
+            })?;
+
+        Ok(connector.get_output(now))
     }
 }

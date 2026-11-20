@@ -55,23 +55,16 @@ pub fn answer<Eng: Send + Sync + 'static>(
     // The page of a portal this emulator holds, and a page saying there is none for every
     // other address of this shape: nothing is invented for a portal that was never created
     // or whose deletion has completed.
-    let status = if page.is_some() { 200_u16 } else { 404 };
-    let document = page.unwrap_or_else(crate::state::consent_portal_not_found_page);
-    let body = if body_wanted {
-        document.clone().into_bytes()
+    let status = if page.is_some() {
+        super::served_page::PAGE_FOUND
     } else {
-        Vec::new()
+        super::served_page::PAGE_NOT_FOUND
     };
-    let mut response = aws_smithy_runtime_api::http::Response::new(
-        aws_smithy_runtime_api::http::StatusCode::try_from(status).ok()?,
-        ::aws_smithy_types::body::SdkBody::from(body),
-    );
-    let headers = response.headers_mut();
-    headers.insert("content-type", crate::state::CONSENT_PORTAL_MEDIA_TYPE);
-    // The size of the page itself, which is what a `HEAD` of it reports with no body.
-    headers.insert("content-length", document.len().to_string());
-    // The page is served from this emulator's own origin, so the type it announces is the
-    // only type it may be treated as.
-    headers.insert("x-content-type-options", "nosniff");
-    Some(response)
+    let document = page.unwrap_or_else(crate::state::consent_portal_not_found_page);
+    super::served_page::served_page(
+        status,
+        crate::state::CONSENT_PORTAL_MEDIA_TYPE,
+        &document,
+        body_wanted,
+    )
 }

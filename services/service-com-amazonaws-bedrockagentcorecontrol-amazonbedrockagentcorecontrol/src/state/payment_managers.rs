@@ -127,6 +127,12 @@ pub struct PaymentManagerRecord {
     /// create minted.
     pub workload_identity_details: Option<WorkloadIdentityDetails>,
     pub tags: BTreeMap<String, String>,
+    /// The payment connectors created on this manager, and what each
+    /// `clientToken` presented to this manager produced
+    /// ([`PaymentConnectorStore`]). Held here because a connector is addressed
+    /// only THROUGH its manager, so the manager and its connectors are read under
+    /// one lookup.
+    pub payment_connectors: PaymentConnectorStore,
     pub created_at: SystemTime,
     pub updated_at: SystemTime,
     /// The status the manager reports until [`Self::settles_at`].

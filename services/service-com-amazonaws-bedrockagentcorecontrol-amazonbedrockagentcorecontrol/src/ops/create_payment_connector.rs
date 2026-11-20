@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePaymentConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePaymentConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePaymentConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a payment connector ON a stored payment manager and PERSISTS it on that
+//! manager's record in [`crate::state`]: the payment provider it integrates with, the
+//! credential provider configuration it authenticates through, and the status its
+//! provisioning leaves it in. Every later read of the connector
+//! ([`crate::ops::get_payment_connector`]) comes from that record.
+//!
+//! A connector is addressed only THROUGH its manager
+//! (`/payments/managers/{paymentManagerId}/connectors/{paymentConnectorId}`), so a
+//! manager this account does not hold is this operation's modelled 404 with nothing
+//! written. What the create leaves behind follows `provisionMode`: a `MANUAL` connector
+//! carries the credential provider the request named and is `CREATING` with `READY` owed
+//! by the clock, while a `QUICK_CREATE` one is `PENDING_AUTHENTICATION` and reports the
+//! address an end user completes its OAuth consent at
+//! ([`crate::state::payment_connector_authorization_url`], served by
+//! [`crate::service::payment_connector_authorization`]).
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +207,186 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePaymentConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePaymentConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePaymentConnector"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePaymentConnectorErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the payment manager store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        // "If you don't specify a value, the default is MANUAL" — so a request that
+        // names no mode is served as one that provides its own credentials.
+        let provision_mode = input.provision_mode.clone().unwrap_or_else(|| {
+            crate::state::DEFAULT_PAYMENT_CONNECTOR_PROVISION_MODE.to_string()
+        });
+        let quick_create =
+            provision_mode == crate::state::PAYMENT_CONNECTOR_PROVISION_MODE_QUICK_CREATE;
+
+        // The configuration a `MANUAL` connector authenticates with is the caller's to
+        // supply — "MANUAL - You provide the credential provider configurations
+        // directly" — and `credentialProviderConfigurations` is modelled `len 0..1`, so
+        // a body that carries an empty list satisfies the constraint walk and is refused
+        // here, in the sentence this service states an undefined credential provider
+        // configuration in. A `QUICK_CREATE` connector supplies none because the service
+        // provisions the provider for it after consent.
+        if !quick_create && input.credential_provider_configurations.is_empty() {
+            return Err(CreatePaymentConnectorErrorModeled::ValidationException(
+                crate::state::member_not_defined(
+                    crate::state::CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE,
+                ),
+            )
+            .into());
+        }
+
+        // A configuration "specifies the payment provider type and its associated
+        // credential provider", and this API states the pairing rule for the same two
+        // vendors on its sibling union: "Provide the member that matches the payment
+        // connector's type" (`smithy_query doc shape=CredentialRotationConfig`). So the
+        // member a configuration is carried in has to be the connector's own `type`: the
+        // other member configures a different vendor's provider, which this connector
+        // could not authenticate through.
+        if let Some(configured) = input
+            .credential_provider_configurations
+            .iter()
+            .map(crate::state::configured_connector_type)
+            .find(|configured| *configured != input.r#type)
+        {
+            return Err(CreatePaymentConnectorErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    CREDENTIAL_PROVIDER_CONFIGURATIONS_MEMBER,
+                    &format!(
+                        "configures {configured}, which is not this payment connector's type {}",
+                        input.r#type
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the connector
+        // that token first created, rather than adding a second one: "If this token
+        // matches a previous request, the service ignores the request, but doesn't
+        // return an error."
+        if let Some(replayed) = store
+            .payment_managers
+            .get(&input.payment_manager_id)
+            .and_then(|manager| {
+                manager
+                    .payment_connectors
+                    .replayed(Self::NAME, input.client_token.as_deref())
+            })
+        {
+            return Ok(replayed.create_output(now));
+        }
+
+        // A connector belongs TO a payment manager, so the manager has to exist: this
+        // route carries its id, and an id this account holds no manager under names
+        // nothing to create a connector on. A manager the clock is still moving through
+        // a transient status TAKES a connector, because the connector carries a
+        // clock-owed status of its own.
+        let manager = store
+            .payment_managers
+            .get(&input.payment_manager_id)
+            .ok_or_else(|| {
+                CreatePaymentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_manager_not_found(&input.payment_manager_id),
+                )
+            })?;
+
+        // The connectors one manager holds are bounded, so a caller looping on create
+        // meets the modelled quota instead of this process's memory limit.
+        if manager.payment_connectors.len() >= crate::state::MAX_CONNECTORS_PER_PAYMENT_MANAGER {
+            return Err(
+                CreatePaymentConnectorErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "payment manager {} already holds the maximum of {} payment connectors",
+                            input.payment_manager_id,
+                            crate::state::MAX_CONNECTORS_PER_PAYMENT_MANAGER
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The configuration names the credential provider the connector authenticates
+        // through, which is a resource of this account's token vault: an ARN that is not
+        // one a provider of this vault reports is a resource referenced by the operation
+        // that does not exist, stated in the sentence this service reports a missing
+        // payment credential provider in. Nothing is written for it, so no connector
+        // reports credentials that are not there.
+        for configuration in &input.credential_provider_configurations {
+            let arn = crate::state::configured_credential_provider_arn(configuration);
+            if !crate::state::holds_payment_credential_provider(
+                &store.payment_credential_providers,
+                arn,
+            ) {
+                return Err(CreatePaymentConnectorErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_credential_provider_not_found(),
+                )
+                .into());
+            }
+        }
+
+        // The caller named the connector, and the service mints the
+        // `paymentConnectorId` every later call addresses it by. The model documents no
+        // uniqueness rule for the name (unlike the gateway and the browser, whose names
+        // "must be unique within your account"), so a repeated name is a second
+        // connector with its own minted id rather than a conflict.
+        let payment_connector_id =
+            store.mint_payment_connector_id(&input.payment_manager_id, &input.name, now);
+        // Where the end user completes the consent a service-orchestrated provisioning
+        // waits for: this emulator's own endpoint, which is the only address a client
+        // holding it can reach. A connector carrying the caller's own credentials waits
+        // for no consent and publishes no address.
+        let authorization_url = quick_create.then(|| {
+            crate::state::payment_connector_authorization_url(
+                ctx.endpoint().as_str(),
+                &input.payment_manager_id,
+                &payment_connector_id,
+            )
+        });
+        let record = crate::state::PaymentConnectorRecord::written(
+            payment_connector_id.clone(),
+            input.payment_manager_id.clone(),
+            input.name,
+            input.description,
+            input.r#type,
+            provision_mode,
+            input.credential_provider_configurations,
+            authorization_url,
+            now,
+        );
+        let output = record.create_output(now);
+
+        // The write, under the lock this call already holds: the manager was resolved
+        // above, so this cannot miss — and a create must never report a success for a
+        // write that was dropped, so a miss is a server error rather than a 202 with
+        // nothing stored.
+        let Some(held) = store.payment_managers.get_mut(&input.payment_manager_id) else {
+            return Err(CreatePaymentConnectorErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!(
+                        "payment manager {} is no longer held by the payment manager store",
+                        input.payment_manager_id
+                    )),
+                },
+            )
+            .into());
+        };
+        held.payment_connectors.remember_client_token(
+            Self::NAME,
+            input.client_token,
+            &payment_connector_id,
+        );
+        held.payment_connectors.insert(record);
+
+        Ok(output)
     }
 }
+
+/// `credentialProviderConfigurations` as the request spells it, for the refusal that
+/// names the member (`smithy_query operation=CreatePaymentConnector`).
+const CREDENTIAL_PROVIDER_CONFIGURATIONS_MEMBER: &str = "credentialProviderConfigurations";

@@ -98,11 +98,21 @@
 //! it with the stored portal's page, unauthenticated and as a web page rather than a modelled
 //! API envelope — which is how that address is opened. [`consent_portal`] documents what
 //! answers there.
+//!
+//! ## This service's other edited seam: the address a payment connector publishes
+//!
+//! A `QUICK_CREATE` payment connector reports `authorizationUrl` for an end user to open,
+//! published on this emulator's OWN endpoint for the same reason a portal's page is
+//! ([`crate::state::payment_connector_authorization_url`]). `can_handle` claims a fetch of
+//! exactly that path and `override_routing_error` answers it with the stored connector's
+//! page. [`payment_connector_authorization`] documents what answers there.
 
 pub mod authorization;
 pub mod consent_portal;
 pub mod entitlement;
 pub mod mcp;
+pub mod payment_connector_authorization;
+pub(crate) mod served_page;
 pub(crate) mod validation;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -608,7 +618,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // anonymously, with no credential scope and no target header naming this service,
         // only the path this service itself minted under the plane segment that is this
         // service's alone. See [`consent_portal`].
-        consent_portal::claimed(parts)
+        if consent_portal::claimed(parts) {
+            return true;
+        }
+        // And a fetch of the address a `QUICK_CREATE` PAYMENT CONNECTOR publishes in its
+        // `authorizationUrl`, which this service minted under a plane segment of its own
+        // and is opened the same way, by whoever holds the URL. See
+        // [`payment_connector_authorization`].
+        payment_connector_authorization::claimed(parts)
     }
 
     fn override_operation(
@@ -695,12 +712,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
         //
-        // The ONE address this service serves that no modelled operation describes: the
+        // The addresses this service serves that no modelled operation describes: the
         // page of a stored consent portal, which `portalUrl` publishes for an end user to
         // follow. It is answered here because the router consults this seam before it
         // authenticates anything, which is how AWS serves its own portal host —
         // unauthenticated, and as a web page rather than a modelled API call.
         consent_portal::answer(&*self.engine, req)
+            // And the authorization address a `QUICK_CREATE` payment connector publishes,
+            // served here for the same reason and in the same way.
+            .or_else(|| payment_connector_authorization::answer(&*self.engine, req))
     }
 
     fn override_framework_error(
