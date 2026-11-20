@@ -27,13 +27,21 @@
 //! `smithy_query(query="shape",shape="AccessRight,ClientToken,DisplayName,\
 //! SecurityGroupIdList,VpcInformation")`), and each expected finding is COMPUTED from it
 //! rather than written out.
+//!
+//! WHEN that refusal is decided is the other half of the rule, asserted at the end of this
+//! suite: a modelled constraint is evaluated BEFORE the operation resolves any resource
+//! the request names, so a request that is invalid in itself earns the constraint refusal
+//! whether or not the resources it addresses exist — and the same request with every value
+//! admitted goes on to the lookup and earns the resource refusal instead.
 
 use serde_json::{json, Value};
 
-use super::harness::{call, encode_label, router, ACCOUNT, REGION};
+use service_com_amazonaws_pcaconnectorad_pcaconnectorad as pcad;
+
+use super::harness::{call, encode_label, router, router_with_engine, ACCOUNT, REGION};
 use super::pattern_refusal_messages::{
     advertised, well_formed_connector_arn, well_formed_directory_registration_arn,
-    DIRECTORY_REGISTRATION_ARN_PATTERN, PATTERN_REQUIREMENT,
+    DIRECTORY_REGISTRATION_ARN_PATTERN, PATTERN_REQUIREMENT, TEMPLATE_ARN_PATTERN,
 };
 
 /// `DirectoryId`'s modelled expression, as the model declares it.
@@ -480,4 +488,424 @@ async fn a_request_broken_in_both_halves_is_refused_as_the_body_finding() {
         "case \"a broken body and a broken path segment\": the body refusal states no \
          clause about the URI, got {parsed}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// WHEN a modelled constraint is evaluated: before the operation resolves anything.
+// ---------------------------------------------------------------------------
+
+/// One clause of the per-member envelope, for a value the request carries OUTSIDE its
+/// body: the other half of the split, so a row about a URI-bound value states the
+/// sentence that half is refused in.
+fn uri_clause(member: &str, value: &str, pattern: &str) -> String {
+    format!(
+        "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+         constraint: {PATTERN_REQUIREMENT}{}",
+        advertised(pattern)
+    )
+}
+
+/// A `CreateTemplate` body: the parent connector it names, the template's own `Name`, the
+/// names its definition supersedes (left out when there are none, since
+/// `SupersededTemplates` is modelled `length 1..100`) and, optionally, a `ClientToken`.
+/// The smallest `TemplateV2` the union accepts
+/// (`smithy_query(query="operation",operation="CreateTemplate")`).
+fn create_template_body(
+    connector_arn: &str,
+    name: &str,
+    superseded: &[&str],
+    client_token: Option<&str>,
+) -> Value {
+    let mut definition = json!({
+        "CertificateValidity": {
+            "ValidityPeriod": { "PeriodType": "YEARS", "Period": 1 },
+            "RenewalPeriod": { "PeriodType": "WEEKS", "Period": 6 },
+        },
+        "PrivateKeyAttributes": { "MinimalKeyLength": 2048, "KeySpec": "KEY_EXCHANGE" },
+        "PrivateKeyFlags": { "ClientVersion": "WINDOWS_SERVER_2016" },
+        "EnrollmentFlags": { "NoSecurityExtension": true },
+        "SubjectNameFlags": { "SanRequireDirectoryGuid": true },
+        "GeneralFlags": { "MachineType": true },
+        "Extensions": { "KeyUsage": { "UsageFlags": { "KeyEncipherment": true } } },
+    });
+    if !superseded.is_empty() {
+        definition["SupersededTemplates"] = json!(superseded);
+    }
+    let mut body = json!({
+        "ConnectorArn": connector_arn,
+        "Name": name,
+        "Definition": { "TemplateV2": definition },
+    });
+    if let Some(token) = client_token {
+        body["ClientToken"] = json!(token);
+    }
+    body
+}
+
+/// One request that breaks a modelled constraint AND names resources this service does
+/// not hold, so which of the two it is refused for states the ORDER the two checks run
+/// in.
+struct PrecedenceCase {
+    /// Why this row is here: the operation, the member, the constraint it breaks and the
+    /// resource it names.
+    case: &'static str,
+    method: &'static str,
+    /// The request target, carrying the offending value when the value travels outside
+    /// the body.
+    target: String,
+    body: Option<Value>,
+    /// The whole message the constraint refusal states, computed from the model: the
+    /// validator's bracketed findings for a body member, the per-member clause for a
+    /// value bound to the URI.
+    expected: String,
+    /// The same request with every value its member admits.
+    admitted_target: String,
+    admitted_body: Option<Value>,
+    /// The resource that request is then refused for, as the modelled shape spells the
+    /// type, and the identifier the refusal echoes.
+    resource_type: &'static str,
+    identifier: String,
+}
+
+/// The rows: six operations, four constraint classes (a `@pattern`, a list `@length`
+/// minimum, a string `@length` maximum, an enumerated type's value set), both halves of
+/// the body/URI split, and three resource types on the far side of the lookup.
+fn precedence_cases() -> Vec<PrecedenceCase> {
+    // Nothing is created before these calls, so every resource they name is absent: a
+    // request refused for a constraint cannot have been refused for the resource.
+    let absent_connector = well_formed_connector_arn();
+    let absent_template = well_formed_template_arn();
+    let absent_registration = well_formed_directory_registration_arn();
+    let entries_of_absent_template = format!(
+        "/templates/{}/accessControlEntries",
+        encode_label(&absent_template)
+    );
+    let name_of_absent_registration = format!(
+        "/directoryRegistrations/{}/servicePrincipalNames/{}",
+        encode_label(&absent_registration),
+        encode_label(&absent_connector)
+    );
+    // A certificate-authority ARN whose resource id is not the UUID its expression
+    // requires, so the only thing wrong with the request is that member.
+    let malformed_ca_arn =
+        format!("arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/not-a-uuid");
+    // A client token one character past the modelled maximum, out of characters the
+    // token's own expression admits.
+    let over_long_token = "t".repeat(CLIENT_TOKEN_MAX_LENGTH + 1);
+    let longest_admitted_token = "t".repeat(CLIENT_TOKEN_MAX_LENGTH);
+    vec![
+        PrecedenceCase {
+            case: "CreateConnector, a capitalised directory id, for a directory this \
+                   service holds no registration for",
+            method: "POST",
+            target: "/connectors".to_string(),
+            body: Some({
+                let mut body = connector_body();
+                body["DirectoryId"] = json!("D-0123456789");
+                body
+            }),
+            expected: report(&[regex_finding(DIRECTORY_ID_PATTERN, "D-0123456789")]),
+            admitted_target: "/connectors".to_string(),
+            admitted_body: Some(connector_body()),
+            resource_type: "DirectoryRegistration",
+            identifier: WELL_FORMED_DIRECTORY_ID.to_string(),
+        },
+        PrecedenceCase {
+            case: "CreateConnector, a certificate-authority ARN without the resource id \
+                   its expression requires, for an unregistered directory",
+            method: "POST",
+            target: "/connectors".to_string(),
+            body: Some({
+                let mut body = connector_body();
+                body["CertificateAuthorityArn"] = json!(malformed_ca_arn);
+                body
+            }),
+            expected: report(&[regex_finding(
+                CERTIFICATE_AUTHORITY_ARN_PATTERN,
+                &malformed_ca_arn,
+            )]),
+            admitted_target: "/connectors".to_string(),
+            admitted_body: Some(connector_body()),
+            resource_type: "DirectoryRegistration",
+            identifier: WELL_FORMED_DIRECTORY_ID.to_string(),
+        },
+        PrecedenceCase {
+            case: "CreateConnector, no security group at all, for an unregistered directory",
+            method: "POST",
+            target: "/connectors".to_string(),
+            body: Some({
+                let mut body = connector_body();
+                body["VpcInformation"]["SecurityGroupIds"] = json!([]);
+                body
+            }),
+            expected: report(&[array_finding(SECURITY_GROUP_IDS_MIN, 0)]),
+            admitted_target: "/connectors".to_string(),
+            admitted_body: Some(connector_body()),
+            resource_type: "DirectoryRegistration",
+            identifier: WELL_FORMED_DIRECTORY_ID.to_string(),
+        },
+        PrecedenceCase {
+            case: "CreateTemplate, a name outside the expression its shape declares, under \
+                   a connector never created",
+            method: "POST",
+            target: "/templates".to_string(),
+            body: Some(create_template_body(
+                &absent_connector,
+                "Web,Server",
+                &[],
+                None,
+            )),
+            expected: report(&[regex_finding(
+                pcad::state::TEMPLATE_NAME_PATTERN,
+                "Web,Server",
+            )]),
+            admitted_target: "/templates".to_string(),
+            admitted_body: Some(create_template_body(
+                &absent_connector,
+                "WebServerTemplate",
+                &[],
+                None,
+            )),
+            resource_type: "Connector",
+            identifier: absent_connector.clone(),
+        },
+        PrecedenceCase {
+            case: "CreateTemplate, a superseded template name outside that same expression, \
+                   under a connector never created",
+            method: "POST",
+            target: "/templates".to_string(),
+            body: Some(create_template_body(
+                &absent_connector,
+                "WebServerTemplate",
+                &["Legacy=Template"],
+                None,
+            )),
+            expected: report(&[regex_finding(
+                pcad::state::TEMPLATE_NAME_PATTERN,
+                "Legacy=Template",
+            )]),
+            admitted_target: "/templates".to_string(),
+            admitted_body: Some(create_template_body(
+                &absent_connector,
+                "WebServerTemplate",
+                &["LegacyTemplate"],
+                None,
+            )),
+            resource_type: "Connector",
+            identifier: absent_connector.clone(),
+        },
+        PrecedenceCase {
+            case: "CreateTemplate, a client token past the modelled maximum, under a \
+                   connector never created",
+            method: "POST",
+            target: "/templates".to_string(),
+            body: Some(create_template_body(
+                &absent_connector,
+                "WebServerTemplate",
+                &[],
+                Some(&over_long_token),
+            )),
+            expected: report(&[too_long_finding(&over_long_token, CLIENT_TOKEN_MAX_LENGTH)]),
+            admitted_target: "/templates".to_string(),
+            admitted_body: Some(create_template_body(
+                &absent_connector,
+                "WebServerTemplate",
+                &[],
+                Some(&longest_admitted_token),
+            )),
+            resource_type: "Connector",
+            identifier: absent_connector.clone(),
+        },
+        PrecedenceCase {
+            case: "CreateServicePrincipalName, a client token its expression does not \
+                   admit, under a registration never created",
+            method: "POST",
+            target: name_of_absent_registration.clone(),
+            body: Some(json!({ "ClientToken": "token with spaces" })),
+            expected: report(&[regex_finding(CLIENT_TOKEN_PATTERN, "token with spaces")]),
+            admitted_target: name_of_absent_registration,
+            admitted_body: Some(json!({ "ClientToken": "token-without-spaces" })),
+            resource_type: "DirectoryRegistration",
+            identifier: absent_registration.clone(),
+        },
+        PrecedenceCase {
+            case: "CreateServicePrincipalName, a connector ARN for the registration its \
+                   PATH names, for a registration that does not exist either",
+            method: "POST",
+            target: format!(
+                "/directoryRegistrations/{}/servicePrincipalNames/{}",
+                encode_label(&absent_connector),
+                encode_label(&absent_connector)
+            ),
+            body: Some(json!({})),
+            expected: uri_clause(
+                "directoryRegistrationArn",
+                &absent_connector,
+                DIRECTORY_REGISTRATION_ARN_PATTERN,
+            ),
+            admitted_target: format!(
+                "/directoryRegistrations/{}/servicePrincipalNames/{}",
+                encode_label(&absent_registration),
+                encode_label(&absent_connector)
+            ),
+            admitted_body: Some(json!({})),
+            resource_type: "DirectoryRegistration",
+            identifier: absent_registration,
+        },
+        PrecedenceCase {
+            case: "CreateTemplateGroupAccessControlEntry, a word for the security \
+                   identifier it takes in its body, under a template never created",
+            method: "POST",
+            target: entries_of_absent_template.clone(),
+            body: Some({
+                let mut body = access_control_entry_body();
+                body["GroupSecurityIdentifier"] = json!("not-a-valid-sid");
+                body
+            }),
+            expected: report(&[regex_finding(GROUP_SID_PATTERN, "not-a-valid-sid")]),
+            admitted_target: entries_of_absent_template.clone(),
+            admitted_body: Some(access_control_entry_body()),
+            resource_type: "Template",
+            identifier: absent_template.clone(),
+        },
+        PrecedenceCase {
+            case: "CreateTemplateGroupAccessControlEntry, a value the access right's \
+                   enumerated type does not admit, under a template never created",
+            method: "POST",
+            target: entries_of_absent_template.clone(),
+            body: Some({
+                let mut body = access_control_entry_body();
+                body["AccessRights"]["Enroll"] = json!("MAYBE");
+                body
+            }),
+            expected: report(&[enum_finding("MAYBE", &ACCESS_RIGHT_VALUES)]),
+            admitted_target: entries_of_absent_template.clone(),
+            admitted_body: Some(access_control_entry_body()),
+            resource_type: "Template",
+            identifier: absent_template.clone(),
+        },
+        PrecedenceCase {
+            case: "CreateTemplateGroupAccessControlEntry, a word for the template ARN its \
+                   PATH names, for a template that does not exist either",
+            method: "POST",
+            target: "/templates/not-a-valid-arn/accessControlEntries".to_string(),
+            body: Some(access_control_entry_body()),
+            expected: uri_clause("templateArn", "not-a-valid-arn", TEMPLATE_ARN_PATTERN),
+            admitted_target: entries_of_absent_template,
+            admitted_body: Some(access_control_entry_body()),
+            resource_type: "Template",
+            identifier: absent_template.clone(),
+        },
+        PrecedenceCase {
+            case: "GetTemplate, a word for the template ARN its path names, for a template \
+                   that does not exist either",
+            method: "GET",
+            target: "/templates/not-a-valid-arn".to_string(),
+            body: None,
+            expected: uri_clause("templateArn", "not-a-valid-arn", TEMPLATE_ARN_PATTERN),
+            admitted_target: format!("/templates/{}", encode_label(&absent_template)),
+            admitted_body: None,
+            resource_type: "Template",
+            identifier: absent_template,
+        },
+    ]
+}
+
+/// A modelled constraint is evaluated before the operation resolves anything: each row
+/// breaks a constraint AND names absent resources, and every one of them is refused for
+/// the constraint — in the words of the half the value travels in — and not for the
+/// resource.
+#[tokio::test]
+async fn a_constraint_refusal_precedes_every_resource_lookup() {
+    let router = router();
+    for row in precedence_cases() {
+        let (status, code, parsed) = call(&router, row.method, &row.target, row.body.as_ref()).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {:?}: a request outside a modelled constraint is refused for that \
+             constraint whatever it names, got {status} / {code:?} / {parsed}",
+            row.case
+        );
+        assert_eq!(
+            parsed["message"].as_str(),
+            Some(row.expected.as_str()),
+            "case {:?}: expected message {:?}, got {parsed}",
+            row.case,
+            row.expected
+        );
+    }
+}
+
+/// The other half of the ordering rule: the SAME request with every value its members
+/// admit reaches the lookup, so it is refused for the resource it names — which is what
+/// makes the refusals above an ordering and not a blanket rejection.
+#[tokio::test]
+async fn the_same_request_with_every_value_admitted_reaches_the_lookup() {
+    let router = router();
+    for row in precedence_cases() {
+        let (status, code, parsed) = call(
+            &router,
+            row.method,
+            &row.admitted_target,
+            row.admitted_body.as_ref(),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {:?}: a request every constraint admits reaches the lookup, \
+             got {status} / {code:?} / {parsed}",
+            row.case
+        );
+        let expected = format!("{} was not found: {}.", row.resource_type, row.identifier);
+        assert_eq!(
+            parsed["Message"].as_str(),
+            Some(expected.as_str()),
+            "case {:?}: expected message {expected:?}, got {parsed}",
+            row.case
+        );
+    }
+}
+
+/// A request refused for a constraint PERSISTS NOTHING: the store holds no resource of
+/// any kind after every row above has been refused, so no value a modelled constraint
+/// forbids was ever written.
+#[tokio::test]
+async fn a_request_refused_for_a_constraint_persists_nothing() {
+    let (router, engine) = router_with_engine();
+    for row in precedence_cases() {
+        let (status, code, parsed) = call(&router, row.method, &row.target, row.body.as_ref()).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {:?}: expected the constraint refusal, got {status} / {code:?} / {parsed}",
+            row.case
+        );
+    }
+
+    let shared = pcad::state::service_state(&*engine).expect("the service's own state");
+    let store = shared.lock();
+    let held = [
+        ("connectors", store.connectors.len()),
+        ("templates", store.templates.len()),
+        (
+            "directory registrations",
+            store.directory_registrations.len(),
+        ),
+        (
+            "service principal names",
+            store.service_principal_names.len(),
+        ),
+        (
+            "access control entries",
+            store.access_control_entries.len(),
+        ),
+    ];
+    for (resource, count) in held {
+        assert_eq!(
+            count, 0,
+            "case {resource:?}: a refused request persists nothing, got {count} record(s)"
+        );
+    }
 }

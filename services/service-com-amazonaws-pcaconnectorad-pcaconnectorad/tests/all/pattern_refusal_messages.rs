@@ -31,8 +31,10 @@ use super::harness::{call, encode_label, router, ACCOUNT, REGION};
 /// and connector operations, so the sentence is written here once.
 pub(crate) const PATTERN_REQUIREMENT: &str = "Member must satisfy regular expression pattern: ";
 
-/// `TemplateArn`'s modelled expression, as the model declares it.
-const TEMPLATE_ARN_PATTERN: &str = r"^arn:[\w-]+:pca-connector-ad:[\w-]+:[0-9]+:connector\/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\/template\/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$";
+/// `TemplateArn`'s modelled expression, as the model declares it. Shared with the
+/// sibling suite that asserts WHEN this service applies a modelled constraint, so the
+/// expression is written here once.
+pub(crate) const TEMPLATE_ARN_PATTERN: &str = r"^arn:[\w-]+:pca-connector-ad:[\w-]+:[0-9]+:connector\/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\/template\/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$";
 
 /// `ConnectorArn`'s modelled expression.
 pub(crate) const CONNECTOR_ARN_PATTERN: &str = r"^arn:[\w-]+:pca-connector-ad:[\w-]+:[0-9]+:connector\/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$";
