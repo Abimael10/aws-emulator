@@ -24,6 +24,17 @@
 //! nonce resource), the method it is addressed with (`GET`, `HEAD`, and the JWS `POST`),
 //! and therefore the three statuses this surface answers a client with (`200`, `204`,
 //! `201`) — plus, for the address itself, what it is NOT the address of.
+//!
+//! THE SAME RULE, FOR EVERY ENDPOINT: an authority is only published if this emulator
+//! ANSWERS on it, so the last two suites take the URL of each of several endpoints in
+//! several Regions and dial THAT — one address serves every endpoint of every Region,
+//! because the endpoint is named by the path, and a path no stored endpoint backs is
+//! refused on the very address that serves the endpoints that do exist. Those rows span the
+//! Region (five, including a name of three hyphen-separated parts), the number of endpoints
+//! sharing one address, the operation that published the URL (`DescribeAcmeEndpoint` and
+//! `ListAcmeEndpoints`), and the resource addressed beneath the published authority. How
+//! the URL is COMPOSED for each kind of caller is
+//! [`crate::acme_endpoint_url_reaches_the_caller`].
 
 use std::collections::BTreeSet;
 
@@ -33,8 +44,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::acme_account_registration::{external_account_binding, jws, AccountKey, Identification};
 use crate::acme_directory_endpoint::{
-    activate_endpoints_now, create_endpoint, split_url, ENROLLMENT_LABEL,
+    activate_endpoints_now, create_endpoint, endpoint_id, split_url, DIRECTORY_MEMBERS,
+    ENROLLMENT_LABEL,
 };
+use crate::acme_endpoint_url_reaches_the_caller::{advertised_url, listed_url};
 use crate::acme_external_account_binding_lifecycle::create_binding;
 use crate::certificate_lifecycle::{call, router_with_engine, ACCOUNT, REGION};
 
@@ -630,4 +643,200 @@ async fn reported_status(
         Some(expected),
         "case {case:?} {step}: expected {expected}, got {response}"
     );
+}
+
+/// The Regions the two suites below span: the recorded one, two other geographies, one
+/// whose name carries three hyphen-separated parts, and one named the way another
+/// partition's Regions are — every Region-name shape an ACM ARN may carry
+/// (`AcmeEndpointArn`'s `@pattern` spells the Region `[a-z0-9-]+`).
+const PUBLISHED_REGIONS: &[&str] = &[
+    "us-west-2",
+    "eu-west-1",
+    "ap-southeast-2",
+    "me-central-1",
+    "us-gov-west-1",
+];
+
+/// How many endpoints each of those Regions gets: more than one, because one published
+/// address serves many endpoints, so what tells them apart must be the path.
+const ENDPOINTS_PER_REGION: usize = 2;
+
+/// RULE: the authority this service publishes is one it ANSWERS on — for every endpoint, in
+/// every Region. Each endpoint's `EndpointUrl` is dialled as it stands over a real socket:
+/// the connection is accepted, the directory served is that endpoint's own, and the resource
+/// map it carries is on the very authority the client fetched it from, so a client that
+/// rewrites no host can go on to `newNonce` and register.
+///
+/// One router and one engine for the whole table, so "one address serves every endpoint of
+/// every Region" is asserted to be one address rather than many.
+#[tokio::test]
+async fn every_published_endpoint_url_is_dialable_and_serves_its_own_endpoint() {
+    let (router, engine) = router_with_engine();
+
+    let mut created: Vec<(String, &str)> = Vec::new();
+    for region in PUBLISHED_REGIONS {
+        for ordinal in 0..ENDPOINTS_PER_REGION {
+            let case = format!("{region} endpoint #{ordinal}");
+            let arn = create_endpoint(&router, &case, region, "published-address-marker").await;
+            created.push((arn, region));
+        }
+    }
+    activate_endpoints_now(&engine);
+
+    // The authorities the whole table was published on, and every nonce it handed out.
+    let mut authorities: BTreeSet<String> = BTreeSet::new();
+    let mut nonces: BTreeSet<String> = BTreeSet::new();
+
+    for (arn, region) in &created {
+        let case = format!("{region} {arn}");
+        let published = advertised_url(&router, &case, Some(REACHED), region, arn).await;
+        // The same URL whichever operation reported it: a client may hold either.
+        let listed = listed_url(&router, &case, Some(REACHED), region, arn).await;
+        assert_eq!(
+            listed, published,
+            "case {case:?}: ListAcmeEndpoints must publish the same URL as \
+             DescribeAcmeEndpoint, got {listed:?}"
+        );
+
+        // An address of this machine with a port — the only authority a client here can
+        // open a connection to — and the endpoint's own id and resource as the whole path.
+        let (authority, path) = address(&case, &published);
+        authorities.insert(authority.clone());
+        let id = endpoint_id(arn);
+        assert_eq!(
+            path,
+            format!("/{id}/directory"),
+            "case {case:?}: expected the endpoint's id and the directory resource as the \
+             whole path of {published:?}"
+        );
+
+        // The first hop a client holding that URL makes: one connection to the published
+        // authority, that URL's own path, no credential of any kind.
+        let directory = dialled(&case, &authority, "GET", &path, None).await;
+        assert_eq!(
+            directory.status, 200,
+            "case {case:?}: the published URL {published} must serve the ACME directory, got \
+             {} {:?}",
+            directory.status, directory.body
+        );
+        assert_canonical_names(&case, &directory);
+        let document = directory.json(&case);
+        for (member, resource) in DIRECTORY_MEMBERS {
+            assert_eq!(
+                document[*member].as_str().unwrap_or_default(),
+                format!("https://{authority}/{id}/{resource}"),
+                "case {case:?}: expected {member} on the dialled authority under {id}, got \
+                 {document}"
+            );
+        }
+
+        // And the resource a registration starts at answers on that same address, with a
+        // nonce no other endpoint's answer repeated.
+        let nonce_url = document["newNonce"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no newNonce in {document}"))
+            .to_string();
+        let (_, nonce_path) = address(&case, &nonce_url);
+        let served = dialled(&case, &authority, "HEAD", &nonce_path, None).await;
+        assert_eq!(
+            served.status, 200,
+            "case {case:?}: {nonce_url} must answer a nonce, got {} {:?}",
+            served.status, served.head
+        );
+        let nonce = served.served("Replay-Nonce").unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a nonce under Replay-Nonce, got {:?}",
+                served.head
+            )
+        });
+        assert!(
+            nonces.insert(nonce.clone()),
+            "case {case:?}: every answer carries a fresh nonce, but {nonce:?} was already \
+             issued"
+        );
+    }
+
+    assert_eq!(
+        authorities.len(),
+        1,
+        "every endpoint of every Region is published on the ONE address this emulator serves \
+         that surface at, got {authorities:?}"
+    );
+    assert_eq!(
+        nonces.len(),
+        created.len(),
+        "expected one fresh nonce per endpoint dialled, got {nonces:?}"
+    );
+}
+
+/// RULE, from the other side: the published address answers for the endpoint RECORD the path
+/// names, not for the address alone. Another Region's endpoint is served on the same address
+/// — the Region is no part of it — while a path no stored endpoint backs is refused there
+/// with an ACME problem document.
+///
+/// The rows differ along why nothing answers: an endpoint id no record answers to, and a
+/// resource no endpoint publishes.
+#[tokio::test]
+async fn the_published_address_answers_for_the_endpoint_record_the_path_names() {
+    let (router, engine) = router_with_engine();
+    let here = PUBLISHED_REGIONS[0];
+    let elsewhere_region = PUBLISHED_REGIONS[3];
+    let endpoint = create_endpoint(&router, "here", here, "published-address-marker").await;
+    let elsewhere =
+        create_endpoint(&router, "elsewhere", elsewhere_region, "published-address-marker").await;
+    activate_endpoints_now(&engine);
+
+    let published = advertised_url(&router, "here", Some(REACHED), here, &endpoint).await;
+    let (authority, _path) = address("here", &published);
+
+    // Served on this authority: the endpoint of ANOTHER Region, because one address serves
+    // every Region's endpoints and the endpoint is named by the path.
+    let case = "another Region's endpoint on the published address";
+    let elsewhere_id = endpoint_id(&elsewhere);
+    let elsewhere_path = format!("/{elsewhere_id}/directory");
+    let served = dialled(case, &authority, "GET", &elsewhere_path, None).await;
+    assert_eq!(
+        served.status, 200,
+        "case {case:?}: one address serves every Region's endpoints, got {} {:?}",
+        served.status, served.body
+    );
+    assert_eq!(
+        served.json(case)["newNonce"].as_str().unwrap_or_default(),
+        format!("https://{authority}/{elsewhere_id}/new-nonce"),
+        "case {case:?}: the resource map must stay on the dialled authority"
+    );
+
+    // Refused on the same authority: a path no stored endpoint backs.
+    let rows: &[(&str, String)] = &[
+        (
+            "an endpoint id no record answers to",
+            "/00000000-0000-4000-8000-000000000000/directory".to_string(),
+        ),
+        (
+            "a resource no endpoint publishes",
+            format!("/{}/not-a-resource", endpoint_id(&endpoint)),
+        ),
+    ];
+    for (case, path) in rows {
+        let served = dialled(case, &authority, "GET", path, None).await;
+        assert_eq!(
+            served.status, 404,
+            "case {case:?}: https://{authority}{path} must serve nothing, got {} {:?}",
+            served.status, served.body
+        );
+        assert_eq!(
+            served.served("Content-Type").as_deref(),
+            Some("application/problem+json"),
+            "case {case:?}: expected an ACME problem document, got {:?}",
+            served.head
+        );
+        let document = served.json(case);
+        assert!(
+            document["type"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("urn:ietf:params:acme:error:"),
+            "case {case:?}: expected an ACME error type, got {document}"
+        );
+    }
 }

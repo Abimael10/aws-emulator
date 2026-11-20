@@ -125,7 +125,7 @@ async fn call_at(
 
 /// The `EndpointUrl` `DescribeAcmeEndpoint` reports for `arn` to a caller that addressed
 /// `host`.
-async fn advertised_url(
+pub(crate) async fn advertised_url(
     router: &MultiServiceRouter,
     case: &str,
     host: Option<&str>,
@@ -152,7 +152,7 @@ async fn advertised_url(
 
 /// The `EndpointUrl` `ListAcmeEndpoints` reports for `arn` to a caller that addressed
 /// `host`.
-async fn listed_url(
+pub(crate) async fn listed_url(
     router: &MultiServiceRouter,
     case: &str,
     host: Option<&str>,
