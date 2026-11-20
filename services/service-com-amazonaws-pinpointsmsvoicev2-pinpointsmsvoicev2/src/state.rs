@@ -41,6 +41,18 @@ pub const MONTHLY_LEASING_PRICE: &str = "0.00";
 pub const CREATE_CONFIGURATION_SET: &str = "CreateConfigurationSet";
 /// See [`CREATE_CONFIGURATION_SET`].
 pub const REQUEST_PHONE_NUMBER: &str = "RequestPhoneNumber";
+/// See [`CREATE_CONFIGURATION_SET`].
+pub const CREATE_EVENT_DESTINATION: &str = "CreateEventDestination";
+
+/// What a `ClientToken` for an event-destination create points at: a destination is named
+/// only within one configuration set, so the set's name is part of the key. Neither name
+/// can hold a `/` (both are `^[A-Za-z0-9_-]+$`), so the two parts cannot run together.
+pub fn event_destination_resource(
+    configuration_set_name: &str,
+    event_destination_name: &str,
+) -> String {
+    format!("{configuration_set_name}/{event_destination_name}")
+}
 
 // ---------------------------------------------------------------------------------
 // Bounds. Every store below grows on a caller-driven path, so each one has a maximum:
@@ -67,6 +79,14 @@ pub const MAX_PROTECT_CONFIGURATIONS_PER_ACCOUNT: usize = 1_000;
 /// `ServiceQuotaExceededException` / `reason = PHONE_NUMBERS_PER_ACCOUNT`. Chosen for
 /// the same reason as [`MAX_CONFIGURATION_SETS_PER_ACCOUNT`].
 pub const MAX_PHONE_NUMBERS_PER_ACCOUNT: usize = 1_000;
+
+/// The most event destinations one configuration set may hold, answered with
+/// `ServiceQuotaExceededException` / `reason = EVENT_DESTINATIONS_PER_CONFIGURATION_SET`.
+///
+/// Unlike the two quotas above this one is AWS's published, fixed bound, which
+/// `CreateEventDestination` documents: "Each configuration set can contain between 0 and 5
+/// event destinations."
+pub const MAX_EVENT_DESTINATIONS_PER_CONFIGURATION_SET: usize = 5;
 
 /// How many of the most recent sends the message log retains. The log is a diagnostic
 /// trail with no operation that reads or trims it, and each record holds caller-sized
@@ -248,6 +268,14 @@ pub struct ConfigurationSet {
 }
 
 impl ConfigurationSet {
+    /// The stored event destination this set holds under `name`, if it holds one. A
+    /// destination's name identifies it within its set, so at most one record matches.
+    pub fn event_destination(&self, name: &str) -> Option<&EventDestination> {
+        self.event_destinations
+            .iter()
+            .find(|destination| destination.event_destination_name == name)
+    }
+
     /// The record's value for one `ConfigurationSetFilterName`, or `None` when the record
     /// carries no value for that attribute (so no filter value can match it).
     ///

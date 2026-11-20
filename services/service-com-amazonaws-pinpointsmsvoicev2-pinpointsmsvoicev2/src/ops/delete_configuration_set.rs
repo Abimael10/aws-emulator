@@ -191,6 +191,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The set is gone, so the idempotency entry that points at it is dead
         // bookkeeping: drop it with the resource rather than retaining it forever.
         state.forget_client_tokens_for(crate::state::CREATE_CONFIGURATION_SET, &removed.name);
+        // Deleting a set takes its event destinations with it, so their idempotency
+        // entries are dead for the same reason.
+        for destination in &removed.event_destinations {
+            let resource = crate::state::event_destination_resource(
+                &removed.name,
+                &destination.event_destination_name,
+            );
+            state.forget_client_tokens_for(crate::state::CREATE_EVENT_DESTINATION, &resource);
+        }
 
         Ok(DeleteConfigurationSetOutput {
             configuration_set_arn: Some(removed.arn),

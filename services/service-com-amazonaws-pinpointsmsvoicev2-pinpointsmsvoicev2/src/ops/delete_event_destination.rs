@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEventDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEventDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEventDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one event destination from a stored configuration set and hands the removed
+//! record back, so the matching `DescribeConfigurationSets` no longer reports it and a
+//! second delete of the same destination is not found.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEventDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEventDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEventDestination"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteEventDestinationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the configuration-set store is unavailable".to_string()),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // `ConfigurationSetName` is a `ConfigurationSetNameOrArn`, so the caller may name
+        // the set by ARN; the store is keyed by name. A destination only exists inside a
+        // set, so a set that is gone — deleted on its own, which takes its destinations
+        // with it — leaves nothing here to delete.
+        let set_name =
+            crate::state::name_from_name_or_arn(&input.configuration_set_name).to_string();
+        let Some(set) = state.configuration_sets.get_mut(&set_name) else {
+            return Err(DeleteEventDestinationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        "configuration-set",
+                        &set_name,
+                    )),
+                    resource_type: Some("configuration-set".to_string()),
+                    resource_id: Some(set_name),
+                },
+            )
+            .into());
+        };
+
+        let Some(position) = set.event_destinations.iter().position(|destination| {
+            destination.event_destination_name == input.event_destination_name
+        }) else {
+            return Err(DeleteEventDestinationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        "event-destination",
+                        &input.event_destination_name,
+                    )),
+                    resource_type: Some("event-destination".to_string()),
+                    resource_id: Some(input.event_destination_name),
+                },
+            )
+            .into());
+        };
+        // Removing from the middle keeps the order of the destinations around it, which is
+        // the order every read of the set reports them in.
+        let removed = set.event_destinations.remove(position);
+        let configuration_set_arn = set.arn.clone();
+        let configuration_set_name = set.name.clone();
+
+        // The destination is gone, so the idempotency entry that points at it is dead
+        // bookkeeping: drop it with the resource rather than retaining it forever.
+        let resource = crate::state::event_destination_resource(
+            &configuration_set_name,
+            &removed.event_destination_name,
+        );
+        state.forget_client_tokens_for(crate::state::CREATE_EVENT_DESTINATION, &resource);
+
+        Ok(DeleteEventDestinationOutput {
+            configuration_set_arn: Some(configuration_set_arn),
+            configuration_set_name: Some(configuration_set_name),
+            event_destination: Some(removed),
+        })
     }
 }

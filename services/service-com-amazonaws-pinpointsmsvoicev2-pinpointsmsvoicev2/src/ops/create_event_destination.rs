@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEventDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEventDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEventDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one event destination to a stored configuration set: the destination is persisted
+//! on the set's record, so `DescribeConfigurationSets` reports it and
+//! `DeleteConfigurationSet` hands it back with the set it removes.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +180,274 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEventDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEventDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEventDestination"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateEventDestinationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the configuration-set store is unavailable".to_string()),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+        let mut state = store.lock();
+
+        // An event destination lives on a configuration set, so the set must exist.
+        // `ConfigurationSetName` is a `ConfigurationSetNameOrArn`, so the caller may name
+        // the set by ARN; the store is keyed by name.
+        let set_name =
+            crate::state::name_from_name_or_arn(&input.configuration_set_name).to_string();
+        let Some(set) = state.configuration_sets.get(&set_name) else {
+            return Err(CreateEventDestinationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message(
+                        "configuration-set",
+                        &set_name,
+                    )),
+                    resource_type: Some("configuration-set".to_string()),
+                    resource_id: Some(set_name),
+                },
+            )
+            .into());
+        };
+        // What this create needs off the set's record. The store stays locked for the whole
+        // handler, so these cannot go stale under it, and the record itself is borrowed
+        // again only where it is written.
+        let configuration_set_arn = set.arn.clone();
+        let configuration_set_name = set.name.clone();
+        let stored_destination = set
+            .event_destination(&input.event_destination_name)
+            .cloned();
+        let stored_destination_count = set.event_destinations.len();
+
+        // One destination, and exactly one: the operation documents that a value must be
+        // provided for a single event destination out of `CloudWatchLogsDestination`,
+        // `KinesisFirehoseDestination` and `SnsDestination`, so a request naming none has
+        // nothing to log to and one naming several does not say where events go. Neither
+        // is a usable request, and the model declares no cross-member constraint for it,
+        // so both are refused here.
+        let named: Vec<&str> = [
+            input
+                .cloud_watch_logs_destination
+                .is_some()
+                .then_some("CloudWatchLogsDestination"),
+            input
+                .kinesis_firehose_destination
+                .is_some()
+                .then_some("KinesisFirehoseDestination"),
+            input.sns_destination.is_some().then_some("SnsDestination"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if named.is_empty() {
+            return Err(CreateEventDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "a value must be provided for a single event destination using one of {}",
+                        DESTINATION_MEMBERS.join(", ")
+                    )),
+                    reason: Some("MISSING_PARAMETER".to_string()),
+                    fields: Some(
+                        DESTINATION_MEMBERS
+                            .iter()
+                            .map(|member| ValidationExceptionField {
+                                name: (*member).to_string(),
+                                message: "exactly one event destination is required".to_string(),
+                            })
+                            .collect(),
+                    ),
+                },
+            )
+            .into());
+        }
+        if named.len() > 1 {
+            return Err(CreateEventDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "only one event destination can be created at a time, but {} were \
+                         provided",
+                        named.join(", ")
+                    )),
+                    reason: Some("PARAMETERS_CANNOT_BE_USED_TOGETHER".to_string()),
+                    fields: Some(
+                        named
+                            .iter()
+                            .map(|member| ValidationExceptionField {
+                                name: (*member).to_string(),
+                                message: "exactly one event destination is required".to_string(),
+                            })
+                            .collect(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The request this `ClientToken` is scoped to: every member that shapes the
+        // destination, so a replay that changes any of them is a different request.
+        let mut fingerprinted: Vec<String> =
+            vec![set_name.clone(), input.event_destination_name.clone()];
+        fingerprinted.extend(input.matching_event_types.iter().cloned());
+        if let Some(destination) = input.cloud_watch_logs_destination.as_ref() {
+            fingerprinted.push(format!(
+                "CloudWatchLogsDestination={}/{}",
+                destination.iam_role_arn, destination.log_group_arn
+            ));
+        }
+        if let Some(destination) = input.kinesis_firehose_destination.as_ref() {
+            fingerprinted.push(format!(
+                "KinesisFirehoseDestination={}/{}",
+                destination.iam_role_arn, destination.delivery_stream_arn
+            ));
+        }
+        if let Some(destination) = input.sns_destination.as_ref() {
+            fingerprinted.push(format!("SnsDestination={}", destination.topic_arn));
+        }
+        let fingerprint = crate::state::request_fingerprint(
+            &fingerprinted
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<&str>>(),
+        );
+        let resource =
+            crate::state::event_destination_resource(&set_name, &input.event_destination_name);
+
+        // Idempotency: the same `ClientToken` must not create a second destination. Answer
+        // from the record that token already created, so a retried request is a read. A
+        // token replayed with a DIFFERENT request is a different request, which AWS does
+        // not answer idempotently, so it is refused.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(seen) = state
+                .client_token_record(crate::state::CREATE_EVENT_DESTINATION, token)
+                .cloned()
+            {
+                if seen.fingerprint != fingerprint || seen.resource != resource {
+                    return Err(CreateEventDestinationErrorModeled::ConflictException(
+                        ConflictException {
+                            message: Some(
+                                crate::state::CLIENT_TOKEN_CONFLICT_MESSAGE.to_string(),
+                            ),
+                            reason: None,
+                            resource_type: None,
+                            resource_id: None,
+                        },
+                    )
+                    .into());
+                }
+                if let Some(existing) = stored_destination.clone() {
+                    return Ok(event_destination_output(
+                        configuration_set_arn,
+                        configuration_set_name,
+                        existing,
+                    ));
+                }
+                // The token's own record points at a destination the store no longer
+                // holds, so a delete removed it: the create below runs as a first create.
+            }
+        }
+
+        // A destination's name identifies it within its set, so a second create under the
+        // same name conflicts rather than replacing the stored destination.
+        if stored_destination.is_some() {
+            return Err(CreateEventDestinationErrorModeled::ConflictException(
+                ConflictException {
+                    // AWS words this service's conflict message as a restatement of the
+                    // exception's own members, so both carry the same values.
+                    message: Some(crate::state::conflict_message(
+                        "RESOURCE_ALREADY_EXISTS",
+                        "event-destination",
+                        &input.event_destination_name,
+                    )),
+                    reason: Some("RESOURCE_ALREADY_EXISTS".to_string()),
+                    resource_type: Some("event-destination".to_string()),
+                    resource_id: Some(input.event_destination_name),
+                },
+            )
+            .into());
+        }
+        // The per-set quota bounds this list, so a loop of creates cannot grow one set's
+        // record without limit.
+        if stored_destination_count >= crate::state::MAX_EVENT_DESTINATIONS_PER_CONFIGURATION_SET
+        {
+            return Err(
+                CreateEventDestinationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "configuration set {set_name} already holds {} event destinations",
+                            crate::state::MAX_EVENT_DESTINATIONS_PER_CONFIGURATION_SET
+                        )),
+                        reason: Some("EVENT_DESTINATIONS_PER_CONFIGURATION_SET".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let record = EventDestination {
+            event_destination_name: input.event_destination_name.clone(),
+            // `CreateEventDestination` models no `Enabled` member: a destination logs
+            // events from the moment it exists, and `UpdateEventDestination` is what turns
+            // one off, so a created destination is enabled.
+            enabled: true,
+            matching_event_types: input.matching_event_types,
+            cloud_watch_logs_destination: input.cloud_watch_logs_destination,
+            kinesis_firehose_destination: input.kinesis_firehose_destination,
+            sns_destination: input.sns_destination,
+        };
+        let mut stored = None;
+        if let Some(set) = state.configuration_sets.get_mut(&set_name) {
+            set.event_destinations.push(record);
+            // Read the response back out of the store: what the caller sees is what was
+            // persisted, not what was passed in.
+            stored = set.event_destination(&input.event_destination_name).cloned();
+        }
+        let Some(stored) = stored else {
+            return Err(CreateEventDestinationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the event destination could not be stored on its configuration set"
+                            .to_string(),
+                    ),
+                    request_id: None,
+                },
+            )
+            .into());
+        };
+        if let Some(token) = input.client_token.as_deref() {
+            state.remember_client_token(
+                crate::state::CREATE_EVENT_DESTINATION,
+                token,
+                &resource,
+                fingerprint,
+            );
+        }
+
+        Ok(event_destination_output(
+            configuration_set_arn,
+            configuration_set_name,
+            stored,
+        ))
+    }
+}
+
+/// The input members that each name one kind of event destination, in the order the
+/// operation's documentation lists them. Exactly one of them carries a value.
+const DESTINATION_MEMBERS: [&str; 3] = [
+    "CloudWatchLogsDestination",
+    "KinesisFirehoseDestination",
+    "SnsDestination",
+];
+
+/// The response for one stored event destination, every member read from the records.
+fn event_destination_output(
+    configuration_set_arn: String,
+    configuration_set_name: String,
+    destination: EventDestination,
+) -> CreateEventDestinationOutput {
+    CreateEventDestinationOutput {
+        configuration_set_arn: Some(configuration_set_arn),
+        configuration_set_name: Some(configuration_set_name),
+        event_destination: Some(destination),
     }
 }

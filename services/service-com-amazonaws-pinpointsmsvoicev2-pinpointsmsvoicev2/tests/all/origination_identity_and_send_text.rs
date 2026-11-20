@@ -20,6 +20,9 @@
 //!   which must name a stored set) and by `Filters`, and pages over the store's order;
 //! * a send resolves every referenced resource against the store and mints a unique
 //!   `MessageId` per accepted send;
+//! * an event destination is persisted on the configuration set it names, whichever kind
+//!   of destination it carries, so every read of the set reports it, a delete of the
+//!   destination removes exactly that one and a delete of the set takes them all;
 //! * `CreateProtectConfiguration` mints and persists a configuration whose every
 //!   reported member comes from the stored record, and `DescribeProtectConfigurations`
 //!   reports it back, narrowed by id, by filter and by page.
@@ -2360,6 +2363,152 @@ async fn describe_configuration_sets_pages_the_whole_account_at_every_page_size(
     );
 }
 
+/// One row of the event-destination table: the kind of destination a create names, the
+/// input member that carries it, and a `MatchingEventTypes` list of a different size.
+struct DestinationCase {
+    case: &'static str,
+    member: &'static str,
+    destination: serde_json::Value,
+    matching_event_types: Vec<String>,
+}
+
+/// Every kind of destination `CreateEventDestination` accepts — one per destination member
+/// the operation models — with `MatchingEventTypes` lists of one, of several, and of every
+/// modelled event type (the names are the model's `EventType` enum, re-exported as
+/// `sms_voice::ops::types::EVENT_TYPE_VALUES`; there are 52 of them, which is also the
+/// list's modelled maximum).
+fn destination_cases() -> Vec<DestinationCase> {
+    vec![
+        DestinationCase {
+            case: "CloudWatch Logs, one event type",
+            member: "CloudWatchLogsDestination",
+            destination: serde_json::json!({
+                "IamRoleArn": "arn:aws:iam::111122223333:role/sms-voice-events",
+                "LogGroupArn": "arn:aws:logs:us-west-2:111122223333:log-group:/aws/sms-voice",
+            }),
+            matching_event_types: vec!["ALL".to_string()],
+        },
+        DestinationCase {
+            case: "Firehose, three event types",
+            member: "KinesisFirehoseDestination",
+            destination: serde_json::json!({
+                "IamRoleArn": "arn:aws:iam::111122223333:role/sms-voice-firehose",
+                "DeliveryStreamArn":
+                    "arn:aws:firehose:us-west-2:111122223333:deliverystream/sms-voice",
+            }),
+            matching_event_types: ["TEXT_DELIVERED", "TEXT_BLOCKED", "VOICE_COMPLETED"]
+                .iter()
+                .map(|event_type| (*event_type).to_string())
+                .collect(),
+        },
+        DestinationCase {
+            case: "Amazon SNS, every modelled event type",
+            member: "SnsDestination",
+            destination: sns_destination(),
+            matching_event_types: sms_voice::ops::types::EVENT_TYPE_VALUES
+                .iter()
+                .map(|event_type| (*event_type).to_string())
+                .collect(),
+        },
+    ]
+}
+
+/// One `SnsDestination` object, the smallest destination the model declares.
+fn sns_destination() -> serde_json::Value {
+    serde_json::json!({"TopicArn": "arn:aws:sns:us-west-2:111122223333:sms-voice-events"})
+}
+
+/// The `CreateEventDestination` request for one row of the table.
+fn create_destination_request(
+    configuration_set_name: &str,
+    event_destination_name: &str,
+    case: &DestinationCase,
+) -> serde_json::Value {
+    let mut request = serde_json::json!({
+        "ConfigurationSetName": configuration_set_name,
+        "EventDestinationName": event_destination_name,
+        "MatchingEventTypes": case.matching_event_types.clone(),
+    });
+    request[case.member] = case.destination.clone();
+    request
+}
+
+/// The `EventDestination` a create of one row must persist and report.
+fn expected_destination(event_destination_name: &str, case: &DestinationCase) -> serde_json::Value {
+    let mut expected = serde_json::json!({
+        "EventDestinationName": event_destination_name,
+        // `CreateEventDestination` models no `Enabled` member: a created destination logs
+        // events, and `UpdateEventDestination` is what turns one off.
+        "Enabled": true,
+        "MatchingEventTypes": case.matching_event_types.clone(),
+    });
+    expected[case.member] = case.destination.clone();
+    expected
+}
+
+/// An `SnsDestination` create, for a case whose subject is not the kind of destination.
+fn sns_destination_request(
+    configuration_set_name: &str,
+    event_destination_name: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ConfigurationSetName": configuration_set_name,
+        "EventDestinationName": event_destination_name,
+        "MatchingEventTypes": ["ALL"],
+        "SnsDestination": sns_destination(),
+    })
+}
+
+/// The event destinations one stored set reports, read back through the implemented
+/// `DescribeConfigurationSets`.
+async fn described_destinations(emulator: &Emulator, set: &str) -> Vec<serde_json::Value> {
+    let described = emulator
+        .ok(
+            "DescribeConfigurationSets",
+            serde_json::json!({"ConfigurationSetNames": [set]}),
+        )
+        .await;
+    described
+        .pointer("/ConfigurationSets/0/EventDestinations")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("expected set {set:?} to report its event destinations, got {described}")
+        })
+}
+
+/// The names of a reported list of event destinations, in the order reported.
+fn destination_names(destinations: &[serde_json::Value]) -> Vec<String> {
+    destinations
+        .iter()
+        .map(|destination| as_str(destination, "EventDestinationName"))
+        .collect()
+}
+
+/// One request `CreateEventDestination` cannot serve, and the refusal it must answer:
+/// the wire error code, the modelled `Reason` (where the exception carries one) and the
+/// input members the refusal names in `ValidationException$Fields`.
+struct RefusalCase {
+    case: &'static str,
+    request: serde_json::Value,
+    code: &'static str,
+    reason: Option<&'static str>,
+    fields: Vec<&'static str>,
+}
+
+/// The names in `ValidationException$Fields`, in the order reported.
+fn field_names(body: &serde_json::Value) -> Vec<String> {
+    body.get("Fields")
+        .and_then(serde_json::Value::as_array)
+        .map(|fields| {
+            fields
+                .iter()
+                .map(|field| as_str(field, "Name"))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default()
+}
+
 /// The ARN this emulator stamps into a protect configuration's record, for the region
 /// these tests sign for.
 fn protect_configuration_arn(id: &str) -> String {
@@ -2382,6 +2531,387 @@ fn described_protect_configuration_ids(body: &serde_json::Value) -> Vec<String> 
                 .collect()
         })
         .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn an_event_destination_of_every_kind_persists_on_the_set_it_names() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "events-set"}),
+        )
+        .await;
+
+    // One row per kind of destination, accumulating on the one set: each create answers
+    // from the stored record, so the response names the set and carries the destination as
+    // it was persisted.
+    let cases = destination_cases();
+    let mut expected: Vec<serde_json::Value> = Vec::new();
+    for (index, case) in cases.iter().enumerate() {
+        let name = format!("dest-{index}");
+        let created = emulator
+            .ok(
+                "CreateEventDestination",
+                create_destination_request("events-set", &name, case),
+            )
+            .await;
+        assert_eq!(
+            (
+                as_str(&created, "ConfigurationSetName"),
+                as_str(&created, "ConfigurationSetArn"),
+            ),
+            (
+                "events-set".to_string(),
+                configuration_set_arn("events-set"),
+            ),
+            "case {:?}: expected the set the destination was added to, got {created}",
+            case.case
+        );
+        let want = expected_destination(&name, case);
+        assert_eq!(
+            created.get("EventDestination"),
+            Some(&want),
+            "case {:?}: expected the destination that was stored, got {created}",
+            case.case
+        );
+        expected.push(want);
+    }
+
+    // Every read of the set reports the whole list, in creation order.
+    let described = described_destinations(&emulator, "events-set").await;
+    assert_eq!(
+        described, expected,
+        "case \"describe after three creates\": expected every stored destination in \
+         creation order, got {described:?}"
+    );
+
+    // Deleting the set hands its destinations back and takes them with it.
+    let deleted = emulator
+        .ok(
+            "DeleteConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "events-set"}),
+        )
+        .await;
+    assert_eq!(
+        deleted.get("EventDestinations"),
+        Some(&serde_json::Value::Array(expected)),
+        "case \"delete the set\": expected the destinations it held, got {deleted}"
+    );
+}
+
+#[tokio::test]
+async fn an_event_destination_is_created_on_the_set_named_by_either_name_or_arn() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "addressed"}),
+        )
+        .await;
+
+    // `ConfigurationSetName` is a `ConfigurationSetNameOrArn`, so both forms name the one
+    // set and both destinations land on it.
+    for (case, named) in [
+        ("by name", "addressed".to_string()),
+        ("by ARN", configuration_set_arn("addressed")),
+    ] {
+        let name = format!("dest-{}", case.replace(' ', "-"));
+        let created = emulator
+            .ok("CreateEventDestination", {
+                let mut request = sns_destination_request(&named, &name);
+                request["ConfigurationSetName"] = serde_json::Value::String(named.clone());
+                request
+            })
+            .await;
+        assert_eq!(
+            as_str(&created, "ConfigurationSetName"),
+            "addressed",
+            "case {case:?}: the response names the stored set, got {created}"
+        );
+    }
+    let described = described_destinations(&emulator, "addressed").await;
+    assert_eq!(
+        destination_names(&described),
+        vec!["dest-by-name".to_string(), "dest-by-ARN".to_string()],
+        "case \"name and ARN name one set\": expected both destinations on it, got \
+         {described:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_event_destination_refuses_every_request_it_cannot_serve() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "refusals"}),
+        )
+        .await;
+    emulator
+        .ok(
+            "CreateEventDestination",
+            sns_destination_request("refusals", "taken"),
+        )
+        .await;
+
+    let cloudwatch = serde_json::json!({
+        "IamRoleArn": "arn:aws:iam::111122223333:role/sms-voice-events",
+        "LogGroupArn": "arn:aws:logs:us-west-2:111122223333:log-group:/aws/sms-voice",
+    });
+
+    // Each row is one request the operation cannot serve, differing in which rule refuses
+    // it: the set must exist, exactly one destination must be named, and a destination's
+    // name is unique within its set.
+    let cases: Vec<RefusalCase> = vec![
+        RefusalCase {
+            case: "a set that does not exist",
+            request: sns_destination_request("missing-set", "dest"),
+            code: "ResourceNotFoundException",
+            reason: None,
+            fields: Vec::new(),
+        },
+        RefusalCase {
+            case: "the ARN of a set that does not exist",
+            request: sns_destination_request(&configuration_set_arn("missing-set"), "dest"),
+            code: "ResourceNotFoundException",
+            reason: None,
+            fields: Vec::new(),
+        },
+        RefusalCase {
+            case: "no destination at all",
+            request: serde_json::json!({
+                "ConfigurationSetName": "refusals",
+                "EventDestinationName": "dest",
+                "MatchingEventTypes": ["ALL"],
+            }),
+            code: "ValidationException",
+            reason: Some("MISSING_PARAMETER"),
+            fields: vec![
+                "CloudWatchLogsDestination",
+                "KinesisFirehoseDestination",
+                "SnsDestination",
+            ],
+        },
+        RefusalCase {
+            case: "two destinations at once",
+            request: serde_json::json!({
+                "ConfigurationSetName": "refusals",
+                "EventDestinationName": "dest",
+                "MatchingEventTypes": ["ALL"],
+                "CloudWatchLogsDestination": cloudwatch.clone(),
+                "SnsDestination": sns_destination(),
+            }),
+            code: "ValidationException",
+            reason: Some("PARAMETERS_CANNOT_BE_USED_TOGETHER"),
+            fields: vec!["CloudWatchLogsDestination", "SnsDestination"],
+        },
+        RefusalCase {
+            case: "all three destinations at once",
+            request: serde_json::json!({
+                "ConfigurationSetName": "refusals",
+                "EventDestinationName": "dest",
+                "MatchingEventTypes": ["ALL"],
+                "CloudWatchLogsDestination": cloudwatch,
+                "KinesisFirehoseDestination": {
+                    "IamRoleArn": "arn:aws:iam::111122223333:role/sms-voice-firehose",
+                    "DeliveryStreamArn":
+                        "arn:aws:firehose:us-west-2:111122223333:deliverystream/sms-voice",
+                },
+                "SnsDestination": sns_destination(),
+            }),
+            code: "ValidationException",
+            reason: Some("PARAMETERS_CANNOT_BE_USED_TOGETHER"),
+            fields: vec![
+                "CloudWatchLogsDestination",
+                "KinesisFirehoseDestination",
+                "SnsDestination",
+            ],
+        },
+        RefusalCase {
+            case: "a destination name the set already holds",
+            request: sns_destination_request("refusals", "taken"),
+            code: "ConflictException",
+            reason: Some("RESOURCE_ALREADY_EXISTS"),
+            fields: Vec::new(),
+        },
+    ];
+
+    for RefusalCase {
+        case,
+        request,
+        code,
+        reason,
+        fields,
+    } in cases
+    {
+        let (status, body) = emulator.call("CreateEventDestination", request).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, code),
+            "case {case:?}: expected the modelled refusal, got {status} with {body}"
+        );
+        assert_eq!(
+            body.get("Reason").and_then(serde_json::Value::as_str),
+            reason,
+            "case {case:?}: expected the modelled reason, got {body}"
+        );
+        assert_eq!(
+            field_names(&body),
+            fields
+                .iter()
+                .map(|field| (*field).to_string())
+                .collect::<Vec<String>>(),
+            "case {case:?}: expected the fields the refusal names, got {body}"
+        );
+    }
+
+    // A refusal persists nothing: the one destination created above is still the only one.
+    let described = described_destinations(&emulator, "refusals").await;
+    assert_eq!(
+        destination_names(&described),
+        vec!["taken".to_string()],
+        "case \"after every refusal\": expected no destination to have been stored, got \
+         {described:?}"
+    );
+
+    // The not-found refusal is worded as a restatement of its own members, whichever form
+    // named the set.
+    let (_, body) = emulator
+        .call(
+            "CreateEventDestination",
+            sns_destination_request(&configuration_set_arn("missing-set"), "dest"),
+        )
+        .await;
+    assert_eq!(
+        (
+            body.get("Message").and_then(serde_json::Value::as_str),
+            body.get("ResourceType").and_then(serde_json::Value::as_str),
+            body.get("ResourceId").and_then(serde_json::Value::as_str),
+        ),
+        (
+            Some(
+                sms_voice::state::resource_not_found_message("configuration-set", "missing-set")
+                    .as_str()
+            ),
+            Some("configuration-set"),
+            Some("missing-set"),
+        ),
+        "case \"the ARN of a set that does not exist\": expected the resource the refusal \
+         names, got {body}"
+    );
+    let (_, body) = emulator
+        .call(
+            "CreateEventDestination",
+            sns_destination_request("refusals", "taken"),
+        )
+        .await;
+    assert_eq!(
+        (
+            body.get("Message").and_then(serde_json::Value::as_str),
+            body.get("ResourceType").and_then(serde_json::Value::as_str),
+            body.get("ResourceId").and_then(serde_json::Value::as_str),
+        ),
+        (
+            Some(
+                sms_voice::state::conflict_message(
+                    "RESOURCE_ALREADY_EXISTS",
+                    "event-destination",
+                    "taken"
+                )
+                .as_str()
+            ),
+            Some("event-destination"),
+            Some("taken"),
+        ),
+        "case \"a destination name the set already holds\": expected the resource the \
+         conflict names, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_configuration_set_holds_the_published_number_of_event_destinations() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "bounded"}),
+        )
+        .await;
+
+    // AWS publishes the bound on `CreateEventDestination`: a configuration set can contain
+    // between 0 and this many event destinations. Every create up to it is served...
+    let limit = sms_voice::state::MAX_EVENT_DESTINATIONS_PER_CONFIGURATION_SET;
+    for index in 0..limit {
+        let name = format!("dest-{index}");
+        emulator
+            .ok(
+                "CreateEventDestination",
+                sns_destination_request("bounded", &name),
+            )
+            .await;
+    }
+    let described = described_destinations(&emulator, "bounded").await;
+    assert_eq!(
+        described.len(),
+        limit,
+        "case \"at the published bound\": expected {limit} stored destinations, got \
+         {described:?}"
+    );
+
+    // ... and the one past it is refused with the quota the model names for this resource.
+    let (status, body) = emulator
+        .call(
+            "CreateEventDestination",
+            sns_destination_request("bounded", "one-too-many"),
+        )
+        .await;
+    assert_eq!(
+        (
+            status,
+            error_code(&body).as_str(),
+            body.get("Reason").and_then(serde_json::Value::as_str),
+        ),
+        (
+            400,
+            "ServiceQuotaExceededException",
+            Some("EVENT_DESTINATIONS_PER_CONFIGURATION_SET"),
+        ),
+        "case \"one past the published bound\": expected the quota refusal, got {status} \
+         with {body}"
+    );
+    let described = described_destinations(&emulator, "bounded").await;
+    assert_eq!(
+        described.len(),
+        limit,
+        "case \"one past the published bound\": the refused create must store nothing, got \
+         {described:?}"
+    );
+
+    // The bound is on what the set holds NOW, so a delete makes room for another create.
+    emulator
+        .ok(
+            "DeleteEventDestination",
+            serde_json::json!({
+                "ConfigurationSetName": "bounded",
+                "EventDestinationName": "dest-0",
+            }),
+        )
+        .await;
+    emulator
+        .ok(
+            "CreateEventDestination",
+            sns_destination_request("bounded", "one-too-many"),
+        )
+        .await;
+    let described = described_destinations(&emulator, "bounded").await;
+    assert!(
+        described.len() == limit
+            && destination_names(&described).contains(&"one-too-many".to_string())
+            && !destination_names(&described).contains(&"dest-0".to_string()),
+        "case \"a create after a delete\": expected the freed slot to be taken, got \
+         {described:?}"
+    );
 }
 
 /// Whether a value satisfies `ProtectConfigurationId` (len 1..64, `^[A-Za-z0-9_-]+$`).
@@ -2557,6 +3087,66 @@ async fn creating_a_protect_configuration_persists_it_and_the_describe_reports_t
 }
 
 #[tokio::test]
+async fn a_repeated_client_token_creates_no_second_event_destination() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "idempotent"}),
+        )
+        .await;
+
+    let mut request = sns_destination_request("idempotent", "dest-one");
+    request["ClientToken"] = serde_json::Value::String("token-one".to_string());
+    let created = emulator
+        .ok("CreateEventDestination", request.clone())
+        .await;
+
+    // The same token with the same request is a retry: it answers from the record that
+    // token created and creates nothing further.
+    let replayed = emulator
+        .ok("CreateEventDestination", request.clone())
+        .await;
+    assert_eq!(
+        replayed, created,
+        "case \"the same token, the same request\": expected the record the token created, \
+         got {replayed}"
+    );
+
+    // The same token with a DIFFERENT request is a different request, which is refused.
+    let mut changed = request.clone();
+    changed["MatchingEventTypes"] = serde_json::json!(["TEXT_DELIVERED"]);
+    let (status, body) = emulator.call("CreateEventDestination", changed).await;
+    assert_eq!(
+        (
+            status,
+            error_code(&body).as_str(),
+            body.get("Message").and_then(serde_json::Value::as_str),
+        ),
+        (
+            400,
+            "ConflictException",
+            Some(sms_voice::state::CLIENT_TOKEN_CONFLICT_MESSAGE),
+        ),
+        "case \"the same token, a different request\": expected the refusal, got {status} \
+         with {body}"
+    );
+
+    // A fresh token creates the next destination.
+    let mut second = sns_destination_request("idempotent", "dest-two");
+    second["ClientToken"] = serde_json::Value::String("token-two".to_string());
+    emulator.ok("CreateEventDestination", second).await;
+
+    let described = described_destinations(&emulator, "idempotent").await;
+    assert_eq!(
+        destination_names(&described),
+        vec!["dest-one".to_string(), "dest-two".to_string()],
+        "case \"one replay and one fresh token\": expected exactly two destinations, got \
+         {described:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_repeated_client_token_creates_one_protect_configuration() {
     let emulator = Emulator::new();
 
@@ -2638,6 +3228,120 @@ async fn a_repeated_client_token_creates_one_protect_configuration() {
         "case \"three creates, one of them a replay\": expected three stored \
          configurations, got {described}"
     );
+}
+
+#[tokio::test]
+async fn deleting_an_event_destination_removes_exactly_that_one() {
+    let emulator = Emulator::new();
+    emulator
+        .ok(
+            "CreateConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "shrinking"}),
+        )
+        .await;
+    for index in 0..3 {
+        emulator
+            .ok(
+                "CreateEventDestination",
+                sns_destination_request("shrinking", &format!("dest-{index}")),
+            )
+            .await;
+    }
+    let stored = described_destinations(&emulator, "shrinking").await;
+
+    // The delete hands back the record it removed and names the set it came from.
+    let deleted = emulator
+        .ok(
+            "DeleteEventDestination",
+            serde_json::json!({
+                "ConfigurationSetName": configuration_set_arn("shrinking"),
+                "EventDestinationName": "dest-1",
+            }),
+        )
+        .await;
+    assert_eq!(
+        (
+            as_str(&deleted, "ConfigurationSetName"),
+            as_str(&deleted, "ConfigurationSetArn"),
+            deleted.get("EventDestination"),
+        ),
+        (
+            "shrinking".to_string(),
+            configuration_set_arn("shrinking"),
+            Some(&stored[1]),
+        ),
+        "case \"delete the middle destination\": expected the record that was removed, got \
+         {deleted}"
+    );
+
+    // Only that one is gone; the ones around it keep their order.
+    let described = described_destinations(&emulator, "shrinking").await;
+    assert_eq!(
+        destination_names(&described),
+        vec!["dest-0".to_string(), "dest-2".to_string()],
+        "case \"after one delete\": expected the remaining destinations in order, got \
+         {described:?}"
+    );
+
+    // A second delete of the same destination is not found.
+    let (status, body) = emulator
+        .call(
+            "DeleteEventDestination",
+            serde_json::json!({
+                "ConfigurationSetName": "shrinking",
+                "EventDestinationName": "dest-1",
+            }),
+        )
+        .await;
+    assert_eq!(
+        (
+            status,
+            error_code(&body).as_str(),
+            body.get("Message").and_then(serde_json::Value::as_str),
+            body.get("ResourceType").and_then(serde_json::Value::as_str),
+        ),
+        (
+            400,
+            "ResourceNotFoundException",
+            Some(
+                sms_voice::state::resource_not_found_message("event-destination", "dest-1")
+                    .as_str()
+            ),
+            Some("event-destination"),
+        ),
+        "case \"a second delete of one destination\": expected the refusal, got {status} \
+         with {body}"
+    );
+
+    // Deleting the set takes the rest with it, so a destination of a deleted set has no
+    // set to be deleted from.
+    emulator
+        .ok(
+            "DeleteConfigurationSet",
+            serde_json::json!({"ConfigurationSetName": "shrinking"}),
+        )
+        .await;
+    for case in ["dest-0", "dest-2"] {
+        let (status, body) = emulator
+            .call(
+                "DeleteEventDestination",
+                serde_json::json!({
+                    "ConfigurationSetName": "shrinking",
+                    "EventDestinationName": case,
+                }),
+            )
+            .await;
+        assert_eq!(
+            (
+                status,
+                error_code(&body).as_str(),
+                body.get("ResourceType").and_then(serde_json::Value::as_str),
+            ),
+            (400, "ResourceNotFoundException", Some("configuration-set")),
+            "case {case:?}: a cascaded destination must already be gone with its set, got \
+             {status} with {body}"
+        );
+    }
 }
 
 #[tokio::test]
