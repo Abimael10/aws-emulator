@@ -35,8 +35,8 @@
 //! rather than a stub that pretends.
 //!
 //! What `os` re-exports as DATA is a different thing, and it is all here
-//! ([`install_data_surface`]): the `stat_result` and `uname_result` types and the `open`
-//! flags are types and a handful of numbers, not calls, and the standard library reads them
+//! ([`install_data_surface`]): the `stat_result`, `uname_result` and `statvfs_result` types
+//! and the `open` flags are types and a handful of numbers, not calls, and the standard library reads them
 //! off `os` WHILE BEING IMPORTED — `shutil` (and so `tempfile`, `zipfile` and `tarfile`)
 //! reads `os.stat_result`, `glob` (and so `pathlib`) reads `os.O_RDONLY` — so a module
 //! missing them is one those modules cannot be imported from at all, which is not what a
@@ -237,6 +237,11 @@ const POSIX_FLAGS: &[(&str, i32)] = &[
     ("SEEK_SET", ::libc::SEEK_SET),
     ("SEEK_CUR", ::libc::SEEK_CUR),
     ("SEEK_END", ::libc::SEEK_END),
+    // The two mount flags POSIX requires a `statvfs` to report, which `os` re-exports as
+    // `os.ST_RDONLY` and `os.ST_NOSUID`: a program reads them off the `f_flag` of the
+    // filesystem it asked about.
+    ("ST_RDONLY", ::libc::ST_RDONLY as i32),
+    ("ST_NOSUID", ::libc::ST_NOSUID as i32),
 ];
 
 /// The TYPE a POSIX `stat` answers with, which `os` re-exports as `os.stat_result`.
@@ -336,6 +341,63 @@ def _bind_fields():
 _bind_fields()
 "#;
 
+/// The TYPE a POSIX `statvfs` answers with, which `os` re-exports as `os.statvfs_result`.
+///
+/// The same shape as the two types above, over the values a filesystem reports about ITSELF:
+/// its block size, how many blocks it has and how many are free, its inode counts, the mount
+/// flags in force on it and the longest name it takes. A program reads the size of a
+/// filesystem off this (`f_blocks * f_frsize`) and what is left of it off `f_bavail`, which is
+/// how a handler reads the size of its function's ephemeral storage.
+const STATVFS_RESULT_SOURCE: &str = r#"
+class statvfs_result(tuple):
+    """What the filesystem a POSIX statvfs answers for is."""
+
+    __module__ = "os"
+
+    _fields = (
+        "f_bsize",
+        "f_frsize",
+        "f_blocks",
+        "f_bfree",
+        "f_bavail",
+        "f_files",
+        "f_ffree",
+        "f_favail",
+        "f_flag",
+        "f_namemax",
+    )
+    n_fields = 10
+    n_sequence_fields = 10
+    n_unnamed_fields = 0
+
+    def __new__(cls, sequence, named=None):
+        values = tuple(sequence)
+        if len(values) < cls.n_sequence_fields:
+            raise TypeError(
+                "statvfs_result() takes an at least %d-sequence (%d-sequence given)"
+                % (cls.n_sequence_fields, len(values))
+            )
+        built = tuple.__new__(cls, values[: cls.n_sequence_fields])
+        # The identifier a filesystem carries beyond the sequence travels in a mapping, which
+        # is how CPython's own constructor takes it, and becomes an attribute of its own.
+        for name, value in dict(named or {}).items():
+            setattr(built, name, value)
+        return built
+
+    def __repr__(self):
+        return "os.statvfs_result(%s)" % ", ".join(
+            "%s=%r" % (name, value) for name, value in zip(self._fields, self)
+        )
+
+
+def _bind_fields():
+    for index, name in enumerate(statvfs_result._fields):
+        setattr(statvfs_result, name, property(lambda self, index=index: self[index]))
+
+
+_bind_fields()
+"#;
+
 /// The attribute of `posix` the five values of [`module::uname`] are held in, written by the
 /// HOST for the execution environment a run is in. Named with a leading underscore, so
 /// `os`'s own `from posix import *` does not re-export it.
@@ -367,7 +429,8 @@ pub(crate) fn machine_of(architecture: &str) -> &str {
 }
 
 /// Install on the `posix` module above everything `os` re-exports from it as DATA: the
-/// [`STAT_RESULT_SOURCE`] and [`UNAME_RESULT_SOURCE`] types and the [`POSIX_FLAGS`].
+/// [`STAT_RESULT_SOURCE`], [`UNAME_RESULT_SOURCE`] and [`STATVFS_RESULT_SOURCE`] types and
+/// the [`POSIX_FLAGS`].
 ///
 /// Called before `os` is imported for the first time, because `os` builds itself out of the
 /// names it finds on this module (`from posix import *`). Nothing here is containment: the
@@ -383,6 +446,7 @@ pub(crate) fn install_data_surface(
     for (name, source) in [
         ("stat_result", STAT_RESULT_SOURCE),
         ("uname_result", UNAME_RESULT_SOURCE),
+        ("statvfs_result", STATVFS_RESULT_SOURCE),
     ] {
         let built = built_type(vm, name, source)?;
         system.set_attr(name, built, vm)?;

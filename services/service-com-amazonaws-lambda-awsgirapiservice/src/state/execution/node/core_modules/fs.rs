@@ -25,15 +25,33 @@ var Buffer = require('buffer').Buffer;
 // /tmp directory" — everything else a function can see is mounted read-only.
 var WRITABLE_ROOT = '/tmp';
 
-// How much `/tmp` may hold in this run. The configured ephemeral storage is the function's
-// own; this is the ceiling on what one run keeps in the engine's memory for it, so a
-// handler cannot turn a write loop into unbounded growth of this process.
-var WRITABLE_BYTES = 512 * 1024 * 1024;
+// How much `/tmp` may hold in this run: the function's own `EphemeralStorage.Size` ("the size
+// of the function's /tmp directory in MB"), which the host states. It is the ceiling on what
+// one environment keeps in the engine's memory for it as well, so a handler cannot turn a write
+// loop into unbounded growth of this process.
+var WRITABLE_BYTES = host().ephemeralBytes();
+
+// What the RECORD of one entry costs the storage, beside the bytes of a file: a filesystem
+// keeps an inode and a directory entry for every name it holds, so a tree of names and no
+// content is not free on one either. One block plus the name itself, which is what the smallest
+// entry of a real filesystem occupies.
+var ENTRY_BYTES = 4096;
+
+// How many entries the storage holds at most, which is the inode count a filesystem of this
+// size reports: an ext filesystem is made with one inode per 16 KiB by default.
+var MAX_ENTRIES = Math.max(1, Math.floor(WRITABLE_BYTES / 16384));
+
+// The longest a path component and a whole path may be, as a filesystem states its own
+// lengths.
+var MAX_NAME = 255;
+var MAX_PATH = 4096;
 
 // The written tree: path -> { data, mtimeMs } for a file, path -> null for a directory.
 var written = Object.create(null);
 written[WRITABLE_ROOT] = null;
 var writtenBytes = 0;
+// How many entries it holds, the root it is mounted at included.
+var entries = 1;
 
 // The instant this run's read-only trees became visible, which is the only time there is
 // for an entry that was never written.
@@ -153,19 +171,76 @@ function makeDirectories(path) {
     for (var index = 1; index < segments.length; index += 1) {
         walked += '/' + segments[index];
         if (!Object.prototype.hasOwnProperty.call(written, walked)) {
+            // A directory is an ENTRY of the storage, so it costs what one costs and takes one
+            // of its inodes: a tree of empty directories fills it as the bytes of a file do.
+            admit(walked);
             written[walked] = null;
         }
     }
 }
 
-function store(path, bytes) {
-    var held = Object.prototype.hasOwnProperty.call(written, path) && written[path] !== null
-        ? written[path].data.length
-        : 0;
-    if (writtenBytes - held + bytes.length > WRITABLE_BYTES) {
+// What the record of one entry costs: the per-entry overhead and the name itself.
+function entryCost(path) {
+    return ENTRY_BYTES + path.length;
+}
+
+// Refuse a path longer than this filesystem takes, as a filesystem refuses one past the
+// lengths it states.
+function named(path) {
+    if (path.length > MAX_PATH) {
+        throw fault('ENAMETOOLONG', 'name too long', 'open', path);
+    }
+    var segments = path.split('/');
+    for (var index = 0; index < segments.length; index += 1) {
+        if (segments[index].length > MAX_NAME) {
+            throw fault('ENAMETOOLONG', 'name too long', 'open', path);
+        }
+    }
+}
+
+// Account for the storage growing by `grown` bytes, which may be negative. A growth past what
+// it has left is refused the way a full device refuses one, and nothing of it is written.
+function charge(path, grown) {
+    if (grown > 0 && writtenBytes + grown > WRITABLE_BYTES) {
         throw fault('ENOSPC', 'no space left on device', 'write', path);
     }
-    writtenBytes = writtenBytes - held + bytes.length;
+    writtenBytes += grown;
+    if (writtenBytes < 0) {
+        writtenBytes = 0;
+    }
+}
+
+// Admit ONE new entry, before anything is held for it.
+function admit(path) {
+    named(path);
+    if (entries >= MAX_ENTRIES) {
+        throw fault('ENOSPC', 'no space left on device', 'write', path);
+    }
+    charge(path, entryCost(path));
+    entries += 1;
+}
+
+// Give back what an entry and its content held.
+function release(path, dataLength) {
+    charge(path, -(entryCost(path) + dataLength));
+    entries -= 1;
+}
+
+function store(path, bytes) {
+    var existing = Object.prototype.hasOwnProperty.call(written, path) && written[path] !== null;
+    var held = existing ? written[path].data.length : 0;
+    // A file the storage does not hold yet is a new ENTRY of it, so its record is charged
+    // beside its bytes and it takes one of the storage's inodes.
+    if (!existing) {
+        named(path);
+        if (entries >= MAX_ENTRIES) {
+            throw fault('ENOSPC', 'no space left on device', 'write', path);
+        }
+    }
+    charge(path, bytes.length - held + (existing ? 0 : entryCost(path)));
+    if (!existing) {
+        entries += 1;
+    }
     written[path] = { data: bytes, mtimeMs: Date.now() };
 }
 
@@ -328,7 +403,7 @@ function unlinkSync(path) {
     if (!Object.prototype.hasOwnProperty.call(written, resolved) || written[resolved] === null) {
         throw fault('ENOENT', 'no such file or directory', 'unlink', resolved);
     }
-    writtenBytes -= written[resolved].data.length;
+    release(resolved, written[resolved].data.length);
     delete written[resolved];
 }
 
@@ -354,9 +429,10 @@ function rmSync(path, options) {
     var keys = Object.keys(written);
     for (var index = 0; index < keys.length; index += 1) {
         if (keys[index] === resolved || keys[index].indexOf(resolved + '/') === 0) {
-            if (written[keys[index]] !== null) {
-                writtenBytes -= written[keys[index]].data.length;
-            }
+            release(
+                keys[index],
+                written[keys[index]] === null ? 0 : written[keys[index]].data.length
+            );
             delete written[keys[index]];
         }
     }

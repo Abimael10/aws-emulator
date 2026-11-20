@@ -749,6 +749,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .serving_revision_of(&executed_version, &resolved_config.revision_id),
                     variables: resolved_config.environment.clone(),
                     memory_size: resolved_config.memory_size,
+                    ephemeral_storage_mb: resolved_config.ephemeral_storage_mb,
                     timeout: resolved_config.timeout,
                     architecture: resolved_config
                         .architectures
@@ -936,6 +937,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             code_revision,
             variables: resolved_config.environment.clone(),
             memory_size: resolved_config.memory_size,
+            ephemeral_storage_mb: resolved_config.ephemeral_storage_mb,
             timeout: resolved_config.timeout,
             architecture: resolved_config
                 .architectures

@@ -1215,7 +1215,11 @@ async fn every_function_of_these_suites_is_created_with_room_for_the_hosts_own_l
 
         // And the wall clock: every second the host waits for a run but the grace it gives one
         // past its budget.
-        let budget = run_budget(timeout, memory_size);
+        let budget = run_budget(
+            timeout,
+            memory_size,
+            service_com_amazonaws_lambda_awsgirapiservice::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+        );
         let least = HOST_WAIT_CEILING.saturating_sub(ABANDON_GRACE);
         assert!(
             budget.wall_clock >= least,

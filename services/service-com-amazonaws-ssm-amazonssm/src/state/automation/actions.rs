@@ -186,6 +186,11 @@ pub const MAX_SCRIPT_STEPS: u64 = 2_000_000;
 /// How much memory one script may add to this process. CHOSEN, for the same reason.
 const MAX_SCRIPT_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 
+/// How much one script may write to the `/tmp` of the environment it runs in. CHOSEN, for the
+/// same reason: that directory is a disk on a real instance and is held in this process's
+/// memory here, so what one run leaves there is bounded like everything else it holds.
+const MAX_SCRIPT_SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
+
 /// How deep one script may recurse. The interpreter's own default is below what the frozen
 /// standard library's import chain needs, so this is the limit a run is given; the call that
 /// would raise it is taken away by the engine before any script code runs.
@@ -214,6 +219,7 @@ pub fn script_budget() -> ::service_com_amazonaws_lambda_awsgirapiservice::state
         wall_clock: SCRIPT_RUN_CEILING,
         steps: MAX_SCRIPT_STEPS,
         memory_bytes: MAX_SCRIPT_MEMORY_BYTES,
+        ephemeral_bytes: MAX_SCRIPT_SCRATCH_BYTES,
         log_bytes: MAX_SCRIPT_LOG_BYTES,
         response_bytes: MAX_SCRIPT_ANSWER_BYTES,
         recursion_limit: MAX_SCRIPT_RECURSION,

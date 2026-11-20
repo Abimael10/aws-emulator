@@ -274,6 +274,12 @@ pub const MAX_JOB_SCRIPT_STEPS: u64 = 2_000_000;
 /// ([`super::statement_execution`]).
 pub(super) const MAX_JOB_SCRIPT_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
+/// How much a script may write to the `/tmp` of the environment it runs in. CHOSEN, for the
+/// same reason, and shared as above: a worker's scratch directory is a disk on the real
+/// service and is held in this process's memory here, so what one script leaves there is
+/// bounded like everything else one run holds.
+pub(super) const MAX_JOB_SCRIPT_SCRATCH_BYTES: u64 = 512 * 1024 * 1024;
+
 /// How deep one script may recurse. The interpreter's own default is below what the frozen
 /// standard library's import chain needs, so this is the limit a run is given; the call that
 /// would raise it is taken away by the engine before any script code runs. Shared, as above.
@@ -619,6 +625,7 @@ pub fn job_script_budget(timeout_minutes: i32) -> python::Budget {
         wall_clock: configured_timeout(timeout_minutes).min(JOB_SCRIPT_RUN_CEILING),
         steps: MAX_JOB_SCRIPT_STEPS,
         memory_bytes: MAX_JOB_SCRIPT_MEMORY_BYTES,
+        ephemeral_bytes: MAX_JOB_SCRIPT_SCRATCH_BYTES,
         log_bytes: MAX_JOB_SCRIPT_LOG_BYTES,
         response_bytes: MAX_JOB_SCRIPT_ANSWER_BYTES,
         recursion_limit: MAX_JOB_SCRIPT_RECURSION,

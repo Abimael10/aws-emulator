@@ -171,6 +171,7 @@ pub fn statement_budget() -> python::Budget {
         wall_clock: STATEMENT_RUN_CEILING,
         steps: MAX_JOB_SCRIPT_STEPS,
         memory_bytes: MAX_JOB_SCRIPT_MEMORY_BYTES,
+        ephemeral_bytes: MAX_JOB_SCRIPT_SCRATCH_BYTES,
         log_bytes: MAX_STATEMENT_OUTPUT_BYTES,
         response_bytes: MAX_JOB_SCRIPT_ANSWER_BYTES,
         recursion_limit: MAX_JOB_SCRIPT_RECURSION,

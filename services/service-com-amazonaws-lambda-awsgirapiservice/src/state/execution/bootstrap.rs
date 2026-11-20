@@ -59,14 +59,17 @@
 //! read out of the document above rather than out of a module this source would otherwise
 //! have to reach for. What the handler reads as the FILES of its execution environment is a
 //! source of its own ([`super::guest_mount`]), evaluated into this scope before this one and
-//! handed the same mounts the finders here import from.
+//! handed the same mounts the finders here import from, with the writable `/tmp` of that
+//! environment beside it ([`super::guest_ephemeral`]).
 
 /// The Python source of the runtime, evaluated once per execution environment.
 ///
-/// It opens with the FILESYSTEM of the execution environment ([`super::guest_mount`]), which
-/// `_prepare` below installs the mounts through: the two are one compiled unit, so the names
-/// that section leaves behind are the runtime's own.
+/// It opens with the FILESYSTEM of the execution environment ([`super::guest_mount`]) and the
+/// EPHEMERAL STORAGE beside it ([`super::guest_ephemeral`]), which `_prepare` below installs
+/// the mounts and the storage through: the three are one compiled unit, so the names those
+/// sections leave behind are the runtime's own.
 pub(super) const RUNTIME_SOURCE: &str = super::guest_mount::mount_source!(
+    super::guest_ephemeral::ephemeral_source!(
     r##"
 import sys
 
@@ -96,6 +99,11 @@ class _LogStream:
     only `sys.stdout`/`sys.stderr` a handler has: `print()` and the logging handler this
     runtime installs (`_install_logging`) reach the invocation's log through it, and
     nothing reaches this process's stdio.
+
+    It reports the DESCRIPTOR a process's own output stream is: a handler that writes by
+    number rather than through the stream object — `os.write(1, ...)` — reaches the same log,
+    because the filesystem of the environment answers those two descriptors through these
+    streams ([`super::guest_ephemeral`]).
     """
 
     encoding = "utf-8"
@@ -103,6 +111,9 @@ class _LogStream:
     name = "<log>"
     mode = "w"
     closed = False
+
+    def __init__(self, descriptor):
+        self._descriptor = descriptor
 
     def write(self, text):
         if not isinstance(text, str):
@@ -130,14 +141,15 @@ class _LogStream:
         return False
 
     def fileno(self):
-        raise OSError("the invocation log has no file descriptor")
+        return self._descriptor
 
     def close(self):
         return None
 
 
-sys.stdout = _LogStream()
-sys.stderr = _LogStream()
+# The two descriptors a process's output goes to, in the order a process holds them.
+sys.stdout = _LogStream(1)
+sys.stderr = _LogStream(2)
 sys.stdin = None
 
 
@@ -1054,6 +1066,16 @@ def _prepare(request, library):
         ],
         time.time(),
     )
+    # The EPHEMERAL STORAGE of the environment, built beside those mounts and after them,
+    # because its calls dispatch to theirs ([`super::guest_ephemeral`]): the writable `/tmp`
+    # the function's `EphemeralStorage.Size` sizes, empty, as a fresh execution environment's
+    # is. It belongs to the ENVIRONMENT, so every invocation served in this one reads and
+    # writes the same `/tmp`.
+    _tmp_install(
+        request.get("ephemeralStorageBytes") or 0,
+        request.get("ephemeralWritableBytes") or 0,
+        time.time(),
+    )
     # The import directories of the LAYER ROOT, which the finder below resolves a layer's
     # modules from and which site processing extends further down — one list, so a directory a
     # path-configuration file adds is both on the path and importable.
@@ -1342,4 +1364,5 @@ __lambda_prepare = _main_prepare
 __lambda_bind = _main_bind
 __lambda_invoke = _main_invoke
 "##
+    )
 );

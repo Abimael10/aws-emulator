@@ -215,6 +215,10 @@ fn notebook_budget() -> Budget {
         wall_clock: NOTEBOOK_WALL_CLOCK,
         steps: 2_000_000,
         memory_bytes: 256 * 1024 * 1024,
+        // The `/tmp` of the environment a cell runs in is a disk on a real cluster and is
+        // held in this process's memory here, so what one run leaves there is bounded like
+        // everything else it holds.
+        ephemeral_bytes: 256 * 1024 * 1024,
         log_bytes: 16 * 1024,
         response_bytes: 64 * 1024,
         recursion_limit: 2_000,

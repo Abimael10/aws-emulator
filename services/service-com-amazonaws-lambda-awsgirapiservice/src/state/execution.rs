@@ -107,6 +107,11 @@ pub mod node;
 /// source is built with this one's macro.
 mod guest_mount;
 
+/// The EPHEMERAL STORAGE that runtime serves beside those mounts: the writable `/tmp` the
+/// function's `EphemeralStorage.Size` sizes. Declared with the mounts and before the runtime,
+/// for the same reason: that source is built with this one's macro too.
+mod guest_ephemeral;
+
 /// The runtime the handler runs under, in the language the handler is written in.
 mod bootstrap;
 
@@ -444,6 +449,31 @@ const MAX_RUN_STEPS: u64 = 20_000_000;
 /// How much memory one run may add to this process.
 const MAX_RUN_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
+/// How many bytes of a function's EPHEMERAL STORAGE one execution environment really holds.
+///
+/// `/tmp` is a disk on the real runtime, and the files a run writes there are held in THIS
+/// process's memory, so what one environment keeps for them is bounded here exactly as what
+/// one run may allocate is ([`MAX_RUN_MEMORY_BYTES`]): a function configured for more
+/// ephemeral storage than this reports its configured size — that is what it has — and the
+/// writes this host can really hold stop at this figure. Every size up to it, the documented
+/// default (`crate::state::DEFAULT_EPHEMERAL_STORAGE_MB`) included, is held in full.
+pub const MAX_EPHEMERAL_HELD_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The size of the `/tmp` directory a function configured for `ephemeral_storage_mb` MB has,
+/// in bytes: what its invocations may write there and what a filesystem reading of it reports
+/// ("The size of the function's /tmp directory in MB"), held to the range the member's own
+/// documentation states.
+#[must_use]
+pub fn ephemeral_storage_bytes(ephemeral_storage_mb: i32) -> u64 {
+    let clamped = i64::from(ephemeral_storage_mb).clamp(
+        i64::from(crate::state::DEFAULT_EPHEMERAL_STORAGE_MB),
+        i64::from(crate::state::MAX_EPHEMERAL_STORAGE_MB),
+    );
+    u64::try_from(clamped)
+        .unwrap_or(1)
+        .saturating_mul(BYTES_PER_MB)
+}
+
 /// How deep one run may recurse.
 ///
 /// The interpreter's own default is far LOWER than Python's (256 against CPython's 1000),
@@ -537,6 +567,9 @@ pub struct Invocation {
     pub variables: BTreeMap<String, String>,
     /// The function's `MemorySize`, in MB.
     pub memory_size: i32,
+    /// The function's `EphemeralStorage.Size`, in MB: how large the `/tmp` directory the
+    /// invocation writes to is.
+    pub ephemeral_storage_mb: i32,
     /// The ARCHITECTURE the function is configured for (`Architectures`), which is what
     /// the runtime reports as its own.
     pub architecture: String,
@@ -883,7 +916,11 @@ pub async fn run_invocation(
     })?
     .map_err(|error| Unrunnable::Internal(format!("the run memory is gone: {error}")))?;
 
-    let budget = run_budget(invocation.timeout, invocation.memory_size);
+    let budget = run_budget(
+        invocation.timeout,
+        invocation.memory_size,
+        invocation.ephemeral_storage_mb,
+    );
     let heap_bytes = run_heap_bytes(invocation.memory_size);
     let started = SystemTime::now();
     let request_id = invocation.request_id.clone();
@@ -1789,14 +1826,20 @@ pub(crate) fn epoch_millis(at: SystemTime) -> i64 {
 /// in ([`run_memory_claim_mb`]), so what a run may allocate and what it holds of the
 /// envelope cannot diverge: a function configured for the smallest `MemorySize` the model
 /// allows is bounded at that, not at the per-run ceiling.
+///
+/// The function's EPHEMERAL STORAGE travels beside the memory and is not part of it: `/tmp`
+/// is a disk the function's `EphemeralStorage.Size` sizes, so what a run writes there is
+/// bounded by that size and charged against no memory bound
+/// ([`ephemeral_storage_bytes`]).
 #[must_use]
-pub fn run_budget(timeout_seconds: i32, memory_size: i32) -> Budget {
+pub fn run_budget(timeout_seconds: i32, memory_size: i32, ephemeral_storage_mb: i32) -> Budget {
     let clamped = i64::from(timeout_seconds).clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS);
     let wall_clock = Duration::from_secs(u64::try_from(clamped).unwrap_or(1));
     Budget {
         wall_clock,
         steps: MAX_RUN_STEPS,
         memory_bytes: u64::try_from(run_heap_bytes(memory_size)).unwrap_or(MAX_RUN_MEMORY_BYTES),
+        ephemeral_bytes: ephemeral_storage_bytes(ephemeral_storage_mb),
         log_bytes: MAX_RUN_LOG_BYTES,
         response_bytes: MAX_RESPONSE_BYTES,
         recursion_limit: MAX_RUN_RECURSION,
@@ -2178,6 +2221,7 @@ mod tests {
             code_revision: "11111111-1111-1111-1111-111111111111".to_string(),
             variables: BTreeMap::new(),
             memory_size: 256,
+            ephemeral_storage_mb: crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
             timeout: 3,
             architecture: "x86_64".to_string(),
             zip_bytes: None,
@@ -2351,7 +2395,11 @@ mod tests {
             (Engine::Node, 3, "3.00"),
         ];
         for (engine, timeout, rendered) in cases {
-            let budget = run_budget(*timeout, MIN_MEMORY_SIZE_MB as i32);
+            let budget = run_budget(
+                *timeout,
+                MIN_MEMORY_SIZE_MB as i32,
+                crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+            );
             let finished = Finished {
                 completion: Completion::Stopped(Stop::Deadline),
                 log: String::new(),
@@ -2417,7 +2465,11 @@ mod tests {
         ];
         for (stop, class) in stops {
             for engine in [Engine::Python, Engine::Node] {
-                let budget = run_budget(3, MIN_MEMORY_SIZE_MB as i32);
+                let budget = run_budget(
+                    3,
+                    MIN_MEMORY_SIZE_MB as i32,
+                    crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                );
                 let finished = Finished {
                     completion: Completion::Stopped(*stop),
                     log: String::new(),
@@ -2510,7 +2562,11 @@ mod tests {
                     finished,
                     request_id,
                     &probe_invocation(),
-                    run_budget(3, MIN_MEMORY_SIZE_MB as i32),
+                    run_budget(
+                        3,
+                        MIN_MEMORY_SIZE_MB as i32,
+                        crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                    ),
                     engine,
                     SystemTime::UNIX_EPOCH,
                     PROBE_LOG_STREAM,
@@ -2559,7 +2615,11 @@ mod tests {
                     finished,
                     request_id,
                     &probe_invocation(),
-                    run_budget(3, MIN_MEMORY_SIZE_MB as i32),
+                    run_budget(
+                        3,
+                        MIN_MEMORY_SIZE_MB as i32,
+                        crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                    ),
                     Engine::Python,
                     SystemTime::UNIX_EPOCH,
                     PROBE_LOG_STREAM,
@@ -2591,7 +2651,11 @@ mod tests {
     #[test]
     fn an_error_document_past_the_response_quota_is_answered_as_a_response_past_it() {
         let request_id = "11111111-2222-3333-4444-555555555555";
-        let budget = run_budget(3, MIN_MEMORY_SIZE_MB as i32);
+        let budget = run_budget(
+            3,
+            MIN_MEMORY_SIZE_MB as i32,
+            crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+        );
         let quota = budget.response_bytes;
         // What the document's own members cost, beside the message: the builder's own answer
         // for an empty message.
@@ -2773,7 +2837,11 @@ mod tests {
                     invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe",
                     client_context: None,
                     tenant_id: None,
-                    budget: run_budget(5, MIN_MEMORY_SIZE_MB as i32),
+                    budget: run_budget(
+                        5,
+                        MIN_MEMORY_SIZE_MB as i32,
+                        crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+                    ),
                     aws: None,
                     durable: None,
                 })
@@ -2805,7 +2873,11 @@ mod tests {
             (100_000, 900),
         ];
         for (configured, expected) in cases {
-            let actual = run_budget(*configured, MIN_MEMORY_SIZE_MB as i32)
+            let actual = run_budget(
+                *configured,
+                MIN_MEMORY_SIZE_MB as i32,
+                crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+            )
                 .wall_clock
                 .as_secs();
             assert_eq!(

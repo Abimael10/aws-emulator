@@ -24,6 +24,13 @@ Issue-Commit: 677b6e35c5226b67b9bfea5e554d250e3c084a9c
 
 > _Note: this issue was identified against the code base at commit `677b6e35c5226b67b9bfea5e554d250e3c084a9c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolution: the seven causes below are served. The trace of cause 3,
+> `lambda.deep-lambda-runtime-truth-layer-files-byte-exact-at-opt-and-opt-write-rejected`, gets
+> past the import that cause is about and past the `/opt` readings it covers, and then fails on
+> ONE capability of its own: the handler starts a child process, which this emulator does not.
+> That cause and its replay key are filed, open, as
+> `issues/things-that-do-not-work/20261108T000000Z-lambda-a-handler-cannot-start-a-child-process.md`._
+
 ## Operation
 Invoke
 

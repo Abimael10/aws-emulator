@@ -99,6 +99,10 @@ fn run_budget() -> Budget {
         wall_clock: RUN_WALL_CLOCK,
         steps: 20_000_000,
         memory_bytes: 256 * 1024 * 1024,
+        // The directory a program writes its own files to is a disk on the real sandbox and
+        // is held in this process's memory here, so what one run may leave there is bounded
+        // like everything else it holds.
+        ephemeral_bytes: 256 * 1024 * 1024,
         log_bytes: 64 * 1024,
         // The answer carries the two output streams and the files the program wrote, so it
         // is the response cap that bounds what one run can make this process hold.

@@ -13,6 +13,13 @@
 //! The count of faulted pages never falls, so what is kept is an UPPER bound on what the run
 //! holds at the instant it is read — a page given back and touched again is counted twice —
 //! which is the side to err on for a figure a memory bound is judged on.
+//!
+//! What the run put on a STORE this process keeps for it that is not the function's memory is
+//! left out of that reading ([`Held::discount`]): the files a run writes to its function's
+//! ephemeral storage are a disk on the real runtime and are held in this process's memory
+//! here, so counting them would report a function as holding memory it is not. How much may be
+//! left out is the HOST's own decision, bounded per run and for this process together
+//! ([`super::python::Bounds::wrote_to_ephemeral_storage`]).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -46,6 +53,10 @@ pub(super) struct Held {
     /// Whether that instant has been marked yet, which is the instant from which a reading
     /// says something about THIS RUN.
     measured: AtomicBool,
+    /// How much of what this thread has faulted in since that baseline is NOT the run's
+    /// memory: the bytes the run put on a store this process keeps for it that is not memory
+    /// at all ([`Self::discount`]).
+    discounted: AtomicU64,
 }
 
 impl Held {
@@ -56,6 +67,7 @@ impl Held {
             baseline: AtomicU64::new(faulted_bytes()),
             peak: AtomicU64::new(0),
             measured: AtomicBool::new(false),
+            discounted: AtomicU64::new(0),
         }
     }
 
@@ -68,13 +80,29 @@ impl Held {
         self.measured.store(true, Ordering::SeqCst);
     }
 
+    /// Hold `bytes` of what this thread has faulted in since the baseline to be something
+    /// OTHER than the run's own memory, which is what every reading below then leaves out.
+    ///
+    /// The figure is an ABSOLUTE one and is only ever raised, because the faulted-page count
+    /// it is taken out of only ever rises as well: pages this run touched for such a store
+    /// stay counted after the run has given the store's bytes back, so a reading that stopped
+    /// leaving them out would report them as the run's memory. How much may be left out is
+    /// decided and bounded by the HOST before this is called
+    /// ([`super::python::Bounds::wrote_to_ephemeral_storage`]), so no guest can discount
+    /// memory of its own.
+    pub(super) fn discount(&self, bytes: u64) {
+        self.discounted.fetch_max(bytes, Ordering::Relaxed);
+    }
+
     /// Read what the run holds beyond its baseline, keep it if it is the greatest reading so
     /// far, and report it.
     ///
     /// Before the run's own start was marked there is no reading that speaks for the run, so
     /// none is kept.
     pub(super) fn sample(&self) -> u64 {
-        let held = faulted_bytes().saturating_sub(self.baseline.load(Ordering::Relaxed));
+        let held = faulted_bytes()
+            .saturating_sub(self.baseline.load(Ordering::Relaxed))
+            .saturating_sub(self.discounted.load(Ordering::Relaxed));
         if self.measured.load(Ordering::Relaxed) {
             self.peak.fetch_max(held, Ordering::Relaxed);
         }

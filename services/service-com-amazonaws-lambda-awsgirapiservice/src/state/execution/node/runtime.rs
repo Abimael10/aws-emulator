@@ -50,6 +50,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     var hostModuleSource = globalThis.__hostModuleSource;
     var hostModulePaths = globalThis.__hostModulePaths;
     var hostCoreSource = globalThis.__hostCoreSource;
+    var hostEphemeralBytes = globalThis.__hostEphemeralBytes;
     var hostDigest = globalThis.__hostDigest;
     var hostHmac = globalThis.__hostHmac;
     var hostCipher = globalThis.__hostCipher;
@@ -68,6 +69,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     delete globalThis.__hostModuleSource;
     delete globalThis.__hostModulePaths;
     delete globalThis.__hostCoreSource;
+    delete globalThis.__hostEphemeralBytes;
     delete globalThis.__hostDigest;
     delete globalThis.__hostHmac;
     delete globalThis.__hostCipher;
@@ -2565,6 +2567,12 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
                 out.push(filenameOf(held[index]));
             }
             return out;
+        },
+        // How large the `/tmp` of this execution environment is, which the filesystem module
+        // writes into and reports: the function's own `EphemeralStorage.Size`, as the host
+        // states it.
+        ephemeralBytes: function () {
+            return hostEphemeralBytes();
         },
         // The ONE call the AWS SDK this runtime supplies makes: the host decides which
         // services are reachable, signs the request and dispatches it. The credentials the

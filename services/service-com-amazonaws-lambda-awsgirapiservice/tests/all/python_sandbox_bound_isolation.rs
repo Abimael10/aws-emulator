@@ -94,6 +94,7 @@ fn budget() -> Budget {
         wall_clock: Duration::from_secs(5),
         steps: 2_000_000,
         memory_bytes: CEILING_OUT_OF_REACH,
+        ephemeral_bytes: 512 * 1024 * 1024,
         log_bytes: 16 * 1024,
         response_bytes: 64 * 1024,
         recursion_limit: 2_000,
@@ -246,6 +247,33 @@ fn cases() -> Vec<BoundCase> {
             },
             clock: Clock::driven(DRIVEN_TICK),
             expected: Some(Stop::Deadline),
+        },
+        BoundCase {
+            case: "a handler that says it wrote far more to its ephemeral storage than that \
+                   storage holds, and then allocates without stopping",
+            // What a run may have left out of its memory reading as the `/tmp` it wrote is the
+            // HOST's own decision, held to the size that function's configuration states: a
+            // run that reports gigabyte after gigabyte is given that one size, so the ceiling
+            // still ends it. Without that bound the reports would discount the whole
+            // allocation and no bound would answer this row at all.
+            source: format!(
+                "{ALLOCATES_WITHOUT_STOPPING}\
+                 def handler(event, context):\n    \
+                     host = __import__('_lambda_host')\n    \
+                     for _ in range(64):\n        \
+                         host.ephemeral(1024 * 1024 * 1024)\n    \
+                     _fill()\n"
+            ),
+            budget: Budget {
+                steps: many_steps,
+                memory_bytes: MEMORY_CEILING_BYTES,
+                // A storage far smaller than what the handler says it wrote, and smaller than
+                // the ceiling above, so the row is about the bound and not about the storage.
+                ephemeral_bytes: 8 * 1024 * 1024,
+                ..budget()
+            },
+            clock: Clock::still(),
+            expected: Some(Stop::Memory),
         },
         BoundCase {
             case: "a handler that allocates well under the ceiling and returns",

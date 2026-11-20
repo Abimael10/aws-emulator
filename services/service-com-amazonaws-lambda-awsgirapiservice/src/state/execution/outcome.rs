@@ -20,6 +20,10 @@ pub struct Budget {
     pub steps: u64,
     /// How much memory the run may add to this process.
     pub memory_bytes: u64,
+    /// How large the function's EPHEMERAL STORAGE is, in bytes: the size of the `/tmp`
+    /// directory its invocations write to, which `EphemeralStorage.Size` configures ("The
+    /// size of the function's `/tmp` directory in MB").
+    pub ephemeral_bytes: u64,
     /// How many bytes of the handler's output are kept.
     pub log_bytes: usize,
     /// How large the handler's response may be.

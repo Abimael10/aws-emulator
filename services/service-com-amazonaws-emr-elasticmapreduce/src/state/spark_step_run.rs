@@ -186,6 +186,12 @@ const MAX_APPLICATION_STEPS: u64 = 200_000_000;
 /// How much memory one application may add to this process. CHOSEN, for the same reason.
 const MAX_APPLICATION_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
 
+/// How much one application may write to the `/tmp` of the environment it runs in. CHOSEN,
+/// for the same reason: that directory is a disk on a real cluster and is held in this
+/// process's memory here, so what one run leaves there is bounded like everything else it
+/// holds.
+const MAX_APPLICATION_SCRATCH_BYTES: u64 = 512 * 1024 * 1024;
+
 /// How deep one application may recurse. The interpreter's own default is below what the
 /// frozen standard library's import chain needs, so this is the limit a run is given.
 const MAX_APPLICATION_RECURSION: usize = 2_000;
@@ -608,6 +614,7 @@ pub fn application_budget() -> python::Budget {
         wall_clock: APPLICATION_RUN_CEILING,
         steps: MAX_APPLICATION_STEPS,
         memory_bytes: MAX_APPLICATION_MEMORY_BYTES,
+        ephemeral_bytes: MAX_APPLICATION_SCRATCH_BYTES,
         log_bytes: MAX_APPLICATION_LOG_BYTES,
         response_bytes: MAX_APPLICATION_ANSWER_BYTES,
         recursion_limit: MAX_APPLICATION_RECURSION,

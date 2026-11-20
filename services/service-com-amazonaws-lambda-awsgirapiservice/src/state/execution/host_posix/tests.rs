@@ -34,6 +34,9 @@ fn budget() -> Budget {
         wall_clock: Duration::from_secs(30),
         steps: 20_000_000,
         memory_bytes: 480 * 1024 * 1024,
+        ephemeral_bytes: crate::state::execution::ephemeral_storage_bytes(
+            crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+        ),
         log_bytes: 16 * 1024,
         response_bytes: 256 * 1024,
         recursion_limit: 2_000,

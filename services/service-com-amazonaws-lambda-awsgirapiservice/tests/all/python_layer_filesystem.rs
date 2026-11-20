@@ -363,10 +363,12 @@ async fn every_entry_of_a_mount_is_a_read_only_file(router: &MultiServiceRouter)
         "list_file": "NotADirectoryError",
         "read_directory": "IsADirectoryError",
         "read_absent": "FileNotFoundError",
-        // A read that walks out of a mount reaches no file, and neither does a write to a
-        // path of no mount: there is no host filesystem behind this environment.
+        // A read that walks out of a mount reaches no file: there is no host filesystem
+        // behind this environment. The one WRITABLE directory a function has is its ephemeral
+        // storage, which is no mount of this function at all and is read and written there
+        // (`crate::python_ephemeral_storage` is its suite).
         "read_escaped": "OSError",
-        "write_outside": "OSError",
+        "write_outside": "written beside the mounts",
         // A file of a mount can be read and never written; a path of no mount is reachable
         // in no way at all.
         "access": {
@@ -539,6 +541,22 @@ def _refusal(call):
         return type(error).__name__
 
 
+def _wrote_to_the_ephemeral_storage():
+    """What a write to the one WRITABLE directory comes to: `/tmp` is the function's own
+    ephemeral storage rather than a mount of this function, so the text written there reads
+    back.
+
+    The file is named for this invocation, so what it reads is what THIS run wrote: the
+    storage belongs to the execution environment and stands for as long as that environment
+    serves invocations (`crate::python_ephemeral_storage` is its suite).
+    """
+    path = "/tmp/written-%s.txt" % os.urandom(4).hex()
+    with open(path, "w") as writing:
+        writing.write("written beside the mounts")
+    with open(path) as reading:
+        return reading.read()
+
+
 def _kind(path):
     """What `path` is to this environment."""
     if os.path.isdir(path):
@@ -629,7 +647,7 @@ def _files(event):
         "read_escaped": _refused(
             lambda: open(_LAYER_ROOT + "/python/../.." + _OFF_MOUNT, "rb").read()
         ),
-        "write_outside": _refused(lambda: open("/tmp/written.txt", "w")),
+        "write_outside": _wrote_to_the_ephemeral_storage(),
         "access": {
             path: _reachable(path)
             for path in (

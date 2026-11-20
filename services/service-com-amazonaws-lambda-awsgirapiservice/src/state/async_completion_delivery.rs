@@ -821,6 +821,7 @@ mod tests {
             code_revision: "11111111-aaaa-bbbb-cccc-222222222222".to_string(),
             variables: ::std::collections::BTreeMap::new(),
             memory_size: 128,
+            ephemeral_storage_mb: crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
             architecture: "x86_64".to_string(),
             timeout: 3,
             zip_bytes: None,

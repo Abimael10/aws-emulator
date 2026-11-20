@@ -73,6 +73,7 @@ const SURFACE: &[&str] = &[
     "aws",
     "db_auth_token",
     "durable",
+    "ephemeral",
     "error_shapes",
     "log",
     "net",
@@ -87,9 +88,9 @@ const SURFACE: &[&str] = &[
 /// by if the guest could reach one: the host's own phase and bound API
 /// (`state::execution::python`'s `Bounds::start`, `Bounds::step`, `Bounds::watch`,
 /// `Bounds::measure_memory_from_here` and `Bounds::remaining`, and the members of
-/// `state::execution::Budget`: `wall_clock`, `steps`, `memory_bytes`, `log_bytes`,
-/// `response_bytes`, `recursion_limit`), plus the words a guest would try for the invoke
-/// phase itself.
+/// `state::execution::Budget`: `wall_clock`, `steps`, `memory_bytes`, `ephemeral_bytes`,
+/// `log_bytes`, `response_bytes`, `recursion_limit`), plus the words a guest would try for the
+/// invoke phase itself.
 const PHASE_AND_BOUND_NAMES: &[&str] = &[
     "start",
     "step",
@@ -105,6 +106,7 @@ const PHASE_AND_BOUND_NAMES: &[&str] = &[
     "wall_clock",
     "steps",
     "memory_bytes",
+    "ephemeral_bytes",
     "log_bytes",
     "response_bytes",
     "recursion_limit",
@@ -118,6 +120,7 @@ fn budget() -> Budget {
         wall_clock: Duration::from_secs(5),
         steps: 2_000_000,
         memory_bytes: CEILING_OUT_OF_REACH,
+        ephemeral_bytes: 512 * 1024 * 1024,
         log_bytes: 16 * 1024,
         response_bytes: 64 * 1024,
         recursion_limit: 2_000,

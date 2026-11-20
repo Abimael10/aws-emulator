@@ -1495,6 +1495,15 @@ fn runtime_input(request: &Run<'_>) -> Result<String, String> {
         "invokedFunctionArn": request.invoked_function_arn,
         "clientContext": request.client_context,
         "tenantId": request.tenant_id,
+        // The EPHEMERAL STORAGE of the environment: how large the `/tmp` the runtime's own
+        // filesystem serves is ([`super::guest_ephemeral`]), and how much of it this host
+        // really holds ([`super::MAX_EPHEMERAL_HELD_BYTES`]) — a function configured for more
+        // than that reports the size it has and writes as far as this host can hold.
+        "ephemeralStorageBytes": request.budget.ephemeral_bytes,
+        "ephemeralWritableBytes": request
+            .budget
+            .ephemeral_bytes
+            .min(super::MAX_EPHEMERAL_HELD_BYTES),
     });
     ::serde_json::to_string(&document).map_err(|error| error.to_string())
 }
@@ -1667,12 +1676,13 @@ fn clamp_recursion(vm: &VirtualMachine, limit: usize) -> PyResult<()> {
 
 /// The module the host functions live on, and the whole of what guest code can call of
 /// this process: `log`, `sleep`, `aws`, `db_auth_token`, `request`, `presign`, `pagination`,
-/// `net` and `durable` — the invocation log, a sleep clamped to what the run has left, ONE AWS SDK
+/// `net`, `durable` and `ephemeral` — the invocation log, a sleep clamped to what the run has left, ONE AWS SDK
 /// call into this same emulator, the authentication token an SDK mints in its client, the one
 /// request a handler sends itself, the one URL it has signed, what the called service's
 /// own model states about paging one operation through, the one call a handler makes on a
-/// stream socket it opened to a data-plane listener of this emulator, and one checkpoint of
-/// the durable execution this invocation is the run of. Nothing else of the
+/// stream socket it opened to a data-plane listener of this emulator, one checkpoint of
+/// the durable execution this invocation is the run of, and what the run wrote to the
+/// ephemeral storage its function is configured for. Nothing else of the
 /// host is reachable from guest code, and nothing here moves a bound.
 ///
 /// Installed ONCE per execution environment, with its interpreter: every one of these
@@ -1699,6 +1709,24 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
         move |args: FuncArgs, vm: &VirtualMachine| {
             let text: String = args.bind(vm)?;
             captured(&framed.capture()).write_record(&text);
+            Ok(vm.ctx.none())
+        },
+    );
+    // What the invocation has written to the function's EPHEMERAL STORAGE: the `/tmp` the
+    // runtime's own filesystem serves is held in this process's memory, and this is how the run
+    // reports the bytes it put there so that the memory ceiling is judged on the memory the
+    // function allocated rather than on the disk it wrote. It moves no bound: what a run may
+    // leave out is held both to the size its own configuration states and to the pool the runs
+    // of this process share, and the grant goes back when the run ends
+    // ([`Bounds::wrote_to_ephemeral_storage`]).
+    let storing = Arc::clone(session);
+    set_function(
+        vm,
+        &module,
+        "ephemeral",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let written: u64 = args.bind(vm)?;
+            storing.bounds().wrote_to_ephemeral_storage(written);
             Ok(vm.ctx.none())
         },
     );
@@ -2083,6 +2111,7 @@ const HOST_MODULE_FUNCTIONS: &[&str] = &[
     "error_shapes",
     "net",
     "durable",
+    "ephemeral",
 ];
 
 /// What the guest reads back from one AWS SDK call: the service's own answer, or the
@@ -2290,6 +2319,14 @@ pub struct Bounds {
     steps: AtomicU64,
     /// How much memory the run may add to this process.
     memory_bytes: u64,
+    /// How large the function's EPHEMERAL STORAGE is, in bytes: the most of what this run has
+    /// faulted in that can be the `/tmp` it wrote rather than its own memory
+    /// ([`Self::wrote_to_ephemeral_storage`]).
+    ephemeral_bytes: u64,
+    /// How much of that this run has been GRANTED out of the process's own pool
+    /// ([`EPHEMERAL_POOL`]), which is what the memory reading leaves out and what this run
+    /// gives back when its bounds are dropped.
+    ephemeral_granted: AtomicU64,
     /// How large the handler's response may be.
     response_bytes: usize,
     /// What this run holds of the host, measured from the instant the HOST marked as the
@@ -2345,6 +2382,10 @@ impl Bounds {
             deadline_epoch_ms: ::std::sync::atomic::AtomicI64::new(0),
             steps: AtomicU64::new(budget.steps),
             memory_bytes: budget.memory_bytes,
+            ephemeral_bytes: budget
+                .ephemeral_bytes
+                .min(super::MAX_EPHEMERAL_HELD_BYTES),
+            ephemeral_granted: AtomicU64::new(0),
             response_bytes: budget.response_bytes,
             held: Held::new(),
             stopped: Mutex::new(None),
@@ -2578,6 +2619,37 @@ impl Bounds {
         None
     }
 
+    /// Hold `bytes` of what this run has faulted in to be the function's EPHEMERAL STORAGE
+    /// rather than its memory.
+    ///
+    /// `/tmp` is a DISK on the real runtime and its bytes are not what `MemorySize` bounds:
+    /// "Each Lambda function receives an ephemeral /tmp directory", sized by
+    /// `EphemeralStorage.Size` on its own. This emulator holds those bytes in this process's
+    /// memory, so the run's own filesystem reports what it wrote there and the reading the
+    /// memory ceiling is judged on leaves that much out ([`Held::discount`]) — without it, a
+    /// function filling the `/tmp` it is configured for would be reported as running out of
+    /// memory it never allocated.
+    ///
+    /// What a run may have left out is the HOST's to decide and is bounded TWICE, so no figure
+    /// a guest states moves a bound: by the size that function's own configuration states, and
+    /// by the pool the runs of this process share ([`claimed_from_the_ephemeral_pool`]). A run
+    /// that reports more than it wrote therefore gains at most the storage its configuration
+    /// already allows it, the runs in flight together gain at most that pool, and every grant
+    /// goes back when the run's bounds are dropped.
+    fn wrote_to_ephemeral_storage(&self, bytes: u64) {
+        let granted = self.ephemeral_granted.load(Ordering::Relaxed);
+        let wanted = granted
+            .saturating_add(bytes)
+            .min(self.ephemeral_bytes)
+            .saturating_sub(granted);
+        if wanted == 0 {
+            return;
+        }
+        let held = granted.saturating_add(claimed_from_the_ephemeral_pool(wanted));
+        self.ephemeral_granted.store(held, Ordering::Relaxed);
+        self.held.discount(held);
+    }
+
     /// Whether the run has grown past its own ceiling, sampled from OUTSIDE the guest: the
     /// interpreter exposes no allocation seam, so the bound is read from this thread's
     /// faulted pages, against what this thread had faulted when the run's own code was
@@ -2616,6 +2688,38 @@ impl Bounds {
     }
 }
 
+impl Drop for Bounds {
+    /// Give the run's grant out of the ephemeral pool back, so what the runs of this process
+    /// have left out of their memory readings is what the runs still in flight were granted.
+    fn drop(&mut self) {
+        let granted = self.ephemeral_granted.load(Ordering::Relaxed);
+        if granted > 0 {
+            EPHEMERAL_POOL.fetch_sub(granted, Ordering::SeqCst);
+        }
+    }
+}
+
+/// How much of this process's memory the runs in flight may leave out of their own memory
+/// readings TOGETHER, as the ephemeral storage their functions are configured for
+/// ([`Bounds::wrote_to_ephemeral_storage`]).
+///
+/// The per-run bound is that function's own `EphemeralStorage.Size`; this is the bound on the
+/// SUM, so what this process may be made to hold does not grow with the number of invocations
+/// that are writing to their `/tmp` at once. It is the same figure one environment may hold
+/// there at all ([`super::MAX_EPHEMERAL_HELD_BYTES`]), and the runs share it: a run that cannot
+/// be granted its share is judged on its memory ceiling like any other run, which stops it.
+static EPHEMERAL_POOL: AtomicU64 = AtomicU64::new(0);
+
+/// Claim up to `wanted` bytes of that pool, answering how much of it was granted.
+fn claimed_from_the_ephemeral_pool(wanted: u64) -> u64 {
+    let mut granted = 0;
+    let _ = EPHEMERAL_POOL.try_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+        granted = wanted.min(super::MAX_EPHEMERAL_HELD_BYTES.saturating_sub(held));
+        (granted > 0).then(|| held.saturating_add(granted))
+    });
+    granted
+}
+
 /// A span in nanoseconds, for the counters the run's waits are accounted in: a span no
 /// `u64` of nanoseconds can hold is counted as the longest one that fits, which is longer
 /// than any run.
@@ -2639,6 +2743,9 @@ mod tests {
             wall_clock: Duration::from_secs(5),
             steps: 2_000_000,
             memory_bytes: CEILING_OUT_OF_REACH,
+            ephemeral_bytes: crate::state::execution::ephemeral_storage_bytes(
+                crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+            ),
             log_bytes: 16 * 1024,
             response_bytes: 64 * 1024,
             recursion_limit: 2_000,
@@ -3367,6 +3474,7 @@ mod tests {
             "aws",
             "db_auth_token",
             "durable",
+            "ephemeral",
             "error_shapes",
             "log",
             "net",

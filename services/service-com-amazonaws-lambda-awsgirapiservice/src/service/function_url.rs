@@ -644,6 +644,7 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
                 .serving_revision_of(&executed_version, &resolved_config.revision_id),
             variables: resolved_config.environment.clone(),
             memory_size: resolved_config.memory_size,
+            ephemeral_storage_mb: resolved_config.ephemeral_storage_mb,
             timeout: resolved_config.timeout,
             architecture: resolved_config
                 .architectures

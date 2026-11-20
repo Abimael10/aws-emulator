@@ -521,6 +521,17 @@ fn install_host(
             Func::from(|name: String| core_module_source(&name).map(str::to_string)),
         )
         .map_err(|error| format!("the core modules could not be installed: {error}"))?;
+    // How large the `/tmp` of this execution environment is: the function's own
+    // `EphemeralStorage.Size` ("the size of the function's /tmp directory in MB"), which is
+    // what the filesystem module writes into and reports ([`core_modules`]'s `fs`). The figure
+    // is the HOST's: the run reads it and never sets it.
+    let ephemeral_bytes = bounds.ephemeral_bytes;
+    globals
+        .set(
+            "__hostEphemeralBytes",
+            Func::from(move || ephemeral_bytes as f64),
+        )
+        .map_err(|error| format!("the ephemeral storage could not be installed: {error}"))?;
     // How a module of the package is COMPILED: as a compilation unit named by the module's
     // own path, so a stack frame of it names the file the caller wrote rather than the
     // engine's anonymous input. The source is the runtime's own wrapper around the module's
@@ -1207,6 +1218,9 @@ pub struct Bounds {
     checks: AtomicU64,
     /// How large the handler's response may be.
     response_bytes: usize,
+    /// How large the function's EPHEMERAL STORAGE is, in bytes: the size of the `/tmp` the
+    /// runtime's own filesystem serves this run ([`core_modules`]'s `fs`).
+    ephemeral_bytes: u64,
     /// Which bound was breached, once one was. Latched: the answer to a run that spent its
     /// budget is that stop, whatever the guest does afterwards.
     stopped: Mutex<Option<Stop>>,
@@ -1243,6 +1257,9 @@ impl Bounds {
             spending: AtomicBool::new(false),
             checks: AtomicU64::new(MAX_ENGINE_CHECKS),
             response_bytes: budget.response_bytes,
+            ephemeral_bytes: budget
+                .ephemeral_bytes
+                .min(super::MAX_EPHEMERAL_HELD_BYTES),
             stopped: Mutex::new(None),
             breached: AtomicBool::new(false),
             held: Held::new(),
@@ -1382,6 +1399,9 @@ mod tests {
             wall_clock: Duration::from_secs(5),
             steps: 2_000_000,
             memory_bytes: 256 * 1024 * 1024,
+            ephemeral_bytes: crate::state::execution::ephemeral_storage_bytes(
+                crate::state::DEFAULT_EPHEMERAL_STORAGE_MB,
+            ),
             log_bytes: 16 * 1024,
             response_bytes: 64 * 1024,
             recursion_limit: 2_000,
