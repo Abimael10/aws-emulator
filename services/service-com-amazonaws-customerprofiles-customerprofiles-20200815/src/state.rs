@@ -56,9 +56,9 @@ pub use event_streams::{
 };
 
 pub use segment_definitions::{
-    segment_definition_arn, segment_definition_exists, segment_definition_not_found,
-    StoredSegmentDefinition, MAX_SEGMENT_DEFINITIONS_PER_DOMAIN, SEGMENT_TYPE_CLASSIC,
-    SEGMENT_TYPE_ENHANCED,
+    segment_criteria_required, segment_definition_arn, segment_definition_exists,
+    segment_definition_not_found, StoredSegmentDefinition, MAX_SEGMENT_DEFINITIONS_PER_DOMAIN,
+    SEGMENT_TYPE_CLASSIC, SEGMENT_TYPE_ENHANCED,
 };
 
 pub use profile_history::{

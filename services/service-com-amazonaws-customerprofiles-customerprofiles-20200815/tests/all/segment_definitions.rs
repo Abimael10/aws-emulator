@@ -82,6 +82,23 @@ fn segment_groups(include: &str, groups: Vec<Value>) -> Value {
     json!({ "Include": include, "Groups": groups })
 }
 
+/// `Tags` as a segment-definition projection of a definition created by `request` must
+/// report it: the map the create carried, and the EMPTY map for a create that carried
+/// none — the member is reported either way.
+fn expected_tags(request: &Value) -> Value {
+    request.get("Tags").cloned().unwrap_or_else(|| json!({}))
+}
+
+/// The sentence a create that names NEITHER segment source is refused with: the service's
+/// fixed text for a missing source, qualified by the domain and the segment-definition
+/// name the request addressed.
+fn no_source_refusal(domain: &str, name: &str) -> String {
+    format!(
+        "Must specify either SegmentSqlQuery or SegmentGroups. Domain: {domain}, \
+         SegmentDefinitionName: {name}"
+    )
+}
+
 /// Every member of `expected` as `actual` reports it.
 fn assert_members(case: &str, actual: &Value, expected: &[(&str, Value)]) {
     for (member, value) in expected {
@@ -238,7 +255,7 @@ async fn a_created_segment_definition_reads_back_as_it_was_stored() {
             "case {case:?}: expected SegmentDefinitionArn {arn:?}, got {:?}",
             created.get("SegmentDefinitionArn")
         );
-        for member in ["DisplayName", "Description", "Tags"] {
+        for member in ["DisplayName", "Description"] {
             assert_eq!(
                 created.get(member),
                 request.get(member),
@@ -247,6 +264,13 @@ async fn a_created_segment_definition_reads_back_as_it_was_stored() {
                 created.get(member)
             );
         }
+        assert_eq!(
+            created.get("Tags"),
+            Some(&expected_tags(request)),
+            "case {case:?}: expected the create to report Tags {:?}, got {:?}",
+            expected_tags(request),
+            created.get("Tags")
+        );
         let created_at = created.get("CreatedAt").cloned().unwrap_or(Value::Null);
         assert!(
             created_at.is_number(),
@@ -276,7 +300,6 @@ async fn a_created_segment_definition_reads_back_as_it_was_stored() {
             "SegmentGroups",
             "SegmentSqlQuery",
             "SegmentSort",
-            "Tags",
         ] {
             assert_eq!(
                 read.get(member),
@@ -286,6 +309,13 @@ async fn a_created_segment_definition_reads_back_as_it_was_stored() {
                 read.get(member)
             );
         }
+        assert_eq!(
+            read.get("Tags"),
+            Some(&expected_tags(request)),
+            "case {case:?}: expected the read to report Tags {:?}, got {:?}",
+            expected_tags(request),
+            read.get("Tags")
+        );
 
         // A read reports, so a second one answers exactly the same.
         let (status, again) = get(&emulator, "segdom", name).await;
@@ -299,7 +329,9 @@ async fn a_created_segment_definition_reads_back_as_it_was_stored() {
 
 /// RULE: a definition is created from exactly one kind of criteria, so a request carrying
 /// both the segment-group structure and a SQL query, or neither, is refused
-/// `BadRequestException` (400) and nothing is persisted.
+/// `BadRequestException` (400) and nothing is persisted. A request naming NO source is
+/// refused with the service's sentence for it, qualified by the domain and the segment
+/// definition the request addressed.
 #[tokio::test]
 async fn a_segment_definition_is_created_from_exactly_one_kind_of_criteria() {
     let emulator = Emulator::new();
@@ -316,12 +348,12 @@ async fn a_segment_definition_is_created_from_exactly_one_kind_of_criteria() {
             ] }),
         )],
     );
-    let rows: Vec<(&str, &str, Value, &str)> = vec![
+    let rows: Vec<(&str, &str, Value, String)> = vec![
         (
             "neither kind of criteria",
             "No_Criteria",
             json!({ "DisplayName": "no criteria" }),
-            "Either SegmentGroups or SegmentSqlQuery must be provided",
+            no_source_refusal("critdom", "No_Criteria"),
         ),
         (
             "neither kind of criteria, but a sort",
@@ -332,7 +364,13 @@ async fn a_segment_definition_is_created_from_exactly_one_kind_of_criteria() {
                     { "Name": "LastName", "Order": "ASC", "Type": "PROFILE" },
                 ] },
             }),
-            "Either SegmentGroups or SegmentSqlQuery must be provided",
+            no_source_refusal("critdom", "Sort_Only"),
+        ),
+        (
+            "neither kind of criteria, but tags",
+            "Tagged-Only",
+            json!({ "DisplayName": "tagged only", "Tags": { "team": "crm" } }),
+            no_source_refusal("critdom", "Tagged-Only"),
         ),
         (
             "both kinds of criteria",
@@ -342,7 +380,7 @@ async fn a_segment_definition_is_created_from_exactly_one_kind_of_criteria() {
                 "SegmentGroups": groups.clone(),
                 "SegmentSqlQuery": sql,
             }),
-            "SegmentGroups and SegmentSqlQuery cannot both be provided",
+            "SegmentGroups and SegmentSqlQuery cannot both be provided".to_string(),
         ),
     ];
 
@@ -486,7 +524,7 @@ async fn a_segment_definition_name_identifies_one_definition_in_its_domain() {
                 read.get(member)
             );
         }
-        for member in ["Description", "SegmentGroups", "SegmentSqlQuery", "Tags"] {
+        for member in ["Description", "SegmentGroups", "SegmentSqlQuery"] {
             if winner.get(member).is_none() {
                 assert_eq!(
                     read.get(member),
@@ -496,6 +534,13 @@ async fn a_segment_definition_name_identifies_one_definition_in_its_domain() {
                 );
             }
         }
+        assert_eq!(
+            read.get("Tags"),
+            Some(&expected_tags(winner)),
+            "case {case:?}: the refused create must leave Tags {:?}, got {:?}",
+            expected_tags(winner),
+            read.get("Tags")
+        );
 
         // The identity is the PAIR, so the same name in another domain is a different
         // definition, with its own criteria and its own ARN.
@@ -597,6 +642,134 @@ async fn an_absent_domain_or_definition_is_not_found() {
             error_message(&refused),
             expected,
             "case {case:?}: expected {expected:?}, got {:?}",
+            error_message(&refused)
+        );
+    }
+}
+
+/// RULE: both segment-definition projections report the modelled `Tags` map PRESENT — the
+/// map the create carried, and the EMPTY map for a definition carrying none — so a caller
+/// that indexes `Tags` can tell "this definition carries no tags" from "tags were not
+/// reported".
+#[tokio::test]
+async fn both_segment_definition_projections_report_tags_present() {
+    let emulator = Emulator::new();
+    emulator.create_domain("tagdom", 90).await;
+
+    // `CreateSegmentDefinitionRequest$Tags` targets `TagMap`, bounded at 1..50 entries, so
+    // the rows span no `Tags` member at all, one tag, several, and the published maximum.
+    let mut at_the_maximum = serde_json::Map::new();
+    for index in 0..50 {
+        at_the_maximum.insert(format!("key{index:02}"), json!(format!("value{index:02}")));
+    }
+    let rows: Vec<(&str, &str, Option<Value>)> = vec![
+        ("a create carrying no Tags member", "Untagged", None),
+        ("one tag", "One_Tag", Some(json!({ "team": "crm" }))),
+        (
+            "several tags",
+            "Three-Tags",
+            Some(json!({ "team": "crm", "env": "dev", "cost-center": "42" })),
+        ),
+        (
+            "as many tags as the map allows",
+            "Fifty_Tags",
+            Some(Value::Object(at_the_maximum)),
+        ),
+    ];
+
+    for (case, name, tags) in &rows {
+        let mut request = json!({
+            "DisplayName": "a tagged definition",
+            "SegmentSqlQuery": "select profile_id from profiles",
+        });
+        if let Some(tags) = tags {
+            request["Tags"] = tags.clone();
+        }
+        let expected = expected_tags(&request);
+
+        let (status, created) = create(&emulator, "tagdom", name, request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected CreateSegmentDefinition 200, got {status} {created:?}"
+        );
+        assert_eq!(
+            created.get("Tags"),
+            Some(&expected),
+            "case {case:?}: expected the create to report Tags {expected:?}, got {:?}",
+            created.get("Tags")
+        );
+
+        let (status, read) = get(&emulator, "tagdom", name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected GetSegmentDefinition 200, got {status} {read:?}"
+        );
+        assert_eq!(
+            read.get("Tags"),
+            Some(&expected),
+            "case {case:?}: expected the read to report Tags {expected:?}, got {:?}",
+            read.get("Tags")
+        );
+    }
+}
+
+/// RULE: the refusal of a create that names no segment source carries the service's fixed
+/// sentence for a missing source with the request's own `{DomainName}` and
+/// `{SegmentDefinitionName}` labels interpolated, so the identifiers in the message are the
+/// ones the rejected request carried.
+#[tokio::test]
+async fn the_missing_source_refusal_names_the_requested_domain_and_definition() {
+    let emulator = Emulator::new();
+    emulator.create_domain("alpha", 90).await;
+    emulator.create_domain("beta-domain", 90).await;
+
+    // The rows differ along the two variable parts of the sentence: the domain, the
+    // definition name, and the length of each (`name` is bounded at 1..64 characters).
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "a domain and a definition name",
+            "alpha".to_string(),
+            "Missing_Source".to_string(),
+        ),
+        (
+            "another definition name in that domain",
+            "alpha".to_string(),
+            "Another-Missing".to_string(),
+        ),
+        (
+            "the same definition name in another domain",
+            "beta-domain".to_string(),
+            "Missing_Source".to_string(),
+        ),
+        (
+            "the shortest and the longest name the label allows",
+            "a".to_string(),
+            "N".repeat(64),
+        ),
+    ];
+
+    for (case, domain, name) in &rows {
+        let (status, refused) = create(
+            &emulator,
+            domain,
+            name,
+            json!({ "DisplayName": "no source at all" }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {refused:?}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {refused:?}"
+        );
+        let expected = no_source_refusal(domain, name);
+        assert_eq!(
+            error_message(&refused),
+            expected,
+            "case {case:?}: expected the sentence {expected:?}, got {:?}",
             error_message(&refused)
         );
     }

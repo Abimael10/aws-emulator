@@ -73,6 +73,18 @@ impl StoredSegmentDefinition {
             SEGMENT_TYPE_CLASSIC.to_string()
         }
     }
+
+    /// `Tags` as a segment-definition projection reports it: the tag map this definition
+    /// carries, PRESENT and empty for a definition that carries none, exactly as
+    /// [`super::Domain::reported_tags`] reports a domain's.
+    ///
+    /// Unlike the definition's other optional members — `Description`, `SegmentGroups`,
+    /// `SegmentSqlQuery`, `SegmentSort`, each absent from the response when the create did
+    /// not carry it — the tag map is always reported, so a caller that indexes `Tags` can
+    /// tell "this definition carries no tags" from "tags were not reported".
+    pub fn reported_tags(&self) -> Option<HashMap<String, String>> {
+        Some(self.tags.clone().unwrap_or_default())
+    }
 }
 
 /// One segment definition's `SegmentDefinitionArn`: this service's ARN namespace, the
@@ -98,6 +110,18 @@ pub fn segment_definition_arn(
 /// same absent name reads the same whichever of them was called.
 pub fn segment_definition_not_found(segment_definition_name: &str) -> String {
     format!("SegmentDefinition {segment_definition_name} is not found")
+}
+
+/// The `BadRequestException` message for a create that carries NEITHER kind of criteria:
+/// the service's fixed sentence for a request that names no segment source, qualified by
+/// the two identifiers the operation is addressed by — the `{DomainName}` and
+/// `{SegmentDefinitionName}` labels of the request — so a caller issuing many creates can
+/// tell WHICH of them was refused.
+pub fn segment_criteria_required(domain_name: &str, segment_definition_name: &str) -> String {
+    format!(
+        "Must specify either SegmentSqlQuery or SegmentGroups. Domain: {domain_name}, \
+         SegmentDefinitionName: {segment_definition_name}"
+    )
 }
 
 /// The `BadRequestException` message for a segment definition name the domain already

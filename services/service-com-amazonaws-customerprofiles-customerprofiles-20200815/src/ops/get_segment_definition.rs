@@ -178,7 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Everything but `SegmentType` is reported exactly as the create stored it,
         // through the same projection the create answers with; that one member says which
-        // kind of criteria the definition carries, so it follows from the record.
+        // kind of criteria the definition carries, so it follows from the record. The tag
+        // map is reported even when the definition carries none, as an empty map
+        // ([`crate::state::StoredSegmentDefinition::reported_tags`]).
         Ok(GetSegmentDefinitionOutput {
             segment_definition_name: Some(stored.name.clone()),
             segment_definition_arn: stored.arn.clone(),
@@ -189,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             segment_sort: stored.segment_sort.clone(),
             segment_type: Some(stored.segment_type()),
             created_at: Some(crate::state::to_date_time(stored.created_at)),
-            tags: stored.tags.clone(),
+            tags: stored.reported_tags(),
         })
     }
 }

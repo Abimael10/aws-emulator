@@ -175,6 +175,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A definition is built from one kind of criteria, so the pair of criteria
         // members is checked before anything is read from the store.
         if let Some(message) = criteria_violation(
+            &input.domain_name,
+            &input.segment_definition_name,
             input.segment_groups.as_ref(),
             input.segment_sql_query.as_deref(),
         ) {
@@ -234,15 +236,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The response is the record that was just stored, so it is the same definition
-        // the readers serve: every member is reported exactly as it was persisted, the
-        // tag map included, so a definition created with no tags reports none.
+        // the readers serve: every member is reported exactly as it was persisted. The tag
+        // map is the one member reported even when the create carried none, as an empty
+        // map ([`crate::state::StoredSegmentDefinition::reported_tags`]).
         let output = CreateSegmentDefinitionOutput {
             segment_definition_name: stored.name.clone(),
             segment_definition_arn: Some(stored.arn.clone()),
             display_name: Some(stored.display_name.clone()),
             description: stored.description.clone(),
             created_at: Some(crate::state::to_date_time(stored.created_at)),
-            tags: stored.tags.clone(),
+            tags: stored.reported_tags(),
         };
 
         domain
@@ -261,8 +264,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// things about what the segment is, and one carrying neither says nothing about it.
 ///
 /// The sentences name the members a caller has to fix, since the model leaves both
-/// optional and the boundary's constraint walk therefore admits either combination.
+/// optional and the boundary's constraint walk therefore admits either combination. A
+/// request naming NO source is refused with the service's own sentence for it, qualified
+/// by the domain and definition the request addressed
+/// ([`crate::state::segment_criteria_required`]).
 fn criteria_violation(
+    domain_name: &str,
+    segment_definition_name: &str,
     segment_groups: Option<&SegmentGroup>,
     segment_sql_query: Option<&str>,
 ) -> Option<String> {
@@ -270,9 +278,10 @@ fn criteria_violation(
         (true, true) => {
             Some("SegmentGroups and SegmentSqlQuery cannot both be provided".to_string())
         }
-        (false, false) => {
-            Some("Either SegmentGroups or SegmentSqlQuery must be provided".to_string())
-        }
+        (false, false) => Some(crate::state::segment_criteria_required(
+            domain_name,
+            segment_definition_name,
+        )),
         _ => None,
     }
 }
