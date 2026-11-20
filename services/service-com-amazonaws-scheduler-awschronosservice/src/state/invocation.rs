@@ -29,6 +29,19 @@
 //! re-pointed, its group deleted) keeps no due instant, so re-enabling one starts
 //! its series afresh rather than owing the invocations it missed.
 //!
+//! ## When a series opens
+//!
+//! At the instant it STARTS: `StartDate` — "the date, after which the schedule can
+//! begin invoking its target", where "invocations might occur on, or after, the
+//! StartDate you specify" — or, for a schedule stating none, the instant the
+//! schedule was written. The first occurrence is the first instant the expression
+//! names at or after that ([`Schedulable::first_at_or_after`]). A `rate(...)`
+//! expression names an interval and no instant of its own, so the instant the
+//! series opens at is itself the first occurrence of one and the interval is the gap
+//! between occurrences, not a wait before the first; an `at(...)` and a `cron(...)`
+//! expression name their own instants, which that opening instant only bounds. A
+//! series is never backfilled: nothing is owed for the span before it opened.
+//!
 //! ## When this emulator performs an occurrence
 //!
 //! AT the occurrence's own instant — the one the expression names, in the schedule's
@@ -263,28 +276,61 @@ struct Schedulable {
 }
 
 impl Schedulable {
-    /// The first occurrence after `after` that falls inside this schedule's window,
-    /// or `None` when the series has none left.
+    /// The series' FIRST occurrence once it opens at `from`, or `None` when it names
+    /// none inside this schedule's own window.
     ///
-    /// The window is the schedule's: an occurrence before `StartDate` is not one it
-    /// "can begin invoking its target" at, and one at or past `EndDate` is not one
-    /// it "can invoke its target" before. `EndDate` bounds a recurring series only
-    /// — "EventBridge Scheduler ignores StartDate and EndDate for one-time
-    /// schedules" — so an `at(...)` instant is kept whatever those members state.
+    /// A series opens where it STARTS — at `StartDate` when the schedule states one
+    /// ahead of `from`, and otherwise at `from` itself — and its first occurrence is
+    /// the first instant the expression names AT OR AFTER that: "invocations might
+    /// occur on, or after, the StartDate you specify". A `rate(...)` expression
+    /// states an interval and no instant of its own, so the instant the series opens
+    /// at is itself the first occurrence of one ([`Occurrences::next_at_or_after`]) —
+    /// the interval is the gap between occurrences, not a wait before the first.
+    /// An `at(...)` and a `cron(...)` expression name their own instants, so the
+    /// opening instant only bounds which of them comes first.
+    fn first_at_or_after(&self, from: SystemTime) -> Option<SystemTime> {
+        self.inside_window(self.occurrences.next_at_or_after(self.opens_at(from))?)
+    }
+
+    /// The first occurrence after `after` that falls inside this schedule's window,
+    /// or `None` when the series has none left: what the occurrence AFTER the one
+    /// being performed is, counted from that occurrence's own instant.
     fn next_after(&self, after: SystemTime) -> Option<SystemTime> {
-        let one_time = self.occurrences.is_one_time();
-        // `StartDate` is a FLOOR on the series, not an offset into it: the first
-        // occurrence is the first one the expression names at or after that instant
-        // ("invocations might occur on, or after, the StartDate you specify"), so a
-        // schedule armed ahead of time invokes nothing while the window is shut.
-        let next = match self.start {
-            Some(start) if !one_time && start > after => {
-                self.occurrences.next_at_or_after(start)
-            }
-            _ => self.occurrences.next_after(after),
+        let opens = self.opens_at(after);
+        let next = if opens > after {
+            // The series has not opened yet, so what comes next is still its own
+            // first occurrence rather than the one after `after`.
+            self.occurrences.next_at_or_after(opens)
+        } else {
+            self.occurrences.next_after(after)
         }?;
+        self.inside_window(next)
+    }
+
+    /// WHERE this schedule's series counts from, given the reading `from`.
+    ///
+    /// `StartDate` is a FLOOR on the series, not an offset into it — "the date, after
+    /// which the schedule can begin invoking its target" — so a schedule armed ahead
+    /// of time invokes nothing while the window is shut, and one whose floor the clock
+    /// has already passed counts from the reading. `StartDate` bounds a recurring
+    /// series only ("EventBridge Scheduler ignores StartDate and EndDate for one-time
+    /// schedules").
+    fn opens_at(&self, from: SystemTime) -> SystemTime {
+        match self.start {
+            Some(start) if !self.is_one_time() && start > from => start,
+            _ => from,
+        }
+    }
+
+    /// `next` when this schedule's own window admits it, and `None` when it does not.
+    ///
+    /// The window is the schedule's: an occurrence at or past `EndDate` is not one it
+    /// "can invoke its target" before. `EndDate` bounds a recurring series only —
+    /// "EventBridge Scheduler ignores StartDate and EndDate for one-time schedules" —
+    /// so an `at(...)` instant is kept whatever those members state.
+    fn inside_window(&self, next: SystemTime) -> Option<SystemTime> {
         match self.end {
-            Some(end) if !one_time && next >= end => None,
+            Some(end) if !self.is_one_time() && next >= end => None,
             _ => Some(next),
         }
     }
@@ -415,12 +461,15 @@ impl Invocations {
                 .filter(|armed| armed.definition == schedule.definition);
             let Some(armed) = held else {
                 // A schedule this clock has not seen yet, or one whose definition a
-                // write has changed: its next occurrence is computed from now, so
-                // the series a client just asked for starts where the client asked
-                // for it.
+                // write has changed: its series OPENS here, so its first occurrence
+                // is the first instant the expression names at or after this reading
+                // — which for a rate expression, naming an interval and no instant,
+                // is this reading itself. The series a client just asked for
+                // therefore starts where the client asked for it rather than one
+                // period later.
                 known.insert(
                     schedule.arn.clone(),
-                    match schedule.next_after(now) {
+                    match schedule.first_at_or_after(now) {
                         Some(nominal) => armed_for(schedule, nominal),
                         None => exhausted(schedule, now),
                     },
@@ -1594,7 +1643,9 @@ mod tests {
 
     /// The first `count` invocations the clock makes for `record` from `now`: each
     /// occurrence's own instant paired with the instant the invocation for it is
-    /// made at, stepped exactly as [`Invocations::take_due`] steps the series.
+    /// made at, stepped exactly as [`Invocations::take_due`] steps the series — the
+    /// first occurrence from where the series OPENS, each one after it from the
+    /// occurrence before.
     fn planned(
         record: &ScheduleRecord,
         now: SystemTime,
@@ -1604,20 +1655,27 @@ mod tests {
             return Vec::new();
         };
         let mut planned = Vec::new();
-        let mut from = now;
+        let mut last: Option<SystemTime> = None;
         for _ in 0..count {
-            let Some(nominal) = schedule.next_after(from) else {
+            let next = match last {
+                Some(previous) => schedule.next_after(previous),
+                None => schedule.first_at_or_after(now),
+            };
+            let Some(nominal) = next else {
                 break;
             };
             planned.push((nominal, invocation_instant(&schedule, nominal)));
-            from = nominal;
+            last = Some(nominal);
         }
         planned
     }
 
     /// A series runs on the cadence its own expression states, against the server
-    /// clock: the rows differ along the FORM of the expression, the rate value and
-    /// unit, and the zone a cron expression is read in.
+    /// clock, and opens where it starts: the rows differ along the FORM of the
+    /// expression, the rate value and unit, and the zone a cron expression is read
+    /// in. A rate series' first occurrence is the reading the series opens at — the
+    /// interval is the gap between occurrences — while a cron and an at expression
+    /// name their own instants.
     #[test]
     fn a_series_runs_on_the_cadence_its_expression_states() {
         // 2030-01-01T00:00:30Z: half a minute past a minute boundary, so a cron
@@ -1629,31 +1687,31 @@ mod tests {
                 "a rate of one minute",
                 "rate(1 minute)",
                 None,
-                &[1_893_456_090, 1_893_456_150, 1_893_456_210],
+                &[1_893_456_030, 1_893_456_090, 1_893_456_150],
             ),
             (
                 "a rate of two minutes",
                 "rate(2 minutes)",
                 None,
-                &[1_893_456_150, 1_893_456_270, 1_893_456_390],
+                &[1_893_456_030, 1_893_456_150, 1_893_456_270],
             ),
             (
                 "a rate of fifteen minutes",
                 "rate(15 minutes)",
                 None,
-                &[1_893_456_930, 1_893_457_830],
+                &[1_893_456_030, 1_893_456_930],
             ),
             (
                 "a rate of hours",
                 "rate(2 hours)",
                 None,
-                &[1_893_463_230, 1_893_470_430],
+                &[1_893_456_030, 1_893_463_230],
             ),
             (
                 "a rate of days",
                 "rate(1 day)",
                 None,
-                &[1_893_542_430, 1_893_628_830],
+                &[1_893_456_030, 1_893_542_430],
             ),
             (
                 "a cron naming every minute",
@@ -1763,24 +1821,24 @@ mod tests {
                 &[1_893_571_200],
             ),
             (
-                "a StartDate behind the clock bounds nothing",
+                "a StartDate behind the clock bounds nothing, so the series opens at the clock",
                 "rate(1 minute)",
                 Some(1_893_452_430),
                 None,
-                &[1_893_456_090, 1_893_456_150],
+                &[1_893_456_030, 1_893_456_090],
             ),
             (
                 "a recurring series stops before its EndDate",
                 "rate(1 minute)",
                 None,
                 Some(1_893_456_180),
-                &[1_893_456_090, 1_893_456_150],
+                &[1_893_456_030, 1_893_456_090, 1_893_456_150],
             ),
             (
-                "an EndDate that admits no occurrence at all",
+                "an EndDate the series opens past admits no occurrence at all",
                 "rate(1 minute)",
                 None,
-                Some(1_893_456_040),
+                Some(1_893_456_020),
                 &[],
             ),
             (

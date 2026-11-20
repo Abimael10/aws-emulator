@@ -484,8 +484,9 @@ const ROWS: &[Row] = &[
         expression: || "rate(1 minute)".to_string(),
         state: "ENABLED",
         start_in: None,
-        // One period on is inside the window, two periods on is not.
-        end_in: Some(90),
+        // The series opens at the write, so its first occurrence is inside the
+        // window; the next falls one period on, past this EndDate.
+        end_in: Some(30),
         expected: Expected::Exactly(1),
     },
 ];

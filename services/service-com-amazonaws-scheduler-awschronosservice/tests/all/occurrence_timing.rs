@@ -367,9 +367,9 @@ async fn the_stated_action_is_applied_once_the_schedule_has_completed() {
         )
         .await;
         let name = format!("completed-{index}");
-        // A recurring row's window closes before its first occurrence, so it
-        // completes at its `EndDate` with its last occurrence behind it; a one-time
-        // row completes at the occurrence it invokes.
+        // A recurring row's window closes one period after its series opens, so its
+        // only occurrence is the one the series opens at and it completes at its
+        // `EndDate`; a one-time row completes at the occurrence it invokes.
         let end_date = seconds_from_now(6);
         let mut body = json!({
             "ScheduleExpression": if row.recurring {
@@ -390,13 +390,20 @@ async fn the_stated_action_is_applied_once_the_schedule_has_completed() {
         given_schedule(&emulator, case, &name, body).await;
 
         if row.recurring {
-            // Nothing is invoked at all: the window holds no occurrence of a
-            // one-minute cadence.
+            // One occurrence only: the series opens at the write and is invoked
+            // there, and the next falls a period on, past the window's own end.
+            let delivery = awaited_delivery(&emulator, &url, DELIVERY_SLACK).await;
+            assert!(
+                delivery.is_some(),
+                "case {case:?}: the occurrence the series opens at was never delivered, so the \
+                 schedule never completed"
+            );
+            drain(&emulator, &url).await;
             tokio::time::sleep(Duration::from_secs(8)).await;
             let held = peek(&emulator, &url).await;
             assert!(
                 held.is_empty(),
-                "case {case:?}: expected no occurrence inside a window shorter than the \
+                "case {case:?}: expected no second occurrence inside a window shorter than the \
                  cadence, got {held:?}"
             );
         } else {
