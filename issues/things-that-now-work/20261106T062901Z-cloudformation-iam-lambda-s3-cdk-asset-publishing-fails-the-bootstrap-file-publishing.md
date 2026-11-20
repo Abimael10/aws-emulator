@@ -27,3 +27,26 @@ Actual (emulator): rc=1 with `fail: User: arn:aws:sts::<account>:assumed-role/cd
 ## Steps to Reproduce
 1. Replay the behavioral suite and re-run cloudformation__iam__lambda__s3.cdk-bootstrap-asset-deploy-is-content-addressed.
 2. Equivalently: run `cdk bootstrap`, then `cdk deploy` on a stack with a Lambda whose code is a local asset; or sts:AssumeRole into the generated file-publishing role and call s3:ListObjectsV2 on the assets bucket.
+
+## Resolution
+
+The one cause of this report is resolved against the current code base: a bucket-level Amazon
+S3 call made by an assumed-role session is decided over the bucket's own ARN against the
+identity-based statements the account holds for the role, so the publishing grant's wildcard
+action family (`s3:List*` over the staging bucket and its objects) authorizes the
+`HeadBucket`/`ListObjectsV2` preflight, the assets publish and the deploy settles. Replay of
+`cloudformation__iam__lambda__s3.cdk-bootstrap-asset-deploy-is-content-addressed`: passed.
+
+What this change adds is the suite that pins that rule rather than the one recorded request:
+`core/router/tests/all/s3_bucket_level_grant_authorizes_a_publishing_session.rs` drives a
+table of identity-based statements — the wildcard action family, the exact action names, the
+service-wide wildcard, the names in another case, names covering neither call, and the
+`Resource` element naming the bucket, its objects, both, every resource or another bucket —
+through three bucket-level calls and two object calls per row, and asserts the 403
+`AccessDenied` sentence (principal, action, addressed ARN, reason) for every refusal that
+answers a body. A second test withdraws the grant with `DeleteRolePolicy` and shows the same
+session refused the calls it was being served, so the decision is taken from the documents in
+force and not from the credential.
+
+The other half of the same chain — a stack DECLARING such a grant really embedding it in the
+role — is pinned by `core/router/tests/all/cloudformation_asset_bucket_publishing_role.rs`.
