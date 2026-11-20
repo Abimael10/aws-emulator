@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !crate::state::is_identity_center_domain(&stored.domain) {
                 return Err(SearchPrincipalsErrorModeled::ValidationException(
                     ValidationException {
-                        message: crate::state::not_identity_center_message(&input.domain_id),
+                        message: crate::state::NOT_IDENTITY_CENTER_MESSAGE.to_string(),
                         error_code: None,
                     },
                 )

@@ -87,6 +87,7 @@ const ESSENTIAL_CONTAINER_EXITED: &str = "EssentialContainerExited";
 const CANNOT_PULL: &str = "CannotPullContainerError";
 
 /// The clause a refusal carries when the REPOSITORY's own policy denies the call the pull makes:
+/// The clause a refusal carries when the REPOSITORY's own policy denies the call the pull makes:
 /// the HTTP status the registry answered the manifest request with.
 ///
 /// What the task reports for such a pull is the container agent's own account of it — the ECS

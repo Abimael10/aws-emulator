@@ -641,20 +641,25 @@ async fn only_a_domain_configured_with_identity_center_is_searched() {
                 status, 400,
                 "case {case:?}: expected HTTP 400 over the wire, got {status}: {rendered:?}"
             );
-            // The sentence is written out here, with only the domain id interpolated from the
-            // request, so a change to the wording is visible in this test rather than
-            // following the implementation.
-            let expected = format!(
-                "Domain '{domain_id}' is not configured with Identity Center. SearchPrincipals \
-                 requires a domain whose identityProviders include IDC."
-            );
+            // The sentence is written out here, in full, so a change to the wording is
+            // visible in this test rather than following the implementation. It is wholly
+            // fixed text: no part of it comes from the request, so the refusal a caller
+            // matches is the same for every domain in this state — which the rows below
+            // check by pinning it per domain id.
+            let expected = "Domain does not have an IdC application ARN configured. The domain \
+                            must be provisioned with Identity Center before this operation can \
+                            proceed.";
             assert!(
-                rendered.contains(&expected),
+                rendered.contains(expected),
                 "case {case:?}: expected the refusal to state {expected:?}, got {rendered:?}"
             );
+            assert!(
+                !rendered.contains(&domain_id) && !rendered.contains("SearchPrincipals requires"),
+                "case {case:?}: the refusal must name neither the domain id nor the operation, \
+                 got {rendered:?}"
+            );
             assert_eq!(
-                omni::state::not_identity_center_message(&domain_id),
-                expected,
+                omni::state::NOT_IDENTITY_CENTER_MESSAGE, expected,
                 "case {case:?}: the store's one wording of this refusal must be the sentence \
                  this test pins"
             );

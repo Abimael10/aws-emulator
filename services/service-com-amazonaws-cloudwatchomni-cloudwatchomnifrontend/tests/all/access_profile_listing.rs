@@ -12,13 +12,15 @@
 //! order, projected onto the modelled summary shape, cut into pages of at most
 //! `maxResults` with a `nextToken` exactly while records remain. So:
 //!
-//! * the page carries the space's own profiles, in creation order, and nothing of
+//! * the page carries the space's own profiles — the one the service provisioned with
+//!   the space and then the ones a caller created — in creation order, and nothing of
 //!   another space;
 //! * each `AccessProfileSummary` member agrees with the profile `GetAccessProfile`
 //!   answers with — the summary is a projection, never a separate record;
 //! * every page size from one up to past the collection walks the same order and yields
 //!   every profile exactly once;
-//! * a space holding no profile lists an empty page with no token;
+//! * a space holding no profile of its own lists exactly the profile it was provisioned
+//!   with, with no token;
 //! * listing changes nothing: the same request twice answers the same page, and a
 //!   following `GetAccessProfile` still answers;
 //! * a space the store does not hold is the modelled 404, and a `nextToken` this
@@ -52,7 +54,7 @@ use omni::ops::types::{
     GetAccessProfileInput, GetAccessProfileOutput, ListAccessProfilesInput,
     ListAccessProfilesOutput, LIST_ACCESS_PROFILES_INPUT_SCHEMA,
 };
-use omni::state::ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED;
+use omni::state::{ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED, ACCESS_PROFILE_TYPE_SERVICE_MANAGED};
 
 /// The region the suite signs for; the handlers record the signed region on each
 /// resource, so every ARN below is expected to carry it.
@@ -347,9 +349,36 @@ fn profile_fields(
     )
 }
 
-/// Seed `space_id` with [`profile_rows`] and answer the ids in creation order.
+/// The id of the access profile `space_id` was PROVISIONED with: creating a space writes
+/// the one SERVICE_MANAGED profile the service owns for it, so it is the first record of
+/// every listing of that space.
+async fn provisioned_profile(omni: &Omni, space_id: &str) -> String {
+    let page = omni
+        .list_access_profiles(&ListAccessProfilesInput {
+            space_id: space_id.to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("the new space lists");
+    let provisioned: Vec<&AccessProfileSummary> = page
+        .items
+        .iter()
+        .filter(|item| item.profile_type.as_deref() == Some(ACCESS_PROFILE_TYPE_SERVICE_MANAGED))
+        .collect();
+    assert_eq!(
+        provisioned.len(),
+        1,
+        "expected the new space to hold exactly one provisioned profile, got {:?}",
+        page.items
+    );
+    provisioned[0].profile_id.clone()
+}
+
+/// Seed `space_id` with [`profile_rows`] and answer the ids of every profile the space
+/// then holds, in creation order — the provisioned one first, because the service wrote
+/// it when the space was created.
 async fn seed(omni: &Omni, space_id: &str) -> Vec<String> {
-    let mut created = Vec::new();
+    let mut created = vec![provisioned_profile(omni, space_id).await];
     for row in profile_rows() {
         created.push(
             omni.create_access_profile(&CreateAccessProfileInput {
@@ -376,6 +405,7 @@ async fn the_listing_reports_one_space_in_creation_order_as_summaries() {
 
     let created = seed(&omni, &space_id).await;
     let names: Vec<String> = profile_rows().into_iter().map(|row| row.name).collect();
+    let other_provisioned = provisioned_profile(&omni, &other_space).await;
     // A profile of ANOTHER space, created under a name this space also holds: no page
     // of this space may carry it.
     let elsewhere = omni
@@ -411,8 +441,9 @@ async fn the_listing_reports_one_space_in_creation_order_as_summaries() {
     );
 
     // The summary is a projection of the record `GetAccessProfile` answers with, so
-    // every member it declares agrees with that profile — and `profileType` is the
-    // documented value for a customer-created profile.
+    // every member it declares agrees with that profile — and `profileType` names who
+    // manages it: the service for the profile the space was provisioned with, the
+    // customer for the ones a caller created.
     for (index, item) in page.items.iter().enumerate() {
         let full = omni
             .get_access_profile(&space_id, &created[index])
@@ -425,17 +456,23 @@ async fn the_listing_reports_one_space_in_creation_order_as_summaries() {
             "case {:?}: the summary disagrees with the profile {full:?}",
             item.name
         );
+        let expected_type = if index == 0 {
+            ACCESS_PROFILE_TYPE_SERVICE_MANAGED
+        } else {
+            ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED
+        };
         assert_eq!(
             item.profile_type.as_deref(),
-            Some(ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED),
-            "case {:?}: expected profileType {ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED}, got {:?}",
+            Some(expected_type),
+            "case {:?}: expected profileType {expected_type}, got {:?}",
             item.name,
             item.profile_type
         );
     }
 
-    // A listing is scoped to the space it names: the other space lists its own profile
-    // and nothing of this one's, though both hold that name.
+    // A listing is scoped to the space it names: the other space lists the profile it
+    // was provisioned with and the one created in it, and nothing of this space's,
+    // though both hold that name.
     let other = omni
         .list_access_profiles(&ListAccessProfilesInput {
             space_id: other_space.clone(),
@@ -449,7 +486,7 @@ async fn the_listing_reports_one_space_in_creation_order_as_summaries() {
             .iter()
             .map(|item| item.profile_id.clone())
             .collect::<Vec<String>>(),
-        vec![elsewhere.clone()],
+        vec![other_provisioned.clone(), elsewhere.clone()],
         "the other space listed {:?}",
         other.items
     );
@@ -463,7 +500,7 @@ async fn every_page_size_walks_the_same_order_exactly_once() {
 
     // Rows: a page smaller than the collection, one page short of it, exactly it, one
     // past it, and the modelled maximum `maxResults` admits.
-    for page_size in [1, 2, 4, 5, 6, 100] {
+    for page_size in [1, 2, 4, 5, 6, 7, 100] {
         let mut walked: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
         loop {
@@ -496,19 +533,28 @@ async fn every_page_size_walks_the_same_order_exactly_once() {
         );
     }
 
-    // A space holding no profile is an empty page with no token, not a refusal.
+    // A space nobody has created a profile in holds exactly the one it was provisioned
+    // with, in one page with no token — not a refusal and not an empty page.
     let empty_space = omni.space("empty", "profile-pages-empty").await;
+    let only_provisioned = provisioned_profile(&omni, &empty_space).await;
     let empty = omni
         .list_access_profiles(&ListAccessProfilesInput {
             space_id: empty_space.clone(),
             ..Default::default()
         })
         .await
-        .expect("an empty space lists");
+        .expect("a space with no created profile lists");
     assert_eq!(
-        (empty.items.len(), empty.next_token.clone()),
-        (0, None),
-        "an empty space listed {:?}",
+        (
+            empty
+                .items
+                .iter()
+                .map(|item| item.profile_id.clone())
+                .collect::<Vec<String>>(),
+            empty.next_token.clone(),
+        ),
+        (vec![only_provisioned], None),
+        "a space with no created profile listed {:?}",
         empty.items
     );
 }

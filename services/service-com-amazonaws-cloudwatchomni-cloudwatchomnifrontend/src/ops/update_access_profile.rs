@@ -189,6 +189,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Who manages the profile decides whether it may be patched: `AccessProfileType`'s
+        // SERVICE_MANAGED doc reads "Provisioned and owned by the service", so a row the
+        // service provisioned is not the caller's to change. Answered before anything is
+        // written, so the profile keeps the description and name it was provisioned with.
+        if crate::state::is_service_managed_profile(&stored.profile) {
+            return Err(UpdateAccessProfileErrorModeled::ConflictException(
+                crate::state::service_managed_conflict(
+                    crate::state::CONFLICT_TYPE_NOT_UPDATABLE,
+                    crate::state::SERVICE_MANAGED_PROFILE_NOT_UPDATABLE,
+                    &input.profile_id,
+                    crate::state::ACCESS_PROFILE_RESOURCE_TYPE,
+                ),
+            )
+            .into());
+        }
+
         // The conflict is answered before anything is written, so a refused patch leaves
         // the profile exactly as it was.
         if let Some((requested, existing_id)) = conflicting {

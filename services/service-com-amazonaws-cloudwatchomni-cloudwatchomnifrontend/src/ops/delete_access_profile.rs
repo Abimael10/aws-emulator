@@ -150,6 +150,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(DeleteAccessProfileOutput {});
         }
 
+        // Who manages the profile decides whether it may go: `AccessProfileType`'s
+        // SERVICE_MANAGED doc reads "Provisioned and owned by the service. Cannot be
+        // deleted by customers." Asked before the in-use check, because the answer is
+        // about the row's own ownership rather than about what references it.
+        let service_managed = store
+            .access_profiles
+            .get(&input.profile_id)
+            .is_some_and(|stored| crate::state::is_service_managed_profile(&stored.profile));
+        if service_managed {
+            drop(store);
+            audit(ctx, &input.space_id, &input.profile_id, "refused_service_managed");
+            return Err(DeleteAccessProfileErrorModeled::ConflictException(
+                crate::state::service_managed_conflict(
+                    crate::state::CONFLICT_TYPE_NOT_DELETABLE,
+                    crate::state::SERVICE_MANAGED_PROFILE_NOT_DELETABLE,
+                    &input.profile_id,
+                    crate::state::ACCESS_PROFILE_RESOURCE_TYPE,
+                ),
+            )
+            .into());
+        }
+
         // "An access profile cannot be deleted while access grants reference it": the
         // grants are resolved from the store, so the refusal names the ones the caller
         // has to remove first.

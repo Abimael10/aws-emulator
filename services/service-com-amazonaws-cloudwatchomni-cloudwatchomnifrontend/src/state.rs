@@ -17,12 +17,11 @@
 use std::collections::HashMap;
 
 use crate::ops::types::{
-    AccessGrant, AccessGrantPrincipal, AccessProfile, AccessProfileSummary, Alert, AlertStateInfo,
-    Domain,
-    EncryptionConfiguration, IdentityProviderConfiguration, NotificationRule, OmniDashboard,
-    OmniDashboardSummary, Rule, Space, SpaceSummary, ALERT_STATE_VALUES, COMPARATOR_VALUES,
-    ENCRYPTION_STRATEGY_VALUES, NOTIFICATION_TARGET_TYPE_VALUES, QUERY_LANGUAGE_VALUES,
-    THRESHOLD_MODE_VALUES,
+    AccessGrant, AccessGrantPrincipal, AccessGrantSummary, AccessProfile, AccessProfileSummary,
+    Alert, AlertStateInfo, Domain, EncryptionConfiguration, IdentityProviderConfiguration,
+    NotificationRule, OmniDashboard, OmniDashboardSummary, Rule, Space, SpaceSummary,
+    ALERT_STATE_VALUES, COMPARATOR_VALUES, ENCRYPTION_STRATEGY_VALUES,
+    NOTIFICATION_TARGET_TYPE_VALUES, QUERY_LANGUAGE_VALUES, THRESHOLD_MODE_VALUES,
 };
 
 /// The region a resource is recorded in when the request carries no SigV4
@@ -656,6 +655,31 @@ impl ComAmazonawsCloudwatchomniCloudwatchomnifrontendState {
             .find(|stored| stored.space_id == space_id && stored.dashboard.name == name)
     }
 
+    /// Every stored access grant that matches every filter the request supplied, in
+    /// creation order, skipping everything at or before `after_seq`.
+    ///
+    /// `ListAccessGrants`'s own doc states the rule: "optional filtering by domain,
+    /// space, principal, or permission. A grant is returned only when it matches every
+    /// filter supplied" — so a filter the request omits restricts nothing, and the ones
+    /// it supplies are conjunctive. Each filter is compared against the member of the
+    /// grant that carries the same thing.
+    ///
+    /// Linear in the number of stored grants, which [`ACCESS_GRANT_QUOTA`] bounds.
+    pub fn access_grants_after(
+        &self,
+        filters: &AccessGrantFilters<'_>,
+        after_seq: u64,
+    ) -> Vec<&StoredAccessGrant> {
+        let mut selected: Vec<&StoredAccessGrant> = self
+            .access_grants
+            .values()
+            .filter(|stored| stored.seq > after_seq)
+            .filter(|stored| filters.matches(&stored.grant))
+            .collect();
+        selected.sort_by_key(|stored| stored.seq);
+        selected
+    }
+
     /// Whether any stored space still belongs to `domain_id`.
     ///
     /// Linear in the number of stored spaces, which [`SPACE_QUOTA`] bounds.
@@ -1163,6 +1187,65 @@ pub fn access_profile_summary(profile: &AccessProfile) -> AccessProfileSummary {
     }
 }
 
+/// Project a stored access grant into the `AccessGrantSummary` the list operation
+/// returns.
+///
+/// Every `AccessGrantSummary` member is a member of `AccessGrant` with the same name —
+/// the summary's doc reads "Summary of an AccessGrant. Call GetAccessGrant for the full
+/// grant" — so the projection is a copy of exactly those members, and a summary never
+/// reports a value the full grant does not. The members the summary leaves out (the
+/// owning account, the timestamps, who created it and its scoped actions) are what
+/// `GetAccessGrant` is for.
+pub fn access_grant_summary(grant: &AccessGrant) -> AccessGrantSummary {
+    AccessGrantSummary {
+        grant_id: grant.grant_id.clone(),
+        grant_arn: grant.grant_arn.clone(),
+        name: grant.name.clone(),
+        domain_id: grant.domain_id.clone(),
+        principal: grant.principal.clone(),
+        permission: grant.permission.clone(),
+        grant_type: grant.grant_type.clone(),
+        space_id: grant.space_id.clone(),
+    }
+}
+
+/// Which stored access grants a listing reports: the filters `ListAccessGrants` declares,
+/// each `None` when the request omitted it.
+///
+/// One structure rather than a parameter list, because the filters are one thing: the
+/// conjunction a grant has to satisfy to be reported. The page token carries only the
+/// cursor, so the filters come from the request that asks for the page — which is what
+/// `nextToken`'s own model doc asks of the caller ("Supply the same filters used on the
+/// request that returned it").
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AccessGrantFilters<'a> {
+    /// Report only grants of this domain.
+    pub domain_id: Option<&'a str>,
+    /// Report only grants that apply to this space.
+    pub space_id: Option<&'a str>,
+    /// Report only grants held by this principal id.
+    pub principal_id: Option<&'a str>,
+    /// Report only grants held by a principal of this type.
+    pub principal_type: Option<&'a str>,
+    /// Report only grants carrying this permission.
+    pub permission: Option<&'a str>,
+}
+
+impl AccessGrantFilters<'_> {
+    /// Whether `grant` matches every filter supplied.
+    pub fn matches(&self, grant: &AccessGrant) -> bool {
+        self.domain_id.is_none_or(|id| grant.domain_id == id)
+            && self.space_id.is_none_or(|id| grant.space_id == id)
+            && self
+                .principal_id
+                .is_none_or(|id| grant.principal.principal_id.as_deref() == Some(id))
+            && self
+                .principal_type
+                .is_none_or(|kind| grant.principal.principal_type == kind)
+            && self.permission.is_none_or(|level| grant.permission == level)
+    }
+}
+
 /// The state an alert reports when its last evaluation produced no data.
 ///
 /// `NoData`'s model doc: it "Configures how the alert reacts when an evaluation produces
@@ -1368,6 +1451,23 @@ mod view_definition;
 /// projections above are reads of this one's.
 mod principal_search;
 
+/// The access profile and the access grants the SERVICE provisions for a space, and what
+/// a call that would change one of them is answered with. It lives beside the store
+/// because the rows it provisions are the store's own, read back by every operation that
+/// reads a profile or a grant.
+mod service_managed;
+
+pub use service_managed::{
+    agent_principal_id, is_service_managed_grant, is_service_managed_profile,
+    service_managed_conflict, service_principal, ACCESS_GRANT_PERMISSION_SPACE_ADMIN,
+    ACCESS_GRANT_PRINCIPAL_TYPE_AGENT, ACCESS_GRANT_PRINCIPAL_TYPE_IAM_ROOT,
+    ACCESS_GRANT_TYPE_SERVICE_MANAGED, ACCESS_PROFILE_TYPE_SERVICE_MANAGED,
+    AGENT_ASSUME_GRANT_NAME, AGENT_PRINCIPAL_ID_PREFIX, ASYNC_WORKFLOWS_PROFILE_NAME,
+    CONFLICT_TYPE_NOT_DELETABLE, CONFLICT_TYPE_NOT_UPDATABLE,
+    SERVICE_MANAGED_GRANT_NOT_DELETABLE, SERVICE_MANAGED_PROFILE_NOT_DELETABLE,
+    SERVICE_MANAGED_PROFILE_NOT_UPDATABLE, SPACE_ADMIN_GRANT_NAME,
+};
+
 /// How a refusal names a resource the store holds nothing under. It lives beside the
 /// store because every operation that addresses one of those resources reports the same
 /// miss for it.
@@ -1388,8 +1488,9 @@ pub use resource_not_found::{
 pub use view_definition::{view_definition_rejection, INVALID_VIEW_DEFINITION};
 
 pub use principal_search::{
-    identity_center_principals, is_identity_center_domain, not_identity_center_message,
-    principal_matches, PRINCIPAL_TYPE_GROUP, PRINCIPAL_TYPE_USER, SEARCH_ALL_PRINCIPALS,
+    identity_center_principals, is_identity_center_domain, principal_matches,
+    NOT_IDENTITY_CENTER_MESSAGE, PRINCIPAL_TYPE_GROUP, PRINCIPAL_TYPE_USER,
+    SEARCH_ALL_PRINCIPALS,
 };
 
 pub use dashboard_body::{
@@ -1472,6 +1573,20 @@ pub fn encode_access_profile_page_token(seq: u64) -> String {
 /// service minted for an access profile listing.
 pub fn decode_access_profile_page_token(token: &str) -> Option<u64> {
     decode_page_token(ACCESS_PROFILE_PAGE_TOKEN_PREFIX, token)
+}
+
+/// The prefix an access-grant-list page token carries, for the same reason.
+const ACCESS_GRANT_PAGE_TOKEN_PREFIX: &str = "access-grants:";
+
+/// Mint the opaque `nextToken` that resumes an access grant listing after `seq`.
+pub fn encode_access_grant_page_token(seq: u64) -> String {
+    encode_page_token(ACCESS_GRANT_PAGE_TOKEN_PREFIX, seq)
+}
+
+/// Read an access-grant-list `nextToken` back, or `None` when it is not one this service
+/// minted for an access grant listing.
+pub fn decode_access_grant_page_token(token: &str) -> Option<u64> {
+    decode_page_token(ACCESS_GRANT_PAGE_TOKEN_PREFIX, token)
 }
 
 /// The prefix a view-list page token carries, for the same reason.

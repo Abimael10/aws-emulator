@@ -128,6 +128,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.spaces.remove(&input.space_id);
+        // The access control the service provisioned WITH this space goes with it:
+        // nothing can address those rows once the space is gone.
+        store.release_space_access_control(&input.space_id);
         // The create token that minted this space no longer names a live resource, so a
         // later replay of that create must mint a new space rather than resurrect this one.
         store

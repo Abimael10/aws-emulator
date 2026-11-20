@@ -689,7 +689,10 @@ async fn the_access_profile_store_is_bounded_and_refuses_past_its_quota() {
     // duplicate-name conflict.
     let omni = Omni::new();
     let space_id = omni.space("quota", "profile-quota").await;
-    for index in 0..ACCESS_PROFILE_QUOTA {
+    // Creating the space provisioned the one access profile the service owns for it, so
+    // the store already holds a record before the loop: the bound counts every profile
+    // the store holds, whoever wrote it.
+    for index in 0..ACCESS_PROFILE_QUOTA - 1 {
         omni.create_access_profile(&create_input(&space_id, &format!("quota-{index}")))
             .await
             .unwrap_or_else(|error| panic!("profile {index} within the quota failed: {error:?}"));

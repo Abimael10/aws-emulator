@@ -23,7 +23,15 @@
 //!   `ValidationException`;
 //! * a grant whose scoped actions apply to an access profile is recorded against that
 //!   profile, which is what `AccessProfile.assumeStatus` reports to a principal that does
-//!   not own the profile.
+//!   not own the profile;
+//! * creating a space PROVISIONS the access control the service owns for it — one
+//!   SERVICE_MANAGED access profile and two SERVICE_MANAGED grants, in the same store
+//!   every reader of a profile or a grant reads — a call that would update or delete one
+//!   of those rows is refused with the modelled `ConflictException`, and deleting the
+//!   space releases them;
+//! * `ListAccessGrants` reports the grants matching every filter supplied, in creation
+//!   order, cut into pages of at most `maxResults` with a `nextToken` exactly while
+//!   grants remain.
 //!
 //! Each assertion names its case and the actual value, so a failure identifies the row
 //! of the table that broke.
@@ -45,17 +53,35 @@ use omni::ops::create_access_grant::{CreateAccessGrant, CreateAccessGrantError};
 use omni::ops::create_access_profile::CreateAccessProfile;
 use omni::ops::create_domain::CreateDomain;
 use omni::ops::create_space::CreateSpace;
+use omni::ops::delete_access_grant::{DeleteAccessGrant, DeleteAccessGrantError};
+use omni::ops::delete_access_profile::{DeleteAccessProfile, DeleteAccessProfileError};
+use omni::ops::delete_space::DeleteSpace;
 use omni::ops::get_access_grant::{GetAccessGrant, GetAccessGrantError};
-use omni::ops::get_access_profile::GetAccessProfile;
+use omni::ops::get_access_profile::{GetAccessProfile, GetAccessProfileError};
+use omni::ops::list_access_grants::{ListAccessGrants, ListAccessGrantsError};
+use omni::ops::list_access_profiles::{ListAccessProfiles, ListAccessProfilesError};
+use omni::ops::update_access_profile::{UpdateAccessProfile, UpdateAccessProfileError};
 use omni::ops::types::{
-    AccessGrant, AccessGrantPrincipal, AccessGrantPrincipalAttribute, CreateAccessGrantInput,
-    CreateAccessGrantOutput, CreateAccessProfileInput, CreateDomainInput, CreateSpaceInput,
-    GetAccessGrantInput, GetAccessGrantOutput, GetAccessProfileInput, ResourceScope, ScopedActions,
-    CREATE_ACCESS_GRANT_INPUT_SCHEMA, GET_ACCESS_GRANT_INPUT_SCHEMA,
+    AccessGrant, AccessGrantPrincipal, AccessGrantPrincipalAttribute, AccessGrantSummary,
+    AccessProfileSummary, CreateAccessGrantInput, CreateAccessGrantOutput,
+    CreateAccessProfileInput, CreateDomainInput, CreateSpaceInput, DeleteAccessGrantInput,
+    DeleteAccessGrantOutput, DeleteAccessProfileInput, DeleteAccessProfileOutput, DeleteSpaceInput,
+    GetAccessGrantInput, GetAccessGrantOutput, GetAccessProfileInput, GetAccessProfileOutput,
+    ListAccessGrantsInput, ListAccessGrantsOutput, ListAccessProfilesInput,
+    ListAccessProfilesOutput, ResourceScope, ScopedActions, UpdateAccessProfileInput,
+    UpdateAccessProfileOutput, CREATE_ACCESS_GRANT_INPUT_SCHEMA, DELETE_ACCESS_GRANT_INPUT_SCHEMA,
+    DELETE_ACCESS_PROFILE_INPUT_SCHEMA, GET_ACCESS_GRANT_INPUT_SCHEMA,
+    LIST_ACCESS_GRANTS_INPUT_SCHEMA, UPDATE_ACCESS_PROFILE_INPUT_SCHEMA,
 };
 use omni::state::{
-    ACCESS_GRANT_TYPE_CUSTOMER_MANAGED, ACCESS_PROFILE_RESOURCE_TYPE, ASSUME_STATUS_ALLOWED,
-    ASSUME_STATUS_DENIED,
+    agent_principal_id, ACCESS_GRANT_PERMISSION_SPACE_ADMIN, ACCESS_GRANT_PRINCIPAL_TYPE_AGENT,
+    ACCESS_GRANT_PRINCIPAL_TYPE_IAM_ROOT, ACCESS_GRANT_TYPE_CUSTOMER_MANAGED,
+    ACCESS_GRANT_TYPE_SERVICE_MANAGED, ACCESS_PROFILE_RESOURCE_TYPE,
+    ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED, ACCESS_PROFILE_TYPE_SERVICE_MANAGED,
+    AGENT_ASSUME_GRANT_NAME, ASSUME_STATUS_ALLOWED, ASSUME_STATUS_DENIED,
+    ASYNC_WORKFLOWS_PROFILE_NAME, SERVICE_MANAGED_GRANT_NOT_DELETABLE,
+    SERVICE_MANAGED_PROFILE_NOT_DELETABLE, SERVICE_MANAGED_PROFILE_NOT_UPDATABLE,
+    SPACE_ADMIN_GRANT_NAME,
 };
 
 /// The region the suite signs for; the handlers record the signed region on each
@@ -1204,5 +1230,993 @@ async fn the_access_grant_lifecycle_over_the_rpcv2cbor_wire() {
     assert!(
         rendered.contains("ValidationException"),
         "the wire refusal does not name ValidationException: {rendered:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The access control a space is PROVISIONED with: the rows the service owns,
+// what refuses a caller that would change them, and what releases them.
+// ---------------------------------------------------------------------------
+
+/// The operations this part of the suite drives beyond the ones above.
+impl Omni {
+    async fn list_access_profiles(
+        &self,
+        input: &ListAccessProfilesInput,
+    ) -> Result<ListAccessProfilesOutput, ListAccessProfilesError> {
+        ListAccessProfiles::new(Arc::clone(&self.engine))
+            .handle(input.clone(), &self.ctx())
+            .await
+    }
+
+    async fn list_access_grants(
+        &self,
+        input: &ListAccessGrantsInput,
+    ) -> Result<ListAccessGrantsOutput, ListAccessGrantsError> {
+        ListAccessGrants::new(Arc::clone(&self.engine))
+            .handle(input.clone(), &self.ctx())
+            .await
+    }
+
+    async fn get_access_profile(
+        &self,
+        space_id: &str,
+        profile_id: &str,
+    ) -> Result<GetAccessProfileOutput, GetAccessProfileError> {
+        GetAccessProfile::new(Arc::clone(&self.engine))
+            .handle(
+                GetAccessProfileInput {
+                    space_id: space_id.to_string(),
+                    profile_id: profile_id.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    async fn update_access_profile(
+        &self,
+        input: &UpdateAccessProfileInput,
+    ) -> Result<UpdateAccessProfileOutput, UpdateAccessProfileError> {
+        UpdateAccessProfile::new(Arc::clone(&self.engine))
+            .handle(input.clone(), &self.ctx())
+            .await
+    }
+
+    async fn delete_access_profile(
+        &self,
+        space_id: &str,
+        profile_id: &str,
+    ) -> Result<DeleteAccessProfileOutput, DeleteAccessProfileError> {
+        DeleteAccessProfile::new(Arc::clone(&self.engine))
+            .handle(
+                DeleteAccessProfileInput {
+                    space_id: space_id.to_string(),
+                    profile_id: profile_id.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    async fn delete_access_grant(
+        &self,
+        grant_id: &str,
+    ) -> Result<DeleteAccessGrantOutput, DeleteAccessGrantError> {
+        DeleteAccessGrant::new(Arc::clone(&self.engine))
+            .handle(
+                DeleteAccessGrantInput {
+                    grant_id: grant_id.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    /// Delete a space, which is what releases the access control it was provisioned
+    /// with.
+    async fn delete_space(&self, case: &str, space_id: &str) {
+        DeleteSpace::new(Arc::clone(&self.engine))
+            .handle(
+                DeleteSpaceInput {
+                    space_id: space_id.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: DeleteSpace failed: {error:?}"));
+    }
+}
+
+/// One row of the `CreateSpace` table: the request members that vary while the access
+/// control the create provisions may not.
+struct SpaceRow {
+    case: &'static str,
+    name: String,
+    tags: Option<HashMap<String, String>>,
+    client_token: Option<String>,
+    agent_core_evaluation_role_arn: Option<String>,
+}
+
+/// The rows span what the provisioning rule generalises over — nothing of the request
+/// decides it — so they differ along the `CreateSpace` members that vary: `name` over its
+/// documented 3..64 lowercase-and-hyphen class, `tags` absent, one and many, a
+/// `clientToken` absent and present, and the optional AgentCore role absent and present.
+fn space_rows() -> Vec<SpaceRow> {
+    vec![
+        SpaceRow {
+            case: "the shortest name the documented class admits",
+            name: "abc".to_string(),
+            tags: None,
+            client_token: None,
+            agent_core_evaluation_role_arn: None,
+        },
+        SpaceRow {
+            case: "a hyphenated name, one tag and an idempotency token",
+            name: "omni-space-1".to_string(),
+            tags: Some(HashMap::from([("team".to_string(), "sre".to_string())])),
+            client_token: Some("provision-token".to_string()),
+            agent_core_evaluation_role_arn: None,
+        },
+        SpaceRow {
+            case: "the longest name the documented class admits, many tags",
+            name: format!("s{}", "a".repeat(63)),
+            tags: Some(
+                (0..50)
+                    .map(|index| (format!("key{index}"), format!("value{index}")))
+                    .collect(),
+            ),
+            client_token: None,
+            agent_core_evaluation_role_arn: None,
+        },
+        SpaceRow {
+            case: "a space that uses AgentCore online evaluation",
+            name: "agentcore-space".to_string(),
+            tags: Some(HashMap::new()),
+            client_token: None,
+            agent_core_evaluation_role_arn: Some(
+                "arn:aws:iam::000000000000:role/OmniAgentCore".to_string(),
+            ),
+        },
+    ]
+}
+
+/// The profile `space_id` was provisioned with, discovered the way a caller discovers it:
+/// the SERVICE_MANAGED record of the space's own profile listing.
+async fn provisioned_profile(omni: &Omni, case: &str, space_id: &str) -> AccessProfileSummary {
+    let page = omni
+        .list_access_profiles(&ListAccessProfilesInput {
+            space_id: space_id.to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap_or_else(|error| panic!("case {case:?}: ListAccessProfiles failed: {error:?}"));
+    let provisioned: Vec<&AccessProfileSummary> = page
+        .items
+        .iter()
+        .filter(|item| item.profile_type.as_deref() == Some(ACCESS_PROFILE_TYPE_SERVICE_MANAGED))
+        .collect();
+    assert_eq!(
+        provisioned.len(),
+        1,
+        "case {case:?}: expected exactly one provisioned profile, got {:?}",
+        page.items
+    );
+    provisioned[0].clone()
+}
+
+/// The grants `space_id` was provisioned with, in the order the listing reports them.
+async fn provisioned_grants(omni: &Omni, case: &str, space_id: &str) -> Vec<AccessGrantSummary> {
+    omni.list_access_grants(&ListAccessGrantsInput {
+        space_id: Some(space_id.to_string()),
+        ..Default::default()
+    })
+    .await
+    .unwrap_or_else(|error| panic!("case {case:?}: ListAccessGrants failed: {error:?}"))
+    .items
+    .into_iter()
+    .filter(|item| item.grant_type == ACCESS_GRANT_TYPE_SERVICE_MANAGED)
+    .collect()
+}
+
+/// Each grant as the members this part of the suite pins, so a row is compared as a
+/// whole.
+type ProvisionedGrant = (
+    Option<String>,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    String,
+);
+
+fn provisioned_fields(grant: &AccessGrantSummary) -> ProvisionedGrant {
+    (
+        grant.name.clone(),
+        grant.permission.clone(),
+        grant.grant_type.clone(),
+        grant.principal.principal_type.clone(),
+        grant.principal.principal_id.clone(),
+        grant.domain_id.clone(),
+        grant.space_id.clone(),
+    )
+}
+
+#[tokio::test]
+async fn creating_a_space_provisions_its_service_managed_access_control() {
+    let omni = Omni::new();
+    // An account holds at most one domain, so every row's space is created in the SAME
+    // domain: what the provisioning depends on is the space, not its parent.
+    let domain_id = omni.domain("provision", "grant-provision").await;
+    // No two spaces may share a provisioned record, so the ids are collected across the
+    // rows and checked for repeats.
+    let mut minted: Vec<String> = Vec::new();
+
+    for (index, row) in space_rows().into_iter().enumerate() {
+        let case = row.case;
+        let space = CreateSpace::new(Arc::clone(&omni.engine))
+            .handle(
+                CreateSpaceInput {
+                    name: row.name.clone(),
+                    domain_id: domain_id.clone(),
+                    data_access_role_arn: DATA_ACCESS_ROLE_ARN.to_string(),
+                    tags: row.tags.clone(),
+                    client_token: row.client_token.clone(),
+                    agent_core_evaluation_role_arn: row.agent_core_evaluation_role_arn.clone(),
+                    ..Default::default()
+                },
+                &omni.ctx(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: CreateSpace failed: {error:?}"))
+            .space;
+        let space_id = space.space_id.clone();
+
+        // ONE access profile, the service's own, under the name the service gives it.
+        let profiles = omni
+            .list_access_profiles(&ListAccessProfilesInput {
+                space_id: space_id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: ListAccessProfiles failed: {error:?}"));
+        let reported: Vec<(String, Option<String>)> = profiles
+            .items
+            .iter()
+            .map(|item| (item.name.clone(), item.profile_type.clone()))
+            .collect();
+        assert_eq!(
+            (reported, profiles.next_token.clone()),
+            (
+                vec![(
+                    ASYNC_WORKFLOWS_PROFILE_NAME.to_string(),
+                    Some(ACCESS_PROFILE_TYPE_SERVICE_MANAGED.to_string()),
+                )],
+                None,
+            ),
+            "case {case:?}: the new space's profiles are {:?}",
+            profiles.items
+        );
+
+        // The profile reads back through the reader a caller resolves it with, as
+        // persisted, and its ARN is derived from the space's region and its own id.
+        let profile_id = profiles.items[0].profile_id.clone();
+        let profile = omni
+            .get_access_profile(&space_id, &profile_id)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: GetAccessProfile failed: {error:?}"))
+            .access_profile;
+        assert_eq!(
+            (
+                profile.space_id.as_str(),
+                profile.name.as_str(),
+                profile.profile_type.as_deref(),
+            ),
+            (
+                space_id.as_str(),
+                ASYNC_WORKFLOWS_PROFILE_NAME,
+                Some(ACCESS_PROFILE_TYPE_SERVICE_MANAGED),
+            ),
+            "case {case:?}: the provisioned profile reads back as {profile:?}"
+        );
+        assert!(
+            profile
+                .arn
+                .ends_with(&format!(":access-profile/{profile_id}"))
+                && profile.arn.contains(&format!(":{REGION}:")),
+            "case {case:?}: the provisioned profile's ARN {:?} does not name it in {REGION}",
+            profile.arn
+        );
+        assert!(
+            !minted.contains(&profile_id),
+            "case {case:?}: the provisioned profile id {profile_id:?} repeats another space's"
+        );
+        minted.push(profile_id.clone());
+
+        // TWO access grants, the service's own, in the order the service wrote them: the
+        // space's administrator, then the agent principal that may assume the profile
+        // above. Every value that is not fixed text is read from the space.
+        let grants = provisioned_grants(&omni, case, &space_id).await;
+        let actual: Vec<ProvisionedGrant> = grants.iter().map(provisioned_fields).collect();
+        assert_eq!(
+            actual,
+            vec![
+                (
+                    Some(SPACE_ADMIN_GRANT_NAME.to_string()),
+                    ACCESS_GRANT_PERMISSION_SPACE_ADMIN.to_string(),
+                    ACCESS_GRANT_TYPE_SERVICE_MANAGED.to_string(),
+                    ACCESS_GRANT_PRINCIPAL_TYPE_IAM_ROOT.to_string(),
+                    Some(space.owner_account_id.clone()),
+                    domain_id.clone(),
+                    space_id.clone(),
+                ),
+                (
+                    Some(AGENT_ASSUME_GRANT_NAME.to_string()),
+                    "CUSTOM".to_string(),
+                    ACCESS_GRANT_TYPE_SERVICE_MANAGED.to_string(),
+                    ACCESS_GRANT_PRINCIPAL_TYPE_AGENT.to_string(),
+                    Some(agent_principal_id(&space_id)),
+                    domain_id.clone(),
+                    space_id.clone(),
+                ),
+            ],
+            "case {case:?}: the new space's grants are {grants:?}"
+        );
+        // The agent principal is derived from the space rather than fixed text.
+        assert!(
+            agent_principal_id(&space_id).ends_with(&space_id),
+            "case {case:?}: the agent principal must carry the space id {space_id:?}"
+        );
+
+        for grant in &grants {
+            assert!(
+                !minted.contains(&grant.grant_id),
+                "case {case:?}: the provisioned grant id {:?} repeats another space's",
+                grant.grant_id
+            );
+            minted.push(grant.grant_id.clone());
+            // Each grant reads back through the reader a caller resolves it with.
+            let full = omni
+                .get_access_grant(&grant.grant_id)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {case:?}: GetAccessGrant failed for {:?}: {error:?}",
+                        grant.name
+                    )
+                })
+                .access_grant;
+            assert_eq!(
+                (
+                    full.name.clone(),
+                    full.space_id.clone(),
+                    full.domain_id.clone(),
+                    full.grant_type.clone(),
+                    full.account_id.clone(),
+                ),
+                (
+                    grant.name.clone(),
+                    space_id.clone(),
+                    domain_id.clone(),
+                    ACCESS_GRANT_TYPE_SERVICE_MANAGED.to_string(),
+                    space.owner_account_id.clone(),
+                ),
+                "case {case:?}: the provisioned grant reads back as {full:?}"
+            );
+            assert_eq!(
+                millis(full.created_at),
+                millis(full.updated_at),
+                "case {case:?}: a grant nothing has updated reports createdAt {:?} and \
+                 updatedAt {:?}",
+                full.created_at,
+                full.updated_at
+            );
+        }
+
+        // The agent grant is what records the trust against the provisioned profile, so
+        // a principal that does not own that profile may assume it — and only it.
+        let status = omni.assume_status(case, &space_id, &profile_id).await;
+        assert_eq!(
+            status, ASSUME_STATUS_ALLOWED,
+            "case {case:?}: expected the provisioned profile to report \
+             {ASSUME_STATUS_ALLOWED}, got {status}"
+        );
+        let (customer_profile, _) = omni
+            .access_profile(case, &space_id, &format!("Customer {index}"))
+            .await;
+        let status = omni.assume_status(case, &space_id, &customer_profile).await;
+        assert_eq!(
+            status, ASSUME_STATUS_DENIED,
+            "case {case:?}: the provisioned grant must not reach another profile of the \
+             space, got {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_access_control_a_space_was_provisioned_with_cannot_be_changed() {
+    let omni = Omni::new();
+    let (domain_id, space_id) = omni.domain_and_space("managed", "grant-managed").await;
+    let profile = provisioned_profile(&omni, "managed", &space_id).await;
+    let grants = provisioned_grants(&omni, "managed", &space_id).await;
+
+    // Rows: every combination of `UpdateAccessProfile`'s own patchable members. None of
+    // them is admitted on a row the service owns, so each is the modelled conflict.
+    for (case, name, description) in [
+        ("a description only", None, Some("changed".to_string())),
+        (
+            "a name only",
+            Some("Renamed Profile".to_string()),
+            None,
+        ),
+        (
+            "both patchable members",
+            Some("Renamed Profile".to_string()),
+            Some("changed".to_string()),
+        ),
+        ("neither patchable member", None, None),
+    ] {
+        expect_modelled_error(
+            case,
+            omni.update_access_profile(&UpdateAccessProfileInput {
+                space_id: space_id.clone(),
+                profile_id: profile.profile_id.clone(),
+                name,
+                description,
+            })
+            .await,
+            409,
+            "ConflictException",
+        );
+    }
+    expect_modelled_error(
+        "a delete of the provisioned profile",
+        omni.delete_access_profile(&space_id, &profile.profile_id)
+            .await,
+        409,
+        "ConflictException",
+    );
+    for grant in &grants {
+        expect_modelled_error(
+            &format!("a delete of the provisioned grant {:?}", grant.name),
+            omni.delete_access_grant(&grant.grant_id).await,
+            409,
+            "ConflictException",
+        );
+    }
+
+    // Nothing moved: the profile keeps the name and the (absent) description it was
+    // provisioned with, and both grants are still there.
+    let after = omni
+        .get_access_profile(&space_id, &profile.profile_id)
+        .await
+        .expect("the refused calls left the profile readable")
+        .access_profile;
+    assert_eq!(
+        (after.name.as_str(), after.description.as_deref()),
+        (ASYNC_WORKFLOWS_PROFILE_NAME, None),
+        "the refused patches changed the profile to {after:?}"
+    );
+    assert_eq!(
+        provisioned_grants(&omni, "managed", &space_id)
+            .await
+            .iter()
+            .map(provisioned_fields)
+            .collect::<Vec<ProvisionedGrant>>(),
+        grants
+            .iter()
+            .map(provisioned_fields)
+            .collect::<Vec<ProvisionedGrant>>(),
+        "the refused deletes changed the space's grants"
+    );
+
+    // The message a caller branches on, read over the wire: fixed text per refusal, with
+    // nothing of the request in it.
+    let update_refusal = omni
+        .over_the_wire(
+            "UpdateAccessProfile",
+            UPDATE_ACCESS_PROFILE_INPUT_SCHEMA,
+            &UpdateAccessProfileInput {
+                space_id: space_id.clone(),
+                profile_id: profile.profile_id.clone(),
+                name: None,
+                description: Some("changed".to_string()),
+            },
+        )
+        .await;
+    let delete_profile_refusal = omni
+        .over_the_wire(
+            "DeleteAccessProfile",
+            DELETE_ACCESS_PROFILE_INPUT_SCHEMA,
+            &DeleteAccessProfileInput {
+                space_id: space_id.clone(),
+                profile_id: profile.profile_id.clone(),
+            },
+        )
+        .await;
+    let delete_grant_refusal = omni
+        .over_the_wire(
+            "DeleteAccessGrant",
+            DELETE_ACCESS_GRANT_INPUT_SCHEMA,
+            &DeleteAccessGrantInput {
+                grant_id: grants[0].grant_id.clone(),
+            },
+        )
+        .await;
+    for (case, refusal, expected) in [
+        (
+            "UpdateAccessProfile",
+            update_refusal,
+            SERVICE_MANAGED_PROFILE_NOT_UPDATABLE,
+        ),
+        (
+            "DeleteAccessProfile",
+            delete_profile_refusal,
+            SERVICE_MANAGED_PROFILE_NOT_DELETABLE,
+        ),
+        (
+            "DeleteAccessGrant",
+            delete_grant_refusal,
+            SERVICE_MANAGED_GRANT_NOT_DELETABLE,
+        ),
+    ] {
+        let (code, body) = refusal;
+        let rendered = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(
+            code, 409,
+            "case {case:?}: expected HTTP 409 over the wire, got {code}: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("ConflictException") && rendered.contains(expected),
+            "case {case:?}: expected the refusal to state {expected:?}, got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&space_id),
+            "case {case:?}: the refusal must not name the space, got {rendered:?}"
+        );
+    }
+
+    // Who manages the row is what decides: a customer-created profile of the SAME space
+    // is patched and deleted, and so is a customer-created grant.
+    let (customer_profile, _) = omni
+        .access_profile("customer", &space_id, "Customer Managed")
+        .await;
+    let patched = omni
+        .update_access_profile(&UpdateAccessProfileInput {
+            space_id: space_id.clone(),
+            profile_id: customer_profile.clone(),
+            name: None,
+            description: Some("changed".to_string()),
+        })
+        .await
+        .expect("a customer-managed profile is patched")
+        .access_profile;
+    assert_eq!(
+        (
+            patched.description.as_deref(),
+            patched.profile_type.as_deref(),
+        ),
+        (Some("changed"), Some(ACCESS_PROFILE_TYPE_CUSTOMER_MANAGED)),
+        "a customer-managed profile must take the patch, got {patched:?}"
+    );
+    omni.delete_access_profile(&space_id, &customer_profile)
+        .await
+        .expect("a customer-managed profile is deleted");
+    let customer_grant = omni
+        .create_access_grant(&create_input(&domain_id, &space_id, "customer-grant"))
+        .await
+        .expect("a customer-managed grant is created")
+        .access_grant;
+    assert_eq!(
+        customer_grant.grant_type, ACCESS_GRANT_TYPE_CUSTOMER_MANAGED,
+        "a grant created through the API is {:?}",
+        customer_grant.grant_type
+    );
+    omni.delete_access_grant(&customer_grant.grant_id)
+        .await
+        .expect("a customer-managed grant is deleted");
+}
+
+#[tokio::test]
+async fn deleting_a_space_releases_the_access_control_it_was_provisioned_with() {
+    let omni = Omni::new();
+    let domain_id = omni.domain("release", "grant-release").await;
+    let removed_space = omni.space("release", &domain_id, "grant-release-one").await;
+    let kept_space = omni.space("release", &domain_id, "grant-release-two").await;
+    let removed = provisioned_grants(&omni, "release", &removed_space).await;
+    let removed_profile = provisioned_profile(&omni, "release", &removed_space).await;
+    let kept = provisioned_grants(&omni, "release", &kept_space).await;
+    // A customer-created grant of the space that survives: the release is about the
+    // space that went, not about the store.
+    let kept_customer = omni
+        .create_access_grant(&create_input(&domain_id, &kept_space, "kept-grant"))
+        .await
+        .expect("the surviving space's grant is created")
+        .access_grant;
+
+    omni.delete_space("release", &removed_space).await;
+
+    // The rows the deleted space was provisioned with are gone from every reader.
+    for grant in &removed {
+        expect_modelled_error(
+            &format!("a read of the released grant {:?}", grant.name),
+            omni.get_access_grant(&grant.grant_id).await,
+            404,
+            "ResourceNotFoundException",
+        );
+    }
+    expect_modelled_error(
+        "a read of the released profile",
+        omni.get_access_profile(&removed_space, &removed_profile.profile_id)
+            .await,
+        404,
+        "ResourceNotFoundException",
+    );
+    let listed: Vec<String> = omni
+        .list_access_grants(&ListAccessGrantsInput::default())
+        .await
+        .expect("the account's grants list")
+        .items
+        .into_iter()
+        .map(|item| item.grant_id)
+        .collect();
+    for grant in &removed {
+        assert!(
+            !listed.contains(&grant.grant_id),
+            "the released grant {:?} is still listed in {listed:?}",
+            grant.name
+        );
+    }
+    // What the surviving space holds is untouched.
+    let mut expected: Vec<String> = kept.iter().map(|item| item.grant_id.clone()).collect();
+    expected.push(kept_customer.grant_id.clone());
+    assert_eq!(
+        listed, expected,
+        "the surviving space's grants are {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_grant_listing_reports_the_grants_matching_every_filter() {
+    let omni = Omni::new();
+    let (domain_id, space_id) = omni.domain_and_space("filters", "grant-filters").await;
+    // A second space of the SAME domain: an account holds at most one domain, so what a
+    // filter has to leave out lives beside this space rather than under another domain.
+    let other_space = omni
+        .space("filters", &domain_id, "grant-filters-other")
+        .await;
+    // One grant per space beyond the provisioned ones, so every filter below has
+    // something it must leave out as well as something it must report.
+    let here = omni
+        .create_access_grant(&CreateAccessGrantInput {
+            permission: "READ".to_string(),
+            principal: principal("IAM_ROLE", "arn:aws:iam::000000000000:role/Reader"),
+            ..create_input(&domain_id, &space_id, "reader")
+        })
+        .await
+        .expect("this space's grant is created")
+        .access_grant;
+    let elsewhere = omni
+        .create_access_grant(&CreateAccessGrantInput {
+            permission: "READ_WRITE_DELETE".to_string(),
+            ..create_input(&domain_id, &other_space, "elsewhere")
+        })
+        .await
+        .expect("the other space's grant is created")
+        .access_grant;
+    let provisioned = provisioned_grants(&omni, "filters", &space_id).await;
+    let other_provisioned = provisioned_grants(&omni, "filters", &other_space).await;
+    let admin_grant = provisioned[0].grant_id.clone();
+    let agent_grant = provisioned[1].grant_id.clone();
+    let other_admin = other_provisioned[0].grant_id.clone();
+    let other_agent = other_provisioned[1].grant_id.clone();
+
+    // Rows: no filter, then each filter the model declares on its own, then two
+    // together, then a conjunction nothing satisfies.
+    for (case, input, expected) in [
+        (
+            "no filter at all",
+            ListAccessGrantsInput::default(),
+            vec![
+                admin_grant.clone(),
+                agent_grant.clone(),
+                other_admin.clone(),
+                other_agent.clone(),
+                here.grant_id.clone(),
+                elsewhere.grant_id.clone(),
+            ],
+        ),
+        (
+            "by space",
+            ListAccessGrantsInput {
+                space_id: Some(space_id.clone()),
+                ..Default::default()
+            },
+            vec![
+                admin_grant.clone(),
+                agent_grant.clone(),
+                here.grant_id.clone(),
+            ],
+        ),
+        (
+            "by the one domain the account holds",
+            ListAccessGrantsInput {
+                domain_id: Some(domain_id.clone()),
+                ..Default::default()
+            },
+            vec![
+                admin_grant.clone(),
+                agent_grant.clone(),
+                other_admin.clone(),
+                other_agent.clone(),
+                here.grant_id.clone(),
+                elsewhere.grant_id.clone(),
+            ],
+        ),
+        (
+            "by permission, over the grants of two spaces",
+            ListAccessGrantsInput {
+                permission: Some("READ_WRITE_DELETE".to_string()),
+                ..Default::default()
+            },
+            vec![elsewhere.grant_id.clone()],
+        ),
+        (
+            "by principal type",
+            ListAccessGrantsInput {
+                principal_type: Some(ACCESS_GRANT_PRINCIPAL_TYPE_AGENT.to_string()),
+                ..Default::default()
+            },
+            vec![agent_grant.clone(), other_agent.clone()],
+        ),
+        (
+            "by principal id",
+            ListAccessGrantsInput {
+                principal_id: Some(agent_principal_id(&space_id)),
+                ..Default::default()
+            },
+            vec![agent_grant.clone()],
+        ),
+        (
+            "by permission",
+            ListAccessGrantsInput {
+                permission: Some(ACCESS_GRANT_PERMISSION_SPACE_ADMIN.to_string()),
+                ..Default::default()
+            },
+            vec![admin_grant.clone(), other_admin.clone()],
+        ),
+        (
+            "by space and permission together",
+            ListAccessGrantsInput {
+                space_id: Some(space_id.clone()),
+                permission: Some("READ".to_string()),
+                ..Default::default()
+            },
+            vec![here.grant_id.clone()],
+        ),
+        (
+            "a conjunction nothing satisfies",
+            ListAccessGrantsInput {
+                space_id: Some(space_id.clone()),
+                principal_id: Some(agent_principal_id(&other_space)),
+                ..Default::default()
+            },
+            Vec::new(),
+        ),
+    ] {
+        let page = omni
+            .list_access_grants(&input)
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: the listing failed: {error:?}"));
+        let actual: Vec<String> = page.items.iter().map(|item| item.grant_id.clone()).collect();
+        assert_eq!(
+            (actual.clone(), page.next_token.clone()),
+            (expected.clone(), None),
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    // Every page size walks the same order exactly once: rows are a page smaller than
+    // the collection, one short of it, exactly it, one past it and the modelled maximum.
+    let everything: Vec<String> = omni
+        .list_access_grants(&ListAccessGrantsInput::default())
+        .await
+        .expect("the account's grants list")
+        .items
+        .into_iter()
+        .map(|item| item.grant_id)
+        .collect();
+    for page_size in [1, 2, 3, 4, 5, 100] {
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let page = omni
+                .list_access_grants(&ListAccessGrantsInput {
+                    max_results: Some(page_size),
+                    next_token: token.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_else(|error| panic!("case {page_size}: the page failed: {error:?}"));
+            assert!(
+                page.items.len() <= page_size as usize,
+                "case {page_size}: a page carried {} items",
+                page.items.len()
+            );
+            walked.extend(page.items.iter().map(|item| item.grant_id.clone()));
+            token = page.next_token;
+            if token.is_none() {
+                break;
+            }
+            assert!(
+                walked.len() <= everything.len(),
+                "case {page_size}: paging ran past the collection with {walked:?}"
+            );
+        }
+        assert_eq!(
+            walked, everything,
+            "case {page_size}: walking the pages gave {walked:?}"
+        );
+    }
+
+    // A read: the same request twice answers the same page.
+    let request = ListAccessGrantsInput {
+        space_id: Some(space_id.clone()),
+        ..Default::default()
+    };
+    let first = omni
+        .list_access_grants(&request)
+        .await
+        .expect("the first listing succeeds");
+    let again = omni
+        .list_access_grants(&request)
+        .await
+        .expect("the second listing succeeds");
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .map(provisioned_fields)
+            .collect::<Vec<ProvisionedGrant>>(),
+        again
+            .items
+            .iter()
+            .map(provisioned_fields)
+            .collect::<Vec<ProvisionedGrant>>(),
+        "listing twice answered different pages"
+    );
+
+    // A filter naming a parent the store does not hold is the modelled miss.
+    for (case, input) in [
+        (
+            "a domain the store does not hold",
+            ListAccessGrantsInput {
+                domain_id: Some(MISSING_DOMAIN_ID.to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "a space the store does not hold",
+            ListAccessGrantsInput {
+                space_id: Some(MISSING_SPACE_ID.to_string()),
+                ..Default::default()
+            },
+        ),
+    ] {
+        expect_modelled_error(case, omni.list_access_grants(&input).await, 404, "ResourceNotFoundException");
+    }
+
+    // A `nextToken` this service did not mint for THIS collection cannot name a resume
+    // point: rows span text that is not a token, hex that decodes to nothing this
+    // service writes, and a token minted for another collection's listing.
+    let foreign_collection = hex::encode("access-profiles:1");
+    for token in [
+        "not-a-token",
+        "6e6f7065",
+        foreign_collection.as_str(),
+        &"f".repeat(2048),
+    ] {
+        expect_modelled_error(
+            token,
+            omni.list_access_grants(&ListAccessGrantsInput {
+                next_token: Some(token.to_string()),
+                ..Default::default()
+            })
+            .await,
+            400,
+            "ValidationException",
+        );
+    }
+
+    // An enumerated filter outside the values the model declares is the modelled 400,
+    // not an empty page.
+    for (case, input) in [
+        (
+            "a principal type the model does not declare",
+            ListAccessGrantsInput {
+                principal_type: Some("ROBOT".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "a permission the model does not declare",
+            ListAccessGrantsInput {
+                permission: Some("SUPER_ADMIN".to_string()),
+                ..Default::default()
+            },
+        ),
+    ] {
+        expect_modelled_error(case, omni.list_access_grants(&input).await, 400, "ValidationException");
+    }
+
+    // The listing answers over the rpcv2Cbor wire from the same store.
+    let codec = CborCodec::default();
+    let (status, body) = omni
+        .over_the_wire(
+            "ListAccessGrants",
+            LIST_ACCESS_GRANTS_INPUT_SCHEMA,
+            &ListAccessGrantsInput {
+                space_id: Some(space_id.clone()),
+                max_results: Some(2),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        status,
+        200,
+        "ListAccessGrants over the wire answered {status}: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let page = {
+        let mut deserializer = codec.create_deserializer(&body);
+        ListAccessGrantsOutput::deserialize(&mut deserializer).expect("the output deserializes")
+    };
+    assert_eq!(
+        page.items
+            .iter()
+            .map(|item| item.grant_id.clone())
+            .collect::<Vec<String>>(),
+        vec![admin_grant.clone(), agent_grant.clone()],
+        "the wire page is {:?}",
+        page.items
+    );
+    let token = page
+        .next_token
+        .clone()
+        .expect("grants remain beyond the first wire page");
+    let (status, body) = omni
+        .over_the_wire(
+            "ListAccessGrants",
+            LIST_ACCESS_GRANTS_INPUT_SCHEMA,
+            &ListAccessGrantsInput {
+                space_id: Some(space_id.clone()),
+                next_token: Some(token),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert_eq!(
+        status,
+        200,
+        "the resumed wire page answered {status}: {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let rest = {
+        let mut deserializer = codec.create_deserializer(&body);
+        ListAccessGrantsOutput::deserialize(&mut deserializer).expect("the output deserializes")
+    };
+    assert_eq!(
+        (
+            rest.items
+                .iter()
+                .map(|item| item.grant_id.clone())
+                .collect::<Vec<String>>(),
+            rest.next_token.clone(),
+        ),
+        (vec![here.grant_id.clone()], None),
+        "the resumed wire page is {:?}",
+        rest.items
     );
 }

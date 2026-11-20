@@ -136,26 +136,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Who manages the grant decides whether it may go: `AccessGrantType`'s
         // SERVICE_MANAGED doc reads "Provisioned and owned by the service. Cannot be
-        // deleted by customers", which this operation's own doc repeats. A grant held
-        // under any other type was created through this API and may be deleted. Every
-        // grant `CreateAccessGrant` mints is CUSTOMER_MANAGED, so this refusal waits for
-        // a service-provisioned grant to exist in the store rather than firing today.
-        let service_managed = store.access_grants.get(&input.grant_id).is_some_and(|stored| {
-            stored.grant.grant_type != crate::state::ACCESS_GRANT_TYPE_CUSTOMER_MANAGED
-        });
+        // deleted by customers", which this operation's own doc repeats ("A
+        // service-managed grant cannot be deleted."). A grant held under any other type
+        // was created through this API and may be deleted.
+        let service_managed = store
+            .access_grants
+            .get(&input.grant_id)
+            .is_some_and(|stored| crate::state::is_service_managed_grant(&stored.grant));
         if service_managed {
             audit(ctx, &input.grant_id, "refused_service_managed");
             return Err(DeleteAccessGrantErrorModeled::ConflictException(
-                ConflictException {
-                    message: format!(
-                        "Access grant '{}' is managed by the service and cannot be deleted.",
-                        input.grant_id
-                    ),
-                    conflict_type: Some("NOT_DELETABLE".to_string()),
-                    resource_id: Some(input.grant_id.clone()),
-                    resource_type: Some("AccessGrant".to_string()),
-                    error_code: None,
-                },
+                crate::state::service_managed_conflict(
+                    crate::state::CONFLICT_TYPE_NOT_DELETABLE,
+                    crate::state::SERVICE_MANAGED_GRANT_NOT_DELETABLE,
+                    &input.grant_id,
+                    "AccessGrant",
+                ),
             )
             .into());
         }

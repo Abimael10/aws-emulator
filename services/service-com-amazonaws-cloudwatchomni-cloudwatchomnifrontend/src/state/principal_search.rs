@@ -59,19 +59,15 @@ pub fn is_identity_center_domain(domain: &Domain) -> bool {
 
 /// How a search of a domain that is NOT configured with Identity Center is worded.
 ///
-/// One wording, read by the one operation that refuses on this condition: it states the
-/// condition that failed of the domain the request named, and then the requirement
-/// `SearchPrincipals`'s own doc states ("The domain must be configured with Identity
-/// Center") in terms of the member that carries it — so a caller is sent to the domain's
-/// identity-provider configuration rather than to its credentials. The domain id is the
-/// request's; nothing else in the sentence varies.
-pub fn not_identity_center_message(domain_id: &str) -> String {
-    format!(
-        "Domain '{domain_id}' is not configured with Identity Center. SearchPrincipals \
-         requires a domain whose identityProviders include {}.",
-        super::IDENTITY_PROVIDER_IDC
-    )
-}
+/// One wording, read by every operation that refuses on this condition: it states what
+/// the domain is missing — the Identity Center application a provisioned domain carries
+/// ([`super::identity_center_application_arn`]) — and then the step that clears it. It is
+/// WHOLLY FIXED TEXT: the condition is a property of the domain rather than of the
+/// request, so the sentence names neither the domain the request addressed nor the
+/// operation that refused, and every domain in this state earns exactly this message.
+pub const NOT_IDENTITY_CENTER_MESSAGE: &str =
+    "Domain does not have an IdC application ARN configured. The domain must be provisioned \
+     with Identity Center before this operation can proceed.";
 
 /// Every Identity Center principal this emulator holds, as the search results they are
 /// reported as, in the deterministic order this module's docs state.
