@@ -380,10 +380,9 @@ async fn an_illegal_legacy_argument_is_a_client_error_with_the_sentence_for_its_
                 "Item": {"pk": {"S": "k9"}, "sk": {"S": "s9"}},
                 "Expected": {"a": {"Exists": true}},
             }),
-            format!(
-                "{ENVELOPE}One or more parameter values were invalid: Value must be provided \
-                 when Exists is true for Attribute: a"
-            ),
+            "One or more parameter values were invalid: Value must be provided when Exists is \
+             true for Attribute: a"
+                .to_string(),
         ),
         (
             "a write stating one half of an Expected entry twice",

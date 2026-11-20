@@ -1904,9 +1904,11 @@ async fn the_largest_accepted_operand_moves_with_the_clauses_stated_beside_it() 
 const SERIALIZATION_EXCEPTION: &str = "com.amazon.coral.service#SerializationException";
 
 /// What the refusal states where the modelled type of a FIELD the body names holds other
-/// values (a list, a map, a structure) and the body carried something else there, or where a
-/// field modelled as a single value carried a collection.
+/// values (a list, a map, a structure) and the body carried a single value there.
 const UNEXPECTED_FIELD_TYPE: &str = "Unexpected field type";
+
+/// What it states where the body opened a structure or a map in a slot read from neither.
+const STRUCTURE_OR_MAP: &str = "Start of structure or map found where not expected";
 
 /// What the same defect states where the value stands INSIDE a collection instead — an
 /// element of a list or the value of a map entry — which no modelled member names.
@@ -1922,8 +1924,10 @@ const VALIDATION_EXCEPTION: &str = "com.amazon.coral.validate#ValidationExceptio
 ///
 /// A serialization refusal states its sentence under the capitalized `Message` and carries
 /// no lowercase `message`; a constraint refusal is the other way round, which is what a tool
-/// extracting an error reason off one slot or the other depends on.
-fn refused_as(case: &str, status: u16, body: &Value, class: &str, sentence: &str) {
+/// extracting an error reason off one slot or the other depends on. `sentence` is `None` for
+/// the refusal that states NO prose at all — the bare carrier a value no conversion was
+/// attempted for earns.
+fn refused_as(case: &str, status: u16, body: &Value, class: &str, sentence: Option<&str>) {
     let answered = body.get("__type").and_then(Value::as_str).unwrap_or_default();
     assert_eq!(
         (status, answered),
@@ -1938,8 +1942,7 @@ fn refused_as(case: &str, status: u16, body: &Value, class: &str, sentence: &str
         (lower, capital, "message")
     };
     assert_eq!(
-        stated,
-        Some(sentence),
+        stated, sentence,
         "case {case:?}: expected ${slot} {sentence:?}, got {body}"
     );
     assert_eq!(
@@ -1970,80 +1973,94 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
     // `TagKeys` targets `TagKeyList` (list), `Key`/`ExpressionAttributeNames` are maps,
     // `KeySchema` is a list, `ProvisionedThroughput` a structure and `ConsistentRead` a
     // boolean.
-    let rows: Vec<(&str, &str, Value, String)> = vec![
+    let rows: Vec<(&str, &str, Value, Option<String>)> = vec![
         (
             "a number where a table name is a string, on the create",
             "CreateTable",
             json!({"TableName": 42,
                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]}),
-            "NUMBER_VALUE cannot be converted to String".to_string(),
+            Some("NUMBER_VALUE cannot be converted to String".to_string()),
         ),
         (
             "a number where a table name is a string, on the update",
             "UpdateTable",
             json!({"TableName": 7}),
-            "NUMBER_VALUE cannot be converted to String".to_string(),
+            Some("NUMBER_VALUE cannot be converted to String".to_string()),
         ),
         (
             "a number where a start key is a string, on the list",
             "ListTables",
             json!({"ExclusiveStartTableName": 1}),
-            "NUMBER_VALUE cannot be converted to String".to_string(),
+            Some("NUMBER_VALUE cannot be converted to String".to_string()),
         ),
         (
             "a number where a resource ARN is a string, on the tag read",
             "ListTagsOfResource",
             json!({"ResourceArn": 1}),
-            "NUMBER_VALUE cannot be converted to String".to_string(),
+            Some("NUMBER_VALUE cannot be converted to String".to_string()),
         ),
         (
             "a number where a resource ARN is a string, on the tag write",
             "TagResource",
             json!({"ResourceArn": 1, "Tags": [{"Key": "k", "Value": "v"}]}),
-            "NUMBER_VALUE cannot be converted to String".to_string(),
+            Some("NUMBER_VALUE cannot be converted to String".to_string()),
         ),
         (
-            "a flag where a table name is a string",
+            "a fraction where a table name is a string",
+            "UpdateTable",
+            json!({"TableName": 2.75}),
+            Some("DECIMAL_VALUE cannot be converted to String".to_string()),
+        ),
+        (
+            "a true flag where a table name is a string",
             "DescribeTable",
             json!({"TableName": true}),
-            "BOOLEAN_VALUE cannot be converted to String".to_string(),
+            Some("TRUE_VALUE cannot be converted to String".to_string()),
+        ),
+        (
+            "a false flag where a table name is a string",
+            "DescribeTable",
+            json!({"TableName": false}),
+            Some("FALSE_VALUE cannot be converted to String".to_string()),
         ),
         (
             "text where a page size is an integer",
             "ListTables",
             json!({"Limit": "10"}),
-            "STRING_VALUE cannot be converted to Integer".to_string(),
+            Some("STRING_VALUE cannot be converted to Integer".to_string()),
         ),
         (
-            "text where a read mode is a boolean",
+            // Text spelling no flag at all: text that DOES spell one is read as the flag it
+            // spells, which is the other side of this boundary.
+            "text spelling no flag where a read mode is a boolean",
             "Scan",
             json!({"TableName": "Tagged", "ConsistentRead": "maybe"}),
-            "STRING_VALUE cannot be converted to Boolean".to_string(),
+            Some("STRING_VALUE cannot be converted to Boolean".to_string()),
         ),
         (
             "text where a tag set is a list",
             "TagResource",
             json!({"ResourceArn": tagged.clone(), "Tags": "k=v"}),
-            UNEXPECTED_FIELD_TYPE.to_string(),
+            Some(UNEXPECTED_FIELD_TYPE.to_string()),
         ),
         (
             "a number where a tag set is a list",
             "TagResource",
             json!({"ResourceArn": tagged.clone(), "Tags": 1}),
-            UNEXPECTED_FIELD_TYPE.to_string(),
+            Some(UNEXPECTED_FIELD_TYPE.to_string()),
         ),
         (
             "text where a tag key set is a list",
             "UntagResource",
             json!({"ResourceArn": tagged.clone(), "TagKeys": "k"}),
-            UNEXPECTED_FIELD_TYPE.to_string(),
+            Some(UNEXPECTED_FIELD_TYPE.to_string()),
         ),
         (
             "a flag where a key schema is a list",
             "CreateTable",
             json!({"TableName": "Later", "KeySchema": false}),
-            UNEXPECTED_FIELD_TYPE.to_string(),
+            Some(UNEXPECTED_FIELD_TYPE.to_string()),
         ),
         (
             "a number where a throughput is a structure",
@@ -2052,25 +2069,40 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
                    "ProvisionedThroughput": 5}),
-            UNEXPECTED_FIELD_TYPE.to_string(),
+            Some(UNEXPECTED_FIELD_TYPE.to_string()),
         ),
         (
             "text where an item key is a map",
             "GetItem",
             json!({"TableName": "Tagged", "Key": "pk"}),
-            UNEXPECTED_FIELD_TYPE.to_string(),
+            Some(UNEXPECTED_FIELD_TYPE.to_string()),
         ),
         (
+            // A COLLECTION where the member is read from none: no conversion was attempted at
+            // all, so an array earns the error class alone and an object the structural
+            // sentence.
             "a list where a table name is a string",
             "DeleteTable",
             json!({"TableName": ["Tagged"]}),
-            UNEXPECTED_FIELD_TYPE.to_string(),
+            None,
+        ),
+        (
+            "a list where the batched tables are a map",
+            "BatchGetItem",
+            json!({"RequestItems": ["Tagged"]}),
+            None,
         ),
         (
             "an object where a table name is a string",
             "DescribeTable",
             json!({"TableName": {"Name": "Tagged"}}),
-            UNEXPECTED_FIELD_TYPE.to_string(),
+            Some(STRUCTURE_OR_MAP.to_string()),
+        ),
+        (
+            "an object where a tag set is a list",
+            "TagResource",
+            json!({"ResourceArn": tagged.clone(), "Tags": {"k": "v"}}),
+            Some(STRUCTURE_OR_MAP.to_string()),
         ),
         (
             // Nested inside a structure: the codec's own descent reaches it, so the depth
@@ -2082,7 +2114,7 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
                    "ProvisionedThroughput": {"ReadCapacityUnits": "5",
                                              "WriteCapacityUnits": 5}}),
-            "STRING_VALUE cannot be converted to Long".to_string(),
+            Some("STRING_VALUE cannot be converted to Long".to_string()),
         ),
         (
             "a number where a nested key attribute name is a string",
@@ -2090,13 +2122,13 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
             json!({"TableName": "Later",
                    "KeySchema": [{"AttributeName": 1, "KeyType": "HASH"}],
                    "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}]}),
-            "NUMBER_VALUE cannot be converted to String".to_string(),
+            Some("NUMBER_VALUE cannot be converted to String".to_string()),
         ),
         (
             "a number where a tag's key is a string, inside the list",
             "TagResource",
             json!({"ResourceArn": tagged.clone(), "Tags": [{"Key": 1, "Value": "v"}]}),
-            "NUMBER_VALUE cannot be converted to String".to_string(),
+            Some("NUMBER_VALUE cannot be converted to String".to_string()),
         ),
         (
             // INSIDE the list, where no member names the value: the same defect, stated as
@@ -2104,20 +2136,20 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
             "a scalar where a tag set's element is a structure",
             "TagResource",
             json!({"ResourceArn": tagged.clone(), "Tags": ["k=v"]}),
-            UNEXPECTED_VALUE_TYPE.to_string(),
+            Some(UNEXPECTED_VALUE_TYPE.to_string()),
         ),
         (
             "a number where a tag key set's element is a string",
             "UntagResource",
             json!({"ResourceArn": tagged.clone(), "TagKeys": [1]}),
-            "NUMBER_VALUE cannot be converted to String".to_string(),
+            Some("NUMBER_VALUE cannot be converted to String".to_string()),
         ),
         (
             "a number where an attribute's substituted name is a string, inside the map",
             "GetItem",
             json!({"TableName": "Tagged", "Key": {"pk": {"S": "a"}},
                    "ProjectionExpression": "#p", "ExpressionAttributeNames": {"#p": 1}}),
-            "NUMBER_VALUE cannot be converted to String".to_string(),
+            Some("NUMBER_VALUE cannot be converted to String".to_string()),
         ),
     ];
 
@@ -2128,7 +2160,7 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
             status,
             &answered,
             SERIALIZATION_EXCEPTION,
-            &sentence,
+            sentence.as_deref(),
         );
     }
 
@@ -2173,10 +2205,17 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
         ),
     ] {
         let (status, answered) = call(&router, operation, body).await;
-        refused_as(case, status, &answered, VALIDATION_EXCEPTION, sentence);
+        refused_as(case, status, &answered, VALIDATION_EXCEPTION, Some(sentence));
     }
     for (case, operation, body) in [
         ("a page size inside its range", "ListTables", json!({"Limit": 10})),
+        (
+            // Text spelling a flag IS read as that flag, so the read mode it states is the
+            // one the request is served with.
+            "text spelling a flag where a read mode is a boolean",
+            "Scan",
+            json!({"TableName": "Tagged", "ConsistentRead": "true"}),
+        ),
         (
             "a tag set that is a list of tags",
             "TagResource",

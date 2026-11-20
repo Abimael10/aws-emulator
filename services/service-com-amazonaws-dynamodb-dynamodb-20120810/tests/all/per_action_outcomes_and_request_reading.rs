@@ -927,7 +927,7 @@ async fn text_that_spells_a_boolean_is_read_where_a_boolean_is_modelled() {
             "a boolean where a table name is modelled",
             "GetItem",
             json!({"TableName": true, "Key": {"pk": {"S": "one"}}}),
-            "BOOLEAN_VALUE cannot be converted to String",
+            "TRUE_VALUE cannot be converted to String",
         ),
     ] {
         let (status, answered) = call(&router, operation, request).await;

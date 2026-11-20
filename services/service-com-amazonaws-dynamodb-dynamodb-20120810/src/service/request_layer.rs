@@ -21,7 +21,10 @@
 //!   protocol's own [`SERIALIZATION_EXCEPTION`], with the reason under the capitalized
 //!   [`MESSAGE_MEMBER`] — the member a protocol-level error of this service states its prose
 //!   in, which is not the lowercase `message` its MODELLED exceptions declare. Nothing is
-//!   read, so nothing is looked up and nothing is written;
+//!   read, so nothing is looked up and nothing is written. Not every such refusal STATES a
+//!   reason: a JSON ARRAY standing where the member it is bound to is read from no array is a
+//!   value no conversion was attempted for at all, and the refusal is then the error class
+//!   alone, with no prose member in the body ([`Refused`]);
 //! * a value that WAS read and then broke a rule the model declares (an absent `@required`
 //!   member, a `@length`/`@range`/`@pattern`/enum violation) is a CONSTRAINT refusal, which
 //!   this service answers as its `ValidationException`
@@ -59,6 +62,21 @@
 //! Because the real codec descends the whole body, a value nested in a structure, a list or a
 //! map is reached exactly as a top-level member is.
 //!
+//! # What a value of another FORM states
+//!
+//! The value it spells, where the modelled type can be read from it: text spelling a JSON
+//! flag standing where the model declares a boolean, and a number carrying a fraction
+//! standing where it declares a whole number, are READ rather than refused, and the operation
+//! is served the request carrying each as read ([`value_reading`], [`readable`]). The codec
+//! itself already reads a number whose fraction is zero into an integral member, so what this
+//! adds is the narrowing beside it; a literal needing no conversion never reaches that
+//! question, because the codec read it. A value so read is then held to the model's own
+//! constraints like any other, which is where a page size read as zero earns the range clause.
+//!
+//! It is read BEFORE the absences above, because what a body states is a fact of the body as
+//! the protocol READS it: a `null` standing for a required member earns the reader's own
+//! diagnosis whether or not a value the protocol reads in another form stands before it.
+//!
 //! # What is left to another layer, deliberately
 //!
 //! * a `null` ELEMENT of a list: no member stands there for it to state the absence of, and
@@ -82,7 +100,9 @@ use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::{BigDecimal, BigInteger, Blob, DateTime, Document};
 use serde::de::{Deserialize, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess};
 use serde_json::{json, Value};
-use service_common::json_wire_values::{ARRAY_VALUE, NULL_VALUE, OBJECT_VALUE};
+use service_common::json_wire_values::{
+    ARRAY_VALUE, BOOLEAN_VALUE, NULL_VALUE, NUMBER_VALUE, OBJECT_VALUE,
+};
 use smithy_server_runtime::{DeserializableStruct, Operation, ServerHttpProtocol, Service};
 
 /// The error code a value the body could not be read from is refused with, as this
@@ -108,12 +128,11 @@ pub const DIAGNOSIS_MEMBER: &str = "message";
 /// something no operation could be given, so it is a client error.
 const SERIALIZATION_EXCEPTION_STATUS: u16 = 400;
 
-/// What the refusal states when the value stands in a member a structure (or a union)
-/// DECLARES — a field the body names — and the modelled type of that field is an AGGREGATE
-/// the body carried something else for, or the field is a single value the body carried a
-/// collection for: no conversion between two single values was even attempted, so what the
-/// sentence states is that the FIELD's type was unexpected, naming neither a class nor a
-/// type.
+/// What the refusal states when a SINGLE value stands in a member a structure (or a union)
+/// DECLARES — a field the body names — and the modelled type of that field is an AGGREGATE,
+/// which holds other values: no conversion between two single values was even attempted, so
+/// what the sentence states is that the FIELD's type was unexpected, naming neither a class
+/// nor a type.
 const UNEXPECTED_FIELD_TYPE: &str = "Unexpected field type";
 
 /// What the same defect states when the value stands INSIDE a collection — an element of a
@@ -134,6 +153,28 @@ const BASE64_LENGTH: &str = "Base64 encoded length is expected a multiple of 4 b
 /// How many characters base64 encodes each group of bytes as: text that is not a whole
 /// number of these groups is text no bytes can be decoded from.
 const BASE64_GROUP: usize = 4;
+
+/// What the refusal states when the body opened a STRUCTURE or a MAP where the member it
+/// stands in is read from neither: the one defect of this class that is named after the
+/// structural token the reader found rather than after the member or the value.
+const STRUCTURE_OR_MAP: &str = "Start of structure or map found where not expected";
+
+/// The tokens this protocol names the offending LITERAL by, where the JSON class of a value
+/// is a class of several literals and the refusal names which one arrived: a `true` and a
+/// `false` are two tokens rather than one "boolean", and a fractional number is a different
+/// token from a whole one.
+///
+/// The class names the rest of the vocabulary shares with every other refusal in this tree
+/// (`service_common::json_wire_values`) — a string is `STRING_VALUE` and a whole number
+/// `NUMBER_VALUE` there as here — so only the literals this protocol splits are named below.
+const TRUE_VALUE: &str = "TRUE_VALUE";
+
+/// See [`TRUE_VALUE`].
+const FALSE_VALUE: &str = "FALSE_VALUE";
+
+/// See [`TRUE_VALUE`]: a number carrying a fraction or an exponent, which is a different
+/// literal from a whole number however small the fraction is.
+const DECIMAL_VALUE: &str = "DECIMAL_VALUE";
 
 /// Dispatch one reader of a request's body on the routing key, one line per modelled
 /// operation.
@@ -228,28 +269,223 @@ macro_rules! for_served_input {
     };
 }
 
-/// The sentence refusing `req`'s body, when a value it carries cannot be read into the
-/// modelled type of the member it is bound to, for the operation `key` names.
+/// What this layer makes of the VALUES `req`'s body carries, for the operation `key` names:
+/// a body every value of which reads as sent, the same request with the values the protocol
+/// reads in another form carried in that form, or a value no modelled member can be read
+/// from at all. Asked by [`body_reading`], of a body already known to be a document of this
+/// protocol.
 ///
-/// `None` is "nothing for THIS layer to refuse", which covers five different outcomes
-/// deliberately: the body read cleanly; the body could not be reached at all (there is no
-/// value to describe, so the framework's own rendering stands); the read failed for a reason
-/// that is NOT a value's JSON class; the read stopped at an explicit `null`, which states a
-/// member's ABSENCE rather than a value of the wrong class ([`BodyReading`]); and a key
-/// naming no modelled operation, which is left to the routing table's own refusal.
-pub fn coercion_refusal<Eng: Send + Sync + 'static>(
+/// [`ValueReading::AsSent`] is also "nothing for THIS question to decide", which covers the
+/// outcomes it has no answer for deliberately: a body that cannot be reached or read at all
+/// (there is no value to describe, so the framework's own rendering stands); a read that
+/// failed for a reason that is NOT a value's JSON class; a read that stopped at an explicit
+/// `null`, which states a member's ABSENCE rather than a value of the wrong class
+/// ([`BodyReading`]); and a key naming no modelled operation, which is left to the routing
+/// table's own refusal.
+fn value_reading<Eng: Send + Sync + 'static>(
     key: &str,
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<String> {
-    let unreadable = unreadable_value::<Eng>(key, protocol, req)?;
-    sentence(&unreadable)
+) -> ValueReading {
+    let Some(body) = req.body().bytes() else {
+        return ValueReading::AsSent;
+    };
+    // The body as a DOCUMENT is only needed once a read has failed — to name the literal that
+    // failed and to carry it in the form the protocol reads it in — so a body every value of
+    // which reads is never parsed again here ([`Forms`]).
+    let mut forms: Option<Forms> = None;
+    // The request rebuilt from each: the one the operation is served, and the one the question
+    // is ASKED of, which a body stating no absence does not have because it is asked about
+    // itself.
+    let mut read: Option<RtRequest> = None;
+    let mut asked: Option<RtRequest> = None;
+    // Each round READS one value the protocol carries in another form and asks again, because
+    // the codec stops at the first value it cannot read: what the next round answers is the
+    // value after it. The whole body is read per round, so what is bounded is the product of
+    // the rounds and the body's size ([`MOST_JSON_READ_FOR_FORMS`]).
+    let rounds = MOST_JSON_READ_FOR_FORMS / body.len().max(1);
+    for _ in 0..=rounds {
+        let standing = asked.as_ref().or(read.as_ref()).unwrap_or(req);
+        let Some(found) = unreadable_value::<Eng>(key, protocol, standing) else {
+            return ValueReading::read(read);
+        };
+        let held = match &mut forms {
+            Some(held) => held,
+            None => {
+                let Ok(document) = ::serde_json::from_slice::<Value>(body) else {
+                    // A body the reader cannot read is no body this layer describes a value
+                    // of: the refusal it earns is the body-level one ([`body_reading`]).
+                    return ValueReading::AsSent;
+                };
+                let held = forms.insert(Forms::of(document));
+                // A body that states an absence is ASKED about the copy without it, so the
+                // round that follows reaches the values standing behind that absence.
+                if held.states_an_absence() {
+                    let Some(next) = rebuilt(req, held.asked()) else {
+                        return ValueReading::AsSent;
+                    };
+                    asked = Some(next);
+                    continue;
+                }
+                held
+            }
+        };
+        // The LITERAL is read off the body, which is the only place it survives: the codec's
+        // own complaint names the JSON type it found, and this protocol names the literal.
+        let found = as_literal(held.asked(), found);
+        let form = found.standing().and_then(|(target, at)| {
+            Some((at.to_vec(), readable(target, value_at(held.asked(), at)?)?))
+        });
+        let Some((at, form)) = form else {
+            return match refusal(&found) {
+                Some(refused) => ValueReading::Unreadable(refused),
+                None => ValueReading::read(read),
+            };
+        };
+        if !held.read(&at, form) {
+            return ValueReading::read(read);
+        }
+        // A request that cannot be rebuilt is served as the last form that could be, which
+        // leaves the value to the codec's own answer.
+        let Some(next) = rebuilt(req, held.served()) else {
+            return ValueReading::read(read);
+        };
+        if held.states_an_absence() {
+            let Some(probe) = rebuilt(req, held.asked()) else {
+                return ValueReading::read(read);
+            };
+            asked = Some(probe);
+        }
+        read = Some(next);
+    }
+    ValueReading::read(read)
+}
+
+/// What this layer makes of the values a request's body carries.
+#[derive(Debug)]
+enum ValueReading {
+    /// Every value reads into the member it is bound to as the body carries it: the request is
+    /// served exactly as it arrived.
+    AsSent,
+    /// The same request with the values the protocol reads in another form carried in that
+    /// form, which is what the operation is served ([`readable`]). BOXED because a whole
+    /// request dwarfs the other two answers and only this one carries it.
+    Read(Box<RtRequest>),
+    /// A value no modelled member can be read from, with what the refusal of it states.
+    Unreadable(Refused),
+}
+
+impl ValueReading {
+    /// The request as it is served, for a body nothing in which is refused: the rebuilt one
+    /// where a value was read in another form, and the request as it arrived where none was.
+    fn read(read: Option<RtRequest>) -> Self {
+        match read {
+            Some(read) => Self::Read(Box::new(read)),
+            None => Self::AsSent,
+        }
+    }
+}
+
+/// The two bodies a FORM question works over: the one the operation is served, and the one the
+/// question is asked of.
+///
+/// They differ in the absences the body states. A member an explicit `null` stands for is a
+/// member the body does not state ([`BodyReading`]), so the codec's walk stops at such a
+/// member and never reaches the values behind it — which would leave a value the protocol
+/// reads in another form unread for no reason but its position. The copy asked about therefore
+/// has those absences GONE, while the body the operation is served keeps them, because what
+/// they state is answered by the absence layer over the body as the protocol reads it.
+#[derive(Debug)]
+struct Forms {
+    /// The body the operation is served, with its absences still stated and every value read
+    /// so far in the form the protocol reads it in.
+    served: Value,
+    /// The copy asked about — `None` for a body that states no absence, which is asked about
+    /// itself.
+    asked: Option<Value>,
+}
+
+impl Forms {
+    /// The two bodies `document` makes.
+    fn of(document: Value) -> Self {
+        let asked = (absences_stated(&document) > 0)
+            .then(|| rewrite(&document, &mut 0, &|_| Applied::Dropped));
+        Self {
+            served: document,
+            asked,
+        }
+    }
+
+    /// Whether the body states an absence at all, which is what makes the two bodies differ.
+    fn states_an_absence(&self) -> bool {
+        self.asked.is_some()
+    }
+
+    /// The body the operation is served.
+    fn served(&self) -> &Value {
+        &self.served
+    }
+
+    /// The body the question is asked of.
+    fn asked(&self) -> &Value {
+        self.asked.as_ref().unwrap_or(&self.served)
+    }
+
+    /// Read the value at `at` as `form`, in both bodies — the paths are the same in each,
+    /// because an absence is dropped as a MEMBER and nothing beside it is renumbered
+    /// ([`rewrite`]). `false` when the path names no value to replace, which leaves both as
+    /// they stand.
+    fn read(&mut self, at: &[Step], form: Value) -> bool {
+        if let Some(asked) = self.asked.as_mut() {
+            if !write_at(asked, at, form.clone()) {
+                return false;
+            }
+        }
+        write_at(&mut self.served, at, form)
+    }
+}
+
+/// How much JSON this layer may read to carry a body's values in the form the protocol reads
+/// them in.
+///
+/// One bound over the two factors a caller multiplies: each value read in another form costs
+/// one read of the WHOLE body to find the value after it, so neither the number of such values
+/// nor the body's size bounds the work on its own. Past the bound the values already read keep
+/// their form and the rest are left to the codec, which refuses the first of them.
+const MOST_JSON_READ_FOR_FORMS: usize = 4 << 20;
+
+/// What this layer answers one value it could not read with: this error class states prose
+/// for some defects and none at all for others, and which of the two it is is a fact of the
+/// defect rather than of the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refused {
+    /// The error class ALONE, in a body carrying no prose member: a value no conversion was
+    /// attempted for ([`refusal`]).
+    Bare,
+    /// The class and this service's sentence about the value, stated in the capitalized
+    /// [`MESSAGE_MEMBER`] ([`Prose::Conversion`]).
+    Stated(String),
+}
+
+impl Refused {
+    /// The prose this refusal states, in the member that class of refusal states it in — and
+    /// `None` for the one that states none.
+    fn prose(self) -> Option<Prose> {
+        match self {
+            Self::Bare => None,
+            Self::Stated(stated) => Some(Prose::Conversion(stated)),
+        }
+    }
 }
 
 /// The value the framework's own deserializer for the operation `key` names stopped at in
-/// `req`'s body, with the modelled type that read was for — or `None` when the body reads,
-/// when it cannot be reached at all, and when the read failed for a reason that is about
-/// neither a value's JSON class nor an explicit `null`.
+/// `req`'s body, with the modelled type that read was for and where in the body it stands —
+/// or `None` when the body reads and when it cannot be reached at all.
+///
+/// A read that failed for a reason this layer states nothing about is reported too
+/// ([`Unreadable::Unclassified`]): whether the value can be READ in another form is a
+/// question about the value rather than about the codec's complaint, and it is asked of every
+/// failing read ([`readable`]).
 fn unreadable_value<Eng: Send + Sync + 'static>(
     key: &str,
     protocol: &dyn ServerHttpProtocol,
@@ -326,13 +562,9 @@ fn input_members<O: Operation>(
             .members()
             .iter()
             .filter_map(|member| {
-                let name = member.member_name()?;
                 Some(DeclaredMember {
-                    name,
-                    wire: member
-                        .json_name()
-                        .map(|given| given.value())
-                        .unwrap_or(name),
+                    name: member.member_name()?,
+                    wire: wire_name(member),
                     target: member.shape_type(),
                 })
             })
@@ -365,14 +597,15 @@ fn input_members<O: Operation>(
 // deserializer, which is the only thing that knows ([`absent_member`]).
 // =============================================================================
 
-/// What this layer makes of a request's BODY, ahead of every value in it.
+/// What this layer makes of a request's BODY and of the values in it.
 #[derive(Debug)]
 pub enum BodyReading {
-    /// A document of this protocol that states no member's absence: the request is served
-    /// exactly as it arrived.
+    /// A document of this protocol every value of which reads as sent, stating no member's
+    /// absence: the request is served exactly as it arrived.
     AsSent,
-    /// The body states the absence of one or more members with an explicit `null`: the same
-    /// request with those members absent, which is what the operation is served. BOXED
+    /// The body as this layer READ it, which is what the operation is served: the members its
+    /// explicit `null`s state the absence of are absent, and the values the protocol reads in
+    /// another form than the one the model declares carry that form ([`readable`]). BOXED
     /// because a whole request dwarfs the other two answers and only this one carries it.
     Absences(Box<RtRequest>),
     /// The body is not one an input of this protocol can be read from, with the prose this
@@ -415,8 +648,14 @@ impl Prose {
 }
 
 /// What `req`'s body is, for the operation `key` names: a document that is served as it
-/// arrived, the same request with the members it states as `null` absent, or a body no input
-/// can be read from.
+/// arrived, the same request with the values it carries in another form read and the members
+/// it states as `null` absent, or a body no input can be read from.
+///
+/// Three questions in the order the body answers them: whether the bytes are a document of
+/// this protocol at all, then which of its VALUES the protocol reads in another form than the
+/// one the model declares ([`value_reading`]), and only then what its explicit `null`s state —
+/// because an absence is a fact of the body as the protocol READS it, so a value read in
+/// another form is read before the absences beside it are asked about.
 pub fn body_reading<Eng: Send + Sync + 'static>(
     key: &str,
     protocol: &dyn ServerHttpProtocol,
@@ -442,203 +681,28 @@ pub fn body_reading<Eng: Send + Sync + 'static>(
     if !document.is_object() {
         return BodyReading::Unreadable(None);
     }
-    // TEXT that spells a boolean, standing where a boolean is modelled, is READ as that
-    // boolean, so what the layers below read is the body this protocol reads
-    // ([`boolean_texts_read`]). It is applied first, because the absences below are a fact of
-    // that same body.
-    match boolean_texts_read::<Eng>(key, protocol, req, &document) {
-        Some(read) => {
-            let Some(served) = rebuilt(req, &read) else {
-                return BodyReading::AsSent;
-            };
-            let Some(body) = served.body().bytes().map(<[u8]>::to_vec) else {
-                return BodyReading::AsSent;
-            };
-            let stated = StatedAbsences::of::<Eng>(key, protocol, &served, &body, read);
-            match stated.reading::<Eng>() {
-                // The body was rewritten for the booleans it spells even where it states no
-                // absence, so the request the operation is served is that one.
-                BodyReading::AsSent => BodyReading::Absences(Box::new(served)),
-                reading => reading,
-            }
-        }
-        None => {
-            let stated = StatedAbsences::of::<Eng>(key, protocol, req, body, document);
-            stated.reading::<Eng>()
-        }
-    }
-}
-
-/// How much JSON this layer may read to ASK which of a body's boolean SPELLINGS stands where
-/// a boolean is modelled.
-///
-/// The question is asked of the framework's own deserializer, one read of the whole body per
-/// spelling the body carries ([`boolean_texts_read`]), so the cost is the product of the two
-/// — both a caller's choice, which is why the bound is on their product. Past it the body is
-/// served exactly as it arrived, which leaves such a request the refusal its text earns
-/// today.
-const MOST_JSON_READ_FOR_BOOLEAN_TEXTS: usize = 4 << 20;
-
-/// `document` with every piece of TEXT that spells a boolean and stands where a boolean is
-/// MODELLED read as that boolean — or `None` when the body carries none, which is every body
-/// that spells no boolean in text.
-///
-/// Why the body is rewritten rather than the read being widened: the codec reads the body
-/// (`vendor/`, read-only from here), and a read that refuses a value has already consumed it,
-/// so the conversion has to happen in the body the codec is handed.
-///
-/// WHICH text stands where a boolean is modelled is not written down here, for the same
-/// reason nothing else about the model is ([`probe`]): each spelling is converted and the
-/// framework's OWN deserializer is asked about the result. A conversion is kept when the body
-/// it leaves carries no value of the boolean class the model cannot read — so text standing
-/// where a string, a number or an enumerated value is modelled (an attribute's `S`, a table
-/// name, a capacity level that happens to spell a boolean) is left exactly as it was sent,
-/// and only text the model does read as a boolean is read as one.
-///
-/// The spellings are walked in the order the body carries them, which is the order the codec
-/// reads them in, so a spelling the model DOES read as a boolean stops being a defect before
-/// the next one is asked about. That leaves one case where an answer could be read wrong — a
-/// defect EARLIER in the body that is no boolean spelling at all (a number where a string is
-/// modelled, say) masks the defect a later conversion would cause — and in that case the body
-/// is refused for that earlier defect either way, with the same sentence, so the conversion
-/// changes no answer.
-fn boolean_texts_read<Eng: Send + Sync + 'static>(
-    key: &str,
-    protocol: &dyn ServerHttpProtocol,
-    req: &RtRequest,
-    document: &Value,
-) -> Option<Value> {
-    // The bound is applied BEFORE a single path is materialised, exactly as the absence
-    // path applies its own ([`StatedAbsences::of`]): how many spellings a body carries is
-    // counted over the document alone, allocating nothing, so neither the paths nor the
-    // probes they drive can be grown past the cap by the request that asks for them.
-    let stated = boolean_spellings_stated(document);
-    if stated == 0 {
-        return None;
-    }
-    let body = ::serde_json::to_vec(document).ok()?.len();
-    if stated.saturating_mul(body) > MOST_JSON_READ_FOR_BOOLEAN_TEXTS {
-        return None;
-    }
-    let spelled = boolean_spellings(document);
-    let mut read = document.clone();
-    let mut applied = false;
-    for at in &spelled {
-        let attempt = as_boolean(&read, at);
-        if reads_a_boolean_nowhere::<Eng>(key, protocol, req, &attempt) {
-            read = attempt;
-            applied = true;
-        }
-    }
-    applied.then_some(read)
-}
-
-/// How many boolean SPELLINGS `document` carries — the cheap count the bound above is
-/// applied to, which allocates nothing and visits the document once, as
-/// [`absences_stated`] does for the absences a body states.
-fn boolean_spellings_stated(document: &Value) -> usize {
-    match document {
-        Value::Object(members) => members.values().map(boolean_spellings_stated).sum(),
-        Value::Array(elements) => elements.iter().map(boolean_spellings_stated).sum(),
-        Value::String(text) => usize::from(boolean_text(text).is_some()),
-        _ => 0,
-    }
-}
-
-/// Whether the framework's own deserializer reads `document` without stopping at a value of
-/// the BOOLEAN class: the question one converted spelling is kept or dropped on.
-///
-/// A body it stops at for any other reason is left to the refusal that reason earns — the
-/// conversion neither caused it nor hides it.
-fn reads_a_boolean_nowhere<Eng: Send + Sync + 'static>(
-    key: &str,
-    protocol: &dyn ServerHttpProtocol,
-    req: &RtRequest,
-    document: &Value,
-) -> bool {
-    let Some(probe) = rebuilt(req, document) else {
-        return false;
+    let read = match value_reading::<Eng>(key, protocol, req) {
+        ValueReading::AsSent => None,
+        ValueReading::Read(read) => Some(read),
+        ValueReading::Unreadable(refused) => return BodyReading::Unreadable(refused.prose()),
     };
-    match unreadable_value::<Eng>(key, protocol, &probe) {
-        Some(Unreadable::Class { class, .. }) => {
-            class != service_common::json_wire_values::BOOLEAN_VALUE
-        }
-        _ => true,
-    }
-}
-
-/// Where `document` carries TEXT that spells a boolean, in the order the body carries it.
-///
-/// The two spellings are the protocol's own literals, which is what a value that travelled
-/// through something carrying every value as text is written as; nothing else is a boolean's
-/// text ([`boolean_text`]). Built only for a body inside
-/// [`MOST_JSON_READ_FOR_BOOLEAN_TEXTS`], which is what bounds what these paths cost to hold.
-fn boolean_spellings(document: &Value) -> Vec<Vec<Step>> {
-    let mut found = Vec::new();
-    descend_boolean_texts(document, &mut Vec::new(), &mut found);
-    found
-}
-
-/// Collect the boolean spellings `value` carries, `at` being the path it stands at.
-///
-/// The recursion is as deep as the document, which is as deep as the reader that produced it
-/// descended — a bound that reader holds, not one a request chooses ([`nests_too_deep`]).
-fn descend_boolean_texts(value: &Value, at: &mut Vec<Step>, found: &mut Vec<Vec<Step>>) {
-    match value {
-        Value::Object(members) => {
-            for (name, held) in members {
-                at.push(Step::Member(name.clone()));
-                descend_boolean_texts(held, at, found);
-                at.pop();
-            }
-        }
-        Value::Array(elements) => {
-            for (index, held) in elements.iter().enumerate() {
-                at.push(Step::Element(index));
-                descend_boolean_texts(held, at, found);
-                at.pop();
-            }
-        }
-        Value::String(text) if boolean_text(text).is_some() => found.push(at.clone()),
-        _ => {}
-    }
-}
-
-/// `document` with the text at `at` read as the boolean it spells, and everything else
-/// exactly as it was.
-///
-/// A path that names no value leaves the document unchanged: it was read off this same
-/// document, so that cannot happen, and inventing a member for it would send the codec a body
-/// the caller did not write.
-fn as_boolean(document: &Value, at: &[Step]) -> Value {
-    let Some((step, rest)) = at.split_first() else {
-        return match document.as_str().and_then(boolean_text) {
-            Some(flag) => Value::Bool(flag),
-            None => document.clone(),
-        };
+    let Some(served) = read else {
+        return StatedAbsences::of::<Eng>(key, protocol, req, body, document).reading::<Eng>();
     };
-    match (step, document) {
-        (Step::Member(name), Value::Object(members)) => {
-            let mut read = members.clone();
-            if let Some(held) = members.get(name) {
-                read.insert(name.clone(), as_boolean(held, rest));
-            }
-            Value::Object(read)
-        }
-        (Step::Element(index), Value::Array(elements)) => Value::Array(
-            elements
-                .iter()
-                .enumerate()
-                .map(|(held, value)| {
-                    if held == *index {
-                        as_boolean(value, rest)
-                    } else {
-                        value.clone()
-                    }
-                })
-                .collect(),
-        ),
-        _ => document.clone(),
+    // The absences are a fact of the body the values were read in, so they are asked about
+    // that one rather than about the body as it arrived.
+    let Some(read) = served.body().bytes().map(<[u8]>::to_vec) else {
+        return BodyReading::AsSent;
+    };
+    let Ok(document) = ::serde_json::from_slice::<Value>(&read) else {
+        return BodyReading::AsSent;
+    };
+    let stated = StatedAbsences::of::<Eng>(key, protocol, &served, &read, document);
+    match stated.reading::<Eng>() {
+        // The body was rewritten for the values it carries in another form even where it
+        // states no absence, so the request the operation is served is that one.
+        BodyReading::AsSent => BodyReading::Absences(served),
+        reading => reading,
     }
 }
 
@@ -649,7 +713,8 @@ fn as_boolean(document: &Value, at: &[Step]) -> Value {
 /// the value travelled through something that carries every value as text (a form field, a
 /// shell variable, a template parameter), and the two words are exactly the ones the JSON
 /// literals are written with. Nothing else is a boolean — text that spells no boolean is
-/// refused as the unconvertible value it is.
+/// refused as the unconvertible value it is, and so is text that spells one in any other case
+/// than the literal's own.
 ///
 /// NOT `service_common::query_boolean_values::boolean_spelled`, which is the lexical space of
 /// an XML Schema boolean (`true`/`false`/`1`/`0`, whitespace collapsed) because that is what
@@ -821,7 +886,7 @@ impl<'r> StatedAbsences<'r> {
     /// Asked of a body in which every OTHER stated absence is gone, so the `null` that read
     /// answers is this one. `None` when the read it answered cannot be told — a value of the
     /// wrong class earlier in the body stopped the walk first, which is a defect of its own
-    /// ([`coercion_refusal`]).
+    /// ([`value_reading`]).
     fn target<Eng: Send + Sync + 'static>(&self, which: usize) -> Option<ShapeType> {
         let probe = rebuilt(self.req, &self.only(which))?;
         null_target::<Eng>(self.key, self.protocol, &probe)
@@ -1280,8 +1345,9 @@ impl<'de> ::serde::de::Visitor<'de> for ElementAt<'_> {
 /// encoded at all, which leaves the framework's own rendering to answer.
 ///
 /// `None` for `prose` is a refusal that states NONE: a body that is not a document of this
-/// protocol at all carries no value whose class could be named, so the refusal is the class
-/// alone (see [`BodyReading::Unreadable`]).
+/// protocol at all carries no value whose class could be named, and a value no conversion was
+/// attempted for states nothing either, so the refusal is the class alone (see
+/// [`BodyReading::Unreadable`], [`Refused::Bare`]).
 pub fn serialization_refusal(
     svc: &dyn Service,
     req: &RtRequest,
@@ -1302,21 +1368,25 @@ pub fn serialization_refusal(
 }
 
 /// Run the framework's own deserializer for `O` over the request, and report the first value
-/// whose JSON class could not be read into the modelled type of the member it is bound to.
+/// it could not read into the modelled type of the member it is bound to, with the type that
+/// read was for and the position in the body it stood at.
 ///
 /// A body that READS is this layer's business no further: whatever the model's own
 /// constraints then say about its values is a constraint refusal, which the walk that
 /// follows answers.
 ///
 /// The CLASS recorded is the one the codec's own complaint named the value under, which is
-/// read off the vendored codec's wording ([`value_class`]).
+/// read off the vendored codec's wording ([`value_class`]), and the LITERAL is read off the
+/// body at the position recorded beside it ([`as_literal`]).
 fn probe<O: Operation>(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Option<Unreadable> {
     let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
     let found: RefCell<Option<Unreadable>> = RefCell::new(None);
+    let at: Trail = RefCell::new(Vec::new());
     let read = {
         let mut probe = Probe {
             inner: &mut *deserializer,
             found: &found,
+            at: &at,
             // The input IS a structure, so the members the body states for it are fields
             // of it.
             slot: Slot::Field,
@@ -1344,10 +1414,12 @@ fn null_read_target<O: Operation>(
     let mut deserializer = protocol.deserialize_input(req, O::INPUT_SCHEMA).ok()?;
     let found: RefCell<Option<Unreadable>> = RefCell::new(None);
     let accepted: RefCell<Option<ShapeType>> = RefCell::new(None);
+    let at: Trail = RefCell::new(Vec::new());
     {
         let mut probe = Probe {
             inner: &mut *deserializer,
             found: &found,
+            at: &at,
             slot: Slot::Field,
             accepted: Some(&accepted),
         };
@@ -1375,50 +1447,190 @@ fn unsatisfied_member<O: Operation>(
     }
 }
 
-/// The sentence one unreadable value is refused with, or `None` when this service states no
-/// name for the type the failing read was for.
+/// What one unreadable value is refused with, or `None` when this service states no name for
+/// the type the failing read was for.
 ///
-/// Three sentences, because a caller has three different defects to fix. A single value sent
+/// Five answers, because a caller has five different defects to fix. A single value sent
 /// where the model declares another single value is a CONVERSION that could not be
-/// performed, and the sentence names the two facts to reconcile: the class of value sent and
-/// the type it could not become. Anything with a collection on either side — a scalar where
-/// the model declares a list, a structure or a map, or a collection where it declares one
-/// value — is not a conversion at all, and what it is called depends on WHERE the value
-/// stands: a member a structure declares is a field whose type was unexpected
-/// ([`UNEXPECTED_FIELD_TYPE`]), while a value inside a collection is named by no member at
-/// all, so what the sentence states is the value the payload carried
-/// ([`UNEXPECTED_VALUE_TYPE`], [`Slot`]). And base64 text no blob can be decoded from is a
-/// defect of the TEXT rather than of its class ([`BASE64_LENGTH`]).
+/// performed, and the sentence names the two facts to reconcile: the literal sent and the
+/// type it could not become. A collection standing where the member it is bound to is read
+/// from no collection is not a conversion at all and none was attempted for it, and which of
+/// the two collections it is decides the answer: an ARRAY earns the error class alone, with
+/// no prose ([`Refused::Bare`]), while an OBJECT is named after the structural token the
+/// reader found ([`STRUCTURE_OR_MAP`]). A single value standing where the model declares a
+/// type that HOLDS other values is named after WHERE it stood: a member a structure declares
+/// is a field whose type was unexpected ([`UNEXPECTED_FIELD_TYPE`]), while a value inside a
+/// collection is named by no member at all, so what the sentence states is the value the
+/// payload carried ([`UNEXPECTED_VALUE_TYPE`], [`Slot`]). And base64 text no blob can be
+/// decoded from is a defect of the TEXT rather than of its class ([`BASE64_LENGTH`]).
 ///
-/// An explicit `null` is no sentence of this class at all: nothing was converted, because
+/// An explicit `null` is no refusal of this class at all: nothing was converted, because
 /// `null` states that the member is ABSENT, which is what [`BodyReading`] answers.
-fn sentence(unreadable: &Unreadable) -> Option<String> {
+fn refusal(unreadable: &Unreadable) -> Option<Refused> {
     let (target, class, slot) = match unreadable {
         Unreadable::Base64Length { characters } => {
-            return Some(format!("{BASE64_LENGTH}{characters}"));
+            return Some(Refused::Stated(format!("{BASE64_LENGTH}{characters}")));
         }
+        // A read this layer states nothing about: the framework's own answer to it stands.
+        Unreadable::Unclassified { .. } => return None,
         Unreadable::Class {
             target,
             class,
             slot,
+            ..
         } => (*target, *class, *slot),
     };
     if class == NULL_VALUE {
         return None;
     }
-    if class == ARRAY_VALUE || class == OBJECT_VALUE {
-        return Some(UNEXPECTED_FIELD_TYPE.to_string());
+    if class == ARRAY_VALUE {
+        return Some(Refused::Bare);
+    }
+    if class == OBJECT_VALUE {
+        return Some(Refused::Stated(STRUCTURE_OR_MAP.to_string()));
     }
     if is_aggregate(target) {
-        return Some(
+        return Some(Refused::Stated(
             match slot {
                 Slot::Field => UNEXPECTED_FIELD_TYPE,
                 Slot::Inside => UNEXPECTED_VALUE_TYPE,
             }
             .to_string(),
-        );
+        ));
     }
-    Some(format!("{class} cannot be converted to {}", named_type(target)?))
+    Some(Refused::Stated(format!(
+        "{class} cannot be converted to {}",
+        named_type(target)?
+    )))
+}
+
+/// `unreadable` with the class of the value it is about refined to the LITERAL `document`
+/// carries at the position the failing read stood.
+///
+/// The codec's own complaint names the JSON TYPE it found ("boolean", "number"), which is a
+/// class of several literals rather than one of them, while this protocol names the literal
+/// ([`TRUE_VALUE`]). The body is the only place that fact survives the read, so the value the
+/// failing read stood at is looked up in it. A path that no longer resolves and a literal of
+/// another class than the codec named both leave the class exactly as the codec named it.
+fn as_literal(document: &Value, unreadable: Unreadable) -> Unreadable {
+    match unreadable {
+        Unreadable::Class {
+            target,
+            class,
+            slot,
+            at,
+        } => {
+            let carried = value_at(document, &at);
+            let class = carried.map_or(class, |held| literal_class(class, held));
+            Unreadable::Class {
+                target,
+                class,
+                slot,
+                at,
+            }
+        }
+        held => held,
+    }
+}
+
+/// The value a member the model types as `target` READS the literal `carried` as, where the
+/// two differ in form and the literal still spells a value of that type — and `None` for a
+/// literal the member can be read from in no form at all, which is the value a refusal is
+/// then about.
+///
+/// Two conversions, both of them the PROTOCOL's rather than rules of the model, so each is
+/// applied wherever the model declares that type: a quoted literal spelling a flag is read as
+/// the flag it spells, and a number carrying a fraction standing where a whole number is
+/// modelled is read as the whole number it truncates to — the codec itself already reads one
+/// whose fraction is zero, so what this adds is the truncation. A literal needing neither
+/// conversion never reaches here: the codec read it.
+fn readable(target: ShapeType, carried: &Value) -> Option<Value> {
+    match (target, carried) {
+        (ShapeType::Boolean, Value::String(text)) => boolean_text(text).map(Value::Bool),
+        (
+            ShapeType::Byte | ShapeType::Short | ShapeType::Integer | ShapeType::Long,
+            Value::Number(number),
+        ) => {
+            // A number whose value is already a whole one is no fraction: whatever refused
+            // it, it was not its form.
+            if !fractional(number) {
+                return None;
+            }
+            // Towards zero, which is the narrowing the reader itself performs on the
+            // fraction it already reads (a number whose fraction is zero), carried to one
+            // that is not zero. No recording states the direction, so it is this one reading
+            // rather than a second rule.
+            let whole = number.as_f64()?.trunc();
+            // Only a fraction of a number a whole one can be made of at all; the rest is no
+            // value of any integral type.
+            if whole < -(2f64.powi(63)) || whole >= 2f64.powi(63) {
+                return None;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            Some(Value::Number(::serde_json::Number::from(whole as i64)))
+        }
+        _ => None,
+    }
+}
+
+/// Whether the number's VALUE is not a whole one — the question the fractional token and the
+/// narrowing both turn on.
+///
+/// Asked of the value rather than of the text the reader renders it as: the maintained reader
+/// holds every number in the nearest type that fits, so a whole number too large for its
+/// integral types is held as a double and is STILL a whole number, while a fraction is a
+/// fraction however the body spelled it (`1.5`, `1e-7`).
+fn fractional(number: &::serde_json::Number) -> bool {
+    number.as_i64().is_none()
+        && number.as_u64().is_none()
+        && number.as_f64().is_some_and(|held| held.fract() != 0.0)
+}
+
+/// Write `form` at `at` in `document`, answering whether the path named a value to replace.
+fn write_at(document: &mut Value, at: &[Step], form: Value) -> bool {
+    let mut held = document;
+    for step in at {
+        let next = match step {
+            Step::Member(name) => held.get_mut(name),
+            Step::Element(index) => held.get_mut(index),
+        };
+        match next {
+            Some(reached) => held = reached,
+            None => return false,
+        }
+    }
+    *held = form;
+    true
+}
+
+/// The token the LITERAL `carried` is named by, where it is one of a class this protocol
+/// splits and `class` — the class the codec named — agrees that it is the value the read
+/// stopped at; otherwise `class` itself.
+///
+/// The agreement is what keeps a path that resolved to another value from renaming the
+/// refusal: a literal whose class is not the one the codec complained about is not the value
+/// that failed to read.
+fn literal_class(class: &'static str, carried: &Value) -> &'static str {
+    match (class, carried) {
+        (BOOLEAN_VALUE, Value::Bool(true)) => TRUE_VALUE,
+        (BOOLEAN_VALUE, Value::Bool(false)) => FALSE_VALUE,
+        // A whole number keeps `NUMBER_VALUE`; one whose value carries a fraction is the
+        // other token ([`fractional`]).
+        (NUMBER_VALUE, Value::Number(number)) if fractional(number) => DECIMAL_VALUE,
+        _ => class,
+    }
+}
+
+/// The value `document` carries at `at`, or `None` when the path names nothing in it.
+fn value_at<'v>(document: &'v Value, at: &[Step]) -> Option<&'v Value> {
+    let mut held = document;
+    for step in at {
+        held = match step {
+            Step::Member(name) => held.get(name)?,
+            Step::Element(index) => held.get(index)?,
+        };
+    }
+    Some(held)
 }
 
 /// Whether the modelled type is one that holds OTHER values rather than being one.
@@ -1456,20 +1668,44 @@ fn named_type(target: ShapeType) -> Option<&'static str> {
 enum Unreadable {
     /// A value whose JSON CLASS the modelled type of the slot it stands in admits no reading
     /// of: the type the failing read was for, the class the codec's own complaint named the
-    /// submitted value under, and the kind of slot the value stands in.
+    /// submitted value under, the kind of slot the value stands in, and where in the body it
+    /// stands — which is what makes the LITERAL the body carries there reachable
+    /// ([`as_literal`]).
     Class {
         target: ShapeType,
         class: &'static str,
         slot: Slot,
+        at: Vec<Step>,
     },
     /// Text standing where a blob is modelled that is not a whole number of base64 groups,
     /// with the number of characters the body carried — the one fact the sentence for it
     /// states ([`BASE64_LENGTH`]).
     Base64Length { characters: usize },
+    /// A read that failed for a reason this layer states nothing about — a number no value of
+    /// the modelled width can be made of, text that is not a timestamp — recorded only for
+    /// the type it was for and the position it was at, because that is what says whether the
+    /// value can be READ after all in the form the protocol carries it
+    /// ([`readable`]). Refused by nobody here: the framework's own answer to it stands
+    /// ([`refusal`]).
+    Unclassified { target: ShapeType, at: Vec<Step> },
+}
+
+impl Unreadable {
+    /// The modelled type the failing read was for, and where in the body the value it was for
+    /// stands — `None` for a defect of a value's TEXT, which is about the text rather than
+    /// about which value stood there.
+    fn standing(&self) -> Option<(ShapeType, &[Step])> {
+        match self {
+            Self::Class { target, at, .. } | Self::Unclassified { target, at } => {
+                Some((*target, at))
+            }
+            Self::Base64Length { .. } => None,
+        }
+    }
 }
 
 /// WHERE the value a read is for stands, which is what a defect involving a collection is
-/// named after ([`sentence`]).
+/// named after ([`refusal`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Slot {
     /// A member a structure or a union DECLARES, which the body names: a field. The input
@@ -1491,6 +1727,11 @@ enum Slot {
 struct Probe<'d, 'f> {
     inner: &'d mut (dyn ShapeDeserializer + 'd),
     found: &'f RefCell<Option<Unreadable>>,
+    /// Where in the BODY the value this probe reads stands: the members, keys and positions
+    /// the reads descended through to reach it. Each container read pushes the step it
+    /// descends through and pops it on the way out, so a failing read records the path the
+    /// body carries that value at ([`note_in`]).
+    at: &'f Trail,
     /// Where the value this probe reads stands: a field of the structure (or union) being
     /// read, or a value inside a collection. Each container read hands the probe it builds
     /// for what is INSIDE it the slot that applies there ([`Slot`]).
@@ -1536,22 +1777,45 @@ impl Probe<'_, '_> {
 /// collection member's own schema.
 fn note_in(
     found: &RefCell<Option<Unreadable>>,
+    at: &Trail,
     target: ShapeType,
     slot: Slot,
     error: SerdeError,
 ) -> SerdeError {
-    let Some(class) = value_class(&error) else {
-        return error;
-    };
     let mut held = found.borrow_mut();
     if held.is_none() {
-        *held = Some(Unreadable::Class {
-            target,
-            class,
-            slot,
+        *held = Some(match value_class(&error) {
+            Some(class) => Unreadable::Class {
+                target,
+                class,
+                slot,
+                at: at.borrow().clone(),
+            },
+            // A read this layer states nothing about is still recorded, because the value it
+            // was for may be one the protocol READS in another form ([`readable`]).
+            None => Unreadable::Unclassified {
+                target,
+                at: at.borrow().clone(),
+            },
         });
     }
     error
+}
+
+/// Where the reads have descended to in the body, as they descend: one step per container
+/// entered, pushed on the way in and popped on the way out, so the path is whatever the
+/// reader is standing at ([`Probe::at`]).
+type Trail = RefCell<Vec<Step>>;
+
+/// The name this protocol carries `member` under — its `@jsonName` where the model gives one,
+/// else its Smithy member name, which is the key the JSON codec matched it by and so the key
+/// the body carries it under.
+fn wire_name(member: &Schema) -> &str {
+    member
+        .json_name()
+        .map(|given| given.value())
+        .or_else(|| member.member_name())
+        .unwrap_or_default()
 }
 
 /// Record `text` — standing where a blob is modelled, and undecodable — as the defect of its
@@ -1586,7 +1850,7 @@ fn note_base64(found: &RefCell<Option<Unreadable>>, text: &str) {
 ///
 /// JSON `null` IS one of the names, and is the one that is not a value of the wrong class: a
 /// `null` states that the member is absent, so what it earns is decided by whether the input
-/// requires that member ([`BodyReading`]) rather than by a conversion ([`sentence`] states no
+/// requires that member ([`BodyReading`]) rather than by a conversion ([`refusal`] states no
 /// conversion for it). It is recorded here because the modelled type the read was FOR is the
 /// only place the type a `null` stood where is stated.
 ///
@@ -1624,10 +1888,11 @@ macro_rules! watched_reads {
         $(
             fn $method(&mut self, schema: &Schema) -> Result<$value, SerdeError> {
                 let found = self.found;
+                let at = self.at;
                 let slot = self.slot;
                 self.inner
                     .$method(schema)
-                    .map_err(|error| note_in(found, ShapeType::$target, slot, error))
+                    .map_err(|error| note_in(found, at, ShapeType::$target, slot, error))
             }
         )+
     };
@@ -1642,21 +1907,30 @@ impl ShapeDeserializer for Probe<'_, '_> {
         self.note_accepted(schema);
         let found = self.found;
         let accepted = self.accepted;
+        let at = self.at;
         let slot = self.slot;
         // What a structure (or a union) holds are the members it DECLARES, so every value
-        // read inside this one stands in a field of it.
+        // read inside this one stands in a field of it, under the name the body carries that
+        // member by.
         let mut watched = |member: &Schema, inner: &mut dyn ShapeDeserializer| {
-            let mut probe = Probe {
-                inner,
-                found,
-                slot: Slot::Field,
-                accepted,
+            at.borrow_mut()
+                .push(Step::Member(wire_name(member).to_string()));
+            let read = {
+                let mut probe = Probe {
+                    inner,
+                    found,
+                    at,
+                    slot: Slot::Field,
+                    accepted,
+                };
+                consumer(member, &mut probe)
             };
-            consumer(member, &mut probe)
+            at.borrow_mut().pop();
+            read
         };
         self.inner
             .read_struct(schema, &mut watched)
-            .map_err(|error| note_in(found, schema.shape_type(), slot, error))
+            .map_err(|error| note_in(found, at, schema.shape_type(), slot, error))
     }
 
     fn read_list(
@@ -1667,20 +1941,30 @@ impl ShapeDeserializer for Probe<'_, '_> {
         self.note_accepted(schema);
         let found = self.found;
         let accepted = self.accepted;
+        let at = self.at;
         let slot = self.slot;
-        // An element is named by no member: it stands INSIDE the collection.
+        // An element is named by no member: it stands INSIDE the collection, at the position
+        // the body carries it — which is the order the elements are read in.
+        let mut position = 0usize;
         let mut watched = |inner: &mut dyn ShapeDeserializer| {
-            let mut probe = Probe {
-                inner,
-                found,
-                slot: Slot::Inside,
-                accepted,
+            at.borrow_mut().push(Step::Element(position));
+            position += 1;
+            let read = {
+                let mut probe = Probe {
+                    inner,
+                    found,
+                    at,
+                    slot: Slot::Inside,
+                    accepted,
+                };
+                consumer(&mut probe)
             };
-            consumer(&mut probe)
+            at.borrow_mut().pop();
+            read
         };
         self.inner
             .read_list(schema, &mut watched)
-            .map_err(|error| note_in(found, schema.shape_type(), slot, error))
+            .map_err(|error| note_in(found, at, schema.shape_type(), slot, error))
     }
 
     fn read_map(
@@ -1691,21 +1975,28 @@ impl ShapeDeserializer for Probe<'_, '_> {
         self.note_accepted(schema);
         let found = self.found;
         let accepted = self.accepted;
+        let at = self.at;
         let slot = self.slot;
         // An entry's value is named by its KEY rather than by a member the model declares,
         // so it too stands inside the collection rather than in a field.
         let mut watched = |key: String, inner: &mut dyn ShapeDeserializer| {
-            let mut probe = Probe {
-                inner,
-                found,
-                slot: Slot::Inside,
-                accepted,
+            at.borrow_mut().push(Step::Member(key.clone()));
+            let read = {
+                let mut probe = Probe {
+                    inner,
+                    found,
+                    at,
+                    slot: Slot::Inside,
+                    accepted,
+                };
+                consumer(key, &mut probe)
             };
-            consumer(key, &mut probe)
+            at.borrow_mut().pop();
+            read
         };
         self.inner
             .read_map(schema, &mut watched)
-            .map_err(|error| note_in(found, schema.shape_type(), slot, error))
+            .map_err(|error| note_in(found, at, schema.shape_type(), slot, error))
     }
 
     // Every value read, forwarded and watched. The list is the trait's own scalar surface,
@@ -1735,11 +2026,12 @@ impl ShapeDeserializer for Probe<'_, '_> {
     /// exactly the texts the read it stands in for admits.
     fn read_blob(&mut self, schema: &Schema) -> Result<Blob, SerdeError> {
         let found = self.found;
+        let at = self.at;
         let slot = self.slot;
         let text = self
             .inner
             .read_string(schema)
-            .map_err(|error| note_in(found, ShapeType::Blob, slot, error))?;
+            .map_err(|error| note_in(found, at, ShapeType::Blob, slot, error))?;
         match ::aws_smithy_types::base64::decode(&text) {
             Ok(bytes) => Ok(Blob::new(bytes)),
             Err(undecodable) => {
@@ -1827,16 +2119,18 @@ mod tests {
     use ::aws_smithy_schema_server::json::JsonCodec;
 
     /// Read `body` into `T` through the same watching probe the request layer drives, and
-    /// report the sentence it would be refused with — the JSON codec alone, so the case is
-    /// about the codec's refusal and the class of the submitted value and nothing else.
-    fn recorded<T: DeserializableStruct>(body: &str) -> Option<String> {
+    /// report what it would be refused with — the JSON codec alone, so the case is about the
+    /// codec's refusal, the literal the body carries and nothing else.
+    fn recorded<T: DeserializableStruct>(body: &str) -> Option<Refused> {
         let codec = JsonCodec::new();
         let mut deserializer = codec.create_deserializer(body.as_bytes());
         let found: RefCell<Option<Unreadable>> = RefCell::new(None);
+        let at: Trail = RefCell::new(Vec::new());
         {
             let mut probe = Probe {
                 inner: &mut deserializer,
                 found: &found,
+                at: &at,
                 slot: Slot::Field,
                 accepted: None,
             };
@@ -1845,13 +2139,22 @@ mod tests {
             }
         }
         let unreadable = found.into_inner()?;
-        sentence(&unreadable)
+        let document = ::serde_json::from_slice::<Value>(body.as_bytes())
+            .expect("every case reads as one JSON document");
+        refusal(&as_literal(&document, unreadable))
+    }
+
+    /// The refusal that states `sentence`.
+    fn stated(sentence: &str) -> Option<Refused> {
+        Some(Refused::Stated(sentence.to_string()))
     }
 
     /// RULE: a value of a class the modelled type of its member admits no reading of earns
-    /// the sentence of its defect — the conversion that could not be performed between two
-    /// single values, and the unexpected field type wherever a collection is involved — at
-    /// whatever depth of the body it stands.
+    /// the refusal of its defect — the conversion that could not be performed between two
+    /// single values, naming the literal sent; the unexpected field or payload value where a
+    /// single value stands in an aggregate; and the class alone, with no prose, where a
+    /// collection stands in a member read from none — at whatever depth of the body it
+    /// stands.
     ///
     /// This layer learns WHETHER a read failed on a value's JSON class from the text of the
     /// vendored codec's own refusal ("expected <type>, got <json type>", "number … does not
@@ -1867,19 +2170,21 @@ mod tests {
         // `TableArn` (`smithy_query(query="operation", operation="CreateTable")`). A
         // collection sent for it is not a conversion at all.
         let string_rows = [
-            ("17", "NUMBER_VALUE cannot be converted to String"),
-            ("17.5", "NUMBER_VALUE cannot be converted to String"),
-            ("true", "BOOLEAN_VALUE cannot be converted to String"),
-            ("false", "BOOLEAN_VALUE cannot be converted to String"),
-            (r#"["t"]"#, UNEXPECTED_FIELD_TYPE),
-            (r#"{"Name":"t"}"#, UNEXPECTED_FIELD_TYPE),
+            ("17", stated("NUMBER_VALUE cannot be converted to String")),
+            ("17.5", stated("DECIMAL_VALUE cannot be converted to String")),
+            // A fraction however the body spelled it, and a WHOLE number however large.
+            ("1e-7", stated("DECIMAL_VALUE cannot be converted to String")),
+            ("1e20", stated("NUMBER_VALUE cannot be converted to String")),
+            ("true", stated("TRUE_VALUE cannot be converted to String")),
+            ("false", stated("FALSE_VALUE cannot be converted to String")),
+            (r#"["t"]"#, Some(Refused::Bare)),
+            (r#"{"Name":"t"}"#, stated(STRUCTURE_OR_MAP)),
         ];
         for (sent, expected) in string_rows {
             let body = format!(r#"{{"TableName":{sent}}}"#);
             let stated = recorded::<CreateTableInput>(&body);
             assert_eq!(
-                stated.as_deref(),
-                Some(expected),
+                stated, expected,
                 "case {sent:?}: expected the refusal {expected:?}, got {stated:?}"
             );
         }
@@ -1890,9 +2195,17 @@ mod tests {
             r#"{"TableName":"t","ProvisionedThroughput":{"ReadCapacityUnits":"5"}}"#,
         );
         assert_eq!(
-            nested.as_deref(),
-            Some("STRING_VALUE cannot be converted to Long"),
+            nested,
+            stated("STRING_VALUE cannot be converted to Long"),
             "a string where a nested long is declared: got {nested:?}"
+        );
+        let flagged = recorded::<CreateTableInput>(
+            r#"{"TableName":"t","ProvisionedThroughput":{"ReadCapacityUnits":true}}"#,
+        );
+        assert_eq!(
+            flagged,
+            stated("TRUE_VALUE cannot be converted to Long"),
+            "a flag where a nested long is declared: got {flagged:?}"
         );
 
         // A value nested inside a LIST's element structure: `Tag$Key` targets `TagKeyString`
@@ -1901,14 +2214,22 @@ mod tests {
             r#"{"ResourceArn":"arn","Tags":[{"Key":1,"Value":"v"}]}"#,
         );
         assert_eq!(
-            in_element.as_deref(),
-            Some("NUMBER_VALUE cannot be converted to String"),
+            in_element,
+            stated("NUMBER_VALUE cannot be converted to String"),
             "a number where a list element's string member is declared: got {in_element:?}"
+        );
+        let in_second = recorded::<TagResourceInput>(
+            r#"{"ResourceArn":"arn","Tags":[{"Key":"k","Value":"v"},{"Key":false,"Value":"v"}]}"#,
+        );
+        assert_eq!(
+            in_second,
+            stated("FALSE_VALUE cannot be converted to String"),
+            "the literal is read at the element it stood at: got {in_second:?}"
         );
         let element = recorded::<TagResourceInput>(r#"{"ResourceArn":"arn","Tags":["k=v"]}"#);
         assert_eq!(
-            element.as_deref(),
-            Some(UNEXPECTED_VALUE_TYPE),
+            element,
+            stated(UNEXPECTED_VALUE_TYPE),
             "a scalar INSIDE a list of structures, which no member names: got {element:?}"
         );
 
@@ -1916,14 +2237,14 @@ mod tests {
         // integral width (`ListTables$Limit` targets `ListTablesInputLimit`, an integer).
         let whole_list = recorded::<TagResourceInput>(r#"{"ResourceArn":"arn","Tags":"k=v"}"#);
         assert_eq!(
-            whole_list.as_deref(),
-            Some(UNEXPECTED_FIELD_TYPE),
+            whole_list,
+            stated(UNEXPECTED_FIELD_TYPE),
             "a scalar where a list is declared: got {whole_list:?}"
         );
         let wide = recorded::<ListTablesInput>(r#"{"Limit":2147483648}"#);
         assert_eq!(
-            wide.as_deref(),
-            Some("NUMBER_VALUE cannot be converted to Integer"),
+            wide,
+            stated("NUMBER_VALUE cannot be converted to Integer"),
             "a number past the modelled integer width: got {wide:?}"
         );
 

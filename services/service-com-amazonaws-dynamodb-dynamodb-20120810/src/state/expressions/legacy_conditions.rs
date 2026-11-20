@@ -322,12 +322,12 @@ pub(super) fn expected_entry_satisfied(
         // "Exists is false but you also provide a Value" is refused, as is an `Exists`
         // of true with nothing to check.
         (Some(_), Some(false)) => Err(refused(format!(
-            "One or more parameter values were invalid: Value cannot be used when Exists is false \
-             for Attribute: {name}"
+            "{INVALID_PARAMETER_CLAUSE}: Value cannot be used when Exists is false for \
+             Attribute: {name}"
         ))),
-        (None, Some(true)) => Err(refused(format!(
-            "One or more parameter values were invalid: Value must be provided when Exists is \
-             true for Attribute: {name}"
+        (None, Some(true)) => Err(exists_without_value(format!(
+            "{INVALID_PARAMETER_CLAUSE}: Value must be provided when Exists is true for \
+             Attribute: {name}"
         ))),
         (None, Some(false)) => Ok(held.is_none()),
         // An entry that states NEITHER member expects nothing: `Exists` defaults to
@@ -335,10 +335,25 @@ pub(super) fn expected_entry_satisfied(
         // exists" — and an expectation that the attribute exists needs the value it is
         // expected to hold. AWS names `Exists` as the member that was left out.
         (None, None) => Err(refused(format!(
-            "One or more parameter values were invalid: Value must be provided when Exists is \
-             null for Attribute: {name}"
+            "{INVALID_PARAMETER_CLAUSE}: Value must be provided when Exists is null for \
+             Attribute: {name}"
         ))),
     }
+}
+
+/// How the refusal of an `Expected` entry that STATES `Exists` true and carries no `Value` is
+/// worded: the sentence on its own, outside the `<N> validation error(s) detected: ` envelope
+/// ([`unenveloped`]).
+///
+/// Which of the refusals this service words itself carries that envelope is recorded per
+/// REFUSAL rather than per member or per operation — the envelope reports what a validating
+/// walk collected, and the walks AWS words these clauses from are not one walk. So each
+/// clause here keeps the form recorded for it: this one is stated alone, while the entry that
+/// states NEITHER member, the member pairs that may not stand together and the operands a
+/// comparison needs are each stated inside it (the arms beside this one, and
+/// [`check_legacy_comparison`]'s own clause, which is stated alone again).
+fn exists_without_value(clause: String) -> RequestError {
+    unenveloped(refused(clause))
 }
 
 /// Whether one legacy `ComparisonOperator` holds between the stored attribute and the

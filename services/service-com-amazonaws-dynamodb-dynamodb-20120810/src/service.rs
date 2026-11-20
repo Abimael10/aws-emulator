@@ -881,28 +881,32 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
             let Some((operation, op)) = routed else {
                 return reported(front_door::unknown_operation_response(req));
             };
-            // DESERIALIZATION precedes every later layer. The BODY comes first: bytes that
-            // are not one complete JSON object are no body of this protocol at all, and a
-            // member the body carries as an explicit `null` is a member it does not state,
-            // so the operation is served the same request with that member absent. Then a
-            // value whose JSON class the modelled member it is bound to cannot be read from
-            // never becomes a value at all, so the request is refused as the PROTOCOL's own
-            // marshalling failure before the operation's validating walk reaches a
-            // constraint and before its handler reads or writes anything. The framework
-            // would otherwise render that codec failure in the constraint-violation
-            // envelope, which is a different error class, under a different member name, and
-            // a different remediation for the caller ([`request_layer`]). The cost is
-            // deliberate: a request's body is read twice, once here and once by the dispatch
-            // that follows.
+            // DESERIALIZATION precedes every later layer, and the BODY is where it starts:
+            // bytes that are not one complete JSON object are no body of this protocol at
+            // all; a value the protocol READS in another form than the one the model declares
+            // is read in that form, and the operation is served the request carrying it as
+            // read; a member the body carries as an explicit `null` is a member it does not
+            // state, so that member is absent from the request served; and a value whose JSON
+            // class the modelled member it is bound to cannot be read from never becomes a
+            // value at all, so the request is refused as the PROTOCOL's own marshalling
+            // failure before the operation's validating walk reaches a constraint and before
+            // its handler reads or writes anything. The framework would otherwise render that
+            // codec failure in the constraint-violation envelope, which is a different error
+            // class, under a different member name, and a different remediation for the
+            // caller ([`request_layer`]). The cost is deliberate: a request's body is read
+            // twice, once here and once by the dispatch that follows.
             let reading = {
                 let protocol = svc.definition().wire_protocol(req);
                 request_layer::body_reading::<Eng>(operation, protocol.protocol(), req)
             };
             let req = match &reading {
                 request_layer::BodyReading::AsSent => req,
-                // The request with every stated absence absent lives for the call it is read
+                // The request as this layer READ it — every stated absence absent and every
+                // value in the form the protocol reads it in — lives for the call it is read
                 // by, which is all the layers below borrow it for.
-                request_layer::BodyReading::Absences(without) => without,
+                request_layer::BodyReading::Absences(read) => read,
+                // Which members the refusal's body carries is a fact of the DEFECT: a value
+                // no conversion was attempted for is refused with the error class alone.
                 request_layer::BodyReading::Unreadable(prose) => {
                     if let Some(refusal) =
                         request_layer::serialization_refusal(svc, req, prose.as_ref())
@@ -912,17 +916,6 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                     req
                 }
             };
-            let unreadable = {
-                let protocol = svc.definition().wire_protocol(req);
-                request_layer::coercion_refusal::<Eng>(operation, protocol.protocol(), req)
-            };
-            if let Some(message) = unreadable {
-                let stated = request_layer::Prose::Conversion(message);
-                if let Some(refusal) = request_layer::serialization_refusal(svc, req, Some(&stated))
-                {
-                    return front_door::announced(req, reported(refusal));
-                }
-            }
             // And the DATATYPE of one value the body carries, for the members that state a
             // defect of it behind a sentence of their own: such a value never becomes an
             // input, so the member it stood in is known only while the body is still in hand

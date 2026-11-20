@@ -213,10 +213,18 @@ async fn a_scalar_where_a_collection_is_declared_is_named_after_the_slot_it_stoo
             "NUMBER_VALUE cannot be converted to String",
         ),
         (
-            "a flag where a value's number datatype is a string, in a field",
+            // The refusal names the LITERAL the body carried, so the two flags are two
+            // tokens rather than one.
+            "a true flag where a value's number datatype is a string, in a field",
             "PutItem",
             json!({"TableName": TABLE, "Item": {"pk": {"N": true}}}),
-            "BOOLEAN_VALUE cannot be converted to String",
+            "TRUE_VALUE cannot be converted to String",
+        ),
+        (
+            "a false flag where a value's number datatype is a string, in a field",
+            "PutItem",
+            json!({"TableName": TABLE, "Item": {"pk": {"N": false}}}),
+            "FALSE_VALUE cannot be converted to String",
         ),
         (
             "a number where a string set's element is a string, inside the list",

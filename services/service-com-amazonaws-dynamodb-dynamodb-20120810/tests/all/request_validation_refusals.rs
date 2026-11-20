@@ -1328,45 +1328,54 @@ async fn an_expected_entry_states_what_it_expects() {
     .await;
 
     // Each row: the case, the entry, and the clause the service states — `None` where
-    // the entry states a condition the service can decide.
-    let rows: Vec<(&str, Value, Option<&str>)> = vec![
+    // the entry states a condition the service can decide — beside whether that clause is
+    // stated inside the `<N> validation error(s) detected: ` envelope, which is recorded
+    // per refusal rather than per member: the entry that states NEITHER member is enveloped
+    // while the one whose `Exists` has no `Value` states its sentence alone.
+    let rows: Vec<(&str, Value, Option<&str>, bool)> = vec![
         (
             "an entry stating neither Value nor Exists",
             json!({}),
             Some("Value must be provided when Exists is null for Attribute: attr"),
+            true,
         ),
         (
             "Exists true with no Value",
             json!({"Exists": true}),
             Some("Value must be provided when Exists is true for Attribute: attr"),
+            false,
         ),
         (
             "Value beside Exists false",
             json!({"Value": {"N": "1"}, "Exists": false}),
             Some("Value cannot be used when Exists is false for Attribute: attr"),
+            true,
         ),
         (
             "Exists beside a ComparisonOperator",
             json!({"Exists": true, "ComparisonOperator": "EQ",
                    "AttributeValueList": [{"N": "1"}]}),
             Some("Exists and ComparisonOperator cannot be used together for Attribute: attr"),
+            true,
         ),
         (
             "Value beside an AttributeValueList",
             json!({"Value": {"N": "1"}, "ComparisonOperator": "EQ",
                    "AttributeValueList": [{"N": "1"}]}),
             Some("Value and AttributeValueList cannot be used together for Attribute: attr"),
+            true,
         ),
-        ("a Value on its own", json!({"Value": {"N": "1"}}), None),
-        ("Exists false on its own", json!({"Exists": false}), None),
+        ("a Value on its own", json!({"Value": {"N": "1"}}), None, false),
+        ("Exists false on its own", json!({"Exists": false}), None, false),
         (
             "a comparison on its own",
             json!({"ComparisonOperator": "EQ", "AttributeValueList": [{"N": "1"}]}),
             None,
+            false,
         ),
     ];
 
-    for (case, entry, clause) in rows {
+    for (case, entry, clause, enveloped) in rows {
         let request = json!({
             "TableName": "Expectations",
             "Key": {"pk": {"S": "one"}},
@@ -1383,10 +1392,15 @@ async fn an_expected_entry_states_what_it_expects() {
             continue;
         };
         let stated = refusal(&router, case, "UpdateItem", request).await;
+        let envelope = if enveloped {
+            "1 validation error detected: "
+        } else {
+            ""
+        };
         assert_eq!(
             stated,
-            format!("1 validation error detected: One or more parameter values were invalid: {clause}"),
-            "case {case:?}: expected the enveloped clause, got {stated:?}"
+            format!("{envelope}One or more parameter values were invalid: {clause}"),
+            "case {case:?}: expected the clause as recorded, got {stated:?}"
         );
     }
 }
