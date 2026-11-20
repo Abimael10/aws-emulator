@@ -49,14 +49,34 @@ impl PagedRead {
     }
 }
 
-/// The `NextToken` that resumes `read` at `resume_at`: the authenticated bytes of the
+/// The `NextToken` that resumes `read` AFTER `resume_after`: the authenticated bytes of the
 /// cursor, hex-encoded.
+///
+/// `resume_after` is the LAST entry the page this token is handed out with served, never the
+/// one that was waiting behind it ([`already_served`]).
 ///
 /// The position is not hidden — a continuation token is opaque, not confidential — and
 /// nothing about it has to be: what a caller cannot do is produce the authenticator for a
 /// position of its own.
-pub fn page_token(key: &PageTokenKey, read: PagedRead, resume_at: &str) -> String {
-    ::hex::encode(key.mint(&format!("{}{CURSOR_SEPARATOR}{resume_at}", read.scope())))
+pub fn page_token(key: &PageTokenKey, read: PagedRead, resume_after: &str) -> String {
+    ::hex::encode(key.mint(&format!("{}{CURSOR_SEPARATOR}{resume_after}", read.scope())))
+}
+
+/// Whether `position` is one a resume after `resume_after` has already served, so the walk
+/// steps over it.
+///
+/// A page's token names the last entry THAT page served, so the next page continues
+/// STRICTLY after it: the walk resumes from the cut the previous page left rather than from
+/// a position fixed while that page was served. An entry the store gained between the two
+/// calls, at a position after that cut, is therefore reported rather than stepped over,
+/// while nothing the previous pages reported is reported twice. `None` resumes nothing, so
+/// every position is still waiting — the first page of the read.
+///
+/// The one reading of what a resume has behind it, shared by the paginated parameter reads,
+/// whichever total order each walks: a parameter name for the metadata describe and the
+/// hierarchy read, a version number for the version history.
+pub fn already_served<T: PartialOrd + ?Sized>(resume_after: Option<&T>, position: &T) -> bool {
+    resume_after.is_some_and(|cut| position <= cut)
 }
 
 /// The position a `NextToken` resumes `read` at, or `None` for any value THIS store did not
@@ -121,6 +141,43 @@ mod tests {
                 page_cursor(&key, PagedRead::Hierarchy, &token),
                 None,
                 "case {case:?}: expected no cursor for {token:?}"
+            );
+        }
+    }
+
+    /// A resume has the entries up to and including the cut behind it, and everything after
+    /// the cut still waiting — in both total orders a parameter read walks.
+    #[test]
+    fn a_resume_continues_strictly_after_the_entry_its_cut_names() {
+        // (case, the cut, the position, whether the position is already served)
+        let names: &[(&str, Option<&str>, &str, bool)] = &[
+            ("no cut at all", None, "Dev/DBServer", false),
+            ("the cut itself", Some("Dev/DBServer"), "Dev/DBServer", true),
+            ("before the cut", Some("Dev/DBServer"), "Dev/A", true),
+            ("after the cut", Some("Dev/DBServer"), "Dev/E", false),
+            ("a deeper name under the cut", Some("Dev"), "Dev/A", false),
+        ];
+        for (case, cut, position, served) in names {
+            assert_eq!(
+                already_served(*cut, *position),
+                *served,
+                "case {case:?}: expected {position:?} after cut {cut:?} to be served={served}"
+            );
+        }
+
+        // (case, the cut, the version, whether the version is already served)
+        let versions: &[(&str, Option<i64>, i64, bool)] = &[
+            ("no cut at all", None, 1, false),
+            ("the cut itself", Some(2), 2, true),
+            ("before the cut", Some(2), 1, true),
+            ("after the cut", Some(2), 3, false),
+        ];
+        for (case, cut, version, served) in versions {
+            assert_eq!(
+                already_served(cut.as_ref(), version),
+                *served,
+                "case {case:?}: expected version {version} after cut {cut:?} to be \
+                 served={served}"
             );
         }
     }

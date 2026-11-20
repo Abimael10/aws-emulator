@@ -19,9 +19,11 @@
 //!
 //! A page carries at most `MaxResults` entries, up to the modelled maximum
 //! ([`crate::state::parameter_history_page_size`]). When versions are left over, the
-//! answer carries a `NextToken` holding the version the next page starts at: a version
-//! number, so a second page resumes at the right change even if a put appended another
-//! version in between, which an offset into a list could not. The token is opaque, and
+//! answer carries a `NextToken` holding the LAST version the page served, and the next
+//! page continues strictly after it
+//! ([`crate::state::parameter_pagination::already_served`]): a version number, so a second
+//! page resumes at the right change even if a put appended another version in between,
+//! which an offset into a list could not. The token is opaque, and
 //! carries that version behind an authenticator only this store can produce
 //! ([`crate::state::parameter_pagination`]), so a value this read did not ISSUE is the
 //! modelled `InvalidNextToken` rather than a page the caller was never offered — and so is
@@ -201,7 +203,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        use crate::state::parameter_pagination::{page_cursor, page_token, PagedRead};
+        use crate::state::parameter_pagination::{
+            already_served, page_cursor, page_token, PagedRead,
+        };
         use crate::state::{
             invalid_next_token_message, parameter_history_page_size, parse_parameter_query,
             request_region, trimmed_name,
@@ -280,9 +284,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = parameter_history_page_size(input.max_results)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
-        // The token is this read's own continuation token, which carries the version the
-        // next page starts at — a version number, not an offset into a list that may have
-        // grown between two pages — behind an authenticator only this store can produce
+        // The token is this read's own continuation token, which carries the LAST version
+        // the previous page served — a version number, not an offset into a list that may
+        // have grown between two pages — behind an authenticator only this store can produce
         // ([`crate::state::parameter_pagination`]). A value this read did not issue names
         // no position at all, however exactly it is shaped like one.
         let page_key = state.lock().page_token_key();
@@ -291,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(invalid_next_token_message(token)),
             })
         };
-        let resume_from = match input.next_token.as_deref() {
+        let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => match page_cursor(&page_key, PagedRead::History, token)
                 .and_then(|cursor| cursor.parse::<i64>().ok())
@@ -332,13 +336,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(record) => record,
                 None => return Err(not_found().into()),
             };
-            // A token this service issued names a version that was waiting when the
-            // previous page was served, so one naming a version past the newest this
-            // parameter has could start no page of its history and was not issued here.
-            // (A version retention has since displaced is not refused: the walk below
-            // resumes at the oldest version still retained at or after the token, so
+            // A token this service issued names a version THIS parameter's history served,
+            // so one naming a version past the newest it has could have come from no page
+            // of that history and was not issued here. (A version retention has since
+            // displaced is not refused: the walk below resumes strictly after the token, so
             // paging keeps making forward progress across a put that trimmed one.)
-            if resume_from
+            if resume_after
                 .is_some_and(|from| record.latest().is_none_or(|last| from > last.version))
             {
                 return Err(
@@ -349,22 +352,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut parameters = Vec::new();
             let mut to_open = Vec::new();
             let mut next_token = None;
+            // Where this page's own cut falls: the last version it served, which is what
+            // its token names.
+            let mut cut: Option<i64> = None;
             for version in &record.versions {
-                if resume_from.is_some_and(|from| version.version < from) {
+                if already_served(resume_after.as_ref(), &version.version) {
                     continue;
                 }
                 if parameters.len() == page_size {
                     // The page is full and a version is still waiting: hand the caller a
-                    // token naming the version it resumes at, so the next request
-                    // continues where this stopped.
-                    next_token = Some(page_token(
-                        &page_key,
-                        PagedRead::History,
-                        &version.version.to_string(),
-                    ));
+                    // token naming the last version THIS page served, so the next request
+                    // continues strictly after the cut this one left. A full page served
+                    // at least one version — the smallest page this read serves is one
+                    // ([`crate::state::MIN_PARAMETER_HISTORY_PAGE_SIZE`]) — so the cut is
+                    // the one this page's last entry left.
+                    debug_assert!(
+                        cut.is_some(),
+                        "a full page of a version history served at least one version"
+                    );
+                    next_token = cut.map(|cut| {
+                        page_token(&page_key, PagedRead::History, &cut.to_string())
+                    });
                     break;
                 }
                 parameters.push(version.to_parameter_history(record));
+                cut = Some(version.version);
                 to_open.extend(
                     crate::state::secure_string::value_to_open(
                         input.with_decryption,

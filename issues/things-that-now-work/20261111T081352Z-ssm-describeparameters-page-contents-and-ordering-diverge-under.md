@@ -11,6 +11,13 @@ Issue-Commit: 34aa023e13a037c836015cae341f7a7e68727fe7
 
 # SSM DescribeParameters page contents and ordering diverge under ParameterFilters and MaxResults paging
 
+## Resolution
+
+Two halves, resolved differently.
+
+- The page's COMPOSITION and its RESUME are fixed. A page carries the entries satisfying every filter of the request, in the store's own total order, cut at `MaxResults`; the `NextToken` now names the LAST entry the page served and the next page continues strictly after it, so a parameter the store gains at a position after that cut is reported instead of stepped over (the same cut now serves `GetParametersByPath` and `GetParameterHistory`, through `state::parameter_pagination::already_served`). Pinned by `tests/all/parameter_page_composition.rs`.
+- The listing ORDER the recording shows is DECLINED. The model declares no result order for this operation and its documentation says results "are returned on a best-effort basis"; the recorded page's order is neither the parameters' name order nor the order they were created in, so it is AWS's internal storage order over names generated per run and no rule in the model or the documentation produces it. The emulator lists in ascending parameter name, the total order its resume cursor is total over. The replay key `ssm|DescribeParameters|2xx->2xx|$.Parameters[*]` therefore still diverges slot by slot on that order alone (HTTP 200 on both sides, equal page lengths, no error involved).
+
 > _Note: this issue was identified against the code base at commit `34aa023e13a037c836015cae341f7a7e68727fe7`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

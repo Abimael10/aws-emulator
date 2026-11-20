@@ -57,8 +57,11 @@
 //! ## Paging
 //!
 //! As for `GetParametersByPath`: the token this operation hands out carries the `Name` of
-//! the parameter the next page starts at, so a resume is a position in the store's own
-//! total order rather than an offset into a list that may have changed between two pages.
+//! the LAST parameter the page it came with served, and the next page continues strictly
+//! after it ([`crate::state::parameter_pagination::already_served`]) — so a resume is a
+//! position in the store's own total order rather than an offset into a list that may have
+//! changed between two pages, and a parameter the store gained after that cut is reported
+//! by the walk instead of being stepped over.
 //! It is opaque, and carries that position behind an authenticator only this store can
 //! produce ([`crate::state::parameter_pagination`]), so a token this read did not ISSUE —
 //! including one a hierarchy read issued — is the modelled `InvalidNextToken`.
@@ -225,7 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::parameter_pagination::{page_cursor, page_token, PagedRead};
+        use crate::state::parameter_pagination::{
+            already_served, page_cursor, page_token, PagedRead,
+        };
         use crate::state::{
             canonical_name, describe_parameter_matches,
             describe_parameters_default_filter_option, describe_parameters_filter_options,
@@ -348,12 +353,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = describe_parameters_page_size(input.max_results)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
-        // The token is this read's own continuation token, which carries the name the next
-        // page starts at behind an authenticator only this store can produce
-        // ([`crate::state::parameter_pagination`]) — so a value this read did not issue
-        // names no position at all, however exactly it is shaped like one.
+        // The token is this read's own continuation token, which carries the name of the
+        // LAST parameter the previous page served behind an authenticator only this store
+        // can produce ([`crate::state::parameter_pagination`]) — so a value this read did
+        // not issue names no position at all, however exactly it is shaped like one.
         let page_key = state.lock().page_token_key();
-        let resume_from = match input.next_token.as_deref() {
+        let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => match page_cursor(&page_key, PagedRead::Metadata, token) {
                 Some(cursor) => Some(cursor),
@@ -416,8 +421,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .collect();
             candidates.sort_by_key(|(name, _)| *name);
+            // Where this page's own cut falls: the name of the last parameter it served,
+            // which is what its token names.
+            let mut cut: Option<&str> = None;
             for (name, record) in candidates {
-                if resume_from.as_deref().is_some_and(|from| name < from) {
+                if already_served(resume_after.as_deref(), name) {
                     continue;
                 }
                 // A metadata listing names no `name:selector`, so each parameter is
@@ -432,16 +440,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 if parameters.len() == page_size {
                     // The page is full and a parameter is still waiting: hand the caller a
-                    // token naming the parameter it resumes at, so the next request
-                    // continues where this stopped.
-                    next_token = Some(page_token(
-                        &page_key,
-                        PagedRead::Metadata,
-                        canonical_name(&record.name),
-                    ));
+                    // token naming the last parameter THIS page served, so the next request
+                    // continues strictly after the cut this one left rather than at a
+                    // position fixed while this page was assembled. A full page served at
+                    // least one parameter — the smallest page this read serves is one
+                    // ([`crate::state::MIN_DESCRIBE_PARAMETERS_PAGE_SIZE`]) — so the cut is
+                    // the one this page's last entry left.
+                    debug_assert!(
+                        cut.is_some(),
+                        "a full page of a parameter describe served at least one parameter"
+                    );
+                    next_token =
+                        cut.map(|cut| page_token(&page_key, PagedRead::Metadata, cut));
                     break;
                 }
                 parameters.push(version.to_parameter_metadata(record));
+                cut = Some(name);
             }
         }
 
