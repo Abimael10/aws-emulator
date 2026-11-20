@@ -62,8 +62,12 @@ const EC2_API_VERSION: &str = "2016-11-15";
 const ELB_VERSION: &str = "2015-12-01";
 
 /// The ECS cluster every service below runs in, and the container name every binding names.
-const CLUSTER: &str = "served";
-const CONTAINER: &str = "app";
+///
+/// `pub(crate)` for the reason [`emulator`] gives: the sibling suite that stands THIS topology up
+/// to measure another rule on it drives the same cluster and the same binding through these
+/// helpers.
+pub(crate) const CLUSTER: &str = "served";
+pub(crate) const CONTAINER: &str = "app";
 
 /// The network every row runs in.
 const VPC_CIDR: &str = "10.90.0.0/16";
@@ -78,7 +82,7 @@ const SUBNET_CIDRS: [(&str, &str); 2] = [
 const HEALTH_CHECK_INTERVAL_SECONDS: &str = "5";
 
 /// The `TargetHealth$State` a target the load balancer's checks reached carries.
-const HEALTHY: &str = "healthy";
+pub(crate) const HEALTHY: &str = "healthy";
 
 /// How long a clock-owed move is waited for before a row gives up, and how often it looks
 /// again. Generous on purpose: the deadline is here so a failure is a failure rather than a
@@ -243,7 +247,13 @@ const ROWS: &[Row] = &[
 
 /// One emulator carrying EC2, Elastic Load Balancing v2 and ECS over ONE shared engine, exactly
 /// as the production router builds them.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` — with the helpers below it — because this suite OWNS the fixture for "an
+/// Application Load Balancer in front of an `awsvpc` Amazon ECS service": the network, the front
+/// door, the revision and the service. A sibling suite measuring another rule of that same
+/// topology calls these rather than keeping a second copy of them, exactly as every awsQuery suite
+/// calls the one `all/query_wire.rs`.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -318,7 +328,11 @@ async fn elbv2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)
 }
 
 /// One awsJson1_1 call to ECS, answered with its status and parsed body.
-async fn ecs(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+pub(crate) async fn ecs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -351,7 +365,7 @@ async fn ecs(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16,
 }
 
 /// One ECS call that must succeed, answered with its parsed body.
-async fn ecs_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+pub(crate) async fn ecs_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
     let (status, parsed) = ecs(router, operation, body).await;
     assert_eq!(
         status, OK,
@@ -363,7 +377,7 @@ async fn ecs_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Va
 /// The network every row runs in: a VPC with two subnets and an internet gateway, the load
 /// balancers' own security group, and the group the tasks are placed in — which admits the load
 /// balancers' checks and traffic on both ports a row may serve on.
-struct Network {
+pub(crate) struct Network {
     vpc: String,
     subnets: Vec<String>,
     load_balancer_group: String,
@@ -371,7 +385,7 @@ struct Network {
 }
 
 /// Create that network through EC2 itself, so every id asserted against is one EC2 minted.
-async fn seed_network(router: &MultiServiceRouter) -> Network {
+pub(crate) async fn seed_network(router: &MultiServiceRouter) -> Network {
     let vpc = element(
         &ec2(router, "CreateVpc", &[("CidrBlock", VPC_CIDR)]).await,
         "vpcId",
@@ -482,7 +496,7 @@ async fn seed_network(router: &MultiServiceRouter) -> Network {
 
 /// Register one `awsvpc`, Fargate-compatible revision of `family` whose single container
 /// listens on `port` and runs `command`, and answer its ARN.
-async fn register_revision(
+pub(crate) async fn register_revision(
     router: &MultiServiceRouter,
     family: &str,
     port: i64,
@@ -515,7 +529,7 @@ async fn register_revision(
 
 /// Create the `ip` target group, the internet-facing load balancer and the listener that
 /// forwards to it, and answer the group's ARN with the address the load balancer published.
-async fn front_door(
+pub(crate) async fn front_door(
     router: &MultiServiceRouter,
     network: &Network,
     case: &str,
@@ -577,7 +591,7 @@ async fn front_door(
 }
 
 /// Create one ECS service of `revision`, bound to `group` on `port`, with one task.
-async fn create_service(
+pub(crate) async fn create_service(
     router: &MultiServiceRouter,
     network: &Network,
     service_name: &str,
@@ -613,7 +627,7 @@ async fn create_service(
 }
 
 /// The `(Id, State)` of every registration `group` reports.
-async fn health(router: &MultiServiceRouter, group: &str) -> Vec<(String, String)> {
+pub(crate) async fn health(router: &MultiServiceRouter, group: &str) -> Vec<(String, String)> {
     let body = elbv2(router, "DescribeTargetHealth", &[("TargetGroupArn", group)]).await;
     members_of(&body)
         .into_iter()
@@ -634,7 +648,7 @@ async fn health(router: &MultiServiceRouter, group: &str) -> Vec<(String, String
 ///
 /// Polls the CONDITION — the task's start, the registration that start owes and the health its
 /// checks determine are all clock-owed — rather than waiting a fixed time.
-async fn healthy_target(
+pub(crate) async fn healthy_target(
     router: &MultiServiceRouter,
     case: &str,
     group: &str,
@@ -666,14 +680,14 @@ async fn healthy_target(
 }
 
 /// One answered data-plane request: the status and the body, as the wire carries them.
-struct Answered {
-    status: u16,
-    body: String,
+pub(crate) struct Answered {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 /// Send one request to the address the load balancer published, carrying no AWS credential —
 /// exactly as a client handed that name sends it.
-async fn get(router: &MultiServiceRouter, dns_name: &str, path: &str) -> Answered {
+pub(crate) async fn get(router: &MultiServiceRouter, dns_name: &str, path: &str) -> Answered {
     let request = http::Request::builder()
         .method("GET")
         .uri(format!("http://{dns_name}{path}"))
@@ -769,12 +783,17 @@ const CONTROL_MARKER: &str = "REVISION-B";
 /// The wording Amazon ECS refuses a Fargate-compatible registration in another network mode
 /// with, and the one it refuses a placement onto a revision that does not support the launch
 /// type with. Both are entirely fixed text, with no value of the request interpolated.
-const FARGATE_NETWORK_MODE_MESSAGE: &str = "Fargate only supports network mode \u{2018}awsvpc\u{2019}.";
-const LAUNCH_TYPE_MESSAGE: &str = "Task definition does not support launch_type FARGATE.";
+///
+/// `pub(crate)` for the reason [`emulator`] gives: the sibling suite that measures this refusal
+/// over the WHOLE `NetworkMode` enum asserts the same two sentences, and one copy of a refusal's
+/// wording cannot drift from itself.
+pub(crate) const FARGATE_NETWORK_MODE_MESSAGE: &str =
+    "Fargate only supports network mode \u{2018}awsvpc\u{2019}.";
+pub(crate) const LAUNCH_TYPE_MESSAGE: &str = "Task definition does not support launch_type FARGATE.";
 
 /// The container command that writes `marker` into the nginx image's document root and then
 /// runs that image's own command.
-fn serving_command(marker: &str) -> Vec<String> {
+pub(crate) fn serving_command(marker: &str) -> Vec<String> {
     vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
