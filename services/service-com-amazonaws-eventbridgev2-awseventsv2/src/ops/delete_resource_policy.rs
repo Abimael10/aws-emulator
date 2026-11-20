@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the named resource policy attached to an event bus.
 //!
 //! ## Shape of an operation
 //!
@@ -106,11 +98,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `DeleteResourcePolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#DeleteResourcePolicy")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#DeleteResourcePolicy",
+    extra_errors = ["AccessDeniedException", "InternalException", "InvalidInputException"]
+)]
 #[derive(Debug)]
 pub enum DeleteResourcePolicyErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ConcurrentModificationException(ConcurrentModificationException),
     ConflictException(ConflictException),
+    InternalException(InternalException),
+    InvalidInputException(InvalidInputException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -165,18 +163,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let _ = ctx;
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteResourcePolicyErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // Which policy this delete addresses, decided from the request alone: the
+        // name it gave, or the customer-managed policy when it gave none.
+        let policy_name = crate::state::requested_policy_name(input.policy_name.as_deref());
+        if !crate::state::is_named_policy(policy_name) {
+            return Err(DeleteResourcePolicyErrorModeled::InvalidInputException(
+                crate::state::unknown_policy_name(policy_name),
+            )
+            .into());
+        }
+        // Deleting a policy writes it: the two writers are exclusive in both
+        // directions, and a request reaching this emulator arrives as the bus
+        // owner, so the one policy it may delete is the customer-managed one;
+        // naming the Resource Access Manager policy names the other party's.
+        if policy_name != crate::state::POLICY_NAME_DEFAULT {
+            return Err(DeleteResourcePolicyErrorModeled::AccessDeniedException(
+                crate::state::policy_write_denied(policy_name),
+            )
+            .into());
+        }
+        // A delete's precondition names a revision that must EXIST, so the
+        // sentinel standing for a policy that does not exist yet is not a value
+        // it can carry.
+        if input.expected_revision_id.as_deref() == Some(crate::state::NO_POLICY_REVISION_ID) {
+            return Err(DeleteResourcePolicyErrorModeled::InvalidInputException(
+                crate::state::no_policy_sentinel_rejected(),
+            )
+            .into());
+        }
+
+        let mut state = store.lock();
+        // Materialise the lifecycle transitions the clock already made due, so
+        // this delete sees the registry as of now.
+        state.settle_lifecycles(now);
+
+        // A delete resolves the whole ARN, identifier segment included: an
+        // identifier this service minted names a bus that is not there, and one
+        // it never handed out names no resource of this service at all.
+        let refusal = state.bus_read_refusal(&input.resource_arn);
+        let Some(bus) = state.event_buses.get_mut(&input.resource_arn) else {
+            return Err(
+                DeleteResourcePolicyErrorModeled::ResourceNotFoundException(refusal).into(),
+            );
+        };
+
+        // The caller's precondition, checked against the revision the store holds
+        // right now; a policy that is not there satisfies no precondition at all,
+        // because the one value it would match is refused above. A request
+        // carrying no precondition deletes unconditionally, which makes deleting
+        // a policy that is not there an idempotent success.
+        if let Some(expected) = input.expected_revision_id.as_deref() {
+            if !crate::state::revision_matches(bus.resource_policy(policy_name), expected) {
+                return Err(DeleteResourcePolicyErrorModeled::ConflictException(
+                    crate::state::revision_conflict(),
+                )
+                .into());
+            }
+        }
+
+        // The policy leaves the store, and the response reports the revision the
+        // store held for it — absent when it held none, since then no policy was
+        // deleted.
+        let removed = bus.remove_resource_policy(policy_name);
+
+        Ok(DeleteResourcePolicyOutput {
+            revision_id: removed.map(|policy| policy.revision_id),
+        })
     }
 }

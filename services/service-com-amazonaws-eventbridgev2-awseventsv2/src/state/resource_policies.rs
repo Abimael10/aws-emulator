@@ -102,6 +102,16 @@ impl EventBus {
             },
         );
     }
+
+    /// Detach the named policy from this bus, answering the policy as it was
+    /// stored — `None` when the bus held none under that name, which is the
+    /// delete that removes nothing. The revision a delete reports comes out of
+    /// the policy handed back here rather than from beside the store, and the
+    /// bus holds nothing under that name afterwards, so every later read of it
+    /// reports the policy gone.
+    pub fn remove_resource_policy(&mut self, policy_name: &str) -> Option<ResourcePolicy> {
+        self.resource_policies.remove(policy_name)
+    }
 }
 
 /// The policy an operation naming `requested` addresses: the name it gave, or
@@ -216,6 +226,24 @@ pub const REVISION_CONFLICT_MESSAGE: &str = "The resource policy revision does n
 pub fn revision_conflict() -> ConflictException {
     ConflictException {
         message: Some(REVISION_CONFLICT_MESSAGE.to_string()),
+    }
+}
+
+/// The `InvalidInputException` a DELETE answers when its `ExpectedRevisionId`
+/// carries the [`NO_POLICY_REVISION_ID`] sentinel.
+///
+/// `DeleteResourcePolicy`'s `ExpectedRevisionId` documents that "The "NO_POLICY"
+/// sentinel is not valid here": the sentinel stands for a policy that does not
+/// exist yet, and a delete's precondition names a revision that must exist, so
+/// it is refused as the bad parameter value it is rather than compared against
+/// the store. The message is wholly fixed — the value the caller sent is the
+/// sentinel itself, which the fixed text already names.
+pub fn no_policy_sentinel_rejected() -> InvalidInputException {
+    InvalidInputException {
+        message: Some(format!(
+            "ExpectedRevisionId {NO_POLICY_REVISION_ID} is not valid when deleting a resource \
+             policy; it matches only a policy that does not exist yet"
+        )),
     }
 }
 
