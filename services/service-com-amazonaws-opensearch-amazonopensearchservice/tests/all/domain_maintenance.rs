@@ -24,7 +24,13 @@
 //!   publishes;
 //! * the listing reports those same records, each once and newest first, narrowed by
 //!   `Action` and by `Status` — over every published value of each — and paged by
-//!   every page size from one record per page up to more than the domain holds.
+//!   every page size from one record per page up to more than the domain holds;
+//! * an accepted action becomes TERMINAL on the reads a polling client makes and
+//!   nothing else: a client that issues only `GetDomainMaintenanceStatus` reads it
+//!   reach the terminal status this service reports a finished action with, and
+//!   `ListDomainMaintenances` then carries that same action under that same status —
+//!   over every published `MaintenanceType` and over the cluster shapes a maintainable
+//!   domain comes in.
 
 use std::collections::BTreeSet;
 
@@ -398,12 +404,8 @@ async fn an_accepted_action_is_read_back_and_walked_by_the_clock() {
         "the action finishes once its spans have passed, got {seen:?}"
     );
     assert!(
-        seen.iter().all(|status| [
-            MAINTENANCE_STATUS_PENDING,
-            MAINTENANCE_STATUS_IN_PROGRESS,
-            MAINTENANCE_STATUS_SUCCESS
-        ]
-        .contains(&status.as_str())),
+        seen.iter()
+            .all(|status| REPORTED_STATUSES.contains(&status.as_str())),
         "every status is one this service reports, got {seen:?}"
     );
 
@@ -645,4 +647,211 @@ async fn the_listing_reports_every_action_once_and_narrows_by_action_and_status(
         answer.status,
         answer.body
     );
+}
+
+/// The statuses a maintenance action of this service is ever reported with: the
+/// non-terminal ones the model publishes, and the terminal one the service answers a
+/// finished action with.
+pub(crate) const REPORTED_STATUSES: [&str; 3] = [
+    MAINTENANCE_STATUS_PENDING,
+    MAINTENANCE_STATUS_IN_PROGRESS,
+    MAINTENANCE_STATUS_SUCCESS,
+];
+
+/// The statuses of [`REPORTED_STATUSES`] an action is still UNDER WAY in — what a
+/// polling client keeps waiting on, and what every other status is terminal by
+/// contrast with.
+const NON_TERMINAL_STATUSES: [&str; 2] = [MAINTENANCE_STATUS_PENDING, MAINTENANCE_STATUS_IN_PROGRESS];
+
+/// Read `maintenance_id` until it reports a TERMINAL status, issuing nothing but that
+/// one read, and answer every distinct status the reads saw in the order they were
+/// seen.
+///
+/// Waits for the CONDITION — a status the action can no longer move off — through the
+/// suite's shared waiter ([`super::domain_lifecycle::poll_until`]), so the same case
+/// passes on a fast host and on a loaded one and no second polling loop is written
+/// here. Terminal means exactly what a polling client treats as terminal: a status
+/// that is not one of the two the model publishes for an action still under way.
+async fn polled_to_terminal(
+    emulator: &Emulator,
+    name: &str,
+    maintenance_id: &str,
+    case: &str,
+) -> Vec<String> {
+    let seen: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    super::domain_lifecycle::poll_until(case, || async {
+        let answer = status(emulator, name, maintenance_id).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200 from every poll, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let reported = string_member(&answer.body, "Status", case);
+        let mut seen = seen.borrow_mut();
+        if seen.last() != Some(&reported) {
+            seen.push(reported.clone());
+        }
+        !NON_TERMINAL_STATUSES.contains(&reported.as_str())
+    })
+    .await;
+    seen.into_inner()
+}
+
+/// RULE: an accepted action becomes TERMINAL on the reads a polling client makes and
+/// nothing else.
+///
+/// What this adds over [`an_accepted_action_is_read_back_and_walked_by_the_clock`],
+/// which walks the same statuses off a domain of ONE shape: the client here issues
+/// nothing but the status read between the start and the terminal status, the read and
+/// the listing are asserted to agree on that terminal status, and the rule is asserted
+/// over the cluster shapes a maintainable domain comes in. The two cases are therefore
+/// about one rule each — the clock walking the record, and a polling client observing
+/// it — and should move together if either changes.
+#[tokio::test]
+async fn an_accepted_action_becomes_terminal_on_a_polling_clients_reads_alone() {
+    // One row per cluster shape a maintainable domain comes in — the role on its own at
+    // the smallest count a node can be taken out of, the same role past that count, and a
+    // cluster carrying every role this service publishes a node for — so the rule is
+    // asserted over the shapes rather than over the one the recorded case used.
+    let shapes: [(&str, &str, Value); 3] = [
+        (
+            "data nodes only",
+            "polled-data-only",
+            json!({
+                "InstanceType": "t3.small.search",
+                "InstanceCount": MAINTAINABLE_DATA_NODES,
+            }),
+        ),
+        (
+            "more data nodes than the smallest maintainable role",
+            "polled-scaled-out",
+            json!({
+                "InstanceType": "t3.small.search",
+                "InstanceCount": MAINTAINABLE_DATA_NODES + 2,
+            }),
+        ),
+        (
+            "every published role",
+            "polled-every-role",
+            every_role(MAINTAINABLE_DATA_NODES),
+        ),
+    ];
+
+    for (shape, name, cluster) in shapes {
+        let emulator = Emulator::new();
+        // The domain is created the way the recorded client created it — a cluster, EBS
+        // storage and an access policy — and the case waits for the CONDITION a client
+        // waits for before it acts on a node of it.
+        let answer = emulator
+            .create(json!({
+                "DomainName": name,
+                "ClusterConfig": cluster,
+                "EBSOptions": { "EBSEnabled": true, "VolumeType": "gp3", "VolumeSize": 10 },
+                "AccessPolicies": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\
+                    \"Allow\",\"Principal\":{\"AWS\":\"*\"},\"Action\":\"es:*\",\"Resource\":\
+                    \"*\"}]}",
+            }))
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case CreateDomain({shape}): expected 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+        super::domain_lifecycle::settled_domain(&emulator, name).await;
+
+        let data_nodes: Vec<String> = census(&emulator, name)
+            .await
+            .into_iter()
+            .filter(|(_, node_type)| node_type == NODE_TYPE_DATA)
+            .map(|(id, _)| id)
+            .collect();
+        assert!(
+            !data_nodes.is_empty(),
+            "case DescribeDomainNodes({shape}): expected the census to publish a data node"
+        );
+
+        // One action per published `MaintenanceType`, each started on a data node of the
+        // census, as a client that read the census starts one.
+        let mut started: Vec<(String, String, String)> = Vec::new();
+        for (index, action) in MAINTENANCE_TYPES.iter().enumerate() {
+            let node_id = data_nodes[index % data_nodes.len()].clone();
+            let answer = start(&emulator, name, action, Some(node_id.as_str())).await;
+            assert_eq!(
+                answer.status, 200,
+                "case StartDomainMaintenance({shape}, {action}): expected 200, got {} with {:?}",
+                answer.status, answer.body
+            );
+            let maintenance_id = string_member(
+                &answer.body,
+                "MaintenanceId",
+                &format!("StartDomainMaintenance({shape}, {action})"),
+            );
+            started.push((maintenance_id, (*action).to_string(), node_id));
+        }
+
+        for (maintenance_id, action, node_id) in &started {
+            let case = format!("{shape} / {action}");
+            // NOTHING but the status read: the action finishes on the reads a client
+            // makes, with no further client-driven step.
+            let seen = polled_to_terminal(&emulator, name, maintenance_id, &case).await;
+            assert_eq!(
+                seen.last().map(String::as_str),
+                Some(MAINTENANCE_STATUS_SUCCESS),
+                "case {case}: expected the terminal status this service reports a finished \
+                 action with, the reads saw {seen:?}"
+            );
+            assert!(
+                seen.iter()
+                    .all(|status| REPORTED_STATUSES.contains(&status.as_str())),
+                "case {case}: every status read is one this service reports, the reads saw \
+                 {seen:?}"
+            );
+
+            // The terminal read still reports the action and the node the request named,
+            // and the listing reports that same action under that same status.
+            let read = status(&emulator, name, maintenance_id).await;
+            assert_eq!(
+                (
+                    read.body["Status"].as_str(),
+                    read.body["Action"].as_str(),
+                    read.body["NodeId"].as_str(),
+                ),
+                (
+                    Some(MAINTENANCE_STATUS_SUCCESS),
+                    Some(action.as_str()),
+                    Some(node_id.as_str()),
+                ),
+                "case {case}: expected the finished action to echo the request, got {:?}",
+                read.body
+            );
+
+            let listed = list(&emulator, name, "").await;
+            assert_eq!(
+                listed.status, 200,
+                "case ListDomainMaintenances({case}): expected 200, got {} with {:?}",
+                listed.status, listed.body
+            );
+            let row = listed.body["DomainMaintenances"]
+                .as_array()
+                .unwrap_or_else(|| {
+                    panic!("case ListDomainMaintenances({case}): expected a list, got {:?}", listed.body)
+                })
+                .iter()
+                .find(|row| row["MaintenanceId"].as_str() == Some(maintenance_id.as_str()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case ListDomainMaintenances({case}): expected the started action to be \
+                         listed, got {:?}",
+                        listed.body
+                    )
+                });
+            assert_eq!(
+                row["Status"].as_str(),
+                Some(MAINTENANCE_STATUS_SUCCESS),
+                "case ListDomainMaintenances({case}): expected the listing to carry the same \
+                 terminal status the read reports, got {row:?}"
+            );
+        }
+    }
 }
