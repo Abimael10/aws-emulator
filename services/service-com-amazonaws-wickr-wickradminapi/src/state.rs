@@ -26,9 +26,83 @@ const LAST_NETWORK_ID: u32 = 99_999_999;
 /// The largest `userId` the modelled `UserId` (len 1..10, `^[0-9]+$`) can express.
 const LAST_USER_ID: u64 = 9_999_999_999;
 
-/// `networkName` bound from the `CreateNetworkRequest$networkName` documentation:
-/// "Must be between 1 and 20 characters."
+/// The longest name a network may carry, from the
+/// `CreateNetworkRequest$networkName` documentation: "Must be between 1 and 20
+/// characters."
 pub const NETWORK_NAME_MAX_CHARS: usize = 20;
+
+/// The shortest name a network may carry.
+///
+/// RECORDED behaviour, since the member documentation states only the upper end
+/// of the range the service enforces: the recorded wire refuses a
+/// three-character name as an invalid name while longer names are created, so the
+/// lower end the service enforces sits above three. This is the least restrictive
+/// bound consistent with that recording — no name is refused for being short
+/// unless the service is known to refuse it — and it is the one part of the name
+/// rule the documentation does not corroborate, so a later recording that creates
+/// a shorter name moves it.
+pub const NETWORK_NAME_MIN_CHARS: usize = 4;
+
+/// The characters a network name may carry besides a letter or a digit of any
+/// script.
+pub const NETWORK_NAME_EXTRA_CHARS: [char; 3] = [' ', '-', '_'];
+
+/// Why a `networkName` was refused.
+///
+/// The service names the member in `ErrorDetail$field` and states this one fixed
+/// sentence in `ErrorDetail$reason` for every network name it will not accept —
+/// whichever part of the name rule the value broke — so the reason carries no
+/// part of the submitted value, neither its length nor the character that made it
+/// invalid.
+pub const NETWORK_NAME_INVALID_REASON: &str = "Network Name is not a valid name";
+
+/// Whether `name` is a name a network may be created with.
+///
+/// `GenericString`'s `^[\S\s]*$` matches every string, so the model expresses no
+/// part of this rule and the service owns all of it: a network name is
+/// [`NETWORK_NAME_MIN_CHARS`] to [`NETWORK_NAME_MAX_CHARS`] characters, each of
+/// them a letter, a digit, or one of [`NETWORK_NAME_EXTRA_CHARS`], and it neither
+/// starts nor ends with a space (which also rules out a name that is only
+/// spaces). Anything else — punctuation or a symbol, a control character or line
+/// break, padding, the empty string, or a name outside the length window — is not
+/// a valid name. The length is counted in characters, not bytes, as the member
+/// documentation states it.
+///
+/// A letter or digit of ANY script counts, which the recorded wire corroborates
+/// in neither direction: it carries only names of ASCII letters, digits and these
+/// separators. Treating a letter as a letter whatever its script is the reading
+/// that refuses nothing the recording shows accepted, so the characters this
+/// turns down are exactly those no name is known to be built from — punctuation,
+/// symbols and control characters.
+pub fn network_name_is_valid(name: &str) -> bool {
+    let length = name.chars().count();
+    if !(NETWORK_NAME_MIN_CHARS..=NETWORK_NAME_MAX_CHARS).contains(&length) {
+        return false;
+    }
+    if name.starts_with(' ') || name.ends_with(' ') {
+        return false;
+    }
+    name.chars()
+        .all(|c| c.is_alphanumeric() || NETWORK_NAME_EXTRA_CHARS.contains(&c))
+}
+
+/// The modelled `ValidationError` refusing one input member.
+///
+/// A field-level refusal is reported as its `reasons` list — one `ErrorDetail`
+/// naming the rejected member and stating why it was refused — and nothing else:
+/// `ValidationError$message` is left unset, so the body of this error class
+/// carries no envelope sentence beside the per-field detail. Shared by every
+/// operation that refuses a member, so they cannot disagree about the shape of
+/// that body.
+pub fn field_validation_error(field: &str, reason: &str) -> crate::ops::types::ValidationError {
+    crate::ops::types::ValidationError {
+        reasons: Some(vec![crate::ops::types::ErrorDetail {
+            field: Some(field.to_string()),
+            reason: Some(reason.to_string()),
+        }]),
+        message: None,
+    }
+}
 
 /// The id of the security group every new network is seeded with.
 ///

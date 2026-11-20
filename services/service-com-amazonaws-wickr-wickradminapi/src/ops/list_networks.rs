@@ -228,14 +228,8 @@ const SORTABLE_FIELDS: &[&str] = &["networkId", "networkName", "accessLevel", "a
 
 /// A `ValidationError` (HTTP 422) naming the member that was wrong and why.
 fn refused(field: &str, reason: String) -> ListNetworksError {
-    ListNetworksErrorModeled::ValidationError(ValidationError {
-        reasons: Some(vec![ErrorDetail {
-            field: Some(field.to_string()),
-            reason: Some(reason),
-        }]),
-        message: Some("1 validation error detected".to_string()),
-    })
-    .into()
+    ListNetworksErrorModeled::ValidationError(crate::state::field_validation_error(field, &reason))
+        .into()
 }
 
 /// One stored network as the modelled `Network` shape.

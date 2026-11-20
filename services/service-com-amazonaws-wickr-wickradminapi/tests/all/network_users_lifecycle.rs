@@ -10,8 +10,10 @@
 //!
 //! The rules under test, and where each comes from:
 //!
-//! * `networkName` "must be between 1 and 20 characters"
-//!   (`CreateNetworkRequest$networkName` documentation).
+//! * `networkName` is a name the service accepts: inside the length window whose
+//!   upper end `CreateNetworkRequest$networkName` documents ("must be between 1
+//!   and 20 characters"), built only of letters, digits, spaces, hyphens and
+//!   underscores, and not padded with a space.
 //! * `accessLevel` is one of `AccessLevel`'s values (`STANDARD`, `PREMIUM`).
 //! * "A user can only be assigned to a single security group"; `username` "must be
 //!   unique within the network" (`BatchCreateUserRequestItem` documentation).
@@ -469,23 +471,102 @@ async fn the_network_and_user_lifecycle_round_trips_through_stored_state() {
     );
 }
 
-#[tokio::test]
-async fn create_network_enforces_the_documented_network_name_bound() {
-    // `CreateNetworkRequest$networkName`: "Must be between 1 and 20 characters."
-    // Both published bounds, one character past each, and a multi-byte name whose
-    // character count differs from its byte count.
-    let cases: &[(&str, usize, bool)] = &[
-        ("empty", 0, false),
-        ("one character", 1, true),
-        ("nineteen characters", 19, true),
-        ("the documented maximum", 20, true),
-        ("one past the maximum", 21, false),
-        ("far past the maximum", 64, false),
-    ];
+/// The names this emulator accepts, one row per way a well-formed name can be
+/// built: at each end of the length window, digits only, every character the name
+/// rule allows beside a letter or a digit, and letters outside ASCII — whose byte
+/// count differs from their character count, which the length window is measured
+/// in.
+///
+/// The two rows the recorded wire fixes are written as LITERAL lengths, so the
+/// window stays tied to what was recorded (a four-character name is created, and
+/// so is one of the twenty characters the member documentation states) rather than
+/// to whatever the constants currently say; the rest are expressed through the
+/// constants so they move with the window.
+fn well_formed_network_names() -> Vec<(&'static str, String)> {
+    use service_com_amazonaws_wickr_wickradminapi::state::{
+        NETWORK_NAME_MAX_CHARS, NETWORK_NAME_MIN_CHARS,
+    };
 
+    vec![
+        ("four characters, the shortest name recorded", "a".repeat(4)),
+        (
+            "twenty characters, the documented maximum",
+            "n".repeat(20),
+        ),
+        ("the shortest name", "a".repeat(NETWORK_NAME_MIN_CHARS)),
+        (
+            "one past the shortest name",
+            "a".repeat(NETWORK_NAME_MIN_CHARS + 1),
+        ),
+        ("digits only", "2024".to_string()),
+        ("letters and digits", "demonet7".to_string()),
+        ("an internal space", "demo net".to_string()),
+        ("a hyphen and an underscore", "demo-net_1".to_string()),
+        ("a letter outside ASCII", "démonet".to_string()),
+        (
+            "the longest name in multi-byte characters",
+            "ü".repeat(NETWORK_NAME_MAX_CHARS),
+        ),
+        (
+            "the longest name",
+            format!("net-{}", "n".repeat(NETWORK_NAME_MAX_CHARS - 4)),
+        ),
+    ]
+}
+
+/// The names this emulator refuses, one row per way a name can break the rule:
+/// each end of the length window (and well past the long end), a character
+/// outside the allowed set, and padding.
+///
+/// As above, the lengths the recorded wire fixes are LITERAL — a three-character
+/// name and a forty-two-character name are both refused — so no change to the
+/// constants can make the window stop covering what was recorded.
+fn malformed_network_names() -> Vec<(&'static str, String)> {
+    use service_com_amazonaws_wickr_wickradminapi::state::{
+        NETWORK_NAME_MAX_CHARS, NETWORK_NAME_MIN_CHARS,
+    };
+
+    vec![
+        ("three characters, the length recorded refused", "a".repeat(3)),
+        ("twenty-one characters, one past the documented maximum", "n".repeat(21)),
+        ("forty-two characters, the longer length recorded refused", "n".repeat(42)),
+        ("empty", String::new()),
+        ("one character", "a".to_string()),
+        (
+            "one short of the shortest name",
+            "a".repeat(NETWORK_NAME_MIN_CHARS - 1),
+        ),
+        (
+            "one past the longest name",
+            "n".repeat(NETWORK_NAME_MAX_CHARS + 1),
+        ),
+        (
+            "far past the longest name",
+            "n".repeat(NETWORK_NAME_MAX_CHARS * 2 + 2),
+        ),
+        ("a dot", "demo.net".to_string()),
+        ("an exclamation mark", "demo!net".to_string()),
+        ("a slash", "demo/net".to_string()),
+        ("an at sign", "demo@net".to_string()),
+        ("a quote", "demo\"net".to_string()),
+        ("a tab", "demo\tnet".to_string()),
+        ("a line break", "demo\nnet".to_string()),
+        ("a leading space", " demonet".to_string()),
+        ("a trailing space", "demonet ".to_string()),
+        ("only spaces", "     ".to_string()),
+        ("a non-ASCII symbol", "demo©net".to_string()),
+        (
+            "one past the longest name in multi-byte characters",
+            "ü".repeat(NETWORK_NAME_MAX_CHARS + 1),
+        ),
+        ("an emoji", "demo\u{1f642}net".to_string()),
+    ]
+}
+
+#[tokio::test]
+async fn create_network_accepts_every_well_formed_network_name() {
     let router = emulator();
-    for (case, length, accepted) in cases {
-        let name = "n".repeat(*length);
+    for (case, name) in well_formed_network_names() {
         let (status, body) = call(
             &router,
             "POST",
@@ -493,49 +574,101 @@ async fn create_network_enforces_the_documented_network_name_bound() {
             Some(json!({ "networkName": name, "accessLevel": "STANDARD" })),
         )
         .await;
-        if *accepted {
-            assert_eq!(
-                status, CREATE_NETWORK_STATUS,
-                "case {case:?} ({length} characters): expected {CREATE_NETWORK_STATUS}, got \
-                 {status} with {body}"
-            );
-            assert_eq!(
-                body["networkName"],
-                json!(name),
-                "case {case:?}: expected the stored name back, got {body}"
-            );
-        } else {
-            assert_eq!(
-                status, 422,
-                "case {case:?} ({length} characters): expected the modelled \
-                 ValidationError status 422, got {status} with {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "ValidationError",
-                "case {case:?}: expected ValidationError, got {body}"
-            );
-            assert_eq!(
-                body["reasons"][0]["field"],
-                json!("networkName"),
-                "case {case:?}: the refusal must name networkName, got {body}"
-            );
-        }
-    }
+        assert_eq!(
+            status,
+            CREATE_NETWORK_STATUS,
+            "case {case:?} ({} characters): expected {CREATE_NETWORK_STATUS}, got {status} \
+             with {body}",
+            name.chars().count()
+        );
+        assert_eq!(
+            body["networkName"],
+            json!(name),
+            "case {case:?}: expected the submitted name back, got {body}"
+        );
 
-    // A multi-byte name of 20 characters is 40 bytes: the bound is in characters.
-    let (status, body) = call(
-        &router,
-        "POST",
-        "/networks",
-        Some(json!({ "networkName": "ü".repeat(20), "accessLevel": "STANDARD" })),
-    )
-    .await;
-    assert_eq!(
-        status, CREATE_NETWORK_STATUS,
-        "case \"20 multi-byte characters\": expected {CREATE_NETWORK_STATUS}, got {status} with \
-         {body}"
-    );
+        // Read it back, so what the create answered is what was stored.
+        let network_id = body["networkId"].as_str().unwrap_or_default().to_string();
+        let (status, fetched) = call(&router, "GET", &format!("/networks/{network_id}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetNetwork expected 200, got {status} with {fetched}"
+        );
+        assert_eq!(
+            fetched["networkName"],
+            json!(name),
+            "case {case:?}: GetNetwork must report the stored name, got {fetched}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_network_refuses_every_malformed_network_name_the_same_way() {
+    let router = emulator();
+    for (case, name) in malformed_network_names() {
+        let (status, body) = call(
+            &router,
+            "POST",
+            "/networks",
+            Some(json!({ "networkName": name, "accessLevel": "STANDARD" })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            422,
+            "case {case:?} ({} characters): expected the modelled ValidationError \
+             status 422, got {status} with {body}",
+            name.chars().count()
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationError",
+            "case {case:?}: expected ValidationError, got {body}"
+        );
+        assert_eq!(
+            items(&body, "reasons").len(),
+            1,
+            "case {case:?}: one refused member is one reason, got {body}"
+        );
+        assert_eq!(
+            body["reasons"][0]["field"],
+            json!("networkName"),
+            "case {case:?}: the refusal must name networkName, got {body}"
+        );
+        // One fixed sentence for every broken name rule, whichever one was broken.
+        assert_eq!(
+            body["reasons"][0]["reason"],
+            json!("Network Name is not a valid name"),
+            "case {case:?}: expected the service's fixed reason, got {body}"
+        );
+        // Nothing of the submitted value reaches the reason: no length, and no
+        // digit it could have been built from.
+        let reason = body["reasons"][0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !reason.chars().any(|c| c.is_ascii_digit()),
+            "case {case:?}: the reason must carry no value from the request, got {reason:?}"
+        );
+        // This error class carries no envelope sentence beside its reasons.
+        assert_eq!(
+            body.get("message"),
+            None,
+            "case {case:?}: ValidationError must carry no top-level message, got {body}"
+        );
+
+        // And the refusal stored nothing: a refused create leaves no network behind.
+        let (status, listed) = call(&router, "GET", "/networks", None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: ListNetworks expected 200, got {status} with {listed}"
+        );
+        assert!(
+            items(&listed, "networks").is_empty(),
+            "case {case:?}: a refused create must store no network, got {listed}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1570,19 +1703,27 @@ type CreateCase = (&'static str, Value);
 /// stored rather than what was sent.
 #[tokio::test]
 async fn create_network_answers_created_with_the_fixed_confirmation() {
+    use service_com_amazonaws_wickr_wickradminapi::state::{
+        NETWORK_NAME_MAX_CHARS, NETWORK_NAME_MIN_CHARS,
+    };
+
     let key_arn = "arn:aws:kms:us-east-1:000000000000:key/9b1c-demo";
     let cases: &[CreateCase] = &[
         (
             "the shortest name, STANDARD",
-            json!({ "networkName": "n", "accessLevel": "STANDARD" }),
+            json!({ "networkName": "n".repeat(NETWORK_NAME_MIN_CHARS), "accessLevel": "STANDARD" }),
         ),
         (
             "a name at the documented maximum, PREMIUM",
-            json!({ "networkName": "n".repeat(20), "accessLevel": "PREMIUM" }),
+            json!({ "networkName": "n".repeat(NETWORK_NAME_MAX_CHARS), "accessLevel": "PREMIUM" }),
         ),
         (
             "a multi-byte name",
             json!({ "networkName": "üüü-net", "accessLevel": "STANDARD" }),
+        ),
+        (
+            "a name carrying every character class a name may",
+            json!({ "networkName": "demo net-1_0", "accessLevel": "STANDARD" }),
         ),
         (
             "the premium free trial asked for",

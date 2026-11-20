@@ -284,12 +284,6 @@ fn numeric_key(user_id: &str) -> String {
 
 /// A `ValidationError` (HTTP 422) naming the member that was wrong and why.
 fn refused(field: &str, reason: String) -> ListUsersError {
-    ListUsersErrorModeled::ValidationError(ValidationError {
-        reasons: Some(vec![ErrorDetail {
-            field: Some(field.to_string()),
-            reason: Some(reason),
-        }]),
-        message: Some("1 validation error detected".to_string()),
-    })
-    .into()
+    ListUsersErrorModeled::ValidationError(crate::state::field_validation_error(field, &reason))
+        .into()
 }

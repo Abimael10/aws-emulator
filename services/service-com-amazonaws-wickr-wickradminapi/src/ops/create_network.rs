@@ -181,21 +181,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
 
-        // `CreateNetworkRequest$networkName` documents "Must be between 1 and 20
-        // characters"; the shape carries no `@length`, so the boundary validator
-        // cannot have refused it and this operation owns the bound.
-        let name_chars = input.network_name.chars().count();
-        if name_chars == 0 || name_chars > crate::state::NETWORK_NAME_MAX_CHARS {
-            return Err(CreateNetworkErrorModeled::ValidationError(ValidationError {
-                reasons: Some(vec![ErrorDetail {
-                    field: Some("networkName".to_string()),
-                    reason: Some(format!(
-                        "networkName must be between 1 and {} characters, got {name_chars}",
-                        crate::state::NETWORK_NAME_MAX_CHARS
-                    )),
-                }]),
-                message: Some("1 validation error detected".to_string()),
-            })
+        // `networkName` is modelled as a `GenericString` whose `^[\S\s]*$` matches
+        // anything, so no boundary check can have refused it and this operation
+        // owns the whole name rule — the length window and the characters a
+        // network name is made of alike. Every name the rule turns down is refused
+        // the same way, naming the member and stating the service's fixed reason.
+        if !crate::state::network_name_is_valid(&input.network_name) {
+            return Err(CreateNetworkErrorModeled::ValidationError(
+                crate::state::field_validation_error(
+                    "networkName",
+                    crate::state::NETWORK_NAME_INVALID_REASON,
+                ),
+            )
             .into());
         }
 
