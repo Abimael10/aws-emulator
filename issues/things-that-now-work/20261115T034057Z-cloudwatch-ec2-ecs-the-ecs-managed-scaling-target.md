@@ -27,3 +27,28 @@ cloudwatch__ec2__ecs.managed-scaling-target-capacity-above-100-rejected-and-trac
 1. Clone the repo and run the behavioral suite so the emulator is serving.
 2. Create an Auto Scaling group and an ECS capacity provider over it with managedScaling enabled and a TargetCapacity in 1..100; poll until the provider is readable and DescribeAlarms lists the managed target-tracking alarm — neither ever settles.
 3. Then call UpdateCapacityProvider with managedScaling.targetCapacity above 100 and re-read the alarm — no refusal and no readable alarm is produced before the client's budget expires.
+
+## Resolution note
+
+The behaviour this report asks for is now served by the ecs crate
+(`src/state/managed_scaling_policy.rs`, reached from the create, update, association,
+cluster and delete paths): a provider over an Auto Scaling group with managed scaling
+ENABLED that is associated with a cluster has exactly one Amazon ECS-owned
+`TargetTrackingScaling` policy on that group over the `AWS/ECS/ManagedScaling`
+`CapacityProviderReservation` series — dimensioned by the capacity provider and the cluster,
+at the provider's own `targetCapacity` — with the CloudWatch alarms it is driven by; the
+policy is re-targeted when the target capacity changes and withdrawn (alarms included) when
+managed scaling is turned off, the association is removed or the provider is deleted; and a
+`managedScaling.targetCapacity` outside the published 1..100 range is refused with HTTP 400
+`ClientException` and AWS's own sentence, leaving the provider, the policy and the alarm as
+they stood. The whole sequence is driven end to end over the assembled emulator by
+`core/router/tests/all/ecs_managed_scaling_target_tracking_policy.rs`.
+
+The recorded check of this report is NOT green: it is still killed by its own 60 s budget
+inside its wiring helper, which the recording does not expose, so the convergence step it
+waits on beyond the policy, the alarm and the refusal is unknown. Two open reports of this
+same scenario family are the candidates for it and remain open:
+`20261111T064629Z-cloudwatch-ec2-ecs-ecs-managed-scaling-never-creates-the-target-tracking.md`
+(the `CapacityProviderReservation` series Amazon ECS publishes for that metric) and
+`20261109T144605Z-cloudwatch-ec2-ecs-the-ec2-backed-ecs-container.md` (the EC2 → ECS
+container-instance registration the other checks of this file hang on).

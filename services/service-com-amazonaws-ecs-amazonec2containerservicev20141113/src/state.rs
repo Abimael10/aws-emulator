@@ -476,6 +476,12 @@ pub use capacity_provider_update::*;
 mod managed_capacity_scaling;
 pub use managed_capacity_scaling::*;
 
+/// The target-tracking scaling POLICY Amazon ECS owns on the Auto Scaling group of a provider
+/// whose managed scaling is on, the managed-scaling CloudWatch series it tracks, and the
+/// alarms it is driven by.
+mod managed_scaling_policy;
+pub use managed_scaling_policy::*;
+
 /// The ECS MANAGED DAEMON scheduler: the revisions a daemon's configuration is captured as,
 /// the deployments that roll them out, and the one daemon task each container instance of
 /// the daemon's capacity providers runs.

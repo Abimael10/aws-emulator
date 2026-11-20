@@ -396,6 +396,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `PutClusterCapacityProviders` takes neither `tags` nor an `include`, so the
         // response reports no tag set — only the cluster's own configured state.
         let view = guard.cluster_mutation_view(&record, false);
+        // The association is what gives a managed-scaling provider the cluster it reserves
+        // capacity for, which is part of the metric Amazon ECS manages its group's scaling by:
+        // a provider this call associated gets the target-tracking policy Amazon ECS owns for
+        // it, and one this call left out of the list has that policy (and its alarms) taken
+        // away ([`crate::state::settle_managed_scaling_policies`]). Taken with this service's
+        // guard released, since that write takes the other stores' locks.
+        drop(guard);
+        crate::state::settle_managed_scaling_policies(
+            &*self.engine,
+            ::std::time::SystemTime::now(),
+        );
 
         Ok(PutClusterCapacityProvidersOutput {
             cluster: Some(view),

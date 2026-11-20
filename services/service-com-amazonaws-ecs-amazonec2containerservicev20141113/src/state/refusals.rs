@@ -374,14 +374,26 @@ pub fn needs_registered_capacity(launch_type: Option<&str>) -> bool {
 /// group", so then nothing is coming. A managed-instances provider manages its own
 /// instances, so it never needs capacity to be there first.
 pub fn needs_registered_capacity_now(provider: &CapacityProviderRecord) -> bool {
-    let Some(group) = provider.auto_scaling_group_provider.as_ref() else {
-        return false;
-    };
-    group
-        .managed_scaling
+    provider.auto_scaling_group_provider.is_some() && !managed_scaling_enabled(provider)
+}
+
+/// Whether `provider` is one whose Auto Scaling group Amazon ECS manages the scaling OF:
+/// `ManagedScaling$status` is "Determines whether to use managed scaling for the capacity
+/// provider", so the switch being [`MANAGED_SCALING_ENABLED`] is the whole of the question —
+/// a provider whose create named no block, or named it with the switch off, is one nothing
+/// turned managed scaling on for.
+///
+/// Asked wherever managed scaling being on decides something: whether a placement through the
+/// provider waits for capacity to be acquired ([`needs_registered_capacity_now`]) and whether
+/// Amazon ECS owns a target-tracking policy on the group
+/// ([`super::managed_scaling_policy`]), so the two cannot read the switch differently.
+pub fn managed_scaling_enabled(provider: &CapacityProviderRecord) -> bool {
+    provider
+        .auto_scaling_group_provider
         .as_ref()
+        .and_then(|group| group.managed_scaling.as_ref())
         .and_then(|scaling| scaling.status.as_deref())
-        != Some(MANAGED_SCALING_ENABLED)
+        == Some(MANAGED_SCALING_ENABLED)
 }
 
 /// Whether a task routed through `provider` still has to have capacity ACQUIRED for it

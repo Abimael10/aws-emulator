@@ -354,11 +354,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clusterCount` is read AFTER the delete landed, so the cluster this call
         // deleted is no longer counted: a tombstone is not a live cluster.
+        let cluster_count = guard.cluster_count_for(&cluster_name);
+        // A provider the deleted cluster was the association of reserves capacity for no
+        // cluster any more, so the target-tracking policy Amazon ECS managed for it goes with
+        // the cluster ([`crate::state::settle_managed_scaling_policies`]). Taken with this
+        // service's guard released, since that write takes the other stores' locks.
+        drop(guard);
+        crate::state::settle_managed_scaling_policies(
+            &*self.engine,
+            ::std::time::SystemTime::now(),
+        );
+
         Ok(DeleteClusterResponse {
             payload: DeleteClusterOutput {
                 cluster: Some(view),
             },
-            cluster_count: guard.cluster_count_for(&cluster_name),
+            cluster_count,
             member: &CLUSTER_COUNT_MEMBER,
         })
     }

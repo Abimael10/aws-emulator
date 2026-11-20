@@ -216,7 +216,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The utilization a `managedScaling` block TARGETS is a percentage, judged the same
         // way and in the same class as the step sizes below
-        // ([`crate::state::managed_scaling_target_capacity_violation`]).
+        // ([`crate::state::managed_scaling_target_capacity_violation`]) — on the value the
+        // request carried and BEFORE anything is written, so the provider, the policy Amazon
+        // ECS manages for it and that policy's alarms are all left exactly as they stood.
         if let Some(message) = crate::state::managed_scaling_target_capacity_violation(
             input
                 .auto_scaling_group_provider
@@ -401,8 +403,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `UpdateCapacityProvider` has no `include` member to narrow the response with, so
         // the provider it acted on is reported with the tags it holds.
+        let view = stored.view(true);
+        // The managed-scaling configuration this update left in force is what the policy
+        // Amazon ECS manages for the provider tracks, so the policy and its alarms follow it:
+        // a changed target capacity re-targets the policy, and managed scaling turned off
+        // takes it away ([`crate::state::settle_managed_scaling_policies`]). Taken with this
+        // service's guard released, since that write takes the other stores' locks.
+        drop(guard);
+        crate::state::settle_managed_scaling_policies(&*self.engine, now);
+
         Ok(UpdateCapacityProviderOutput {
-            capacity_provider: Some(stored.view(true)),
+            capacity_provider: Some(view),
         })
     }
 }

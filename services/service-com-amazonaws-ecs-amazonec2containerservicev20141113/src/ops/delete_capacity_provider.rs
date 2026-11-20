@@ -312,8 +312,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DeleteCapacityProvider` has no `include` member to narrow the response with, so
         // the provider it acted on is reported with the tags it holds.
+        let view = stored.view(true);
+        // A retired provider wants no scaling policy on its group, so the one Amazon ECS
+        // manages for it is taken away with it, alarms included
+        // ([`crate::state::settle_managed_scaling_policies`]). Taken with this service's guard
+        // released, since that write takes the other stores' locks; a delete the association
+        // held off changes nothing, and neither does this pass.
+        drop(guard);
+        crate::state::settle_managed_scaling_policies(&*self.engine, now);
+
         Ok(DeleteCapacityProviderOutput {
-            capacity_provider: Some(stored.view(true)),
+            capacity_provider: Some(view),
         })
     }
 }

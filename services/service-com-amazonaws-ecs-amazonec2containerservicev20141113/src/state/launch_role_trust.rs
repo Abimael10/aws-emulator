@@ -120,6 +120,10 @@ pub fn advance_task_clock<Eng: Send + Sync + 'static>(engine: &Eng, now: SystemT
     // fallen due, against the Auto Scaling store with no guard of this one held
     // ([`super::settle_managed_capacity_scaling`]).
     super::settle_managed_capacity_scaling(engine, now);
+    // The target-tracking policy Amazon ECS manages for each provider whose managed scaling is
+    // on, which the clock owes in the same way: Amazon ECS puts it on the provider's group
+    // with no request from anybody ([`super::settle_managed_scaling_policies`]).
+    super::settle_managed_scaling_policies(engine, now);
     settle_task_launches(engine);
 }
 

@@ -251,6 +251,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|reference| crate::state::cluster_name_from_reference(Some(reference)));
         let region = crate::state::request_region(ctx);
 
+        // The target-tracking policy Amazon ECS manages for a provider whose managed scaling
+        // is on is work the CLOCK owes rather than work a call does — Amazon ECS puts it on
+        // the group with no request from anybody — so this read materialises what was already
+        // due, exactly as the clock pump does, before it reports the providers it is owed for
+        // ([`crate::state::settle_managed_scaling_policies`]). Taken with NO guard of this
+        // store held, since it takes the other stores' locks.
+        crate::state::settle_managed_scaling_policies(
+            &*self.engine,
+            ::std::time::SystemTime::now(),
+        );
+
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 

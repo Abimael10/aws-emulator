@@ -457,11 +457,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `clusterCount` is read AFTER the create landed, so it counts the cluster this
         // call just added.
+        let cluster_count = guard.cluster_count_for(&name);
+        // A create that ASSOCIATES capacity providers is what gives a managed-scaling
+        // provider the cluster it reserves capacity for, so the target-tracking policy
+        // Amazon ECS manages for such a provider follows this call exactly as it follows a
+        // later association ([`crate::state::settle_managed_scaling_policies`]). Taken with
+        // this service's guard released, since that write takes the other stores' locks.
+        drop(guard);
+        crate::state::settle_managed_scaling_policies(&*self.engine, now);
+
         Ok(CreateClusterResponse {
             payload: CreateClusterOutput {
                 cluster: Some(view),
             },
-            cluster_count: guard.cluster_count_for(&name),
+            cluster_count,
             member: &CLUSTER_COUNT_MEMBER,
         })
     }

@@ -218,6 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // since it reads the Amazon EC2 store under that store's own lock.
         let now = ::std::time::SystemTime::now();
         crate::state::settle_ec2_capacity(&*self.engine, now);
+        // The target-tracking policy Amazon ECS manages for a managed-scaling provider this
+        // cluster is associated with is owed by the CLOCK in the same way — Amazon ECS puts it
+        // on the provider's group with no request from anybody — so this read materialises
+        // what was already due ([`crate::state::settle_managed_scaling_policies`]), with no
+        // guard of this store held either.
+        crate::state::settle_managed_scaling_policies(&*self.engine, now);
 
         let mut guard = state.lock();
         guard.advance_clock(now);

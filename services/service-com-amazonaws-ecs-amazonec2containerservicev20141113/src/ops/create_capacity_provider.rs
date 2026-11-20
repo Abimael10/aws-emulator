@@ -574,6 +574,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(group_arn) = requested_group.as_deref() {
             crate::state::mark_group_managed(&*self.engine, group_arn);
         }
+        // A provider whose managed scaling Amazon ECS runs is one Amazon ECS holds a
+        // target-tracking policy for, on that same group
+        // ([`crate::state::settle_managed_scaling_policies`]): the policy is Amazon ECS's own,
+        // so it is written where the group lives as soon as the provider that wants it exists
+        // — with this service's guard released first, since that write takes the other
+        // stores' locks.
+        crate::state::settle_managed_scaling_policies(&*self.engine, now);
 
         Ok(CreateCapacityProviderOutput {
             capacity_provider: Some(view),
