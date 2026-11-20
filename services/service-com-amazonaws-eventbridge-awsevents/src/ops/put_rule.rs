@@ -220,6 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // authorization, so a caller that may not write the rule at all reads that first.
         let handed_roles_denied =
             crate::state::pass_role::handed_roles_denial(&caller, [input.role_arn.as_deref()]);
+        // The pattern this call submits, as the authorization pass below and the pattern
+        // reading further down both take it: a member carrying nothing but whitespace
+        // submits no pattern at all.
+        let submitted_pattern = input
+            .event_pattern
+            .as_deref()
+            .filter(|text| !text.trim().is_empty());
         let mut store = state.lock();
 
         // Writing a rule is the action `events:PutRule` on that rule, so the policies
@@ -229,13 +236,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no rule under carries no tag yet, so a create is decided against the ARN such
         // a rule would carry and an empty tag set
         // (`crate::state::rule_authorization`).
-        if let Some(message) = crate::state::rule_authorization::rule_call_denial(
+        //
+        // This call also SUBMITS the rule's event pattern, so it publishes the
+        // event-content condition keys that pattern establishes — `events:source`,
+        // `events:detail-type` and the keys under the event's `detail` document — which is
+        // what scopes a grant to the rules a principal may author: a pattern fixing a
+        // field to a list of literal values admits only events carrying one of them, so
+        // those literals are the values this call carries for that field's key.
+        if let Some(message) = crate::state::rule_authorization::pattern_rule_denial(
             &store,
             &caller,
             Self::NAME,
             &region,
             &bus_name,
             &input.name,
+            submitted_pattern,
         ) {
             return Err(PutRuleErrorModeled::AccessDeniedException(AccessDeniedException {
                 message: Some(message),
@@ -255,7 +270,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "A rule must contain at least an EventPattern or ScheduleExpression"
         // (this operation's own documentation). The model cannot express a
         // requirement spanning two optional members, so it is refused here.
-        let event_pattern = input.event_pattern.filter(|text| !text.trim().is_empty());
+        let event_pattern = submitted_pattern.map(str::to_string);
         let schedule_expression = input
             .schedule_expression
             .filter(|text| !text.trim().is_empty());

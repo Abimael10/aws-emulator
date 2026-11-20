@@ -50,23 +50,36 @@
 //! Beside the resource half, AWS publishes this service's OWN request condition keys for the
 //! call being decided — the keys named after the members that call carries — so a statement
 //! scoped by one of them decides the calls whose members satisfy it and refuses only the
-//! others. A call that attaches targets to a rule carries the ARN of each target it attaches,
-//! so it publishes [`TARGET_ARN_CONDITION_KEY`], one value per entry
-//! ([`target_attachment_denial`]); a call that carries no target ARN publishes none of them
-//! ([`rule_call_denial`]), which is every other call on a rule of this service — the
-//! removal operation names the targets to remove by `Id` and so carries no ARN at all.
+//! others. Two families of them are published here:
+//!
+//! * a call that attaches targets to a rule carries the ARN of each target it attaches, so it
+//!   publishes [`TARGET_ARN_CONDITION_KEY`], one value per entry
+//!   ([`target_attachment_denial`]);
+//! * a call that submits the rule's EVENT PATTERN publishes the event-content keys that
+//!   pattern establishes — the keys a publication onto a bus publishes out of the event it
+//!   carries ([`PUBLICATION_CONDITION_KEYS`]), read here off the pattern instead, one value
+//!   per literal the pattern fixes the field to ([`pattern_rule_denial`]). A pattern that
+//!   fixes a field to a list of literal values admits only events carrying one of them, so
+//!   those literals are what the call establishes for that field; a field the pattern
+//!   constrains some other way, or not at all, is [`PatternField`]'s other two readings, and
+//!   a pattern carrying a `$or` relationship publishes no event-content key at all (see
+//!   [`pattern_leaves`]).
+//!
+//! A call that carries neither publishes neither ([`rule_call_denial`]) — the removal
+//! operation names the targets to remove by `Id` and so carries no ARN at all, and a call
+//! that merely addresses a rule submits no pattern of its own.
 //!
 //! ## The condition keys this gate does not publish yet
 //!
 //! AWS also publishes the REQUEST-tag families for a call that carries tags of its own —
 //! `aws:RequestTag/<tag-key>` and `aws:TagKeys` — which here would be the `Tags` a
 //! rule-creating `PutRule` or a `TagResource` carries and the `TagKeys` an `UntagResource`
-//! names, and the keys read out of a rule's submitted event PATTERN. A statement conditioned
-//! on one of those is therefore left UNDECIDED, which never
+//! names. A statement conditioned on one of those is therefore left UNDECIDED, which never
 //! grants and never weakens a deny ([`::service_common::iam_authorization`]): such a grant
 //! refuses a call AWS would serve, which is the fail-closed direction, and reading the
 //! request's own tags onto the context is what closes it.
 
+use ::serde_json::{Map, Value};
 use ::service_common::iam_authorization::{self as iam, Decision};
 
 use super::authorization::Caller;
@@ -131,6 +144,168 @@ impl RequestKeys {
                 .collect(),
         }
     }
+
+    /// The keys a call that SUBMITS the rule's event pattern publishes: for each key of
+    /// [`event_content_keys`], one value per literal the pattern fixes that key's own event
+    /// field to.
+    ///
+    /// `pattern` is the pattern the request carries, or `None` for a call that carries none —
+    /// a rule fired by a schedule alone, which constrains no event field, so every key is
+    /// published carrying no value and a clause asking about the ABSENCE of one is
+    /// answerable.
+    ///
+    /// A pattern the language does not admit establishes nothing about any field, so no key
+    /// is published for it: the operation reads the pattern itself and refuses it as the
+    /// invalid pattern it is, and until then a statement scoped by one of these keys stays
+    /// undecided rather than being decided against a value this reading could not take.
+    fn of_event_pattern(pattern: Option<&str>) -> Self {
+        let parsed = match pattern {
+            None => Some(Map::new()),
+            Some(text) => event_pattern::parse(text).ok(),
+        };
+        let Some(leaves) = parsed.as_ref().and_then(pattern_leaves) else {
+            return Self::default();
+        };
+        let mut keys = Self::default();
+        for (key, path) in event_content_keys() {
+            if let PatternField::Known(values) = field_values(&leaves, &path) {
+                keys.published.push(key);
+                keys.context.extend(
+                    values
+                        .into_iter()
+                        .map(|value| (key.to_string(), value)),
+                );
+            }
+        }
+        keys
+    }
+}
+
+/// The members of an event the event-content condition keys are named after: the event's own
+/// `source` and `detail-type`, and the `detail` document the rest of them sit inside — the
+/// field names an event envelope of this service carries (`super::event_envelope`).
+const SOURCE_FIELD: &str = "source";
+const DETAIL_TYPE_FIELD: &str = "detail-type";
+const DETAIL_FIELD: &str = "detail";
+
+/// Every event-content condition key, with the path from an event's ROOT to the member whose
+/// value it carries.
+///
+/// They are the keys a publication onto a bus publishes out of the event it carries
+/// ([`PUBLICATION_CONDITION_KEYS`]), so the two readings cannot name different keys: the
+/// members under the event's `detail` document sit at the paths inside it a publication reads
+/// them at (`super::DETAIL_CONDITION_KEYS`), one level below [`DETAIL_FIELD`].
+fn event_content_keys() -> Vec<(&'static str, Vec<&'static str>)> {
+    let mut keys = vec![
+        (SOURCE_CONDITION_KEY, vec![SOURCE_FIELD]),
+        (DETAIL_TYPE_CONDITION_KEY, vec![DETAIL_TYPE_FIELD]),
+    ];
+    for (key, path) in super::DETAIL_CONDITION_KEYS {
+        let mut at = vec![DETAIL_FIELD];
+        at.extend(path.iter().copied());
+        keys.push((key, at));
+    }
+    keys
+}
+
+/// What a submitted event pattern establishes about ONE field of the events it admits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PatternField {
+    /// The field is fixed to these literal values — and to none at all where the pattern
+    /// leaves it free, since a pattern that says nothing about a field admits events carrying
+    /// whatever they like there, which is a call carrying no value for that field's key.
+    Known(Vec<String>),
+    /// The pattern constrains the field in a way no value set can be read off: a match
+    /// expression (`prefix`, `anything-but`, …), which admits values the pattern does not
+    /// list; a term that is not a string, which no string comparison reads; or the same field
+    /// constrained twice over. Every field of a pattern carrying a `$or` relationship reads
+    /// this way too, whatever else that pattern fixes: the relationship holds when ANY branch
+    /// matches, so what the pattern admits is not the per-path reading [`pattern_leaves`]
+    /// takes. The key is then left UNPUBLISHED and carries no value, so a statement scoped by
+    /// it stays undecided, which never grants and never weakens a deny
+    /// ([`::service_common::iam_authorization`]).
+    Unknown,
+}
+
+/// Every leaf of a submitted pattern, as the field PATH it constrains and the match terms it
+/// lists there, or `None` for a pattern no such reading exists for.
+///
+/// A member name IS the path it spells, so one written with the path separator contributes a
+/// segment per separator and a nested object lengthens the path rather than descending into a
+/// sub-document — exactly how the matcher reads a pattern (`super::event_pattern`), which is
+/// what makes `{"detail.service":[…]}` and `{"detail":{"service":[…]}}` one constraint.
+///
+/// A pattern carrying a `$or` relationship ANYWHERE has no path-to-terms reading at all —
+/// the relationship holds when any one branch matches, so no path the pattern names is a
+/// requirement on every event it admits — and nothing is published off such a pattern, the
+/// fields outside the relationship included. That is the fail-closed direction: it withholds
+/// a grant AWS would give rather than giving one AWS withholds.
+///
+/// The recursion is bounded by the parse the pattern already came through, which refuses a
+/// pattern nesting objects deeper than the language's own limit.
+fn pattern_leaves(pattern: &Map<String, Value>) -> Option<Vec<(Vec<&str>, &Value)>> {
+    let mut leaves = Vec::new();
+    collect_leaves(pattern, &[], &mut leaves).then_some(leaves)
+}
+
+/// The walk [`pattern_leaves`] is: append every leaf of `pattern` under the path `prefix`,
+/// answering `false` for a construct that has no path-to-terms reading.
+fn collect_leaves<'a>(
+    pattern: &'a Map<String, Value>,
+    prefix: &[&'a str],
+    leaves: &mut Vec<(Vec<&'a str>, &'a Value)>,
+) -> bool {
+    for (member, spec) in pattern {
+        if member == event_pattern::OR_RELATIONSHIP {
+            return false;
+        }
+        let mut path = prefix.to_vec();
+        path.extend(member.split(event_pattern::PATH_SEPARATOR));
+        match spec {
+            Value::Object(nested) => {
+                if !collect_leaves(nested, &path, leaves) {
+                    return false;
+                }
+            }
+            terms => leaves.push((path, terms)),
+        }
+    }
+    true
+}
+
+/// What `leaves` establish about the field at `path`.
+fn field_values(leaves: &[(Vec<&str>, &Value)], path: &[&str]) -> PatternField {
+    let mut values: Option<Vec<String>> = None;
+    for (at, terms) in leaves {
+        if at.as_slice() == path {
+            // A pattern constraining one path twice — a nested object and a member name
+            // spelling the same path — admits the values BOTH lists admit, which is neither
+            // list, so nothing is read off it.
+            if values.is_some() {
+                return PatternField::Unknown;
+            }
+            let Some(literals) = literal_values(terms) else {
+                return PatternField::Unknown;
+            };
+            values = Some(literals);
+        } else if at.starts_with(path) || path.starts_with(at.as_slice()) {
+            // The pattern constrains the field at another DEPTH: a parent of it as a leaf, or
+            // a member below it. Either way the value an event carries at this path is not a
+            // literal the pattern names.
+            return PatternField::Unknown;
+        }
+    }
+    PatternField::Known(values.unwrap_or_default())
+}
+
+/// The literal strings a term list fixes a field to, or `None` when it lists a term that is
+/// not one (see [`PatternField::Unknown`]).
+fn literal_values(terms: &Value) -> Option<Vec<String>> {
+    terms
+        .as_array()?
+        .iter()
+        .map(|term| term.as_str().map(str::to_string))
+        .collect()
 }
 
 /// The IAM action the operation `operation` performs — `events:DisableRule` for
@@ -229,6 +404,34 @@ fn rule_denial(
     );
     let tags = stored.map(|rule| rule.tags.as_slice()).unwrap_or_default();
     action_denial(caller, &rule_action(operation), &rule_arn, tags, request)
+}
+
+/// [`rule_call_denial`] for a call that SUBMITS the rule's event pattern, which publishes the
+/// event-content condition keys that pattern establishes beside the resource half — so a
+/// statement scoped by one of them grants the calls whose pattern satisfies it and refuses
+/// only the others.
+///
+/// `event_pattern` is the pattern the request carries, or `None` for a call that carries none
+/// (see [`RequestKeys::of_event_pattern`]).
+#[must_use]
+pub fn pattern_rule_denial(
+    store: &ComAmazonawsEventbridgeAwseventsState,
+    caller: &Caller,
+    operation: &str,
+    region: &str,
+    bus_name: &str,
+    rule_name: &str,
+    event_pattern: Option<&str>,
+) -> Option<String> {
+    rule_denial(
+        store,
+        caller,
+        operation,
+        region,
+        bus_name,
+        rule_name,
+        &RequestKeys::of_event_pattern(event_pattern),
+    )
 }
 
 /// [`rule_call_denial`] for a call that addressed its rule by ARN rather than by name:

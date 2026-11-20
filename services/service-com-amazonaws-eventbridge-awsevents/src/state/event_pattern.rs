@@ -135,6 +135,14 @@ const BOTTOM_BELOW_TOP: &str = "Bottom must be less than top";
 /// anything else.
 const FILTER_NOT_AN_OBJECT: &str = "Filter is not an object";
 
+/// The member name that names a RELATIONSHIP between pattern objects rather
+/// than a field of the event: "at least one branch must match".
+///
+/// Named here, where the language is read, so every reader of a pattern — the
+/// validator, the matcher, and whoever reads what a pattern establishes about a
+/// field — spells the relationship one way.
+pub(super) const OR_RELATIONSHIP: &str = "$or";
+
 /// How many pattern objects an `$or` relationship relates.
 ///
 /// `$or` is a RELATIONSHIP between pattern objects, and a relationship needs
@@ -792,7 +800,7 @@ fn validate_object(
     }
     for (key, spec) in pattern {
         let at = at.key(key);
-        if key == "$or" {
+        if key == OR_RELATIONSHIP {
             let Some(branches) = spec.as_array() else {
                 return Err(at.refuse(
                     Read::Opening,
@@ -1473,7 +1481,7 @@ fn match_object(
         if !budget.charge(1) {
             return false;
         }
-        let held = if key == "$or" && relates_objects(spec) {
+        let held = if key == OR_RELATIONSHIP && relates_objects(spec) {
             match_any_branch(spec, event, prefix, budget)
         } else {
             // A member name IS the path it spells, so one written with
@@ -1530,7 +1538,7 @@ fn match_object(
 /// carrying one is indistinguishable from the path it spells: `{"a.b": "v"}`
 /// and `{"a": {"b": "v"}}` carry `"v"` at the same path, so a pattern over
 /// either matches both.
-const PATH_SEPARATOR: char = '.';
+pub(super) const PATH_SEPARATOR: char = '.';
 
 /// Every value of `event` that sits at the field path `steps`, appended to
 /// `found`.

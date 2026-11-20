@@ -3415,9 +3415,11 @@ pub mod authorization;
 /// against the caller's identity-based policies with the TARGET rule's tags
 /// published as `aws:ResourceTag/<key>` and the request keys the CALL itself
 /// carries beside them — the ARN of each target a target-attaching call attaches,
-/// as `events:TargetArn`
+/// as `events:TargetArn`, and the event-content keys the event pattern a
+/// rule-writing call submits establishes
 /// ([`rule_authorization::rule_call_denial`],
-/// [`rule_authorization::target_attachment_denial`]).
+/// [`rule_authorization::target_attachment_denial`],
+/// [`rule_authorization::pattern_rule_denial`]).
 pub mod rule_authorization;
 
 /// Every spelling of the identity a publication is made as that a resource
