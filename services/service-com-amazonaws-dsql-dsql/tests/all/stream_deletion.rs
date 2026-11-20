@@ -425,7 +425,6 @@ fn seeded_cluster(region: &str, identifier: &str, status: &str, stream: Stream) 
         kms_encryption_key: None,
         encryption_details: None,
         multi_region_properties: None,
-        endpoint: None,
         tags: Default::default(),
         policy: None,
         policy_versions_issued: 0,

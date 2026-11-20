@@ -26,6 +26,7 @@ use service_com_amazonaws_dsql_dsql::state::{
     Cluster, ComAmazonawsDsqlDsqlState, PendingTransition, RecordedCall, TokenScope, MAX_CLUSTERS,
     MAX_CREATE_TOKENS, MAX_RETIRED_CLUSTERS, STATUS_DELETED,
 };
+use service_common::data_plane_addressing::{AWS_ENDPOINT_DNS_SUFFIXES, LOOPBACK_ZONE};
 
 use crate::harness::{
     absent_identifier, expected_arn, is_cluster_id, wait_for_the_clock, Dsql,
@@ -201,8 +202,9 @@ async fn create_persists_a_cluster_that_get_reports_back() {
         );
         assert_eq!(
             created.str("endpoint"),
-            format!("{identifier}.dsql.{}.on.aws", case.region),
-            "case {:?}: endpoint must name the minted cluster, got {:?}",
+            LOOPBACK_ZONE,
+            "case {:?}: endpoint must name the host this emulator is served at, which for \
+             one embedded in a process is the loopback zone, got {:?}",
             case.name,
             created.str("endpoint")
         );
@@ -232,6 +234,14 @@ async fn create_persists_a_cluster_that_get_reports_back() {
             created.str("arn"),
             "case {:?}: GetCluster must report the stored arn",
             case.name
+        );
+        assert_eq!(
+            fetched.str("endpoint"),
+            created.str("endpoint"),
+            "case {:?}: GetCluster must report the stored endpoint {:?}, got {:?}",
+            case.name,
+            created.str("endpoint"),
+            fetched.str("endpoint")
         );
         assert_eq!(
             fetched.get("creationTime"),
@@ -287,6 +297,102 @@ async fn create_persists_a_cluster_that_get_reports_back() {
             case.name,
             fetched.str("status")
         );
+    }
+}
+
+/// The endpoint bases this emulator can be served at, with the host a cluster's
+/// connection endpoint is announced at when it is served there.
+///
+/// The rows span the forms that address takes: a loopback literal with a port, a name
+/// with another port, a bracketed IPv6 literal (a host `Endpoint`'s `^[a-zA-Z0-9.-]+$`
+/// cannot carry) and the base of an emulator served on no port at all
+/// (`smithy_server_runtime::UNSERVED_URL_BASE`, the base of one embedded in another
+/// process). The announced host is the served host itself, with the loopback zone — the
+/// interface the core binds its listeners on — standing in wherever that host is not one
+/// a hostname member can carry.
+const ENDPOINT_BASES: [(&str, &str); 4] = [
+    ("https://127.0.0.1:9297", "127.0.0.1"),
+    ("https://localhost:39355", "localhost"),
+    ("https://[::1]:8443", LOOPBACK_ZONE),
+    (smithy_server_runtime::UNSERVED_URL_BASE, LOOPBACK_ZONE),
+];
+
+/// Whether `value` is a host `Endpoint` and `ClusterVpcEndpoint` admit: non-empty, and
+/// drawn from `^[a-zA-Z0-9.-]+$`. Source: `smithy_query(query="shape", shape="Endpoint")`.
+fn is_endpoint(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+/// RULE: every response that reports a cluster's connection endpoint — `CreateCluster`'s
+/// own answer, the retry a repeated `clientToken` replays, `GetCluster`'s read of the
+/// stored cluster and the `clusterVpcEndpoint` `GetVpcEndpointServiceName` reports — names
+/// the host THIS emulator is served at, so a client that dials the value reaches this
+/// process; never a host in a zone Amazon Web Services publishes its own endpoints in,
+/// whatever Region the request is signed for.
+#[tokio::test]
+async fn every_reported_cluster_endpoint_names_this_emulators_own_host() {
+    for (base, announced) in ENDPOINT_BASES {
+        // Two Regions per base: the announced host is where this process answers, so it
+        // follows the endpoint the emulator is served at and not the request's Region.
+        for region in ["us-east-1", "eu-west-1"] {
+            let case = format!("served at {base:?} in {region}");
+            let dsql = Dsql::served_at(region, base);
+            let body = json!({"deletionProtectionEnabled": false, "clientToken": "tok-endpoint"});
+            let created = dsql.create(body.clone()).await;
+            assert_eq!(
+                created.status, 200,
+                "case {case:?}: CreateCluster must answer 200, got {} {:?}",
+                created.status, created.body
+            );
+            let identifier = created.str("identifier");
+
+            // Each reported value, asked for the way a client asks for it.
+            let replayed = dsql.create(body).await;
+            let fetched = dsql.get(&identifier).await;
+            let fronted = dsql
+                .call(
+                    "GET",
+                    &format!("/clusters/{identifier}/vpc-endpoint-service-name"),
+                    None,
+                )
+                .await;
+            for (member, reported) in [
+                ("CreateCluster's endpoint", created.str("endpoint")),
+                ("the replayed create's endpoint", replayed.str("endpoint")),
+                ("GetCluster's endpoint", fetched.str("endpoint")),
+                (
+                    "GetVpcEndpointServiceName's clusterVpcEndpoint",
+                    fronted.str("clusterVpcEndpoint"),
+                ),
+            ] {
+                assert_eq!(
+                    reported, announced,
+                    "case {case:?}: {member} must name this emulator's own host \
+                     {announced:?}, got {reported:?}"
+                );
+                assert!(
+                    is_endpoint(&reported),
+                    "case {case:?}: {member} must satisfy Endpoint's ^[a-zA-Z0-9.-]+$, \
+                     got {reported:?}"
+                );
+                for suffix in AWS_ENDPOINT_DNS_SUFFIXES {
+                    assert!(
+                        !reported.ends_with(suffix),
+                        "case {case:?}: {member} must name no endpoint of Amazon Web \
+                         Services' own ({suffix}), got {reported:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                replayed.str("identifier"),
+                identifier,
+                "case {case:?}: the replayed create must answer the first cluster, got {:?}",
+                replayed.str("identifier")
+            );
+        }
     }
 }
 
@@ -1022,7 +1128,6 @@ pub fn retiring_cluster(identifier: &str, due_at: SystemTime) -> Cluster {
         kms_encryption_key: None,
         encryption_details: None,
         multi_region_properties: None,
-        endpoint: None,
         tags: Default::default(),
         policy: None,
         policy_versions_issued: 0,

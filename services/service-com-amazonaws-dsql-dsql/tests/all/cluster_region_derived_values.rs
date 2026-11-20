@@ -161,9 +161,9 @@ async fn the_updated_kms_key_arn_stays_in_the_clusters_region() {
 }
 
 /// RULE as an invariant: whichever region an update is signed for, the cluster's
-/// own region-qualified values are left alone — its ARN and its connection
-/// endpoint still name the region it was minted in, and a later update does not
-/// move them.
+/// own stored values are left alone — its ARN still names the region it was minted
+/// in, its connection endpoint still names where this emulator answers, and a later
+/// update does not move them.
 #[tokio::test]
 async fn an_update_from_another_region_moves_nothing_into_that_region() {
     for (home, away) in REGION_PAIRS {

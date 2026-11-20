@@ -2,8 +2,9 @@
 
 //! @op CreateCluster
 //!
-//! Mints and persists a cluster: a fresh lowercase-ULID `identifier`, the ARN and
-//! endpoint derived from it and the request's region, `CREATING` with the clock
+//! Mints and persists a cluster: a fresh lowercase-ULID `identifier`, the ARN
+//! derived from it and the request's region, the connection endpoint this
+//! emulator is served at (`state::cluster_endpoint`), `CREATING` with the clock
 //! owing it the status its configuration settles into — `ACTIVE` for a
 //! single-Region cluster, and `PENDING_SETUP` for one created with a
 //! `multiRegionProperties` configuration, whose peering is not established on
@@ -371,7 +372,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             )
                             .into());
                         };
-                        return Ok(replayed_cluster_output(existing, answered));
+                        return Ok(replayed_cluster_output(
+                            existing,
+                            answered,
+                            &crate::state::cluster_endpoint(ctx),
+                        ));
                     }
                 }
                 crate::state::TokenVerdict::Mismatch => {
@@ -435,7 +440,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encryption_pending: crate::state::encryption_settlement(encryption_status, now),
             kms_encryption_key: customer_key.map(str::to_string),
             multi_region_properties: input.multi_region_properties.clone(),
-            endpoint: Some(crate::state::cluster_endpoint(&region, &identifier)),
             tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
             policy: None,
             policy_versions_issued: 0,
@@ -461,7 +465,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cluster.policy = Some(crate::state::ClusterPolicy { document, version });
         }
 
-        let created = created_cluster_output(&cluster);
+        let created = created_cluster_output(&cluster, &crate::state::cluster_endpoint(ctx));
         state.clusters.insert(identifier.clone(), cluster);
         if let Some(token) = input.client_token {
             let answered = crate::state::RecordedClusterCreation {
@@ -509,8 +513,12 @@ fn create_fingerprint(input: &CreateClusterInput) -> String {
 }
 
 /// `CreateClusterOutput` for the call that MINTS the cluster, read off the
-/// record it just persisted.
-fn created_cluster_output(cluster: &crate::state::Cluster) -> CreateClusterOutput {
+/// record it just persisted, with `endpoint` the address this emulator answers on
+/// ([`crate::state::cluster_endpoint`]) rather than a member of that record.
+fn created_cluster_output(
+    cluster: &crate::state::Cluster,
+    endpoint: &str,
+) -> CreateClusterOutput {
     CreateClusterOutput {
         identifier: cluster.identifier.clone(),
         arn: cluster.arn.clone(),
@@ -519,29 +527,32 @@ fn created_cluster_output(cluster: &crate::state::Cluster) -> CreateClusterOutpu
         multi_region_properties: cluster.multi_region_properties.clone(),
         encryption_details: cluster.encryption_details.clone(),
         deletion_protection_enabled: cluster.deletion_protection_enabled,
-        endpoint: cluster.endpoint.clone(),
+        endpoint: Some(endpoint.to_string()),
     }
 }
 
 /// `CreateClusterOutput` for a RETRY the ledger recognised: the result the
 /// original call produced.
 ///
-/// The cluster's minted identity — `identifier`, `arn`, `creationTime` and the
-/// `endpoint` derived from the identifier — is fixed for its whole life, so it
-/// is rendered from the stored record; every member a later call can write again
-/// comes from what the original call answered
+/// The cluster's minted identity — `identifier`, `arn` and `creationTime` — is
+/// fixed for its whole life, so it is rendered from the stored record, and
+/// `endpoint` is where this emulator answers NOW
+/// ([`crate::state::cluster_endpoint`]), which is the one address every report of
+/// this cluster names; every member a later call can write again comes from what
+/// the original call answered
 /// ([`crate::state::RecordedClusterCreation`]), because the live cluster's
 /// configuration is not that result once an `UpdateCluster` or the clock has
 /// changed it.
 fn replayed_cluster_output(
     cluster: &crate::state::Cluster,
     answered: crate::state::RecordedClusterCreation,
+    endpoint: &str,
 ) -> CreateClusterOutput {
     CreateClusterOutput {
         identifier: cluster.identifier.clone(),
         arn: cluster.arn.clone(),
         creation_time: ::aws_smithy_types::DateTime::from(cluster.creation_time),
-        endpoint: cluster.endpoint.clone(),
+        endpoint: Some(endpoint.to_string()),
         status: answered.status,
         multi_region_properties: answered.multi_region_properties,
         encryption_details: answered.encryption_details,

@@ -214,7 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect()
             }),
             encryption_details: cluster.encryption_details.clone(),
-            endpoint: cluster.endpoint.clone(),
+            // The connection endpoint is where THIS emulator answers, which is a
+            // property of the process and not of the stored cluster, so it is
+            // reported as it stands now (`crate::state::cluster_endpoint`) — the same
+            // address the create published and every other read of this cluster
+            // reports.
+            endpoint: Some(crate::state::cluster_endpoint(ctx)),
         })
     }
 }

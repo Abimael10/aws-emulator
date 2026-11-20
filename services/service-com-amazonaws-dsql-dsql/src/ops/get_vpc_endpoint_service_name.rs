@@ -192,7 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetVpcEndpointServiceNameOutput {
             service_name: crate::state::vpc_endpoint_service_name(&region, &cluster.identifier),
-            cluster_vpc_endpoint: cluster.endpoint.clone(),
+            // The VPC connection endpoint of a cluster is the host that cluster is
+            // reached at, which here is where THIS emulator answers
+            // (`crate::state::cluster_endpoint`) — the same address `GetCluster`
+            // reports for the same cluster.
+            cluster_vpc_endpoint: Some(crate::state::cluster_endpoint(ctx)),
         })
     }
 }

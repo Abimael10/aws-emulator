@@ -79,6 +79,19 @@ impl Dsql {
         }
     }
 
+    /// One emulator, signed for `region`, whose OWN endpoint is `base`: the base URL
+    /// `OperationContext::endpoint` reports, which is what the data port publishes when
+    /// the emulator is served on one — and therefore the address every value a handler
+    /// announces for a client to dial has to name.
+    pub fn served_at(region: &str, base: &str) -> Self {
+        let mut emulator = Self::in_region(region);
+        emulator.router.set_url_base(
+            smithy_server_runtime::EndpointUrl::parse(base)
+                .unwrap_or_else(|| panic!("{base:?} is a usable endpoint base")),
+        );
+        emulator
+    }
+
     /// An emulator holding Aurora DSQL beside the services a stream's
     /// `targetDefinition` NAMES: Amazon Kinesis, which owns the data stream the
     /// target addresses, and IAM, which holds the role it asks this service to

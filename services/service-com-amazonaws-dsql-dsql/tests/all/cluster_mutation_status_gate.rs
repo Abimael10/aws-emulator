@@ -124,7 +124,6 @@ fn stored_cluster(identifier: &str, status: &str) -> Cluster {
         kms_encryption_key: None,
         encryption_details: None,
         multi_region_properties: None,
-        endpoint: None,
         tags: Default::default(),
         policy: Some(ClusterPolicy {
             document: allow("dsql:DbConnect"),

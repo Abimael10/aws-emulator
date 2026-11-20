@@ -95,13 +95,6 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The connection endpoint `CreateCluster` derives for a cluster it mints in
-/// `region` (`{identifier}.dsql.{region}.on.aws`, which `Endpoint`'s
-/// `^[a-zA-Z0-9.-]+$` admits).
-fn expected_endpoint(region: &str, identifier: &str) -> String {
-    format!("{identifier}.dsql.{region}.on.aws")
-}
-
 /// The `kmsKeyArn` an answer's `encryptionDetails` reports, if it reports one.
 fn key_arn(answer: &crate::harness::Answer) -> Option<String> {
     answer
@@ -112,8 +105,9 @@ fn key_arn(answer: &crate::harness::Answer) -> Option<String> {
 }
 
 /// Assert every Region-derived member of a create's answer names `region`: the
-/// ARN, the connection endpoint and the key ARN a bare `kmsEncryptionKey`
-/// expanded into.
+/// ARN and the key ARN a bare `kmsEncryptionKey` expanded into. The connection
+/// endpoint is NOT one of them — it names where this emulator answers, which
+/// `crate::cluster_lifecycle` pins over every address it can be served at.
 fn assert_minted_in(case: &str, answer: &crate::harness::Answer, region: &str) {
     let identifier = answer.str("identifier");
     assert_eq!(
@@ -121,12 +115,6 @@ fn assert_minted_in(case: &str, answer: &crate::harness::Answer, region: &str) {
         expected_arn(region, &identifier),
         "case {case:?}: the cluster must carry {region}'s ARN, got {:?}",
         answer.str("arn")
-    );
-    assert_eq!(
-        answer.str("endpoint"),
-        expected_endpoint(region, &identifier),
-        "case {case:?}: the connection endpoint must name {region}, got {:?}",
-        answer.str("endpoint")
     );
     assert!(
         key_arn(answer).is_none_or(|key| key.contains(&format!(":kms:{region}:"))),

@@ -86,6 +86,11 @@ use crate::ops::types::{
 /// that owns keys, before it records an encryption configuration.
 pub mod kms_key;
 
+/// WHERE a cluster's connection endpoint is announced — the address this emulator is
+/// served at, which is the only address a client handed the member can reach.
+pub mod cluster_addressing;
+pub use cluster_addressing::*;
+
 /// The `ClusterStatus` values this service drives a cluster through, spelled as
 /// the enum spells them on the wire (`smithy_query(query="shape",
 /// shape="ClusterStatus")`: CREATING | ACTIVE | IDLE | INACTIVE | UPDATING |
@@ -340,6 +345,11 @@ impl Stream {
 }
 
 /// One persisted Aurora DSQL cluster.
+///
+/// Its connection endpoint is NOT among these members: that value is the address THIS
+/// emulator answers on ([`cluster_endpoint`]), so it is derived on every report rather
+/// than stored — a host recorded when the cluster was minted would name wherever this
+/// process was reachable then, which is not where a later caller has to connect.
 #[derive(Debug, Clone)]
 pub struct Cluster {
     /// The 26-character lowercase identifier (`ClusterId`).
@@ -362,8 +372,6 @@ pub struct Cluster {
     pub encryption_details: Option<EncryptionDetails>,
     /// Multi-Region configuration, if the cluster has any.
     pub multi_region_properties: Option<MultiRegionProperties>,
-    /// The connection endpoint, as [`cluster_endpoint`] builds it.
-    pub endpoint: Option<String>,
     /// The cluster's tags. Sorted so a read is deterministic.
     pub tags: BTreeMap<String, String>,
     /// The resource-based policy currently attached, if any.
@@ -1627,13 +1635,6 @@ pub fn stream_arn(region: &str, cluster_identifier: &str, stream_identifier: &st
             "{RESOURCE_TYPE_CLUSTER}/{cluster_identifier}/{RESOURCE_TYPE_STREAM}/{stream_identifier}"
         ),
     )
-}
-
-/// The connection endpoint of a cluster, in Aurora DSQL's own form
-/// (`{identifier}.dsql.{region}.on.aws`), which satisfies `Endpoint`'s
-/// `^[a-zA-Z0-9.-]+$`.
-pub fn cluster_endpoint(region: &str, identifier: &str) -> String {
-    format!("{identifier}.dsql.{region}.on.aws")
 }
 
 /// The region segment of an ARN this service minted
