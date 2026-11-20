@@ -33,3 +33,27 @@ Actual: AssertionError: [phase 2/4 solve] endpoint_url was given https://awslamb
 1. Deploy a Lambda function (e.g. through a CloudFormation stack with Code.ZipFile).
 2. Call GetFunction on it.
 3. Read Code.Location and attempt to GET it; observe the host is an amazonaws.com S3 host the emulator does not serve.
+
+## Resolution
+Cause 1 is FIXED. By the time this report was picked up the code base had drifted past the commit it
+was filed against: a download location is no longer formatted onto an upstream S3 hostname but
+PRESIGNED against the base URL this emulator is reached on, with the object's own path-style address
+(`/<per-region bucket>/snapshots/<account>/<key>`) carried in the path
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/download_location.rs`), and that
+same path is read back by the crate's own download plane
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/service.rs`), which serves the stored
+deployment-package bytes under `content-type: application/zip`. The recorded unit this report was
+derived from replays green.
+
+What was missing was coverage of the route this report reproduces through: a function deployed by a
+CloudFormation stack, whose `Code.ZipFile` is the template's SOURCE TEXT rather than an archive, so
+the deployment archives it itself. The new suite
+`services/service-com-amazonaws-cloudformation-cloudformation/tests/all/stack_function_package_download.rs`
+deploys such a stack against an emulator reached at a loopback address with a port, reads the
+function back through `GetFunction`, and follows the announced `Code.Location` unsigned: the address
+has to be on that endpoint, the bytes served have to digest and measure to the `CodeSha256` and
+`CodeSize` the same read reports, and the package has to carry the declared source under the module
+file the declared `Handler` resolves. Its rows span the runtime families whose inline form
+CloudFormation publishes (Python, Node.js, Ruby), a handler naming a module other than `index`, and
+a package the client staged in Amazon S3 itself — which the download has to serve back byte for
+byte.

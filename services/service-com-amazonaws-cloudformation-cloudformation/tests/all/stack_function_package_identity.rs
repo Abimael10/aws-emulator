@@ -168,7 +168,11 @@ const ROWS: &[Row] = &[
 
 /// The base64-encoded SHA-256 of `bytes` — the independent computation of what `CodeSha256`
 /// must report, so no case reads the value it is checking out of the answer.
-fn expected_digest(bytes: &[u8]) -> String {
+///
+/// `pub(crate)` because the suite that DOWNLOADS a stack-deployed package
+/// (`stack_function_package_download.rs`) holds the bytes it fetched to the same reported
+/// digest, and one computation of it serves both.
+pub(crate) fn expected_digest(bytes: &[u8]) -> String {
     aws_smithy_types::base64::encode(sha2::Sha256::digest(bytes))
 }
 
