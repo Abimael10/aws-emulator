@@ -1399,3 +1399,203 @@ async fn a_delete_removes_the_subscription_and_a_second_one_is_refused() {
         listed_names(&listed.body)
     );
 }
+
+/// One row of the unrecognised-value table: a `Severity`, or an entry of an
+/// `EventCategories` list, that no published catalog of this service holds,
+/// with the fault and the sentence the refusal must carry.
+struct UnrecognizedValueCase {
+    case: &'static str,
+    /// The `EventCategories` the request names, empty when it names none.
+    categories: Vec<&'static str>,
+    /// The `Severity` the request names, or `None` when it names none.
+    severity: Option<&'static str>,
+    /// The `<Code>` of the fault the value's class is refused with.
+    code: &'static str,
+    /// The whole `<Message>` the refusal carries, written out rather than
+    /// composed from the same helper the handler uses, so the test pins the
+    /// sentence and not the emulator's own idea of it.
+    message: &'static str,
+}
+
+/// Every unrecognised value the create and the modify path are both driven
+/// over: one per catalog and per form a value can take it outside the catalog —
+/// a wholly different word, a prefix of a published value, two published values
+/// run into one, and an unpublished entry beside a published one in the same
+/// list.
+///
+/// The catalogs themselves are `state::EVENT_SEVERITIES` ("Values: ERROR,
+/// INFO", `smithy_query(query="doc", shape="CreateEventSubscriptionMessage",
+/// member="Severity")`) and `state::EVENT_CATEGORIES` ("Values: configuration,
+/// management, monitoring, security, pending", the same query for
+/// `member="EventCategories"`); every value below is outside them, and none of
+/// them is the value the recorded request carried alone.
+fn unrecognized_value_rows() -> Vec<UnrecognizedValueCase> {
+    vec![
+        UnrecognizedValueCase {
+            case: "a severity naming a level this service does not publish",
+            categories: Vec::new(),
+            severity: Some("WARNING"),
+            code: "SubscriptionSeverityNotFound",
+            message: "Severity 'WARNING' was not recognized.",
+        },
+        UnrecognizedValueCase {
+            case: "a severity that is a prefix of a published one",
+            categories: Vec::new(),
+            severity: Some("ERR"),
+            code: "SubscriptionSeverityNotFound",
+            message: "Severity 'ERR' was not recognized.",
+        },
+        UnrecognizedValueCase {
+            case: "both published severities run into one value",
+            categories: Vec::new(),
+            severity: Some("ERROR INFO"),
+            code: "SubscriptionSeverityNotFound",
+            message: "Severity 'ERROR INFO' was not recognized.",
+        },
+        UnrecognizedValueCase {
+            case: "an unpublished severity beside published categories",
+            categories: vec!["monitoring", "security"],
+            severity: Some("CRITICAL"),
+            code: "SubscriptionSeverityNotFound",
+            message: "Severity 'CRITICAL' was not recognized.",
+        },
+        UnrecognizedValueCase {
+            case: "an event category this service does not publish",
+            categories: vec!["backup"],
+            severity: None,
+            code: "SubscriptionCategoryNotFound",
+            message: "Category 'backup' was not recognized.",
+        },
+        UnrecognizedValueCase {
+            case: "an event category that is a prefix of a published one",
+            categories: vec!["securit"],
+            severity: None,
+            code: "SubscriptionCategoryNotFound",
+            message: "Category 'securit' was not recognized.",
+        },
+        UnrecognizedValueCase {
+            case: "two published categories run into one entry",
+            categories: vec!["configuration,management"],
+            severity: None,
+            code: "SubscriptionCategoryNotFound",
+            message: "Category 'configuration,management' was not recognized.",
+        },
+        UnrecognizedValueCase {
+            case: "an unpublished category after a published one",
+            categories: vec!["pending", "no-such-category"],
+            severity: Some("INFO"),
+            code: "SubscriptionCategoryNotFound",
+            message: "Category 'no-such-category' was not recognized.",
+        },
+        UnrecognizedValueCase {
+            case: "the first of two unpublished categories",
+            categories: vec!["not-a-category", "also-not-a-category"],
+            severity: None,
+            code: "SubscriptionCategoryNotFound",
+            message: "Category 'not-a-category' was not recognized.",
+        },
+    ]
+}
+
+/// Assert one unrecognised-value refusal: the 404 class, the `<Code>` of the
+/// catalog's own fault, and the whole sentence — the catalog's singular noun,
+/// the offending value copied from the request, and nothing else.
+fn assert_unrecognized_value(case: &str, answer: &Answer, code: &str, message: &str) {
+    assert_refused(case, answer, 404, code);
+    assert_eq!(
+        answer.text("Message").as_deref(),
+        Some(message),
+        "case {case}: expected the message {message:?}, got {:?} with body {}",
+        answer.text("Message"),
+        answer.body
+    );
+}
+
+/// A `Severity` or an `EventCategories` entry outside the published catalogs is
+/// refused with the catalog's own 404 fault and the per-value sentence naming
+/// the catalog's singular noun and the offending value — `Severity 'X' was not
+/// recognized.`, `Category 'Y' was not recognized.` — and nothing is stored.
+///
+/// The sentence enumerates no catalog and never names the `EventCategories`
+/// member an entry arrived on, so a client can tell these two faults apart from
+/// the other not-found faults a subscription write shares.
+#[tokio::test]
+async fn an_unrecognized_severity_or_category_carries_the_per_value_sentence() {
+    let emulator = Emulator::new();
+
+    for (position, row) in unrecognized_value_rows().iter().enumerate() {
+        let name = format!("sub-unrecognized-{position}");
+        let configured = CreateCase {
+            categories: row.categories.clone(),
+            severity: row.severity,
+            ..CreateCase::new("an unrecognised value", &name)
+        };
+        let answer = create_subscription(&emulator, &configured).await;
+        assert_unrecognized_value(row.case, &answer, row.code, row.message);
+
+        let read = describe_one(&emulator, &name).await;
+        assert_subscription_not_found(row.case, &read, &name);
+    }
+
+    // The refusal is about the CATALOG, not the spelling: a published value is
+    // served whatever case it is written in, so no row above was refused for
+    // being spelled unusually.
+    for (position, (severity, category)) in [("info", "MONITORING"), ("Error", "Security")]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("sub-spelled-{position}");
+        let configured = CreateCase {
+            categories: vec![category],
+            severity: Some(severity),
+            ..CreateCase::new("a published value spelled in another case", &name)
+        };
+        let answer = create_subscription(&emulator, &configured).await;
+        assert_eq!(
+            answer.status, 200,
+            "case the published pair {severity}/{category}: expected 200, got {} with body {}",
+            answer.status, answer.body
+        );
+    }
+}
+
+/// The modify path refuses the same unrecognised values with the same fault and
+/// the same sentence — one rule reached from two operations — and leaves the
+/// stored subscription exactly as it was.
+#[tokio::test]
+async fn the_modify_path_refuses_an_unrecognized_value_with_the_same_sentence() {
+    let emulator = Emulator::new();
+
+    let created = CreateCase {
+        categories: vec!["management"],
+        severity: Some("ERROR"),
+        ..CreateCase::new(
+            "the subscription a refused modify leaves alone",
+            "sub-unrecognized-modify",
+        )
+    };
+    assert_eq!(
+        create_subscription(&emulator, &created).await.status,
+        200,
+        "case the starting subscription: the create must be served"
+    );
+
+    for row in unrecognized_value_rows() {
+        let mut params: Vec<(String, String)> =
+            vec![("SubscriptionName".to_string(), created.name.clone())];
+        for (position, category) in row.categories.iter().enumerate() {
+            params.push((
+                format!("EventCategories.EventCategory.{}", position + 1),
+                (*category).to_string(),
+            ));
+        }
+        if let Some(severity) = row.severity {
+            params.push(("Severity".to_string(), severity.to_string()));
+        }
+        let answer = call_with(&emulator, "ModifyEventSubscription", &params).await;
+        assert_unrecognized_value(row.case, &answer, row.code, row.message);
+
+        let read = describe_one(&emulator, &created.name).await;
+        assert_describes(row.case, "the read after the refusal", &read.body, &created);
+    }
+}

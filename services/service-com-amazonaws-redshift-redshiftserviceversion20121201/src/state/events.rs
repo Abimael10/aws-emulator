@@ -642,6 +642,31 @@ pub fn unpublished_value_message(member: &str, value: &str, published: &[&str]) 
     )
 }
 
+/// How Amazon Redshift names one event SEVERITY in the sentence refusing an
+/// unrecognised one: the singular noun, not the input member `Severity` list
+/// name.
+pub const SUBSCRIPTION_SEVERITY_NOUN: &str = "Severity";
+
+/// How Amazon Redshift names one event CATEGORY in the sentence refusing an
+/// unrecognised one: the singular noun, which is NOT the `EventCategories`
+/// input member the value arrived on.
+pub const SUBSCRIPTION_CATEGORY_NOUN: &str = "Category";
+
+/// Why one catalog value a subscription asked to publish is not recognised,
+/// naming the catalog's singular noun and the single offending value.
+///
+/// Amazon Redshift answers a `Severity` or an `EventCategories` entry outside
+/// its published catalogs with a per-value sentence — `Severity 'X' was not
+/// recognized.`, `Category 'Y' was not recognized.` — rather than enumerating
+/// the catalog, so a client can tell these two 404 faults apart from the other
+/// not-found faults the subscription writes share. `noun` is the catalog's
+/// singular noun ([`SUBSCRIPTION_SEVERITY_NOUN`],
+/// [`SUBSCRIPTION_CATEGORY_NOUN`]) and `value` is the offending value copied
+/// from the request.
+pub fn unrecognized_catalog_value_message(noun: &str, value: &str) -> String {
+    format!("{noun} '{value}' was not recognized.")
+}
+
 /// What an event notification subscription publishes, resolved from one create
 /// or modify request: the sources it is scoped to, the event categories and the
 /// severity.

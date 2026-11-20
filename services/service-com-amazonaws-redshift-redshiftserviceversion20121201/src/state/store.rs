@@ -1063,10 +1063,9 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                         Some(category) => published.push(category.to_string()),
                         None => {
                             return Err(SubscriptionRefusal::CategoryNotFound(
-                                unpublished_value_message(
-                                    "EventCategories",
+                                unrecognized_catalog_value_message(
+                                    SUBSCRIPTION_CATEGORY_NOUN,
                                     value,
-                                    &EVENT_CATEGORIES,
                                 ),
                             ))
                         }
@@ -1081,7 +1080,7 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                 Some(published) => Some(published.to_string()),
                 None => {
                     return Err(SubscriptionRefusal::SeverityNotFound(
-                        unpublished_value_message("Severity", requested, &EVENT_SEVERITIES),
+                        unrecognized_catalog_value_message(SUBSCRIPTION_SEVERITY_NOUN, requested),
                     ))
                 }
             },
