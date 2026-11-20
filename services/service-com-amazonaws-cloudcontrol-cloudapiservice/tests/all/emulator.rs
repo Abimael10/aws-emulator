@@ -104,6 +104,14 @@ pub(crate) const SSM_TARGET_PREFIX: &str = "AmazonSSM";
 /// Smithy service shape.
 pub(crate) const SFN_TARGET_PREFIX: &str = "AWSStepFunctions";
 
+/// The sigv4 signing name of the AWS Secrets Manager service, whose own store holds the
+/// secrets `AWS::SecretsManager::Secret` names.
+pub(crate) const SECRETSMANAGER_SIGNING_NAME: &str = "secretsmanager";
+
+/// The `X-Amz-Target` prefix a client writes for that service: the local name of its Smithy
+/// service shape.
+pub(crate) const SECRETSMANAGER_TARGET_PREFIX: &str = "secretsmanager";
+
 /// How long a wait for a resource operation request to complete runs before the case
 /// fails.
 ///
@@ -407,6 +415,55 @@ impl Emulator {
     /// One operation of the Systems Manager service, required to succeed.
     pub(crate) async fn ssm_ok(&self, operation: &str, body: Value) -> Value {
         let (status, decoded) = self.ssm(operation, body).await;
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with body {decoded:?}"
+        );
+        decoded
+    }
+
+    /// One emulator with the service that OWNS `AWS::SecretsManager::Secret` mounted beside
+    /// this one.
+    pub(crate) fn with_secretsmanager() -> Self {
+        Self::mounted(|router, engine| {
+            router.register_service(
+                service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService::new(engine),
+            );
+        })
+    }
+
+    /// One emulator with the services that own `AWS::SecretsManager::Secret` and
+    /// `AWS::CloudFormation::Stack` mounted beside this one — what a case about a secret a
+    /// CLOUDFORMATION STACK provisioned needs, since the stack's own deployment is what
+    /// creates the secret in Secrets Manager.
+    pub(crate) fn with_secretsmanager_and_cloudformation() -> Self {
+        Self::mounted(|router, engine| {
+            router.register_service(
+                service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService::new(
+                    ::std::sync::Arc::clone(&engine),
+                ),
+            );
+            router.register_service(
+                service_com_amazonaws_cloudformation_cloudformation::EmulatedService::new(engine),
+            );
+        })
+    }
+
+    /// One operation of the AWS Secrets Manager service — the OWNING service's own API, the
+    /// one a client uses when it is not going through Cloud Control API.
+    pub(crate) async fn secretsmanager(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.post(
+            SECRETSMANAGER_SIGNING_NAME,
+            "application/x-amz-json-1.1",
+            &format!("{SECRETSMANAGER_TARGET_PREFIX}.{operation}"),
+            body,
+        )
+        .await
+    }
+
+    /// One operation of the AWS Secrets Manager service, required to succeed.
+    pub(crate) async fn secretsmanager_ok(&self, operation: &str, body: Value) -> Value {
+        let (status, decoded) = self.secretsmanager(operation, body).await;
         assert_eq!(
             status, 200,
             "{operation}: expected HTTP 200, got {status} with body {decoded:?}"

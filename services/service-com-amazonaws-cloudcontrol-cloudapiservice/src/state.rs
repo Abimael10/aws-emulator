@@ -2023,6 +2023,7 @@ const CREATE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
     ("AWS::Kinesis::Stream", &["Name"]),
     ("AWS::Logs::LogGroup", &["LogGroupName"]),
     ("AWS::S3::Bucket", &["BucketName", "ObjectLockEnabled"]),
+    ("AWS::SecretsManager::Secret", &["Name"]),
     ("AWS::SNS::Topic", &["TopicName", "FifoTopic"]),
     ("AWS::SQS::Queue", &["QueueName", "FifoQueue"]),
     ("AWS::SSM::Parameter", &["Name"]),
@@ -2084,6 +2085,7 @@ const READ_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
     ("AWS::IAM::ManagedPolicy", &["PolicyArn", "PolicyId", "AttachmentCount", "CreateDate", "DefaultVersionId", "IsAttachable", "PermissionsBoundaryUsageCount", "UpdateDate"]),
     ("AWS::Logs::LogGroup", &["Arn"]),
     ("AWS::S3::Bucket", &["Arn", "DomainName", "DualStackDomainName", "RegionalDomainName", "WebsiteURL"]),
+    ("AWS::SecretsManager::Secret", &["Id"]),
     ("AWS::SNS::Topic", &["TopicArn"]),
     ("AWS::SQS::Queue", &["Arn", "QueueUrl"]),
     ("AWS::StepFunctions::StateMachine", &["Arn", "Name", "StateMachineRevisionId"]),
@@ -2179,6 +2181,15 @@ const WRITE_ONLY_PROPERTIES: &[(&str, &[&str])] = &[
     (
         "AWS::SSM::Parameter",
         &["AllowedPattern", "Description", "Policies", "Tier"],
+    ),
+    // `AWS::SecretsManager::Secret`: the two forms a declaration STATES the secret's value in
+    // — the value itself and the generation parameters the owning service draws one from —
+    // neither of which `secretsmanager:DescribeSecret`, the call the type's read handler reads
+    // a secret with, reports: a secret's value is answered only by that service's own
+    // `GetSecretValue`.
+    (
+        "AWS::SecretsManager::Secret",
+        &["SecretString", "GenerateSecretString"],
     ),
     // `AWS::StepFunctions::StateMachine`: the three forms a request STATES the Amazon States
     // Language definition in beside `DefinitionString` — the definition as the JSON object a

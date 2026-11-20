@@ -158,6 +158,49 @@ pub const DECLARED_PROPERTIES: &[DeclaredProperties] = &[
         resource_type: "AWS::Logs::LogStream",
         declared: &["LogGroupName", "LogStreamName"],
     },
+    // `AWS::SecretsManager::Secret`: the secret's own configuration — the two alternative
+    // forms its value is stated in (`SecretString`, `GenerateSecretString`), the `Name`
+    // CloudFormation may generate, the `Description` and `KmsKeyId` `CreateSecret` takes under
+    // the same names, the `ReplicaRegions` the secret is replicated to, the `Tags` the type
+    // publishes as a list, and the read-only `Id` — the ARN Secrets Manager assigns, which a
+    // declaration may carry and a deployment ignores. Every one but `Id` is a property this
+    // emulator's own provider applies
+    // (`crate::state::provisioning::secretsmanager_secret`).
+    DeclaredProperties {
+        resource_type: crate::state::template::SECRETSMANAGER_SECRET,
+        declared: &[
+            "Description",
+            "GenerateSecretString",
+            "Id",
+            "KmsKeyId",
+            "Name",
+            "ReplicaRegions",
+            "SecretString",
+            "Tags",
+        ],
+    },
+    // `AWS::SecretsManager::ResourcePolicy`: the resource-based policy document, the secret it
+    // is attached to, the switch that refuses a policy granting broad access, and the
+    // read-only `Id`.
+    DeclaredProperties {
+        resource_type: "AWS::SecretsManager::ResourcePolicy",
+        declared: &["BlockPublicPolicy", "Id", "ResourcePolicy", "SecretId"],
+    },
+    // `AWS::SecretsManager::RotationSchedule`: the secret rotation is configured for, the
+    // function that rotates it (either named outright or the hosted one this type asks Secrets
+    // Manager to make), the schedule, whether the first rotation happens on update, and the
+    // read-only `Id`.
+    DeclaredProperties {
+        resource_type: "AWS::SecretsManager::RotationSchedule",
+        declared: &[
+            "HostedRotationLambda",
+            "Id",
+            "RotateImmediatelyOnUpdate",
+            "RotationLambdaARN",
+            "RotationRules",
+            "SecretId",
+        ],
+    },
     // `AWS::MediaConvert::CertificateAssociation` publishes ONE property: the `Arn` of the ACM
     // certificate the account's MediaConvert service is to trust, which is the whole of the
     // resource.

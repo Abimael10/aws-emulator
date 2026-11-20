@@ -41,6 +41,7 @@ mod log_streams;
 mod managed_policies;
 mod parameters;
 mod queues;
+mod secrets;
 mod state_machines;
 mod tables;
 mod topics;
@@ -223,6 +224,9 @@ impl NativeResources {
         if let Some(provider) = tables::TableProvider::for_engine(engine) {
             providers.push(Box::new(provider));
         }
+        if let Some(provider) = secrets::SecretProvider::for_engine(engine) {
+            providers.push(Box::new(provider));
+        }
         Self { providers }
     }
 
@@ -297,6 +301,14 @@ pub type DynamodbState =
 /// `ssm:PutParameter` wrote is the parameter Cloud Control API resolves, and one
 /// `ssm:DeleteParameter` removed is one it reports as not found.
 pub type SsmState = ::service_com_amazonaws_ssm_amazonssm::ComAmazonawsSsmAmazonssmState;
+
+/// The AWS Secrets Manager store the resources of the `AWS::SecretsManager::Secret` type live
+/// in — that service's OWN state struct, reached through the shared engine, so a secret
+/// `secretsmanager:CreateSecret` created (or a CloudFormation stack declared) is the secret
+/// Cloud Control API resolves, and one `secretsmanager:DeleteSecret` removed is one it reports
+/// as not found.
+pub type SecretsManagerState =
+    ::service_com_amazonaws_secretsmanager_secretsmanager::state::ComAmazonawsSecretsmanagerSecretsmanagerState;
 
 /// The window `(after, limit)` names of an owning store keyed by its resources' own
 /// identifiers: the entries whose key sorts AFTER `after`, in key order, at most `limit`
@@ -539,6 +551,10 @@ mod tests {
         assert!(
             native.provider("AWS::DynamoDB::Table").is_some(),
             "expected the table provider, got {native:?}"
+        );
+        assert!(
+            native.provider("AWS::SecretsManager::Secret").is_some(),
+            "expected the secret provider, got {native:?}"
         );
         for unbacked in ["AWS::Kinesis::Stream", "AWS::DynamoDB::GlobalTable", "AWS::Logs"] {
             assert!(

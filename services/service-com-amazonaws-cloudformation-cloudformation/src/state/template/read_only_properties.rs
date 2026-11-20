@@ -66,7 +66,28 @@ pub const READ_ONLY_PROPERTIES: &[ReadOnlyProperties] = &[
             crate::state::provisioner::lake_formation_permissions::RESOURCE_IDENTIFIER_PROPERTY,
         ],
     },
+    // `AWS::SecretsManager::Secret`, `AWS::SecretsManager::ResourcePolicy` and
+    // `AWS::SecretsManager::RotationSchedule` each publish ONE read-only property, `Id`: the
+    // ARN Secrets Manager assigns the secret, which the type's own "Return values" section
+    // publishes as its `Fn::GetAtt` attribute and no member of `CreateSecret`,
+    // `PutResourcePolicy` or `RotateSecret` accepts. A secret's ARN ends in six characters
+    // that service draws per secret, so nothing but that service could state it.
+    ReadOnlyProperties {
+        resource_type: super::SECRETSMANAGER_SECRET,
+        read_only: &[SECRETSMANAGER_ID],
+    },
+    ReadOnlyProperties {
+        resource_type: "AWS::SecretsManager::ResourcePolicy",
+        read_only: &[SECRETSMANAGER_ID],
+    },
+    ReadOnlyProperties {
+        resource_type: "AWS::SecretsManager::RotationSchedule",
+        read_only: &[SECRETSMANAGER_ID],
+    },
 ];
+
+/// The one read-only property the `AWS::SecretsManager::*` types above publish.
+const SECRETSMANAGER_ID: &str = "Id";
 
 /// The properties of `resource_type` its schema marks read-only ([`READ_ONLY_PROPERTIES`]),
 /// and the empty set for a type with no row.

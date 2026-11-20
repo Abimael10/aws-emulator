@@ -36,6 +36,10 @@ service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 # And for `AWS::SSM::Parameter`: a parameter lives in the Systems Manager service's store,
 # whichever API created it, so this crate reads and writes it THERE.
 service-com-amazonaws-ssm-amazonssm = { workspace = true }
+# And for `AWS::SecretsManager::Secret`: a secret lives in the AWS Secrets Manager service's
+# store, whichever API created it, so this crate reads and writes it THERE — including the
+# ARN its primary identifier is, which comes from that service's own ARN builder.
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 # And for `AWS::CloudWatch::Alarm`: a metric alarm lives in the Amazon CloudWatch service's
 # store, so an alarm provisioned through this service is one that service's own
 # `DescribeAlarms` reports and its own evaluation then grades.
@@ -90,6 +94,9 @@ uuid = { version = "1", features = ["v4"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`, which declares every
+# `tests/all/<name>.rs` as a suite, so adding one is adding a file.
+automod = { workspace = true }
 # The service that OWNS `AWS::CloudFormation::Stack`: a suite about that type mounts it
 # beside this one on the same engine, exactly as the assembled router does, and drives the
 # stack through its own API — `DescribeStackResource` and `SignalResource` — while the
