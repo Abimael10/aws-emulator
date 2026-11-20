@@ -162,18 +162,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Feedback forwarding can only be disabled when Amazon Simple
         // Notification Service (Amazon SNS) topics are specified for both
-        // bounces and complaints" (this operation's own documentation), so
-        // turning it off without both topics is refused and the flag stays as it
-        // was: with no topic for either class, nothing would carry the feedback.
-        if !input.forwarding_enabled && !record.notifications.publishes_bounces_and_complaints() {
-            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
-                format!(
-                    "ForwardingEnabled can only be set to false when Amazon SNS topics are set \
-                     for both Bounce and Complaint notification types; {named} has no topic \
-                     for both of them"
-                ),
-            ));
-        }
+        // bounces and complaints" (this operation's own documentation) says where
+        // an identity's feedback GOES once forwarding is off — Amazon SNS is the
+        // only other channel a bounce or a complaint travels on — not what the
+        // call admits: the operation models NO error, and Amazon SES takes the
+        // flag for an identity with no topic bound and reports it back. So the
+        // requested value is written as sent, whatever the identity publishes to,
+        // and a repeated call with the same value leaves the record as it was.
         record.notifications.forwarding_enabled = input.forwarding_enabled;
 
         // `SetIdentityFeedbackForwardingEnabledResponse` has no members: what the

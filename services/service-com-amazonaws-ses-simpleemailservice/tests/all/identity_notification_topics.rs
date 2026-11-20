@@ -20,8 +20,8 @@
 //!   this Region is refused with HTTP 400 `InvalidParameterValue` and the stored
 //!   topic is left as it was;
 //! * headers in notifications are set per type, whether or not that type carries
-//!   a topic yet; feedback forwarding is turned off only with a bounce AND a
-//!   complaint topic;
+//!   a topic yet, and feedback forwarding takes the value the request carries
+//!   whether or not the identity publishes anywhere;
 //! * an identity this account has not verified is refused and nothing is stored;
 //! * only identities in the list are reported, and a call may ask about at most
 //!   100 of them;
@@ -671,100 +671,189 @@ async fn headers_in_notifications_are_set_per_type_whether_or_not_a_topic_is_set
 }
 
 #[tokio::test]
-async fn feedback_forwarding_is_disabled_only_with_a_bounce_and_a_complaint_topic() {
-    // "Feedback forwarding can only be disabled when Amazon Simple Notification
-    // Service (Amazon SNS) topics are specified for both bounces and complaints"
-    // (the operation's own documentation).
+async fn feedback_forwarding_takes_the_requested_value_whatever_the_identity_publishes_to() {
+    // `SetIdentityFeedbackForwardingEnabled` models NO error. "Feedback
+    // forwarding can only be disabled when Amazon Simple Notification Service
+    // (Amazon SNS) topics are specified for both bounces and complaints" (the
+    // operation's own documentation) says where an identity's feedback GOES once
+    // forwarding is off, not what the call admits — so the flag follows the
+    // request whether or not the identity publishes anywhere, which is the only
+    // way a caller ever turns it off: every identity starts with forwarding on
+    // and no topic at all. The rows differ in what the identity publishes to,
+    // which header flags it carries, how the request names it, and the sequence
+    // of values written.
     struct Case {
         label: &'static str,
-        /// Which notification types carry a topic before forwarding is set off.
+        /// The identity as it is verified.
+        name: &'static str,
+        /// A domain identity rather than an email address.
+        domain: bool,
+        /// Whether the request names the identity by the ARN form the `Identity`
+        /// member documents rather than by its name.
+        by_arn: bool,
+        /// The notification types carrying a topic before forwarding is written.
         topics: &'static [&'static str],
-        /// Whether turning forwarding off is accepted.
-        accepted: bool,
+        /// The notification types whose header flag is turned on before it.
+        headers: &'static [&'static str],
+        /// The values written, in order, each read back before the next.
+        written: &'static [bool],
     }
     let cases = [
         Case {
-            label: "no topic at all",
+            label: "an address publishing nowhere, turned off and on again",
+            name: "quiet@example.com",
+            domain: false,
+            by_arn: false,
             topics: &[],
-            accepted: false,
+            headers: &[],
+            written: &[false, true, false],
         },
         Case {
-            label: "a bounce topic only",
+            label: "an address publishing bounces only",
+            name: "bounces@example.com",
+            domain: false,
+            by_arn: false,
             topics: &["Bounce"],
-            accepted: false,
+            headers: &[],
+            written: &[false],
         },
         Case {
-            label: "a complaint topic only",
+            label: "an address publishing complaints only, written off twice",
+            name: "complaints@example.com",
+            domain: false,
+            by_arn: false,
             topics: &["Complaint"],
-            accepted: false,
+            headers: &[],
+            written: &[false, false],
         },
         Case {
-            label: "a delivery topic only",
+            label: "an address publishing deliveries only, named by its ARN",
+            name: "deliveries@example.com",
+            domain: false,
+            by_arn: true,
             topics: &["Delivery"],
-            accepted: false,
+            headers: &[],
+            written: &[false, true],
         },
         Case {
-            label: "a bounce and a complaint topic",
+            label: "an address publishing bounces and complaints",
+            name: "feedback@example.com",
+            domain: false,
+            by_arn: false,
             topics: &["Bounce", "Complaint"],
-            accepted: true,
+            headers: &[],
+            written: &[false, true, false],
         },
         Case {
-            label: "a topic for every type",
+            label: "an address publishing every class, with every header flag on",
+            name: "loud@example.com",
+            domain: false,
+            by_arn: false,
             topics: &["Bounce", "Complaint", "Delivery"],
-            accepted: true,
+            headers: &["Bounce", "Complaint", "Delivery"],
+            written: &[false],
+        },
+        Case {
+            label: "a domain publishing nowhere, with its bounce headers on",
+            name: "forwarding.example.com",
+            domain: true,
+            by_arn: false,
+            topics: &[],
+            headers: &["Bounce"],
+            written: &[false, true],
+        },
+        Case {
+            label: "a subdomain publishing nowhere, named by its ARN",
+            name: "mail.forwarding.example.net",
+            domain: true,
+            by_arn: true,
+            topics: &[],
+            headers: &[],
+            written: &[false],
         },
     ];
 
     for case in cases {
         let router = emulator();
-        let identity = "forwarding@example.com";
-        verify_email(&router, identity).await;
+        if case.domain {
+            verify_domain(&router, case.name).await;
+        } else {
+            verify_email(&router, case.name).await;
+        }
         for kind in case.topics {
             let topic = topic_arn(&format!("ses-forwarding-{}", kind.to_lowercase()));
-            set_topic_ok(&router, identity, kind, Some(&topic)).await;
+            set_topic_ok(&router, case.name, kind, Some(&topic)).await;
+        }
+        for kind in case.headers {
+            let (status, body) = set_headers_enabled(&router, case.name, kind, true).await;
+            assert_eq!(
+                status, 200,
+                "case {}: SetIdentityHeadersInNotificationsEnabled({kind}) must be accepted, \
+                 got {status} with {body}",
+                case.label
+            );
         }
 
-        // Turning forwarding ON is always allowed: it needs no topic.
-        let (status, body) = set_forwarding_enabled(&router, identity, true).await;
+        // What the identity publishes to and which headers travel with it belong
+        // to the other two setters: forwarding is written beside them, and leaves
+        // them exactly as they stand here.
+        let before = attributes_of(&router, case.name)
+            .await
+            .expect("a verified identity is reported");
+        let settled: Vec<(String, String)> = NOTIFICATION_TYPE_VALUES
+            .iter()
+            .map(|kind| {
+                (
+                    reported_topic(&before, kind),
+                    reported_headers_flag(&before, kind),
+                )
+            })
+            .collect();
         assert_eq!(
-            status, 200,
-            "case {}: enabling forwarding must be accepted, got {status} with {body}",
+            member(&before, "ForwardingEnabled"),
+            "true",
+            "case {}: a verified identity forwards its feedback until told not to, got \
+             {before:?}",
             case.label
         );
 
-        let (status, body) = set_forwarding_enabled(&router, identity, false).await;
-        let attributes = attributes_of(&router, identity)
-            .await
-            .expect("a verified identity is reported");
-        let reported = member(&attributes, "ForwardingEnabled");
-        if case.accepted {
+        let named = if case.by_arn {
+            identity_arn(case.name)
+        } else {
+            case.name.to_string()
+        };
+        for enabled in case.written {
+            let (status, body) = set_forwarding_enabled(&router, &named, *enabled).await;
             assert_eq!(
-                (status, reported.as_str()),
-                (200, "false"),
-                "case {}: expected forwarding off, got {status} with {body}",
+                status, 200,
+                "case {}: SetIdentityFeedbackForwardingEnabled({named:?}, {enabled}) must be \
+                 accepted, got {status} with {body}",
                 case.label
             );
-            // And back on again, from the stored state.
-            let (status, body) = set_forwarding_enabled(&router, identity, true).await;
-            let attributes = attributes_of(&router, identity)
+            let attributes = attributes_of(&router, case.name)
                 .await
                 .expect("a verified identity is reported");
+            let reported = member(&attributes, "ForwardingEnabled");
             assert_eq!(
-                (status, member(&attributes, "ForwardingEnabled").as_str()),
-                (200, "true"),
-                "case {}: expected forwarding on again, got {status} with {body}",
+                reported,
+                enabled.to_string(),
+                "case {}: expected ForwardingEnabled {enabled}, got {reported:?} in \
+                 {attributes:?}",
                 case.label
             );
-        } else {
+            let still: Vec<(String, String)> = NOTIFICATION_TYPE_VALUES
+                .iter()
+                .map(|kind| {
+                    (
+                        reported_topic(&attributes, kind),
+                        reported_headers_flag(&attributes, kind),
+                    )
+                })
+                .collect();
             assert_eq!(
-                (status, element(&body, "Code").as_deref()),
-                (400, Some("InvalidParameterValue")),
-                "case {}: expected 400 InvalidParameterValue, got {status} with {body}",
-                case.label
-            );
-            assert_eq!(
-                reported, "true",
-                "case {}: a refused request must leave forwarding on, got {attributes:?}",
+                still, settled,
+                "case {}: writing ForwardingEnabled {enabled} must leave the topics and the \
+                 header flags alone, expected {settled:?}, got {still:?}",
                 case.label
             );
         }

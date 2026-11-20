@@ -507,12 +507,11 @@ impl Default for NotificationSettings {
     /// A freshly recorded identity publishes nowhere and forwards feedback as
     /// email.
     ///
-    /// `ForwardingEnabled` starts TRUE because SES cannot be asked for anything
-    /// else yet: `SetIdentityFeedbackForwardingEnabledRequest$ForwardingEnabled`
-    /// is documented as "This value can only be set to `false` when Amazon SNS
-    /// topics are set for both `Bounce` and `Complaint` notification types", and
-    /// an identity with no topics has neither. The header flags start false —
-    /// the model's own `@default` for each of them.
+    /// `ForwardingEnabled` starts TRUE because Amazon SES forwards an identity's
+    /// bounces and complaints as email until a caller asks it not to: that is
+    /// what `GetIdentityNotificationAttributes` reports for an identity nobody
+    /// has configured. The header flags start false — the model's own `@default`
+    /// for each of them.
     fn default() -> Self {
         Self {
             bounce_topic: None,
@@ -565,16 +564,6 @@ impl NotificationSettings {
             NotificationType::Delivery => &mut self.headers_in_delivery_notifications_enabled,
         };
         *slot = enabled;
-    }
-
-    /// Whether a topic is set for both `Bounce` and `Complaint`, which is the
-    /// condition `SetIdentityFeedbackForwardingEnabled` documents for turning
-    /// feedback forwarding OFF: "This value can only be set to `false` when
-    /// Amazon SNS topics are set for both `Bounce` and `Complaint` notification
-    /// types."
-    pub fn publishes_bounces_and_complaints(&self) -> bool {
-        self.topic(NotificationType::Bounce).is_some()
-            && self.topic(NotificationType::Complaint).is_some()
     }
 }
 
