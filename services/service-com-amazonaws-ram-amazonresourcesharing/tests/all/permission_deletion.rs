@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for `DeletePermission` and what it makes the reads and writes
-//! of a managed permission report afterwards.
+//! End-to-end HTTP tests for `DeletePermission` and `DeletePermissionVersion` and what
+//! they make the reads and writes of a managed permission report afterwards.
 //!
 //! The rule the rows below pin: deleting a customer managed permission is performed
 //! asynchronously and deletes the permission with every version written for it — the
@@ -31,6 +31,19 @@
 //! * WHICH rule a refused delete breaks: a permission Amazon Web Services manages, one
 //!   a live share is associated with, an ARN no permission answers to, a value that is
 //!   not a managed permission ARN, and an empty `clientToken`.
+//!
+//! The second rule, which the version rows at the end of this file pin: ONE version of a
+//! customer managed permission may be deleted only when that version is neither the
+//! permission's default version nor one a live resource share is governed by; such a
+//! delete is performed asynchronously, so that version leaves the attachable statuses
+//! for `DELETING` when the call is answered and reports `DELETED` once that move falls
+//! due, every other version is left exactly as it was, and the deleted version no longer
+//! counts against the versions one permission may carry. Every other version delete is
+//! refused with the modelled error that words that refusal and writes nothing.
+//!
+//! So those rows vary along HOW MANY versions the permission carries, WHICH of them is
+//! deleted, WHICH resource type it is for, WHAT a `clientToken` answers for, and WHICH
+//! rule a refused version delete breaks.
 
 use std::time::{Duration, Instant};
 
@@ -749,5 +762,704 @@ async fn the_name_of_a_deleted_permission_is_free_again() {
         ),
         "case {case:?}: the permission created under the freed name reads back as a live one, got \
          {detail:?}"
+    );
+}
+
+/// `DeletePermissionVersion`, whose members are query parameters
+/// (`smithy_query(query="operation",operation="DeletePermissionVersion")`).
+async fn delete_permission_version(
+    router: &MultiServiceRouter,
+    permission_arn: &str,
+    permission_version: i32,
+    client_token: Option<&str>,
+) -> (u16, Value) {
+    let mut uri = format!(
+        "/deletepermissionversion?permissionArn={}&permissionVersion={permission_version}",
+        query_escape(permission_arn)
+    );
+    if let Some(token) = client_token {
+        uri.push_str(&format!("&clientToken={}", query_escape(token)));
+    }
+    call(router, "DELETE", &uri, None).await
+}
+
+/// Delete one version, asserting the delete was served the way the model describes the
+/// response, and answer the `permissionStatus` it reported.
+async fn delete_version_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    permission_arn: &str,
+    permission_version: i32,
+    client_token: Option<&str>,
+) -> String {
+    let (status, answered) =
+        delete_permission_version(router, permission_arn, permission_version, client_token).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 deleting version {permission_version} of \
+         {permission_arn}, got {status} with {answered:?}"
+    );
+    assert_eq!(
+        answered.get("returnValue").and_then(Value::as_bool),
+        Some(true),
+        "case {case:?}: a served version delete reports returnValue true, got {answered:?}"
+    );
+    let token = answered
+        .get("clientToken")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: a version delete reports a clientToken, got {answered:?}")
+        });
+    match client_token {
+        Some(supplied) => assert_eq!(
+            token, supplied,
+            "case {case:?}: a version delete reports back the clientToken it was given, got \
+             {answered:?}"
+        ),
+        None => assert!(
+            !token.is_empty(),
+            "case {case:?}: a version delete given no clientToken generates one, got {answered:?}"
+        ),
+    }
+    answered
+        .get("permissionStatus")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: a version delete reports a permissionStatus, got {answered:?}")
+        })
+        .to_string()
+}
+
+/// The `(version, status)` pair of every version `ListPermissionVersions` reports for
+/// the permission.
+async fn version_statuses(
+    router: &MultiServiceRouter,
+    case: &str,
+    permission_arn: &str,
+) -> Vec<(String, String)> {
+    let (status, body) = call(
+        router,
+        "POST",
+        "/listpermissionversions",
+        Some(&json!({"permissionArn": permission_arn})),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 listing the versions of {permission_arn}, got {status} \
+         with {body:?}"
+    );
+    body.get("permissions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: the list reported no permissions, got {body:?}"))
+        .iter()
+        .map(|permission| {
+            (
+                field(case, permission, "version"),
+                field(case, permission, "status"),
+            )
+        })
+        .collect()
+}
+
+/// Look at one version of the permission until it reports `PERMISSION_STATUS_DELETED`,
+/// or the deadline passes, and answer the detail that reported it.
+///
+/// Waits for the CONDITION rather than for a span, exactly as [`poll_until_deleted`]
+/// does for a whole permission.
+async fn poll_until_version_deleted(
+    router: &MultiServiceRouter,
+    case: &str,
+    permission_arn: &str,
+    version: i32,
+) -> Value {
+    let give_up_at = Instant::now() + DELETE_POLL_DEADLINE;
+    loop {
+        let detail = read(router, case, permission_arn, Some(version)).await;
+        let status = field(case, &detail, "status");
+        if status == PERMISSION_STATUS_DELETED {
+            return detail;
+        }
+        assert_eq!(
+            status, PERMISSION_STATUS_DELETING,
+            "case {case:?}: a version being deleted reports DELETING until it is DELETED, got \
+             {detail:?}"
+        );
+        assert!(
+            Instant::now() < give_up_at,
+            "case {case:?}: expected version {version} of {permission_arn} to report \
+             {PERMISSION_STATUS_DELETED}, still {status:?} after {DELETE_POLL_DEADLINE:?}"
+        );
+        std::thread::sleep(DELETE_POLL_INTERVAL);
+    }
+}
+
+/// The version numbers a list of `(version, status)` pairs reported, in the order they
+/// were reported.
+fn numbers_of(listed: &[(String, String)]) -> Vec<String> {
+    listed
+        .iter()
+        .map(|(version, _)| version.clone())
+        .collect()
+}
+
+/// Whether a reported `PermissionStatus` is one a delete puts a permission or a version
+/// in: the non-terminal `DELETING` or the terminal `DELETED`.
+fn on_the_delete_path(status: &str) -> bool {
+    status == PERMISSION_STATUS_DELETING || status == PERMISSION_STATUS_DELETED
+}
+
+/// One row of the refused-version-delete table: the version delete a caller may not
+/// make, the modelled error that refusal is worded with, and what its message must name
+/// — so a refusal is about what the caller asked for.
+struct VersionRefusalRow {
+    case: &'static str,
+    permission_arn: String,
+    permission_version: i32,
+    client_token: Option<&'static str>,
+    expected_code: &'static str,
+    must_name: String,
+}
+
+/// One row of the version-delete table: a permission of some resource type carrying some
+/// number of versions, one of which the row deletes.
+struct VersionDeleteRow {
+    case: &'static str,
+    name: &'static str,
+    resource_type: &'static str,
+    /// One template per version, the first one the create wrote.
+    templates: Vec<String>,
+    /// The version this row deletes. Never the last one written, which is the
+    /// permission's default version.
+    delete: i32,
+    client_token: Option<&'static str>,
+}
+
+#[tokio::test]
+async fn a_deleted_permission_version_reports_deleting_then_deleted_and_frees_room() {
+    // Each resource type below is one `ListResourceTypes` reports as taking a customer
+    // managed permission (`RESOURCE_TYPES`), and each row's actions are of that type's
+    // own service namespace.
+    let rows = vec![
+        VersionDeleteRow {
+            case: "the first of two versions, no clientToken",
+            name: "VersionedComponentReader",
+            resource_type: "imagebuilder:Component",
+            templates: vec![
+                policy_template(&["imagebuilder:ListComponents"]),
+                policy_template(&["imagebuilder:ListComponents", "imagebuilder:GetComponent"]),
+            ],
+            delete: FIRST_PERMISSION_VERSION,
+            client_token: None,
+        },
+        VersionDeleteRow {
+            case: "the middle of three versions",
+            name: "VersionedProjectReader",
+            resource_type: "codebuild:Project",
+            templates: vec![
+                policy_template(&["codebuild:BatchGetProjects"]),
+                policy_template(&["codebuild:BatchGetProjects", "codebuild:ListBuildsForProject"]),
+                policy_template(&[
+                    "codebuild:BatchGetProjects",
+                    "codebuild:ListBuildsForProject",
+                    "codebuild:BatchGetBuilds",
+                ]),
+            ],
+            delete: FIRST_PERMISSION_VERSION + 1,
+            client_token: Some("delete-the-middle-version"),
+        },
+        VersionDeleteRow {
+            case: "the first of the maximum number of versions a permission may carry",
+            name: "VersionedDatabaseReader",
+            resource_type: "glue:Database",
+            // One version per action, each adding the next one: five versions, which is
+            // the most a permission may carry (`MAX_PERMISSION_VERSIONS`).
+            templates: (0..GLUE_ACTIONS.len().min(MAX_PERMISSION_VERSIONS))
+                .map(|index| policy_template(&GLUE_ACTIONS[..=index]))
+                .collect(),
+            delete: FIRST_PERMISSION_VERSION,
+            client_token: Some("delete-one-of-the-maximum-versions"),
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let (router, _engine) = emulator_with_engine();
+        let arn = mint(&router, case, row.name, row.resource_type, &row.templates).await;
+        let count = i32::try_from(row.templates.len()).expect("a small version count");
+        let latest = count + FIRST_PERMISSION_VERSION - 1;
+        let template_of = |version: i32| {
+            row.templates[usize::try_from(version - FIRST_PERMISSION_VERSION)
+                .expect("a version at or above the first one")]
+            .clone()
+        };
+
+        // Before the delete the permission carries every version written, and none of
+        // them is on the delete path.
+        let before = version_statuses(&router, case, &arn).await;
+        assert_eq!(
+            numbers_of(&before),
+            (FIRST_PERMISSION_VERSION..=latest)
+                .map(|version| version.to_string())
+                .collect::<Vec<_>>(),
+            "case {case:?}: the permission carries every version written, got {before:?}"
+        );
+        assert!(
+            !before
+                .iter()
+                .any(|(_, status)| on_the_delete_path(status)),
+            "case {case:?}: no version is on the delete path before the delete, got {before:?}"
+        );
+        // A permission already carrying the maximum has no room for another version
+        // until one is deleted, which is what deleting one is for.
+        if row.templates.len() == MAX_PERMISSION_VERSIONS {
+            let (status, refused) = create_permission_version(
+                &router,
+                &json!({"permissionArn": arn, "policyTemplate": policy_template(&GLUE_ACTIONS)}),
+            )
+            .await;
+            assert_eq!(
+                (status, error_code(&refused)),
+                (
+                    400,
+                    "PermissionVersionsLimitExceededException".to_string()
+                ),
+                "case {case:?}: a version past the limit is refused before the delete, got \
+                 {status} with {refused:?}"
+            );
+        }
+
+        // The delete is answered with that version in the non-terminal status.
+        let answered = delete_version_ok(&router, case, &arn, row.delete, row.client_token).await;
+        assert_eq!(
+            answered, PERMISSION_STATUS_DELETING,
+            "case {case:?}: the version delete reports the status that version has reached, got \
+             {answered:?}"
+        );
+        let deleting = read(&router, case, &arn, Some(row.delete)).await;
+        assert_eq!(
+            (
+                field(case, &deleting, "status"),
+                field(case, &deleting, "version"),
+                field(case, &deleting, "permission")
+            ),
+            (
+                PERMISSION_STATUS_DELETING.to_string(),
+                row.delete.to_string(),
+                template_of(row.delete)
+            ),
+            "case {case:?}: a read straight after the version delete reports DELETING at the \
+             version that was stored, got {deleting:?}"
+        );
+
+        // The move to DELETED is the clock's.
+        let deleted = poll_until_version_deleted(&router, case, &arn, row.delete).await;
+        assert_eq!(
+            (
+                field(case, &deleted, "version"),
+                field(case, &deleted, "permission"),
+                flag(case, &deleted, "defaultVersion")
+            ),
+            (row.delete.to_string(), template_of(row.delete), false),
+            "case {case:?}: the deleted version still reports the policy that was stored and is \
+             not the default version, got {deleted:?}"
+        );
+
+        // Every OTHER version is exactly as it was: the delete takes away one version,
+        // not the permission.
+        for version in (FIRST_PERMISSION_VERSION..=latest).filter(|version| *version != row.delete)
+        {
+            let detail = read(&router, case, &arn, Some(version)).await;
+            assert_eq!(
+                (
+                    field(case, &detail, "version"),
+                    field(case, &detail, "permission"),
+                    flag(case, &detail, "defaultVersion")
+                ),
+                (
+                    version.to_string(),
+                    template_of(version),
+                    version == latest
+                ),
+                "case {case:?}: version {version} is untouched by the delete of version {}, got \
+                 {detail:?}",
+                row.delete
+            );
+            assert!(
+                !on_the_delete_path(&field(case, &detail, "status")),
+                "case {case:?}: version {version} is not on the delete path after the delete of \
+                 version {}, got {detail:?}",
+                row.delete
+            );
+        }
+        // A read naming no version still reports the default one, which the delete did
+        // not move.
+        let default = read(&router, case, &arn, None).await;
+        assert_eq!(
+            (
+                field(case, &default, "version"),
+                field(case, &default, "status"),
+                field(case, &default, "permissionType")
+            ),
+            (
+                latest.to_string(),
+                PERMISSION_STATUS_ATTACHABLE.to_string(),
+                PERMISSION_TYPE_CUSTOMER_MANAGED.to_string()
+            ),
+            "case {case:?}: the delete of another version leaves the default version alone, got \
+             {default:?}"
+        );
+
+        // Every read of the permission's versions reports the delete: the record
+        // survives in its terminal status, which is what lets a caller poll the delete
+        // to completion, and no other version is on the delete path.
+        let listed = version_statuses(&router, case, &arn).await;
+        for version in FIRST_PERMISSION_VERSION..=latest {
+            let reported = listed
+                .iter()
+                .find(|(number, _)| *number == version.to_string())
+                .map(|(_, status)| status.clone())
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: version {version} is not reported at all, got {listed:?}")
+                });
+            if version == row.delete {
+                assert_eq!(
+                    reported, PERMISSION_STATUS_DELETED,
+                    "case {case:?}: the deleted version is reported DELETED, got {listed:?}"
+                );
+            } else {
+                assert!(
+                    !on_the_delete_path(&reported),
+                    "case {case:?}: version {version} is not on the delete path, got {listed:?}"
+                );
+            }
+        }
+
+        // "If a customer managed permission has the maximum of 5 versions, then you must
+        // delete at least one version before you can create another": the deleted
+        // version no longer counts, and the number it carried is not reused. The
+        // template is one of this row's own, so it names actions of the permission's
+        // resource type.
+        let next_template = template_of(FIRST_PERMISSION_VERSION);
+        let (status, written) = create_permission_version(
+            &router,
+            &json!({"permissionArn": arn, "policyTemplate": next_template}),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a version written after the delete is served, got {status} with \
+             {written:?}"
+        );
+        let after = read(&router, case, &arn, None).await;
+        assert_eq!(
+            (
+                field(case, &after, "version"),
+                field(case, &after, "permission"),
+                flag(case, &after, "defaultVersion")
+            ),
+            (
+                (latest + 1).to_string(),
+                next_template,
+                true
+            ),
+            "case {case:?}: the version written after the delete is numbered above every version \
+             ever written and is the new default, got {after:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_version_delete_a_caller_may_not_make_is_refused_and_changes_nothing() {
+    let case = "a refused version delete";
+    let (router, _engine) = emulator_with_engine();
+
+    // A permission carrying two versions, whose FIRST version a live resource share is
+    // governed by: the share attached the permission while version 1 was the default,
+    // and "existing resource shares continue to use their original permission versions".
+    let attached_arn = mint(
+        &router,
+        case,
+        "VersionHeldByAShare",
+        "imagebuilder:Component",
+        &[policy_template(&["imagebuilder:ListComponents"])],
+    )
+    .await;
+    let share_arn = arn_of(
+        case,
+        &create_ok(
+            &router,
+            case,
+            &json!({
+                "name": "share-holding-a-permission-version",
+                "resourceArns": [LOCAL_RESOURCE],
+                "permissionArns": [attached_arn],
+            }),
+        )
+        .await,
+    );
+    let (status, written) = create_permission_version(
+        &router,
+        &json!({
+            "permissionArn": attached_arn,
+            "policyTemplate": policy_template(&["imagebuilder:GetComponent"]),
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 writing a second version, got {status} with {written:?}"
+    );
+
+    // A permission carrying a single version, which is therefore its default version.
+    let single_arn = mint(
+        &router,
+        case,
+        "TheOnlyVersion",
+        "codebuild:Project",
+        &[policy_template(&["codebuild:BatchGetProjects"])],
+    )
+    .await;
+    // A permission whose own delete is in flight: `DeletePermission` "deletes all
+    // versions associated with the customer managed permission", so it has no version
+    // left for a caller to delete.
+    let deleted_arn = mint(
+        &router,
+        case,
+        "DeletedWholePermission",
+        "glue:Database",
+        &[policy_template(&["glue:GetDatabase"])],
+    )
+    .await;
+    delete_ok(&router, case, &deleted_arn, None).await;
+
+    let rows = vec![
+        VersionRefusalRow {
+            case: "the permission's default version",
+            permission_arn: attached_arn.clone(),
+            permission_version: FIRST_PERMISSION_VERSION + 1,
+            client_token: None,
+            expected_code: "OperationNotPermittedException",
+            must_name: attached_arn.clone(),
+        },
+        VersionRefusalRow {
+            case: "the only version a permission carries, which is its default",
+            permission_arn: single_arn.clone(),
+            permission_version: FIRST_PERMISSION_VERSION,
+            client_token: Some("delete-the-only-version"),
+            expected_code: "OperationNotPermittedException",
+            must_name: single_arn.clone(),
+        },
+        VersionRefusalRow {
+            case: "a version a live resource share is governed by",
+            permission_arn: attached_arn.clone(),
+            permission_version: FIRST_PERMISSION_VERSION,
+            client_token: None,
+            expected_code: "OperationNotPermittedException",
+            must_name: share_arn.clone(),
+        },
+        VersionRefusalRow {
+            case: "a version of a permission Amazon Web Services manages",
+            permission_arn: aws_managed_permission_arn("AWSRAMDefaultPermissionCodeBuildProject"),
+            permission_version: FIRST_PERMISSION_VERSION,
+            client_token: None,
+            expected_code: "OperationNotPermittedException",
+            must_name: aws_managed_permission_arn("AWSRAMDefaultPermissionCodeBuildProject"),
+        },
+        VersionRefusalRow {
+            case: "a version of another permission Amazon Web Services manages",
+            permission_arn: aws_managed_permission_arn("AWSRAMDefaultPermissionGlueDatabase"),
+            permission_version: FIRST_PERMISSION_VERSION,
+            client_token: Some("delete-an-aws-managed-permission-version"),
+            expected_code: "OperationNotPermittedException",
+            must_name: aws_managed_permission_arn("AWSRAMDefaultPermissionGlueDatabase"),
+        },
+        VersionRefusalRow {
+            case: "a version number the permission never carried",
+            permission_arn: attached_arn.clone(),
+            permission_version: FIRST_PERMISSION_VERSION + 5,
+            client_token: None,
+            expected_code: "UnknownResourceException",
+            must_name: (FIRST_PERMISSION_VERSION + 5).to_string(),
+        },
+        VersionRefusalRow {
+            case: "an ARN no permission answers to",
+            permission_arn: customer("NeverCreatedVersioned"),
+            permission_version: FIRST_PERMISSION_VERSION,
+            client_token: None,
+            expected_code: "UnknownResourceException",
+            must_name: customer("NeverCreatedVersioned"),
+        },
+        VersionRefusalRow {
+            case: "a version of a permission whose own delete is in flight",
+            permission_arn: deleted_arn.clone(),
+            permission_version: FIRST_PERMISSION_VERSION,
+            client_token: None,
+            expected_code: "UnknownResourceException",
+            must_name: deleted_arn.clone(),
+        },
+        VersionRefusalRow {
+            case: "a version number below the first version any permission carries",
+            permission_arn: attached_arn.clone(),
+            permission_version: FIRST_PERMISSION_VERSION - 1,
+            client_token: None,
+            expected_code: "InvalidParameterException",
+            must_name: "permissionVersion".to_string(),
+        },
+        VersionRefusalRow {
+            case: "a negative version number",
+            permission_arn: attached_arn.clone(),
+            permission_version: -3,
+            client_token: None,
+            expected_code: "InvalidParameterException",
+            must_name: "permissionVersion".to_string(),
+        },
+        VersionRefusalRow {
+            case: "a value that is not a managed permission ARN",
+            permission_arn: format!(
+                "arn:aws:ram:{REGION}:{ACCOUNT}:resource-share/not-a-permission"
+            ),
+            permission_version: FIRST_PERMISSION_VERSION,
+            client_token: None,
+            expected_code: "MalformedArnException",
+            must_name: "permissionArn".to_string(),
+        },
+        VersionRefusalRow {
+            case: "a value that is not an ARN at all",
+            permission_arn: "VersionHeldByAShare".to_string(),
+            permission_version: FIRST_PERMISSION_VERSION,
+            client_token: None,
+            expected_code: "MalformedArnException",
+            must_name: "permissionArn".to_string(),
+        },
+        VersionRefusalRow {
+            case: "an empty clientToken",
+            permission_arn: attached_arn.clone(),
+            permission_version: FIRST_PERMISSION_VERSION,
+            client_token: Some(""),
+            expected_code: "InvalidClientTokenException",
+            must_name: "clientToken".to_string(),
+        },
+    ];
+
+    for row in &rows {
+        let refused_case = row.case;
+        let expected_code = row.expected_code;
+        let (status, refused) = delete_permission_version(
+            &router,
+            &row.permission_arn,
+            row.permission_version,
+            row.client_token,
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refused)),
+            (400, expected_code.to_string()),
+            "case {refused_case:?}: expected a 400 {expected_code}, got {status} with {refused:?}"
+        );
+        assert!(
+            error_message(&refused).contains(row.must_name.as_str()),
+            "case {refused_case:?}: expected the message to name {:?}, got {refused:?}",
+            row.must_name
+        );
+    }
+
+    // Nothing above deleted anything: both live permissions still carry every version
+    // they were written, none of them on the delete path.
+    for (row, arn, versions) in [
+        (
+            "the permission a share holds a version of",
+            &attached_arn,
+            2,
+        ),
+        ("the permission carrying one version", &single_arn, 1),
+    ] {
+        let listed = version_statuses(&router, case, arn).await;
+        assert_eq!(
+            numbers_of(&listed),
+            (FIRST_PERMISSION_VERSION..FIRST_PERMISSION_VERSION + versions)
+                .map(|version| version.to_string())
+                .collect::<Vec<_>>(),
+            "case {row:?}: a refused version delete takes no version away, got {listed:?}"
+        );
+        assert!(
+            !listed
+                .iter()
+                .any(|(_, status)| on_the_delete_path(status)),
+            "case {row:?}: a refused version delete puts no version on the delete path, got \
+             {listed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn repeating_a_version_delete_deletes_nothing_further() {
+    let case = "a repeated version delete";
+    let (router, _engine) = emulator_with_engine();
+    let arn = mint(
+        &router,
+        case,
+        "RepeatedlyDeletedVersion",
+        "imagebuilder:Component",
+        &[
+            policy_template(&["imagebuilder:ListComponents"]),
+            policy_template(&["imagebuilder:ListComponents", "imagebuilder:GetComponent"]),
+        ],
+    )
+    .await;
+
+    let token = "one-version-delete-token";
+    assert_eq!(
+        delete_version_ok(&router, case, &arn, FIRST_PERMISSION_VERSION, Some(token)).await,
+        PERMISSION_STATUS_DELETING,
+        "case {case:?}: the version delete starts the move"
+    );
+    // The same request under the same token: the first call's delete is the answer, and
+    // the status is the one that version has reached since.
+    assert_eq!(
+        delete_version_ok(&router, case, &arn, FIRST_PERMISSION_VERSION, Some(token)).await,
+        PERMISSION_STATUS_DELETING,
+        "case {case:?}: a retry under the same token reports the same delete"
+    );
+    // And without a token: deleting a version is idempotent for as long as its record
+    // exists.
+    assert_eq!(
+        delete_version_ok(&router, case, &arn, FIRST_PERMISSION_VERSION, None).await,
+        PERMISSION_STATUS_DELETING,
+        "case {case:?}: a second delete of the same version deletes nothing further"
+    );
+
+    // The same token naming a DIFFERENT version is a different request.
+    let (status, refused) =
+        delete_permission_version(&router, &arn, FIRST_PERMISSION_VERSION + 1, Some(token)).await;
+    assert_eq!(
+        (status, error_code(&refused)),
+        (400, "IdempotentParameterMismatchException".to_string()),
+        "case {case:?}: a token reused for another version is refused, got {status} with \
+         {refused:?}"
+    );
+
+    // Once the delete has completed, repeating it still reports the delete that happened
+    // rather than a client error.
+    poll_until_version_deleted(&router, case, &arn, FIRST_PERMISSION_VERSION).await;
+    assert_eq!(
+        delete_version_ok(&router, case, &arn, FIRST_PERMISSION_VERSION, None).await,
+        PERMISSION_STATUS_DELETED,
+        "case {case:?}: a delete of an already deleted version reports DELETED"
+    );
+    // And the version the refused retry named is untouched: still the default, still
+    // attachable.
+    let default = read(&router, case, &arn, None).await;
+    assert_eq!(
+        (
+            field(case, &default, "version"),
+            field(case, &default, "status")
+        ),
+        (
+            (FIRST_PERMISSION_VERSION + 1).to_string(),
+            PERMISSION_STATUS_ATTACHABLE.to_string()
+        ),
+        "case {case:?}: the default version is untouched by the delete of another version, got \
+         {default:?}"
     );
 }

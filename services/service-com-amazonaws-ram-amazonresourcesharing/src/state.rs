@@ -26,11 +26,13 @@
 mod aws_managed_permissions;
 mod permission_attachments;
 mod permission_deletion;
+mod permission_version_deletion;
 mod policy_actions;
 
 pub use aws_managed_permissions::*;
 pub use permission_attachments::*;
 pub use permission_deletion::*;
+pub use permission_version_deletion::*;
 pub use policy_actions::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -792,6 +794,9 @@ pub struct PermissionVersionRecord {
     /// Epoch milliseconds; rendered as the modelled `DateTime` timestamps.
     pub creation_time: i64,
     pub last_updated_time: i64,
+    /// Where the delete of THIS version has got to, or `None` for a version nobody has
+    /// deleted ([`permission_version_deletion`]).
+    pub deletion: Option<PermissionDeletion>,
 }
 
 /// One stored managed permission, keyed by its ARN, with every version written for
@@ -1081,6 +1086,8 @@ impl ComAmazonawsRamAmazonresourcesharingState {
             status: PERMISSION_STATUS_ATTACHABLE.to_string(),
             creation_time: now,
             last_updated_time: now,
+            // Nothing has deleted a version this call is writing.
+            deletion: None,
         };
         permission.versions.insert(version, record.clone());
         permission.default_version = version;

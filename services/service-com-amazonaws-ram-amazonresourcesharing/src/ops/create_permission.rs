@@ -373,6 +373,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     status: crate::state::PERMISSION_STATUS_ATTACHABLE.to_string(),
                     creation_time: now,
                     last_updated_time: now,
+                    // Nothing has deleted the version this call is minting.
+                    deletion: None,
                 },
             )]
             .into_iter()

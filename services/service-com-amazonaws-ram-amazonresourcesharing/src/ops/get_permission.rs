@@ -184,9 +184,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(GetPermissionErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: format!(
-                        "permissionVersion must be {} or greater",
-                        crate::state::FIRST_PERMISSION_VERSION
+                    message: crate::state::permission_version_below_first_message(
+                        "permissionVersion",
                     ),
                 },
             )

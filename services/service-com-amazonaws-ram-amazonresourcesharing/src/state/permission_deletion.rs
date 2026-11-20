@@ -79,10 +79,11 @@ impl PermissionRecord {
     }
 
     /// The `PermissionStatus` a read of `version` of this permission reports: the
-    /// status the delete put the whole permission in, or — for a permission nobody has
-    /// deleted — the version's own status.
+    /// status the delete put the whole permission in, then the status the delete of
+    /// that one version put it in, or — for a version nobody has deleted — the
+    /// version's own status.
     pub fn version_status(&self, version: &PermissionVersionRecord) -> String {
-        match &self.deletion {
+        match self.deletion.as_ref().or(version.deletion.as_ref()) {
             Some(deletion) => deletion.status.clone(),
             None => version.status.clone(),
         }
@@ -140,8 +141,12 @@ impl ComAmazonawsRamAmazonresourcesharingState {
     /// Like [`Self::settle_due_associations`], this only materialises what was already
     /// due: a permission `DeletePermission` accepted in `DELETING` is `DELETED`
     /// [`PERMISSION_DELETED_AFTER_MILLIS`] after the call that deleted it, whether or
-    /// not anybody asks.
+    /// not anybody asks. The delete of ONE version is the same owed move, so it is
+    /// settled from here too
+    /// ([`ComAmazonawsRamAmazonresourcesharingState::settle_due_permission_versions`]):
+    /// every call that settles a permission settles its versions.
     pub fn settle_due_permissions(&mut self, now: i64) {
+        self.settle_due_permission_versions(now);
         for permission in self.permissions.values_mut() {
             let Some(deletion) = &mut permission.deletion else {
                 continue;

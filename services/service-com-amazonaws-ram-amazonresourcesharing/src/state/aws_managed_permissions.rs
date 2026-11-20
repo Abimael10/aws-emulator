@@ -494,6 +494,9 @@ impl AwsManagedPermission {
                     status: PERMISSION_STATUS_ATTACHABLE.to_string(),
                     creation_time: now,
                     last_updated_time: now,
+                    // A permission Amazon Web Services manages carries no deleted
+                    // version: no caller can delete one of its versions.
+                    deletion: None,
                 },
             )]
             .into_iter()

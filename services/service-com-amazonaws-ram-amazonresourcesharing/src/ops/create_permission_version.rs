@@ -323,8 +323,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "If the specified customer managed permission already has the maximum of 5
         // versions, then you must delete one of the existing versions before you can
-        // create a new one."
-        if permission.versions.len() >= crate::state::MAX_PERMISSION_VERSIONS {
+        // create a new one." A version `DeletePermissionVersion` has deleted is no
+        // longer one of the versions the permission has, so it leaves room for this
+        // create: that is what deleting one is for.
+        if permission.live_version_count() >= crate::state::MAX_PERMISSION_VERSIONS {
             return Err(
                 CreatePermissionVersionErrorModeled::PermissionVersionsLimitExceededException(
                     PermissionVersionsLimitExceededException {
