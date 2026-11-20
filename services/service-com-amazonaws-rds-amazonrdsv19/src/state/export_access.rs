@@ -183,8 +183,8 @@ const PRINCIPAL_ARN_KEY: &str = "aws:PrincipalArn";
 /// role nor the action.
 ///
 /// `false` for everything that is not an answer: no KMS beside this service, a key it would
-/// not report a policy for, or a document that could not be read. A refusal has to be
-/// grounded in what KMS said.
+/// not report a policy for or an ARN for, or a document that could not be read. A refusal has
+/// to be grounded in what KMS said.
 pub async fn export_key_withholds_a_required_action(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -192,6 +192,14 @@ pub async fn export_key_withholds_a_required_action(
     role_arn: &str,
 ) -> bool {
     let Some(kms) = super::managed_master_secret::kms_client(ctx, region) else {
+        return false;
+    };
+    // The KEY the request's reference resolves to. A key policy is written over the key
+    // ITSELF — the wildcard, or the key's own ARN — so the resource the decision is taken on
+    // is that ARN, whichever spelling (key id, key ARN, alias name, alias ARN) the request
+    // named the key by: the spelling SELECTS the key, it is not what a policy states a rule
+    // about. A reference KMS reports no key ARN for leaves the decision ungrounded.
+    let Some(key_arn) = resolved_key_arn(&kms, key_id).await else {
         return false;
     };
     let Some(policy) = kms
@@ -206,24 +214,192 @@ pub async fn export_key_withholds_a_required_action(
         return false;
     };
     let principals = export_principals(role_arn);
-    let context = export_context(role_arn);
     EXPORT_KEY_ACTIONS.into_iter().any(|action| {
-        let request = ::service_common::iam_authorization::Request::new(
-            action,
-            // The key itself is the resource those actions are taken on; a key policy
-            // names its own key as `"*"`, which covers it.
-            key_id,
-            &principals,
-        )
-        .with_context(&context);
+        let context = export_key_context(region, role_arn, action);
+        let request =
+            ::service_common::iam_authorization::Request::new(action, &key_arn, &principals)
+                .with_context(&context);
         ::service_common::iam_authorization::resource_decision(&policy, &request)
             != ::service_common::iam_authorization::Decision::Allowed
     })
 }
 
+/// The ARN of the KMS key the reference `key_id` names at `region`'s endpoint — the key
+/// itself, whichever of the spellings `KmsKeyId` publishes ("the key ARN, key ID, alias ARN,
+/// or alias name") the request carried.
+///
+/// KMS owns the mapping from a reference to a key, so KMS is what resolves it: it is the one
+/// service that can say which key an alias points at and which key a bare id belongs to. The
+/// ARN is what the export needs the key AS — the resource its key-policy decision is taken
+/// on, and the key the objects it writes are recorded as encrypted under — because both are
+/// statements about the KEY rather than about how a caller spelled it.
+///
+/// `None` when nothing was answered: no KMS beside this service, a Region label it cannot be
+/// asked in, a reference it holds no key for, or an answer carrying no ARN.
+pub async fn export_key_arn(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    key_id: &str,
+) -> Option<String> {
+    let kms = super::managed_master_secret::kms_client(ctx, region)?;
+    resolved_key_arn(&kms, key_id).await
+}
+
+/// The same resolution through a client the caller already built, so one request that asks
+/// KMS about the key twice builds one client.
+async fn resolved_key_arn(kms: &::aws_sdk_kms::Client, key_id: &str) -> Option<String> {
+    kms.describe_key()
+        .key_id(key_id)
+        .send()
+        .await
+        .ok()?
+        .key_metadata?
+        .arn
+        .filter(|arn| !arn.is_empty())
+}
+
 /// The KMS operations an export has to be authorized to run on the key its data is
 /// encrypted under, as `KmsKeyId` lists them.
 const EXPORT_KEY_ACTIONS: [&str; 2] = ["kms:CreateGrant", "kms:DescribeKey"];
+
+/// The condition keys the KMS call `action` of an export really carries, so a key policy
+/// statement scoped by one of them is DECIDED rather than left undecided — which the shared
+/// evaluator reads fail-closed, refusing an export the key admits.
+///
+/// An export performs these calls on the key THROUGH Amazon RDS, on behalf of the account
+/// whose role it runs under: that is `kms:ViaService` ("limits use of a KMS key to requests
+/// from specified Amazon Web Services", whose value is a service's regional endpoint name)
+/// and `kms:CallerAccount` (the account of the principal the service is acting for), beside
+/// the principal the export acts as. And the GRANT an export creates is created for an Amazon
+/// Web Services resource — the export Amazon RDS runs — which is what
+/// `kms:GrantIsForAWSResource` states, so it is carried by the grant call alone: the other
+/// call creates no grant and answers for no such key.
+fn export_key_context(region: &str, role_arn: &str, action: &str) -> Vec<(String, String)> {
+    let mut context = export_context(role_arn);
+    context.push((
+        VIA_SERVICE_KEY.to_string(),
+        format!("{}.{region}.amazonaws.com", super::ARN_NAMESPACE),
+    ));
+    if let Some(account) = ::service_common::arn::parse(role_arn)
+        .map(|arn| arn.account)
+        .filter(|account| !account.is_empty())
+    {
+        context.push((CALLER_ACCOUNT_KEY.to_string(), account.to_string()));
+    }
+    if action == EXPORT_KEY_GRANT_ACTION {
+        context.push((GRANT_IS_FOR_AWS_RESOURCE_KEY.to_string(), "true".to_string()));
+    }
+    context
+}
+
+/// The one of [`EXPORT_KEY_ACTIONS`] that creates the export's grant.
+const EXPORT_KEY_GRANT_ACTION: &str = "kms:CreateGrant";
+
+/// The AWS KMS condition key naming the service a request reached the key THROUGH.
+const VIA_SERVICE_KEY: &str = "kms:ViaService";
+
+/// The AWS KMS condition key naming the account the request was made on behalf of.
+const CALLER_ACCOUNT_KEY: &str = "kms:CallerAccount";
+
+/// The AWS KMS condition key stating that the grant a request creates is created for an
+/// Amazon Web Services resource rather than for a principal of the caller's own choosing.
+const GRANT_IS_FOR_AWS_RESOURCE_KEY: &str = "kms:GrantIsForAWSResource";
+
+/// The KMS operations the grant an export takes on its key permits: what the export does
+/// with the key while it runs — it mints and encrypts the data keys the exported objects are
+/// sealed with, reads them back, and reads the key itself — and the retirement of the grant
+/// once the export has ended.
+const EXPORT_GRANT_OPERATIONS: [&str; 6] = [
+    "GenerateDataKey",
+    "GenerateDataKeyWithoutPlaintext",
+    "Encrypt",
+    "Decrypt",
+    "DescribeKey",
+    "RetireGrant",
+];
+
+/// Take the GRANT an accepted export holds on the key its data is encrypted under, at
+/// `region`'s KMS endpoint, answering the grant's id when KMS took one.
+///
+/// `kms:CreateGrant` is one of the two operations `KmsKeyId` documents the export as having
+/// to be authorized for, and this is the call that uses it: a snapshot export encrypts every
+/// object it writes under the caller's key, so the export principal has to be able to use
+/// that key WHILE the export runs, and in KMS that permission is a grant — created for the
+/// service that performs the export, constrained to the resource it is performed for, and
+/// retirable by the same service once the export has ended. So an accepted export leaves a
+/// grant on the key, which is what `ListGrants` then reports.
+///
+/// `key_arn` is the key the reference resolved to ([`export_key_arn`]), because a grant names
+/// the key it was taken on by the key's own ARN; `source_arn` is the resource the export reads
+/// and `name` the export task it was taken for, which makes the call IDEMPOTENT ("when this
+/// value is absent, all CreateGrant requests result in a new grant with a unique GrantId"),
+/// so one export never leaves two grants behind.
+///
+/// `None` where KMS took no grant: no KMS beside this service, or an answer that refused the
+/// call. The refusal the EXPORT is answered with is decided before this, from the key's own
+/// policy ([`export_key_withholds_a_required_action`]), so a grant KMS declines leaves an
+/// operator-visible line rather than turning into a second refusal path.
+pub async fn take_export_grant(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    key_arn: &str,
+    source_arn: &str,
+    name: &str,
+) -> Option<String> {
+    let kms = super::managed_master_secret::kms_client(ctx, region)?;
+    let mut request = kms
+        .create_grant()
+        .key_id(key_arn)
+        .name(export_grant_name(name))
+        // "When you specify a GranteeServicePrincipal, you must also specify a SourceArn
+        // grant constraint. In addition, you must specify either a RetiringPrincipal or a
+        // RetiringServicePrincipal" (`CreateGrantRequest$GranteeServicePrincipal`): the
+        // grantee is the service that performs the export, the resource it is performed for
+        // is the source the export reads, and the principal that retires the grant is the
+        // one that took it — the export ending is what retires it.
+        .grantee_service_principal(super::EXPORT_SERVICE_PRINCIPAL)
+        .retiring_service_principal(super::EXPORT_SERVICE_PRINCIPAL)
+        .constraints(
+            ::aws_sdk_kms::types::GrantConstraints::builder()
+                .source_arn(source_arn)
+                .build(),
+        );
+    for operation in EXPORT_GRANT_OPERATIONS {
+        request = request.operations(::aws_sdk_kms::types::GrantOperation::from(operation));
+    }
+    match request.send().await {
+        Ok(created) => created.grant_id.filter(|id| !id.is_empty()),
+        Err(error) => {
+            ::tracing::warn!(
+                key_arn = ?key_arn,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "KMS took no grant on the key an export encrypts its data with"
+            );
+            None
+        }
+    }
+}
+
+/// The `GrantName` the grant of ONE export carries: the export task it was taken for, under
+/// this service's own prefix, so a grant a key holds says which export put it there and a
+/// retried create takes the same grant rather than another.
+///
+/// `GrantName` publishes its own grammar (`^[a-zA-Z0-9:/_-]+$`), which an export task
+/// identifier is not bound by, so every byte outside that set is replaced rather than sent on
+/// to be refused.
+fn export_grant_name(export_task_identifier: &str) -> String {
+    let name: String = export_task_identifier
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, ':' | '/' | '_' | '-') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    format!("{}-export-{name}", super::ARN_NAMESPACE)
+}
 
 /// Every identity-based policy document IAM holds for the role `role_arn` names — the
 /// documents of the managed policies attached to it, and its inline policies — or `None`

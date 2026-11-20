@@ -231,6 +231,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region =
             crate::state::request_region(ctx).map_err(StartExportTaskError::validation)?;
 
+
         // Every stored free-form value is BOUNDED where it enters the store: none of these
         // members publishes a bound of its own and all of them are stored.
         crate::state::check_stored_text(
@@ -473,6 +474,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record, so a call this store has no room for is refused BEFORE it copies anything
         // into the object store, and a caller never finds objects of an export no task
         // stands for.
+        //
+        // The KEY the exported data is encrypted with is resolved here, once, while the
+        // store is unlocked: `KmsKeyId` is "the ID of the Amazon Web Services KMS key to use
+        // to encrypt the data exported to Amazon S3" and names ONE key in four spellings, so
+        // the objects below are recorded as encrypted under the key KMS resolved rather than
+        // under the spelling the request carried. A reference KMS answered nothing for
+        // (unreachable, or no ARN in its answer) is kept as the request spelled it: the
+        // export was still performed under the key it named.
+        let encryption_key = crate::state::export_key_arn(ctx, &region, &input.kms_key_id)
+            .await
+            .unwrap_or_else(|| input.kms_key_id.clone());
         let started = ::std::time::SystemTime::now();
         let prefix =
             crate::state::export_prefix(input.s3_prefix.as_deref(), &input.export_task_identifier);
@@ -540,6 +552,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             );
         }
+
+        // And the GRANT the export holds on that key while it runs: `kms:CreateGrant` is one
+        // of the two operations the key has to admit, and this is the call that uses it — the
+        // export encrypts every object it writes under the caller's key, so the service that
+        // performs it is given the key's use for this source alone, retirable by itself
+        // ([`crate::state::take_export_grant`]). Taken once the task is recorded and before
+        // the data is read, so a key a caller inspects after an accepted export holds the
+        // grant the export is running under.
+        crate::state::take_export_grant(
+            ctx,
+            &region,
+            &encryption_key,
+            &source.arn,
+            &input.export_task_identifier,
+        )
+        .await;
 
         // What the export READS: a COPY of the source's data — never the live storage of a
         // cluster or the storage a stored snapshot holds, both of which this call leaves
@@ -658,7 +686,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into_bytes(),
         });
-        let written = crate::state::write_objects(&*self.engine, &input.s3_bucket_name, &objects);
+        let written = crate::state::write_objects(
+            &*self.engine,
+            &input.s3_bucket_name,
+            &objects,
+            Some(&encryption_key),
+        );
 
         let mut store = state.lock();
         // The record this call inserted, read back under the new guard: a cancel that ran in

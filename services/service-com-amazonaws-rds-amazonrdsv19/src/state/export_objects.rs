@@ -416,10 +416,16 @@ fn epoch_millis(instant: SystemTime) -> u64 {
 /// refuses a write — its own object or byte ceiling — leaves that object unwritten and its
 /// bytes out of the answer: the export then reports what was really stored rather than
 /// claiming the whole of it, and says so in its `WarningMessage`.
+///
+/// `kms_key_arn` is the key the export's data is encrypted under, which is the key the
+/// request's `KmsKeyId` resolved to ([`super::export_key_arn`]): "the ID of the Amazon Web
+/// Services KMS key to use to encrypt the data exported to Amazon S3", so every object this
+/// writes is stored under SSE-KMS with that key and a later read of one reports it.
 pub fn write_objects<Eng: Send + Sync + 'static>(
     engine: &Eng,
     bucket: &str,
     objects: &[ExportedObject],
+    kms_key_arn: Option<&str>,
 ) -> ExportWrite {
     let Some(state) = ::service_com_amazonaws_s3_amazons3::state::service_state(engine) else {
         ::tracing::warn!(
@@ -427,7 +433,7 @@ pub fn write_objects<Eng: Send + Sync + 'static>(
         );
         return ExportWrite::default();
     };
-    write_objects_into(&state, bucket, objects)
+    write_objects_into(&state, bucket, objects, kms_key_arn)
 }
 
 /// The same write, through an object store already resolved rather than through the engine
@@ -443,14 +449,23 @@ pub fn write_objects_into(
     >,
     bucket: &str,
     objects: &[ExportedObject],
+    kms_key_arn: Option<&str>,
 ) -> ExportWrite {
     let mut store = state.lock();
     let mut written = ExportWrite::default();
     for object in objects {
-        let encryption = store
-            .bucket(bucket)
-            .map(::service_com_amazonaws_s3_amazons3::state::Bucket::default_object_encryption)
-            .unwrap_or_default();
+        // How an object a SERVICE writes into a bucket is encrypted at rest is the object
+        // store's own rule, shared with every other service that writes one
+        // ([`::service_com_amazonaws_s3_amazons3::state::written_object_encryption`]): a write
+        // naming a KMS key is stored under SSE-KMS with that key, and one naming none takes
+        // the bucket's own default encryption configuration. So an export's objects are
+        // recorded under the key the export was given, and two services' objects under one
+        // key are recorded identically.
+        let encryption = ::service_com_amazonaws_s3_amazons3::state::written_object_encryption(
+            &store,
+            bucket,
+            kms_key_arn,
+        );
         let stored = ::service_com_amazonaws_s3_amazons3::state::Object {
             // The entity tag is computed over the bytes stored, exactly as it is for an
             // object written through `PutObject`.

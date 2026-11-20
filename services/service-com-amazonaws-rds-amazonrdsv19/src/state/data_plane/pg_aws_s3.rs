@@ -733,6 +733,25 @@ pub fn access_denied(capability: S3Capability, object_arn: &str) -> EngineError 
     )
 }
 
+/// What the export answers for a query that is itself a call of this extension: the exported
+/// query runs on the session, so one naming this schema would be served by the very path that
+/// dispatches these functions, and the nesting would be the statement's to choose.
+///
+/// `0A000` `feature_not_supported` is what PostgreSQL reports for a construct the server does
+/// not serve in the position it was written in, and the sentence names the function the query
+/// may not call so a client can see which argument to change.
+#[must_use]
+fn nested_export() -> EngineError {
+    EngineError::new(
+        EngineErrorKind::FeatureNotSupported,
+        format!(
+            "the query {AWS_S3_SCHEMA}.{EXPORT_FUNCTION} exports must not itself call a \
+             function of the {AWS_S3_SCHEMA} schema"
+        ),
+    )
+    .with_sqlstate("0A000")
+}
+
 /// What it answers when Amazon S3 holds no such bucket: that service's own error code and
 /// message for a read or a write of one.
 #[must_use]
@@ -849,6 +868,17 @@ pub fn serve(
             // The query is this session's own statement: it is run the way every other
             // statement of the session is, so what is exported is what the client would have
             // read back.
+            //
+            // It is not run as a CALL OF THIS EXTENSION, though: the statement path it goes
+            // down is the one that recognises `aws_s3` calls, so a query that is itself such a
+            // call would re-enter this function once per level and the nesting would be the
+            // statement's to choose rather than this emulator's. "The SQL query that the
+            // PostgreSQL server runs" is a query of the database, so one that names this
+            // schema is refused before it runs — the one depth bound this path needs, taken
+            // from the text the call carried and not from how far a run has already gone.
+            if names_the_schema(query) {
+                return Err(nested_export());
+            }
             let answer = wire_session::run_statement(database, facts, query, &[])?;
             if answer.result.columns.is_empty() {
                 return Err(EngineError::new(
@@ -874,6 +904,10 @@ pub fn serve(
                     key: object.key.clone(),
                     body,
                 }],
+                // The extension's own statement names no KMS key, so the object is stored
+                // under the destination bucket's default encryption configuration, exactly
+                // as any other write that names none is.
+                None,
             );
             if written.objects == 0 {
                 return Err(EngineError::new(
