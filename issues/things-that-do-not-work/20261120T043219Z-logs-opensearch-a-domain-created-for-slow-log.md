@@ -1,0 +1,51 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: logs__opensearch.obs-opensearch-3-index-slow-and-application-logs-publish-to-their-own-log-groups logs__opensearch.opensearch-search-slow-logs-reach-the-log-group-only-for-an-index-over-threshold
+Issue-Key: logs__opensearch.obs-opensearch-3-index-slow-and-application-logs-publish-to-their-own-log-groups|run#52|Timeout|time.sleep(2)
+Issue-Key: logs__opensearch.opensearch-search-slow-logs-reach-the-log-group-only-for-an-index-over-threshold|run#43|Timeout|time.sleep(2)
+Issue-Commit: c2a9aa425461796da61883782981cd948eb4a841
+
+# logs__opensearch: a domain created for slow-log / application-log publishing never converges to a usable domain, so the INDEX_SLOW_LOGS, SEARCH_SLOW_LOGS and ES_APPLICATION_LOGS delivery scenarios reach no verdict
+
+> _Note: this issue was identified against the code base at commit `c2a9aa425461796da61883782981cd948eb4a841`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+DescribeDomain
+
+## Description
+One net-new root cause with two grounded checks (Cause 1 of 1).
+
+Cause 1 of 1: an OpenSearch Service domain created with the cheapest legal single-node topology (OpenSearch_2.11, t3.small.search, 1 node, no dedicated master, no zone awareness, gp3 10 GiB EBS) never converges to a settled, searchable domain, so neither the index/application-log scenario nor the search-slow-log scenario ever gets as far as enabling log publishing, writing a document, or reading a delivered event out of CloudWatch Logs. Both checks make no observable progress and are cut off at the harness cap (60.0 s). Failing checks: logs__opensearch.obs-opensearch-3-index-slow-and-application-logs-publish-to-their-own-log-groups, logs__opensearch.opensearch-search-slow-logs-reach-the-log-group-only-for-an-index-over-threshold.
+
+AWS: Smithy (opensearch) DescribeDomain GET /2021-01-01/opensearch/domain/{DomainName} -> DomainStatus, whose members include Created, Processing ('True if OpenSearch Service is processing configuration changes. False if the configuration is active'), Endpoint ('Domain-specific endpoint used to submit index, search, and data upload requests'), DomainProcessingStatus and LogPublishingOptions; UpdateDomainConfig POST /2021-01-01/opensearch/domain/{DomainName}/config takes LogPublishingOptions keyed by LogType (enum: INDEX_SLOW_LOGS, SEARCH_SLOW_LOGS, ES_APPLICATION_LOGS, AUDIT_LOGS) and answers ValidationException (400) for an invalid option such as a CloudWatchLogsLogGroupArn naming a log group that does not exist. On AWS a newly created domain reaches Created=true / Processing=false and publishes an Endpoint, and both of these checks then proceed: the nonexistent-log-group UpdateDomainConfig is refused synchronously with ValidationException and leaves no enabled option behind, the real grant is accepted, DescribeDomain echoes each group ARN under its own LogType with Enabled=true, and writes/queries over the domain endpoint produce slow-log events only in the group of the matching LogType and only for the index whose threshold is exceeded (index.indexing.slowlog.threshold.index.warn / index.search.slowlog.threshold.query.warn of '0ms' logs every operation; '-1' is the documented default and disables it).
+Emulator: both checks terminate with 'Error: Check timed out after 60.0s' and reach none of those assertions. The checks' own budgets are generous (_wait_settled / _wait_searchable allow 1200-2400 s), so the domain readiness poll — DescribeDomain reporting Created=true, Processing=false and a usable Endpoint — is the first thing that never satisfies its predicate, and the harness cap fires. Hypothesis: the domain stays Processing (or publishes an Endpoint that is not served) indefinitely; the replay output states only the timeout, so the exact blocking poll is not attributable from this run. Net effect: the whole log-publishing surface for INDEX_SLOW_LOGS, SEARCH_SLOW_LOGS and ES_APPLICATION_LOGS is unverifiable, including the ValidationException refusal for a nonexistent destination log group.
+Why: a client that provisions a domain and turns on slow-log or application-log publishing gets a domain that never becomes usable and never answers, so it cannot index, query, or observe a single delivered log record; and because the control plane never refuses, there is no error code or message to act on — only a hang. Any pipeline that waits on DescribeDomain Processing=false (CloudFormation, the CLI waiters, CDK) blocks forever.
+Fix: the OpenSearch domain lifecycle/state machine behind CreateDomain and DescribeDomain (it must drive Created=true / Processing=false / DomainProcessingStatus to an active state and publish an Endpoint the emulator actually serves), the UpdateDomainConfig LogPublishingOptions handler and its validation of the destination log group, and the slow-log/application-log delivery path that must write events into the named CloudWatch Logs group for the matching LogType.
+Related open filings that do NOT carry these replay keys: 20261108T145640Z-logs-opensearch-opensearch-the-audit-log-delivery-scenario-never-converges.md and 20261119T165842Z-logs-opensearch-the-audit-logs-document-get-audit.md describe the same non-convergence for AUDIT_LOGS, and 20261110T162352Z-opensearch-chained-waits-for-a-domain-and-its.md reports domain waits never converging under the 'opensearch' heading; none of them carries the two replay keys below, so these checks survive as live failures.
+Traces: logs__opensearch.obs-opensearch-3-index-slow-and-application-logs-publish-to-their-own-log-groups and logs__opensearch.opensearch-search-slow-logs-reach-the-log-group-only-for-an-index-over-threshold, both 'Check timed out after 60.0s'.
+
+## Evidence
+Replay of suite simparity-behavioral-aws-v1 against the booted emulator. Service heading logs__opensearch: 9/16 (56%), 7 failed; 5 of the failures are OWNED by open filings, the two ids below survive.
+
+[mismatch] logs__opensearch.obs-opensearch-3-index-slow-and-application-logs-publish-to-their-own-log-groups
+  Error: Check timed out after 60.0s
+  Expected: two log groups each with a RESOURCE-scoped policy granting es.amazonaws.com logs:PutLogEvents/logs:CreateLogStream; CreateDomain with no publishing settles (DescribeDomain Created=true, Processing=false, Endpoint published); UpdateDomainConfig naming a nonexistent log group ARN is refused 400 ValidationException and leaves no enabled option or trace of that ARN; the same call with the two real group ARNs is accepted; DescribeDomain echoes INDEX_SLOW_LOGS -> index group ARN and ES_APPLICATION_LOGS -> app group ARN with Enabled=true and nothing else enabled; the 0ms-threshold index logs a write into the index group only.
+  Actual: no verdict at all — the check makes no observable progress and is cut off at the 60 s cap, before the domain is ever reported settled.
+
+[mismatch] logs__opensearch.opensearch-search-slow-logs-reach-the-log-group-only-for-an-index-over-threshold
+  Error: Check timed out after 60.0s
+  Expected: the log group and its RESOURCE-scoped es.amazonaws.com policy round-trip through DescribeResourcePolicies; the domain settles and becomes searchable; a disabled->enabled UpdateDomainConfig enabling SEARCH_SLOW_LOGS is accepted and DescribeDomain reports SEARCH_SLOW_LOGS Enabled=true; a query against the index whose index.search.slowlog.threshold.query.warn is '0ms' delivers a slow-log event to the group while the twin index at '-1' delivers nothing.
+  Actual: no verdict at all — same 60 s cut-off.
+
+Smithy consulted (model services/service-com-amazonaws-opensearch-amazonopensearchservice/smithy-model/com-amazonaws-opensearch-amazonopensearchservice.json): DescribeDomain (GET /2021-01-01/opensearch/domain/{DomainName}, output DomainStatus required; errors BaseException 400, InternalException 500, ResourceNotFoundException 409, ValidationException 400); DomainStatus members Created/Deleted/Processing/Endpoint/DomainProcessingStatus/LogPublishingOptions; UpdateDomainConfig (POST /2021-01-01/opensearch/domain/{DomainName}/config, LogPublishingOptions map, errors include ValidationException 400); LogType enum = INDEX_SLOW_LOGS, SEARCH_SLOW_LOGS, ES_APPLICATION_LOGS, AUDIT_LOGS. Slow-log threshold semantics and the ~30-minute publishing-enable window: recorded behavior plus the OpenSearch Service developer guide the checks cite.
+
+## Steps to Reproduce
+1. Clone the repo and replay the behavioral suite; both ids in trace_ids reproduce as 'Check timed out after 60.0s'.
+2. Create a CloudWatch Logs log group and PutResourcePolicy a RESOURCE-scoped policy on <group ARN> granting Service es.amazonaws.com logs:PutLogEvents and logs:CreateLogStream on '<group ARN>:*', conditioned on aws:SourceAccount and ArnLike aws:SourceArn arn:aws:es:<region>:<account>:domain/<domain>.
+3. CreateDomain <domain> with EngineVersion OpenSearch_2.11, ClusterConfig {InstanceType t3.small.search, InstanceCount 1, DedicatedMasterEnabled false, ZoneAwarenessEnabled false}, EBSOptions {EBSEnabled true, gp3, 10}, and NO LogPublishingOptions.
+4. Poll DescribeDomain for DomainStatus.Created=true, Processing=false and a published Endpoint. Expected: it settles. Actual: the readiness poll never satisfies that predicate and the check is cut off.
+5. Once settled, call UpdateDomainConfig with LogPublishingOptions {INDEX_SLOW_LOGS: {CloudWatchLogsLogGroupArn: arn:aws:logs:<region>:<account>:log-group:<a group nobody created>, Enabled: true}}. Expected: HTTP 400 ValidationException, and DescribeDomain shows no enabled option and no trace of that ARN.
+6. Call UpdateDomainConfig with the real granted group ARNs for INDEX_SLOW_LOGS and ES_APPLICATION_LOGS (and separately SEARCH_SLOW_LOGS in the second scenario). Expected: accepted; DescribeDomain echoes each ARN under its own LogType with Enabled=true.
+7. Set the index-level slowlog threshold to '0ms' on one index and '-1' on a twin, then index/query both. Expected: events for the 0ms index only, in the group of the matching LogType.
+8. Re-replay both ids in trace_ids to confirm the fix.
