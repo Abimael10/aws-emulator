@@ -14,8 +14,9 @@
 //!    in ARN" BEFORE the identifier is resolved — so the refusal does not depend on what
 //!    this store happens to hold, nor on the FORM of the id the ARN carries. The rows span
 //!    the operations that resolve such an identifier, the member kinds an ARN reaches them
-//!    through (`cluster`, `task`, a list of tasks or clusters, `containerInstance`, an
-//!    `attachmentArn`, a tagging `resourceArn`) and the Region the ARN carries.
+//!    through (`cluster`, `task`, a list of tasks, clusters, services, container instances,
+//!    task sets or capacity providers, `containerInstance`, the `service` a task-set read
+//!    names, an `attachmentArn`, a tagging `resourceArn`) and the Region the ARN carries.
 //! 2. The refusal is about the ARN's REGION and not about ARNs: the same request carrying
 //!    the same identifier in THIS Region's spelling resolves as the identifier it is, and an
 //!    ARN with no Region segment at all carries no Region to disagree with.
@@ -56,6 +57,16 @@ const INSTANCE_ID: &str = "fedcba9876543210fedcba9876543210";
 
 /// An attachment id of the form an attachment carries.
 const ATTACHMENT_ID: &str = "11111111-2222-3333-4444-555555555555";
+
+/// The service every service-shaped row below names, created in the fixture so the rows that
+/// carry THIS Region's spelling resolve to a service that exists.
+const SERVICE: &str = "regionscopeservice";
+
+/// The id segment a task-set ARN carries after its `ecs-svc/` prefix.
+const TASK_SET_ID: &str = "1234567890123456789";
+
+/// The capacity provider every provider-shaped row names.
+const CAPACITY_PROVIDER: &str = "FARGATE";
 
 /// Region segments that are NOT the Region these requests are addressed to
 /// ([`SIGNED_REGION`]), each with the partition it belongs to. The first five are Region
@@ -121,6 +132,33 @@ fn instance_arn_without_an_id(partition: &str, region: &str) -> String {
 /// An attachment ARN in `partition` and `region`.
 fn attachment_arn(partition: &str, region: &str) -> String {
     ecs_arn(partition, region, &format!("attachment/{ATTACHMENT_ID}"))
+}
+
+/// The service the service-shaped rows name:
+/// `arn:<partition>:ecs:<region>:<account>:service/<cluster>/<name>`.
+fn service_arn(partition: &str, region: &str) -> String {
+    ecs_arn(partition, region, &format!("service/{CLUSTER}/{SERVICE}"))
+}
+
+/// A task set of that service:
+/// `arn:<partition>:ecs:<region>:<account>:task-set/<cluster>/<service>/<id>`, the id
+/// carrying the `ecs-svc/` prefix a task set's own id has.
+fn task_set_arn(partition: &str, region: &str) -> String {
+    ecs_arn(
+        partition,
+        region,
+        &format!("task-set/{CLUSTER}/{SERVICE}/ecs-svc/{TASK_SET_ID}"),
+    )
+}
+
+/// A capacity provider of this account:
+/// `arn:<partition>:ecs:<region>:<account>:capacity-provider/<name>`.
+fn capacity_provider_arn(partition: &str, region: &str) -> String {
+    ecs_arn(
+        partition,
+        region,
+        &format!("capacity-provider/{CAPACITY_PROVIDER}"),
+    )
 }
 
 /// Every operation that resolves a caller-supplied ARN identifier on this surface, one row
@@ -239,6 +277,43 @@ fn arn_rows() -> Vec<ArnRow> {
             code: "InvalidParameterException",
         },
         ArnRow {
+            case: "DescribeContainerInstances, an instance of the list",
+            operation: "DescribeContainerInstances",
+            arn: instance_arn,
+            request: |arn| json!({ "cluster": CLUSTER, "containerInstances": [arn] }),
+            code: "InvalidParameterException",
+        },
+        ArnRow {
+            case: "DescribeServices, a service of the list",
+            operation: "DescribeServices",
+            arn: service_arn,
+            request: |arn| json!({ "cluster": CLUSTER, "services": [arn] }),
+            code: "InvalidParameterException",
+        },
+        ArnRow {
+            case: "DescribeTaskSets, the service that owns them",
+            operation: "DescribeTaskSets",
+            arn: service_arn,
+            request: |arn| json!({ "cluster": CLUSTER, "service": arn }),
+            code: "InvalidParameterException",
+        },
+        ArnRow {
+            case: "DescribeTaskSets, a task set of the list",
+            operation: "DescribeTaskSets",
+            arn: task_set_arn,
+            request: |arn| {
+                json!({ "cluster": CLUSTER, "service": SERVICE, "taskSets": [arn] })
+            },
+            code: "InvalidParameterException",
+        },
+        ArnRow {
+            case: "DescribeCapacityProviders, a provider of the list",
+            operation: "DescribeCapacityProviders",
+            arn: capacity_provider_arn,
+            request: |arn| json!({ "capacityProviders": [arn] }),
+            code: "InvalidParameterException",
+        },
+        ArnRow {
             case: "UpdateContainerInstancesState, an instance of the list",
             operation: "UpdateContainerInstancesState",
             arn: instance_arn,
@@ -270,12 +345,26 @@ fn arn_rows() -> Vec<ArnRow> {
     ]
 }
 
-/// A router holding the cluster the rows act in, with capacity, and one revision of
-/// [`FAMILY`].
+/// A router holding the cluster the rows act in, with capacity, one revision of
+/// [`FAMILY`] and one service of [`SERVICE`] — so a row carrying THIS Region's spelling
+/// names a resource that exists.
 async fn fixture() -> MultiServiceRouter {
     let router = service();
     cluster_with_capacity(&router, CLUSTER, "fixture").await;
     register_definition(&router, FAMILY, "fixture").await;
+    ok(
+        &router,
+        "CreateService",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": SERVICE,
+            "taskDefinition": FAMILY,
+            "desiredCount": 0,
+            "launchType": "EC2",
+        }),
+        "fixture",
+    )
+    .await;
     router
 }
 

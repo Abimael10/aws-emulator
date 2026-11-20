@@ -25,7 +25,10 @@
 //!   result."
 //! * `ListServiceDeployments$createdAt`: "An optional filter you can use to narrow the
 //!   results by the service creation date", whose `before`/`after` members "Include
-//!   service deployments in the result that were created before/after this time".
+//!   service deployments in the result that were created before/after this time". The window
+//!   it asks for is bounded by the history there is to report: a bound reaching further back
+//!   than the deployment records are kept for is refused with the sentence naming that
+//!   window, whichever end of the filter carries it.
 //! * `ListServiceDeployments$maxResults`: "This value can be between 1 and 100. If this
 //!   parameter isn't used, then ListServiceDeployments returns up to 20 results and a
 //!   nextToken value if applicable."
@@ -915,4 +918,177 @@ async fn list_service_deployments_resolves_one_service_and_refuses_what_names_no
         case,
     )
     .await;
+}
+
+/// The window a deployment-history `createdAt` filter may reach back over, read from the ONE
+/// place this service states it
+/// (`state::DEPLOYMENT_HISTORY_WINDOW`), so this suite and the
+/// service cannot disagree about where the published bound sits.
+pub(crate) const HISTORY_WINDOW: Duration =
+    service_com_amazonaws_ecs_amazonec2containerservicev20141113::state::DEPLOYMENT_HISTORY_WINDOW;
+
+/// The sentence a `createdAt` bound outside that window earns. Shared with the DAEMON
+/// deployment listing's suite ([`crate::daemon_deployment_listing_pages`]), which is held to
+/// the same rule, so the two cannot drift on what they claim Amazon ECS says.
+pub(crate) const HISTORY_WINDOW_SENTENCE: &str =
+    "Before and After time filter must be within the last 3 months.";
+
+/// Now, in the epoch seconds a modelled timestamp travels as in this protocol's bodies.
+pub(crate) fn epoch_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("a clock after the epoch")
+        .as_secs_f64()
+}
+
+/// How many seconds one hour is, as the step each row below sits either side of the window's
+/// own edge by.
+pub(crate) const HOUR: f64 = 3_600.0;
+
+#[tokio::test]
+async fn a_created_at_bound_older_than_the_retained_history_is_refused() {
+    let router = service();
+    let case = "setup";
+    create_cluster(&router, "retained", case).await;
+    register_definition(&router, "retainedfamily", case).await;
+    let created = create_service(&router, "retained", "web", "retainedfamily", 0, case).await;
+    let service_arn = string(&created, "serviceArn", case);
+
+    let now = epoch_seconds();
+    let window = HISTORY_WINDOW.as_secs_f64();
+
+    // Each row is a bound placed relative to the window's own edge: just past it, far past
+    // it, on either end of the window and on both ends at once — because the sentence holds
+    // BOTH bounds to the window, so which end carries the offending value does not change
+    // the answer.
+    let refused_rows: Vec<(&str, Value)> = vec![
+        (
+            "after an hour past the edge of the window",
+            json!({ "after": now - window - HOUR }),
+        ),
+        (
+            "before an hour past the edge of the window",
+            json!({ "before": now - window - HOUR }),
+        ),
+        (
+            "both bounds past the edge of the window",
+            json!({ "after": now - window - 2.0 * HOUR, "before": now - window - HOUR }),
+        ),
+        (
+            "after inside the window with before past its edge",
+            json!({ "after": now - HOUR, "before": now - window - HOUR }),
+        ),
+        (
+            "a bound a year back",
+            json!({ "after": now - 365.0 * 24.0 * HOUR }),
+        ),
+        (
+            "a bound at the epoch",
+            json!({ "before": 0.0 }),
+        ),
+    ];
+    for (case, filter) in refused_rows {
+        let (code, message) = refusal(
+            &router,
+            "ListServiceDeployments",
+            json!({ "cluster": "retained", "service": "web", "createdAt": filter }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("InvalidParameterException", HISTORY_WINDOW_SENTENCE),
+            "case {case:?}: expected the window the filter has to fall inside, got {code:?} \
+             with {message:?}"
+        );
+    }
+
+    // Inside the window the filter is SERVED, and the rows span both ends of it, a window
+    // wholly inside it and a bound in the future — which the sentence does not bound, since
+    // what it bounds is how far BACK a filter reaches.
+    let served_rows: Vec<(&str, Value)> = vec![
+        (
+            "after an hour inside the edge of the window",
+            json!({ "after": now - window + HOUR }),
+        ),
+        ("before now", json!({ "before": now })),
+        (
+            "a window wholly inside the retained one",
+            json!({ "after": now - window + HOUR, "before": now + HOUR }),
+        ),
+        (
+            "before a bound in the future",
+            json!({ "before": now + window }),
+        ),
+    ];
+    for (case, filter) in served_rows {
+        let deployments = all_deployments(
+            &router,
+            json!({ "cluster": "retained", "service": "web", "createdAt": filter }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            deployment_arns(&deployments, case).len(),
+            1,
+            "case {case:?}: expected the create's own deployment inside the window, got \
+             {deployments:?}"
+        );
+        assert_history_shape(&deployments, &service_arn, case);
+    }
+
+    // A filter the request omits bounds nothing, so the history reads whole.
+    let case = "no createdAt filter";
+    let deployments = all_deployments(
+        &router,
+        json!({ "cluster": "retained", "service": "web" }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        deployments.len(),
+        1,
+        "case {case:?}: expected the create's own deployment, got {deployments:?}"
+    );
+
+    // The window the sentence names is THREE MONTHS, so a bound inside the third month back
+    // is served and one past it is refused — pinned at literal offsets, which fixes the
+    // window's own value rather than only the rows measured from it.
+    let day = 24.0 * HOUR;
+    let case = "a bound 89 days back";
+    let deployments = all_deployments(
+        &router,
+        json!({
+            "cluster": "retained",
+            "service": "web",
+            "createdAt": { "after": now - 89.0 * day },
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        deployments.len(),
+        1,
+        "case {case:?}: expected a bound inside the three months to be served, got \
+         {deployments:?}"
+    );
+
+    let case = "a bound 91 days back";
+    let (code, message) = refusal(
+        &router,
+        "ListServiceDeployments",
+        json!({
+            "cluster": "retained",
+            "service": "web",
+            "createdAt": { "after": now - 91.0 * day },
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("InvalidParameterException", HISTORY_WINDOW_SENTENCE),
+        "case {case:?}: expected a bound past the three months to be refused, got {code:?} \
+         with {message:?}"
+    );
 }

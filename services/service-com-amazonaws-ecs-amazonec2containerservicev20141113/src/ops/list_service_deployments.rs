@@ -249,6 +249,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // "An optional filter you can use to narrow the results by the service creation
+        // date": the window a filter asks for is bounded by the history there is to report —
+        // a bound reaching further back than the deployment records are kept for names a time
+        // this listing has nothing for, so the filter is refused rather than served from what
+        // falls inside it ([`crate::state::created_at_window_violation`]).
+        if let Some(message) = crate::state::created_at_window_violation(
+            input.created_at.as_ref(),
+            ::std::time::SystemTime::now(),
+        ) {
+            return Err(
+                ListServiceDeploymentsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // "The ARN or name of the service", and "The cluster that hosts the service. This
         // can either be the cluster name or ARN. ... If you don't specify a cluster,
         // default is used." A service ARN carries the cluster that hosts it, so an ARN

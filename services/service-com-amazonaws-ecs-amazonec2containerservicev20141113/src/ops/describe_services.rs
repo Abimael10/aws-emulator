@@ -171,10 +171,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // An ARN is a WHOLE identifier, Region and account included, so both segments are
-        // checked before the identifier is resolved
-        // ([`crate::state::request_arn_violation`]).
-        if let Some(message) = crate::state::request_arn_violation(ctx, input.cluster.as_deref()) {
+        // An ARN is a WHOLE identifier, Region and account included, so both segments of
+        // every identifier the request carries are checked before any of them is resolved
+        // ([`crate::state::request_arn_violation`]) — the cluster that hosts the services and
+        // each service the request names, since an ARN that addresses another Region or
+        // another account names no service of this endpoint whichever member carried it. The
+        // scan is over the list the bound above has already clamped.
+        let references = input
+            .cluster
+            .as_deref()
+            .into_iter()
+            .chain(input.services.iter().map(String::as_str));
+        if let Some(message) = crate::state::request_arn_violation(ctx, references) {
             return Err(DescribeServicesErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message.to_string()),
@@ -186,6 +194,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
         let region = crate::state::request_region(ctx);
         let fields = crate::state::ServiceFields::from_include(input.include.as_ref());
+
+        // A service ARN carries the cluster that hosts it, so an ARN names the cluster too,
+        // while `cluster` is what names it otherwise — the default cluster for a request that
+        // names none. An entry naming a DIFFERENT cluster from the one the request addresses
+        // names no service at all, which is the bad parameter it is rather than a report about
+        // either cluster: the two identifiers of ONE request disagreeing is a property of the
+        // request, so it is answered before either of them is resolved against the store, and
+        // ahead of what this account holds. The refusal `DeleteService` and `UpdateService`
+        // answer a cross-cluster `service` reference with
+        // ([`crate::state::SERVICE_NOT_WITHIN_CLUSTER_MESSAGE`]).
+        if input.services.iter().any(|reference| {
+            crate::state::cluster_and_service_from_reference(reference)
+                .0
+                .is_some_and(|from_arn| from_arn != cluster_name)
+        }) {
+            return Err(DescribeServicesErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::SERVICE_NOT_WITHIN_CLUSTER_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // Everything the CLOCK owes this read, materialised before the counts below are
         // read: the capacity the account's Amazon EC2 instances owe their clusters (an
@@ -220,29 +250,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut services = Vec::new();
         let mut failures = Vec::new();
-        // A service is reported once however many times the request names it: the same
-        // name repeated names the same service, so it is one answer, not one per entry.
+        // A list that REPEATS an entry is refused before this runs, as the malformed request
+        // it is ([`crate::service::refusal_wording`]). What is left is two entries that spell
+        // the same service two ways — its name and its ARN — which name one service, so it is
+        // one answer and not one per entry.
         let mut seen = ::std::collections::HashSet::new();
         for reference in &input.services {
-            // A service ARN carries the cluster that hosts it, so an ARN names the cluster
-            // too, while `cluster` is what names it otherwise. Naming two different
-            // clusters in one entry names no service at all, which is the bad parameter it
-            // is rather than a `MISSING` failure — the refusal `DeleteService` and
-            // `UpdateService` answer a cross-cluster `service` reference with
-            // ([`crate::state::SERVICE_NOT_WITHIN_CLUSTER_MESSAGE`]).
-            let (arn_cluster, name) = crate::state::cluster_and_service_from_reference(reference);
-            if let Some(from_arn) = arn_cluster.as_deref() {
-                if from_arn != cluster_name {
-                    return Err(DescribeServicesErrorModeled::InvalidParameterException(
-                        InvalidParameterException {
-                            message: Some(
-                                crate::state::SERVICE_NOT_WITHIN_CLUSTER_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                    .into());
-                }
-            }
+            let (_, name) = crate::state::cluster_and_service_from_reference(reference);
             if !seen.insert(name.clone()) {
                 continue;
             }

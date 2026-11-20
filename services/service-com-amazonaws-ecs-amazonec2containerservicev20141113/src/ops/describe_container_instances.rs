@@ -163,19 +163,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let region = crate::state::request_region(ctx);
-        // An ARN is a WHOLE identifier, Region and account included, so both segments are
-        // checked before the identifier is resolved
-        // ([`crate::state::request_arn_violation`]).
-        if let Some(message) = crate::state::request_arn_violation(ctx, input.cluster.as_deref()) {
-            return Err(
-                DescribeContainerInstancesErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message.to_string()),
-                    },
-                )
-                .into(),
-            );
-        }
 
         let cluster_name = crate::state::cluster_name_from_reference(input.cluster.as_deref());
         let fields = crate::state::ContainerInstanceFields::from_include(input.include.as_ref());
@@ -190,6 +177,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "container instances",
                             crate::state::MAX_DESCRIBE_BATCH,
                         )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An ARN is a WHOLE identifier, Region and account included, so both segments of
+        // every identifier the request carries are checked before any of them is resolved
+        // ([`crate::state::request_arn_violation`]) — the cluster and each container instance
+        // the request names, since an ARN that addresses another Region or another account
+        // names no instance of this endpoint whichever member carried it. The scan is over
+        // the list the bound above has already clamped.
+        let references = input
+            .cluster
+            .as_deref()
+            .into_iter()
+            .chain(input.container_instances.iter().map(String::as_str));
+        if let Some(message) = crate::state::request_arn_violation(ctx, references) {
+            return Err(
+                DescribeContainerInstancesErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
                     },
                 )
                 .into(),

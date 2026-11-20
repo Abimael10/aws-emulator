@@ -212,6 +212,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "An optional filter to narrow the ListDaemonDeployments results by creation time":
+        // the window a filter asks for is bounded by the history there is to report — a bound
+        // reaching further back than the deployment records are kept for names a time this
+        // listing has nothing for, so the filter is refused rather than served from what
+        // falls inside it ([`crate::state::created_at_window_violation`]).
+        if let Some(message) = crate::state::created_at_window_violation(
+            input.created_at.as_ref(),
+            ::std::time::SystemTime::now(),
+        ) {
+            return Err(ListDaemonDeploymentsErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // "The Amazon Resource Name (ARN) of the daemon to list deployments for": the member
         // takes an ARN and nothing else, so the SHAPE of the identifier is settled before
         // any state is consulted ([`crate::state::is_daemon_arn`]) — a value that could name

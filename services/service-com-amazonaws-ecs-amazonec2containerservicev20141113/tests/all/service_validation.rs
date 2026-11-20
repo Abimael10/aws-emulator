@@ -18,7 +18,15 @@
 //!   which is the identity the session signs with;
 //! * a `CODE_DEPLOY`-controlled service requires a load-balancer binding;
 //! * a `loadBalancers` binding may only name a container the revision declares, and a
-//!   container port that container declares in its `portMappings`.
+//!   container port that container declares in its `portMappings`;
+//! * a service the blue/green (`CODE_DEPLOY`) controller deploys runs the revision and the
+//!   networking of the task set that controller shifts traffic onto, so `UpdateService`
+//!   changes neither — while the members that API does take are still served, and the same
+//!   update is served on a sibling the ECS scheduler deploys;
+//! * the deployment circuit breaker pairs only with the rolling update (`ECS`) controller
+//!   ("The deployment circuit breaker can only be used for services using the rolling update
+//!   (`ECS`) deployment type"), so turning it on under another controller and moving a
+//!   service whose breaker is on onto another controller are refused alike.
 //!
 //! The rows span the operations that launch tasks (`CreateService`, `RunTask`,
 //! `UpdateService`) and, within each rule, the inputs the rule generalises over: every
@@ -819,4 +827,371 @@ async fn a_task_on_an_auto_scaling_group_provider_needs_capacity_unless_it_scale
             "case {case:?}: expected the refusal to name the provider the placement used"
         );
     }
+}
+
+/// The sentence an update of a blue/green service earns for each member only a CodeDeploy
+/// deployment changes, in the order the rows below submit them.
+const CODE_DEPLOY_IMMUTABLE: [&str; 2] = [
+    "Unable to update task definition on services with a CODE_DEPLOY deployment controller. \
+     Use AWS CodeDeploy to trigger a new deployment.",
+    "Unable to update network parameters on services with a CODE_DEPLOY deployment \
+     controller. Use AWS CodeDeploy to trigger a new deployment.",
+];
+
+/// The sentence a deployment circuit breaker paired with any other controller earns.
+const CIRCUIT_BREAKER_ECS_ONLY: &str =
+    "Deployment circuit breaker feature is only supported with ECS (rolling update) \
+     deployment controller. Update to ECS deployment controller and try again.";
+
+/// A router holding [`CLUSTER`] with capacity, one `bridge` revision of `family` whose `app`
+/// container publishes port 80, and a target group an Application Load Balancer forwards to —
+/// the binding a `CODE_DEPLOY` service requires. Returns that binding.
+async fn blue_green_fixture(router: &MultiServiceRouter, family: &str, group: &str) -> Value {
+    let case = "setup";
+    cluster_with_capacity(router, CLUSTER, case).await;
+    register(
+        router,
+        family,
+        json!({ "networkMode": "bridge" }),
+        json!([{
+            "name": "app",
+            "image": "public.ecr.aws/nginx/nginx:latest",
+            "memory": 128,
+            "portMappings": [{ "containerPort": 80 }],
+        }]),
+        case,
+    )
+    .await;
+    let target_group =
+        crate::load_balancer_target_groups::create_target_group(router, group, "instance", case)
+            .await;
+    json!([{ "targetGroupArn": target_group, "containerName": "app", "containerPort": 80 }])
+}
+
+#[tokio::test]
+async fn a_blue_green_service_refuses_the_members_only_a_code_deploy_deployment_changes() {
+    // BOTH stores, for the reason the binding suites give: the binding names a real target
+    // group, read from the Elastic Load Balancing v2 service's own store.
+    let router = crate::load_balancer_target_groups::emulator();
+    let family = "bluegreenapp";
+    let binding = blue_green_fixture(&router, family, "bluegreen-tg").await;
+
+    // One service under each controller, so every row below is run against the blue/green
+    // service and against a sibling the ECS scheduler deploys.
+    for (name, controller) in [("bluegreen", "CODE_DEPLOY"), ("rolling", "ECS")] {
+        ok(
+            &router,
+            "CreateService",
+            json!({
+                "cluster": CLUSTER,
+                "serviceName": name,
+                "taskDefinition": family,
+                "desiredCount": 0,
+                "loadBalancers": binding,
+                "deploymentController": { "type": controller },
+            }),
+            "setup",
+        )
+        .await;
+    }
+
+    // A SECOND revision of the same family, registered once both services run the first, so
+    // a row can try to move the service onto another revision as well as re-submitting the
+    // one it runs.
+    let second = register(
+        &router,
+        family,
+        json!({ "networkMode": "bridge" }),
+        json!([{
+            "name": "app",
+            "image": "public.ecr.aws/nginx/nginx:latest",
+            "memory": 256,
+            "portMappings": [{ "containerPort": 80 }],
+        }]),
+        "setup",
+    )
+    .await;
+
+    // The rows differ along WHICH member the update submits and what it submits in it: the
+    // revision the service already runs, another revision of the same family, and a network
+    // configuration. Each earns the sentence for its own member.
+    let rows: [(&str, Value, &str); 3] = [
+        (
+            "the revision the service already runs",
+            json!({ "taskDefinition": family }),
+            CODE_DEPLOY_IMMUTABLE[0],
+        ),
+        (
+            "another revision of the same family",
+            json!({ "taskDefinition": second.clone() }),
+            CODE_DEPLOY_IMMUTABLE[0],
+        ),
+        (
+            "a network configuration",
+            json!({ "networkConfiguration": awsvpc_network_configuration() }),
+            CODE_DEPLOY_IMMUTABLE[1],
+        ),
+    ];
+    for (case, member, expected) in rows {
+        let mut request = json!({ "cluster": CLUSTER, "service": "bluegreen" });
+        for (name, value) in member.as_object().expect("the member is an object") {
+            request[name] = value.clone();
+        }
+        let (code, message) = refusal(&router, "UpdateService", request, case).await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("InvalidParameterException", expected),
+            "case {case:?}: expected the sentence the member earns on a blue/green service, \
+             got {code:?} with {message:?}"
+        );
+    }
+
+    // The refusals changed nothing: the service still runs the revision it was created with
+    // and carries no network configuration.
+    let case = "the blue/green service after the refusals";
+    let described = ok(
+        &router,
+        "DescribeServices",
+        json!({ "cluster": CLUSTER, "services": ["bluegreen"] }),
+        case,
+    )
+    .await;
+    let described = list(&described, "services", case);
+    let stored = described
+        .first()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the service to be described"));
+    assert!(
+        string(stored, "taskDefinition", case).ends_with(&format!("{family}:1")),
+        "case {case:?}: expected the first revision to be kept, got {stored}"
+    );
+    assert!(
+        stored["networkConfiguration"].is_null(),
+        "case {case:?}: expected no network configuration to be written, got {stored}"
+    );
+
+    // The members this API DOES take on such a service are served, and the same task
+    // definition update is served on the sibling the ECS scheduler deploys — the rule is
+    // keyed on the controller, not on the member.
+    let case = "the desired count of a blue/green service";
+    let updated = ok(
+        &router,
+        "UpdateService",
+        json!({
+            "cluster": CLUSTER,
+            "service": "bluegreen",
+            "desiredCount": 1,
+            "healthCheckGracePeriodSeconds": 30,
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        updated["service"]["desiredCount"].as_i64(),
+        Some(1),
+        "case {case:?}: expected the count this API does take to be applied, got {updated}"
+    );
+
+    let case = "another revision on the rolling-update sibling";
+    let updated = ok(
+        &router,
+        "UpdateService",
+        json!({ "cluster": CLUSTER, "service": "rolling", "taskDefinition": second }),
+        case,
+    )
+    .await;
+    assert!(
+        string(&updated["service"], "taskDefinition", case).ends_with(&format!("{family}:2")),
+        "case {case:?}: expected the sibling to move onto the second revision, got {updated}"
+    );
+}
+
+#[tokio::test]
+async fn the_deployment_circuit_breaker_pairs_only_with_the_rolling_update_controller() {
+    let router = crate::load_balancer_target_groups::emulator();
+    let family = "breakerapp";
+    let binding = blue_green_fixture(&router, family, "breaker-tg").await;
+
+    // One service per controller: the ECS scheduler's, the blue/green controller's (which
+    // requires the binding) and an EXTERNAL one, whose tasks come from a task set and which
+    // therefore names no task definition.
+    for (name, controller) in [("rolling", "ECS"), ("bluegreen", "CODE_DEPLOY")] {
+        ok(
+            &router,
+            "CreateService",
+            json!({
+                "cluster": CLUSTER,
+                "serviceName": name,
+                "taskDefinition": family,
+                "desiredCount": 0,
+                "loadBalancers": binding,
+                "deploymentController": { "type": controller },
+            }),
+            "setup",
+        )
+        .await;
+    }
+    ok(
+        &router,
+        "CreateService",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": "external",
+            "desiredCount": 0,
+            "deploymentController": { "type": "EXTERNAL" },
+        }),
+        "setup",
+    )
+    .await;
+
+    // Turning the breaker ON is refused for every controller that is not the rolling
+    // update, whichever of its members the request spells out — the flags alone, and the
+    // flags with a threshold beside them.
+    let breakers: [(&str, Value); 3] = [
+        ("the two flags", json!({ "enable": true, "rollback": true })),
+        (
+            "enable alone, the rest left to the service",
+            json!({ "enable": true }),
+        ),
+        (
+            "the flags with a threshold",
+            json!({
+                "enable": true,
+                "rollback": false,
+                "thresholdConfiguration": { "type": "BOUNDED_PERCENT", "value": 25 },
+            }),
+        ),
+    ];
+    for service_name in ["bluegreen", "external"] {
+        for (form, breaker) in &breakers {
+            let case = format!("{service_name} with {form}");
+            let (code, message) = refusal(
+                &router,
+                "UpdateService",
+                json!({
+                    "cluster": CLUSTER,
+                    "service": service_name,
+                    "deploymentConfiguration": { "deploymentCircuitBreaker": breaker },
+                }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                ("InvalidParameterException", CIRCUIT_BREAKER_ECS_ONLY),
+                "case {case:?}: expected the controller the breaker needs to be named, got \
+                 {code:?} with {message:?}"
+            );
+        }
+    }
+
+    // The ECS scheduler's own service takes it, and reports it back turned on.
+    let case = "the rolling-update service turning the breaker on";
+    let updated = ok(
+        &router,
+        "UpdateService",
+        json!({
+            "cluster": CLUSTER,
+            "service": "rolling",
+            "deploymentConfiguration": {
+                "deploymentCircuitBreaker": { "enable": true, "rollback": true },
+            },
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        updated["service"]["deploymentConfiguration"]["deploymentCircuitBreaker"]["enable"]
+            .as_bool(),
+        Some(true),
+        "case {case:?}: expected the breaker to be stored turned on, got {updated}"
+    );
+
+    // And once it IS on, the service cannot be moved onto another controller either: the
+    // pair is what the rule is about, so it is refused whichever half the request changes —
+    // and before the precondition a change of controller has of its own.
+    for controller in ["CODE_DEPLOY", "EXTERNAL"] {
+        let case = format!("moving a breaker-enabled service onto {controller}");
+        let (code, message) = refusal(
+            &router,
+            "UpdateService",
+            json!({
+                "cluster": CLUSTER,
+                "service": "rolling",
+                "deploymentController": { "type": controller },
+            }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("InvalidParameterException", CIRCUIT_BREAKER_ECS_ONLY),
+            "case {case:?}: expected the breaker to be named as what blocks the move, got \
+             {code:?} with {message:?}"
+        );
+    }
+
+    // What is NOT the breaker turned on is served under every controller: a configuration
+    // that names no breaker at all, and one whose breaker is explicitly off.
+    let served: [(&str, Value); 2] = [
+        (
+            "a configuration naming no breaker",
+            json!({ "maximumPercent": 200, "minimumHealthyPercent": 50 }),
+        ),
+        (
+            "a breaker that is explicitly off",
+            json!({ "deploymentCircuitBreaker": { "enable": false, "rollback": false } }),
+        ),
+    ];
+    for service_name in ["bluegreen", "external"] {
+        for (form, configuration) in &served {
+            let case = format!("{service_name} with {form}");
+            ok(
+                &router,
+                "UpdateService",
+                json!({
+                    "cluster": CLUSTER,
+                    "service": service_name,
+                    "deploymentConfiguration": configuration,
+                }),
+                &case,
+            )
+            .await;
+        }
+    }
+
+    // A service that already HOLDS the pair stays updatable: the refusal belongs to the
+    // request that would make the pair, so an update changing neither half of it is served.
+    // This is the service a create stored with the breaker on under the blue/green
+    // controller — `CreateService` does not refuse that pair yet — which must not be left
+    // un-updatable by the rule above.
+    let case = "a service created holding the pair";
+    ok(
+        &router,
+        "CreateService",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": "heldpair",
+            "taskDefinition": family,
+            "desiredCount": 0,
+            "loadBalancers": binding,
+            "deploymentController": { "type": "CODE_DEPLOY" },
+            "deploymentConfiguration": {
+                "deploymentCircuitBreaker": { "enable": true, "rollback": true },
+            },
+        }),
+        case,
+    )
+    .await;
+    let updated = ok(
+        &router,
+        "UpdateService",
+        json!({ "cluster": CLUSTER, "service": "heldpair", "desiredCount": 2 }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        updated["service"]["desiredCount"].as_i64(),
+        Some(2),
+        "case {case:?}: expected a service holding the pair to stay updatable, got {updated}"
+    );
 }

@@ -20,7 +20,12 @@
 //!   token resumes exactly where its page stopped, and a value this listing never minted
 //!   (one a caller assembled, one minted for another daemon's history, one minted by
 //!   another operation) names no page and is refused as the identifier that isn't valid it
-//!   is.
+//!   is;
+//! * the `createdAt` window a request asks for is bounded by the history there is to report
+//!   — a bound reaching further back than the deployment records are kept for is refused with
+//!   the sentence naming that window, whichever end of the filter carries it, which is the
+//!   SAME rule the service deployment listing is held to
+//!   ([`crate::list_service_deployments`]).
 //!
 //! Every case drives the emulator through the shared wire harness in [`crate::ecs_wire`],
 //! the same front door a client uses, so nothing reaches into the state struct and a page
@@ -34,6 +39,12 @@ use crate::daemon_scheduling::{
     IMAGE,
 };
 use crate::ecs_wire::{create_cluster, ok, refusal, service, string};
+// The window a deployment-history `createdAt` filter may reach back over and the sentence a
+// bound outside it earns are ONE rule of this service, shared with the SERVICE deployment
+// listing's suite rather than written again here, so the two suites cannot drift on it.
+use crate::list_service_deployments::{
+    epoch_seconds, HISTORY_WINDOW, HISTORY_WINDOW_SENTENCE, HOUR,
+};
 // The sentence a daemon-plane page size outside its range earns is the ONE sentence every
 // daemon-plane listing of this service words for it, so it is taken from where
 // `crate::page_size_range_refusals` already spells it rather than written again here: the
@@ -312,4 +323,79 @@ async fn a_deployment_listing_resumes_only_a_token_it_minted_for_that_daemon() {
         "case {CASE:?}: expected every rollout of the daemon after the refusals, got \
          {whole:?} with {token:?}"
     );
+}
+
+#[tokio::test]
+async fn a_created_at_bound_older_than_the_retained_history_is_refused() {
+    let router = service();
+    const CASE: &str = "one rollout of a daemon";
+    let (daemon_arn, newest_first) = daemon_history(&router, "daemon-window", 1, CASE).await;
+
+    let now = epoch_seconds();
+    let window = HISTORY_WINDOW.as_secs_f64();
+
+    // The same rule the SERVICE deployment listing is held to, on the listing that filters
+    // the daemon-plane history by the same `createdAt` window: each row places a bound either
+    // side of the window's own edge, on each end of the filter and on both at once.
+    for (row, filter) in [
+        (
+            "after an hour past the edge of the window",
+            json!({ "after": now - window - HOUR }),
+        ),
+        (
+            "before an hour past the edge of the window",
+            json!({ "before": now - window - HOUR }),
+        ),
+        (
+            "both bounds past the edge of the window",
+            json!({ "after": now - window - 2.0 * HOUR, "before": now - window - HOUR }),
+        ),
+        (
+            "after inside the window with before past its edge",
+            json!({ "after": now - HOUR, "before": now - window - HOUR }),
+        ),
+        ("a bound at the epoch", json!({ "before": 0.0 })),
+    ] {
+        let case = format!("a daemon deployment listing with {row}");
+        let (code, message) = refusal(
+            &router,
+            "ListDaemonDeployments",
+            json!({ "daemonArn": daemon_arn, "createdAt": filter }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("InvalidParameterException", HISTORY_WINDOW_SENTENCE),
+            "case {case:?}: expected the window the filter has to fall inside, got {code} \
+             with {message:?}"
+        );
+    }
+
+    // Inside the window the filter is SERVED, and the rollout the create started is reported.
+    for (row, filter) in [
+        (
+            "after an hour inside the edge of the window",
+            json!({ "after": now - window + HOUR }),
+        ),
+        ("before now", json!({ "before": now })),
+        (
+            "a window wholly inside the retained one",
+            json!({ "after": now - window + HOUR, "before": now + HOUR }),
+        ),
+    ] {
+        let case = format!("a daemon deployment listing with {row}");
+        let (page, token) = list_deployments_page(
+            &router,
+            json!({ "daemonArn": daemon_arn, "createdAt": filter }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            (reported(&page, &case), token.clone()),
+            (newest_first.clone(), None),
+            "case {case:?}: expected the rollout inside the window, got {page:?} with \
+             {token:?}"
+        );
+    }
 }

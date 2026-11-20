@@ -217,10 +217,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // An ARN is a WHOLE identifier, Region and account included, so both segments are
-        // checked before the identifier is resolved
-        // ([`crate::state::request_arn_violation`]).
-        if let Some(message) = crate::state::request_arn_violation(ctx, input.cluster.as_deref()) {
+        // An ARN is a WHOLE identifier, Region and account included, so both segments of
+        // every identifier the request carries are checked before any of them is resolved
+        // ([`crate::state::request_arn_violation`]) — the cluster and each capacity provider
+        // the request names, since an ARN that addresses another Region or another account
+        // names no provider of this endpoint whichever member carried it.
+        let references = input
+            .cluster
+            .as_deref()
+            .into_iter()
+            .chain(
+                input
+                    .capacity_providers
+                    .iter()
+                    .flatten()
+                    .map(String::as_str),
+            );
+        if let Some(message) = crate::state::request_arn_violation(ctx, references) {
             return Err(
                 DescribeCapacityProvidersErrorModeled::InvalidParameterException(
                     InvalidParameterException {

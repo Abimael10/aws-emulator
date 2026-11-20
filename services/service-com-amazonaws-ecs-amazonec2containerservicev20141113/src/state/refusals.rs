@@ -2985,6 +2985,52 @@ pub fn timestamp_key(at: DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
 }
 
+/// How far back a DEPLOYMENT HISTORY filter may reach. The deployment records a listing
+/// reports are kept for THREE MONTHS, which is the window the refusal a bound outside it
+/// earns states ([`DEPLOYMENT_HISTORY_WINDOW_MESSAGE`]) — counted here as three 30-day
+/// months, the shortest reading of it, so a window this service serves is one the records a
+/// listing would report can still be inside.
+pub const DEPLOYMENT_HISTORY_WINDOW: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
+/// `InvalidParameterException$message` for a `createdAt` filter reaching further back than
+/// [`DEPLOYMENT_HISTORY_WINDOW`]: the whole sentence is fixed, naming the window and neither
+/// of the two bounds — a caller that sent them holds them already, and which one it has to
+/// move is whichever falls outside.
+pub const DEPLOYMENT_HISTORY_WINDOW_MESSAGE: &str =
+    "Before and After time filter must be within the last 3 months.";
+
+/// The refusal a `createdAt` filter earns for reaching outside the window a deployment
+/// history is kept for, or `None` when every bound it STATES falls inside it — and for a
+/// request that carries no filter, which bounds nothing.
+///
+/// Both ends are held to the same window, which is what the sentence states: a listing can
+/// only report the records still kept, so neither end of the window a request asks for may
+/// name a time there is no history for, and the request is refused rather than served from
+/// whatever is left inside the window. A bound the filter omits is no bound.
+///
+/// Spelled once for every listing that filters a deployment history by creation date, so two
+/// of them cannot answer differently about the same window.
+///
+/// The window's own start is taken from `now` SATURATED at the epoch, so a clock that cannot
+/// reach three months back (one set before the epoch, which no store this serves can hold
+/// records from) leaves the window starting at the epoch rather than silently serving every
+/// bound.
+pub fn created_at_window_violation(
+    window: Option<&CreatedAt>,
+    now: SystemTime,
+) -> Option<&'static str> {
+    let window = window?;
+    let earliest = timestamp_key(DateTime::from(
+        now.checked_sub(DEPLOYMENT_HISTORY_WINDOW)
+            .unwrap_or(SystemTime::UNIX_EPOCH),
+    ));
+    [window.before, window.after]
+        .into_iter()
+        .flatten()
+        .any(|bound| timestamp_key(bound) < earliest)
+        .then_some(DEPLOYMENT_HISTORY_WINDOW_MESSAGE)
+}
+
 /// The `TargetType` a target group must carry to receive the tasks of a revision whose
 /// `networkMode` is `network_mode`.
 ///

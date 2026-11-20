@@ -42,6 +42,9 @@
 //! * **A required identifier the request leaves out, or names nothing at all in**, refused
 //!   with the one sentence that operation publishes for it — naming no member path, no value
 //!   and no count, which is what the framework's clause would state.
+//! * **A list of identifiers that names the same one twice**, refused as the malformed
+//!   request Amazon ECS calls it, with the fixed sentence that operation publishes — judged
+//!   on the list as the request spells it, before any entry is resolved.
 //!
 //! An operation absent from here, and a condition absent from the operation's own function,
 //! keeps exactly the refusal it had: there is no AWS sentence to put in its place.
@@ -110,6 +113,13 @@ const SERVICES_EMPTY_MESSAGE: &str = "Services cannot be empty";
 
 /// The member a service describe names the services to report on.
 const SERVICES_MEMBER: &str = "services";
+
+/// `DescribeServicesRequest$services` is "A list of services to describe. You may specify up
+/// to 10 services to describe in a single operation": one service is one entry of that list,
+/// so a list naming the same one twice asks for one service in two entries and is a MALFORMED
+/// request rather than a list of two services. Amazon ECS states that as one fixed sentence,
+/// naming neither the repeated entry nor how many times it was repeated. RECORDED behaviour.
+const DUPLICATE_SERVICE_NAMES_MESSAGE: &str = "Malformed request with duplicate service names.";
 
 /// `DescribeTasksRequest$tasks` is "A list of up to 100 task IDs or full ARN entries": a
 /// request whose list holds nothing names no task to describe. RECORDED behaviour, trailing
@@ -186,7 +196,8 @@ pub fn operation_worded_refusal(
                 Some(input) => input
                     .services
                     .is_empty()
-                    .then(|| SERVICES_EMPTY_MESSAGE.to_string()),
+                    .then(|| SERVICES_EMPTY_MESSAGE.to_string())
+                    .or_else(|| duplicate_services_refusal(&input.services)),
                 None => absent_member::<DescribeServicesInput>(
                     protocol,
                     DESCRIBE_SERVICES_INPUT_SCHEMA,
@@ -274,6 +285,20 @@ fn scheduling_strategy_refusal(requested: Option<&str>) -> Option<String> {
             &LISTED_SCHEDULING_STRATEGIES,
         )
     })
+}
+
+/// The sentence a `services` list that names one service more than once earns, or `None`
+/// when each entry names a different one (and for a list of one, which can repeat nothing).
+///
+/// The list is judged AS THE REQUEST SPELLS IT, before any entry is resolved against the
+/// store: this is the shape of the request rather than a statement about what the entries
+/// name, which is what the sentence it earns calls it — so a request is refused for repeating
+/// an entry whether or not the service it names is stored, and never for naming one service
+/// the two ways a reference may spell it.
+fn duplicate_services_refusal(requested: &[String]) -> Option<String> {
+    let mut named = ::std::collections::HashSet::new();
+    (!requested.iter().all(|service| named.insert(service.as_str())))
+        .then(|| DUPLICATE_SERVICE_NAMES_MESSAGE.to_string())
 }
 
 /// The clause a `status` filter holding an entry outside the status set earns, reported

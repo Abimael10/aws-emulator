@@ -124,7 +124,7 @@ use crate::ops::types::{
     Attachment, Attribute, AutoScalingGroupProvider, AwsVpcConfiguration, CapacityProvider,
     CapacityProviderStrategyItem, Cluster, ClusterConfiguration, ClusterServiceConnectDefaults,
     ClusterSetting, Container, ContainerDefinition, ContainerDependency, ContainerImage,
-    ContainerInstance, ContainerOverride,
+    ContainerInstance, ContainerOverride, CreatedAt,
     DaemonCapacityProvider, DaemonCircuitBreaker, DaemonContainerDefinition, DaemonContainerImage,
     DaemonDeployment, DaemonDeploymentAlarms, DaemonDeploymentCapacityProvider,
     DaemonDeploymentConfiguration, DaemonDeploymentRevisionDetail, DaemonDeploymentSummary,
@@ -2992,6 +2992,46 @@ pub const DEPLOYMENT_CONTROLLER_PRIMARY_TASK_SET_REQUIRED_MESSAGE: &str =
     "Updating the deployment controller requires a primary taskset in the service. Please \
      ensure your service has a primary taskset and try again.";
 
+/// `InvalidParameterException$message` for a DEPLOYMENT CIRCUIT BREAKER asked for on a
+/// service that does not deploy through the rolling update.
+///
+/// `DeploymentCircuitBreaker`'s own note states the rule: "The deployment circuit breaker can
+/// only be used for services using the rolling update (`ECS`) deployment type." The breaker
+/// fails and rolls back a ROLLOUT the ECS scheduler owns, and the other controllers deploy by
+/// shifting traffic between task sets instead, so there is no rollout for it to watch. Fixed
+/// text, naming the controller the feature needs and what the caller has to do about it, and
+/// carrying nothing from the request.
+pub const CIRCUIT_BREAKER_ECS_CONTROLLER_ONLY_MESSAGE: &str =
+    "Deployment circuit breaker feature is only supported with ECS (rolling update) \
+     deployment controller. Update to ECS deployment controller and try again.";
+
+/// The refusal a deployment configuration and a deployment controller earn TOGETHER when the
+/// pair the request would MAKE is one the circuit breaker cannot run in, or `None` when that
+/// pair turns no breaker on (and for the rolling update, which is the controller the feature
+/// is for).
+///
+/// `requested` is the configuration the request names; `stored` is the one the service
+/// already holds, which the caller passes only when this request is what MOVES the controller
+/// — the request that would make the pair. A request that changes neither half makes no pair,
+/// so it is judged by neither and is served. `controller` is the controller the service will
+/// deploy through.
+///
+/// The pair is what the rule is about, so BOTH ways of making it are refused: turning the
+/// breaker on for a service another controller deploys, and moving a service whose breaker is
+/// on onto another controller.
+pub fn circuit_breaker_controller_violation(
+    controller: &str,
+    requested: Option<&DeploymentConfiguration>,
+    stored: Option<&DeploymentConfiguration>,
+) -> Option<&'static str> {
+    let breaker = [requested, stored]
+        .into_iter()
+        .flatten()
+        .find_map(|configuration| configuration.deployment_circuit_breaker.as_ref())?;
+    (breaker.enable && controller != DEPLOYMENT_CONTROLLER_ECS)
+        .then_some(CIRCUIT_BREAKER_ECS_CONTROLLER_ONLY_MESSAGE)
+}
+
 /// `ClientException$message` for a `taskDefinition` that is not a task-definition
 /// reference at all — the condition [`parse_task_definition_reference`] answers `None`
 /// for.
@@ -3205,6 +3245,50 @@ pub const AWSVPC_NETWORK_CONFIGURATION_REQUIRED_MESSAGE: &str =
 pub const CODE_DEPLOY_LOAD_BALANCER_REQUIRED_MESSAGE: &str =
     "When specifying the CODE_DEPLOY deployment controller type, the service requires an \
      Application Load Balancer or Network Load Balancer.";
+
+/// `InvalidParameterException$message` for an update that submits the TASK DEFINITION of a
+/// service the blue/green (`CODE_DEPLOY`) controller deploys.
+///
+/// `UpdateService`'s own doc: "For services using the blue/green (CODE_DEPLOY) deployment
+/// controller, only the desired count, deployment configuration, health check grace period,
+/// task placement constraints and strategies, enable ECS managed tags option, and propagate
+/// tags can be updated using this API. If the network configuration, platform version, task
+/// definition, or load balancer need to be updated, create a new CodeDeploy deployment." Such
+/// a service runs the revision and the networking of the task SET that controller creates and
+/// shifts traffic onto, so neither is this API's to change: the request is refused and nothing
+/// of it is written.
+///
+/// The sentence is entirely FIXED text, naming the member that was submitted, the controller
+/// the service deploys through and what to use instead — and nothing from the request.
+pub const CODE_DEPLOY_TASK_DEFINITION_IMMUTABLE_MESSAGE: &str =
+    "Unable to update task definition on services with a CODE_DEPLOY deployment controller. \
+     Use AWS CodeDeploy to trigger a new deployment.";
+
+/// The same for the NETWORK CONFIGURATION of such a service — the other member of that doc's
+/// list this API has a recorded sentence for.
+pub const CODE_DEPLOY_NETWORK_IMMUTABLE_MESSAGE: &str =
+    "Unable to update network parameters on services with a CODE_DEPLOY deployment \
+     controller. Use AWS CodeDeploy to trigger a new deployment.";
+
+/// The refusal an update of a `CODE_DEPLOY`-controlled service earns for the members it
+/// submits, or `None` when it submits neither of them (and for a service any other controller
+/// deploys, which this rule says nothing about).
+///
+/// Each member is passed under its own name, so which sentence a member earns cannot drift:
+/// the task definition is read first, so a request that submits both is refused for it.
+pub fn code_deploy_immutable_member_violation(
+    controller: &str,
+    task_definition: bool,
+    network_configuration: bool,
+) -> Option<&'static str> {
+    if controller != DEPLOYMENT_CONTROLLER_CODE_DEPLOY {
+        return None;
+    }
+    if task_definition {
+        return Some(CODE_DEPLOY_TASK_DEFINITION_IMMUTABLE_MESSAGE);
+    }
+    network_configuration.then_some(CODE_DEPLOY_NETWORK_IMMUTABLE_MESSAGE)
+}
 
 /// One capacity provider, as `CreateCapacityProvider` created it.
 ///

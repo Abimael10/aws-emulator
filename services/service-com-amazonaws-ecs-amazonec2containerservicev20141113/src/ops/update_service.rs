@@ -641,6 +641,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let daemon = snapshot.scheduling_strategy == crate::state::SCHEDULING_DAEMON;
         let scheduler_owned = snapshot.places_tasks();
 
+        // A service the blue/green (CODE_DEPLOY) controller deploys runs the revision and the
+        // networking of the task SET that controller shifts traffic onto, so neither is this
+        // API's to change: a request that submits one of those members is refused with the
+        // sentence that member earns, and nothing of the update is written
+        // ([`crate::state::code_deploy_immutable_member_violation`]). It is refused for
+        // SUBMITTING the member rather than for the value it carries, so it is judged as soon
+        // as the service has resolved and before any value of the request is. The members
+        // this API does take are untouched, so the same service is still scaled and
+        // reconfigured through it.
+        if let Some(message) = crate::state::code_deploy_immutable_member_violation(
+            snapshot.controller(),
+            input.task_definition.is_some(),
+            input.network_configuration.is_some(),
+        ) {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // The registry read taken before the lock, acted on now that the cluster and the
         // service have resolved: an entry naming a Cloud Map service that service holds no
         // record of registers nothing, so nothing of the update is written for it.
@@ -695,6 +717,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .deployment_controller
             .as_ref()
             .filter(|controller| controller.r#type != snapshot.controller());
+        // The CIRCUIT BREAKER and the CONTROLLER are a pair: what the breaker watches is a
+        // rollout the ECS scheduler owns, and the other controllers deploy by shifting traffic
+        // between task sets instead, so the breaker has no rollout to watch there. What is
+        // judged is the pair this update would MAKE — the controller it names over the one the
+        // service has, and the breaker it names, or the one the service holds when this update
+        // is what moves the controller. So turning the breaker on under another controller and
+        // moving a breaker-enabled service onto another controller are refused alike, before
+        // the change of controller is weighed at all, while an update that changes neither half
+        // is left to the rest of this handler — a service that somehow already holds the pair
+        // stays scalable ([`crate::state::circuit_breaker_controller_violation`]).
+        let controller_after_update = requested_controller
+            .map(|controller| controller.r#type.as_str())
+            .unwrap_or_else(|| snapshot.controller());
+        if let Some(message) = crate::state::circuit_breaker_controller_violation(
+            controller_after_update,
+            input.deployment_configuration.as_ref(),
+            requested_controller.map(|_| &snapshot.deployment_configuration),
+        ) {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
         if requested_controller.is_some()
             && !guard.service_has_primary_task_set(&cluster_name, &name)
         {
@@ -893,6 +940,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(controller) => controller.r#type.as_str(),
             None => snapshot.controller(),
         };
+        // And a service that ALREADY deploys through it runs the revision and the networking
+        // of the task set that controller shifts traffic onto, so this API changes neither.
         if effective_controller == crate::state::DEPLOYMENT_CONTROLLER_CODE_DEPLOY
             && effective_bindings.is_empty()
         {

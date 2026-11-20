@@ -30,6 +30,10 @@
 //!   sentence that operation publishes, naming no member path, no value and no count — and
 //!   an operation that publishes none keeps the modelled clause the framework renders, which
 //!   is the row the table closes with.
+//! * **A list of identifiers that names the same one twice**, refused as the malformed
+//!   request Amazon ECS calls it, on the list as the request spells it — so the refusal does
+//!   not depend on what its entries resolve to, while a list of entries that each name a
+//!   different service is served, one answer per entry.
 //! * **A page token a listing never minted**, refused under the class and the member name
 //!   the operation publishes — and, where the listing reads a token's LENGTH before reading
 //!   the token, for that length.
@@ -942,4 +946,107 @@ async fn a_delete_of_a_service_that_resolves_to_nothing_carries_no_message_membe
         SERVICE,
         "case {case:?}: expected the stored service deleted, got {deleted}"
     );
+}
+
+/// The sentence a `services` list that names one service more than once earns: fixed text,
+/// naming neither the repeated entry nor how many times it was repeated.
+const DUPLICATE_SERVICES: &str = "Malformed request with duplicate service names.";
+
+#[tokio::test]
+async fn a_describe_naming_one_service_twice_is_refused_as_a_malformed_request() {
+    let router = fixture().await;
+
+    // The second service lets a row repeat an entry with ANOTHER name beside it, so a
+    // refusal cannot come from the list's length or from its one name.
+    let second = "worded-second";
+    ok(
+        &router,
+        "CreateService",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": second,
+            "taskDefinition": FAMILY,
+            "desiredCount": 0,
+            "launchType": "EC2",
+        }),
+        "fixture",
+    )
+    .await;
+
+    // The rows differ along WHERE the repeat sits and WHAT it repeats: the whole list, a
+    // repeat after another name, one before it, a name repeated three times, and a name that
+    // names no stored service at all — the list is judged as the request spells it, before
+    // any entry is resolved, so a repeat of a name that would have come back as a MISSING
+    // failure is refused just the same.
+    let rows: [(&str, Vec<&str>); 6] = [
+        ("the same name twice", vec![SERVICE, SERVICE]),
+        ("a repeat after another name", vec![second, SERVICE, SERVICE]),
+        ("a repeat before another name", vec![SERVICE, SERVICE, second]),
+        ("a name repeated three times", vec![SERVICE, SERVICE, SERVICE]),
+        (
+            "a name no service is stored under, repeated",
+            vec!["nosuchservice", "nosuchservice"],
+        ),
+        (
+            "two names each repeated once",
+            vec![SERVICE, second, SERVICE, second],
+        ),
+    ];
+    for (case, services) in rows {
+        let (code, message) = refusal(
+            &router,
+            "DescribeServices",
+            json!({ "cluster": CLUSTER, "services": services }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (INVALID_PARAMETER, DUPLICATE_SERVICES),
+            "case {case:?}: expected the malformed-request sentence, got {code:?} with \
+             {message:?}"
+        );
+        // The sentence echoes nothing of the list the request carried.
+        assert!(
+            !message.contains(SERVICE),
+            "case {case:?}: the sentence must not echo an entry of the list, got {message:?}"
+        );
+    }
+
+    // A list whose entries each name a different service is SERVED, and reports one answer
+    // per entry: a stored service under `services`, a name nothing is stored under as a
+    // `MISSING` failure.
+    let rows: [(&str, Vec<&str>, usize, usize); 4] = [
+        ("one stored service", vec![SERVICE], 1, 0),
+        ("two different stored services", vec![SERVICE, second], 2, 0),
+        (
+            "a stored service beside a name nothing is stored under",
+            vec![SERVICE, "nosuchservice"],
+            1,
+            1,
+        ),
+        (
+            "two different names nothing is stored under",
+            vec!["nosuchservice", "anothermissing"],
+            0,
+            2,
+        ),
+    ];
+    for (case, services, described, missing) in rows {
+        let body = ok(
+            &router,
+            "DescribeServices",
+            json!({ "cluster": CLUSTER, "services": services }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (
+                list(&body, "services", case).len(),
+                list(&body, "failures", case).len()
+            ),
+            (described, missing),
+            "case {case:?}: expected {described} described and {missing} failed, got {body}"
+        );
+    }
 }

@@ -12,7 +12,9 @@
 //! errors are reserved for what they say: `ClusterNotFoundException` ("The specified cluster
 //! wasn't found") for a cluster nothing holds, and `InvalidParameterException` for a request
 //! outside the bound the input documents ("You may specify up to 10 services to describe in a
-//! single operation"). A client is therefore entitled to poll this read for a target state and
+//! single operation") or one whose list REPEATS an identifier, which Amazon ECS calls a
+//! malformed request ([`crate::operation_worded_refusals`] owns that rule). A client is
+//! therefore entitled to poll this read for a target state and
 //! to be answered 200 on every poll, which is what lets the poll TERMINATE: a
 //! `Deployment$rolloutState` is constrained to `COMPLETED | FAILED | IN_PROGRESS`
 //! (`smithy_query(query="shape", shape="DeploymentRolloutState")`) and leaves `IN_PROGRESS`
@@ -234,13 +236,6 @@ async fn every_identifier_form_is_answered_inside_one_two_hundred() {
             failures: Vec::new(),
         },
         Row {
-            case: "the same service named twice",
-            cluster: CLUSTER.to_string(),
-            named: vec![PROVIDER_SERVICE.to_string(), PROVIDER_SERVICE.to_string()],
-            services: vec![PROVIDER_SERVICE],
-            failures: Vec::new(),
-        },
-        Row {
             case: "the same service under both spellings",
             cluster: CLUSTER.to_string(),
             named: vec![PROVIDER_SERVICE.to_string(), service_arn(PROVIDER_SERVICE)],
@@ -342,9 +337,45 @@ async fn every_identifier_form_is_answered_inside_one_two_hundred() {
 }
 
 #[tokio::test]
-async fn only_an_absent_cluster_and_an_oversized_list_are_refused() {
+async fn only_an_absent_cluster_an_oversized_list_and_a_repeat_are_refused() {
     let router = service();
     fixture(&router).await;
+
+    // A list that names the same identifier twice is the other request this read refuses:
+    // one service is one entry, so a repeat is the malformed request Amazon ECS calls it
+    // rather than a list of two services. The rows name the repeat beside another stored
+    // service, so the refusal is the repeat's and not the list's.
+    let rows: [(&str, Vec<String>); 2] = [
+        (
+            "the same service named twice",
+            vec![PROVIDER_SERVICE.to_string(), PROVIDER_SERVICE.to_string()],
+        ),
+        (
+            "a repeat beside another stored service",
+            vec![
+                PROVIDER_SERVICE.to_string(),
+                LAUNCH_TYPE_SERVICE.to_string(),
+                PROVIDER_SERVICE.to_string(),
+            ],
+        ),
+    ];
+    for (case, named) in rows {
+        let (code, message) = refusal(
+            &router,
+            "DescribeServices",
+            json!({ "cluster": CLUSTER, "services": named }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                "InvalidParameterException",
+                "Malformed request with duplicate service names."
+            ),
+            "case {case:?}: expected the malformed-request refusal, got {code} / {message:?}"
+        );
+    }
 
     // One past the documented maximum is the request the input's own bound refuses; the
     // maximum itself is answered 200 by the table above.

@@ -21,8 +21,11 @@
 //!   capacity up for the cluster — is dropped while its tasks run on;
 //! * a reference whose ARN names one cluster while the request's `cluster` names another
 //!   names no resource at all, so the call is refused rather than answered about another
-//!   cluster's resource (or with a `MISSING` failure). The rows span the operations and the
-//!   two resources that carry such a reference;
+//!   cluster's resource (or with a `MISSING` failure) — and the two identifiers of one
+//!   request disagreeing is a property of the request, so it is answered ahead of what this
+//!   account holds, while a reference carrying no cluster of its own is still scoped by
+//!   `cluster` alone. The rows span the operations and the two resources that carry such a
+//!   reference;
 //! * a launch may not name a subnet the account has DELETED: `AwsVpcConfiguration$subnets`
 //!   is "The IDs of the subnets associated with the task or service", and Amazon ECS
 //!   retrieves each subnet from Amazon EC2 before it accepts the launch. The rows span the
@@ -542,7 +545,7 @@ async fn a_reference_of_another_cluster_is_refused_rather_than_resolved() {
     let described = ok(
         &router,
         "DescribeServices",
-        json!({ "cluster": elsewhere, "services": [service_elsewhere] }),
+        json!({ "cluster": elsewhere, "services": [service_elsewhere.clone()] }),
         case,
     )
     .await;
@@ -550,6 +553,55 @@ async fn a_reference_of_another_cluster_is_refused_rather_than_resolved() {
         list(&described, "services", case).len(),
         1,
         "case {case:?}: expected the service of its own cluster, got {described}"
+    );
+
+    // The two identifiers of ONE request disagreeing is a property of the REQUEST, so it is
+    // answered ahead of what this account holds: the same foreign ARN earns the same sentence
+    // while the request addresses a cluster nothing holds, and while it addresses none at all
+    // — which is the `default` cluster this account never created. Neither is reported as a
+    // missing cluster, which is a different fault and a different error class.
+    let rows: [(&str, Value); 3] = [
+        (
+            "a cluster nothing holds",
+            json!({ "cluster": "nosuchcluster", "services": [service_elsewhere.clone()] }),
+        ),
+        (
+            "no cluster at all, so the default one",
+            json!({ "services": [service_elsewhere.clone()] }),
+        ),
+        (
+            "a cluster nothing holds, named by its full ARN",
+            json!({
+                "cluster": format!("arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:cluster/nosuchcluster"),
+                "services": [service_elsewhere.clone()],
+            }),
+        ),
+    ];
+    for (case, request) in rows {
+        let (code, message) = refusal(&router, "DescribeServices", request, case).await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            ("InvalidParameterException", SERVICE_NOT_WITHIN_CLUSTER),
+            "case {case:?}: expected the cross-cluster refusal ahead of the cluster lookup, \
+             got {code} with {message:?}"
+        );
+    }
+
+    // The cluster lookup still answers for a request whose entries name no cluster of their
+    // own: a bare service name is scoped by `cluster` alone, so a cluster nothing holds is
+    // the missing cluster it is.
+    let case = "a bare name under a cluster nothing holds";
+    let (code, message) = refusal(
+        &router,
+        "DescribeServices",
+        json!({ "cluster": "nosuchcluster", "services": ["shared"] }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        code, "ClusterNotFoundException",
+        "case {case:?}: expected the missing cluster to be reported as one, got {code} with \
+         {message:?}"
     );
 }
 

@@ -188,12 +188,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // An ARN is a WHOLE identifier, Region and account included, so both segments are
-        // checked before the identifier is resolved
-        // ([`crate::state::request_arn_violation`]).
-        if let Some(message) =
-            crate::state::request_arn_violation(ctx, Some(input.cluster.as_str()))
-        {
+        // An ARN is a WHOLE identifier, Region and account included, so both segments of
+        // every identifier the request carries are checked before any of them is resolved
+        // ([`crate::state::request_arn_violation`]) — the cluster, the service that owns the
+        // task sets and each task set the request names, since an ARN that addresses another
+        // Region or another account names no task set of this endpoint whichever member
+        // carried it. The scan is over the list the bound above has already clamped.
+        let supplied_arns = [input.cluster.as_str(), input.service.as_str()]
+            .into_iter()
+            .chain(input.task_sets.iter().flatten().map(String::as_str));
+        if let Some(message) = crate::state::request_arn_violation(ctx, supplied_arns) {
             return Err(DescribeTaskSetsErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message.to_string()),
