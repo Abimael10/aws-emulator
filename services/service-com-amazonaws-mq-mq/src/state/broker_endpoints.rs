@@ -19,15 +19,27 @@
 //! one (as the console's and the Developer Guide's connection snippets do) finds the
 //! engine's primary wire there rather than whichever scheme happens to sort first.
 //!
-//! The ADDRESS they name is the host this emulator serves on, recorded on the broker
-//! when it was created ([`Broker::published_host`]), so what a broker publishes leads
-//! back to the emulator the client is already talking to rather than to a hostname
-//! nothing here answers. A broker whose engine this emulator serves a WIRE for is given
-//! a socket of the emulator's own ([`serve_broker`]), and that socket's address is what
-//! its endpoint publishes — so the endpoint is one a client both reaches and is answered
-//! the broker's own protocol on; a broker this emulator opened no socket for publishes
-//! the port Amazon MQ publishes for the protocol on the host it was created on, which is
-//! the control plane's record of where the broker is published.
+//! The ADDRESS they name is the BROKER's OWN: Amazon MQ publishes a broker's console and
+//! its wire endpoints under a host that carries that broker's id and the Region it was
+//! created in ([`published_broker_host`]), so no two brokers of one account advertise the
+//! same authority and the broker an address belongs to is recoverable from the address.
+//! The host is composed ONCE, by the create, and kept on the record
+//! ([`Broker::published_host`]), so every later read of the broker publishes the one host.
+//!
+//! The ZONE that host sits in is the one this emulator may announce a name of its own in
+//! ([`::service_common::data_plane_addressing::announced_zone_of_authority`]), never the
+//! zone AWS serves its own names in: a name a service hands a client is a name the client
+//! RESOLVES and then dials, so it has to lead back to this process, and the zone of an
+//! emulator reached at an ADDRESS is the one a resolver answers with the loopback
+//! interface — the interface the core binds its listeners on unless the operator names
+//! another.
+//!
+//! A broker whose engine this emulator serves a WIRE for is given a socket of the
+//! emulator's own ([`serve_broker`]), and the endpoint published for the protocol that
+//! socket serves is that socket's own dialable address: an endpoint is an address the
+//! broker ANSWERS on, and which interface and port it answered on is the core's to assign.
+//! Every other endpoint names the broker's own host and the port Amazon MQ publishes that
+//! protocol on.
 
 use super::*;
 
@@ -109,6 +121,71 @@ const RABBITMQ_CONSOLE_PORT: u16 = 443;
 /// The scheme every broker console URL carries: both consoles are served over TLS.
 const CONSOLE_SCHEME: &str = "https";
 
+/// The label every Amazon MQ broker host carries between the broker's own label and the
+/// Region: this service's `endpointPrefix` (`smithy_query(query="service_info")`), which is
+/// what names Amazon MQ in the host of every broker it publishes.
+const BROKER_HOST_SERVICE_LABEL: &str = "mq";
+
+/// The ordinal that follows a broker's id in the host of its FIRST instance — the only one
+/// a `SINGLE_INSTANCE` broker has — which is how Amazon MQ numbers the instances of one
+/// broker in their host names.
+const FIRST_INSTANCE_ORDINAL: u8 = 1;
+
+/// The host a broker PUBLISHES its console and its wire endpoints under:
+/// `<brokerId>-<ordinal>.<service>.<region>.<zone>`.
+///
+/// Every label of it but the zone comes from the BROKER: its own minted id and instance
+/// ordinal, the label that names this service and the Region the create was signed for. So
+/// the published authority identifies the resource — two brokers never share one, and a
+/// client correlating a connection with its control-plane broker, or building a
+/// Region-aware client from the endpoint, reads both back out of the host — which is what
+/// `BrokerInstance$endpoints` ("The broker's wire-level protocol endpoints") and
+/// `consoleURL` ("The brokers web console URL") carry in Amazon MQ.
+///
+/// The ZONE is the one this emulator may announce a name of its own in, read off the
+/// `host[:port]` a request reached it at through the workspace's one reading of that
+/// question: the loopback zone where that address is an IP address rather than a name (see
+/// the module docs). The Region is CALLER-SUPPLIED text that ends up in a host here, so it
+/// is taken only as a Region LABEL (`service_common::arn::region_label`, this tree's one
+/// statement of that grammar) and anything else falls back to [`DEFAULT_REGION`]: a value
+/// carrying a host or path delimiter would name an authority the caller chose.
+pub fn published_broker_host(reached_authority: &str, broker_id: &str, region: &str) -> String {
+    let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
+    let zone =
+        ::service_common::data_plane_addressing::announced_zone_of_authority(reached_authority);
+    format!("{broker_id}-{FIRST_INSTANCE_ORDINAL}.{BROKER_HOST_SERVICE_LABEL}.{region}.{zone}")
+}
+
+/// The first octet of the block a broker's interface address is drawn from: `10.0.0.0/8`,
+/// the largest range RFC 1918 reserves for private networks and the space a VPC subnet's
+/// addresses are allocated out of.
+const BROKER_INTERFACE_BLOCK: u8 = 10;
+
+/// How many of a `/24`'s addresses an interface can hold: its 256 less the network and
+/// broadcast addresses, which name no interface.
+const ASSIGNABLE_HOSTS: u8 = 254;
+
+/// The address of the elastic network interface attached to the broker `broker_id` names, as
+/// `BrokerInstance$ipAddress` reports it.
+///
+/// Amazon MQ attaches that interface in one of the BROKER's own subnets, so the address is
+/// the one that VPC assigned to it — never an address of the host the control plane is
+/// answering on, which belongs to no broker. This emulator provisions no interface, so the
+/// address is DERIVED from the broker's own minted id, out of the private block above:
+/// distinct per broker, stable across every read of it, and never a network or broadcast
+/// host byte. It is derived the same way every other value this service assigns a broker
+/// from its id is ([`assigned_maintenance_window`]).
+pub fn broker_interface_ipv4(broker_id: &str) -> String {
+    let digest = <::sha2::Sha256 as ::sha2::Digest>::digest(broker_id.as_bytes());
+    ::std::net::Ipv4Addr::new(
+        BROKER_INTERFACE_BLOCK,
+        digest[0],
+        digest[1],
+        digest[2] % ASSIGNABLE_HOSTS + 1,
+    )
+    .to_string()
+}
+
 /// One instance allocated to a broker, as a client addresses it: the console to open,
 /// the endpoints to dial, and the broker's own IP address when it has one.
 ///
@@ -147,20 +224,13 @@ impl Broker {
     /// address of the Elastic Network Interface (ENI) attached to the broker. Does not
     /// apply to RabbitMQ brokers").
     ///
-    /// It is the address the broker is published at, so it is reported only when that
-    /// address IS an address rather than a name — a name is not an IP address, and no
-    /// address is invented for it.
+    /// It is the address of the interface attached to THIS broker
+    /// ([`broker_interface_ipv4`]), so it identifies the broker rather than the host the
+    /// control plane answered on; a RabbitMQ broker reports none, the member not applying
+    /// to that engine.
     fn ip_address(&self) -> Option<String> {
-        if self.engine_type == ENGINE_TYPE_RABBITMQ {
-            return None;
-        }
-        let host = self
-            .published_host
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        host.parse::<::std::net::IpAddr>()
-            .ok()
-            .map(|address| address.to_string())
+        (self.engine_type != ENGINE_TYPE_RABBITMQ)
+            .then(|| broker_interface_ipv4(&self.broker_id))
     }
 
     /// The instances allocated to this broker as of `now`: one once the clock has made
@@ -197,6 +267,119 @@ impl Broker {
                 format!("{}://{}:{}", protocol.scheme, served.host, served.port)
             }
             _ => protocol.endpoint(&self.published_host),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: a broker's published host names the BROKER — its own id and instance ordinal,
+    /// this service's label and the Region it was created in — in the zone this emulator
+    /// may announce a name of its own in, which is the loopback zone wherever the emulator
+    /// is reached at an address rather than a name.
+    #[test]
+    fn a_brokers_published_host_names_the_broker_in_the_announced_zone() {
+        // The rows span what the composition reads: the authority forms a client reaches
+        // this emulator on (an IPv4 address with and without a port, a bracketed IPv6
+        // literal, a name, a host naming one of AWS's own endpoints, which is not this
+        // emulator's zone to announce in) and the Region values a request can sign for,
+        // including one that is no Region label at all.
+        let rows: &[(&str, &str, &str, &str, &str)] = &[
+            (
+                "an emulator reached at an address",
+                "127.0.0.1:9297",
+                "b-0123456789abcdef0123456789abcdef",
+                "us-west-2",
+                "b-0123456789abcdef0123456789abcdef-1.mq.us-west-2.localhost",
+            ),
+            (
+                "an address with no port",
+                "127.0.0.1",
+                "b-1",
+                "eu-central-1",
+                "b-1-1.mq.eu-central-1.localhost",
+            ),
+            (
+                "a bracketed IPv6 literal",
+                "[::1]:9297",
+                "b-1",
+                "ap-northeast-1",
+                "b-1-1.mq.ap-northeast-1.localhost",
+            ),
+            (
+                "an emulator reached at a name",
+                "mq.emulator.test:9297",
+                "b-2",
+                "us-east-2",
+                "b-2-1.mq.us-east-2.mq.emulator.test",
+            ),
+            (
+                "a host naming one of AWS's own endpoints",
+                "mq.us-west-2.amazonaws.com",
+                "b-3",
+                "us-west-2",
+                "b-3-1.mq.us-west-2.localhost",
+            ),
+            (
+                "a region that is no Region label",
+                "127.0.0.1:9297",
+                "b-4",
+                "us-west-2/../somewhere",
+                "b-4-1.mq.us-east-1.localhost",
+            ),
+        ];
+        for (case, authority, broker_id, region, expected) in rows {
+            let host = published_broker_host(authority, broker_id, region);
+            assert_eq!(
+                &host, expected,
+                "case {case:?}: expected the host {expected:?}, got {host:?}"
+            );
+        }
+    }
+
+    /// RULE: the address a broker reports for its own interface is a private address
+    /// derived from that broker's id — one address per broker, the same on every read, no
+    /// network or broadcast host byte, and never the loopback address.
+    #[test]
+    fn a_brokers_interface_address_is_private_stable_and_its_own() {
+        // The rows span the ids a broker record can carry: ids this service mints, and the
+        // shortest and longest values a record could hold.
+        let ids: &[&str] = &[
+            "b-0123456789abcdef0123456789abcdef",
+            "b-fedcba9876543210fedcba9876543210",
+            "b-d2783693-0791-2384-7a71-ae0ae15403f9",
+            "b-1",
+            "b",
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for id in ids {
+            let reported = broker_interface_ipv4(id);
+            let address: ::std::net::Ipv4Addr = reported.parse().unwrap_or_else(|_| {
+                panic!("case {id:?}: expected an IPv4 address, got {reported:?}")
+            });
+            assert!(
+                address.is_private() && !address.is_loopback(),
+                "case {id:?}: expected a private address that is not the loopback one, got \
+                 {reported:?}"
+            );
+            let host_byte = address.octets()[3];
+            assert!(
+                (1..=ASSIGNABLE_HOSTS).contains(&host_byte),
+                "case {id:?}: expected an assignable host byte, got {reported:?}"
+            );
+            assert_eq!(
+                broker_interface_ipv4(id),
+                reported,
+                "case {id:?}: the same broker must always report the same address"
+            );
+            assert!(
+                !seen.contains(&reported),
+                "case {id:?}: two brokers must not report the same address, got {reported:?} \
+                 again among {seen:?}"
+            );
+            seen.push(reported);
         }
     }
 }

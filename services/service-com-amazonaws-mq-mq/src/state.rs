@@ -372,10 +372,11 @@ pub struct Broker {
     /// broker of a replication pair holds before any promotion is derived from the pair
     /// itself ([`Broker::data_replication_role`]).
     pub data_replication_role: Option<String>,
-    /// The host this emulator answered the create on, which is the address this
-    /// broker is published at ([`Broker::allocated_instances`]). Recorded at create
-    /// time so every read of the broker publishes the one address, whichever host a
-    /// later caller reached the emulator on.
+    /// The host THIS broker's console and endpoints are published under
+    /// ([`published_broker_host`]), which carries the broker's own id and Region so a
+    /// published address identifies the broker ([`Broker::allocated_instances`]).
+    /// Composed at create time so every read of the broker publishes the one host,
+    /// whichever host a later caller reached the emulator on.
     pub published_host: String,
     /// The address of the socket this emulator OPENED for the broker, when its engine is
     /// one this emulator serves a wire for ([`serve_broker`]). It is what the broker's

@@ -352,13 +352,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = state::request_region(ctx.parts());
-        // The address this broker is published at: the endpoint this emulator answered
-        // the create on, so what the broker's instances publish leads back to the
-        // emulator the client is already talking to.
-        let published_host = ::service_common::data_plane_addressing::host_only(
-            &::service_common::data_plane_addressing::emulator_endpoint_authority(ctx),
-        )
-        .to_string();
+        // The `host[:port]` this emulator was reached at, whose ZONE the broker's own
+        // published host is minted in, so a name this broker hands a client leads back to
+        // this process: the endpoint the request addressed, or the one this emulator is
+        // served at for a caller that addressed a host naming some service.
+        let reached_authority =
+            ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(
+                ctx.parts(),
+            )
+            .unwrap_or_else(|| {
+                ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)
+            });
 
         // The members the request may also set on the broker, in the records the
         // state module keeps them in. Each is stored as sent, except the
@@ -670,7 +674,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // starts as the REPLICA of the primary its create named, which
             // `Broker::data_replication_role` derives, and only a promotion records one.
             data_replication_role: None,
-            published_host,
+            // The host this broker publishes its console and endpoints under, carrying
+            // its own id and Region: it is composed here, from the id the store just
+            // minted, so every read of the broker publishes the one host.
+            published_host: state::published_broker_host(
+                &reached_authority,
+                &broker_id,
+                &region,
+            ),
             // Filled in by the socket this create opens for the broker below, once the
             // core has told the service which address it answers on.
             served_amqps: None,

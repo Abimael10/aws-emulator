@@ -33,6 +33,11 @@
 //! 10. A broker read lists the CloudWatch Logs log group of every kind of log its engine
 //!     keeps — general first, then audit — each entry naming the kind, whether that kind
 //!     of logging is enabled on the broker, and the group named after the broker itself.
+//! 11. Every address that instance publishes identifies the BROKER: its console URL and
+//!     every endpoint this emulator opened no socket for name a host carrying the broker's
+//!     own id and Region, and the `ipAddress` of a broker whose engine reports one is a
+//!     private address of that broker's own interface — so two brokers never advertise one
+//!     authority and neither publishes the loopback address.
 //!
 //! The tables span the model's own enumerations (`ENGINE_TYPE_VALUES`,
 //! `BROKER_STORAGE_TYPE_VALUES`, `AUTHENTICATION_STRATEGY_VALUES`, `DAY_OF_WEEK_VALUES`)
@@ -562,23 +567,226 @@ async fn a_running_broker_publishes_its_console_and_one_endpoint_per_protocol() 
         }
 
         // `BrokerInstance$ipAddress` "Does not apply to RabbitMQ brokers"; where it
-        // does apply it is the address the broker is published at, reported only when
-        // that address IS an address rather than a name.
+        // does apply it is the address of the interface attached to THIS broker — an
+        // address of the broker's own, not of the host the control plane answered on —
+        // which `a_brokers_published_addresses_identify_that_broker` pins in full.
         let ip_address = instance.pointer("/ipAddress").and_then(Value::as_str);
-        let published_an_address = host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<std::net::IpAddr>()
-            .is_ok();
-        let expected_ip = if row.engine_type == ENGINE_TYPE_RABBITMQ || !published_an_address {
-            None
-        } else {
-            Some(host.as_str())
-        };
+        let applies = row.engine_type != ENGINE_TYPE_RABBITMQ;
         assert_eq!(
-            ip_address, expected_ip,
-            "case {case:?}: expected ipAddress {expected_ip:?}, got {instance:?}"
+            ip_address.is_some(),
+            applies,
+            "case {case:?}: expected ipAddress to be reported only where it applies \
+             ({applies}), got {instance:?}"
         );
+        if let Some(reported) = ip_address {
+            let address: std::net::Ipv4Addr = reported.parse().unwrap_or_else(|_| {
+                panic!("case {case:?}: expected an IPv4 address, got {reported:?}")
+            });
+            assert!(
+                address.is_private() && !address.is_loopback(),
+                "case {case:?}: expected the broker's own private interface address, got \
+                 {reported:?}"
+            );
+            assert_ne!(
+                reported, host,
+                "case {case:?}: the interface address must be the broker's own rather than \
+                 the host it is published under, got {reported:?}"
+            );
+        }
+    }
+}
+
+/// The host form Amazon MQ publishes a broker's addresses under, up to the zone the name
+/// lives in: the broker's own id, the ordinal of its first instance, the label naming
+/// Amazon MQ and the Region the broker was created in
+/// (`b-<id>-1.mq.<region>.<zone>`, the host the recorded broker answer's endpoints carry).
+fn broker_host_prefix(broker_id: &str, region: &str) -> String {
+    format!("{broker_id}-1.mq.{region}.")
+}
+
+/// The host of `authority`, which is everything ahead of the `:port` it ends in.
+fn authority_host(case: &str, authority: &str) -> String {
+    let (host, port) = authority
+        .rsplit_once(':')
+        .unwrap_or_else(|| panic!("case {case:?}: expected a host:port, got {authority:?}"));
+    port.parse::<u16>()
+        .unwrap_or_else(|_| panic!("case {case:?}: expected a port, got {authority:?}"));
+    host.to_string()
+}
+
+/// RULE 11: every address a RUNNING broker publishes identifies THAT broker — its console
+/// URL and every endpoint this emulator opened no socket for name a host carrying the
+/// broker's own id and Region, so no two brokers of one account share an authority and both
+/// are recoverable from the address — and the `ipAddress` of a broker whose engine reports
+/// one is a private address of that broker's own interface, never the loopback address and
+/// never another broker's.
+#[tokio::test]
+async fn a_brokers_published_addresses_identify_that_broker() {
+    // The rows span what the rule generalises over: the engine, which decides the protocol
+    // set, the console port and whether this emulator opens a socket of the broker's own,
+    // and the Region the create is signed for, which the published host carries. Each row
+    // creates TWO brokers, so what one publishes can be told from what the other does.
+    let rows: &[(&str, &str)] = &[
+        ("us-west-2", ENGINE_TYPE_ACTIVEMQ),
+        ("eu-central-1", ENGINE_TYPE_ACTIVEMQ),
+        ("ap-northeast-1", ENGINE_TYPE_RABBITMQ),
+        ("us-east-1", ENGINE_TYPE_RABBITMQ),
+    ];
+
+    for (region, engine_type) in rows {
+        let mq = Mq::new(region);
+        // What each broker of this row published: its id, its console URL, its endpoints
+        // and its reported address.
+        let mut published: Vec<(String, String, Vec<String>, Option<String>)> = Vec::new();
+
+        for index in 0..2usize {
+            let case = format!("{region}/{engine_type}/broker-{index}");
+            let mut body = create_body(&format!("identified-{index}"));
+            body["engineType"] = json!(engine_type);
+            let (status, created) = mq.create_broker(body).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200 from create, got {status} {created:?}"
+            );
+            let broker_id = string_at(&created, "/brokerId");
+
+            let described = describe_running(&mq, &broker_id).await;
+            let instance = described
+                .pointer("/brokerInstances/0")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let console_url = string_at(&instance, "/consoleURL");
+            let endpoints = strings_at(&instance, "/endpoints");
+            let ip_address = instance
+                .pointer("/ipAddress")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+
+            // The console URL names the broker's own host, and the broker's id and Region
+            // are both recoverable from it.
+            let prefix = broker_host_prefix(&broker_id, region);
+            let console_authority = console_url
+                .strip_prefix("https://")
+                .unwrap_or_else(|| panic!("case {case:?}: expected an https console URL, got {console_url:?}"));
+            let console_host = authority_host(&case, console_authority);
+            assert!(
+                console_host.starts_with(&prefix),
+                "case {case:?}: expected the console URL to name the host {prefix:?}<zone>, \
+                 got {console_url:?}"
+            );
+            let zone = &console_host[prefix.len()..];
+            assert!(
+                !zone.is_empty() && !zone.starts_with('.') && !zone.ends_with('.'),
+                "case {case:?}: expected the broker's host to name a zone, got {console_url:?}"
+            );
+            let first_label = console_host.split('.').next().unwrap_or_default();
+            assert_eq!(
+                first_label.strip_suffix("-1"),
+                Some(broker_id.as_str()),
+                "case {case:?}: expected the broker's id to be recoverable from \
+                 {console_url:?}"
+            );
+
+            assert!(
+                !endpoints.is_empty(),
+                "case {case:?}: a running broker publishes its wire endpoints, got \
+                 {instance:?}"
+            );
+            for endpoint in &endpoints {
+                let (_scheme, authority) = endpoint
+                    .split_once("://")
+                    .unwrap_or_else(|| panic!("case {case:?}: expected a URI, got {endpoint:?}"));
+                let host = authority_host(&case, authority);
+                if host == console_host {
+                    continue;
+                }
+                // An endpoint that does NOT name the broker's own host is one this
+                // emulator opened a socket of its own for, and the whole reason it names
+                // that socket instead is that a client dials it — so it is dialled here.
+                // The core binds its listeners on this machine's own interface, which is
+                // loopback unless the operator names another address, so that is the
+                // address such an endpoint carries and the one dialled below.
+                assert_eq!(
+                    host, "127.0.0.1",
+                    "case {case:?}: expected an endpoint of a socket of this emulator's own \
+                     to name this machine's loopback address, got {endpoint:?}"
+                );
+                let port = authority
+                    .rsplit_once(':')
+                    .and_then(|(_, port)| port.parse::<u16>().ok())
+                    .unwrap_or_default();
+                let dialled = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+                assert!(
+                    dialled.is_ok(),
+                    "case {case:?}: an endpoint that does not name the broker's host must \
+                     be an address it answers on, but {endpoint:?} accepted no connection: \
+                     {dialled:?}"
+                );
+            }
+
+            // `BrokerInstance$ipAddress` is "The IP address of the Elastic Network
+            // Interface (ENI) attached to the broker. Does not apply to RabbitMQ brokers":
+            // where it applies it is a private address of the broker's own interface, and
+            // never the loopback address, which belongs to no broker.
+            if *engine_type == ENGINE_TYPE_RABBITMQ {
+                assert_eq!(
+                    ip_address, None,
+                    "case {case:?}: ipAddress does not apply to a RabbitMQ broker, got \
+                     {instance:?}"
+                );
+            } else {
+                let reported = ip_address.clone().unwrap_or_else(|| {
+                    panic!("case {case:?}: expected an ipAddress, got {instance:?}")
+                });
+                let address: std::net::Ipv4Addr = reported.parse().unwrap_or_else(|_| {
+                    panic!("case {case:?}: expected an IPv4 address, got {reported:?}")
+                });
+                assert!(
+                    address.is_private() && !address.is_loopback(),
+                    "case {case:?}: expected a private interface address rather than the \
+                     loopback address, got {reported:?}"
+                );
+            }
+
+            // A read decides nothing: reading the broker again publishes the same
+            // addresses.
+            let (_, again) = mq.describe_broker(&broker_id).await;
+            assert_eq!(
+                again.pointer("/brokerInstances"),
+                described.pointer("/brokerInstances"),
+                "case {case:?}: a second read must publish the same addresses, got \
+                 {again:?}"
+            );
+
+            published.push((broker_id, console_url, endpoints, ip_address));
+        }
+
+        // Two brokers of one account never advertise the same authority, so endpoint-keyed
+        // client state can tell them apart.
+        let (first, second) = (&published[0], &published[1]);
+        let case = format!("{region}/{engine_type}/two brokers");
+        assert_ne!(
+            first.1, second.1,
+            "case {case:?}: two brokers must not share a console URL, got {:?}",
+            first.1
+        );
+        for endpoint in &first.2 {
+            assert!(
+                !second.2.contains(endpoint),
+                "case {case:?}: two brokers must not share the endpoint {endpoint:?}, got \
+                 {:?} and {:?}",
+                first.2,
+                second.2
+            );
+        }
+        if *engine_type != ENGINE_TYPE_RABBITMQ {
+            assert_ne!(
+                first.3, second.3,
+                "case {case:?}: two brokers must not report the same interface address, got \
+                 {:?}",
+                first.3
+            );
+        }
     }
 }
 
