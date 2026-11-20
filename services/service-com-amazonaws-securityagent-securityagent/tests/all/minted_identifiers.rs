@@ -9,20 +9,22 @@
 //! reader before it counts, so nothing here passes against a handler that answers a
 //! canned body.
 //!
-//! RULE: every identifier and every verification token this service mints is a fresh
-//! opaque value of the account's ONE mint — unique across every resource the account
-//! holds whatever its type, carrying nothing the request supplied, and never the
-//! ordinal of the call that asked for it, so no two mints hand out one value. An
-//! identifier is rendered in the form its RESOURCE CLASS is read by (that class's
-//! prefix, then the draw as this resource's own body); `crate::minted_identifier_forms`
-//! owns that form rule, and what the cases here add is the uniqueness it sits on.
+//! RULE: every value this service mints is a fresh opaque draw of the account's ONE
+//! mint — unique across everything the account holds, carrying nothing the request
+//! supplied, and never the ordinal of the call that asked for it, so no two mints hand
+//! out one value. What a draw identifies is its RESOURCE for an identifier, rendered in
+//! the form its resource class is read by (that class's prefix, then the draw as this
+//! resource's own body; `crate::minted_identifier_forms` owns that form rule), and the
+//! registered DOMAIN for an ownership-verification token, which is why a domain name
+//! registered again is told to publish the challenge it already has rather than a new
+//! draw (`crate::target_domain_registration` owns that rule).
 //!
 //! The cases assert that rule over a TABLE whose rows span the dimension it
 //! generalises over — the resource TYPE, since a collision across types is exactly what
 //! it forbids — and, within a type, the input: byte-identical requests, a request that
 //! carries nothing at all, and every `DomainVerificationMethod` the model admits.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_securityagent_securityagent::state::{
@@ -207,8 +209,10 @@ async fn mint_every_resource(router: &MultiServiceRouter) -> Vec<Minted> {
 
     // Target domains: one per `DomainVerificationMethod` the model admits
     // (`smithy_query(query="shape",shape="DomainVerificationMethod")`), plus a repeat of
-    // a name already registered. Each registration is handed an id AND, where its method
-    // has a challenge to publish, a token of its own.
+    // a name already registered. Each registration is handed an id of its own AND, where
+    // its method has a challenge to publish, the token of the DOMAIN it registers — so
+    // the repeat row is handed one newly minted value, its id.
+    let mut domain_tokens: BTreeMap<String, String> = BTreeMap::new();
     for (case, domain, method) in [
         (
             "a DNS_TXT target domain",
@@ -262,24 +266,37 @@ async fn mint_every_resource(router: &MultiServiceRouter) -> Vec<Minted> {
         match challenge_token(&created) {
             Some(token) => {
                 // The token is the record's own state, so the read reports the one the
-                // registration minted rather than recomputing anything.
+                // registration was answered with rather than recomputing anything.
                 assert_eq!(
                     challenge_token(&record),
                     Some(token.clone()),
                     "case {case:?}: the read must report the token the registration \
-                     minted: {record}"
+                     carried: {record}"
                 );
                 assert_ne!(
                     token, id,
                     "case {case:?}: the ownership token is a value of its own, not the \
                      domain's id"
                 );
-                minted.push(Minted {
-                    case: case.to_string(),
-                    member: "verificationDetails.token",
-                    value: token,
-                    form: Form::Token,
-                });
+                match domain_tokens.get(domain) {
+                    // A name this account has already registered keeps its challenge,
+                    // so this row was handed no new value of the mint.
+                    Some(held) => assert_eq!(
+                        &token, held,
+                        "case {case:?}: {domain:?} is already told to publish {held:?}, \
+                         so a second registration must not change its challenge: \
+                         {created}"
+                    ),
+                    None => {
+                        domain_tokens.insert(domain.to_string(), token.clone());
+                        minted.push(Minted {
+                            case: case.to_string(),
+                            member: "verificationDetails.token",
+                            value: token,
+                            form: Form::Token,
+                        });
+                    }
+                }
             }
             None => assert_eq!(
                 method, VERIFICATION_METHOD_PRIVATE_VPC,
@@ -551,15 +568,16 @@ async fn two_mints_hand_out_no_value_in_common() {
 }
 
 /// RULE, applied to the one value that is a SECRET: the ownership token a target domain
-/// is told to publish is that domain's own, so no other domain — and no other
-/// verification method — is ever told to publish it, and it is state of the record
-/// rather than a value a projection computes.
+/// is told to publish is that DOMAIN's own, so no other domain name is ever told to
+/// publish it, and it is state the record carries rather than a value a projection
+/// computes. That one domain name keeps one challenge across its registrations is the
+/// other half of the same rule, and `crate::target_domain_registration` owns it.
 #[tokio::test]
 async fn each_target_domain_is_told_to_publish_its_own_token() {
     let router = emulator();
 
-    // The rows differ along what a shared token would otherwise be shared across: the
-    // verification method, the domain name, and the SAME name registered twice.
+    // One row per domain name, differing along the verification method as well, since a
+    // token shared across methods would be a token shared across domains too.
     let rows = [
         (
             "the first domain, verified by DNS",
@@ -567,18 +585,18 @@ async fn each_target_domain_is_told_to_publish_its_own_token() {
             VERIFICATION_METHOD_DNS_TXT,
         ),
         (
-            "the same domain name, verified by DNS again",
-            "token-one.example.com",
+            "a second domain, verified by DNS",
+            "token-two.example.com",
             VERIFICATION_METHOD_DNS_TXT,
         ),
         (
-            "the same domain name, verified over HTTP",
-            "token-one.example.com",
+            "a third domain, verified over HTTP",
+            "token-three.example.com",
             VERIFICATION_METHOD_HTTP_ROUTE,
         ),
         (
-            "another domain, verified over HTTP",
-            "token-two.example.com",
+            "a fourth domain, verified over HTTP",
+            "token-four.example.com",
             VERIFICATION_METHOD_HTTP_ROUTE,
         ),
     ];

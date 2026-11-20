@@ -11,9 +11,13 @@
 //! Each case asserts a RULE over a TABLE of inputs rather than one recorded call: the
 //! rows differ along the `DomainVerificationMethod` chosen, the form and the size of
 //! the domain name, and the tag map — and the published DNS limits are exercised on
-//! each bound and one character past it.
+//! each bound and one character past it. The ownership challenge a registration reports
+//! is a property of the DOMAIN rather than of the registration, so its cases drive one
+//! domain name through several registrations — differing in method, tags, spelling and
+//! whether the earlier registration still exists — and several domain names beside each
+//! other.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
@@ -293,7 +297,7 @@ fn timestamp_secs(value: &Value, case: &str) -> f64 {
 }
 
 /// The verification token a challenge carries: 64 lowercase hex characters, the
-/// hex-encoded SHA-256 the service mints per record.
+/// hex-encoded SHA-256 the service draws once per registered domain name.
 fn assert_token(challenge: &Value, case: &str) -> String {
     let token = member(challenge, "token")
         .unwrap_or_else(|| panic!("case {case:?}: the challenge carries no token: {challenge}"));
@@ -312,14 +316,17 @@ fn assert_token(challenge: &Value, case: &str) -> String {
 }
 
 /// RULE: `CreateTargetDomain` registers the domain as a stored record — it mints the
-/// `targetDomainId` and the verification challenge, reports the domain as `PENDING`
-/// with no verification time, and `BatchGetTargetDomains` answers that same record,
-/// member for member, from the shared store.
+/// `targetDomainId`, reports the challenge the account's domain carries, reports the
+/// domain as `PENDING` with no verification time, and `BatchGetTargetDomains` answers
+/// that same record, member for member, from the shared store.
 #[tokio::test]
 async fn create_then_batch_get_reads_back_the_registered_target_domain() {
     let router = emulator();
     let mut seen_ids: BTreeSet<String> = BTreeSet::new();
-    let mut seen_tokens: BTreeSet<String> = BTreeSet::new();
+    // The challenge belongs to the DOMAIN, so it is held per domain name here: the cases
+    // below own that rule, and what this one needs of it is that two different names
+    // never share a token.
+    let mut domain_tokens: BTreeMap<String, String> = BTreeMap::new();
 
     for (domain_case, domain) in domain_name_rows() {
         for method in verification_methods() {
@@ -336,10 +343,21 @@ async fn create_then_batch_get_reads_back_the_registered_target_domain() {
                 );
                 let token = assert_pending_projection(&created, &id, &domain, method, &case);
                 if let Some(token) = token.clone() {
-                    assert!(
-                        seen_tokens.insert(token.clone()),
-                        "case {case:?}: CreateTargetDomain reused the verification token {token:?}"
-                    );
+                    match domain_tokens.get(&domain) {
+                        Some(held) => assert_eq!(
+                            &token, held,
+                            "case {case:?}: {domain:?} already carries the challenge \
+                             {held:?}, so this registration must report it again"
+                        ),
+                        None => {
+                            assert!(
+                                !domain_tokens.values().any(|held| held == &token),
+                                "case {case:?}: the verification token {token:?} is \
+                                 already another domain's challenge"
+                            );
+                            domain_tokens.insert(domain.clone(), token);
+                        }
+                    }
                 }
 
                 let page = batch_get(&router, std::slice::from_ref(&id), &case).await;
@@ -363,7 +381,8 @@ async fn create_then_batch_get_reads_back_the_registered_target_domain() {
                     assert_pending_projection(&found[0], &id, &domain, method, &case);
                 assert_eq!(
                     read_token, token,
-                    "case {case:?}: the read must report the token the registration minted"
+                    "case {case:?}: the read must report the token the registration \
+                     reported"
                 );
                 assert_eq!(
                     found[0].get("createdAt"),
@@ -382,9 +401,10 @@ async fn create_then_batch_get_reads_back_the_registered_target_domain() {
     }
 }
 
-/// RULE: the identity is minted per call, not derived from the request — two
-/// registrations of the same domain name with the same method are two distinct
-/// records, each readable on its own and each carrying its own token.
+/// RULE: the id is minted per call, not derived from the request — two registrations of
+/// the same domain name with the same method are two distinct records, each readable on
+/// its own, while the ownership challenge they both report is the one the DOMAIN carries
+/// (the cases below own that half).
 #[tokio::test]
 async fn identical_requests_register_distinct_target_domains() {
     let router = emulator();
@@ -426,9 +446,10 @@ async fn identical_requests_register_distinct_target_domains() {
             &case,
         );
         if method != VERIFICATION_METHOD_PRIVATE_VPC {
-            assert_ne!(
+            assert_eq!(
                 first_token, second_token,
-                "case {case:?}: each record carries its own verification token"
+                "case {case:?}: both records register one domain, so both report that \
+                 domain's one challenge"
             );
         }
     }
@@ -740,5 +761,223 @@ async fn create_target_domain_stops_at_the_target_domain_quota() {
         Some(1),
         "case \"past the quota\": a refused registration must not disturb the stored ones: \
          {page}"
+    );
+}
+
+/// The ownership-verification token a projection reports, whichever challenge the
+/// record's verification method publishes.
+fn reported_token(payload: &Value, case: &str) -> String {
+    let details = payload
+        .get("verificationDetails")
+        .unwrap_or_else(|| panic!("case {case:?}: the projection carries no details: {payload}"));
+    ["dnsTxt", "httpRoute"]
+        .iter()
+        .find_map(|challenge| details.get(challenge).and_then(|held| member(held, "token")))
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the challenge carries no token to publish: {payload}")
+        })
+}
+
+/// The ownership token the record `id` reports when it is read back out of the store.
+async fn stored_token(router: &MultiServiceRouter, id: &str, case: &str) -> String {
+    let page = batch_get(router, std::slice::from_ref(&id.to_string()), case).await;
+    let found = page
+        .get("targetDomains")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: BatchGetTargetDomains answered no list: {page}"));
+    assert_eq!(
+        found.len(),
+        1,
+        "case {case:?}: expected the one registered domain {id:?}, got {page}"
+    );
+    reported_token(&found[0], case)
+}
+
+/// One spelling a client may send a domain name as, and how it is written.
+type DomainSpelling = (&'static str, fn(&str) -> String);
+
+/// The spellings that name ONE domain, as a client may send them: the name as it was
+/// first registered, the same labels in another case (DNS labels are compared
+/// case-insensitively, RFC 4343) and the rooted form with its single trailing dot (RFC
+/// 1035 §3.1), which `target_domain_name_violation` already measures the name without.
+fn same_domain_spellings() -> [DomainSpelling; 3] {
+    [
+        ("the same spelling", |name: &str| name.to_string()),
+        ("the name upper-cased", |name: &str| {
+            name.to_ascii_uppercase()
+        }),
+        ("the rooted form", |name: &str| format!("{name}.")),
+    ]
+}
+
+/// RULE: the ownership-verification token is the challenge of the registered DOMAIN, not
+/// of one registration of it — every registration of a domain name the account already
+/// holds a challenge for reports that same token, whichever `DomainVerificationMethod`
+/// publishes it, so a challenge the owner has already published on the domain goes on
+/// matching.
+#[tokio::test]
+async fn one_domain_name_keeps_one_ownership_challenge_across_its_registrations() {
+    let router = emulator();
+
+    // The rows differ along what a second registration may change: the method whose
+    // challenge publishes the token (both published-challenge members of the enum, in
+    // either order), and the tags the request carries.
+    let rows = [
+        (
+            "registered again with the same method",
+            VERIFICATION_METHOD_DNS_TXT,
+            VERIFICATION_METHOD_DNS_TXT,
+        ),
+        (
+            "registered again with the other published challenge",
+            VERIFICATION_METHOD_DNS_TXT,
+            VERIFICATION_METHOD_HTTP_ROUTE,
+        ),
+        (
+            "registered over HTTP, then by DNS",
+            VERIFICATION_METHOD_HTTP_ROUTE,
+            VERIFICATION_METHOD_DNS_TXT,
+        ),
+        (
+            "registered again over HTTP",
+            VERIFICATION_METHOD_HTTP_ROUTE,
+            VERIFICATION_METHOD_HTTP_ROUTE,
+        ),
+    ];
+
+    for (row, (row_case, first_method, second_method)) in rows.iter().enumerate() {
+        // A domain name of this row's own, so a row's challenge is its own and the
+        // spellings below are all spellings of that one name.
+        let domain = format!("stable-{row}.example.com");
+        let case = format!("{row_case}, as first registered");
+        let first = create(&router, &domain, first_method, None, &case).await;
+        let first_id = member(&first, "targetDomainId")
+            .unwrap_or_else(|| panic!("case {case:?}: no targetDomainId: {first}"));
+        let challenge = reported_token(&first, &case);
+
+        for ((spelling_case, spell), (tag_case, tags)) in
+            same_domain_spellings().into_iter().zip(tag_rows())
+        {
+            let case = format!("{row_case}, registered again as {spelling_case}, {tag_case}");
+            let name = spell(&domain);
+            let again = create(&router, &name, second_method, tags.as_ref(), &case).await;
+
+            // One domain, one challenge — whatever this registration asked for.
+            assert_eq!(
+                reported_token(&again, &case),
+                challenge,
+                "case {case:?}: expected the challenge {challenge:?} the account already \
+                 holds for {domain:?}, got {again}"
+            );
+            // Still two registrations: the id names this one, not the domain.
+            let again_id = member(&again, "targetDomainId")
+                .unwrap_or_else(|| panic!("case {case:?}: no targetDomainId: {again}"));
+            assert_ne!(
+                again_id, first_id,
+                "case {case:?}: a second registration is a record of its own, got \
+                 {first_id:?} twice"
+            );
+            // The response echoes the spelling the caller sent, so the normalisation is
+            // the lookup's and never the projection's.
+            assert_eq!(
+                member(&again, "domainName").as_deref(),
+                Some(name.as_str()),
+                "case {case:?}: expected domainName {name:?}, got {again}"
+            );
+            // Both records are in the store, and both report the domain's challenge.
+            for (read_case, id) in [("the earlier record", &first_id), ("this record", &again_id)]
+            {
+                assert_eq!(
+                    stored_token(&router, id, &case).await,
+                    challenge,
+                    "case {case:?}: {read_case} must report the domain's challenge \
+                     {challenge:?}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE, the other half: the challenge belongs to the domain NAME, so two different
+/// names never share one, and a name whose registrations have all been deleted keeps the
+/// challenge its owner published — re-registering it reports that same token.
+#[tokio::test]
+async fn a_domains_challenge_outlives_its_registrations_and_is_never_another_domains() {
+    let router = emulator();
+    let mut challenges: BTreeMap<String, String> = BTreeMap::new();
+
+    // The rows differ along the method the domain is registered with, the method it is
+    // re-registered with after the delete, and the spelling the re-registration sends.
+    for (row, (row_case, first_method, second_method)) in [
+        (
+            "deleted and registered again by DNS",
+            VERIFICATION_METHOD_DNS_TXT,
+            VERIFICATION_METHOD_DNS_TXT,
+        ),
+        (
+            "deleted and registered again over HTTP",
+            VERIFICATION_METHOD_HTTP_ROUTE,
+            VERIFICATION_METHOD_HTTP_ROUTE,
+        ),
+        (
+            "deleted, then registered with the other challenge",
+            VERIFICATION_METHOD_HTTP_ROUTE,
+            VERIFICATION_METHOD_DNS_TXT,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (spelling, (spelling_case, spell)) in same_domain_spellings().into_iter().enumerate() {
+            let domain = format!("outlives-{row}-{spelling}.example.com");
+            let case = format!("{row_case}, as {spelling_case}");
+            let created = create(&router, &domain, first_method, None, &case).await;
+            let id = member(&created, "targetDomainId")
+                .unwrap_or_else(|| panic!("case {case:?}: no targetDomainId: {created}"));
+            let challenge = reported_token(&created, &case);
+
+            // No two domain names are ever told to publish one challenge.
+            for (held_domain, held) in &challenges {
+                assert_ne!(
+                    &challenge, held,
+                    "case {case:?}: {domain:?} was handed the challenge {held_domain:?} \
+                     already publishes ({held:?})"
+                );
+            }
+            challenges.insert(domain.clone(), challenge.clone());
+
+            // Deregistering the domain drops the RECORD, so its id is unknown...
+            ok(
+                &router,
+                "DeleteTargetDomain",
+                &json!({"targetDomainId": &id}),
+                &case,
+            )
+            .await;
+            let page = batch_get(&router, std::slice::from_ref(&id), &case).await;
+            assert_eq!(
+                page.get("notFound")
+                    .and_then(Value::as_array)
+                    .map(Vec::len),
+                Some(1),
+                "case {case:?}: the deleted id {id:?} must be unknown to the account: \
+                 {page}"
+            );
+
+            // ... but not the challenge its owner published for the domain.
+            let again = create(&router, &spell(&domain), second_method, None, &case).await;
+            assert_eq!(
+                reported_token(&again, &case),
+                challenge,
+                "case {case:?}: expected {domain:?} to keep the challenge {challenge:?} \
+                 its owner published, got {again}"
+            );
+        }
+    }
+
+    assert_eq!(
+        challenges.len(),
+        9,
+        "the table must register nine domain names, got {challenges:?}"
     );
 }

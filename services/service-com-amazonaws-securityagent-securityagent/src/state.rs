@@ -1283,8 +1283,11 @@ pub struct TargetDomainRecord {
     /// The record's `TargetDomainStatus`.
     pub verification_status: String,
     pub verification_status_reason: Option<String>,
-    /// The token this service minted for the owner to publish. Stored, not recomputed
-    /// per read, so every projection of the record carries the same token.
+    /// The token this service issued for the owner to publish — the challenge of the
+    /// DOMAIN this record registers, taken from the account's challenge registry
+    /// ([`ComAmazonawsSecurityagentSecurityagentState::domain_verification_token`]).
+    /// Stored, not recomputed per read, so every projection of the record carries the
+    /// same token.
     pub verification_token: String,
     /// The tags supplied at create time, persisted so the tagging operations have
     /// state to read once they are implemented.
@@ -1783,6 +1786,18 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// the upload order the records themselves carry ([`ArtifactRecord::sequence`]), since
     /// a minted id is opaque and carries no order.
     pub artifacts: BTreeMap<String, ArtifactRecord>,
+    /// The ownership-verification challenge this account holds for each domain name it
+    /// has registered, keyed by that name in its normalised form
+    /// ([`normalized_domain_name`]).
+    ///
+    /// Keyed by the DOMAIN rather than by a registration, because that is what the
+    /// challenge belongs to: a registration of a domain name the account has already
+    /// registered is answered with the token that domain already has, whichever
+    /// `DomainVerificationMethod` it is registered with, so a challenge its owner has
+    /// published goes on matching. A record's own
+    /// [`TargetDomainRecord::verification_token`] is the entry taken from here when the
+    /// record was created.
+    pub domain_verification_tokens: BTreeMap<String, String>,
     /// The one generator every identifier and verification token this account's
     /// resources are minted from — whatever their type — so no two of them are ever
     /// handed the same value. See [`IdentifierMint`].
@@ -1825,6 +1840,7 @@ impl Default for ComAmazonawsSecurityagentSecurityagentState {
                 })
                 .collect(),
             artifacts: BTreeMap::new(),
+            domain_verification_tokens: BTreeMap::new(),
             identifiers: IdentifierMint::default(),
         }
     }
@@ -1930,28 +1946,68 @@ impl ComAmazonawsSecurityagentSecurityagentState {
         }
     }
 
-    /// Mint the identity of a new target domain: its id and the ownership-verification
-    /// token its owner is told to publish.
+    /// Mint the identity of a new target domain of `domain_name`: its id and the
+    /// ownership-verification token its owner is told to publish.
     ///
-    /// BOTH are fresh draws of the account's one mint ([`IdentifierMint`]), never
-    /// derived from each other or from request text. So the id is unique across every
-    /// resource this account holds, and the token is this ONE domain's proof of
-    /// control: no other domain, and no other verification method, is ever told to
-    /// publish it.
-    ///
-    /// The id is rendered in the target domain class's own form
-    /// ([`TARGET_DOMAIN_ID_PREFIX`] and a body of this domain's own), so a client that
-    /// routes on, validates or stores it can tell it from an agent space's or a pack's
-    /// id. The token is not an identifier and carries no class prefix: it is the
-    /// challenge value its owner publishes.
-    pub fn mint_target_domain_identity(&mut self) -> TargetDomainIdentity {
+    /// The two are identities of DIFFERENT things, so they are resolved differently.
+    /// The id names this one REGISTRATION, so it is a fresh draw of the account's one
+    /// mint ([`IdentifierMint`]) — unique across every resource this account holds —
+    /// rendered in the target domain class's own form ([`TARGET_DOMAIN_ID_PREFIX`] and a
+    /// body of this domain's own), so a client that routes on, validates or stores it
+    /// can tell it from an agent space's or a pack's id. The token is the proof of
+    /// control of the DOMAIN, so it comes from the account's challenge registry
+    /// ([`Self::domain_verification_token`]): one value per domain name, drawn once and
+    /// reported again for every later registration of that name. It is not an
+    /// identifier and carries no class prefix: it is the challenge value its owner
+    /// publishes.
+    pub fn mint_target_domain_identity(&mut self, domain_name: &str) -> TargetDomainIdentity {
         TargetDomainIdentity {
             target_domain_id: format!(
                 "{TARGET_DOMAIN_ID_PREFIX}{}",
                 self.identifiers.next_uuid()
             ),
-            verification_token: self.identifiers.next_secret(VERIFICATION_TOKEN_CONTEXT),
+            verification_token: self.domain_verification_token(domain_name),
         }
+    }
+
+    /// The ownership-verification token this account's challenge for `domain_name`
+    /// carries: the one already bound to that domain name, or a fresh draw of the
+    /// account's one mint bound to it now.
+    ///
+    /// The challenge is a proof of control of the domain, which its owner publishes ON
+    /// the domain — in its zone or under its web root — so it is keyed to the domain
+    /// name and not to a registration of it: registering a name the account has already
+    /// registered reports the token that name already has, whatever verification method
+    /// either registration chose, so a challenge the owner has already published stays
+    /// the one this service asks for. Two DIFFERENT domain names are never told to
+    /// publish one value, because an unbound name draws from the mint, whose draws are
+    /// unique. The name is keyed in its normalised form ([`normalized_domain_name`]), so
+    /// the spellings that name one domain share its challenge.
+    ///
+    /// The registry outlives the registrations that read it — a published challenge
+    /// stays valid across a deregistration — so it is bounded where that costs nothing:
+    /// at [`MAX_TARGET_DOMAINS`] entries the challenges of domains the account no longer
+    /// holds a registration of are dropped. A caller reaching this point has passed the
+    /// registration quota, so the account holds fewer than that many domains and
+    /// dropping the rest always makes room.
+    pub fn domain_verification_token(&mut self, domain_name: &str) -> String {
+        let domain = normalized_domain_name(domain_name);
+        if let Some(token) = self.domain_verification_tokens.get(&domain) {
+            return token.clone();
+        }
+        if self.domain_verification_tokens.len() >= MAX_TARGET_DOMAINS {
+            let registered: BTreeSet<String> = self
+                .target_domains
+                .values()
+                .map(|record| normalized_domain_name(&record.domain_name))
+                .collect();
+            self.domain_verification_tokens
+                .retain(|domain, _| registered.contains(domain));
+        }
+        let token = self.identifiers.next_secret(VERIFICATION_TOKEN_CONTEXT);
+        self.domain_verification_tokens
+            .insert(domain, token.clone());
+        token
     }
 
     /// Mint the `agentSpaceId` of a new agent space.
@@ -2240,6 +2296,21 @@ pub fn resolve_subnet(region: &str, subnet_id: &str) -> Option<SubnetRecord> {
     region_subnets(region)
         .into_iter()
         .find(|subnet| subnet.subnet_id == subnet_id)
+}
+
+/// `name` in the form that identifies the DOMAIN it names, for keying what belongs to a
+/// domain rather than to one spelling of it.
+///
+/// Two names identify one domain when they differ only in case (DNS labels are compared
+/// case-insensitively, RFC 4343) or in the single trailing dot of the rooted form
+/// (`example.com.` names the same domain as `example.com`, which is also why
+/// [`target_domain_name_violation`] measures the name without it). The caller's own
+/// spelling is what a projection reports — a registration's `domainName` is the text it
+/// was registered with — so this form is for lookups, never for a response.
+pub fn normalized_domain_name(name: &str) -> String {
+    name.strip_suffix('.')
+        .unwrap_or(name)
+        .to_ascii_lowercase()
 }
 
 /// Why `name` is not a domain name this service can register as a target domain, or

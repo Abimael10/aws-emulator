@@ -2,9 +2,10 @@
 
 //! @op CreateTargetDomain
 //!
-//! Registers a target domain: validates the domain name, mints the domain's identity
-//! and verification token, stores a `PENDING` record carrying the challenge the chosen
-//! verification method requires, and answers with that record.
+//! Registers a target domain: validates the domain name, mints this registration's
+//! identity, resolves the ownership-verification token the account holds for that domain
+//! name, stores a `PENDING` record carrying the challenge the chosen verification method
+//! requires, and answers with that record.
 //!
 //! ## Shape of an operation
 //!
@@ -232,12 +233,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A fresh identity per call: the id and the verification token are the
-        // service's to choose, so two calls are two distinct registrations whatever the
-        // inputs were. The model gives this operation no idempotency token and no
-        // conflict error, and every other target domain operation addresses the record
-        // by its `targetDomainId`, so the domain name is not an alternate key.
-        let identity = state.mint_target_domain_identity();
+        // The id names this REGISTRATION and is minted fresh per call: the model gives
+        // this operation no idempotency token and no conflict error, and every other
+        // target domain operation addresses the record by its `targetDomainId`, so the
+        // domain name is not an alternate key and two calls are two distinct
+        // registrations whatever the inputs were. The ownership-verification token, by
+        // contrast, is the proof of control of the DOMAIN, so it is the one the account
+        // already holds for that domain name where it holds one — a challenge its owner
+        // has published goes on matching across registrations.
+        let identity = state.mint_target_domain_identity(&input.target_domain_name);
         let record = crate::state::TargetDomainRecord::pending(
             identity,
             input.target_domain_name,

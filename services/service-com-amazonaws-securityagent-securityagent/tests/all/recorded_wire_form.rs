@@ -822,14 +822,15 @@ async fn a_pending_target_domain_names_the_recorded_challenge() {
         1,
         "the HTTP_ROUTE challenge is one fixed path for every domain, got {http_paths:?}"
     );
-    // The token, by contrast, is per record: one per challenge-bearing registration.
+    // The token, by contrast, is per DOMAIN: the two challenge-bearing methods of one
+    // domain name report that name's one challenge, and no two names share one
+    // (`crate::target_domain_registration` owns that rule).
     assert_eq!(
         tokens.len(),
-        domains.len() * 2,
-        "each challenge-bearing registration carries its own token, got {} for {} \
-         registrations",
+        domains.len(),
+        "each registered domain name carries one challenge token, got {} for {} names",
         tokens.len(),
-        domains.len() * 2
+        domains.len()
     );
 }
 
@@ -954,7 +955,7 @@ async fn create_agent_space_bounds_the_association_it_will_store() {
 }
 
 /// The verification token a challenge carries: 64 lowercase hex characters, the
-/// hex-encoded SHA-256 this service mints per record.
+/// hex-encoded SHA-256 this service draws once per registered domain name.
 fn assert_token(challenge: &Value, case: &str) -> String {
     let token = member(challenge, "token")
         .unwrap_or_else(|| panic!("case {case:?}: the challenge carries no token: {challenge}"));
