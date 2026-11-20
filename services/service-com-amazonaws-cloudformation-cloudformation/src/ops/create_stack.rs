@@ -265,7 +265,10 @@ use crate::state::{status, StoredStack};
 /// The `OnFailure` value that means the same thing as `DisableRollback=true` (the model
 /// documents the two as alternative spellings: "You can specify either OnFailure or
 /// DisableRollback, but not both").
-const ON_FAILURE_DO_NOTHING: &str = "DO_NOTHING";
+///
+/// The value itself is this service's one spelling of it ([`crate::state::on_failure`]), since
+/// it is also what the stack RECORDS about the create and what a later refusal states.
+const ON_FAILURE_DO_NOTHING: &str = crate::state::on_failure::DO_NOTHING;
 
 /// The `OnFailure` value that asks for the stack itself to go when its creation fails:
 /// "DELETE — Delete the stack if stack creation failed."
@@ -753,6 +756,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .and_then(|config| config.mode.as_deref()),
             ),
         });
+        // ...and WHICH statement put it there: the failure action this create named, kept
+        // beside the setting it spells rather than folded into it, because what a later call
+        // may do to a stack this create leaves failed turns on the one the caller used
+        // ([`crate::state::StoredStack::on_failure`]).
+        stack.on_failure = input.on_failure.clone();
         stack.enable_termination_protection =
             input.enable_termination_protection.unwrap_or(false);
         stack.retain_except_on_create = input.retain_except_on_create;

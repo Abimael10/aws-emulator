@@ -143,6 +143,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "DeactivateOrganizationsAccess",
             ));
         };
+        // There is no trusted access to deactivate for an account that is in no organization:
+        // the setting belongs to an organization, so with none the call is refused and nothing
+        // is written
+        // ([`crate::state::organizations_access::refuse_without_an_organization`]).
+        crate::state::organizations_access::refuse_without_an_organization(&*self.engine)?;
         // No `settle` call: trusted access belongs to no stack and carries no status the clock
         // owes — the modelled `OrganizationStatus` has no in-progress value, so the
         // deactivation is in force for the next read.

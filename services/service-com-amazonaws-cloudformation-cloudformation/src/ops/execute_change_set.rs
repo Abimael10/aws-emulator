@@ -133,7 +133,7 @@ use crate::state::{change_set_type, execution_status, status, PendingChangeSetSt
 /// `DisableRollback=true` (the model documents the two as equivalent: "DO_NOTHING - if the
 /// stack creation fails, do nothing. This is equivalent to specifying true for the
 /// DisableRollback parameter").
-const ON_STACK_FAILURE_DO_NOTHING: &str = "DO_NOTHING";
+const ON_STACK_FAILURE_DO_NOTHING: &str = crate::state::on_failure::DO_NOTHING;
 
 /// The `OnStackFailure` value that takes the STACK away when the execution of a change set
 /// that creates it fails ("DELETE - if the stack creation fails, delete the stack"), which
@@ -470,6 +470,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // off the change set here with everything else it carries.
             let deletes_the_stack_on_failure =
                 change_set.on_stack_failure.as_deref() == Some(ON_STACK_FAILURE_DELETE);
+            // The same member, kept as the failure ACTION this execution runs under: it is
+            // what the stack then records about the operation that deployed onto it
+            // ([`crate::state::StoredStack::on_failure`]), read off the change set here with
+            // everything else it carries.
+            let on_stack_failure = change_set.on_stack_failure.clone();
             // "DO_NOTHING - if the stack creation fails, do nothing. This is equivalent to
             // specifying true for the DisableRollback parameter." The deployment
             // configuration the change set was created with states the same thing through
@@ -549,9 +554,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // available for the caller that comes back asking for the failed state to be
             // kept. A CREATE change set's stack is in review rather than in a failed status,
             // so it never meets this gate.
-            if let Some(message) =
-                crate::state::fix_forward_refusal(&stack.status, disable_rollback)
-            {
+            if let Some(message) = crate::state::fix_forward_refusal(stack, disable_rollback) {
                 return Err(crate::scaffolded::Scaffolded::validation_error(message));
             }
 
@@ -664,6 +667,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(disable_rollback) = disable_rollback {
                 stack.disable_rollback = disable_rollback;
             }
+            // The failure ACTION in force on the stack is now this change set's own
+            // `OnStackFailure` — "determines what action will be taken if stack creation
+            // fails" — and nothing where the change set chose none: what the setting above
+            // reports and what a failure of THIS execution may be deployed onto again are this
+            // execution's statements, not those of the operation before it
+            // ([`crate::state::StoredStack::on_failure`]).
+            stack.on_failure = on_stack_failure;
             // `RetainExceptOnCreate` is THIS execution's, under its documented default of
             // `false` for an execution that states it nowhere — the same reading
             // `UpdateStack` gives the member.

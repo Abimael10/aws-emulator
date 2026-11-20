@@ -91,6 +91,10 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # request names BY REFERENCE is read with that principal's own permissions
 # (`state::caller_object_access`).
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The organization this account belongs to, which is AWS Organizations' own record: the
+# StackSets trusted-access operations are about an organization, so whether there is one at
+# all is read from that service's store (`state::organizations_access`).
+service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }
 # Writes the .zip deployment package an `AWS::Lambda::Function` declaring INLINE code is
 # created from: a template states that function's source TEXT, while Lambda's `ZipFile`
 # member is the bytes of an archive, so the source is archived in memory rather than with a

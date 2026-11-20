@@ -1429,6 +1429,18 @@ pub fn on_refused_resource_deletion(deletion_mode: Option<&str>) -> provisioning
     }
 }
 
+/// The failure ACTION a request that deploys a template onto a stack can name: `OnFailure`
+/// on `CreateStack` (the model's `OnFailure` enum) and `OnStackFailure` on a change set (its
+/// `OnStackFailure` enum), whose values the two models spell alike.
+///
+/// Only the one value that CHANGES what a later call may do is named here
+/// ([`fix_forward_refusal`]): `ROLLBACK` and `DELETE` leave no failed stack to act on at all.
+pub mod on_failure {
+    /// "DO_NOTHING - if the stack creation fails, do nothing. This is equivalent to
+    /// specifying true for the DisableRollback parameter."
+    pub const DO_NOTHING: &str = "DO_NOTHING";
+}
+
 /// `ResourceSignalStatus` values (the model's `ResourceSignalStatus` enum): "The status of
 /// the signal, which is either success or failure" (`SignalResourceInput$Status`).
 pub mod resource_signal_status {
@@ -4267,11 +4279,40 @@ pub fn stack_is_in_a_non_terminal_state(status: &str) -> String {
 /// change set it executes was created with; a request stating nothing asks for nothing,
 /// which is that member's own documented default ("Default: False") and not the setting the
 /// FAILING operation ran under.
-pub fn fix_forward_refusal(status: &str, asked: Option<bool>) -> Option<String> {
-    if !status_preserved_a_failure(status) || asked.unwrap_or(false) {
+///
+/// The failed state a request CAN go on preserving is the one the FAILING operation was asked
+/// to preserve with that same flag. A failure kept because the operation named the failure
+/// ACTION instead ([`StoredStack::on_failure`]) is not that state: the escape hatch is the
+/// flag, and it has to have been stated on the operation that failed, so such a stack takes no
+/// deployment at all and is refused with [`stack_kept_by_its_failure_action`] whatever this
+/// request asks.
+pub fn fix_forward_refusal(stack: &StoredStack, asked: Option<bool>) -> Option<String> {
+    if !status_preserved_a_failure(&stack.status) {
         return None;
     }
-    Some(stack_is_in_a_non_terminal_state(status))
+    if let Some(action) = stack.failure_action_in_force() {
+        return Some(stack_kept_by_its_failure_action(&stack.status, action));
+    }
+    if asked.unwrap_or(false) {
+        return None;
+    }
+    Some(stack_is_in_a_non_terminal_state(&stack.status))
+}
+
+/// The message CloudFormation answers a deployment onto a stack whose failed state is kept
+/// because the operation that failed named the failure ACTION rather than the flag that
+/// disables the rollback.
+///
+/// The sentence states the status the stack is in and the action that is in force on it, and
+/// then the member that WOULD have left the stack updatable — stated on the create, which is
+/// where the choice between the two is made. Both variable parts are read off the stack: the
+/// status its failed operation left and the action that operation named; nothing comes from the
+/// request or from any one run.
+pub fn stack_kept_by_its_failure_action(status: &str, action: &str) -> String {
+    format!(
+        "This stack cannot be updated from [{status}] state because it contains [on-failure: \
+         {action}]. Please use disable-rollback option instead during stack creation."
+    )
 }
 
 /// The statuses a stack can be ROLLED BACK from on request, in the order `RollbackStack`'s

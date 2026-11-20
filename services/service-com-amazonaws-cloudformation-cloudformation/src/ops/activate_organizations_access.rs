@@ -142,6 +142,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "ActivateOrganizationsAccess",
             ));
         };
+        // There is no trusted access to activate for an account that is in no organization:
+        // activating it is what gives the management account permissions "to create and manage
+        // StackSets for your organization", so with no organization the call is refused and
+        // nothing is written
+        // ([`crate::state::organizations_access::refuse_without_an_organization`]).
+        crate::state::organizations_access::refuse_without_an_organization(&*self.engine)?;
         // No `settle` call: trusted access belongs to no stack and carries no status the clock
         // owes — the modelled `OrganizationStatus` has no in-progress value, so the activation
         // is in force for the next read.

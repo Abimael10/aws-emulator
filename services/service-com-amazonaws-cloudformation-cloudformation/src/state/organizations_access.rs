@@ -38,6 +38,14 @@
 //! that same organization. So no caller reaching this service is a delegated administrator,
 //! and a call that says it is one is refused with the modelled `InvalidOperationException`
 //! (400) and [`NOT_A_DELEGATED_ADMINISTRATOR`], reading and writing nothing.
+//!
+//! ## An account that is in no organization
+//!
+//! Trusted access is a setting OF AN ORGANIZATION, so all three calls require the account to
+//! be in one: with no organization there is nothing to activate, deactivate or report on, and
+//! each is refused with [`NO_ORGANIZATION`] ([`refuse_without_an_organization`]). Whether
+//! there is an organization is AWS Organizations' own record rather than a copy kept here, so
+//! it is read from that service's store through the shared engine.
 
 /// The model's `OrganizationStatus` enum, "the status of the OrganizationAccess"
 /// (`smithy_query(query="shape", shape="OrganizationStatus")`: `ENABLED | DISABLED |
@@ -75,6 +83,66 @@ pub const NOT_A_DELEGATED_ADMINISTRATOR: &str = "Account used is not a delegated
 /// specified" — so an absent value is NOT this claim.
 pub fn claims_delegated_administrator(call_as: Option<&str>) -> bool {
     call_as == Some(DELEGATED_ADMIN)
+}
+
+/// The sentence every operation of this trusted-access switch is refused with for an account
+/// that is in NO ORGANIZATION.
+///
+/// Entirely FIXED text: the account, the organization and the stack set it speaks of are the
+/// caller's own and none of them reaches the sentence. It states the capability the switch is
+/// for — service-managed stack sets — because that is what an account with no organization
+/// cannot operate, whichever of the three calls asked.
+pub const NO_ORGANIZATION: &str =
+    "You must have an organization setup before operating a SERVICE_MANAGED stack set";
+
+/// The AWS Organizations store this service asks whether the account is in an organization.
+///
+/// It is that service's OWN state struct, reached through the SAME shared engine this
+/// service's store lives in, so CloudFormation reads the very record `CreateOrganization`
+/// wrote rather than a second copy of it — the same seam a stack's `RoleARN` is resolved
+/// against IAM through ([`super::service_role_trust`]).
+pub type OrganizationsState =
+    ::service_com_amazonaws_organizations_awsorganizationsv20161128::ComAmazonawsOrganizationsAwsorganizationsv20161128State;
+
+/// That store in the shared engine, through Organizations' own accessor — called rather than
+/// copied. `None` has the same meaning as for [`super::service_state`]: the engine carries no
+/// such store.
+pub fn organizations_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<OrganizationsState>> {
+    ::service_com_amazonaws_organizations_awsorganizationsv20161128::state::service_state(engine)
+}
+
+/// Refuse the call when this account is in no organization, so no trusted-access status is
+/// reported or written for an organization that does not exist.
+///
+/// Trusted access is a setting OF AN ORGANIZATION: it is what gives the management account
+/// "permissions to create and manage StackSets for your organization", so with no organization
+/// there is nothing for the three calls of this switch to report on, activate or deactivate,
+/// and each is refused with [`NO_ORGANIZATION`] — HTTP 400 with the wire code
+/// `ValidationError`, the service-common refusal, since none of them models an error for it.
+///
+/// The question is put to AWS Organizations, which owns the record, at the instant the
+/// decision is made: an account is in an organization only once `CreateOrganization` has put
+/// it in one, and that call is the only thing that can change this answer. An engine carrying
+/// no Organizations store establishes nothing either way — the same reading the service-role
+/// check gives an engine with no IAM store ([`super::refuse_unassumable_role`]) — so the call
+/// goes ahead there.
+///
+/// Generic over the operation's error enum, so all three calls refuse alike. Called with the
+/// handler's `&*self.engine` and holding no store lock.
+pub fn refuse_without_an_organization<Eng: Send + Sync + 'static, E>(
+    engine: &Eng,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    let Some(organizations) = organizations_state(engine) else {
+        return Ok(());
+    };
+    if organizations.lock().organization.is_some() {
+        return Ok(());
+    }
+    Err(crate::scaffolded::Scaffolded::validation_error(
+        NO_ORGANIZATION.to_string(),
+    ))
 }
 
 /// Whether trusted access between StackSets and Organizations is activated for this

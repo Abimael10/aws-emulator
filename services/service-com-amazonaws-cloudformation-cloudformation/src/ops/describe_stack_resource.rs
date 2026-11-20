@@ -104,10 +104,9 @@ fn stack_resource_detail(stack: &StoredStack, deployed: &DeployedResource) -> St
         resource_type: deployed.resource.resource_type.clone(),
         last_updated_timestamp: crate::state::timestamp(deployed.status_timestamp),
         resource_status: deployed.status.clone(),
-        // "Success/failure message associated with the resource": what the record carries,
-        // which is the "work started" message for a resource whose operation is under way
-        // and nothing for one whose status speaks for itself.
-        resource_status_reason: deployed.status_reason.clone(),
+        // "Success/failure message associated with the resource": the one reading of it this
+        // service has ([`crate::state::StoredStack::reported_resource_reason`]).
+        resource_status_reason: stack.reported_resource_reason(deployed),
         description: None,
         metadata: Some(
             deployed

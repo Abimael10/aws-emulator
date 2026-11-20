@@ -184,6 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "DescribeOrganizationsAccess",
             ));
         };
+        // Trusted access is a setting OF AN ORGANIZATION, so an account that is in none has no
+        // status to report: the call is refused rather than answering a setting for an
+        // organization that does not exist
+        // ([`crate::state::organizations_access::refuse_without_an_organization`]).
+        crate::state::organizations_access::refuse_without_an_organization(&*self.engine)?;
         // A pure report: nothing here writes, and there is no `settle` call either, because
         // trusted access carries no status the clock owes — it moves only when a call
         // activates or deactivates it.

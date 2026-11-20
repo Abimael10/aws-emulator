@@ -87,17 +87,21 @@ use crate::state::{DeployedResource, StoredStack};
 /// for exactly the reasons `ops::describe_stack_resources`'s `stack_resource_view` states
 /// once and in full — `ResourceStatusReason` and `ModuleInfo` — so the two readers of one
 /// record cannot drift apart.
-fn stack_resource_summary(deployed: &DeployedResource) -> StackResourceSummary {
+fn stack_resource_summary(
+    stack: &StoredStack,
+    deployed: &DeployedResource,
+) -> StackResourceSummary {
     StackResourceSummary {
         logical_resource_id: deployed.resource.logical_id.clone(),
         physical_resource_id: Some(deployed.resource.physical_resource_id.clone()),
         resource_type: deployed.resource.resource_type.clone(),
         last_updated_timestamp: crate::state::timestamp(deployed.status_timestamp),
         resource_status: deployed.status.clone(),
-        // "Success/failure message associated with the resource": what the record carries,
-        // which is the "work started" message for a resource whose operation is under way
-        // and nothing for one whose status speaks for itself.
-        resource_status_reason: deployed.status_reason.clone(),
+        // "Success/failure message associated with the resource": the one reading of it this
+        // service has ([`crate::state::StoredStack::reported_resource_reason`]), so this
+        // summary and the two `Describe` views cannot report a resource's diagnosis
+        // differently.
+        resource_status_reason: stack.reported_resource_reason(deployed),
         drift_information: crate::state::resource_drift_information_summary(deployed),
         module_info: None,
     }
@@ -225,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let summaries: Vec<StackResourceSummary> = ordered_resources(stack)
             .iter()
-            .map(stack_resource_summary)
+            .map(|deployed| stack_resource_summary(stack, deployed))
             .collect();
         // The stack the token this read hands out is scoped to: its stack id, which names
         // the one stack whose resources are being paged whichever way the request named it.

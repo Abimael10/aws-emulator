@@ -115,6 +115,12 @@ use crate::state::StoredStack;
 /// `DriftInformation` is the result of the last drift detection that COMPLETED against the
 /// stack, with the instant the most recent detection was initiated on it: `NOT_CHECKED`
 /// with no timestamp until `DetectStackDrift` has run one.
+///
+/// `DisableRollback` (and the same member of `DeploymentConfig`) is the flag the REQUEST that
+/// last deployed onto the stack stated
+/// ([`crate::state::StoredStack::stated_disable_rollback`]), not the rollback setting in force:
+/// a failure ACTION that spells the same behaviour is a different member of a different
+/// request, and a caller branches on this one to pick a recovery verb.
 fn stack_view(nesting: &crate::state::Nesting, stored: &StoredStack) -> Stack {
     Stack {
         stack_id: Some(stored.stack_id.clone()),
@@ -130,10 +136,10 @@ fn stack_view(nesting: &crate::state::Nesting, stored: &StoredStack) -> Stack {
         ),
         stack_status: stored.status.clone(),
         stack_status_reason: stored.status_reason.clone(),
-        disable_rollback: Some(stored.disable_rollback),
+        disable_rollback: Some(stored.stated_disable_rollback()),
         deployment_config: crate::state::deployment_config_view(
             stored.deployment_config.as_ref(),
-            stored.disable_rollback,
+            stored.stated_disable_rollback(),
         ),
         notification_ar_ns: Some(stored.notification_arns.clone()),
         timeout_in_minutes: stored.timeout_in_minutes,

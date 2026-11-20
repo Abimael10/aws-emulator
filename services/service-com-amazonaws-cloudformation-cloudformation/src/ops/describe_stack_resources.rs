@@ -105,12 +105,15 @@ const NO_SINGLE_SELECTOR: &str = "Either StackName or PhysicalResourceId must be
 ///
 /// The members this emulator has nothing to report for are absent rather than invented:
 ///
-/// * `ResourceStatusReason` — "Success/failure message associated with the resource":
-///   reported for a resource whose work is UNDER WAY, which is the message CloudFormation
-///   records when it has initiated it ([`crate::state::DeployedResource::status_reason`]),
-///   and absent for one whose status speaks for itself. The reason a resource was not
-///   created at all is reported on the STACK (its `StackStatusReason` and its events),
-///   which is where this service records what the owning service refused.
+/// * `ResourceStatusReason` — "Success/failure message associated with the resource": the
+///   diagnosis the resource's own record carries — the message CloudFormation records when it
+///   has INITIATED the work ([`crate::state::DeployedResource::status_reason`]), and the
+///   owning service's refusal for a resource whose work FAILED — and nothing for a resource
+///   whose status speaks for itself. A resource in a failed status whose record carries no
+///   diagnosis falls back on the one its own EVENT carries, through the ONE reading of this
+///   member the three per-resource views share
+///   ([`crate::state::StoredStack::reported_resource_reason`]), so no view reports that a
+///   resource failed while the stack's own event log says why.
 /// * `Description` — "User defined description associated with the resource": a resource
 ///   description is not one of the resource attributes CloudFormation names (the model's
 ///   `ResourceAttribute` enum lists `CreationPolicy`, `DeletionPolicy`, `Metadata`,
@@ -131,10 +134,9 @@ fn stack_resource_view(stack: &StoredStack, deployed: &DeployedResource) -> Stac
         resource_type: deployed.resource.resource_type.clone(),
         timestamp: crate::state::timestamp(deployed.status_timestamp),
         resource_status: deployed.status.clone(),
-        // "Success/failure message associated with the resource": what the record carries,
-        // which is the "work started" message for a resource whose operation is under way
-        // and nothing for one whose status speaks for itself.
-        resource_status_reason: deployed.status_reason.clone(),
+        // "Success/failure message associated with the resource": the one reading of it this
+        // service has ([`crate::state::StoredStack::reported_resource_reason`]).
+        resource_status_reason: stack.reported_resource_reason(deployed),
         description: None,
         drift_information: crate::state::resource_drift_information(deployed),
         module_info: None,

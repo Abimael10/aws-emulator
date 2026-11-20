@@ -720,7 +720,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // call that deploys onto such a stack goes through
             // ([`crate::state::fix_forward_refusal`]).
             if let Some(message) =
-                crate::state::fix_forward_refusal(&previous.status, disables_rollback(&input))
+                crate::state::fix_forward_refusal(previous, disables_rollback(&input))
             {
                 return Err(crate::scaffolded::Scaffolded::validation_error(message));
             }
@@ -1273,6 +1273,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(disable_rollback) = disables_rollback(&input) {
                 stack.disable_rollback = disable_rollback;
             }
+            // An update names no failure ACTION — the member belongs to the calls that create
+            // a stack — so from here on the stack carries none: what the setting above reports
+            // and what a failure of THIS operation may be deployed onto again are this
+            // request's statements, not the create's
+            // ([`crate::state::StoredStack::on_failure`]).
+            stack.on_failure = None;
             // `RetainExceptOnCreate` is THIS operation's, and its documented default is
             // `false`: "when set to true, newly created resources are deleted when the
             // operation rolls back […] Default: false" — so an update that states it nowhere

@@ -58,6 +58,18 @@ pub struct StoredStack {
     pub role_arn: Option<String>,
     pub timeout_in_minutes: Option<i32>,
     pub disable_rollback: bool,
+    /// The failure ACTION the request that last deployed onto this stack named — `OnFailure`
+    /// on a create, the executed change set's own `OnStackFailure` — or `None` for a request
+    /// that named none (every `UpdateStack`, which has no such member).
+    ///
+    /// It is NOT the same statement as [`Self::disable_rollback`], even where the two have the
+    /// same effect: "DO_NOTHING … is equivalent to specifying true for the DisableRollback
+    /// parameter" says what the action DOES, not that the request stated that flag. Two rules
+    /// turn on which of the two a caller used — what `Stack$DisableRollback` reports
+    /// ([`Self::stated_disable_rollback`]) and whether a stack resting in a failed create can
+    /// be updated at all ([`super::fix_forward_refusal`]) — so the action is recorded beside
+    /// the setting it put in force rather than folded into it.
+    pub on_failure: Option<String>,
     pub enable_termination_protection: bool,
     pub retain_except_on_create: Option<bool>,
     pub deployment_config: Option<StoredDeploymentConfig>,
@@ -321,6 +333,7 @@ impl StoredStack {
             role_arn: None,
             timeout_in_minutes: None,
             disable_rollback: false,
+            on_failure: None,
             enable_termination_protection: false,
             retain_except_on_create: None,
             deployment_config: None,
@@ -880,6 +893,75 @@ impl StoredStack {
     /// stack ID").
     pub fn is_live(&self) -> bool {
         self.status != status::DELETE_COMPLETE
+    }
+
+    /// The failure ACTION that is in force on a stack RESTING in a failed status, where that
+    /// action is the reason the failed state was kept at all — or `None` for every other
+    /// stack.
+    ///
+    /// `OnFailure` `DO_NOTHING` is the one action that leaves such a stack behind ("do nothing
+    /// if stack creation fails"); the other two take it away, by rolling the create back or by
+    /// deleting the stack, so no stack rests under them. The answer is therefore the action
+    /// itself rather than a flag, because the refusal it earns states it
+    /// ([`super::stack_kept_by_its_failure_action`]).
+    pub fn failure_action_in_force(&self) -> Option<&str> {
+        self.on_failure
+            .as_deref()
+            .filter(|action| *action == super::on_failure::DO_NOTHING)
+            .filter(|_| super::status_preserved_a_failure(&self.status))
+    }
+
+    /// "Whether to disable rollback of the stack if the stack operation fails" as the REQUEST
+    /// stated it, which is what `Stack$DisableRollback` reports.
+    ///
+    /// The setting in force ([`Self::disable_rollback`]) is also put there by a failure ACTION
+    /// that spells the same behaviour ("DO_NOTHING … is equivalent to specifying true for the
+    /// DisableRollback parameter"), and that equivalence is about what the operation DOES: the
+    /// member reports the flag the request carried, so a request that named the action and not
+    /// the flag reports `false` — and a later request that does name the flag names the action
+    /// no longer, so what it stated is what is reported from then on.
+    pub fn stated_disable_rollback(&self) -> bool {
+        self.disable_rollback && self.on_failure.is_none()
+    }
+
+    /// `StackResource$ResourceStatusReason` for one of this stack's resources — "success/failure
+    /// message associated with the resource" — as every per-resource view reports it.
+    ///
+    /// The ONE reading of that member, shared by `ListStackResources`, `DescribeStackResources`
+    /// and `DescribeStackResource`, so the three cannot disagree about what a resource's
+    /// diagnosis is.
+    ///
+    /// A resource whose record carries the message reports it, which is every resource whose
+    /// status was written beside its reason. A resource in a FAILED status whose record carries
+    /// none falls back on the diagnosis its OWN EVENT carries: the event log is where the
+    /// owning service's refusal is written as the failure happens, and a failure is reported
+    /// there whatever path recorded it — so a view can report that the resource failed and
+    /// nothing about why only if the stack itself knows nothing about why. The latest such
+    /// event is the one read, since a resource that failed, was deployed again and failed again
+    /// has the newest failure as its current one.
+    ///
+    /// Nothing is invented for a resource in a SUCCESS status: its status speaks for itself, so
+    /// the member stays absent rather than carrying the message of some earlier attempt.
+    pub fn reported_resource_reason(&self, deployed: &DeployedResource) -> Option<String> {
+        if let Some(reason) = deployed
+            .status_reason
+            .as_deref()
+            .filter(|reason| !reason.is_empty())
+        {
+            return Some(reason.to_string());
+        }
+        if !deployed.status.ends_with(FAILED_SUFFIX) {
+            return None;
+        }
+        self.events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.logical_resource_id == deployed.resource.logical_id
+                    && event.resource_status == deployed.status
+            })
+            .and_then(|event| event.resource_status_reason.clone())
+            .filter(|reason| !reason.is_empty())
     }
 
     /// Resolve the DECLARATIONS of the deployment in flight once more, against the resource

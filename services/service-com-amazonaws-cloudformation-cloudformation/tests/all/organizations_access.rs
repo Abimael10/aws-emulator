@@ -14,6 +14,13 @@
 //! management account and is registered as a delegated administrator of nothing; and no read,
 //! answered or refused, moves the setting it reports.**
 //!
+//! Trusted access is a setting OF AN ORGANIZATION, so every case here runs against an account
+//! that is IN one: the organization is created through AWS Organizations' own API, mounted
+//! beside CloudFormation on the one engine, exactly as the assembled emulator mounts it. What
+//! each of these calls answers for an account in NO organization is the subject of
+//! `core/router/tests/all/cloudformation_organizations_access_needs_an_organization.rs`, where
+//! both services are driven together.
+//!
 //! The table spans the class the rule generalises over: every sequence of writes that can
 //! precede a read (none at all, one activation, a repeated activation, an activation a
 //! deactivation follows, a deactivation of an organization nobody activated, a repeated
@@ -24,9 +31,54 @@
 //! Every call goes through the real request path (form-encoded body in, XML envelope out), so
 //! what is asserted is what a client sees.
 
+use std::sync::Arc;
+
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{call_in, member, router_with_engine, store, xml_text, REGION};
+
+/// A router carrying CloudFormation and AWS Organizations on ONE engine, with the account
+/// already IN an organization — the state every case below reads the trusted-access setting
+/// in.
+///
+/// The organization is created through Organizations' own `CreateOrganization`, over that
+/// service's own awsJson wire, rather than written into its store: the fact CloudFormation
+/// reads is that service's own record, so it is established by the one request a client sends
+/// to establish it.
+async fn in_an_organization() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let (mut router, engine) = router_with_engine();
+    router.register_service(
+        service_com_amazonaws_organizations_awsorganizationsv20161128::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://organizations.{REGION}.amazonaws.com/"))
+        .header("content-type", "application/x-amz-json-1.1")
+        .header(
+            "x-amz-target",
+            "AWSOrganizationsV20161128.CreateOrganization",
+        )
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/organizations/\
+                 aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
+            ),
+        )
+        .body(bytes::Bytes::from_static(b"{}"))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.into_body().as_ref()).to_string();
+    assert_eq!(
+        status, 200,
+        "the account must be put in an organization first, CreateOrganization answered \
+         {status} {body}"
+    );
+    (router, engine)
+}
 
 /// The Regions every row is driven from: trusted access is organization-wide, so the Region a
 /// write or a read is signed for selects nothing.
@@ -125,7 +177,7 @@ async fn write_trusted_access(case: &str, router: &MultiServiceRouter, region: &
 #[tokio::test]
 async fn a_read_reports_the_trusted_access_the_writes_left() {
     for (sequence, writes, expected) in SEQUENCES {
-        let (router, engine) = router_with_engine();
+        let (router, engine) = in_an_organization().await;
 
         // Each write of the sequence is signed for a different Region, since where trusted
         // access is activated from does not scope it.
@@ -176,7 +228,7 @@ async fn a_read_made_as_a_delegated_administrator_is_refused() {
             ENABLED,
         ),
     ] {
-        let (router, engine) = router_with_engine();
+        let (router, engine) = in_an_organization().await;
         for action in writes {
             let case = format!("{state}: {action}");
             write_trusted_access(&case, &router, REGION, action).await;

@@ -405,8 +405,11 @@ async fn an_executed_create_change_set_settles_the_stack_it_left_in_review() {
             row.case
         );
         // "Preserve the state of previously provisioned resources when an operation fails":
-        // the flag in force on the stack is the one the execution ran under.
-        let expected_flag = if row.settles_to == Settles::Parked {
+        // the member reports the FLAG the request stated, so it reads `true` for the
+        // execution that stated it and `false` where the change set's own failure ACTION kept
+        // the failed state instead — a different member of a different request, however alike
+        // the two behave.
+        let expected_flag = if row.disable_rollback == Some("true") {
             "true"
         } else {
             "false"
