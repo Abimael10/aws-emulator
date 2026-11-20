@@ -341,14 +341,16 @@ async fn a_developer_login_links_into_the_identity_the_call_names_or_proves() {
             "case {case:?}: the identity carries the identifier {identifier:?} it was \
              registered with"
         );
-        // An identity the call IGNORED keeps exactly the logins it had: nothing of the
-        // request bound the call to it, so it took no part in it.
-        if let (Some(named), Some(before)) = (identity_id, named_before) {
+        // An identity the call resolved AWAY from is the UNAUTHENTICATED one it named: the
+        // two are one account from here on, so it is absorbed into the identity that
+        // answered and a read of it projects the sentinel a join leaves behind.
+        if let (Some(named), Some(_)) = (identity_id, named_before.as_ref()) {
             if named != owed {
-                assert_eq!(
-                    described_providers(&emulator, case, named).await,
-                    before,
-                    "case {case:?}: the identity {named:?} the call ignored is left untouched"
+                let projected = described_providers(&emulator, case, named).await;
+                assert!(
+                    projected.first().is_some_and(|first| first == "DISABLED"),
+                    "case {case:?}: the identity {named:?} the call resolved away from is \
+                     absorbed into {owed:?}, got {projected:?}"
                 );
             }
         }

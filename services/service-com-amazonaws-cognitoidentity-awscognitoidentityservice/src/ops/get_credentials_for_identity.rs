@@ -80,14 +80,16 @@
 //! credential of some other provider, a token of another issuer's form — is no Cognito token
 //! at all, the refusal a token another identity pool minted carries as well.
 //!
-//! The pool's own `DeveloperProviderName` is no provider a login can be redeemed against
-//! here: it is "the 'domain' by which Cognito will refer to your users", this account's own
-//! back end rather than an identity provider, and it issues no token — a
-//! developer-authenticated identity reaches this exchange with the token
-//! `GetOpenIdTokenForDeveloperIdentity` minted for it, presented under THIS service's own
-//! provider name. So an entry keyed by that name carries a developer user identifier where a
-//! token has to be, which is no Cognito token either, whichever identity the pool has
-//! registered the identifier under.
+//! A DEVELOPER provider is no provider a login can be redeemed against here: it is "the
+//! 'domain' by which Cognito will refer to your users", this account's own back end rather
+//! than an identity provider, and it issues no token — a developer-authenticated identity
+//! reaches this exchange with the token `GetOpenIdTokenForDeveloperIdentity` minted for it,
+//! presented under THIS service's own provider name. So an entry keyed by such a name carries
+//! a developer user identifier where a token has to be, which is no Cognito token either,
+//! whichever identity the pool has registered the identifier under. WHICH names those are is
+//! the classification every reading of a presented `Logins` map makes
+//! ([`crate::state::developer_provider_logins`]): the pool's own `DeveloperProviderName` and
+//! every other name this service cannot say is an identity PROVIDER's.
 //!
 //! Every presented
 //! login is decided BEFORE the request's role-selection parameters are looked at, so a

@@ -18,6 +18,10 @@ pub mod authorization;
 /// where the account's trails deliver it.
 pub mod data_events;
 
+/// Which KIND of login one `Logins` entry carries — an identity provider's credential or a
+/// developer user identifier — and the rules that classification decides.
+pub mod developer_provider_logins;
+
 /// The MANAGEMENT events of this service's control plane: what the account's CloudTrail
 /// records and delivers for a call a client made with AWS developer credentials.
 pub mod management_events;
@@ -347,11 +351,13 @@ impl IdentityPool {
     }
 
     /// Whether `logins` carries at least one entry made in the name of a PUBLIC provider —
-    /// any provider that is not this pool's own developer one.
+    /// any entry that is not a DEVELOPER provider's
+    /// ([`IdentityPool::names_a_developer_provider`]), whose value is a developer user
+    /// identifier out of the caller's own directory rather than a provider's credential.
     pub fn logins_name_a_public_provider(&self, logins: &HashMap<String, String>) -> bool {
         logins
             .keys()
-            .any(|provider| !self.names_developer_provider(provider))
+            .any(|provider| !self.names_a_developer_provider(provider))
     }
 
     /// Whether a `Logins` entry made in the name of `provider_name` carries an OpenID
@@ -506,10 +512,10 @@ impl IdentityPool {
     }
 
     /// Why a `Logins` map presented to the exchange that REDEEMS a login into a credential
-    /// carries no token for one of its entries, if so: an entry keyed by this pool's own
-    /// `DeveloperProviderName`.
+    /// carries no token for one of its entries, if so: an entry keyed by a DEVELOPER
+    /// provider.
     ///
-    /// That name is not an identity provider of the pool
+    /// Such a name is not an identity provider of the pool
     /// ([`Self::names_federated_provider`]) but "the 'domain' by which Cognito will refer to
     /// your users … a placeholder that allows your backend and the Cognito service to
     /// communicate about the developer provider"
@@ -527,17 +533,25 @@ impl IdentityPool {
     /// ([`NOT_A_COGNITO_TOKEN_MESSAGE`]), whatever identifier it is and whichever identity
     /// the pool has registered it under.
     ///
-    /// A pool that names no developer provider has no such entry to find, and the developer
-    /// identity operations that TAKE such an identifier — the mint, the lookup, the merge and
-    /// the developer unlink — are not this refusal's: they are the calls that name the
-    /// developer provider by design.
+    /// WHICH entries those are is the classification every reading of a presented map here
+    /// makes ([`IdentityPool::names_a_developer_provider`]): a name this service can say
+    /// names an identity PROVIDER — its own, a published public provider, an Amazon Cognito
+    /// user pool, or a provider this pool declares — keys a provider's credential, and every
+    /// other name is a "domain" of some back end, whose value is an identifier. So an entry
+    /// keyed by a developer provider the pool was never created with carries no token either,
+    /// and the exchange answers it the same way: the pool's own name is not what makes the
+    /// value an identifier, the absence of a provider that could have issued a token is.
+    ///
+    /// The developer identity operations that TAKE such an identifier — the mint, the lookup,
+    /// the merge and the developer unlink — are not this refusal's: they are the calls that
+    /// name the developer provider by design.
     pub fn refuse_developer_provider_login(
         &self,
         logins: &HashMap<String, String>,
     ) -> Option<LoginTokenRefusal> {
         logins
             .keys()
-            .any(|provider_name| self.names_developer_provider(provider_name))
+            .any(|provider_name| self.names_a_developer_provider(provider_name))
             .then_some(LoginTokenRefusal::NotACognitoToken)
     }
 }

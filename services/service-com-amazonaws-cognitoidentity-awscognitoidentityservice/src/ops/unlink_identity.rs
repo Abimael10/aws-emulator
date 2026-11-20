@@ -336,8 +336,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UnlinkIdentity<En
         // This operation detaches PUBLIC-provider logins: a developer login is detached
         // through `UnlinkDeveloperIdentity`, which is the operation that takes a
         // `DeveloperProviderName`. A `Logins` map naming no public provider at all —
-        // carrying only the pool's own developer provider — therefore presents nothing this
-        // operation can act for, which is a bad input parameter.
+        // carrying only developer-provider entries, the pool's own among them
+        // ([`crate::state::IdentityPool::names_a_developer_provider`]) — therefore presents
+        // nothing this operation can act for, which is a bad input parameter.
         if !pool.logins_name_a_public_provider(&input.logins) {
             return Err(UnlinkIdentityErrorModeled::InvalidParameterException(
                 InvalidParameterException {

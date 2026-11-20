@@ -216,7 +216,8 @@ async fn an_empty_logins_map_and_a_foreign_provider_are_two_fixed_sentences() {
 /// RULE: an identity NO login has ever been linked to is named by its id alone, so nothing
 /// the request carries binds the call to it — a developer user identifier the pool has
 /// already registered keeps naming the identity it is registered under, and that identity
-/// is the one the call answers, with the named identity left exactly as it was.
+/// is the one the call answers, the unauthenticated identity it named being ABSORBED into it
+/// as the side a join gives up.
 #[tokio::test]
 async fn an_identity_no_login_binds_is_ignored_and_the_registered_identity_answers() {
     let emulator = Emulator::new();
@@ -281,12 +282,16 @@ async fn an_identity_no_login_binds_is_ignored_and_the_registered_identity_answe
             "case {case:?}: the served call mints a token, got {answered}"
         );
 
-        // The identity the request named took no part in the call: it is still the guest it
-        // was, carrying no login at all.
+        // The identity the request named is not the one the call answered, and the two are
+        // one account from here on: the unauthenticated identity is absorbed into the
+        // identity that answered, so what a read of it projects is the sentinel a join leaves
+        // behind rather than the empty login list of a guest anyone holding its id can still
+        // reach.
         let guest_logins = described_logins(&emulator, case, &guest).await;
         assert!(
-            guest_logins.is_empty(),
-            "case {case:?}: the named identity must be left untouched, got {guest_logins:?}"
+            guest_logins.first().is_some_and(|first| first == "DISABLED"),
+            "case {case:?}: the named identity must be absorbed into the one that answered, \
+             got {guest_logins:?}"
         );
         // And the mapping still resolves to the identity it was registered under.
         let looked_up = emulator

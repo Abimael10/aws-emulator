@@ -37,7 +37,15 @@
 //! has ever been linked to is named by its id alone, so nothing a request carries binds the
 //! call to it: a developer user identifier the pool has already registered keeps naming the
 //! identity it is registered under, which is the identity such a call resolves to and
-//! answers, leaving the one it named untouched.
+//! answers, and the unauthenticated identity the call named is ABSORBED into it — the two are
+//! one account from there on, so the absorbed id is left in the state a join leaves the side
+//! it absorbed in and no later call reaches it as the guest it was.
+//!
+//! The `Logins` map names ONE developer provider — "you can only specify one developer
+//! provider as part of the `Logins` map, which is linked to the identity pool" — and WHICH of
+//! its entries name one is the classification every reading of a presented map makes
+//! ([`crate::state::developer_provider_logins`]): a map naming two is refused before the
+//! pool's configuration is consulted at all.
 //!
 //! The token is minted from the stored identity (see [`crate::state::open_id_token`]) and
 //! recorded in `open_id_tokens`, so the service can later say which identity a token it
@@ -150,6 +158,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The sentence a `Logins` map naming more than one DEVELOPER provider is refused with,
+/// named here so the refusal below reads as one line.
+use crate::state::developer_provider_logins::MULTIPLE_DEVELOPER_PROVIDERS_MESSAGE;
 
 /// How long the token this operation mints stays valid when the request names no
 /// `TokenDuration`. From that member's own documentation: "The expiration time of the
@@ -351,6 +363,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
             );
         }
 
+        // An identity pool is linked to ONE developer provider — "you can only specify one
+        // developer provider as part of the `Logins` map, which is linked to the identity
+        // pool" (`smithy_query(query="doc",shape="GetOpenIdTokenForDeveloperIdentity")`) — so
+        // a map naming TWO of them asks for one account of two back ends' users at once,
+        // which no pool can serve whichever domain it was created with. WHICH entries name a
+        // developer provider is the classification a `Logins` map is read with
+        // ([`crate::state::IdentityPool::names_a_developer_provider`]): every name this
+        // service cannot say names an identity PROVIDER is a "domain" of some back end. The
+        // map the caller sent is what is wrong, so this is decided on the request alone,
+        // before the pool's own configuration is consulted and before any identity is
+        // resolved, linked or minted and any token issued
+        // ([`crate::state::developer_provider_logins::MULTIPLE_DEVELOPER_PROVIDERS_MESSAGE`]).
+        if pool.logins_name_several_developer_providers(&input.logins) {
+            return Err(
+                GetOpenIdTokenForDeveloperIdentityErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(MULTIPLE_DEVELOPER_PROVIDERS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // A ROLE MAPPING has the SERVICE pick the role a session gets from the CLAIMS of the
         // token the exchange presents, and a token minted here stands for a user the
         // CALLER's own backend authenticated, so it carries no provider claims for a mapping
@@ -382,15 +417,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
         // The developer provider is "the 'domain' by which Cognito will refer to your
         // users; you provided this domain while creating/updating the identity pool", so
         // the developer login this call carries is the `Logins` entry keyed by the POOL's
-        // own `DeveloperProviderName`, and its value is the developer user identifier.
-        // `Logins` is a MAP, so one request cannot carry two entries for one developer
-        // provider: "You can only specify one developer provider as part of the Logins
-        // map" holds by construction. A pool that names no developer provider, and a
-        // `Logins` naming none of the pool's own, are the SAME refusal to a caller — the
-        // developer provider this call is about is not one this pool supports — so both
-        // answer the one fixed sentence every operation of this service that resolves a
-        // developer provider answers ([`crate::state::UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE`]),
-        // which names neither the provider the request carried nor the pool's own.
+        // own `DeveloperProviderName`, and its value is the developer user identifier. A map
+        // naming a SECOND developer provider beside it was refused above, so what is left
+        // here is the one developer login a pool can serve. A pool that names no developer
+        // provider, and a `Logins` naming none of the pool's own, are the SAME refusal to a
+        // caller — the developer provider this call is about is not one this pool supports —
+        // so both answer the one fixed sentence every operation of this service that resolves
+        // a developer provider answers
+        // ([`crate::state::UNSUPPORTED_DEVELOPER_PROVIDER_MESSAGE`]), which names neither the
+        // provider the request carried nor the pool's own.
         let Some(developer_provider) = pool.developer_provider_name.clone() else {
             return Err(unsupported_developer_provider());
         };
@@ -688,6 +723,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
                     identity.logins.sort();
                     identity.last_modified_date = now;
                 }
+            }
+        }
+
+        // The UNAUTHENTICATED identity a call resolved AWAY from is one side of the account
+        // this call joins: it carries no login of its own, so there is nothing of it to link
+        // to the identity the developer user identifier is registered under, and what the
+        // implicit link joins is the IDENTITY itself — "supplying multiple logins will create
+        // an implicit linked account". The two are one account from here on, reached through
+        // the identity this call answers, so the guest identity is ABSORBED into it: the state
+        // a join leaves the side it absorbed in ([`crate::state::ComAmazonawsCognitoidentityAwscognitoidentityserviceState::merge_identity_into`]),
+        // a DISABLED identity whose record stays stored and whose read projects the sentinel
+        // that join leaves behind. So no later call reaches the absorbed id as the
+        // unauthenticated identity it was: what names an identity a login has been linked to
+        // is a login OF it, and the absorbed one has none.
+        if ignores_named_identity {
+            if let Some(absorbed) = &input.identity_id {
+                store.merge_identity_into(
+                    &input.identity_pool_id,
+                    absorbed,
+                    &identity_id,
+                    now,
+                );
             }
         }
 

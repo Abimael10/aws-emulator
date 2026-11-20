@@ -51,6 +51,9 @@ service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice 
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` file, so a new suite is picked up by being
+# added rather than by being listed.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The authorization suite makes the principals it calls as through IAM's and STS's own
