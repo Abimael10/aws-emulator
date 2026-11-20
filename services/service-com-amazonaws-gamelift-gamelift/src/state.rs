@@ -2180,17 +2180,32 @@ impl MatchmakingConfigurationRecord {
     }
 }
 
-/// What the service answers when no matchmaking ticket is stored under the
-/// `MatchmakingIdStringModel` an operation was asked about — the one text the service's
-/// ticket lookup failure reads as, shared by every operation that names a ticket, so the
-/// same missing ticket reads the same way whichever of them was called. The modelled error
-/// CLASS it is carried in is each operation's own (`smithy_query`).
+/// What `DescribeMatchmaking` answers when one of the `TicketIds` it was asked to retrieve
+/// details for is stored under no ticket — the message of the modelled
+/// `InvalidRequestException` it declares for an id that resolves to nothing.
 ///
-/// The ticket id the CALLER supplied is the sentence's one variable part: a ticket is
-/// "identified by a unique ticket ID", so the refusal states which id was asked for.
-pub fn matchmaking_ticket_not_found_message(ticket_id: &str) -> String {
+/// Fixed text `"Matchmaking ticket not found: "` and the ticket id the CALLER supplied,
+/// which is the sentence's one variable part: a request may name several tickets, so the
+/// refusal states WHICH of them resolved to nothing. The service words the same missing
+/// ticket differently per operation — `StopMatchmaking` reads as
+/// [`STOP_MATCHMAKING_TICKET_NOT_FOUND_MESSAGE`] — so each caller words its own refusal and
+/// neither of them is a blanket text.
+pub fn describe_matchmaking_ticket_lookup_failure_message(ticket_id: &str) -> String {
     format!("Matchmaking ticket not found: {ticket_id}")
 }
+
+/// What `StopMatchmaking` answers when the `TicketId` it was asked to cancel work on is
+/// stored under no ticket — the message of the modelled `NotFoundException` ("the requested
+/// resource was not found. The resource was either not created yet or deleted").
+///
+/// The WHOLE sentence is this refusal's fixed text, trailing period included: the service
+/// states that the ticket the request specified does not exist, without naming it, so this
+/// message has no variable part at all — neither the id the request carried nor anything
+/// read off the store. Contrast
+/// [`describe_matchmaking_ticket_lookup_failure_message`], which names the one id among
+/// several that resolved to nothing.
+pub const STOP_MATCHMAKING_TICKET_NOT_FOUND_MESSAGE: &str =
+    "Specified matchmaking ticket does not exist.";
 
 /// A matchmaking request, as `StartMatchmaking` persisted it.
 #[derive(Debug, Clone)]

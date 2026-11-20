@@ -9,6 +9,9 @@
 //! with cannot be stopped, and a cancelled ticket is out of the clock's progression: it is
 //! neither picked up nor timed out afterwards.
 //!
+//! The not-found refusal has its own section at the end of this suite: its message is the
+//! WHOLE fixed sentence that error class is worded with, so it names no part of the request.
+//!
 //! The harness (`GameLift`, `wait_for_due_transitions`) is the one `hosting_loop` already
 //! drives the production dispatch path with; the matchmaker helpers are `matchmaking`'s.
 
@@ -121,6 +124,28 @@ async fn cancel(gamelift: &GameLift, label: &str, started: &Value) -> Value {
          connection information, got {ticket}"
     );
     ticket
+}
+
+/// Look again until the ticket `ticket_id` names reads `status`, and answer it: the clock
+/// owes a ticket's pick-up and its request timeout at an INSTANT, so the condition is what
+/// this waits for rather than a span it times. Fails once a deadline far longer than any
+/// transition this suite starts has passed.
+async fn wait_for_ticket_status(gamelift: &GameLift, ticket_id: &str, status: &str) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let described = gamelift
+            .ok("DescribeMatchmaking", json!({"TicketIds": [ticket_id]}))
+            .await;
+        let ticket = described["TicketList"][0].clone();
+        if ticket["Status"] == json!(status) {
+            return ticket;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "ticket {ticket_id:?} must reach {status} before the deadline, got {ticket}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// Every matchmaking request that is still being processed is cancelled by
@@ -305,8 +330,8 @@ async fn a_request_that_is_not_being_processed_is_refused() {
     let impatient = matchmaker(&gamelift, "refusal-impatient-matchmaker", 1).await;
 
     // A ticket id that names nothing is the modelled `NotFoundException` — "the requested
-    // resource was not found[;] the resource was either not created yet or deleted" — and
-    // the refusal states which id was asked for.
+    // resource was not found[;] the resource was either not created yet or deleted" — whose
+    // whole sentence is this refusal's fixed text, naming no part of the request.
     for (label, ticket_id) in [
         ("an id no ticket was ever started with", "cancel-absent"),
         ("the empty id the modelled pattern admits", ""),
@@ -323,8 +348,9 @@ async fn a_request_that_is_not_being_processed_is_refused() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Matchmaking ticket not found: {ticket_id}"),
-            "case {label:?}: the refusal must state which ticket was asked for, got {body}"
+            STOP_MATCHMAKING_TICKET_NOT_FOUND,
+            "case {label:?}: the refusal must answer the one fixed not-found sentence, got \
+             {body}"
         );
     }
 
@@ -353,7 +379,6 @@ async fn a_request_that_is_not_being_processed_is_refused() {
             }),
         )
         .await;
-    std::thread::sleep(Duration::from_millis(1_100));
 
     for (label, ticket_id, expected_status) in [
         (
@@ -367,15 +392,9 @@ async fn a_request_that_is_not_being_processed_is_refused() {
             "TIMED_OUT",
         ),
     ] {
-        let described = gamelift
-            .ok("DescribeMatchmaking", json!({"TicketIds": [ticket_id]}))
-            .await;
-        let before = described["TicketList"][0].clone();
-        assert_eq!(
-            before["Status"],
-            json!(expected_status),
-            "case {label:?}: the ticket must be {expected_status} before the stop, got {before}"
-        );
+        // The timed-out row reaches its status once the request timeout the matchmaker was
+        // created with is due, so the condition is waited for rather than a span timed.
+        let before = wait_for_ticket_status(&gamelift, ticket_id, expected_status).await;
 
         let (status, body) = gamelift
             .call("StopMatchmaking", &json!({"TicketId": ticket_id}))
@@ -398,6 +417,304 @@ async fn a_request_that_is_not_being_processed_is_refused() {
         assert_eq!(
             described["TicketList"][0], before,
             "case {label:?}: a refused stop must leave the ticket as it was, got {described}"
+        );
+    }
+}
+
+// --- The WORDING of the not-found refusal -----------------------------------------------
+//
+// The rule these two tests pin: a `TicketId` that resolves to no stored ticket is refused
+// with HTTP 400 and the modelled `NotFoundException`, whose `Message` is the WHOLE fixed
+// sentence this error class is worded with — it has no variable part at all, so neither the
+// id the request carried nor anything read off the store appears in it, and every
+// unresolvable id is answered with the very same string. The service words the same missing
+// ticket differently per operation: `DescribeMatchmaking`, which may name several tickets
+// at once, answers its own modelled `InvalidRequestException` naming the one id that
+// resolved to nothing.
+
+/// The one sentence `StopMatchmaking` answers for a ticket id that resolves to nothing. The
+/// entire string is this error class's fixed text; it interpolates nothing.
+const STOP_MATCHMAKING_TICKET_NOT_FOUND: &str = "Specified matchmaking ticket does not exist.";
+
+/// What `DescribeMatchmaking` answers for the one id among its `TicketIds` that resolves to
+/// nothing — the per-operation wording this family does NOT share.
+fn describe_not_found_message(ticket_id: &str) -> String {
+    format!("Matchmaking ticket not found: {ticket_id}")
+}
+
+/// The modelled maximum length of `StopMatchmaking$TicketId`
+/// (`smithy_query operation=StopMatchmaking`: `MatchmakingIdStringModel`, length 0..128,
+/// pattern `^[a-zA-Z0-9-\.]*$`).
+const MAX_TICKET_ID_LENGTH: usize = 128;
+
+/// The ticket the rows below store, so each refusal is checked against a store that is NOT
+/// empty and can be shown to survive it.
+const STORED_TICKET: &str = "stored-ticket-1";
+
+/// A request timeout that cannot elapse while these tests run, so the stored ticket stays in
+/// process (`MatchmakingRequestTimeoutInteger`, range 1..43200).
+const PATIENT_TIMEOUT: i64 = 43200;
+
+/// What the store holds for the row's id before the refused request is sent — why the id
+/// resolves to nothing.
+#[derive(Clone, Copy, PartialEq)]
+enum Setup {
+    /// No matchmaking request was ever started with the id, and the store holds the
+    /// sentinel ticket.
+    NeverStarted,
+    /// Nothing at all is stored: no matchmaker, no ticket.
+    EmptyStore,
+    /// A matchmaking CONFIGURATION holds the name — a matchmaker is not a ticket.
+    ConfigurationOfTheSameName,
+}
+
+/// One request whose ticket id resolves to nothing.
+struct Absent {
+    label: &'static str,
+    ticket_id: String,
+    setup: Setup,
+}
+
+fn absent_cases() -> Vec<Absent> {
+    vec![
+        Absent {
+            label: "a hyphenated id no request was ever started with",
+            ticket_id: "missing-ticket-probe".to_string(),
+            setup: Setup::NeverStarted,
+        },
+        Absent {
+            // `MatchmakingIdStringModel` is len 0..128, so this id is at the minimum.
+            label: "the empty id the modelled length minimum admits",
+            ticket_id: String::new(),
+            setup: Setup::NeverStarted,
+        },
+        Absent {
+            label: "a one-character id",
+            ticket_id: "z".to_string(),
+            setup: Setup::NeverStarted,
+        },
+        Absent {
+            label: "an id carrying the dots the modelled pattern allows",
+            ticket_id: "missing.ticket.probe".to_string(),
+            setup: Setup::NeverStarted,
+        },
+        Absent {
+            label: "an id in the UUID form the service mints for a request without one",
+            ticket_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".to_string(),
+            setup: Setup::NeverStarted,
+        },
+        Absent {
+            label: "an id at the modelled maximum length",
+            ticket_id: "m".repeat(MAX_TICKET_ID_LENGTH),
+            setup: Setup::NeverStarted,
+        },
+        Absent {
+            label: "a stored ticket's id with one more character on the end",
+            ticket_id: format!("{STORED_TICKET}0"),
+            setup: Setup::NeverStarted,
+        },
+        Absent {
+            label: "a stored ticket's id in another case",
+            ticket_id: STORED_TICKET.to_uppercase(),
+            setup: Setup::NeverStarted,
+        },
+        Absent {
+            label: "an id no request was started with, against a store holding nothing",
+            ticket_id: "missing-ticket-probe".to_string(),
+            setup: Setup::EmptyStore,
+        },
+        Absent {
+            label: "a name only a matchmaking configuration holds",
+            ticket_id: "configuration-only".to_string(),
+            setup: Setup::ConfigurationOfTheSameName,
+        },
+    ]
+}
+
+/// Start the sentinel matchmaking request on `configuration` and answer the ticket.
+async fn start_stored_ticket(gamelift: &GameLift, configuration: &str) -> Value {
+    let started = gamelift
+        .ok(
+            "StartMatchmaking",
+            json!({
+                "TicketId": STORED_TICKET,
+                "ConfigurationName": configuration,
+                "Players": [{"PlayerId": "player-1"}],
+            }),
+        )
+        .await;
+    started["MatchmakingTicket"].clone()
+}
+
+/// Every ticket id that resolves to no stored ticket is refused with the one fixed
+/// not-found sentence, and the refusal leaves the store as it was.
+///
+/// The rows differ along what the rule generalises over: the form and length of the id
+/// (empty, one character, hyphenated, dotted, the UUID form the service mints, the modelled
+/// maximum length, a near-miss of a stored id), why it resolves to nothing (never started,
+/// held by another resource kind), and whether the store holds any ticket at all.
+#[tokio::test]
+async fn an_unresolvable_ticket_id_is_refused_with_the_one_fixed_not_found_sentence() {
+    let mut answered: Vec<(&str, String)> = Vec::new();
+
+    for case in absent_cases() {
+        let label = case.label;
+        let gamelift = GameLift::new();
+        let mut stored: Option<Value> = None;
+        if case.setup != Setup::EmptyStore {
+            let configuration = matchmaker(&gamelift, "wording-matchmaker", PATIENT_TIMEOUT).await;
+            stored = Some(start_stored_ticket(&gamelift, &configuration).await);
+        }
+        if case.setup == Setup::ConfigurationOfTheSameName {
+            matchmaker(&gamelift, &case.ticket_id, PATIENT_TIMEOUT).await;
+        }
+
+        let (status, body) = gamelift
+            .call("StopMatchmaking", &json!({"TicketId": &case.ticket_id}))
+            .await;
+        let code = error_code(&body);
+        let message = error_message(&body);
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (400, "NotFoundException", STOP_MATCHMAKING_TICKET_NOT_FOUND),
+            "case {label:?}: StopMatchmaking on {:?} must answer 400 NotFoundException \
+             {STOP_MATCHMAKING_TICKET_NOT_FOUND:?}, got {status} {code} {message:?}",
+            case.ticket_id
+        );
+        // The sentence has no variable part: the id the request carried is not in it, and
+        // neither is the id of the ticket the store does hold.
+        if !case.ticket_id.is_empty() {
+            assert!(
+                !message.contains(&case.ticket_id),
+                "case {label:?}: the refusal must not name the requested id, got {message:?}"
+            );
+        }
+        assert!(
+            !message.contains(STORED_TICKET),
+            "case {label:?}: the refusal must name nothing read off the store, got {message:?}"
+        );
+        answered.push((label, message));
+
+        // The same absent id is refused by `DescribeMatchmaking` too — with THAT operation's
+        // own wording, which names the id that resolved to nothing.
+        let expected_describe = describe_not_found_message(&case.ticket_id);
+        let (status, body) = gamelift
+            .call(
+                "DescribeMatchmaking",
+                &json!({"TicketIds": [&case.ticket_id]}),
+            )
+            .await;
+        let code = error_code(&body);
+        let message = error_message(&body);
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (400, "InvalidRequestException", expected_describe.as_str()),
+            "case {label:?}: DescribeMatchmaking on {:?} must answer 400 \
+             InvalidRequestException {expected_describe:?}, got {status} {code} {message:?}",
+            case.ticket_id
+        );
+
+        // The refused requests started nothing and stopped nothing: the stored ticket is
+        // still there and still in process.
+        if let Some(before) = &stored {
+            let described = gamelift
+                .ok("DescribeMatchmaking", json!({"TicketIds": [STORED_TICKET]}))
+                .await;
+            let after = described["TicketList"][0].clone();
+            for member in ["TicketId", "ConfigurationName", "StartTime", "Players"] {
+                assert_eq!(
+                    after[member], before[member],
+                    "case {label:?}: {member} of the stored ticket must be untouched by a \
+                     refused stop, got {after}"
+                );
+            }
+            assert!(
+                after["EndTime"].is_null(),
+                "case {label:?}: the stored ticket must still be in process after a refused \
+                 stop, got {after}"
+            );
+        }
+    }
+
+    // Every row was answered with the very same string, so the sentence is a constant and
+    // not a template.
+    let mut distinct: Vec<&String> = Vec::new();
+    for (_, message) in &answered {
+        if !distinct.contains(&message) {
+            distinct.push(message);
+        }
+    }
+    assert_eq!(
+        distinct.len(),
+        1,
+        "every unresolvable ticket id must be answered with one and the same sentence, got \
+         {answered:?}"
+    );
+}
+
+/// The not-found sentence is the answer to a ticket id that RESOLVES to nothing, and to
+/// nothing else: a stored ticket is stopped, the same id then resolves to a ticket in a
+/// terminal status and is refused as such, and an id the modelled constraints reject never
+/// reaches the lookup at all.
+#[tokio::test]
+async fn the_not_found_sentence_is_answered_only_for_an_id_that_resolves_to_nothing() {
+    let gamelift = GameLift::new();
+    let configuration = matchmaker(&gamelift, "served-matchmaker", PATIENT_TIMEOUT).await;
+    start_stored_ticket(&gamelift, &configuration).await;
+
+    // The stored ticket is served, not refused.
+    let stopped = gamelift
+        .ok("StopMatchmaking", json!({"TicketId": STORED_TICKET}))
+        .await;
+    assert_eq!(
+        stopped,
+        json!({}),
+        "a stored ticket in process must be stopped, got {stopped}"
+    );
+
+    // The id still resolves — to a ticket the service has finished with — so the refusal is
+    // about the ticket's status, NOT about a missing resource.
+    let (status, body) = gamelift
+        .call("StopMatchmaking", &json!({"TicketId": STORED_TICKET}))
+        .await;
+    let code = error_code(&body);
+    let message = error_message(&body);
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "InvalidRequestException"),
+        "a ticket that is no longer being processed must be refused as such, got {status} {body}"
+    );
+    assert_ne!(
+        message, STOP_MATCHMAKING_TICKET_NOT_FOUND,
+        "a ticket that resolves must not be answered with the not-found sentence, got {body}"
+    );
+
+    // An id the modelled `MatchmakingIdStringModel` rejects is a constraint violation: one
+    // character past the length maximum, and a character the pattern does not admit.
+    for (label, ticket_id) in [
+        (
+            "one character past the modelled maximum length",
+            "m".repeat(MAX_TICKET_ID_LENGTH + 1),
+        ),
+        (
+            "a character the modelled pattern does not admit",
+            "not a ticket".to_string(),
+        ),
+    ] {
+        let (status, body) = gamelift
+            .call("StopMatchmaking", &json!({"TicketId": &ticket_id}))
+            .await;
+        let code = error_code(&body);
+        let message = error_message(&body);
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {label:?}: a malformed ticket id must be refused as a constraint \
+             violation, got {status} {body}"
+        );
+        assert_ne!(
+            message, STOP_MATCHMAKING_TICKET_NOT_FOUND,
+            "case {label:?}: a malformed id must not reach the ticket lookup, got {body}"
         );
     }
 }

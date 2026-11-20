@@ -168,11 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One lookup of the one stored record: the condition below is read off it and the
         // cancellation is written to it.
         let Some(ticket) = state.matchmaking_tickets.get_mut(&input.ticket_id) else {
+            // This refusal's message is the whole fixed sentence this error class is worded
+            // with: it states that the ticket the request specified does not exist, and
+            // names neither the id the request carried nor anything read off the store.
             return Err(StopMatchmakingErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::matchmaking_ticket_not_found_message(
-                        &input.ticket_id,
-                    )),
+                    message: Some(
+                        crate::state::STOP_MATCHMAKING_TICKET_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into());
