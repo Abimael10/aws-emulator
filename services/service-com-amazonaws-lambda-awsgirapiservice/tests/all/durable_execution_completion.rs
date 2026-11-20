@@ -49,7 +49,10 @@ const INVOCATIONS_URI: &str = "/2015-03-31/functions";
 const DURABLE_EXECUTION_NAME_HEADER: &str = "x-amz-durable-execution-name";
 
 /// The response header `Invoke$DurableExecutionArn` is bound to.
-const DURABLE_EXECUTION_ARN_HEADER: &str = "x-amz-durable-execution-arn";
+///
+/// `pub(crate)` for the same reason [`kms_call`] is: the suites that put a key into a state
+/// and then assert what Lambda does about it start their executions through the helpers here.
+pub(crate) const DURABLE_EXECUTION_ARN_HEADER: &str = "x-amz-durable-execution-arn";
 
 /// A customer managed key ARN satisfying the model's `KMSKeyArn` pattern, which the durable
 /// function here names in its `DurableConfig`.
@@ -84,7 +87,11 @@ async fn get_execution(router: &MultiServiceRouter, arn: &str) -> Answer {
 
 /// `GetDurableExecution` with `query` appended, which is how a read states whether it asks
 /// for the execution's own data (`IncludeExecutionData`).
-async fn read_execution(router: &MultiServiceRouter, arn: &str, query: &str) -> Answer {
+pub(crate) async fn read_execution(
+    router: &MultiServiceRouter,
+    arn: &str,
+    query: &str,
+) -> Answer {
     json_call(
         router,
         "GET",
@@ -103,7 +110,7 @@ async fn get_history(router: &MultiServiceRouter, arn: &str) -> Answer {
 }
 
 /// `GetDurableExecutionHistory` with `query` appended; see [`read_execution`].
-async fn read_history(router: &MultiServiceRouter, arn: &str, query: &str) -> Answer {
+pub(crate) async fn read_history(router: &MultiServiceRouter, arn: &str, query: &str) -> Answer {
     json_call(
         router,
         "GET",
@@ -514,15 +521,17 @@ const EXECUTION_SUCCEEDED: &str = "ExecutionSucceeded";
 /// of the sentence is fixed; the only variable part of the whole message is the key ARN the
 /// clause that relays the key service's own answer names, which is the key the function's
 /// `DurableConfig` carries.
-const DATA_DISABLED_SENTENCE: &str = "Lambda was unable to access your execution data \
-                                      because the KMS key used is disabled. Check the KMS \
-                                      key configured in the function's durable config.";
+pub(crate) const DATA_DISABLED_SENTENCE: &str = "Lambda was unable to access your execution \
+                                                 data because the KMS key used is disabled. \
+                                                 Check the KMS key configured in the \
+                                                 function's durable config.";
 
 /// See [`DATA_DISABLED_SENTENCE`]; the state of the key does not admit a decrypt.
-const DATA_INVALID_STATE_SENTENCE: &str = "Lambda was unable to access your execution data \
-                                           because the state of the KMS key used is not \
-                                           valid for Decrypt. Check the KMS key configured \
-                                           in the function's durable config.";
+pub(crate) const DATA_INVALID_STATE_SENTENCE: &str = "Lambda was unable to access your execution \
+                                                      data because the state of the KMS key \
+                                                      used is not valid for Decrypt. Check the \
+                                                      KMS key configured in the function's \
+                                                      durable config.";
 
 /// A handler written against the durable-execution programming model the runtime supplies:
 /// it runs one unit of work through `context.step(...)`, so what the execution reports as
@@ -547,13 +556,13 @@ fn durable_event() -> Value {
 }
 
 /// What [`DURABLE_STEP_HANDLER`] answers for [`durable_event`].
-fn durable_result() -> Value {
+pub(crate) fn durable_result() -> Value {
     json!({ "charged": 7 })
 }
 
 /// A durable function on `name` running [`DURABLE_STEP_HANDLER`], its payload data encrypted
 /// under `key_arn`.
-async fn create_durable_function(
+pub(crate) async fn create_durable_function(
     router: &MultiServiceRouter,
     name: &str,
     key_arn: &str,
@@ -581,7 +590,7 @@ async fn create_durable_function(
 }
 
 /// `PublishVersion` on `name`, answering the version it minted.
-async fn publish_version(router: &MultiServiceRouter, name: &str) -> String {
+pub(crate) async fn publish_version(router: &MultiServiceRouter, name: &str) -> String {
     let published = json_call(
         router,
         "POST",
@@ -638,7 +647,7 @@ pub(crate) async fn wait_until_active(
 
 /// `Invoke` on `reference` (with `query` appended), SYNCHRONOUSLY, naming `execution` as the
 /// durable execution the invocation starts.
-async fn invoke_durable(
+pub(crate) async fn invoke_durable(
     router: &MultiServiceRouter,
     reference: &str,
     query: &str,
@@ -659,7 +668,7 @@ async fn invoke_durable(
 }
 
 /// The `Message` an answer carries, whichever casing the channel that rendered it used.
-fn message_of(answer: &Answer) -> String {
+pub(crate) fn message_of(answer: &Answer) -> String {
     answer
         .string("Message")
         .or_else(|| answer.string("message"))
@@ -669,7 +678,7 @@ fn message_of(answer: &Answer) -> String {
 /// The RESULT payload a served read reports, however that read carries it: `Result` on the
 /// execution itself, and the `ExecutionSucceeded` event's own result in a history. `None`
 /// when the read carries none — which is what a read asking for no execution data reports.
-fn result_payload(body: &Value) -> Option<Value> {
+pub(crate) fn result_payload(body: &Value) -> Option<Value> {
     let payload = body
         .get("Result")
         .and_then(Value::as_str)
