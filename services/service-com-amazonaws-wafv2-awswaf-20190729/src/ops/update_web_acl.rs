@@ -374,6 +374,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Every judgement one statement earns from its OWN settings: a statement kind
+        // written where that kind may not appear, an enumerated setting outside the
+        // values it accepts, and a setting applied to a request component it is not
+        // defined for. All of them are made before anything is written, so a refused
+        // update leaves the stored rules and the lock token exactly as they were.
+        if let Some(refusal) = crate::state::statement_settings_refusal(
+            input.rules.as_deref().unwrap_or_default(),
+        ) {
+            return Err(UpdateWebACLErrorModeled::WAFInvalidParameterException(refusal).into());
+        }
+
         // A `ManagedRuleGroupStatement$Version` is resolved when the rule is saved,
         // so a new rule tree pinning a version the publishing vendor has retired is
         // refused with the modelled `WAFExpiredManagedRuleGroupVersionException`,

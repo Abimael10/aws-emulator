@@ -64,6 +64,9 @@ mod patterns;
 mod rule_set;
 /// The `Scope` every resource is namespaced by.
 mod scope;
+/// What ONE rule statement has to satisfy on its own: where its kind may be
+/// written, and which values and components its own settings accept.
+mod statements;
 pub use api_keys::*;
 pub use capacity::*;
 pub use catalog::*;
@@ -75,6 +78,7 @@ pub use managed_products::*;
 pub use patterns::*;
 pub use rule_set::*;
 pub use scope::*;
+pub use statements::*;
 
 // ---------------------------------------------------------------------------
 // The exception messages: ONE constant sentence per exception type.

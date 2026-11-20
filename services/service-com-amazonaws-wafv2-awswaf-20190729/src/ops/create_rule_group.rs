@@ -268,6 +268,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Every judgement one statement earns from its OWN settings: a statement kind
+        // written where that kind may not appear, an enumerated setting outside the
+        // values it accepts, and a setting applied to a request component it is not
+        // defined for. The same judgements the web ACL save path makes, because a rule
+        // is the same rule inside a rule group — and all of them are made before
+        // anything is written, so a refused create leaves no rule group behind.
+        if let Some(refusal) = crate::state::statement_settings_refusal(
+            input.rules.as_deref().unwrap_or_default(),
+        ) {
+            return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(refusal).into());
+        }
+
         // A `ChallengeConfig` is "available at the web ACL level and in each rule",
         // and for the Challenge action the immunity time has a floor of its own,
         // above the modelled one that applies to a CAPTCHA immunity: a save carrying

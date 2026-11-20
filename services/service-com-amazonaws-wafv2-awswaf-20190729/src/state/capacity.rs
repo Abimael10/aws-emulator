@@ -3,6 +3,7 @@
 //! The WCU cost model: what one rule list costs to run.
 
 use super::*;
+use crate::ops::types::PreParseTextTransformation;
 
 /// The web ACL capacity units (WCUs) a rule list consumes.
 ///
@@ -20,7 +21,10 @@ use super::*;
 /// ([`JSON_BODY_BASE_MULTIPLIER`]), and each text transformation it applies adds a
 /// flat [`TEXT_TRANSFORMATION_WCU`] — once per (component, transformation chain)
 /// across the WHOLE rule list, because the transformed content is computed once and
-/// every statement over that component inspects it (see [`CapacityAccount`]).
+/// every statement over that component inspects it (see [`CapacityAccount`]). A
+/// statement's `PreParseTextTransformations` are transformations too and are charged
+/// the same way, over the component THEY transform
+/// ([`CapacityAccount::note_pre_parse_transformations`]).
 ///
 /// One cost is not a constant: a `RuleGroupReferenceStatement` costs the
 /// referenced rule group's own `Capacity` — "the web ACL capacity units (WCUs)
@@ -149,7 +153,25 @@ pub const TEXT_TRANSFORMATION_WCU: i64 = 10;
 
 /// The `TextTransformationType` that transforms nothing
 /// (`smithy_query(query="shape",shape="TextTransformationType")`).
+///
+/// `PreParseTextTransformationType` spells its own no-op the same way
+/// (`smithy_query(query="shape",shape="PreParseTextTransformationType")`), so one
+/// token answers "does this transformation transform anything?" for both.
 pub const TEXT_TRANSFORMATION_NONE: &str = "NONE";
+
+/// The WCUs a statement adds for applying pre-parse text transformations at all,
+/// beside the per-transformation charge each of them costs
+/// ([`TEXT_TRANSFORMATION_WCU`]).
+///
+/// A pre-parse text transformation "normalizes the raw query string before WAF parses
+/// it into individual query arguments", so a statement that applies one makes WAF
+/// parse that component a second time, out of text it did not arrive as — work on top
+/// of transforming it, the way splitting a multi-valued component into its entries is
+/// work on top of matching one ([`MULTI_VALUED_COMPONENT_WCU`]). Pinned by the
+/// recorded corpus: a `CONTAINS` byte match over a single query argument that applies
+/// one pre-parse transformation reports `Capacity` 30 — its base
+/// ([`BYTE_MATCH_SCANNING_WCU`]), one charged transformation, and this.
+pub const PRE_PARSE_QUERY_STRING_WCU: i64 = 10;
 
 /// The WCUs a statement adds for inspecting EVERY value of a multi-valued request
 /// component rather than one named value.
@@ -172,6 +194,17 @@ pub const MULTI_VALUED_COMPONENT_WCU: i64 = 10;
 /// selects, rather than over one value — so the match itself is done repeatedly and
 /// the base cost of the statement is doubled.
 pub const JSON_BODY_BASE_MULTIPLIER: i64 = 2;
+
+/// The request component a pre-parse text transformation transforms, as the key its
+/// charge is shared under: the RAW query string, before WAF parses it into the
+/// individual arguments a statement then inspects
+/// (`smithy_query(query="shape",shape="PreParseTextTransformation")` — "normalizes
+/// the raw query string before WAF parses it into individual query arguments").
+///
+/// It is a component of its own, beside the ones [`component_key`] names: the
+/// transformed text is the query string as it arrived, which is not what any
+/// statement's standard transformations run on.
+pub const PRE_PARSE_COMPONENT: &str = "PreParseQueryString";
 
 /// The most (component, transformation chain) pairs one accounting shares a charge
 /// between.
@@ -228,11 +261,16 @@ impl CapacityAccount {
     /// ([`MULTI_VALUED_COMPONENT_WCU`]) and inspecting the body as JSON multiplies the
     /// match itself ([`JSON_BODY_BASE_MULTIPLIER`]) — so they COMPOSE with each
     /// other and with the per-transformation charge, which is flat.
+    ///
+    /// `pre_parse_text_transformations` is the statement's own
+    /// `PreParseTextTransformations`, charged the same way over the component THEY
+    /// transform; see [`note_pre_parse_transformations`](Self::note_pre_parse_transformations).
     pub(super) fn add_inspection(
         &mut self,
         base: i64,
         field_to_match: &FieldToMatch,
         text_transformations: &[TextTransformation],
+        pre_parse_text_transformations: Option<&Vec<PreParseTextTransformation>>,
     ) {
         let component = component_key(field_to_match);
         self.base = self.base.saturating_add(
@@ -240,6 +278,9 @@ impl CapacityAccount {
                 .saturating_add(component_surcharge(field_to_match)),
         );
         self.note_transformations(&component, text_transformations);
+        self.note_pre_parse_transformations(
+            pre_parse_text_transformations.map_or(&[][..], Vec::as_slice),
+        );
     }
 
     /// Charge a statement that inspects no request component (a request attribute,
@@ -264,17 +305,67 @@ impl CapacityAccount {
     /// step, so the walk never holds a chain prefix of its own, and no more pairs are
     /// shared than [`MAX_SHARED_TRANSFORMATION_CHARGES`].
     pub(super) fn note_transformations(&mut self, component: &str, text_transformations: &[TextTransformation]) {
+        self.note_chain(
+            component,
+            text_transformations
+                .iter()
+                .map(|transformation| (transformation.priority, transformation.r#type.as_str())),
+        );
+    }
+
+    /// Record the chain `pre_parse_text_transformations` applies, over the component
+    /// a pre-parse transformation transforms ([`PRE_PARSE_COMPONENT`]).
+    ///
+    /// A pre-parse text transformation is transformation work like any other — "they
+    /// are applied before the standard text transformations" — so it is charged
+    /// [`TEXT_TRANSFORMATION_WCU`] and shared exactly as those are
+    /// ([`Self::note_transformations`]). What it transforms is not the component the
+    /// statement inspects but the raw query string the component is parsed out of, so
+    /// the chain is recorded under that component: two statements inspecting
+    /// different query arguments with the same pre-parse chain normalize the same raw
+    /// query string and share the charge.
+    ///
+    /// A statement that applies one also pays [`PRE_PARSE_QUERY_STRING_WCU`] for the
+    /// parse of the normalized text, which is the statement's own work and so is not
+    /// shared. A list of nothing but the no-op transforms nothing, so it normalizes
+    /// nothing to re-parse and pays neither charge.
+    pub(super) fn note_pre_parse_transformations(
+        &mut self,
+        pre_parse_text_transformations: &[PreParseTextTransformation],
+    ) {
+        if pre_parse_text_transformations
+            .iter()
+            .all(|transformation| transformation.r#type == TEXT_TRANSFORMATION_NONE)
+        {
+            return;
+        }
+        self.add_base(PRE_PARSE_QUERY_STRING_WCU);
+        self.note_chain(
+            PRE_PARSE_COMPONENT,
+            pre_parse_text_transformations
+                .iter()
+                .map(|transformation| (transformation.priority, transformation.r#type.as_str())),
+        );
+    }
+
+    /// Record the (component, chain) pairs one chain of transformations — each a
+    /// (`Priority`, `Type`) pair — applies to `component`. See
+    /// [`Self::note_transformations`] for what a pair is and why the charge is shared.
+    fn note_chain<'a>(
+        &mut self,
+        component: &str,
+        transformations: impl Iterator<Item = (i32, &'a str)>,
+    ) {
         use ::std::hash::{Hash, Hasher};
 
-        let mut ordered: Vec<&TextTransformation> = text_transformations
-            .iter()
-            .filter(|transformation| transformation.r#type != TEXT_TRANSFORMATION_NONE)
+        let mut ordered: Vec<(i32, &str)> = transformations
+            .filter(|(_, kind)| *kind != TEXT_TRANSFORMATION_NONE)
             .collect();
-        ordered.sort_by_key(|transformation| transformation.priority);
+        ordered.sort_by_key(|(priority, _)| *priority);
         let mut chain = ::std::collections::hash_map::DefaultHasher::new();
         component.hash(&mut chain);
-        for transformation in ordered {
-            transformation.r#type.hash(&mut chain);
+        for (_, kind) in ordered {
+            kind.hash(&mut chain);
             if self.transformations.len() >= MAX_SHARED_TRANSFORMATION_CHARGES {
                 // Past the bound this accounting stops sharing and charges the
                 // transformation on its own; see the constant.
@@ -305,6 +396,7 @@ impl CapacityAccount {
                 byte_match_base(&byte_match.positional_constraint),
                 &byte_match.field_to_match,
                 &byte_match.text_transformations,
+                byte_match.pre_parse_text_transformations.as_ref(),
             );
         }
         if let Some(size_constraint) = statement.size_constraint_statement.as_ref() {
@@ -312,6 +404,7 @@ impl CapacityAccount {
                 ATTRIBUTE_MATCH_WCU,
                 &size_constraint.field_to_match,
                 &size_constraint.text_transformations,
+                size_constraint.pre_parse_text_transformations.as_ref(),
             );
         }
         // The statements that decide from one already-extracted request attribute
@@ -331,6 +424,7 @@ impl CapacityAccount {
                 sqli_match_base(sqli.sensitivity_level.as_deref()),
                 &sqli.field_to_match,
                 &sqli.text_transformations,
+                sqli.pre_parse_text_transformations.as_ref(),
             );
         }
         if let Some(xss) = statement.xss_match_statement.as_ref() {
@@ -338,6 +432,7 @@ impl CapacityAccount {
                 XSS_MATCH_WCU,
                 &xss.field_to_match,
                 &xss.text_transformations,
+                xss.pre_parse_text_transformations.as_ref(),
             );
         }
         if let Some(regex) = statement.regex_match_statement.as_ref() {
@@ -345,6 +440,7 @@ impl CapacityAccount {
                 REGEX_MATCH_WCU,
                 &regex.field_to_match,
                 &regex.text_transformations,
+                regex.pre_parse_text_transformations.as_ref(),
             );
         }
         if let Some(reference) = statement.regex_pattern_set_reference_statement.as_ref() {
@@ -352,6 +448,7 @@ impl CapacityAccount {
                 REGEX_PATTERN_SET_REFERENCE_WCU,
                 &reference.field_to_match,
                 &reference.text_transformations,
+                reference.pre_parse_text_transformations.as_ref(),
             );
         }
         // A rate-based statement costs `RATE_BASED_WCU` on its own, plus

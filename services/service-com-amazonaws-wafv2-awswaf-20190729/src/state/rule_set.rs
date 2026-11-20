@@ -57,9 +57,11 @@ const PARAMETER_DEFAULT_ACTION: &str = "DefaultAction";
 /// The shape name a refusal about one rule's action setting carries in `Parameter`.
 const PARAMETER_RULE: &str = "Rule";
 
-/// The shape name a refusal about a rate-based statement's aggregation carries in
-/// `Parameter`: the statement whose `AggregateKeyType` asked for the absent member.
-const PARAMETER_RATE_BASED_STATEMENT: &str = "RateBasedStatement";
+/// The shape name a refusal about a rate-based statement carries in `Parameter`: the
+/// statement at fault, as the model names it — whichever of its settings tripped the
+/// refusal (an `AggregateKeyType` naming an absent companion member, a statement
+/// written where its kind may not appear).
+pub const PARAMETER_RATE_BASED_STATEMENT: &str = "RateBasedStatement";
 
 /// One `AggregateKeyType` that requires a companion member of the same statement:
 /// the setting, the `ParameterExceptionField` naming the member it requires, the

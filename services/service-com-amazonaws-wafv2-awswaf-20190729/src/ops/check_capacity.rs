@@ -227,6 +227,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Every judgement one statement earns from its OWN settings — a statement kind
+        // written where that kind may not appear, an enumerated setting outside the
+        // values it accepts, a setting applied to a request component it is not defined
+        // for — is made here exactly as the save path makes it: these are "the rules you
+        // want to use in a RuleGroup or WebACL", and a rule list WAF would refuse to
+        // store is not one it quotes a capacity for. No audit record, because this call
+        // changes nothing.
+        if let Some(refusal) = crate::state::statement_settings_refusal(&input.rules) {
+            return Err(CheckCapacityErrorModeled::WAFInvalidParameterException(refusal).into());
+        }
+
         // These are "the rules you want to use in a RuleGroup or WebACL", so a rule
         // pinning a managed rule group version the publishing vendor has retired is
         // refused here exactly as the save path refuses it: a version WAF would not

@@ -21,6 +21,18 @@
 //!   reference is accepted, the asymmetry `RuleActionOverride`'s own doc states;
 //! * the rules price above the per-web-ACL web ACL capacity unit ceiling.
 //!
+//! And the preconditions ONE statement of that list has to satisfy on its own — which
+//! every operation that takes a rule list judges, the four that SAVE one and
+//! `CheckCapacity`, which only prices one:
+//!
+//! * a `RateBasedStatement` is accepted only as a rule's own top-level `Statement`,
+//!   never nested ("you can use any statement that can be nested",
+//!   `NotStatement$Statement`, which a rate-based statement is not);
+//! * a `RateBasedStatement$EvaluationWindowSec` names one of the four settings the
+//!   member enumerates;
+//! * `PreParseTextTransformations` are applied only to a `FieldToMatch` they are
+//!   defined for, and what they cost is charged to the rule set's capacity.
+//!
 //! A refused save writes nothing: no web ACL appears in `ListWebACLs` after a refused
 //! create, and after a refused update the stored rules, bodies and `LockToken` are
 //! exactly what they were.
@@ -41,8 +53,9 @@ use serde_json::{json, Value};
 use service_com_amazonaws_wafv2_awswaf_20190729::state::MAX_WEB_ACL_CAPACITY;
 
 use crate::managed_rule_groups::managed_statement;
+use crate::regex_pattern_set_lifecycle::create_regex_pattern_set;
 use crate::rule_group_lifecycle::{byte_match_statement, create_rule_group};
-use crate::web_acl_lifecycle::{sqli_statement, visibility, xss_statement, Waf};
+use crate::web_acl_lifecycle::{base64_of, sqli_statement, visibility, xss_statement, Waf};
 
 /// The scope the rows are saved in. A scope is only the namespace a save lands in,
 /// and the preconditions are about the rule set itself, so one namespace carries the
@@ -916,4 +929,788 @@ async fn the_rules_of_a_web_acl_may_price_up_to_the_published_ceiling_and_no_fur
         (before.rules.clone(), Some(lock_token.as_str())),
         "case \"an update past the ceiling\": the stored web ACL must be untouched, got {got}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The settings of ONE statement
+//
+// Beside the judgements above, which are about the rule list as a whole, every
+// statement of that list is judged on its own settings: where a statement of its
+// kind may be written, which values its enumerated settings accept, and which
+// request components a setting of it is defined for. These are properties of the
+// statement rather than of the document, so they are judged by every operation that
+// takes a rule list — the four that SAVE one and `CheckCapacity`, which prices one.
+// ---------------------------------------------------------------------------
+
+/// The `ParameterExceptionField` values WAF names for the settings of one statement
+/// (`smithy_query(query="shape",shape="ParameterExceptionField")` lists
+/// `RATE_BASED_STATEMENT` and `PRE_PARSE_TEXT_TRANSFORMATION`). See [`FIELD_RULE`].
+const FIELD_RATE_BASED_STATEMENT: &str = "RATE_BASED_STATEMENT";
+const FIELD_PRE_PARSE_TEXT_TRANSFORMATION: &str = "PRE_PARSE_TEXT_TRANSFORMATION";
+
+/// The `ErrorReason` sentences WAF carries for these refusals. See [`FIELD_RULE`].
+const NESTED_STATEMENT_REASON: &str = "A reference in your rule statement is not valid.";
+const NOT_VALID_REASON: &str = "Your request in not valid.";
+const PRE_PARSE_REASON: &str = "PreParseTextTransformations is only supported for \
+     SingleQueryArgument and AllQueryArguments field to match types.";
+
+/// The member name a refusal about a rate-based statement, or about a pre-parse text
+/// transformation, carries in `Parameter`.
+const PARAMETER_RATE_BASED_STATEMENT: &str = "RateBasedStatement";
+const PARAMETER_PRE_PARSE_TEXT_TRANSFORMATION: &str = "PreParseTextTransformation";
+
+/// Every evaluation window a rate-based statement may look back over: "Valid settings
+/// are 60, 120, 300, and 600" (`RateBasedStatement$EvaluationWindowSec`), its lowest
+/// and its highest included. Written out here rather than imported, so the table pins
+/// the set and not merely its reuse.
+const PUBLISHED_WINDOWS_SEC: [i64; 4] = [60, 120, 300, 600];
+
+/// The window a statement that names none looks back over: "Default: `300`
+/// (5 minutes)" (the same member's doc).
+const DEFAULT_WINDOW_SEC: i64 = 300;
+
+/// `RateBasedStatement$Limit` is `@range(min 10)`, so this is a limit every row can
+/// carry.
+const RATE_LIMIT: i64 = 100;
+
+/// A `RateBasedStatement` aggregating on the request origin's address, carrying
+/// `window` as its `EvaluationWindowSec` only when `window` is `Some` — so an absent
+/// member is really absent on the wire.
+fn rate_based_statement(window: Option<i64>) -> Value {
+    let mut statement = json!({ "Limit": RATE_LIMIT, "AggregateKeyType": "IP" });
+    if let Some(window) = window {
+        statement["EvaluationWindowSec"] = json!(window);
+    }
+    json!({ "RateBasedStatement": statement })
+}
+
+/// Assert that `operation` refuses `request` with the refusal `expected` describes.
+async fn assert_operation_refuses(
+    waf: &Waf,
+    operation: &str,
+    request: Value,
+    expected: &Refusal,
+) {
+    let case = &expected.set.case;
+    let (status, body) = waf.call(operation, request).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: {operation} must refuse it, got status {status} and body {body}"
+    );
+    assert_refusal(&body, expected);
+}
+
+/// A `RateBasedStatement` counts the requests of a whole rule over time, so it is not
+/// one of the statements that "can be nested" (`NotStatement$Statement` and both
+/// logical lists are documented "you can use any statement that can be nested"): WAF
+/// accepts one only as a rule's OWN top-level `Statement`, and refuses a rule list
+/// that nests one with the modelled `WAFInvalidParameterException` naming the
+/// statement kind — whichever operation the list was handed to, and without storing
+/// anything.
+///
+/// One row per nesting the model has (each logical operator, both operand positions,
+/// two levels down, and each statement that carries a nested statement of its own),
+/// driven through every operation that takes a rule list. The controls beside them
+/// differ in the one thing the rule is about: the same statement as the rule's own
+/// statement is saved, read back and priced, and an ordinary statement nested in the
+/// same places is accepted — so what is refused is the KIND of statement, not the
+/// nesting.
+#[tokio::test]
+async fn a_rate_based_statement_may_only_be_a_rule_s_own_top_level_statement() {
+    let waf = Waf::new();
+    let nested = rate_based_statement(None);
+
+    // `(case, rules, judged by a rule group save)`. A rule group save judges a row
+    // whose statements it could hold at all: a managed rule group statement may not
+    // appear in a rule group's rules in the first place, so that row is a web ACL's.
+    let rows: Vec<(&str, Value, bool)> = vec![
+        (
+            "a rate-based statement inside a NotStatement",
+            json!([blocking_rule(
+                "nests",
+                0,
+                json!({ "NotStatement": { "Statement": nested.clone() } })
+            )]),
+            true,
+        ),
+        (
+            "a rate-based statement as the first operand of an AndStatement",
+            json!([blocking_rule(
+                "nests",
+                0,
+                json!({ "AndStatement": { "Statements": [nested.clone(), sqli_statement()] } })
+            )]),
+            true,
+        ),
+        (
+            "a rate-based statement as the second operand of an OrStatement",
+            json!([blocking_rule(
+                "nests",
+                0,
+                json!({ "OrStatement": { "Statements": [sqli_statement(), nested.clone()] } })
+            )]),
+            true,
+        ),
+        (
+            "a rate-based statement two levels down, in an AndStatement in a NotStatement",
+            json!([blocking_rule(
+                "nests",
+                0,
+                json!({
+                    "NotStatement": {
+                        "Statement": {
+                            "AndStatement": { "Statements": [nested.clone(), xss_statement()] }
+                        }
+                    }
+                })
+            )]),
+            true,
+        ),
+        (
+            "a rate-based statement as another rate-based statement's scope-down",
+            json!([blocking_rule(
+                "nests",
+                0,
+                json!({
+                    "RateBasedStatement": {
+                        "Limit": RATE_LIMIT,
+                        "AggregateKeyType": "IP",
+                        "ScopeDownStatement": nested.clone(),
+                    }
+                })
+            )]),
+            true,
+        ),
+        (
+            "a rate-based statement as a managed rule group statement's scope-down",
+            json!([group_running_rule("nests", 0, {
+                let mut statement =
+                    managed_statement("AWS", "AWSManagedRulesAmazonIpReputationList");
+                statement["ManagedRuleGroupStatement"]["ScopeDownStatement"] = nested.clone();
+                statement
+            })]),
+            false,
+        ),
+        (
+            "a rate-based statement beside an ordinary rule, nested in the second rule",
+            json!([
+                blocking_rule("plain", 0, sqli_statement()),
+                blocking_rule(
+                    "nests",
+                    1,
+                    json!({ "NotStatement": { "Statement": nested.clone() } })
+                ),
+            ]),
+            true,
+        ),
+    ];
+
+    // One stored web ACL every refused update is measured against.
+    let stored = RuleSet::of(
+        "the stored rule set",
+        json!([blocking_rule("kept", 0, sqli_statement())]),
+    );
+    let created = waf.ok("CreateWebACL", stored.create_body("nesting-acl")).await;
+    let acl_id = created["Summary"]["Id"]
+        .as_str()
+        .expect("Summary.Id")
+        .to_string();
+    let acl_lock = created["Summary"]["LockToken"]
+        .as_str()
+        .expect("Summary.LockToken")
+        .to_string();
+
+    for (index, (case, rules, in_rule_group)) in rows.iter().enumerate() {
+        let set = RuleSet::of(*case, rules.clone());
+        let expected = Refusal {
+            set: set.clone(),
+            field: FIELD_RATE_BASED_STATEMENT,
+            parameter: PARAMETER_RATE_BASED_STATEMENT.to_string(),
+            reason: NESTED_STATEMENT_REASON,
+        };
+
+        let name = format!("nested-rate-acl-{index}");
+        assert_operation_refuses(&waf, "CreateWebACL", set.create_body(&name), &expected).await;
+        let listed = listed_names(&waf).await;
+        assert!(
+            !listed.contains(&name),
+            "case {case:?}: a refused create must leave no web ACL behind, got {listed:?}"
+        );
+        assert_operation_refuses(
+            &waf,
+            "UpdateWebACL",
+            set.update_body("nesting-acl", &acl_id, &acl_lock),
+            &expected,
+        )
+        .await;
+        assert_operation_refuses(
+            &waf,
+            "CheckCapacity",
+            json!({ "Scope": SCOPE, "Rules": rules.clone() }),
+            &expected,
+        )
+        .await;
+        if *in_rule_group {
+            assert_operation_refuses(
+                &waf,
+                "CreateRuleGroup",
+                json!({
+                    "Name": format!("nested-rate-group-{index}"),
+                    "Scope": SCOPE,
+                    "Capacity": 500,
+                    "VisibilityConfig": visibility("nested-rate-group"),
+                    "Rules": rules.clone(),
+                }),
+                &expected,
+            )
+            .await;
+        }
+    }
+
+    // The refused update changed nothing, and the token the caller holds still works.
+    let held = waf
+        .ok(
+            "GetWebACL",
+            json!({ "Name": "nesting-acl", "Scope": SCOPE, "Id": &acl_id }),
+        )
+        .await;
+    assert_eq!(
+        (held["WebACL"]["Rules"].clone(), held["LockToken"].as_str()),
+        (stored.rules.clone(), Some(acl_lock.as_str())),
+        "case \"the stored rule set\": a refused update must change nothing, got {held}"
+    );
+
+    // The controls: the same statement where it belongs, and an ordinary statement in
+    // each of the places the rate-based one was refused in.
+    let controls: Vec<(&str, Value)> = vec![
+        (
+            "the rate-based statement as the rule's own statement",
+            json!([blocking_rule("rate", 0, rate_based_statement(None))]),
+        ),
+        (
+            "the rate-based statement with an ordinary scope-down of its own",
+            json!([blocking_rule(
+                "rate",
+                0,
+                json!({
+                    "RateBasedStatement": {
+                        "Limit": RATE_LIMIT,
+                        "AggregateKeyType": "IP",
+                        "ScopeDownStatement": sqli_statement(),
+                    }
+                })
+            )]),
+        ),
+        (
+            "an ordinary statement inside a NotStatement",
+            json!([blocking_rule(
+                "nests",
+                0,
+                json!({ "NotStatement": { "Statement": sqli_statement() } })
+            )]),
+        ),
+        (
+            "an ordinary statement in an AndStatement beside a rate-based rule",
+            json!([
+                blocking_rule("rate", 0, rate_based_statement(Some(60))),
+                blocking_rule(
+                    "nests",
+                    1,
+                    json!({ "AndStatement": { "Statements": [sqli_statement(), xss_statement()] } })
+                ),
+            ]),
+        ),
+    ];
+    for (index, (case, rules)) in controls.iter().enumerate() {
+        let name = format!("accepted-rate-acl-{index}");
+        let set = RuleSet::of(*case, rules.clone());
+        let created = waf.ok("CreateWebACL", set.create_body(&name)).await;
+        let id = created["Summary"]["Id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Summary.Id, got {created}"))
+            .to_string();
+        let got = waf
+            .ok(
+                "GetWebACL",
+                json!({ "Name": &name, "Scope": SCOPE, "Id": &id }),
+            )
+            .await;
+        // The stored rules are the submitted ones with the documented evaluation
+        // window filled in wherever a rate-based statement named none.
+        let mut expected_rules = rules.clone();
+        for rule in expected_rules.as_array_mut().expect("a list of rules") {
+            if let Some(statement) = rule["Statement"].get_mut("RateBasedStatement") {
+                if statement.get("EvaluationWindowSec").is_none() {
+                    statement["EvaluationWindowSec"] = json!(DEFAULT_WINDOW_SEC);
+                }
+            }
+        }
+        assert_eq!(
+            got["WebACL"]["Rules"], expected_rules,
+            "case {case:?}: an accepted rule set must read back as stored, got {got}"
+        );
+        let priced = waf
+            .ok(
+                "CheckCapacity",
+                json!({ "Scope": SCOPE, "Rules": rules.clone() }),
+            )
+            .await;
+        assert!(
+            priced["Capacity"].as_i64().is_some_and(|price| price > 0),
+            "case {case:?}: an accepted rule set must be priced, got {priced}"
+        );
+    }
+
+    // And a rule group holds the same rate-based rule.
+    let (_group_id, _group_arn, _group_lock) = create_rule_group(
+        &waf,
+        SCOPE,
+        "accepted-rate-group",
+        500,
+        json!([blocking_rule("rate", 0, rate_based_statement(None))]),
+    )
+    .await;
+}
+
+/// `RateBasedStatement$EvaluationWindowSec` is "the amount of time, in seconds, that
+/// WAF should include in its request counts" and enumerates what it accepts ("valid
+/// settings are 60, 120, 300, and 600"), with no modelled range narrowing the numeric
+/// domain — so a value inside that domain but outside the set is refused with the
+/// modelled `WAFInvalidParameterException` naming the rejected value, nothing is
+/// stored, and each of the four settings is saved and read back unchanged.
+///
+/// The rows span the published set and the values around it: every accepted setting,
+/// the absent member (which reads back as the documented default), each published
+/// bound and one second outside it, values far outside in both directions, and a
+/// negative one — judged on the save paths and on the capacity report alike.
+#[tokio::test]
+async fn a_rate_based_statement_s_evaluation_window_must_be_one_of_the_published_settings() {
+    let waf = Waf::new();
+
+    // Every accepted window, plus the absent member: `(case, requested, stored)`.
+    let accepted: Vec<(String, Option<i64>, i64)> = ::std::iter::once((
+        "an absent EvaluationWindowSec".to_string(),
+        None,
+        DEFAULT_WINDOW_SEC,
+    ))
+    .chain(PUBLISHED_WINDOWS_SEC.iter().map(|window| {
+        (
+            format!("EvaluationWindowSec {window}"),
+            Some(*window),
+            *window,
+        )
+    }))
+    .collect();
+
+    for (index, (case, requested, stored)) in accepted.iter().enumerate() {
+        let name = format!("window-acl-{index}");
+        let rules = json!([blocking_rule("rate", 0, rate_based_statement(*requested))]);
+        let set = RuleSet::of(case.clone(), rules.clone());
+        let created = waf.ok("CreateWebACL", set.create_body(&name)).await;
+        let id = created["Summary"]["Id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Summary.Id, got {created}"))
+            .to_string();
+        let got = waf
+            .ok(
+                "GetWebACL",
+                json!({ "Name": &name, "Scope": SCOPE, "Id": &id }),
+            )
+            .await;
+        assert_eq!(
+            got["WebACL"]["Rules"][0]["Statement"]["RateBasedStatement"]["EvaluationWindowSec"]
+                .as_i64(),
+            Some(*stored),
+            "case {case:?}: the stored window must be {stored}, got {got}"
+        );
+        // A rule group holds the same rule, so the acceptance is not the web ACL
+        // path's alone.
+        let (_id, _arn, _lock) = create_rule_group(
+            &waf,
+            SCOPE,
+            &format!("window-group-{index}"),
+            500,
+            rules.clone(),
+        )
+        .await;
+    }
+
+    // Every window outside the published set: each bound's neighbour, the values the
+    // domain holds between the settings, far outside, and below zero.
+    let refused: [i64; 10] = [-600, -1, 1, 30, 59, 61, 90, 299, 601, 86_400];
+    for (index, window) in refused.iter().enumerate() {
+        let case = format!("EvaluationWindowSec {window}");
+        let rules = json!([blocking_rule("rate", 0, rate_based_statement(Some(*window)))]);
+        let set = RuleSet::of(case.clone(), rules.clone());
+        let expected = Refusal {
+            set: set.clone(),
+            field: FIELD_RATE_BASED_STATEMENT,
+            parameter: window.to_string(),
+            reason: NOT_VALID_REASON,
+        };
+
+        let name = format!("bad-window-acl-{index}");
+        assert_operation_refuses(&waf, "CreateWebACL", set.create_body(&name), &expected).await;
+        let listed = listed_names(&waf).await;
+        assert!(
+            !listed.contains(&name),
+            "case {case:?}: a refused create must leave no web ACL behind, got {listed:?}"
+        );
+        assert_operation_refuses(
+            &waf,
+            "CheckCapacity",
+            json!({ "Scope": SCOPE, "Rules": rules.clone() }),
+            &expected,
+        )
+        .await;
+        assert_operation_refuses(
+            &waf,
+            "CreateRuleGroup",
+            json!({
+                "Name": format!("bad-window-group-{index}"),
+                "Scope": SCOPE,
+                "Capacity": 500,
+                "VisibilityConfig": visibility("bad-window-group"),
+                "Rules": rules.clone(),
+            }),
+            &expected,
+        )
+        .await;
+    }
+}
+
+/// The base WCUs a `CONTAINS` byte match costs: the price this service publishes for
+/// a statement that has to scan the component it inspects. Written out here rather
+/// than imported, so the table pins the arithmetic and not merely its reuse.
+const BYTE_MATCH_SCANNING_WCU: i64 = 10;
+
+/// The WCUs inspecting EVERY value of a multi-valued component adds.
+const MULTI_VALUED_COMPONENT_WCU: i64 = 10;
+
+/// The WCUs one transformation of a request component costs, and what applying
+/// pre-parse transformations at all costs on top: a statement that normalizes the raw
+/// query string makes WAF parse that component out of text it did not arrive as.
+const TRANSFORMATION_WCU: i64 = 10;
+const PRE_PARSE_PARSE_WCU: i64 = 10;
+
+/// Every `FieldToMatch` these rows inspect. The two pre-parse text transformations are
+/// defined for — "only supported when `FieldToMatch` is `SingleQueryArgument` or
+/// `AllQueryArguments`" (`smithy_query(query="shape",shape="PreParseTextTransformation")`)
+/// — and a spread of the others the shape declares
+/// (`smithy_query(query="shape",shape="FieldToMatch")`).
+fn supported_fields() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "SingleQueryArgument",
+            json!({ "SingleQueryArgument": { "Name": "q" } }),
+        ),
+        ("AllQueryArguments", json!({ "AllQueryArguments": {} })),
+    ]
+}
+
+fn unsupported_fields() -> Vec<(&'static str, Value)> {
+    vec![
+        ("UriPath", json!({ "UriPath": {} })),
+        ("QueryString", json!({ "QueryString": {} })),
+        ("Body", json!({ "Body": {} })),
+        ("Method", json!({ "Method": {} })),
+        (
+            "SingleHeader",
+            json!({ "SingleHeader": { "Name": "x-probe" } }),
+        ),
+        ("UriFragment", json!({ "UriFragment": {} })),
+    ]
+}
+
+/// A `PreParseTextTransformations` list of `types`, at ascending priorities
+/// (`PreParseTextTransformation$Priority` "sets the relative processing order").
+fn pre_parse(types: &[&str]) -> Value {
+    Value::Array(
+        types
+            .iter()
+            .enumerate()
+            .map(|(position, kind)| json!({ "Priority": position, "Type": kind }))
+            .collect(),
+    )
+}
+
+/// One statement of `kind` inspecting `field_to_match`, carrying `pre_parse_list` as
+/// its `PreParseTextTransformations` when that is `Some`.
+///
+/// Every statement kind that carries the member
+/// (`smithy_query(query="shape",shape="Statement")` → the six statements with a
+/// `FieldToMatch`), so the rule is asserted on all of them rather than on the one
+/// kind an example happened to use. `regex_set_arn` is a stored regex pattern set, for
+/// the kind that references one.
+fn inspecting_statement(
+    kind: &str,
+    field_to_match: &Value,
+    pre_parse_list: Option<&Value>,
+    regex_set_arn: &str,
+) -> Value {
+    let transformations = json!([{ "Priority": 0, "Type": "NONE" }]);
+    let mut inner = match kind {
+        "ByteMatchStatement" => json!({
+            "SearchString": base64_of("probe"),
+            "FieldToMatch": field_to_match,
+            "TextTransformations": transformations,
+            "PositionalConstraint": "CONTAINS",
+        }),
+        "SizeConstraintStatement" => json!({
+            "FieldToMatch": field_to_match,
+            "ComparisonOperator": "GT",
+            "Size": 1024,
+            "TextTransformations": transformations,
+        }),
+        "RegexMatchStatement" => json!({
+            "RegexString": "^/admin",
+            "FieldToMatch": field_to_match,
+            "TextTransformations": transformations,
+        }),
+        "RegexPatternSetReferenceStatement" => json!({
+            "ARN": regex_set_arn,
+            "FieldToMatch": field_to_match,
+            "TextTransformations": transformations,
+        }),
+        // `SqliMatchStatement` and `XssMatchStatement` carry the component and its
+        // transformations and nothing else required.
+        _ => json!({
+            "FieldToMatch": field_to_match,
+            "TextTransformations": transformations,
+        }),
+    };
+    if let Some(list) = pre_parse_list {
+        inner["PreParseTextTransformations"] = list.clone();
+    }
+    json!({ kind: inner })
+}
+
+/// Pre-parse text transformations "normalize the raw query string before WAF parses
+/// it into individual query arguments", so they are defined only for the components
+/// parsed out of that query string: a statement that applies one to any other
+/// `FieldToMatch` is refused with the modelled `WAFInvalidParameterException` naming
+/// the setting, by every operation that takes a rule list, and nothing is stored.
+///
+/// One refused row per (statement kind that carries the member × component it is not
+/// defined for), one accepted row per (statement kind × component it IS defined for)
+/// — read back to show the setting is stored as sent — and an empty list, which
+/// applies no transformation to anything and so is accepted wherever it is written.
+#[tokio::test]
+async fn pre_parse_text_transformations_are_only_accepted_on_a_query_argument_field() {
+    let waf = Waf::new();
+    let (_set_id, regex_set_arn, _set_lock) =
+        create_regex_pattern_set(&waf, SCOPE, "pre-parse-patterns", &["^/admin"], None).await;
+    let kinds = [
+        "ByteMatchStatement",
+        "SqliMatchStatement",
+        "XssMatchStatement",
+        "SizeConstraintStatement",
+        "RegexMatchStatement",
+        "RegexPatternSetReferenceStatement",
+    ];
+    let applied = pre_parse(&["URL_DECODE"]);
+
+    let mut index = 0usize;
+    for kind in kinds {
+        for (component, field_to_match) in unsupported_fields() {
+            let case = format!("{kind} applying a pre-parse transformation to {component}");
+            let statement =
+                inspecting_statement(kind, &field_to_match, Some(&applied), &regex_set_arn);
+            let rules = json!([blocking_rule("inspects", 0, statement)]);
+            let set = RuleSet::of(case.clone(), rules.clone());
+            let expected = Refusal {
+                set: set.clone(),
+                field: FIELD_PRE_PARSE_TEXT_TRANSFORMATION,
+                parameter: PARAMETER_PRE_PARSE_TEXT_TRANSFORMATION.to_string(),
+                reason: PRE_PARSE_REASON,
+            };
+
+            let name = format!("pre-parse-acl-{index}");
+            assert_operation_refuses(&waf, "CreateWebACL", set.create_body(&name), &expected)
+                .await;
+            let listed = listed_names(&waf).await;
+            assert!(
+                !listed.contains(&name),
+                "case {case:?}: a refused create must leave no web ACL behind, got {listed:?}"
+            );
+            assert_operation_refuses(
+                &waf,
+                "CheckCapacity",
+                json!({ "Scope": SCOPE, "Rules": rules.clone() }),
+                &expected,
+            )
+            .await;
+            assert_operation_refuses(
+                &waf,
+                "CreateRuleGroup",
+                json!({
+                    "Name": format!("pre-parse-group-{index}"),
+                    "Scope": SCOPE,
+                    "Capacity": 500,
+                    "VisibilityConfig": visibility("pre-parse-group"),
+                    "Rules": rules.clone(),
+                }),
+                &expected,
+            )
+            .await;
+            index += 1;
+        }
+    }
+
+    // The accepted rows: the supported components, and an EMPTY list on a component
+    // the transformations are not defined for — it applies none of them.
+    let mut accepted: Vec<(String, Value)> = Vec::new();
+    for kind in kinds {
+        for (component, field_to_match) in supported_fields() {
+            accepted.push((
+                format!("{kind} applying a pre-parse transformation to {component}"),
+                inspecting_statement(kind, &field_to_match, Some(&applied), &regex_set_arn),
+            ));
+        }
+        accepted.push((
+            format!("{kind} carrying an empty PreParseTextTransformations on UriPath"),
+            inspecting_statement(
+                kind,
+                &json!({ "UriPath": {} }),
+                Some(&json!([])),
+                &regex_set_arn,
+            ),
+        ));
+    }
+    for (index, (case, statement)) in accepted.iter().enumerate() {
+        let name = format!("pre-parse-accepted-acl-{index}");
+        let rules = json!([blocking_rule("inspects", 0, statement.clone())]);
+        let set = RuleSet::of(case.clone(), rules.clone());
+        let created = waf.ok("CreateWebACL", set.create_body(&name)).await;
+        let id = created["Summary"]["Id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Summary.Id, got {created}"))
+            .to_string();
+        let got = waf
+            .ok(
+                "GetWebACL",
+                json!({ "Name": &name, "Scope": SCOPE, "Id": &id }),
+            )
+            .await;
+        assert_eq!(
+            got["WebACL"]["Rules"], rules,
+            "case {case:?}: an accepted statement must read back as sent, got {got}"
+        );
+    }
+}
+
+/// A pre-parse text transformation is work WAF does on a request component, so it is
+/// charged like every other transformation — once per (component, chain) across the
+/// rule list — and the statement that applies one also pays for parsing the component
+/// out of the normalized text. So a rule set carrying them prices strictly above the
+/// same rule set without them, and `CheckCapacity` publishes that price.
+///
+/// The rows differ along what the arithmetic generalises over: no transformation, one,
+/// two, a chain of nothing but the no-op, the component inspected, and two statements
+/// sharing one chain. The first two are the figures the recorded corpus pins: the
+/// statement alone prices 10 and the same statement applying one pre-parse
+/// transformation prices 30.
+#[tokio::test]
+async fn pre_parse_text_transformations_are_charged_web_acl_capacity_units() {
+    let waf = Waf::new();
+    let (_set_id, regex_set_arn, _set_lock) =
+        create_regex_pattern_set(&waf, SCOPE, "pre-parse-cost-patterns", &["^/admin"], None).await;
+    let single = json!({ "SingleQueryArgument": { "Name": "q" } });
+    let byte_match = |field_to_match: &Value, pre_parse_list: Option<&Value>| {
+        inspecting_statement(
+            "ByteMatchStatement",
+            field_to_match,
+            pre_parse_list,
+            &regex_set_arn,
+        )
+    };
+
+    let one = pre_parse(&["URL_DECODE"]);
+    let two = pre_parse(&["URL_DECODE", "REPLACE_SEMICOLONS_WITH_AMPERSANDS"]);
+    let none_only = pre_parse(&["NONE"]);
+    let rows: Vec<(&str, Value, i64)> = vec![
+        (
+            "a scanning byte match over one query argument, no pre-parse transformations",
+            json!([blocking_rule("a", 0, byte_match(&single, None))]),
+            BYTE_MATCH_SCANNING_WCU,
+        ),
+        (
+            "the same statement applying one pre-parse transformation",
+            json!([blocking_rule("a", 0, byte_match(&single, Some(&one)))]),
+            BYTE_MATCH_SCANNING_WCU + PRE_PARSE_PARSE_WCU + TRANSFORMATION_WCU,
+        ),
+        (
+            "the same statement applying two pre-parse transformations",
+            json!([blocking_rule("a", 0, byte_match(&single, Some(&two)))]),
+            BYTE_MATCH_SCANNING_WCU + PRE_PARSE_PARSE_WCU + 2 * TRANSFORMATION_WCU,
+        ),
+        (
+            "a pre-parse chain of nothing but the no-op normalizes nothing",
+            json!([blocking_rule("a", 0, byte_match(&single, Some(&none_only)))]),
+            BYTE_MATCH_SCANNING_WCU,
+        ),
+        (
+            "one pre-parse transformation over every query argument",
+            json!([blocking_rule(
+                "a",
+                0,
+                byte_match(&json!({ "AllQueryArguments": {} }), Some(&one))
+            )]),
+            BYTE_MATCH_SCANNING_WCU
+                + MULTI_VALUED_COMPONENT_WCU
+                + PRE_PARSE_PARSE_WCU
+                + TRANSFORMATION_WCU,
+        ),
+        (
+            "two statements over different arguments sharing one pre-parse chain",
+            json!([
+                blocking_rule("a", 0, byte_match(&single, Some(&one))),
+                blocking_rule(
+                    "b",
+                    1,
+                    byte_match(
+                        &json!({ "SingleQueryArgument": { "Name": "r" } }),
+                        Some(&one)
+                    )
+                ),
+            ]),
+            // Each statement is matched and its component parsed, and the chain they
+            // both normalize the query string with is charged once.
+            2 * (BYTE_MATCH_SCANNING_WCU + PRE_PARSE_PARSE_WCU) + TRANSFORMATION_WCU,
+        ),
+    ];
+
+    for (index, (case, rules, expected)) in rows.iter().enumerate() {
+        let priced = waf
+            .ok(
+                "CheckCapacity",
+                json!({ "Scope": SCOPE, "Rules": rules.clone() }),
+            )
+            .await;
+        assert_eq!(
+            priced["Capacity"].as_i64(),
+            Some(*expected),
+            "case {case:?}: CheckCapacity must publish {expected} WCU, got {priced}"
+        );
+
+        // The web ACL that stores those rules reports the price it was quoted.
+        let name = format!("pre-parse-cost-acl-{index}");
+        let set = RuleSet::of(*case, rules.clone());
+        let created = waf.ok("CreateWebACL", set.create_body(&name)).await;
+        let id = created["Summary"]["Id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Summary.Id, got {created}"))
+            .to_string();
+        let got = waf
+            .ok(
+                "GetWebACL",
+                json!({ "Name": &name, "Scope": SCOPE, "Id": &id }),
+            )
+            .await;
+        assert_eq!(
+            got["WebACL"]["Capacity"].as_i64(),
+            Some(*expected),
+            "case {case:?}: the stored web ACL must report {expected} WCU, got {got}"
+        );
+    }
 }
