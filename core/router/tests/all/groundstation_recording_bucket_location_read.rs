@@ -80,7 +80,7 @@ const OTHER_ACCOUNT: &str = "210987654321";
 /// A bucket policy is how a test puts S3 in the one state that makes it ANSWER about a bucket
 /// while withholding where it is: an explicit denial of the read refuses whatever any grant
 /// says, so it holds for the caller Ground Station asks as.
-async fn put_bucket_policy(router: &MultiServiceRouter, bucket: &str, document: &str) {
+pub(crate) async fn put_bucket_policy(router: &MultiServiceRouter, bucket: &str, document: &str) {
     let request = http::Request::builder()
         .method("PUT")
         .uri(format!("https://s3.{REGION}.amazonaws.com/{bucket}?policy"))
@@ -103,7 +103,7 @@ async fn put_bucket_policy(router: &MultiServiceRouter, bucket: &str, document: 
 }
 
 /// A policy denying every principal the read of `bucket`.
-fn deny_bucket_read(bucket: &str) -> String {
+pub(crate) fn deny_bucket_read(bucket: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -359,7 +359,7 @@ fn role_arn_of(roles: &[(Role, String)], role: Role) -> String {
 
 /// The error shape a refusal names, out of the restJson1 envelope's `__type`, which may carry
 /// the shape's namespace.
-fn error_code_of(payload: &Value) -> String {
+pub(crate) fn error_code_of(payload: &Value) -> String {
     payload
         .get("__type")
         .and_then(Value::as_str)
