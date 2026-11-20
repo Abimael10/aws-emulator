@@ -18,10 +18,12 @@
 //! server's database is therefore what its established sessions carried and nothing else —
 //! minting a prefix for a session that carried none would be routing data nothing learned.
 //!
-//! A READ: whether routes are persisted is DERIVED from the stored route server's
-//! persistence configuration and the instant the clock owes that move
+//! A READ: whether routes are persisted is DERIVED from the DATABASE this report is of —
+//! there has to be a learned route in it to persist — together with the stored route server's
+//! persistence configuration as of the instant the clock owes that move
 //! ([`crate::state::RouteServerRecord::persist_routes_state_at`]), so reading the database
-//! changes nothing a later caller sees. A route server id the account holds no route server
+//! changes nothing a later caller sees and the member is not an echo of the `PersistRoutes`
+//! setting a create or a modify carried. A route server id the account holds no route server
 //! for is refused rather than answered with an empty database, so "no routes" and "no such
 //! route server" stay distinguishable.
 //!
@@ -281,30 +283,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.route_server_id)
             .ok_or_else(|| state::invalid_route_server_id_not_found(&input.route_server_id))?;
 
-        // "Indicates whether routes are being persisted in the routing database"
-        // (`AreRoutesPersisted`): the stored route server's persistence configuration as of
-        // now — one whose persistence is still `enabling`, or is being turned off, is not
-        // persisting, so only the settled `enabled` state reports `true`.
-        let are_routes_persisted =
-            record.persist_routes_state_at(now) == state::PERSIST_ROUTES_STATE_ENABLED;
-
-        // Every entry of this route server's database the request selects, each beside the
-        // position it holds in the order the report pages over.
+        // Every entry of this route server's database, before the request narrows it: what
+        // the database HOLDS is what the report below is of, and it is also what decides
+        // whether anything is being persisted.
         //
         // Every comparison is charged to ONE budget, so the product of entries, filters,
         // values and value length is bounded however the caller combines them — which is
         // also what bounds how long this holds the store's lock.
+        let database = learned_routes(&store, &input.route_server_id);
+
+        // "Indicates whether routes are being persisted in the routing database"
+        // (`AreRoutesPersisted`): a fact of the DATABASE, not of the configuration — routes
+        // are being persisted only when there are routes in it to persist AND the stored
+        // route server's persistence is the settled `enabled` (one still `enabling`, or being
+        // turned off, is not persisting). A route server configured to persist whose database
+        // holds no learned route is persisting nothing, which is what lets a caller tell
+        // "configured to persist" (`persistRoutesState`, which `DescribeRouteServers`
+        // reports) from "actually persisting learned routes".
+        let are_routes_persisted = !database.is_empty()
+            && record.persist_routes_state_at(now) == state::PERSIST_ROUTES_STATE_ENABLED;
+
+        // Every entry the request selects, each beside the position it holds in the order the
+        // report pages over.
         let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
-        let mut selected: Vec<(String, RouteServerRoute)> =
-            learned_routes(&store, &input.route_server_id)
-                .into_iter()
-                .filter(|route| {
-                    state::matches_every_filter(&compiled, &mut budget, &|name| {
-                        filter_values(route, name)
-                    })
+        let mut selected: Vec<(String, RouteServerRoute)> = database
+            .into_iter()
+            .filter(|route| {
+                state::matches_every_filter(&compiled, &mut budget, &|name| {
+                    filter_values(route, name)
                 })
-                .map(|route| (entry_position(&route), route))
-                .collect();
+            })
+            .map(|route| (entry_position(&route), route))
+            .collect();
         // A spent budget means the answer is INCOMPLETE, which is not something to report as
         // a result: the request asked for more filtering than one call will do, and is told
         // so.

@@ -16,6 +16,12 @@
 //! `pending` state with the clock owing it `available`
 //! ([`crate::state::RouteServerPropagationRecord`]).
 //!
+//! `DryRun` is answered once the pair's two ids have been resolved and BEFORE the pair's own
+//! state is asked about: the flag asks whether the CALLER may make the call, so a probe of a
+//! pair that already propagates is answered `DryRunOperation` rather than with that state
+//! conflict — the same order the sibling `crate::ops::disable_route_server_propagation`
+//! answers it in.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request. The store
@@ -149,6 +155,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::Instant::now();
 
+        // DryRun sits after the request's ids have been resolved and BEFORE this operation's
+        // own state precondition is asked: the flag "checks whether you have the required
+        // permissions for the operation, without actually making the request" (`$DryRun`),
+        // which is a question about the CALLER, so a probe is answered `DryRunOperation`
+        // rather than with the state conflict the request would have met — the same order
+        // the sibling `crate::ops::disable_route_server_propagation` answers it in, the two
+        // writes of this pair. An id that names no route server or route table of the
+        // account is still refused above: there is nothing to probe the permissions on.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
         // A pair that already propagates has no enable to perform: the request is refused
         // and nothing is written, so the first call's write stays observable to this one.
         // The state it is already in is read off the record, so this refusal cannot name a
@@ -166,20 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The store's own record ceiling, asked of the write that would fill it: a dry run
+        // writes nothing, so it needs no room.
         if !store.has_route_server_propagation_capacity() {
             return Err(state::route_server_limit_exceeded(format!(
                 "This emulator holds {max} route server propagations, which is as many as \
                  it stores",
                 max = state::MAX_ROUTE_SERVER_RECORDS,
             )));
-        }
-
-        // DryRun sits AFTER every id has been resolved and every refusal asked, and BEFORE
-        // the write: the flag asks whether the request WOULD have succeeded, so one that
-        // would have been refused is refused with that reason instead, and one that would
-        // have succeeded leaves state untouched.
-        if input.dry_run == Some(true) {
-            return Err(state::dry_run_operation());
         }
 
         // The propagation is written in `pending` with the clock owing it `available` one

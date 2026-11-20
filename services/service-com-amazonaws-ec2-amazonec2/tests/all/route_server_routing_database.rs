@@ -12,10 +12,11 @@
 //!    every route server reports a database with no entry and no `NextToken`, however many
 //!    peers it holds, whichever liveness protocol they use, and whether or not the clock has
 //!    settled them;
-//! 2. `AreRoutesPersisted` is DERIVED from the stored route server's persistence
-//!    configuration as of the read — true exactly while `persistRoutesState` is the settled
-//!    `enabled`, which `DescribeRouteServers` reports for the same route server — so the two
-//!    reads cannot disagree, and the clock, not a caller, moves a persistence state on;
+//! 2. `AreRoutesPersisted` is DERIVED from the DATABASE the read is of: routes are being
+//!    persisted only when the database holds a learned route to persist AND the stored route
+//!    server's persistence has settled on `enabled`, so a route server configured to persist
+//!    whose peers established no session reports `false` while `DescribeRouteServers` goes on
+//!    reporting the configuration it was given — the member is not an echo of that setting;
 //! 3. a request this operation cannot serve is REFUSED rather than answered with an empty
 //!    database: a `RouteServerId` that is absent, malformed or names no route server of the
 //!    account, a filter name the operation does not answer, and a `NextToken` this service
@@ -38,6 +39,7 @@ use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::ec2_query::{call, element, elements, error_code, error_message, filters};
+use super::rbin_retention_rules::poll_until;
 
 /// The Region every call here is signed for. The default VPC's subnets — the subnets a route
 /// server endpoint is placed into below — are seeded for the emulator's default Region.
@@ -185,6 +187,50 @@ async fn described_persistence(case: &str, router: &MultiServiceRouter, route_se
     .await;
     element(&body, "persistRoutesState")
         .unwrap_or_else(|| panic!("case {case:?}: no persistRoutesState in {body}"))
+}
+
+/// Whether `state` is one of the two SETTLED `RouteServerPersistRoutesState` words —
+/// `enabled` and `disabled`, the catalog's members beside its three transients
+/// (`smithy_query(query="shape",shape="RouteServerPersistRoutesState")`).
+fn persistence_has_settled(state: &str) -> bool {
+    state == ec2::state::PERSIST_ROUTES_STATE_ENABLED
+        || state == ec2::state::PERSIST_ROUTES_STATE_DISABLED
+}
+
+/// Look again until the route server's persistence configuration has SETTLED, and answer the
+/// word it settled on — waiting for that condition rather than for the service's span.
+async fn settled_persistence(case: &str, router: &MultiServiceRouter, route_server_id: &str) -> String {
+    let probe_router = router;
+    let probe_server = route_server_id;
+    poll_until(case, "the route server's persistence to settle", || async move {
+        persistence_has_settled(&described_persistence(case, probe_router, probe_server).await)
+    })
+    .await;
+    described_persistence(case, router, route_server_id).await
+}
+
+/// Assert that the database `route_server_id` reports holds no entry and reports nothing being
+/// persisted, `when` naming the moment the read was made.
+async fn assert_persists_nothing(
+    case: &str,
+    when: &str,
+    router: &MultiServiceRouter,
+    route_server_id: &str,
+) {
+    let body = database_ok(case, router, route_server_id).await;
+    let prefixes = reported_prefixes(&body);
+    assert!(
+        prefixes.is_empty(),
+        "case {case:?}: {when}, the database must hold no learned route, got {prefixes:?} \
+         in {body}"
+    );
+    let persisted = element(&body, "areRoutesPersisted");
+    assert_eq!(
+        persisted.as_deref(),
+        Some("false"),
+        "case {case:?}: {when}, the database holds no learned route to persist, so \
+         areRoutesPersisted must be false, got {persisted:?} in {body}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -350,23 +396,27 @@ async fn each_route_server_is_read_through_its_own_id() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 2: whether routes are persisted is derived from the stored route server
+// Rule 2: whether routes are persisted is derived from the database, not the setting
 // ---------------------------------------------------------------------------
 
 /// One row of the persistence table: the case, the create's extra members, the modify's
-/// members (empty for a route server nothing modifies), the `areRoutesPersisted` the read
-/// answers before the clock settles the move, and the one it answers after.
-type PersistRow = (&'static str, Params, Params, bool, bool);
+/// members (empty for a route server nothing modifies), and whether the configuration the row
+/// asks for settles on persistence being on.
+type PersistRow = (&'static str, Params, Params, bool);
 
-/// RULE 2: `AreRoutesPersisted` follows the STORED route server's persistence configuration
-/// as of the read — true exactly while the settled `enabled` state holds — and it agrees with
-/// the `persistRoutesState` `DescribeRouteServers` reports for the same route server, before
-/// and after the clock settles each move.
+/// RULE 2: `AreRoutesPersisted` reports whether the DATABASE this read is of holds routes
+/// being persisted, which it does only when there is a learned route in it to persist — so a
+/// route server whose peers have established no BGP session persists nothing, whatever
+/// persistence it was configured with, while `DescribeRouteServers` goes on reporting that
+/// configuration. The member is therefore not an echo of the `PersistRoutes` a create or a
+/// modify carried: the two reads answer different questions of the same route server.
 ///
 /// The rows differ in the persistence action (each published member, and none at all), where
-/// it is asked for (the create, a later modify), and the configuration it is asked of.
+/// it is asked for (the create, a later modify), and the configuration it is asked of — and
+/// each row is read both while the configuration's move is in flight and after the clock has
+/// settled it.
 #[tokio::test]
-async fn whether_routes_are_persisted_follows_the_stored_route_server() {
+async fn whether_routes_are_persisted_follows_the_database_and_not_the_setting() {
     let (floor, ceiling) = ec2::state::PERSIST_ROUTES_DURATION_RANGE;
     let enabled_at = |duration: i64| -> Params {
         vec![
@@ -381,27 +431,23 @@ async fn whether_routes_are_persisted_follows_the_stored_route_server() {
             Vec::new(),
             Vec::new(),
             false,
-            false,
         ),
         (
             "persistence asked for at the create, at the published floor",
             enabled_at(floor),
             Vec::new(),
-            false,
             true,
         ),
         (
             "persistence asked for at the create, at the published ceiling",
             enabled_at(ceiling),
             Vec::new(),
-            false,
             true,
         ),
         (
             "persistence turned on by a later modify",
             Vec::new(),
             enabled_at(floor),
-            false,
             true,
         ),
         (
@@ -409,13 +455,11 @@ async fn whether_routes_are_persisted_follows_the_stored_route_server() {
             enabled_at(ceiling),
             vec![p("PersistRoutes", "disable")],
             false,
-            false,
         ),
         (
             "the persisted routes of a persisting route server withdrawn",
             enabled_at(floor),
             vec![p("PersistRoutes", "reset")],
-            false,
             true,
         ),
         (
@@ -423,56 +467,62 @@ async fn whether_routes_are_persisted_follows_the_stored_route_server() {
             Vec::new(),
             vec![p("PersistRoutes", "reset")],
             false,
-            false,
         ),
     ];
 
-    for (case, created_with, modified_with, before, after) in rows {
+    // The settled `persistRoutesState` a configuration that persists reaches: the `enabled`
+    // member of `RouteServerPersistRoutesState`
+    // (`smithy_query(query="shape",shape="RouteServerPersistRoutesState")`).
+    let enabled = ec2::state::PERSIST_ROUTES_STATE_ENABLED;
+
+    for (case, created_with, modified_with, persists) in rows {
         let router = emulator();
         let route_server_id = create_route_server(case, &router, 64_512, created_with).await;
+
+        // Read while the create's own persistence move is still in flight.
+        assert_persists_nothing(
+            case,
+            "while the create's move is in flight",
+            &router,
+            &route_server_id,
+        )
+        .await;
+
         if !modified_with.is_empty() {
-            // The create's own `pending` span is waited out first, so the modify is the one
-            // move in flight when the read below happens.
-            past_the_transition().await;
+            // The create's move is waited out by LOOKING at the route server — the
+            // condition, never a span — so the modify below is the one move in flight.
+            settled_persistence(case, &router, &route_server_id).await;
             let mut params = vec![p("RouteServerId", route_server_id.clone())];
             params.extend(modified_with);
             ok(case, &router, "ModifyRouteServer", &params).await;
+            assert_persists_nothing(
+                case,
+                "while the modify's move is in flight",
+                &router,
+                &route_server_id,
+            )
+            .await;
         }
 
-        let body = database_ok(case, &router, &route_server_id).await;
-        let persisted = element(&body, "areRoutesPersisted");
-        assert_eq!(
-            persisted.as_deref(),
-            Some(if before { "true" } else { "false" }),
-            "case {case:?}: expected areRoutesPersisted {before} while the move is in \
-             flight, got {persisted:?} in {body}"
-        );
-        // The two reads of one route server cannot disagree: persistence is reported here
-        // exactly while the state the describe reports is the settled `enabled`.
-        let described = described_persistence(case, &router, &route_server_id).await;
-        assert_eq!(
-            persisted.as_deref() == Some("true"),
-            described == ec2::state::PERSIST_ROUTES_STATE_ENABLED,
-            "case {case:?}: expected areRoutesPersisted {persisted:?} to agree with the \
-             reported persistRoutesState {described:?}"
-        );
+        // The CLOCK, not a caller, settles the configuration — and the answer is the same
+        // once it has: there is still no learned route in the database to persist.
+        let settled = settled_persistence(case, &router, &route_server_id).await;
+        assert_persists_nothing(
+            case,
+            "once the clock settled the configuration",
+            &router,
+            &route_server_id,
+        )
+        .await;
 
-        // The CLOCK, not a caller, settles the move.
-        past_the_transition().await;
-        let settled = database_ok(case, &router, &route_server_id).await;
-        let persisted = element(&settled, "areRoutesPersisted");
+        // The CONFIGURATION is still reported, by the read that reports it: the two reads of
+        // one route server answer different questions, so a route server whose persistence
+        // has settled on `enabled` says so here while persisting nothing above.
         assert_eq!(
-            persisted.as_deref(),
-            Some(if after { "true" } else { "false" }),
-            "case {case:?}: expected areRoutesPersisted {after} once the clock settled the \
-             move, got {persisted:?} in {settled}"
-        );
-        let described = described_persistence(case, &router, &route_server_id).await;
-        assert_eq!(
-            persisted.as_deref() == Some("true"),
-            described == ec2::state::PERSIST_ROUTES_STATE_ENABLED,
-            "case {case:?}: expected the settled areRoutesPersisted {persisted:?} to agree \
-             with the reported persistRoutesState {described:?}"
+            settled == enabled,
+            persists,
+            "case {case:?}: expected the settled persistRoutesState to be {enabled:?} = \
+             {persists}, got {settled:?}"
         );
     }
 }
@@ -795,7 +845,22 @@ async fn reading_the_routing_database_writes_nothing() {
     .await;
     let endpoint_id = create_endpoint(case, &router, &route_server_id, subnet).await;
     create_peer(case, &router, &endpoint_id, "203.0.113.9", 64_601, Some("bfd")).await;
-    past_the_transition().await;
+    // Every move the create started is waited out by LOOKING at what it moves — the
+    // condition, never a span — so a difference between the two reads below is this
+    // operation's doing and not the clock's.
+    settled_persistence(case, &router, &route_server_id).await;
+    let probe_router = &router;
+    poll_until(case, "the route server and its peer to settle", || async move {
+        let described = ok(case, probe_router, "DescribeRouteServers", &[]).await;
+        let peers = ok(case, probe_router, "DescribeRouteServerPeers", &[]).await;
+        elements(&described, "state")
+            .iter()
+            .all(|state| state == ec2::state::ROUTE_SERVER_STATE_AVAILABLE)
+            && elements(&peers, "state")
+                .iter()
+                .all(|state| state == ec2::state::ROUTE_SERVER_PEER_STATE_AVAILABLE)
+    })
+    .await;
 
     let describe_before = ok(
         case,
@@ -824,8 +889,9 @@ async fn reading_the_routing_database_writes_nothing() {
     );
     assert_eq!(
         element(&first, "areRoutesPersisted").as_deref(),
-        Some("true"),
-        "case {case:?}: the stored route server persists its routes, got {first}"
+        Some("false"),
+        "case {case:?}: the route server's database holds no learned route to persist, got \
+         {first}"
     );
 
     let describe_after = ok(

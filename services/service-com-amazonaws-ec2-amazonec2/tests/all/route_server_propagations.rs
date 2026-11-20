@@ -560,7 +560,7 @@ async fn propagation_needs_the_route_server_to_be_associated_with_the_tables_vpc
 
     let served_table = create_route_table("a table of the served VPC", &router, &served_vpc).await;
 
-    // (case, the route server, the message's VPC)
+    // (case, the route server, the VPC its table is in — which the refusal must NOT name)
     let rows: [(&str, &str, &str); 2] = [
         ("a route server with no association at all", &unassociated, &served_vpc),
         ("a route server associated with another VPC", &elsewhere, &served_vpc),
@@ -584,14 +584,20 @@ async fn propagation_needs_the_route_server_to_be_associated_with_the_tables_vpc
                 "case {case:?}: expected InvalidRouteServerId.NotAssociated from {name}, got \
                  body {body}"
             );
+            // The association that is missing is the ROUTE SERVER's own, so the refusal
+            // names the route server and nothing else — neither the table it was paired
+            // with nor the VPC that table routes for.
+            let message = error_message(&body);
             assert_eq!(
-                error_message(&body),
-                format!(
-                    "The route-server ID '{route_server_id}' is not associated with the vpc \
-                     ID '{vpc_id}' of routeTable ID '{served_table}'"
-                ),
-                "case {case:?}: expected the refusal to name the pair and the VPC, got body \
+                message,
+                format!("Route Server {route_server_id} is not associated with a VPC."),
+                "case {case:?}: expected the refusal to name only the route server, got body \
                  {body}"
+            );
+            assert!(
+                !message.contains(vpc_id) && !message.contains(&served_table),
+                "case {case:?}: the refusal must name neither {vpc_id} nor {served_table}, \
+                 got {message:?}"
             );
         }
         // Nothing was written for a pair the service refused.

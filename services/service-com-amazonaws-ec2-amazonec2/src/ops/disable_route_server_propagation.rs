@@ -12,6 +12,11 @@
 //! resolved through the one rule this operation shares with the enable
 //! ([`crate::state::require_route_server_propagation_pair`]).
 //!
+//! `DryRun` is answered once the pair's two ids have been resolved and BEFORE the pair's own
+//! state is asked about: the flag asks whether the CALLER may make the call, so a probe
+//! naming a pair that does not propagate (one never enabled, or one whose disable the clock
+//! already carried out) is answered `DryRunOperation` rather than with that state conflict.
+//!
 //! ## Reaching this service's state
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request. The store
@@ -155,6 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::Instant::now();
 
+        // DryRun sits after the request's ids have been resolved and BEFORE this operation's
+        // own state precondition is asked: the flag "checks whether you have the required
+        // permissions for the action without actually making the request" (`$DryRun`), which
+        // is a question about the CALLER, so a probe is answered `DryRunOperation` rather
+        // than with the state conflict the request would have met. A value that names no
+        // route server or no route table of the account is still refused above: there is
+        // nothing to probe the permissions on.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
         // A pair that does not propagate has no disable to perform: the request is refused
         // rather than answered with a propagation nothing recorded. A pair whose disable is
         // already being carried out reports `deleting`, which is a propagation this call
@@ -170,13 +186,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 route_server_id = input.route_server_id,
                 route_table_id = input.route_table_id,
             )));
-        }
-
-        // DryRun sits AFTER every id has been resolved and every refusal asked, and BEFORE
-        // the write, the order every other route server operation of this crate answers a
-        // dry run in.
-        if input.dry_run == Some(true) {
-            return Err(state::dry_run_operation());
         }
 
         // The pair moves into `deleting` now, with the clock owing it the end of the

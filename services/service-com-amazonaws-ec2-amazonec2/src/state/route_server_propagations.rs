@@ -261,24 +261,24 @@ impl ComAmazonawsEc2Amazonec2State {
 }
 
 /// Refuse a propagation request whose route server is not associated with the VPC the route
-/// table it named routes for: HTTP 400 [`INVALID_ROUTE_SERVER_ID_NOT_ASSOCIATED`].
+/// table it named routes for: HTTP 400 [`INVALID_ROUTE_SERVER_ID_NOT_ASSOCIATED`],
+/// `Route Server <id> is not associated with a VPC.`
 ///
-/// The resource is named in the message the way EC2 names this resource TYPE
-/// ([`ROUTE_SERVER_TAGGABLE_RESOURCE`]), like [`invalid_route_server_id_not_found`], and the
-/// values come from the REQUEST and from the store: the route server and route table the
-/// request named, and the VPC the store says that table routes for.
-pub fn invalid_route_server_id_not_associated<E>(
-    route_server_id: &str,
-    route_table_id: &str,
-    vpc_id: &str,
-) -> Scaffolded<E> {
+/// What is missing is the ROUTE SERVER's own association: propagation installs the routes a
+/// route server learned through the association it holds with a VPC, so the refusal reports
+/// that route server and the association it lacks, and names neither the route table the
+/// request paired it with nor a VPC it is not associated with. The resource is named the way
+/// this surface words the refusals it spells itself ([`ROUTE_SERVER_REFUSAL_NAME`]), the same
+/// family as [`route_server_surface_incorrect_state`], rather than by the
+/// [`ROUTE_SERVER_TAGGABLE_RESOURCE`] token a tag specification carries.
+///
+/// The id comes from the REQUEST, and has already been resolved to a route server of the
+/// account ([`require_route_server_propagation_pair`]), so it is an id this service minted.
+pub fn invalid_route_server_id_not_associated<E>(route_server_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_ROUTE_SERVER_ID_NOT_ASSOCIATED,
         400,
-        format!(
-            "The {ROUTE_SERVER_TAGGABLE_RESOURCE} ID '{route_server_id}' is not associated \
-             with the vpc ID '{vpc_id}' of routeTable ID '{route_table_id}'"
-        ),
+        format!("{ROUTE_SERVER_REFUSAL_NAME} {route_server_id} is not associated with a VPC."),
     )
 }
 
@@ -317,15 +317,11 @@ pub fn require_route_server_propagation_pair<E>(
         }
     }
     require_known_route_server(store, route_server_id)?;
-    let Some(vpc_id) = store.vpc_of_route_table(route_table_id) else {
+    if store.vpc_of_route_table(route_table_id).is_none() {
         return Err(invalid_route_table_id_not_found(route_table_id));
-    };
+    }
     if !store.route_server_serves_route_table(route_server_id, route_table_id) {
-        return Err(invalid_route_server_id_not_associated(
-            route_server_id,
-            route_table_id,
-            vpc_id,
-        ));
+        return Err(invalid_route_server_id_not_associated(route_server_id));
     }
     Ok(())
 }
