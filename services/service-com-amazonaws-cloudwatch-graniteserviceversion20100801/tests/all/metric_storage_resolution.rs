@@ -17,7 +17,9 @@
 //!
 //! A read cannot report detail finer than the resolution the data is stored at, but it is not
 //! refused and not answered with nothing either: the datapoint is served at the start of the span
-//! it IS stored in. `StorageResolution` is optional and "if you omit this, the default of 60 is
+//! it IS stored in — once the clock has LEFT that span, which is what makes the span's aggregate
+//! complete (`metric_open_span_reads` holds that half of the rule, over spans the clock is still
+//! inside). `StorageResolution` is optional and "if you omit this, the default of 60 is
 //! used", so an omitted member reads exactly like 60.
 //!
 //! The rows differ along what the rule generalises over: the resolution the series was published
@@ -152,19 +154,19 @@ const ROWS: &[Row] = &[
         case: "regular resolution read at a minute",
         storage_resolution: Some(60),
         period: 60,
-        buckets: &[(0.0, 2.0), (60.0, 1.0)],
+        buckets: BY_THE_MINUTE,
     },
     Row {
         case: "an omitted StorageResolution read at a minute",
         storage_resolution: None,
         period: 60,
-        buckets: &[(0.0, 2.0), (60.0, 1.0)],
+        buckets: BY_THE_MINUTE,
     },
     Row {
         case: "high resolution read at a minute",
         storage_resolution: Some(1),
         period: 60,
-        buckets: &[(0.0, 2.0), (60.0, 1.0)],
+        buckets: BY_THE_MINUTE,
     },
     Row {
         // A period coarser than a minute folds both minutes together, whichever resolution the
@@ -353,7 +355,8 @@ async fn a_range_inside_one_minute_holds_a_datapoint_published_inside_it_at_eith
     // decides is where the datapoint is REPORTED: the sub-minute period reads the second the
     // observation was published at where that detail is stored, and the whole minute the series
     // is stored at where it is not — an instant that may precede the range's own start, that
-    // minute having no other instant to be reported at.
+    // minute having no other instant to be reported at. Every span here is one the clock has
+    // left, so each is complete.
     let router = build_router();
     let base = base_time();
 

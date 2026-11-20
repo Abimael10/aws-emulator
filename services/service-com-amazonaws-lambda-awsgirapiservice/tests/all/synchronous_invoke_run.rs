@@ -557,10 +557,10 @@ async fn an_invocation_that_resolves_to_nothing_names_the_qualified_resource() {
     )
     .await;
     // The third column is the whole expected message: a pair that resolved an ARN is
-    // refused naming that ARN — the function at the version the invocation resolved, which is
-    // the unpublished version's own label where the request named no qualifier — and a name of
-    // another Region resolves none, the Region being settled first, so it is refused on the two
-    // Regions that disagree.
+    // refused naming that ARN — the function at the version this SYNCHRONOUS invocation
+    // resolved, which is the unpublished version's own label where the request named no
+    // qualifier — and a name of another Region resolves none, the Region being settled first,
+    // so it is refused on the two Regions that disagree.
     let cases: &[(&str, &str, String)] = &[
         (
             "a function that does not exist",

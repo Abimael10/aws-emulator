@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The VERSION an invocation's not-found refusal names, end to end over the wire.
+//! The VERSION a synchronous invocation's not-found refusal names, end to end over the wire.
 //!
-//! The rule under test: **an invocation resolves a VERSION of a function to run — `Qualifier`
-//! "specif[ies] a version or alias to invoke a published version of the function" and an
-//! invocation naming none runs the unpublished version, which such an invocation reports as
-//! its `ExecutedVersion` — so the resource an invoking operation says it could not find is
+//! The rule under test: **a SYNCHRONOUS invocation resolves a VERSION of a function to run —
+//! `Qualifier` "specif[ies] a version or alias to invoke a published version of the function"
+//! and an invocation naming none runs the unpublished version, which such an invocation reports
+//! as its `ExecutedVersion` — so the resource such an operation says it could not find is
 //! always the function's ARN QUALIFIED by that version: `Function not found: ` followed by
 //! `arn:aws:lambda:<region>:<account>:function:<name>:<qualifier>`, carrying the qualifier the
 //! request named and `$LATEST` where it named none.** A LOOKUP of a function addresses the
 //! function rather than a version it would run, so its own sentence leaves the unpublished
-//! version unqualified — asserted here as the boundary of the rule.
+//! version unqualified — asserted here as the boundary of the rule. (The ASYNCHRONOUS
+//! invocation, which is handed on rather than run for the caller, names the identifier the
+//! request addressed instead; `invoke_addressed_function` holds that half, driving each of its
+//! rows through every `InvocationType`.)
 //!
 //! The rows differ along what the rule generalises over: the operation that invokes
 //! (`Invoke` and `InvokeWithResponseStream`), the documented `FunctionName` form the request
@@ -95,7 +98,9 @@ struct Row {
     qualifier: Option<&'static str>,
     /// The function the refused ARN must name.
     function: &'static str,
-    /// The version the refused ARN must be qualified by.
+    /// The version the refused ARN must be qualified by — the one the request named, and the
+    /// unpublished version's own label where it named none, that being the version such an
+    /// invocation resolves.
     version: &'static str,
 }
 
@@ -174,8 +179,8 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// RULE: an invoking operation's `ResourceNotFoundException` names the function at the version
-/// the invocation resolved, `$LATEST` included.
+/// RULE: a synchronous invocation's `ResourceNotFoundException` names the function at the
+/// version the invocation resolved, `$LATEST` included.
 #[tokio::test]
 async fn an_invocation_that_resolves_nothing_names_the_version_it_resolved() {
     let engine = Arc::new(engine::InMemoryEngine::new());

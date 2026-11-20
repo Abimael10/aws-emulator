@@ -187,15 +187,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // A vault-scoped call decides ACCESS FIRST, before any value it carries is judged: a
+        // vault outside the caller's visibility is refused with 403 `AccessDeniedException`
+        // rather than reported as missing, so the answer discloses nothing about whether it
+        // exists — and a parameter-value refusal is only ever reached for a vault the caller
+        // may act on. The decision lives in `state::visible_vault_mut`, shared with every
+        // other vault-scoped write; this input models no `BackupVaultAccountId`, so the vault
+        // is resolved in the caller's own account.
+        {
+            let mut store = state.lock();
+            // The write this operation performs is the association, so the
+            // transition the clock owes the vault is materialised first: the vault
+            // it resolves is the vault as it stands now.
+            store.settle_vault(&region, &input.backup_vault_name, now);
+            store.visible_vault_mut(&region, &input.backup_vault_name, None)?;
+        }
+
         // Only a value that NAMES a team can be recorded on a vault: the model types
         // `MpaApprovalTeamArn` as `ARN` with no pattern, so the framework admits the ARN
         // of anything at all, and whether a team of that form exists is the answer of the
         // service that MINTS teams rather than anything this service holds. Both halves
         // are `crate::state`'s one resolution step
-        // (`crate::state::rejected_approval_team`), run — like the form check it grew out
-        // of — before this store is even reached, so a refused association leaves no team
-        // behind for a later read to report and takes no store lock across the hop that
-        // asks.
+        // (`crate::state::rejected_approval_team`), run with NO store lock held across the
+        // hop that asks, so a refused association leaves no team behind for a later read to
+        // report.
         if let Some(refusal) = crate::state::rejected_approval_team(
             ctx.callback(),
             "MpaApprovalTeamArn",
@@ -212,17 +227,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut store = state.lock();
-        // The write this operation performs is the association, so the
-        // transition the clock owes the vault is materialised first: the vault
-        // it resolves is the vault as it stands now.
+        // The vault as it stands now, the access decision above having been made without the
+        // lock held across the hop: the same decision answers for this write.
         store.settle_vault(&region, &input.backup_vault_name, now);
-        // A vault-scoped call decides access before existence: a vault outside
-        // the caller's visibility is refused with 403 `AccessDeniedException`
-        // rather than reported as missing, so the answer discloses nothing
-        // about whether it exists. The decision lives in
-        // `state::visible_vault_mut`, shared with every other vault-scoped
-        // write; this input models no `BackupVaultAccountId`, so the vault is
-        // resolved in the caller's own account.
         let vault = store.visible_vault_mut(&region, &input.backup_vault_name, None)?;
         // Multi-party approval is a facility of a LOGICALLY AIR-GAPPED vault:
         // it governs access to the recovery points such a vault holds, so a

@@ -474,15 +474,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the invocation runs under a chain of its own and LINKS back to each of theirs
         // (`crate::state::execution::trace_context`). Read once, off this request.
         let supplied_links = crate::state::supplied_event_source_links(ctx);
-        // The resource an INVOCATION addresses is a function AT a version, so the refusal
-        // for a pair that resolves to nothing names that QUALIFIED resource — the ARN this
-        // invocation resolved, built from the request by the one construction every
-        // invoking operation shares (`crate::state::addressed_function_arn`).
-        let addressed_arn = crate::state::addressed_function_arn(
-            &region,
-            &input.function_name,
-            input.qualifier.as_deref(),
-        );
+        // The resource an INVOCATION says it could not find, built from the request alone.
+        // Which of the two readings of it applies is what the INVOCATION TYPE decides: a
+        // synchronous caller is waiting on the version that would have run, so the refusal
+        // names the version the pair RESOLVED — the unpublished version's own label where the
+        // request named no qualifier (`crate::state::resolved_invocation_arn`). An
+        // asynchronous invocation is handed on rather than run for the caller, so no version
+        // is resolved on its behalf and the refusal names the identifier the request
+        // ADDRESSED, unqualified where it named no qualifier
+        // (`crate::state::addressed_arn_of`) — which is also how the asynchronous entry
+        // point `InvokeAsync` and every LOOKUP of a function spell it.
+        let not_found_arn = match crate::state::parse_function_reference(&input.function_name) {
+            Some(reference) if invocation_type == INVOCATION_TYPE_EVENT => {
+                crate::state::addressed_arn_of(&region, &reference, input.qualifier.as_deref())
+            }
+            Some(reference) => crate::state::resolved_invocation_arn(
+                &region,
+                &reference,
+                input.qualifier.as_deref(),
+            ),
+            // A `FunctionName` that names no function at all: the resolution refuses it as
+            // malformed, so there is no resource of this service to name.
+            None => None,
+        };
         // The store guard lives in THIS block and no longer: everything the run needs is
         // copied out of the record here, and the run below happens with no guard held, so
         // one caller's handler cannot stall another caller's request.
@@ -508,7 +522,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 InvokeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     r#type: None,
                     message: Some(
-                        addressed_arn
+                        not_found_arn
                             .as_ref()
                             .map_or(message, |arn| format!("Function not found: {arn}")),
                     ),

@@ -254,6 +254,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // base URL a later request addresses (`ctx.endpoint()`), which is the one address this
         // process answers Amazon ECS on. An agent that discovered its endpoints through this
         // deployment is pointed back at this deployment.
+        //
+        // The three are three DISTINCT addresses, as Amazon ECS answers them on three different
+        // hosts: here they share the one authority this process serves and name their plane in
+        // the PATH (`crate::state::agent_endpoints`). What that limits is stated there: the
+        // agent-side protocols these addresses carry — agent communication, telemetry and the
+        // Service Connect configuration poll — are not among the surfaces this emulator serves
+        // at any address, so a member promises the authority a client can reach and which plane
+        // it stands for, and an agent dialling one is answered by this router rather than by a
+        // host outside the machine.
         let here = ctx.endpoint();
         let here = here.as_str();
         Ok(DiscoverPollEndpointOutput {

@@ -3,21 +3,23 @@
 //! What `Invoke` says it could not find: `POST
 //! /2015-03-31/functions/{FunctionName}/invocations`.
 //!
-//! The rule under test: **the resource an INVOCATION addresses is a function AT a version —
-//! `Qualifier` "specif[ies] a version or alias to invoke a published version of the
-//! function", and an invocation naming none runs the unpublished version — so the
-//! `ResourceNotFoundException` for a request that resolves to nothing names the ARN the
-//! invocation ADDRESSED, always QUALIFIED by the version it resolved:
-//! `Function not found: arn:aws:lambda:<region>:<account>:function:<name>:<qualifier>`, where
-//! the qualifier is the one the request named and `$LATEST` for a request that named none — the
-//! version such an invocation would have run and reported as its `ExecutedVersion`.** The
-//! fixed text is `Function not found: `; the variable part is built from the request — the
-//! function the name addresses, the Region the name named when it carried one, and the
-//! qualifier it resolved, whether that qualifier was named in the name, in the `Qualifier`
-//! parameter or nowhere at all.
+//! The rule under test: **what an invocation says it could not find is the ARN of the function
+//! the request named, and WHICH spelling of it depends on the `InvocationType`. A SYNCHRONOUS
+//! invocation (`RequestResponse`, `DryRun`, and the default when the header is absent) runs a
+//! version for the caller — `Qualifier` "specif[ies] a version or alias to invoke a published
+//! version of the function", and an invocation naming none runs the unpublished version, which
+//! it reports as its `ExecutedVersion` — so its refusal names the version it RESOLVED:
+//! `Function not found: arn:aws:lambda:<region>:<account>:function:<name>:<qualifier>`, with
+//! `$LATEST` where the request named no qualifier. An `Event` invocation is handed on rather
+//! than run for the caller, so no version is resolved on its behalf and its refusal names the
+//! identifier the request ADDRESSED: the same ARN carrying only the qualifier the request
+//! named, and none where it named none.** The fixed text is `Function not found: ` in both; the
+//! variable part is built from the request — the function the name addresses, the Region the
+//! name named when it carried one, and the qualifier, whether it was named in the name, in the
+//! `Qualifier` parameter or nowhere at all.
 //!
-//! The rows differ along what the rule generalises over: the documented `FunctionName` form
-//! the request addresses the function by (the bare name, the full ARN, the partial ARN, the
+//! The rows differ along what the rule generalises over: the documented `FunctionName` form the
+//! request addresses the function by (the bare name, the full ARN, the partial ARN, the
 //! `function:` prefix form, a name carrying its own qualifier), where the qualifier is named
 //! (the name, the `Qualifier` parameter, nowhere), which qualifier it is (none, a published
 //! version number, an alias name), what is missing (the function
@@ -227,9 +229,9 @@ struct NotFoundRow {
     reference: fn(&str) -> String,
     /// The `Qualifier` query parameter the request carries, if any.
     qualifier: Option<&'static str>,
-    /// The qualifier the refused ARN must carry — the one the request named, in the name or
-    /// in the `Qualifier` parameter — absent for a request that named none, which addressed
-    /// the unpublished version and is answered about that version's own label.
+    /// The qualifier the REQUEST named, in the name or in the `Qualifier` parameter, and
+    /// `None` for a request that named none — which an asynchronous refusal leaves off the
+    /// ARN altogether and a synchronous one answers about as [`LATEST`].
     resolved_qualifier: Option<&'static str>,
     /// Whether the reference names a Region this endpoint does not serve, which is settled
     /// BEFORE a version is: those rows resolve no resource to name and are refused on the
@@ -293,7 +295,7 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             case: "a missing function whose name names the unpublished version",
             reference: |_| format!("{ABSENT}:{LATEST}"),
             qualifier: None,
-            resolved_qualifier: None,
+            resolved_qualifier: Some(LATEST),
             unreachable_region: false,
             addressed_region: REGION,
             function: ABSENT,
@@ -370,8 +372,9 @@ fn not_found_rows() -> Vec<NotFoundRow> {
     ]
 }
 
-/// RULE: `Invoke`'s `ResourceNotFoundException` names the ARN the invocation addressed, always
-/// qualified by the version it resolved.
+/// RULE: an invocation's `ResourceNotFoundException` names the ARN of the function the request
+/// named — at the version a SYNCHRONOUS invocation resolved, and at only the qualifier the
+/// request named for an `Event` one.
 #[tokio::test]
 async fn the_invoke_refusal_names_the_qualified_arn_the_invocation_resolved() {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -381,28 +384,36 @@ async fn the_invoke_refusal_names_the_qualified_arn_the_invocation_resolved() {
     for row in not_found_rows() {
         let case = row.case;
         let reference = (row.reference)(HELD);
-        // A reference naming another Region is refused on the Region before any version is
-        // resolved, so there is no resource to name: those rows are refused on the two
-        // Regions that disagree instead.
-        let expected = if row.unreachable_region {
-            format!(
-                "Functions from '{}' are not reachable in this region ('{REGION}')",
-                row.addressed_region
-            )
-        } else {
-            let arn = format!(
-                "arn:aws:lambda:{}:{ACCOUNT}:function:{}",
-                row.addressed_region, row.function
-            );
-            // A request that named no qualifier resolved the unpublished version, so that is
-            // the version the resource it addressed is qualified by.
-            let qualifier = row.resolved_qualifier.unwrap_or(LATEST);
-            format!("Function not found: {arn}:{qualifier}")
-        };
-        // The resolution happens before the invocation type is acted on, so every type is
-        // refused the same way — including the asynchronous one, which never queues an
-        // event for a resource that does not exist.
+        let arn = format!(
+            "arn:aws:lambda:{}:{ACCOUNT}:function:{}",
+            row.addressed_region, row.function
+        );
+        // The resolution happens before the invocation type is ACTED on, so every type is
+        // refused — including the asynchronous one, which never queues an event for a
+        // resource that does not exist — and what differs between them is which spelling of
+        // the resource the refusal names.
         for invocation_type in [None, Some("DryRun"), Some("Event"), Some("RequestResponse")] {
+            // A reference naming another Region is refused on the Region before any version
+            // is resolved, so there is no resource to name whatever the type: those rows are
+            // refused on the two Regions that disagree instead.
+            let expected = if row.unreachable_region {
+                format!(
+                    "Functions from '{}' are not reachable in this region ('{REGION}')",
+                    row.addressed_region
+                )
+            } else if invocation_type == Some("Event") {
+                // Handed on rather than run for the caller: the identifier the request
+                // addressed, unqualified where it named no qualifier.
+                match row.resolved_qualifier {
+                    Some(qualifier) => format!("Function not found: {arn}:{qualifier}"),
+                    None => format!("Function not found: {arn}"),
+                }
+            } else {
+                // Run for the caller: the version the invocation resolved, which is the
+                // unpublished version's own label where the request named no qualifier.
+                let qualifier = row.resolved_qualifier.unwrap_or(LATEST);
+                format!("Function not found: {arn}:{qualifier}")
+            };
             let answer = invoke(&router, &reference, row.qualifier, invocation_type).await;
             assert_eq!(
                 answer.status,

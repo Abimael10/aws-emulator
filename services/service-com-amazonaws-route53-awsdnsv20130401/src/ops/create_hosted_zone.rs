@@ -323,22 +323,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A hosted zone is stored and reported under the ONE canonical form of
         // its name, whatever spelling it was created with.
         let name = canonical_dns_name(&input.name);
-        // "You can't create a hosted zone for a top-level domain (TLD) such as
-        // .com." A zone name therefore needs at least two labels: a name that
-        // spells one label alone names a top-level domain, and that whole level
-        // of the namespace is reserved rather than delegable to an account — so
-        // the refusal reports the name as RESERVED, which is the rule it broke,
-        // rather than as a name the domain-name format rejects (it does not).
-        if name.trim_end_matches('.').split('.').count() < 2 {
-            return Err(CreateHostedZoneErrorModeled::InvalidDomainName(InvalidDomainName {
-                // REQUEST-DERIVED: the one variable part is the requested name,
-                // echoed exactly as the request wrote it rather than in the
-                // canonical form a created zone would be stored under, so the
-                // caller reads back the name it sent.
-                message: Some(format!("{}{RESERVED_NAME_FIXED_TEXT}", input.name)),
-            })
-            .into());
-        }
 
         // A reusable delegation set is named here by the id
         // `CreateReusableDelegationSet` answered with; an empty one names none.
@@ -375,6 +359,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .hosted_zone_config
                 .as_ref()
                 .is_some_and(|config| config.private_zone);
+
+        // "You can't create a hosted zone for a top-level domain (TLD) such as
+        // .com." A name that spells ONE label alone names a top-level domain,
+        // and that whole level of the PUBLIC namespace is reserved rather than
+        // delegable to an account — so the refusal reports the name as
+        // RESERVED, which is the rule it broke, rather than as a name the
+        // domain-name format rejects (it does not). The rule is a property of
+        // the public namespace: a private hosted zone is resolved only inside
+        // the VPCs it is associated with and delegates nothing from the public
+        // namespace, so any number of labels — a single one included — is a
+        // name it can carry.
+        if !private_zone && name.trim_end_matches('.').split('.').count() < 2 {
+            return Err(CreateHostedZoneErrorModeled::InvalidDomainName(InvalidDomainName {
+                // REQUEST-DERIVED: the one variable part is the requested name,
+                // echoed exactly as the request wrote it rather than in the
+                // canonical form a created zone would be stored under, so the
+                // caller reads back the name it sent.
+                message: Some(format!("{}{RESERVED_NAME_FIXED_TEXT}", input.name)),
+            })
+            .into());
+        }
 
         // A private hosted zone exists to serve a VPC, so its first association
         // is made at creation and a private zone asked for with no complete VPC

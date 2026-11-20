@@ -4299,49 +4299,70 @@ pub fn resolve_durable_execution<'a>(
 }
 
 /// The ARN one INVOCATION addresses: the function the `FunctionName`/`Qualifier` pair names,
-/// at the version it resolves.
+/// spelled with exactly the qualifier the REQUEST named.
 ///
 /// `Qualifier` "specif[ies] a version or alias to invoke a published version of the
-/// function", and an invocation naming none runs the unpublished version — which is what an
-/// invocation's answer reports as `ExecutedVersion` — so the qualifier is the one the name
-/// carries, else the `Qualifier` parameter's, else [`VERSION_LATEST`]. ONE construction,
-/// shared by every operation that INVOKES (`Invoke`, `InvokeWithResponseStream`), because
-/// the resource they address is the same one: a refusal naming no single resolved ARN is
-/// what a client comparing it against the ARN it invoked cannot match.
+/// function", so the qualifier is the one the name carries, else the `Qualifier`
+/// parameter's, and NONE where the request named neither — the same reading
+/// [`invoked_function_arn`] makes of what the caller addressed, and the same spelling
+/// [`qualified_arn`] gives the unpublished version.
 ///
-/// The ARN always CARRIES that qualifier, the unpublished version's label included: an
-/// invocation resolves a version to run whether or not the request named one, so the resource
-/// it addressed is `<function arn>:<version>` — `:$LATEST` for a request that named no
-/// qualifier, exactly as the invocation that resolved would have reported
-/// [`VERSION_LATEST`] as its `ExecutedVersion`. This is the ARN an invoking operation's
-/// refusal names, and it is not how a LOOKUP of a function spells the resource it could not
-/// find ([`qualified_arn`], which leaves the unpublished version unqualified): a lookup
-/// addresses the function, an invocation addresses the version it would have run.
+/// This is the resource an ASYNCHRONOUS invocation says it could not find: the event is
+/// handed on rather than run for the caller, so no version is resolved on its behalf and the
+/// refusal names the identifier it sent. A SYNCHRONOUS invocation waits on the version that
+/// would have run and names that instead ([`resolved_invocation_arn`]).
 ///
-/// `None` is a `FunctionName` this operation resolves NO version for, so there is no
-/// resolved ARN to name and the refusal is the resolution's own: a value that names no
-/// function at all (which the resolution refuses as malformed), and an ARN of another
-/// Region, which is refused on the Region before any version is resolved
+/// `None` is a reference this endpoint resolves NO function of, so there is no ARN of this
+/// Region to name and the refusal is the resolution's own: an ARN of another Region, which is
+/// refused on the Region before any version is resolved
 /// ([`foreign_region_function_message`]).
-#[must_use]
-pub fn addressed_function_arn(
-    region: &str,
-    function_name: &str,
-    qualifier: Option<&str>,
-) -> Option<String> {
-    let reference = parse_function_reference(function_name)?;
-    addressed_arn_of(region, &reference, qualifier)
-}
-
-/// [`addressed_function_arn`] for a caller that has ALREADY parsed the reference, so no
-/// caller carries a second reading of the same `FunctionName` — and none needs a fallback
-/// for a parse that cannot fail twice.
 #[must_use]
 pub fn addressed_arn_of(
     region: &str,
     reference: &FunctionReference,
     qualifier: Option<&str>,
 ) -> Option<String> {
+    let (arn, named) = invocation_target(region, reference, qualifier)?;
+    Some(invoked_function_arn(&arn, named))
+}
+
+/// The ARN a SYNCHRONOUS invocation RESOLVES: the function the `FunctionName`/`Qualifier`
+/// pair names, at the version such an invocation would run.
+///
+/// `Qualifier` "specif[ies] a version or alias to invoke a published version of the function",
+/// and an invocation naming none runs the unpublished version — which is what the answer
+/// reports as `ExecutedVersion` — so the qualifier is the one the name carries, else the
+/// `Qualifier` parameter's, else [`VERSION_LATEST`], and the ARN always CARRIES it. This is
+/// the resource a SYNCHRONOUS invocation's `ResourceNotFoundException` names, where the caller
+/// is waiting on the version that would have run; the ASYNCHRONOUS path hands the event on
+/// without resolving a version for the caller and names the identifier it was given
+/// ([`addressed_arn_of`]).
+///
+/// `None` for the same reason [`addressed_arn_of`] answers `None`.
+#[must_use]
+pub fn resolved_invocation_arn(
+    region: &str,
+    reference: &FunctionReference,
+    qualifier: Option<&str>,
+) -> Option<String> {
+    let (arn, named) = invocation_target(region, reference, qualifier)?;
+    Some(format!("{arn}:{}", named.unwrap_or(VERSION_LATEST)))
+}
+
+/// What the two readings of an invocation's target are both built from: the function's own
+/// unqualified ARN in this endpoint's Region, and the qualifier the CALL named — the one the
+/// name carries, else the `Qualifier` parameter's, and `None` where it named neither.
+///
+/// ONE place for the Region decision and the qualifier precedence, so the identifier an
+/// asynchronous refusal names ([`addressed_arn_of`]) and the version a synchronous one resolves
+/// ([`resolved_invocation_arn`]) cannot drift apart in anything but that last step. `None`
+/// where the reference names a function of ANOTHER Region: a function is regional, so this
+/// endpoint resolves none for it ([`foreign_region_function_message`]).
+fn invocation_target<'a>(
+    region: &str,
+    reference: &'a FunctionReference,
+    qualifier: Option<&'a str>,
+) -> Option<(String, Option<&'a str>)> {
     if reference
         .region
         .as_deref()
@@ -4349,15 +4370,8 @@ pub fn addressed_arn_of(
     {
         return None;
     }
-    let addressed = reference
-        .qualifier
-        .as_deref()
-        .or(qualifier)
-        .unwrap_or(VERSION_LATEST);
-    Some(format!(
-        "{}:{addressed}",
-        function_arn(region, &reference.name)
-    ))
+    let named = reference.qualifier.as_deref().or(qualifier);
+    Some((function_arn(region, &reference.name), named))
 }
 
 /// The ARN an invocation ADDRESSED, as `context.invoked_function_arn` reports it to the

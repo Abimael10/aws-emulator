@@ -189,13 +189,18 @@ async fn discover_poll_endpoint_announces_this_emulators_own_address_for_a_regis
     let elsewhere =
         register_agent(&router, OTHER_CLUSTER, "i-0e1e2e3e4e5e6e7e8", None, "fixture").await;
 
-    // The three members an agent discovers are addresses it DIALS afterwards, so each is the
-    // base URL this emulator is reached at — whatever that base is. The rows below move that
-    // base along its forms (the unserved base, an IPv4 address with a port, an IPv6 literal
-    // with a port, a host name), which is what the rule generalises over: nothing of the
-    // announced value comes from the Region the request was signed for, from the resources it
-    // named, or from any host written into this service.
-    let members = ["endpoint", "telemetryEndpoint", "serviceConnectEndpoint"];
+    // The three members an agent discovers are addresses it DIALS afterwards, so each is this
+    // emulator's own base URL — whatever that base is — and the three are DISTINCT, Amazon ECS
+    // answering each on a host of its own: here the plane is named in the path instead. The rows
+    // below move that base along its forms (the unserved base, an IPv4 address with a port, an
+    // IPv6 literal with a port, a host name), which is what the rule generalises over: nothing
+    // of the announced value comes from the Region the request was signed for, from the
+    // resources it named, or from any host written into this service.
+    let members = [
+        ("endpoint", ""),
+        ("telemetryEndpoint", "telemetry/"),
+        ("serviceConnectEndpoint", "service-connect/"),
+    ];
     let bases = [
         (
             "the unserved base",
@@ -245,17 +250,22 @@ async fn discover_poll_endpoint_announces_this_emulators_own_address_for_a_regis
             let case = format!("{asked} while served at {served}");
             let case = case.as_str();
             let body = ok(&router, "DiscoverPollEndpoint", request.clone(), case).await;
-            for member in &members {
+            let mut announced: Vec<String> = Vec::new();
+            for (member, plane) in &members {
                 let answered = string(&body, member, case);
+                let wanted = format!("{expected}{plane}");
                 assert_eq!(
-                    answered, expected,
+                    answered, wanted,
                     "case {case:?}: expected {member} to be this emulator's own address \
-                     {expected:?}, got {answered:?}"
+                     {wanted:?}, got {answered:?}"
                 );
+                announced.push(answered.clone());
                 // The invariant each row is really about: the host announced is the one this
                 // emulator answers on, and never a host AWS publishes its own endpoints at.
                 let authority = service_common::data_plane_addressing::url_authority(&answered)
-                    .trim_end_matches('/')
+                    .split('/')
+                    .next()
+                    .unwrap_or_default()
                     .to_string();
                 assert_eq!(
                     authority,
@@ -269,6 +279,17 @@ async fn discover_poll_endpoint_announces_this_emulators_own_address_for_a_regis
                      {answered:?}"
                 );
             }
+            // The other half of the rule: the three planes are three DISTINCT addresses, so an
+            // agent can tell the one it polls from the one it reports telemetry to.
+            let mut distinct = announced.clone();
+            distinct.sort();
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                announced.len(),
+                "case {case:?}: expected the three announced endpoints to differ, got \
+                 {announced:?}"
+            );
         }
     }
 

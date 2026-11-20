@@ -13,8 +13,8 @@
 //! that zone's id and reads back.
 //!
 //! The rows below differ along WHICH rule of a hosted zone's own creation the request
-//! breaks — a name that is a single label, a name with an empty label, a name with an
-//! over-long label, a `Vpc` that is not a VPC id — because `NamespaceNamePrivate`
+//! breaks — a name with an empty label, a name with an over-long label, a `Vpc` that is
+//! not a VPC id — because `NamespaceNamePrivate`
 //! (`^(?!arn:)[!-~]{1,253}$`, from
 //! `smithy_query(query="operation",operation="CreatePrivateDnsNamespace")`) admits values
 //! that a hosted zone's name cannot be, where `NamespaceNamePublic` is itself a
@@ -131,11 +131,6 @@ async fn a_dns_namespace_whose_hosted_zone_is_refused_fails_its_operation() {
     // (case, the create, the fragment of Route 53's refusal the request put in it)
     let cases: Vec<(&str, Create, String)> = vec![
         (
-            "a private namespace named by a single label",
-            private("privatezonetld", WELL_FORMED_VPC),
-            "privatezonetld".to_string(),
-        ),
-        (
             "a private namespace whose name has an empty label",
             private("empty..label.example.com", WELL_FORMED_VPC),
             "empty..label.example.com".to_string(),
@@ -215,7 +210,9 @@ async fn a_dns_namespace_whose_hosted_zone_is_created_reports_that_zone() {
     let (router, engine) = emulator_with_engine();
 
     // Rows differ along the namespace kind, i.e. along whether the zone is private (bound
-    // to the requested VPC) or public.
+    // to the requested VPC) or public, and — for a private namespace, whose zone is
+    // resolved only inside its VPCs and so delegates nothing of the public namespace —
+    // along how many labels the name spells, a single one included.
     let cases: Vec<(&str, Create, bool)> = vec![
         (
             "a public namespace named by a domain name",
@@ -225,6 +222,11 @@ async fn a_dns_namespace_whose_hosted_zone_is_created_reports_that_zone() {
         (
             "a private namespace named by a domain name",
             private("zone-ok-private.example.com", WELL_FORMED_VPC),
+            true,
+        ),
+        (
+            "a private namespace named by a single label",
+            private("privatezonetld", WELL_FORMED_VPC),
             true,
         ),
     ];

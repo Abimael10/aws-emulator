@@ -340,10 +340,11 @@ async fn a_pair_that_names_no_function_is_the_modelled_not_found() {
     // for each of the two invocation types — the refusal is about resolution, so it does
     // not depend on what the caller asked to be done once resolved. The expected message
     // names the resource the invocation addressed: the function's ARN qualified by the version
-    // the invocation resolved — the qualifier the request named, else the unpublished version's
-    // own label, which is the version an unqualified invocation would have run. A name of
-    // ANOTHER Region resolves no version at all — the Region is settled first — so its refusal
-    // states the two Regions that disagree instead of naming a resolved ARN.
+    // this SYNCHRONOUS entry point resolved — the qualifier the request named, else the
+    // unpublished version's own label, which is the version an unqualified invocation would
+    // have run. A name of ANOTHER Region resolves no version at all — the Region is settled
+    // first — so its refusal states the two Regions that disagree instead of naming a resolved
+    // ARN.
     let not_found = |arn: &str| format!("Function not found: {arn}");
     for (label, reference, qualifier, expected) in [
         (

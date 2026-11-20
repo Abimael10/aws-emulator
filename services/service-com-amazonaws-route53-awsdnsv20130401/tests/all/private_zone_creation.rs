@@ -24,6 +24,15 @@
 //!    `AssociateVPCWithHostedZone` requests (which a public zone refuses), and
 //!    every association is in what `GetHostedZone` reports.
 //!
+//! 4. The top-level-domain reservation is a property of the PUBLIC namespace:
+//!    "You can't create a hosted zone for a top-level domain (TLD) such as
+//!    .com", so a name of a SINGLE label is refused `InvalidDomainName` (HTTP
+//!    400) for a public zone — which would be a delegation out of that
+//!    namespace — and is a name a PRIVATE zone may carry, a private zone being
+//!    resolved only "within one or more Amazon Virtual Private Clouds" and
+//!    delegating nothing. The table spans the number of labels the name spells
+//!    and the spellings a label can take.
+//!
 //! Every test drives the service through the real router, using the SAME
 //! harness `hosted_zone_records` and `vpc_associations` use, so what is
 //! asserted is the HTTP/restXml behaviour a Route 53 client sees.
@@ -454,5 +463,170 @@ async fn a_vpc_only_private_zone_takes_further_associations() {
              body {}",
             read.body
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 4: the reserved top level of the namespace is the PUBLIC namespace's
+// ---------------------------------------------------------------------------
+
+/// The VPC the private zones of the naming table are created with.
+const NAMING_VPC: &str = "vpc-0a1b2c3d4e5f60718";
+
+/// The FIXED text of the refusal a name in the reserved (top-level) part of the
+/// public namespace earns, appended to the requested name
+/// (`crate::ops::create_hosted_zone`'s `RESERVED_NAME_FIXED_TEXT`).
+const RESERVED_SUFFIX: &str = " is reserved by AWS!";
+
+/// One name to create a zone under, and whether it spells ONE label — which is
+/// what makes it name a top-level domain.
+struct NameRow {
+    case: &'static str,
+    name: &'static str,
+    single_label: bool,
+}
+
+/// The rows differ along the number of labels the name spells and, for the
+/// single-label rows, along the spelling of that label: an existing top-level
+/// domain, a label no registry carries, digits, the punctuation the documented
+/// name format admits, letter case, and a name already terminated by the root dot.
+const NAME_ROWS: &[NameRow] = &[
+    NameRow {
+        case: "a single label no registry carries",
+        name: "internal",
+        single_label: true,
+    },
+    NameRow {
+        case: "a single label that is an existing top-level domain",
+        name: "com",
+        single_label: true,
+    },
+    NameRow {
+        case: "a single label of digits",
+        name: "42",
+        single_label: true,
+    },
+    NameRow {
+        case: "a single label carrying the hyphen and underscore the name format admits",
+        name: "my_private-ns",
+        single_label: true,
+    },
+    NameRow {
+        case: "a single label in upper case",
+        name: "INTERNAL",
+        single_label: true,
+    },
+    NameRow {
+        case: "a single label already terminated by the root dot",
+        name: "svc.",
+        single_label: true,
+    },
+    NameRow {
+        case: "two labels",
+        name: "ns.example.com",
+        single_label: false,
+    },
+    NameRow {
+        case: "three labels whose first is a reserved spelling",
+        name: "com.ns.example.net",
+        single_label: false,
+    },
+];
+
+/// The canonical form a zone's name is stored and reported under: the name
+/// terminated by the root dot, lower-cased.
+fn canonical_name(name: &str) -> String {
+    let lowered = name.to_lowercase();
+    if lowered.ends_with('.') {
+        lowered
+    } else {
+        format!("{lowered}.")
+    }
+}
+
+#[tokio::test]
+async fn a_private_hosted_zone_takes_a_name_of_any_label_count() {
+    let router = router();
+    let config = format!(
+        "<HostedZoneConfig><PrivateZone>true</PrivateZone></HostedZoneConfig>{}",
+        vpc_block(Some(NAMING_VPC), Some(HOME_REGION))
+    );
+
+    for (index, row) in NAME_ROWS.iter().enumerate() {
+        let case = row.case;
+        let reply = create_zone(&router, row.name, &format!("private-name-{index}"), &config).await;
+        assert_eq!(
+            reply.status, 201,
+            "case {case:?}: a private zone named {:?} must be created, got {} with body {}",
+            row.name, reply.status, reply.body
+        );
+        // The round trip: the zone reads back under the canonical form of the
+        // name it was created with, as the private zone it was asked for.
+        let zone_id = bare_zone_id(&reply);
+        let read = get_zone(&router, &zone_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: the created zone must read back, got {} with body {}",
+            read.status, read.body
+        );
+        let expected = canonical_name(row.name);
+        assert_eq!(
+            read.first("HostedZone/Name").map(str::to_string),
+            Some(expected.clone()),
+            "case {case:?}: expected the zone to be held under {expected:?}; body {}",
+            read.body
+        );
+        assert_eq!(
+            read.first("PrivateZone").map(str::to_string),
+            Some("true".to_string()),
+            "case {case:?}: the created zone must be reported private; body {}",
+            read.body
+        );
+        assert_eq!(
+            read.first("VPCId").map(str::to_string),
+            Some(NAMING_VPC.to_string()),
+            "case {case:?}: the zone must carry the VPC it was created with; body {}",
+            read.body
+        );
+    }
+}
+
+/// The other half of the rule: the SAME names asked for as PUBLIC zones, where a
+/// single label asks for a top-level domain and is refused as reserved while a
+/// name of more labels is created.
+#[tokio::test]
+async fn a_public_hosted_zone_keeps_the_reserved_name_refusal() {
+    let router = router();
+
+    for (index, row) in NAME_ROWS.iter().enumerate() {
+        let case = row.case;
+        let reply = create_zone(&router, row.name, &format!("public-name-{index}"), "").await;
+        if row.single_label {
+            assert_eq!(
+                reply.status, 400,
+                "case {case:?}: a public zone named by one label must be refused, got {} with \
+                 body {}",
+                reply.status, reply.body
+            );
+            assert_eq!(
+                reply.error_code(),
+                "InvalidDomainName",
+                "case {case:?}: expected InvalidDomainName, got body {}",
+                reply.body
+            );
+            let expected = format!("{}{RESERVED_SUFFIX}", row.name);
+            assert!(
+                reply.body.contains(&expected),
+                "case {case:?}: expected the message {expected:?}, got body {}",
+                reply.body
+            );
+        } else {
+            assert_eq!(
+                reply.status, 201,
+                "case {case:?}: a public zone of more than one label must be created, got {} \
+                 with body {}",
+                reply.status, reply.body
+            );
+        }
     }
 }

@@ -45,7 +45,7 @@ const ZIP_FILE: &str = "UEsDBAoAAAAAAAAAAAA=";
 /// The local name of Cognito's Smithy shape, which is the `X-Amz-Target` prefix.
 const COGNITO_TARGET_PREFIX: &str = "AWSCognitoIdentityProviderService";
 
-/// The version an invocation that names no qualifier addresses, which Lambda's own
+/// The version a SYNCHRONOUS invocation that names no qualifier resolves, which Lambda's own
 /// `ResourceNotFoundException` qualifies the resource it could not find by.
 const LATEST: &str = "$LATEST";
 
@@ -368,9 +368,9 @@ async fn a_confirmation_invokes_the_pools_post_confirmation_function() {
         if !expected_code.is_empty() {
             // The refusal states the trigger and the error Lambda itself reported for the
             // function the pool named — both taken from the request's own pool and from
-            // what Lambda answered. An INVOCATION's not-found refusal names the ARN the
-            // request addressed AT the version it resolved, and the trigger names no
-            // qualifier, so the unpublished version's own label is what it carries.
+            // what Lambda answered. A trigger is invoked SYNCHRONOUSLY, and such an
+            // invocation's not-found refusal names the version it resolved, so the
+            // unpublished version's own label is what it carries.
             assert_eq!(
                 message(&answer),
                 format!(

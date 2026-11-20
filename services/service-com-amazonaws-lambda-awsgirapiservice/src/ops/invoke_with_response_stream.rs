@@ -299,10 +299,10 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         // The resource an INVOCATION addresses is a function AT a version: `Qualifier`
         // "specif[ies] a version or alias to invoke a published version of the function",
         // and an invocation that names none runs the unpublished version, which is what
-        // the output's `ExecutedVersion` reports as `$LATEST`. So the refusal for a pair
-        // that resolves to nothing names that qualified resource, built from the request by
-        // the one construction every invoking operation shares
-        // (`crate::state::addressed_function_arn`).
+        // the output's `ExecutedVersion` reports as `$LATEST`. This entry point is
+        // SYNCHRONOUS — the caller waits on the version that would have run — so the
+        // refusal for a pair that resolves to nothing names that RESOLVED resource
+        // (`crate::state::resolved_invocation_arn`), as `Invoke`'s synchronous types do.
         let reference =
             crate::state::parse_function_reference(&input.function_name).ok_or_else(|| {
                 invalid_parameter(format!(
@@ -312,8 +312,11 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
                     input.function_name
                 ))
             })?;
-        let addressed_arn =
-            crate::state::addressed_arn_of(&region, &reference, input.qualifier.as_deref());
+        let addressed_arn = crate::state::resolved_invocation_arn(
+            &region,
+            &reference,
+            input.qualifier.as_deref(),
+        );
 
         // The store guard lives in THIS block and no longer: everything the run needs is
         // copied out of the record here, and the run below happens with no guard held.

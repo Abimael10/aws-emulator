@@ -1104,14 +1104,25 @@ pub fn retention_secs_at_period(period: i32) -> f64 {
 /// range selects is every datapoint whose STORED SPAN — the span its own `StorageResolution`
 /// aggregates it into ([`StoredDatum::aggregated_instant`] to that instant plus
 /// [`StoredDatum::aggregated_span`]): the whole minute for a regular-resolution datapoint and
-/// its own second for a high-resolution one — reaches into `[start, end)`. A period FINER than
-/// that granularity still selects the datapoint: the series holds no detail at that period, so
-/// the datapoint is reported at the start of the span it IS stored in — whole-minute instants
-/// for a regular-resolution series however short the period asked for. A regular-resolution
+/// its own second for a high-resolution one — reaches into `[start, end)`. A regular-resolution
 /// datapoint stands for the minute it is stored in rather than for the instant inside that
 /// minute it happened to be published at, so a range that opens or closes part way through that
-/// minute holds it, and it is reported under the whole minute either way — which may be an
-/// instant before the range's own start, that minute having no other instant to be reported at.
+/// minute holds it, and it is reported under the whole minute — which may be an instant before
+/// the range's own start, that minute having no other instant to be reported at.
+///
+/// A period FINER than the span a datapoint is stored at can only be answered with that whole
+/// span's aggregate, so such a read is answered from the datapoint once the clock has LEFT its
+/// span and that aggregate is complete: "For metrics with regular resolution, a period can be as
+/// short as one minute (60 seconds) and must be a multiple of 60. For high-resolution metrics
+/// that are collected at intervals of less than one minute, the period can be 1, 5, 10, 20, 30,
+/// 60, or any multiple of 60. High-resolution metrics are those metrics stored by a
+/// `PutMetricData` call that includes a `StorageResolution` of 1 second."
+/// (`GetMetricStatisticsInput$Period`). A span the clock is still INSIDE is one more
+/// observations can still be published into, so a sub-minute read of a regular-resolution
+/// datapoint stamped in the minute now running holds no datapoint of it, while the same
+/// datapoint read at the minute it is stored at — or at any coarser period — is answered from as
+/// it stands, the window being folded then being that span itself.
+///
 /// A window holding no datapoint is never inserted, so what this allocates is bounded by the
 /// datapoints the series holds in the range rather than by the range the request spans. A
 /// datapoint the retention tier of `period` no longer holds is not in any window
@@ -1137,14 +1148,30 @@ pub fn windows_by_unit<'a>(
     unit: Option<&str>,
     now: f64,
 ) -> BTreeMap<(i64, &'a str), Vec<&'a StoredDatum>> {
-    let span = f64::from(period);
+    // The window width, guarded exactly as the sibling that lays the same windows out guards
+    // it ([`first_window_start`]): a non-positive period is refused at the request boundary
+    // before any read reaches here, and the guard keeps the two helpers' notion of a window's
+    // width one notion rather than an invariant each assumes separately.
+    let span = f64::from(period.max(1));
     let mut windows: BTreeMap<(i64, &str), Vec<&StoredDatum>> = BTreeMap::new();
     for datum in data {
         // The span the datapoint is stored as: a read sees it at the granularity it is stored
         // at, not at a finer one the read asks for, so what the range is judged against is
         // that whole span rather than the instant inside it the observation was published at.
         let instant = datum.aggregated_instant();
-        if instant >= end || instant + datum.aggregated_span() <= start {
+        let stored_span = datum.aggregated_span();
+        if instant >= end || instant + stored_span <= start {
+            continue;
+        }
+        // A period FINER than the span the datapoint is stored as can only be answered with
+        // that WHOLE span's aggregate, and that aggregate is complete only once the clock has
+        // LEFT the span: a span the clock is still inside is one more observations can still
+        // be published into, so a read finer than it holds no datapoint of it yet. At the
+        // span's own granularity or coarser the window being folded IS that span (or covers
+        // it), which is answered from as it stands — so a regular-resolution datapoint of the
+        // minute now running is read at `Period` 60 and above while the minute runs, and at a
+        // sub-minute period only once that minute has closed.
+        if stored_span > span && now < instant + stored_span {
             continue;
         }
         if unit.is_some_and(|wanted| datum.unit() != wanted) {
@@ -1158,14 +1185,14 @@ pub fn windows_by_unit<'a>(
         // The window the stored span's start falls in, which is where the datapoint is
         // REPORTED: a span that began before the range did is reported at its own start, so
         // the index may reach back past the range's first window. A read at a period FINER
-        // than the granularity the datapoint is stored at is still answered from it, at the
-        // start of the span it IS stored in rather than at an instant the series holds no
-        // detail for: "Setting this to 1 specifies this metric as a high-resolution metric, so
-        // that CloudWatch stores the metric with sub-minute resolution down to one second.
-        // Setting this to 60 specifies this metric as regular resolution, which CloudWatch
-        // stores at 1-minute resolution." (`MetricDatum$StorageResolution`) — so a sub-minute
-        // period over a regular-resolution datapoint buckets it by the minute it is stored in,
-        // which is what the alarm evaluator grades such a series on as well
+        // than the granularity the datapoint is stored at is answered from it at the start of
+        // the span it IS stored in rather than at an instant the series holds no detail for:
+        // "Setting this to 1 specifies this metric as a high-resolution metric, so that
+        // CloudWatch stores the metric with sub-minute resolution down to one second. Setting
+        // this to 60 specifies this metric as regular resolution, which CloudWatch stores at
+        // 1-minute resolution." (`MetricDatum$StorageResolution`) — so a sub-minute period
+        // over a regular-resolution datapoint buckets it by the minute it is stored in, which
+        // is what the alarm evaluator grades such a series on as well
         // ([`crate::state::alarm_evaluation`]'s window of a datapoint's stored instant).
         #[allow(clippy::cast_possible_truncation)]
         let index = ((instant - start) / span).floor() as i64;
