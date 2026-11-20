@@ -463,8 +463,9 @@ async fn only_one_of_two_reshards_of_a_group_wins() {
     );
     assert_eq!(
         second.error_message(),
-        state::replication_group_modify_state_refusal(),
-        "expected the state refusal this service words for a change to a group, got {:?}",
+        state::RESHARD_STATE_MESSAGE,
+        "expected the state refusal this service words for a reshard it could not carry out, got \
+         {:?}",
         second.error_message()
     );
 

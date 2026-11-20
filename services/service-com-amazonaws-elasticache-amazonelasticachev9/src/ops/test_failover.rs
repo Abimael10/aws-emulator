@@ -236,13 +236,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // have is answered the same whatever the group happens to be doing, so a
         // caller is never told the group is busy about a shard that does not
         // exist. `NodeGroupNotFoundFault` is exactly "the node group specified
-        // by the NodeGroupId parameter could not be found".
+        // by the NodeGroupId parameter could not be found", worded the one way
+        // this service words that fault
+        // (`crate::state::node_group_not_found_message`).
         if !shard_exists {
             return Err(TestFailoverErrorModeled::NodeGroupNotFoundFault(
                 NodeGroupNotFoundFault {
-                    message: Some(format!(
-                        "Node group {node_group_id} not found in replication group {}.",
-                        input.replication_group_id
+                    message: Some(crate::state::node_group_not_found_message(
+                        &node_group_id,
+                        &input.replication_group_id,
                     )),
                 },
             )

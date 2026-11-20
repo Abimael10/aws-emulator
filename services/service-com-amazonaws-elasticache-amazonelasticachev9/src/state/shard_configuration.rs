@@ -30,6 +30,32 @@ use super::*;
 pub const SHARDS_NEED_CLUSTER_MODE_MESSAGE: &str =
     "Operation is only applicable for cluster mode enabled replication groups.";
 
+/// How ElastiCache refuses a shard-configuration change on a replication group
+/// whose status cannot take one: the sentence states that the reshard could not be
+/// carried out and that it is worth retrying, which is what a caller whose reshard
+/// lost a race against another one acts on.
+///
+/// The state gate of the operation that RESHARDS a group, worded for that
+/// operation rather than through the general modification refusal
+/// ([`replication_group_modify_state_refusal`]), because the work it could not
+/// start is its own. Wholly fixed text: neither the group nor the status it is in
+/// appears in it.
+pub const RESHARD_STATE_MESSAGE: &str =
+    "Could not reshard replication group. Please try again later.";
+
+/// How ElastiCache words a node group (shard) the replication group a request
+/// named does not hold: `Node group <node-group-id> was not found for replication
+/// group <replication-group-id>` — no trailing stop.
+///
+/// The message of the modelled `NodeGroupNotFoundFault` ("the node group specified
+/// by the NodeGroupId parameter could not be found"), so one helper words every
+/// surface that answers it. Both variable parts are taken from the request: the
+/// node group it asked about and the group it asked about it in, each as the
+/// request spelled it.
+pub fn node_group_not_found_message(node_group_id: &str, replication_group_id: &str) -> String {
+    format!("Node group {node_group_id} was not found for replication group {replication_group_id}")
+}
+
 /// How many replicas a shard a reshard ADDS gets when the group it joins has no shard to
 /// take a count from: none, the primary alone.
 ///

@@ -315,12 +315,13 @@ pub fn serverless_description(requested: &str) -> Result<String, String> {
 ///
 /// "The maximum value allowed is 35 days" ([`MAX_SNAPSHOT_RETENTION_LIMIT`]),
 /// and a negative retention retains nothing: a limit outside that range is
-/// refused rather than clamped.
+/// refused rather than clamped. The sentence states the bound the service
+/// publishes, and its one variable part is the rejected value from the request.
 pub fn snapshot_retention_limit_refusal(limit: i32) -> Option<String> {
     (!(0..=MAX_SNAPSHOT_RETENTION_LIMIT).contains(&limit)).then(|| {
         format!(
-            "Invalid value {limit} for SnapshotRetentionLimit: must be at least 0 and no more \
-             than {MAX_SNAPSHOT_RETENTION_LIMIT} days."
+            "Invalid snapshot retention limit: {limit}. Snapshot retention limit must be between \
+             0 and {MAX_SNAPSHOT_RETENTION_LIMIT}."
         )
     })
 }

@@ -277,14 +277,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::SHARDS_NEED_CLUSTER_MODE_MESSAGE,
             ));
         }
-        // The same gate every change to a group applies: one still `creating`,
+        // The gate every change to a group applies: one still `creating`,
         // already `modifying` (a reshard of its own included) or on its way out
-        // cannot take another change.
+        // cannot take another change. The sentence is THIS operation's — the
+        // reshard could not be carried out and is worth retrying
+        // (`crate::state::RESHARD_STATE_MESSAGE`) — rather than the general
+        // modification refusal, so the loser of a race between two reshards is
+        // told which work it lost.
         if group.status != crate::state::STATUS_AVAILABLE {
             return Err(
                 ModifyReplicationGroupShardConfigurationErrorModeled::InvalidReplicationGroupStateFault(
                     InvalidReplicationGroupStateFault {
-                        message: Some(crate::state::replication_group_modify_state_refusal()),
+                        message: Some(crate::state::RESHARD_STATE_MESSAGE.to_string()),
                     },
                 )
                 .into(),
