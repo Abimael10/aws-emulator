@@ -53,8 +53,8 @@
 //! [`topic_delivery_refusal`], on a function target by
 //! [`function_delivery_refusal`] and on a log-group target by
 //! [`log_group_grants`]; what such a refusal REPORTS is the answer that
-//! target's own service gives it, so a queue's names the resource while a topic's
-//! and a function's name the permission). A topic target that is ENCRYPTED with a
+//! target's own service gives it, which for a target that IS there and refused
+//! this principal names the permission in each of those services). A topic target that is ENCRYPTED with a
 //! customer managed key is decided by a second document as well — that key's own
 //! policy, since the publish has Amazon SNS generate a data key under it — so a
 //! key policy withholding `kms:GenerateDataKey` from this service is a delivery
@@ -3671,7 +3671,7 @@ fn queue_delivery_refusal(
             "an EventBridge delivery was withheld: the queue's own policy does not allow this \
              service to send it a message"
         );
-        let (code, message) = crate::state::queue_access_refusal();
+        let (code, message) = crate::state::queue_access_refusal(resource, action);
         return Some(crate::state::InvocationOutcome::Failed {
             code: delivery_condition(code).to_string(),
             message,
