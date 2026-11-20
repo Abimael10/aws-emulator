@@ -42,6 +42,10 @@ service-common = { path = "../common" }
 # The identity-based policies in force on the calling principal are read through the IAM
 # service's own accessors there (`state::authorization`).
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# Private CA client the certificate authority a trust anchor's source names is read through
+# (`GetCertificateAuthorityCertificate`), called over the in-process callback into this same
+# emulator — no network client feature is enabled, so the transport is the emulator's own.
+aws-sdk-acmpca = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

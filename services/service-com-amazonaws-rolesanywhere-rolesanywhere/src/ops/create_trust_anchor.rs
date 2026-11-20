@@ -160,15 +160,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateTrustAnchorErrorModeled::AccessDeniedException(denied).into());
         }
 
-        let state = crate::state::service_state(&*self.engine)
-            .ok_or_else(crate::state::state_unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
 
         // A `Source` that names no certificate authority this service can store is
         // refused rather than stored — certificate data that does not read as certificates
-        // included, because an anchor holding it could authenticate nothing;
+        // included, because an anchor holding it could authenticate nothing, and a private
+        // certificate authority the service that owns it cannot answer for, because the
+        // root certificate a credential request is validated against is the one that
+        // service holds. The authority is therefore RESOLVED here, before anything is
+        // written, so a refused create allocates no trust anchor id;
         // `UpdateTrustAnchor` judges a submitted source the same way, so the rule lives
         // beside the record it guards.
-        if let Some(rejection) = crate::state::source_rejection(&input.source) {
+        if let Some(rejection) =
+            crate::state::private_ca::source_rejection(ctx, &region, &input.source).await
+        {
             return Err(CreateTrustAnchorErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(crate::state::source_rejection_message(
@@ -196,8 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
         let mut store = state.lock();
         // Both caller-driven stores are bounded by an entry count, refused here before
         // anything is inserted, so repeating this call cannot grow the store without

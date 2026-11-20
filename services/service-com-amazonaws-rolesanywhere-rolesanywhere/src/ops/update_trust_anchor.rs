@@ -161,12 +161,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A submitted `Source` is judged exactly as `CreateTrustAnchor` judges one, and
         // before anything is written, so a source naming no certificate authority never
-        // replaces a usable one.
-        if let Some(rejection) = input
-            .source
-            .as_ref()
-            .and_then(crate::state::source_rejection)
-        {
+        // replaces a usable one — the private certificate authority such a source names
+        // included, which is resolved through the service that owns it.
+        let region = crate::state::request_region(ctx.parts());
+        let submitted_source_rejection = match input.source.as_ref() {
+            Some(source) => {
+                crate::state::private_ca::source_rejection(ctx, &region, source).await
+            }
+            None => None,
+        };
+        if let Some(rejection) = submitted_source_rejection {
             return Err(UpdateTrustAnchorErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(crate::state::source_rejection_message(

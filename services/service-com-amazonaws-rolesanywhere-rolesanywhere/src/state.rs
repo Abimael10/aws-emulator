@@ -34,6 +34,11 @@ pub mod authorization;
 /// The principal a request speaks for, which a created profile records as its creator.
 mod caller_identity;
 
+/// The private certificate authority a trust anchor's source names, read through the
+/// service that owns it: the resolution both trust-anchor writes put before they store a
+/// source of that type.
+pub mod private_ca;
+
 pub use caller_identity::*;
 pub use subjects::*;
 
@@ -1095,6 +1100,11 @@ pub enum SourceRejection {
     },
     /// `x509CertificateData` that is not readable as PEM-encoded X.509 certificates.
     BadCertificateData,
+    /// The private certificate authority a source of the private-CA type names is one this
+    /// service could not read: the service that owns that authority holds none under the
+    /// ARN, does not take the value for an ARN of its resources, or holds one with no root
+    /// certificate to answer with. See [`private_ca`].
+    UnreadableCertificateAuthority,
 }
 
 /// Which trust-anchor write is refusing a `Source`, which its refusal of the certificate
@@ -1117,14 +1127,19 @@ impl TrustAnchorWrite {
 
 /// The `message` the trust-anchor write `write` refuses `rejection` with.
 ///
-/// The certificate-data refusal is FIXED text naming the write: it quotes nothing the
-/// request carried, because the material it is about is the whole submitted value.
+/// The certificate-data and private-CA refusals are FIXED text naming the write: they quote
+/// nothing the request carried, because the material one is about is the whole submitted
+/// value and the other is about a read of another service that either answered or did not.
 pub fn source_rejection_message(rejection: &SourceRejection, write: TrustAnchorWrite) -> String {
     match rejection {
         SourceRejection::Member { member, constraint } => validation_message(member, constraint),
         SourceRejection::BadCertificateData => {
             format!("Error {} TrustAnchor. Bad certificate data", write.action())
         }
+        SourceRejection::UnreadableCertificateAuthority => format!(
+            "Error {} TrustAnchor. Given AWS PCA did not allow get request, or invalid ARN.",
+            write.action()
+        ),
     }
 }
 
@@ -1140,6 +1155,11 @@ pub fn source_rejection_message(rejection: &SourceRejection, write: TrustAnchorW
 /// PEM-encoded X.509 certificates names no authority either: it could authenticate no
 /// certificate, which is the one thing a trust anchor is for. Shared, because every
 /// operation that accepts a `Source` has to judge it the same way.
+///
+/// These are the checks that need nothing but the submitted value. A source naming a private
+/// certificate authority describes one only if the service that OWNS that authority can
+/// answer for it, which is a read rather than a check: a handler judges a source through
+/// [`private_ca::source_rejection`], which states both halves.
 pub fn source_rejection(source: &Source) -> Option<SourceRejection> {
     let source_type = match source
         .source_type

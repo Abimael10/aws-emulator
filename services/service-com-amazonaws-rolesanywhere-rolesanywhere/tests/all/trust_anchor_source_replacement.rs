@@ -15,7 +15,13 @@
 //! `x509CertificateData` is "The PEM-encoded data for the certificate anchor"
 //! (`smithy_query(query="shape", shape="SourceData")`), so a value that does not read as
 //! PEM X.509 certificates is refused 400 `ValidationException` by both writes — a trust
-//! anchor holding it could authenticate nothing — and nothing is stored.
+//! anchor holding it could authenticate nothing — and nothing is stored. A source of the
+//! `AWS_ACM_PCA` type carries no certificates of its own but the ARN of an authority another
+//! service owns, so a value that is not such an ARN names no authority either and is refused
+//! the same way, with that error class's own fixed sentence. Whether an authority is really
+//! there is the owning service's own read, which
+//! `core/router/tests/all/rolesanywhere_trust_anchor_private_ca_source.rs` mounts both
+//! services to cover.
 //!
 //! Each test therefore spans a TABLE of inputs — which `sourceType` the stored anchor
 //! carries and which the update names, and each way a source can fail to describe a
@@ -727,6 +733,231 @@ async fn update_trust_anchor_refuses_certificate_data_it_cannot_read() {
         assert_eq!(
             updated.get("source"),
             Some(&source("CERTIFICATE_BUNDLE", &data)),
+            "case {case:?}: an accepted update must store what it carried, got {updated:?}"
+        );
+    }
+}
+
+/// Values that are NOT the ARN of a private certificate authority, as `(case, acmPcaArn)`.
+///
+/// A trust anchor of the `AWS_ACM_PCA` type names an authority by its ARN, whose form the
+/// owning service documents: "This is of the form:
+/// arn:aws:acm-pca:region:account:certificate-authority/12345678-1234-1234-1234-123456789012"
+/// (`GetCertificateAuthorityCertificate$CertificateAuthorityArn`, that service's model). No
+/// authority can carry a value outside that form, so such a value describes no authority
+/// whatever any service holds.
+///
+/// The rows differ along HOW the value fails to be such an ARN: it is not an ARN at all
+/// (plain text, an empty value, a URL), it carries too few segments, its partition is empty,
+/// its service segment names another service, its region segment is empty, its account
+/// segment is not an account id or is a digit short of one, its resource segment names
+/// another kind of that service's resources, carries no id, or is absent altogether.
+fn values_that_name_no_private_certificate_authority() -> Vec<(&'static str, String)> {
+    vec![
+        ("plain-text", "not-a-certificate-authority".to_string()),
+        ("empty-value", String::new()),
+        (
+            "a-url",
+            "https://acm-pca.us-west-2.amazonaws.com/ca".to_string(),
+        ),
+        (
+            "too-few-segments",
+            format!("arn:aws:acm-pca:{REGION}:certificate-authority/ca"),
+        ),
+        (
+            "empty-partition",
+            format!("arn::acm-pca:{REGION}:000000000000:certificate-authority/ca"),
+        ),
+        (
+            "another-services-arn",
+            format!("arn:aws:acm:{REGION}:000000000000:certificate/ca"),
+        ),
+        (
+            "empty-region",
+            "arn:aws:acm-pca::000000000000:certificate-authority/ca".to_string(),
+        ),
+        (
+            "account-that-is-not-an-account-id",
+            format!("arn:aws:acm-pca:{REGION}:account:certificate-authority/ca"),
+        ),
+        (
+            "account-one-digit-short",
+            format!("arn:aws:acm-pca:{REGION}:00000000000:certificate-authority/ca"),
+        ),
+        (
+            "another-resource-type-of-that-service",
+            format!("arn:aws:acm-pca:{REGION}:000000000000:template/EndEntityCertificate"),
+        ),
+        (
+            "no-authority-id",
+            format!("arn:aws:acm-pca:{REGION}:000000000000:certificate-authority/"),
+        ),
+        (
+            "no-resource-segment",
+            format!("arn:aws:acm-pca:{REGION}:000000000000:"),
+        ),
+    ]
+}
+
+/// ARNs that ARE of that form, as `(case, acmPcaArn)`: the rows differ along the partition,
+/// the Region, the account and the form of the authority's own id.
+///
+/// This suite mounts THIS service alone, so no service owns an authority under any of them
+/// and none is refused by the form rule above — whether an authority is really there is
+/// established by the owning service's own read, which is what
+/// `core/router/tests/all/rolesanywhere_trust_anchor_private_ca_source.rs` mounts both
+/// services to cover.
+fn well_formed_certificate_authority_arns() -> Vec<(&'static str, String)> {
+    vec![
+        ("this-region", acm_pca_arn("11111111-2222-3333-4444-555555555555")),
+        (
+            "another-region",
+            "arn:aws:acm-pca:ap-southeast-2:000000000000:certificate-authority/\
+             aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                .to_string(),
+        ),
+        (
+            "another-partition",
+            format!(
+                "arn:aws-us-gov:acm-pca:{REGION}:000000000000:certificate-authority/\
+                 12345678-90ab-cdef-1234-567890abcdef"
+            ),
+        ),
+        (
+            "another-account",
+            format!(
+                "arn:aws:acm-pca:{REGION}:123456789012:certificate-authority/\
+                 99999999-8888-7777-6666-555544443333"
+            ),
+        ),
+        ("a-short-id", acm_pca_arn("ca")),
+    ]
+}
+
+/// The fixed wording a trust-anchor write refuses a source whose private certificate
+/// authority it could not read with: it names the write and nothing the request carried.
+fn unreadable_authority_message(action: &str) -> String {
+    format!("Error {action} TrustAnchor. Given AWS PCA did not allow get request, or invalid ARN.")
+}
+
+/// A create whose `acmPcaArn` is no private certificate authority's ARN is refused 400
+/// `ValidationException` with the service's fixed private-CA wording and mints no trust
+/// anchor, while one carrying an ARN of that form gets past the form rule.
+#[tokio::test]
+async fn create_trust_anchor_refuses_a_source_naming_no_private_certificate_authority() {
+    let client = Client::new();
+
+    for (case, arn) in values_that_name_no_private_certificate_authority() {
+        let name = format!("refused-authority-{case}");
+        let answer = client
+            .create_trust_anchor(json!({"name": name, "source": source("AWS_ACM_PCA", &arn)}))
+            .await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: a value that names no private certificate authority must be \
+             refused with HTTP 400, got {answer:?}"
+        );
+        assert_eq!(
+            answer.error_code, "ValidationException",
+            "case {case:?}: the refusal must be the operation's modelled error, got {answer:?}"
+        );
+        assert_eq!(
+            message_of(&answer),
+            unreadable_authority_message("creating"),
+            "case {case:?}: expected the service's private-CA wording, got {answer:?}"
+        );
+        assert!(
+            answer.body.get("trustAnchor").is_none(),
+            "case {case:?}: a refused create must report no trust anchor, got {answer:?}"
+        );
+
+        let listed = listed_names(&client.send("GET", "/trustanchors", None).await);
+        assert!(
+            !listed.contains(&name),
+            "case {case:?}: a refused create must mint nothing, so it allocates no id, got \
+             {listed:?}"
+        );
+    }
+
+    for (case, arn) in well_formed_certificate_authority_arns() {
+        let name = format!("admitted-authority-{case}");
+        let submitted = source("AWS_ACM_PCA", &arn);
+        let created = anchor_of(
+            case,
+            201,
+            &client
+                .create_trust_anchor(json!({"name": name, "source": submitted}))
+                .await,
+        );
+        let id = id_of(case, &created);
+        let read_back = anchor_of(case, 200, &client.get_trust_anchor(&id).await);
+        assert_eq!(
+            read_back.get("source"),
+            Some(&source("AWS_ACM_PCA", &arn)),
+            "case {case:?}: a stored authority reference must read back exactly as \
+             submitted, got {read_back:?}"
+        );
+    }
+}
+
+/// An update whose `acmPcaArn` is no private certificate authority's ARN is refused the same
+/// way — worded for the update — and leaves the stored source alone, while one carrying an
+/// ARN of that form replaces it.
+#[tokio::test]
+async fn update_trust_anchor_refuses_a_source_naming_no_private_certificate_authority() {
+    let client = Client::new();
+    let created = anchor_of(
+        "setup",
+        201,
+        &client
+            .create_trust_anchor(json!({
+                "name": "authority under update",
+                "source": source("CERTIFICATE_BUNDLE", CERTIFICATE_BUNDLE_PEM),
+            }))
+            .await,
+    );
+    let id = id_of("setup", &created);
+    let stored_source = created
+        .get("source")
+        .cloned()
+        .expect("the create reports the stored source");
+
+    for (case, arn) in values_that_name_no_private_certificate_authority() {
+        let answer = client
+            .update_trust_anchor(&id, json!({"source": source("AWS_ACM_PCA", &arn)}))
+            .await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a value that names no private certificate authority must be \
+             refused with the operation's modelled error, got {answer:?}"
+        );
+        assert_eq!(
+            message_of(&answer),
+            unreadable_authority_message("updating"),
+            "case {case:?}: expected the service's private-CA wording for an update, got \
+             {answer:?}"
+        );
+
+        let read_back = anchor_of(case, 200, &client.get_trust_anchor(&id).await);
+        assert_eq!(
+            read_back.get("source"),
+            Some(&stored_source),
+            "case {case:?}: a refused update must leave the stored source alone, got \
+             {read_back:?}"
+        );
+    }
+
+    for (case, arn) in well_formed_certificate_authority_arns() {
+        let submitted = source("AWS_ACM_PCA", &arn);
+        let updated = anchor_of(
+            case,
+            200,
+            &client.update_trust_anchor(&id, json!({"source": submitted})).await,
+        );
+        assert_eq!(
+            updated.get("source"),
+            Some(&source("AWS_ACM_PCA", &arn)),
             "case {case:?}: an accepted update must store what it carried, got {updated:?}"
         );
     }
