@@ -43,7 +43,7 @@ async fn the_segments_of_a_parallel_scan_are_runs_of_the_scans_own_walk() {
     seed_shapes(&router).await;
 
     for shape in &SHAPES {
-        let whole = item_keys(&ok(&router, "Scan", json!({"TableName": shape.table})).await);
+        let whole = item_keys(&ok(&router, "Scan", json!({"TableName": shape.table})).await, "S");
         let seeded = shape.total();
         assert_eq!(
             whole.len(),
@@ -69,7 +69,7 @@ async fn the_segments_of_a_parallel_scan_are_runs_of_the_scans_own_walk() {
                     }),
                 )
                 .await;
-                let keys = item_keys(&page);
+                let keys = item_keys(&page, "S");
                 assert_eq!(
                     page["Count"].clone(),
                     json!(keys.len()),
@@ -128,6 +128,7 @@ async fn paging_inside_one_segment_carries_on_along_its_run() {
                             }),
                         )
                         .await,
+                        "S",
                     );
                     let mut paged: Vec<String> = Vec::new();
                     let mut start: Option<Value> = None;
@@ -142,7 +143,7 @@ async fn paging_inside_one_segment_carries_on_along_its_run() {
                             request["ExclusiveStartKey"] = key;
                         }
                         let page = ok(&router, "Scan", request).await;
-                        let keys = item_keys(&page);
+                        let keys = item_keys(&page, "S");
                         assert!(
                             keys.len() <= limit,
                             "case {case} segment {segment}: a page holds at most the Limit \

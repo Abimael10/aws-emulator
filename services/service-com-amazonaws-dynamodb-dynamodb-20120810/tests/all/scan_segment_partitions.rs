@@ -94,10 +94,16 @@ pub(crate) fn partition_of(key: &str) -> String {
     key.split('/').next().unwrap_or(key).to_string()
 }
 
-/// The item keys a response reports, in the order it reported them. A response that
-/// carries no `Items` member reports none, which is what a segment with nothing to
+/// The item keys a response reports, in the order it reported them, as
+/// `partition/sort` — the form [`partition_of`] reads a partition back out of. A response
+/// that carries no `Items` member reports none, which is what a segment with nothing to
 /// evaluate — and a filter that kept nothing — answers.
-pub(crate) fn item_keys(page: &Value) -> Vec<String> {
+///
+/// `partition_wire` is the `AttributeValue` member the table's partition key is carried in,
+/// so a suite whose table is keyed on another TYPE reads its keys through this one reader
+/// (`tests/all/scan_segment_key_types_and_fan_out.rs`); the sort key is numeric in every
+/// table these suites seed.
+pub(crate) fn item_keys(page: &Value, partition_wire: &str) -> Vec<String> {
     page.get("Items")
         .and_then(Value::as_array)
         .map(|items| {
@@ -106,7 +112,7 @@ pub(crate) fn item_keys(page: &Value) -> Vec<String> {
                 .map(|item| {
                     format!(
                         "{}/{}",
-                        item["pk"]["S"].as_str().unwrap_or("<no pk>"),
+                        item["pk"][partition_wire].as_str().unwrap_or("<no pk>"),
                         item["sk"]["N"].as_str().unwrap_or("<no sk>")
                     )
                 })
@@ -172,7 +178,7 @@ async fn an_unsegmented_scan_evaluates_every_item_of_the_table() {
 
     for shape in &SHAPES {
         let page = ok(&router, "Scan", json!({"TableName": shape.table})).await;
-        let answered = item_keys(&page);
+        let answered = item_keys(&page, "S");
         // A scan walks the KEY SPACE: each partition where the hash of its key puts it,
         // and the rows of one partition in sort-key order. So what a scan reports is every
         // item exactly once, with each partition's own rows contiguous and ascending —
@@ -264,7 +270,7 @@ async fn the_segments_of_a_parallel_scan_are_whole_partitions() {
                             json!({":absent": {"S": "no item carries this"}});
                     }
                     let page = ok(&router, "Scan", request).await;
-                    let keys = item_keys(&page);
+                    let keys = item_keys(&page, "S");
                     let scanned = scanned_count(&page);
                     assert_eq!(
                         page["Count"].clone(),
@@ -416,7 +422,7 @@ async fn the_segments_of_a_parallel_index_scan_are_whole_index_partitions() {
                 }),
             )
             .await;
-            let keys = item_keys(&page);
+            let keys = item_keys(&page, "S");
             evaluated += scanned_count(&page);
             for key in &keys {
                 let group = partitions.get(key).cloned().unwrap_or_default();
