@@ -28,11 +28,12 @@
 //! nothing about whether the image exists, so a create naming one is stored rather than
 //! refused.
 
-use crate::ops::types::{Image, ImageState};
+use crate::ops::types::{Filter, Image, ImageState, ImageVersion};
 
 use super::{
-    normalized_name, parent_image_platform, reported_tags, version_admits, VersionedReference,
-    ARN_SERVICE, FIRST_BUILD_VERSION, IMAGE_ARN_PREFIX, IMAGE_STATUS_AVAILABLE, IMAGE_TYPE_AMI,
+    image_filters_admit, normalized_name, parent_image_platform, reported_tags, version_admits,
+    VersionedReference, ARN_SERVICE, FIRST_BUILD_VERSION, IMAGE_ARN_PREFIX, IMAGE_STATUS_AVAILABLE,
+    IMAGE_TYPE_AMI, OWNERSHIP_AMAZON, VERSION_FILTER_NAME, WILDCARD_VERSION,
 };
 
 /// The account field an Amazon-managed image's ARN carries, in place of an account id: the
@@ -144,11 +145,96 @@ impl ManagedImage {
     /// this account ([`MANAGED_IMAGE_OWNER`]).
     #[must_use]
     pub fn arn(&self, partition: &str, region: &str) -> String {
+        self.versioned_arn(
+            partition,
+            region,
+            &format!("{MANAGED_IMAGE_VERSION}/{FIRST_BUILD_VERSION}"),
+        )
+    }
+
+    /// This image's ARN in `region` at `version`, which carries the build number or does not
+    /// according to what the ARN stands for: one published BUILD ([`Self::arn`]), the version
+    /// it was published at, or the name every version of it shares ([`Self::listed_arn`]).
+    fn versioned_arn(&self, partition: &str, region: &str, version: &str) -> String {
         format!(
             "arn:{partition}:{ARN_SERVICE}:{region}:{MANAGED_IMAGE_OWNER}:{IMAGE_ARN_PREFIX}{}/\
-             {MANAGED_IMAGE_VERSION}/{FIRST_BUILD_VERSION}",
+             {version}",
             normalized_name(self.name)
         )
+    }
+
+    /// The version a LISTING entry this catalog image stands for reports: the version it was
+    /// published at, or [`WILDCARD_VERSION`] when the entry aggregates every version of one
+    /// name. See [`super::ImageBuildVersionRecord::listed_version`].
+    #[must_use]
+    pub fn listed_version(&self, aggregated_by_name: bool) -> &'static str {
+        if aggregated_by_name {
+            WILDCARD_VERSION
+        } else {
+            MANAGED_IMAGE_VERSION
+        }
+    }
+
+    /// The ARN a LISTING entry this catalog image stands for reports: the version ARN of the
+    /// version it was published at, or the name ARN when the entry aggregates every version
+    /// of one name. Neither carries a build number, since an entry stands for a version or
+    /// for a name rather than for one build.
+    #[must_use]
+    pub fn listed_arn(&self, partition: &str, region: &str, aggregated_by_name: bool) -> String {
+        self.versioned_arn(partition, region, self.listed_version(aggregated_by_name))
+    }
+
+    /// This catalog entry as the modelled `ImageVersion` a listing reports for the version,
+    /// or for the name, its entry stands for.
+    ///
+    /// What the catalog knows, exactly as a read of the image reports it ([`Self::view`]): the
+    /// image's name, the operating system it carries, the platform its name states, the
+    /// version AWS published it at and Amazon as its owner — the value `ListImages`' `owner`
+    /// names that catalog by ([`OWNERSHIP_AMAZON`]).
+    #[must_use]
+    pub fn version_entry(
+        &self,
+        partition: &str,
+        region: &str,
+        aggregated_by_name: bool,
+    ) -> ImageVersion {
+        ImageVersion {
+            arn: Some(self.listed_arn(partition, region, aggregated_by_name)),
+            name: Some(self.name.to_string()),
+            r#type: Some(IMAGE_TYPE_AMI.to_string()),
+            version: Some(self.listed_version(aggregated_by_name).to_string()),
+            platform: Some(parent_image_platform(self.name)),
+            os_version: Some(self.os_version.to_string()),
+            owner: Some(OWNERSHIP_AMAZON.to_string()),
+            date_created: Some(MANAGED_IMAGE_DATE_CREATED.to_string()),
+            // "Indicates the type of build that created this image": an image AWS publishes
+            // was created by no build of this account, so none of the modelled values
+            // describes it and none is reported — as a read of it reports none
+            // ([`Self::view`]).
+            build_type: None,
+            image_source: Some(IMAGE_SOURCE_AMAZON_MANAGED.to_string()),
+        }
+    }
+
+    /// The value of the member `filter_name` filters on, or `None` when this catalog image
+    /// reports none. See [`super::IMAGE_FILTER_NAMES`].
+    #[must_use]
+    pub fn filterable(&self, filter_name: &str) -> Option<String> {
+        match filter_name {
+            "name" => Some(self.name.to_string()),
+            "osVersion" => Some(self.os_version.to_string()),
+            "platform" => Some(parent_image_platform(self.name)),
+            "type" => Some(IMAGE_TYPE_AMI.to_string()),
+            VERSION_FILTER_NAME => Some(MANAGED_IMAGE_VERSION.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Whether every filter of `filters` admits this catalog image, so a listing selects it
+    /// ([`image_filters_admit`]).
+    #[must_use]
+    pub fn admitted_by(&self, filters: Option<&[Filter]>) -> bool {
+        image_filters_admit(filters, |name| self.filterable(name))
     }
 
     /// This catalog entry as the modelled `Image` a read of it reports, in the partition and

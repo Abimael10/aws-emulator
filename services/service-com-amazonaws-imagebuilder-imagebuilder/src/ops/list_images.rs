@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListImages
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListImages`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListImages::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the images this service holds, as one page of `ImageVersion`.
+//!
+//! The rules it follows, each from the modelled documentation quoted beside it:
+//!
+//! * an entry stands for one image VERSION — the output is "the list of image semantic
+//!   versions" — or for one NAME, with "all versions of each image aggregated" (`byName`),
+//!   and "you can't combine this option with the version filter", so that pair is refused
+//!   rather than answered one way or the other;
+//! * `owner` says whose images to report, and "by default, only your account's images are
+//!   returned" — so an omitted owner is `Self` and reports the images this account built,
+//!   `Amazon` reports the images AWS publishes (`crate::state::MANAGED_IMAGES`, the catalog
+//!   a read of a published image answers from), and an ownership this emulator holds no
+//!   images of reports an empty page;
+//! * `filters` accepts the five names the member lists (`name`, `osVersion`, `platform`,
+//!   `type`, `version`), case-sensitively, and any other name is refused as the parameter
+//!   value it is;
+//! * `includeDeprecated` "specifies whether to include deprecated Amazon-managed images in
+//!   the results. Deprecated images that you own are always returned" — no image this
+//!   service reports carries a deprecation time, so its default leaves out none of them;
+//! * `maxResults` bounds the page at 1..25, and a page that does not exhaust the listing
+//!   answers with a `nextToken` that continues it — a token this operation did not issue for
+//!   this listing carries no page position here and is refused rather than read as "start
+//!   from the beginning".
+//!
+//! A pure read: it answers from the store and writes nothing a later caller sees. The page
+//! token CARRIES the position it continues rather than being filed in the store, so listing
+//! one page cannot change what a later caller observes.
 //!
 //! ## Shape of an operation
 //!
@@ -118,13 +137,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `ListImagesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#ListImages")]
+// `InvalidParameterValueException` is widened in through `extra_errors`: the SERVICE models
+// that shape (a client error, `@httpError` 400 — "The value that you provided for the
+// specified parameter is invalid.") and other operations declare it, while this operation's
+// own error list does not. It is the class Image Builder refuses a parameter of this request
+// with, which is what a `nextToken` this listing did not issue is — a value that parameter
+// does not admit — and what a filter naming a member this listing does not filter on is.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#ListImages",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum ListImagesErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
     ClientException(ClientException),
     ForbiddenException(ForbiddenException),
     InvalidPaginationTokenException(InvalidPaginationTokenException),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -181,18 +210,197 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListImages` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListImagesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListImages"))
+        // The `Ownership` enum, the `maxResults` 1..25 range, the filter list's 1..10 bound
+        // and the token's length have all been refused past by the centralized walk before
+        // this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListImagesErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // The secret this store authenticates its page tokens under, taken off the store so
+        // a `nextToken` is minted and read back as the opaque value this store issued.
+        let page_token_key = state.lock().page_token_key;
+
+        // Each filter names one member and the values it admits. An unnamed filter, one with
+        // no values, and a name this operation does not filter on are all refused rather
+        // than ignored: a filter nothing applies would answer with images the caller did not
+        // ask for.
+        for filter in input.filters.iter().flatten() {
+            let Some(name) = filter.name.as_deref() else {
+                return Err(ListImagesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::incomplete_filter_message()),
+                    },
+                )
+                .into());
+            };
+            if filter.values.as_ref().is_none_or(|values| values.is_empty()) {
+                return Err(ListImagesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::incomplete_filter_message()),
+                    },
+                )
+                .into());
+            }
+            if !crate::state::IMAGE_FILTER_NAMES.contains(&name) {
+                return Err(ListImagesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::unsupported_filter_message(
+                            Self::NAME,
+                            crate::state::IMAGE_FILTER_NAMES,
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "You can't combine this option with the version filter" (`byName`): an entry
+            // that aggregates every version of a name cannot also stand for one version, so
+            // the pair is refused rather than answered one way or the other.
+            if input.by_name && name == crate::state::VERSION_FILTER_NAME {
+                return Err(ListImagesErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::by_name_with_version_filter_message()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Which listing this page belongs to: the owner, `byName` and the filters, so a
+        // token issued for one listing is refused for another.
+        let mut cursor = crate::state::PageCursor {
+            operation: crate::state::LIST_IMAGES_OPERATION.to_string(),
+            region: region.clone(),
+            query: crate::state::image_query_fingerprint(
+                input.owner.as_deref(),
+                input.by_name,
+                input.filters.as_deref(),
+            ),
+            after: String::new(),
+        };
+        // A continuation token is opaque: the only value this parameter admits is one a
+        // previous page of THIS listing handed back, so a value that carries no page position
+        // here is refused as the parameter value it is rather than read as "start from the
+        // beginning" — which would answer a first page to a caller walking with a corrupt
+        // token instead of failing its walk fast.
+        let after = match input.next_token.as_deref() {
+            None => String::new(),
+            Some(token) => match crate::state::decode_page_token(&page_token_key, token, &cursor) {
+                Some(after) => after,
+                None => {
+                    return Err(ListImagesErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::invalid_pagination_token_message()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // A page carries at most `maxResults` entries, and at most the modelled maximum when
+        // the request names none.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_IMAGES_PER_PAGE)
+            .clamp(1, crate::state::MAX_IMAGES_PER_PAGE);
+
+        // Whose images the request asked for: "by default, only your account's images are
+        // returned".
+        let owner_asked = input
+            .owner
+            .as_deref()
+            .unwrap_or(crate::state::OWNERSHIP_SELF);
+
+        // The entries the request selected, keyed by the ARN each one reports — so the
+        // listing has ONE order, whichever inventory it reads, and a token's position in it
+        // is stable.
+        let own_images = owner_asked == crate::state::OWNERSHIP_SELF;
+        let published_images = owner_asked == crate::state::OWNERSHIP_AMAZON;
+        let entries: ::std::collections::BTreeMap<String, ImageVersion> = if own_images {
+            // A pure read: the guard is taken, this listing is copied out as modelled
+            // entries, and nothing is written.
+            //
+            // The store holds one record per BUILD version, while this listing reports one
+            // entry per version — or per name, with every version aggregated. So the stored
+            // build versions are grouped under the ARN their entry reports, and the entry is
+            // read from the GREATEST build version in its group, which is the one a
+            // reference to that version or name resolves to.
+            let store = state.lock();
+            let mut latest: ::std::collections::BTreeMap<
+                String,
+                &crate::state::ImageBuildVersionRecord,
+            > = ::std::collections::BTreeMap::new();
+            for record in store.images.values() {
+                if record.region != region || !record.admitted_by(input.filters.as_deref()) {
+                    continue;
+                }
+                latest
+                    .entry(record.listed_arn(input.by_name))
+                    .and_modify(|held| {
+                        if record.version_order() > held.version_order() {
+                            *held = record;
+                        }
+                    })
+                    .or_insert(record);
+            }
+            let entries = latest
+                .into_iter()
+                .map(|(arn, record)| (arn, record.version_entry(input.by_name)))
+                .collect();
+            drop(store);
+            entries
+        } else if published_images {
+            // The images AWS publishes are this service's catalog rather than records of the
+            // build store, and are the images a read of an Amazon-owned image answers from —
+            // so a listing of that ownership reports them, one entry per published version or
+            // per name.
+            let partition = crate::state::listing_partition(&region);
+            crate::state::MANAGED_IMAGES
+                .iter()
+                .filter(|image| image.admitted_by(input.filters.as_deref()))
+                .map(|image| {
+                    (
+                        image.listed_arn(&partition, &region, input.by_name),
+                        image.version_entry(&partition, &region, input.by_name),
+                    )
+                })
+                .collect()
+        } else {
+            // An image shared with this account, published through the Amazon Web Services
+            // Marketplace or by a third party is one this emulator holds none of, so that
+            // ownership reports an empty page rather than this account's own images.
+            ::std::collections::BTreeMap::new()
+        };
+
+        let mut matching = entries
+            .into_iter()
+            .filter(|(arn, _)| arn.as_str() > after.as_str());
+        let page: Vec<ImageVersion> = matching
+            .by_ref()
+            .take(page_size)
+            .map(|(_, entry)| entry)
+            .collect();
+        // A `nextToken` is answered only when an entry this page did not carry remains.
+        let remaining = matching.next().is_some();
+        let next_token = page
+            .last()
+            .filter(|_| remaining)
+            .and_then(|last| last.arn.clone())
+            .map(|last| {
+                cursor.after = last;
+                crate::state::encode_page_token(&page_token_key, &cursor)
+            });
+
+        Ok(ListImagesOutput {
+            request_id: Some(crate::state::new_request_id()),
+            image_version_list: Some(page),
+            next_token,
+        })
     }
 }

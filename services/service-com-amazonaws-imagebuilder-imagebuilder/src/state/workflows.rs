@@ -562,7 +562,7 @@ impl WorkflowRecord {
     /// nodes and so `1.0.x` admits every patch of `1.0`.
     #[must_use]
     pub fn admits_filter(&self, filter_name: &str, values: &[String]) -> bool {
-        if filter_name == super::COMPONENT_VERSION_FILTER_NAME {
+        if filter_name == super::VERSION_FILTER_NAME {
             return values
                 .iter()
                 .any(|value| super::version_pattern_admits(value, &self.version));

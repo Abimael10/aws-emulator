@@ -152,6 +152,10 @@ pub use workflow::*;
 mod image_pipeline_listing;
 pub use image_pipeline_listing::*;
 
+/// What an image listing asks for, and what one of its entries stands for.
+mod image_listing;
+pub use image_listing::*;
+
 /// How an UPDATE of an infrastructure configuration replaces the stored record.
 mod infrastructure_configuration_update;
 pub use infrastructure_configuration_update::*;
@@ -398,6 +402,12 @@ pub const OWNERSHIP_SELF: &str = "Self";
 /// or `Amazon`, `ThirdParty`, or `AWSMarketplace`."
 pub const OWNERSHIP_AWS_MARKETPLACE: &str = "AWSMarketplace";
 
+/// The owner an image AWS itself publishes reports, from the modelled `Ownership` enum:
+/// `ListImages`' `owner` names that catalog `Amazon` ("Filters the list to images owned by
+/// you, by Amazon, or shared with you by other accounts"), which is the catalog this service
+/// holds as [`MANAGED_IMAGES`].
+pub const OWNERSHIP_AMAZON: &str = "Amazon";
+
 /// The filter names `ListImageRecipes` accepts, from the `filters` member's own list:
 /// "Use the following filters to streamline results: name, parentImage, platform."
 pub const IMAGE_RECIPE_FILTER_NAMES: &[&str] = &["name", "parentImage", "platform"];
@@ -426,11 +436,11 @@ pub const MAX_IMAGE_PACKAGES_PER_PAGE: usize = 25;
 /// `maxResults`: the modelled `maxResults` range's own maximum (1..25).
 pub const MAX_IMAGE_BUILD_VERSIONS_PER_PAGE: usize = 25;
 
-/// The filter names `ListImageBuildVersions` accepts, from the `filters` member's own
-/// list: "Use the following filters to streamline results: name, osVersion, platform,
-/// type, version."
-pub const IMAGE_BUILD_VERSION_FILTER_NAMES: &[&str] =
-    &["name", "osVersion", "platform", "type", "version"];
+/// The filter names an image listing accepts, from the `filters` member's own list, which
+/// `ListImages` and `ListImageBuildVersions` state identically: "Use the following filters
+/// to streamline results: name, osVersion, platform, type, version." One set, since both
+/// listings filter on the members of the same resource.
+pub const IMAGE_FILTER_NAMES: &[&str] = &["name", "osVersion", "platform", "type", "version"];
 
 /// The filter names `ListComponents` accepts, from the `filters` member's own list:
 /// "Use the following filters to streamline results: description, name, platform,
@@ -451,9 +461,10 @@ pub const COMPONENT_FILTER_NAMES: &[&str] = &[
     "status",
 ];
 
-/// The one filter a `ListComponents` request may not carry beside `byName`: "You can't
-/// combine this option with the version filter" (the modelled `byName` member).
-pub const COMPONENT_VERSION_FILTER_NAME: &str = "version";
+/// The one filter a request may not carry beside `byName`: "You can't combine this option
+/// with the version filter" (the modelled `byName` member of `ListComponents`,
+/// `ListImages` and `ListWorkflows` alike).
+pub const VERSION_FILTER_NAME: &str = "version";
 
 /// The most items one `ListComponents` page carries when the request names no
 /// `maxResults`: the modelled `maxResults` range's own maximum (1..25).
@@ -1098,7 +1109,7 @@ impl ComponentRecord {
                 .iter()
                 .flatten()
                 .any(|supported| values.iter().any(|value| value == supported)),
-            COMPONENT_VERSION_FILTER_NAME => values
+            VERSION_FILTER_NAME => values
                 .iter()
                 .any(|value| version_pattern_admits(value, &self.version)),
             _ => self
@@ -1379,7 +1390,7 @@ impl ImageBuildVersionRecord {
     }
 
     /// The value of the member `filter_name` filters on, or `None` when this record
-    /// reports none. See [`IMAGE_BUILD_VERSION_FILTER_NAMES`].
+    /// reports none. See [`IMAGE_FILTER_NAMES`].
     #[must_use]
     pub fn filterable(&self, filter_name: &str) -> Option<&str> {
         match filter_name {
@@ -4589,8 +4600,7 @@ pub fn unsupported_filter_message(operation: &str, supported: &[&str]) -> String
     )
 }
 
-/// Why a `ListComponents` request carrying both `byName` and the version filter is
-/// refused.
+/// Why a listing request carrying both `byName` and the version filter is refused.
 ///
 /// The rule is the `byName` member's own: "You can't combine this option with the version
 /// filter."
@@ -4598,7 +4608,7 @@ pub fn unsupported_filter_message(operation: &str, supported: &[&str]) -> String
 pub fn by_name_with_version_filter_message() -> String {
     format!(
         "The request must not specify byName together with the \
-         {COMPONENT_VERSION_FILTER_NAME} filter."
+         {VERSION_FILTER_NAME} filter."
     )
 }
 

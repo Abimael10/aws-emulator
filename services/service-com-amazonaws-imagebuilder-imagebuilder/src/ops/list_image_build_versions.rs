@@ -210,13 +210,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            if !crate::state::IMAGE_BUILD_VERSION_FILTER_NAMES.contains(&name) {
+            if !crate::state::IMAGE_FILTER_NAMES.contains(&name) {
                 return Err(
                     ListImageBuildVersionsErrorModeled::InvalidParameterValueException(
                         InvalidParameterValueException {
                             message: Some(crate::state::unsupported_filter_message(
                                 Self::NAME,
-                                crate::state::IMAGE_BUILD_VERSION_FILTER_NAMES,
+                                crate::state::IMAGE_FILTER_NAMES,
                             )),
                         },
                     )

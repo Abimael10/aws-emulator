@@ -237,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "You can't combine this option with the version filter" (`byName`): an
             // entry that aggregates every version of a name cannot also stand for one
             // version, so the pair is refused rather than answered one way or the other.
-            if input.by_name && name == crate::state::COMPONENT_VERSION_FILTER_NAME {
+            if input.by_name && name == crate::state::VERSION_FILTER_NAME {
                 return Err(ListComponentsErrorModeled::InvalidRequestException(
                     InvalidRequestException {
                         message: Some(crate::state::by_name_with_version_filter_message()),
