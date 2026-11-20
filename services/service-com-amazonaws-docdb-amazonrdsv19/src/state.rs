@@ -22,6 +22,11 @@ use std::time::{Duration, Instant};
 /// The subnets a `SubnetIds` list names, resolved against the service that OWNS subnets.
 pub mod ec2_subnets;
 
+/// The connection address an instance announces for a client to dial.
+pub mod announced_address;
+
+pub use announced_address::announced_instance_host;
+
 pub use ec2_subnets::{
     az_coverage_message, group_network_types, invalid_subnets_message, resolve_subnets,
     zone_coverage_shortfall, ResolvedSubnet, ResolvedSubnets, MIN_SUBNET_GROUP_AVAILABILITY_ZONES,
@@ -32,8 +37,8 @@ use crate::ops::types::{
     AvailabilityZone, Certificate, DBCluster, DBClusterMember, DBClusterParameterGroup,
     DBClusterSnapshot, DBClusterSnapshotAttribute, DBClusterSnapshotAttributesResult,
     DBEngineVersion, DBInstance, DBSubnetGroup, Endpoint, EventCategoriesMap,
-    OrderableDBInstanceOption, Parameter, ServerlessV2ScalingConfigurationInfo, Subnet, Tag,
-    UpgradeTarget, VpcSecurityGroupMembership,
+    OrderableDBInstanceOption, Parameter, PendingModifiedValues,
+    ServerlessV2ScalingConfigurationInfo, Subnet, Tag, UpgradeTarget, VpcSecurityGroupMembership,
 };
 
 /// The ARN namespace and sigv4 signing name DocumentDB shares with RDS, so a cluster ARN
@@ -147,6 +152,33 @@ pub const DEFAULT_VPC_NETWORKING_ENABLED: bool = true;
 /// `DBCluster$InternetAccessGatewayEnabled` for a cluster created without an internet
 /// access gateway: no input member in this model attaches one.
 pub const DEFAULT_INTERNET_ACCESS_GATEWAY_ENABLED: bool = false;
+
+/// `DBInstance$PubliclyAccessible` for every instance of this engine:
+/// "Not supported. Amazon DocumentDB does not currently support public endpoints. The
+/// value of `PubliclyAccessible` is always `false`."
+pub const INSTANCE_PUBLICLY_ACCESSIBLE: bool = false;
+
+/// `DBInstance$AllocatedStorage`, in gibibytes: an Amazon DocumentDB instance stores its
+/// data on the storage its CLUSTER manages ("Amazon DocumentDB manages the storage of your
+/// cluster automatically", Amazon DocumentDB Developer Guide), so no storage is allocated
+/// to the instance itself and it reports the single-unit size AWS reports for
+/// cluster-managed storage.
+pub const INSTANCE_ALLOCATED_STORAGE: i32 = 1;
+
+/// `DBInstance$StorageThroughput` for an instance of this engine: throughput is a property
+/// of provisioned instance storage, which cluster-managed storage
+/// ([`INSTANCE_ALLOCATED_STORAGE`]) provisions none of.
+pub const INSTANCE_STORAGE_THROUGHPUT: i32 = 0;
+
+/// `DBInstance$DbInstancePort` for an instance of this engine: the instance is reached at
+/// its cluster's port, which `DBInstance$Endpoint$Port` and `DBCluster$Port` report, so it
+/// carries no port of its own.
+pub const INSTANCE_PORT_UNSET: i32 = 0;
+
+/// `DBInstance$HttpEndpointEnabled` for an instance of this engine: the model binds no
+/// operation and no input member that enables an HTTP endpoint on an Amazon DocumentDB
+/// resource, so none of them has one.
+pub const INSTANCE_HTTP_ENDPOINT_ENABLED: bool = false;
 
 /// Seconds in the day `BackupRetentionPeriod` is counted in
 /// (`CreateDBClusterMessage$BackupRetentionPeriod`: "The number of days for which
@@ -544,7 +576,8 @@ pub struct DbInstanceRecord {
     pub availability_zone: String,
     /// `PromotionTier`.
     pub promotion_tier: i32,
-    /// `Endpoint$Address`.
+    /// `Endpoint$Address`, resolved when the instance was created; see
+    /// [`announced_address`].
     pub endpoint_address: String,
     /// `InstanceCreateTime`.
     pub instance_create_time: ::aws_smithy_types::DateTime,
@@ -1670,9 +1703,16 @@ pub fn cluster_to_shape(
 ///
 /// `cluster` is the instance's cluster, when it is still in state: the members that a
 /// cluster owns (port, backup settings, encryption, security groups, engine version, the
-/// Route 53 hosted zone its endpoints live in, and the point-in-time-restore window its
-/// continuous backup covers) are read from it rather than copied at create time, so a
-/// later `ModifyDBCluster` shows up on its instances too.
+/// master user name, the storage its data sits on, whether it runs in a virtual private
+/// cloud, the Route 53 hosted zone its endpoints live in, and the point-in-time-restore
+/// window its continuous backup covers) are read from it rather than copied at create
+/// time, so a later `ModifyDBCluster` shows up on its instances too.
+///
+/// The members this engine fixes for every instance — it supports no public endpoint, no
+/// HTTP endpoint, no instance-level port and no instance-level storage — are projected
+/// from the constants that state each rule ([`INSTANCE_PUBLICLY_ACCESSIBLE`] and its
+/// neighbours), so no path can report an instance as reachable from the internet or as
+/// carrying provisioned storage of its own.
 pub fn instance_to_shape(
     record: &DbInstanceRecord,
     cluster: Option<&DbClusterRecord>,
@@ -1682,6 +1722,26 @@ pub fn instance_to_shape(
         db_instance_class: Some(record.instance_class.clone()),
         engine: Some(record.engine.clone()),
         db_instance_status: Some(record.status.clone()),
+        // The storage the instance's data sits on is its CLUSTER's, so the type is the
+        // cluster's own and the instance has neither a size nor a throughput of its own.
+        allocated_storage: Some(INSTANCE_ALLOCATED_STORAGE),
+        storage_type: Some(
+            cluster
+                .and_then(|owner| owner.storage_type.clone())
+                .unwrap_or_else(|| DEFAULT_STORAGE_TYPE.to_string()),
+        ),
+        storage_throughput: Some(INSTANCE_STORAGE_THROUGHPUT),
+        // The master user is the CLUSTER's: `CreateDBInstanceMessage` models no master-user
+        // member at all, so an instance reports the user its cluster was created with.
+        master_username: cluster.and_then(|owner| owner.master_username.clone()),
+        license_model: Some(DOCDB_LICENSE_MODEL.to_string()),
+        db_instance_port: Some(INSTANCE_PORT_UNSET),
+        vpc_networking_enabled: Some(
+            cluster.map_or(DEFAULT_VPC_NETWORKING_ENABLED, |owner| {
+                owner.vpc_networking_enabled
+            }),
+        ),
+        http_endpoint_enabled: Some(INSTANCE_HTTP_ENDPOINT_ENABLED),
         endpoint: Some(Endpoint {
             address: Some(record.endpoint_address.clone()),
             port: Some(cluster.map_or(DEFAULT_PORT, |owner| owner.port)),
@@ -1703,13 +1763,16 @@ pub fn instance_to_shape(
         availability_zone: Some(record.availability_zone.clone()),
         db_subnet_group: None,
         preferred_maintenance_window: Some(record.preferred_maintenance_window.clone()),
-        pending_modified_values: None,
+        // The changes to this instance that are still pending. The element is reported on
+        // every instance, carrying a subelement per pending change and none at all for an
+        // instance with nothing pending, which is how a caller reads "settled".
+        pending_modified_values: Some(PendingModifiedValues::default()),
         latest_restorable_time: cluster
             .and_then(|owner| cluster_restore_window(owner, now()))
             .map(|(_, latest)| latest),
         engine_version: cluster.map(|owner| owner.engine_version.clone()),
         auto_minor_version_upgrade: Some(record.auto_minor_version_upgrade),
-        publicly_accessible: Some(false),
+        publicly_accessible: Some(INSTANCE_PUBLICLY_ACCESSIBLE),
         status_infos: None,
         db_cluster_identifier: Some(record.cluster_identifier.clone()),
         storage_encrypted: cluster.map(|owner| owner.storage_encrypted),
@@ -2305,12 +2368,14 @@ pub fn instance_classes() -> Vec<String> {
 /// is the type a create without a `StorageType` gets ([`DEFAULT_STORAGE_TYPE`]).
 pub use ::service_common::docdb_engine_catalog::STORAGE_TYPES;
 
-/// `OrderableDBInstanceOption$LicenseModel` for this engine.
+/// `OrderableDBInstanceOption$LicenseModel` and `DBInstance$LicenseModel` for this engine.
 ///
 /// The licence setting does not apply to Amazon DocumentDB — the model declares no
-/// `LicenseModel` on `CreateDBInstance` at all — and an option of an engine AWS licenses
-/// itself carries `na`.
-pub const DOCDB_LICENSE_MODEL: &str = "na";
+/// `LicenseModel` on `CreateDBInstance` at all — and an engine AWS licenses itself carries
+/// `na`. Read from the shared engine catalogue
+/// ([`::service_common::docdb_engine_catalog::LICENSE_MODEL`]), so this view and the Amazon
+/// RDS view of the same front door report the one value for this engine.
+pub const DOCDB_LICENSE_MODEL: &str = ::service_common::docdb_engine_catalog::LICENSE_MODEL;
 
 /// One (engine version, instance class, storage type) row as the modelled
 /// `OrderableDBInstanceOption`.

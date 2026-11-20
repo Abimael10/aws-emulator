@@ -1046,6 +1046,38 @@ pub fn is_sibling_control_plane_engine(engine: &str) -> bool {
         .any(|sibling| sibling.eq_ignore_ascii_case(engine))
 }
 
+/// The license model an instance whose attributes are CLUSTER-MANAGED reports
+/// ([`instance_attributes_are_cluster_managed`]): the one value that engine's own catalogue
+/// publishes, which is also the value this front door's orderable options report for it
+/// (`service_common::docdb_engine_catalog::LICENSE_MODEL`). `None` for an engine whose
+/// catalogue publishes none.
+pub fn cluster_managed_license_model(engine: &str) -> Option<&'static str> {
+    engine
+        .eq_ignore_ascii_case(DOCDB_ENGINE)
+        .then_some(::service_common::docdb_engine_catalog::LICENSE_MODEL)
+}
+
+/// Whether an INSTANCE of `engine` is ordered through a control plane that models no
+/// instance-level storage, port, public-access, license or master-user member at all, so
+/// every one of those is a property of its CLUSTER or of its engine and never of the
+/// instance.
+///
+/// `com.amazonaws.docdb#CreateDBInstanceMessage` carries none of `AllocatedStorage`,
+/// `StorageType`, `StorageThroughput`, `Iops`, `Port`, `PubliclyAccessible`, `LicenseModel`
+/// or `MasterUsername`: its whole input is the class, the engine, the cluster to join and
+/// the placement, and `com.amazonaws.docdb#DBInstance$PubliclyAccessible` states "Amazon
+/// DocumentDB does not currently support public endpoints. The value of
+/// `PubliclyAccessible` is always `false`". So an instance of it reports its cluster's
+/// storage and master user and the engine's own fixed values, which is what
+/// [`DbInstanceRecord::to_wire`] projects.
+///
+/// NOT every sibling: `com.amazonaws.neptune#CreateDBInstanceMessage` models every one of
+/// those members, so a Neptune instance keeps reporting the values its own request carried
+/// ([`is_sibling_control_plane_engine`] is the broader question).
+pub fn instance_attributes_are_cluster_managed(engine: &str) -> bool {
+    engine.eq_ignore_ascii_case(DOCDB_ENGINE)
+}
+
 /// The engines a DB CLUSTER can run, as `CreateDBClusterMessage$Engine` lists them
 /// (`smithy_query(query="doc",shape="CreateDBClusterMessage",member="Engine")`: "Valid
 /// Values: aurora-mysql aurora-postgresql mysql postgres neptune"). It is a different,

@@ -26,6 +26,72 @@ pub fn standby_availability_zone(region: &str, primary: &str, multi_az: bool) ->
         .find(|zone| zone != primary)
 }
 
+/// The members an instance reports from its CLUSTER and its ENGINE rather than from its own
+/// record, for an instance whose control plane models none of them
+/// ([`instance_attributes_are_cluster_managed`]).
+///
+/// Such a request cannot carry storage, a port, a public-access flag, a licence or a master
+/// user, so whatever the record holds for one of those is the generic default of a member
+/// that create could not set: the instance's storage is the one its cluster manages, its
+/// master user is its cluster's, and the rest are what its engine publishes. Resolved once
+/// for one projection, so every operation that reports such an instance reports the same
+/// values.
+///
+/// `cluster` is `None` for a member whose cluster this store no longer holds, which leaves
+/// the members read OFF that record — its storage size, its storage type and its master
+/// user — unreported rather than invented. The two flags stay the engine's own reading even
+/// then: every resource of it runs inside a virtual private cloud, and none of them has an
+/// HTTP endpoint.
+struct ClusterManagedAttributes {
+    /// `AllocatedStorage`: the size the CLUSTER reports, since the instance's data sits on
+    /// the cluster's storage ([`DbClusterRecord::reported_allocated_storage`]).
+    allocated_storage: Option<i32>,
+    /// `StorageType`: the type the cluster manages that storage on, which for a cluster
+    /// created without one is the default its own `StorageType` publishes
+    /// ([`SIBLING_CLUSTER_DEFAULT_STORAGE_TYPE`]).
+    storage_type: Option<String>,
+    /// `StorageThroughput`: throughput is provisioned with INSTANCE storage, and a
+    /// cluster's storage throughput is "not configurable", so none is provisioned here —
+    /// reported as zero, as it is for an instance on any storage type that provisions none
+    /// ([`default_storage_throughput`]).
+    storage_throughput: i32,
+    /// `MasterUsername`: the master user of the cluster, the only one a member has.
+    master_username: Option<String>,
+    /// `LicenseModel`: the one value the engine's catalogue publishes
+    /// ([`cluster_managed_license_model`]).
+    license_model: Option<&'static str>,
+    /// `PubliclyAccessible`: `com.amazonaws.docdb#DBInstance$PubliclyAccessible` states
+    /// that the value "is always `false`" for this engine, which supports no public
+    /// endpoint at all.
+    publicly_accessible: bool,
+    /// `VPCNetworkingEnabled`: whether the CLUSTER this instance belongs to runs inside a
+    /// virtual private cloud, which every cluster of this engine does.
+    vpc_networking_enabled: bool,
+    /// `HttpEndpointEnabled`: whether an HTTP endpoint answers for that cluster.
+    http_endpoint_enabled: bool,
+}
+
+impl ClusterManagedAttributes {
+    /// Resolve them for an instance of `engine` that belongs to `cluster`.
+    fn of(engine: &str, cluster: Option<&DbClusterRecord>) -> Self {
+        Self {
+            allocated_storage: cluster.and_then(DbClusterRecord::reported_allocated_storage),
+            storage_type: cluster.map(|cluster| {
+                cluster
+                    .storage_type
+                    .clone()
+                    .unwrap_or_else(|| SIBLING_CLUSTER_DEFAULT_STORAGE_TYPE.to_string())
+            }),
+            storage_throughput: 0,
+            master_username: cluster.and_then(|cluster| cluster.master_username.clone()),
+            license_model: cluster_managed_license_model(engine),
+            publicly_accessible: false,
+            vpc_networking_enabled: cluster.is_none_or(|cluster| cluster.vpc_networking_enabled),
+            http_endpoint_enabled: cluster.is_some_and(|cluster| cluster.http_endpoint_enabled),
+        }
+    }
+}
+
 /// A stored DB instance: everything the service persists about it.
 ///
 /// The ARN, the endpoint DNS name and the hosted zone id are NOT stored as text:
@@ -619,6 +685,12 @@ impl DbInstanceRecord {
     /// endpoint has to be the one a client can reach, and this member is what still says
     /// which port the request asked the instance to listen on.
     pub fn db_instance_port(&self) -> i32 {
+        // An instance whose port is its CLUSTER's has none of its own: its control plane
+        // models no `Port` member at all, so no request could set one, and the port a
+        // client dials is the cluster's, which `Endpoint$Port` reports.
+        if instance_attributes_are_cluster_managed(&self.engine) {
+            return 0;
+        }
         match self.db_cluster_identifier {
             Some(_) => self.endpoint_port,
             None => 0,
@@ -719,17 +791,35 @@ impl DbInstanceRecord {
     /// group holds are the ones the engine is RUNNING is what the membership's
     /// `ParameterApplyStatus` reports ([`Self::parameter_apply_status`]), and that is a fact
     /// about the group and this instance's engine run together.
+    /// `db_cluster` is the DB CLUSTER this instance is a member of, read by the store for
+    /// this projection ([`ComAmazonawsRdsAmazonrdsv19State::db_cluster_of`]): an instance
+    /// whose storage and master user belong to its cluster
+    /// ([`instance_attributes_are_cluster_managed`]) reports THAT record's values, so the
+    /// member and the cluster cannot disagree about storage the cluster manages for both.
     pub fn to_wire(
         &self,
         db_subnet_group: Option<&DbSubnetGroupRecord>,
         db_parameter_group: Option<&DbParameterGroupRecord>,
+        db_cluster: Option<&DbClusterRecord>,
     ) -> DBInstance {
+        // An instance ordered through a control plane that models no instance-level
+        // storage, port, public-access, license or master-user member at all: every one of
+        // those is its CLUSTER's or its engine's, so they are projected from the cluster
+        // record and from what that engine publishes rather than from what this record was
+        // created with. `None` for an instance of one of this front door's own engines,
+        // whose request carried each of them.
+        let cluster_managed = instance_attributes_are_cluster_managed(&self.engine)
+            .then_some(db_cluster)
+            .map(|cluster| ClusterManagedAttributes::of(&self.engine, cluster));
         DBInstance {
             db_instance_identifier: Some(self.identifier.clone()),
             db_instance_class: Some(self.db_instance_class.clone()),
             engine: Some(self.engine.clone()),
             db_instance_status: Some(self.status.clone()),
-            master_username: self.master_username.clone(),
+            master_username: cluster_managed.as_ref().map_or_else(
+                || self.master_username.clone(),
+                |managed| managed.master_username.clone(),
+            ),
             // `MasterUserSecret`: reported for an instance whose master user password RDS
             // manages, and only for one — an instance whose password the caller supplied
             // has no secret of RDS's own, which is what reporting nothing says.
@@ -746,7 +836,23 @@ impl DbInstanceRecord {
                     endpoint_domain(&self.engine),
                 )),
             }),
-            allocated_storage: self.allocated_storage,
+            // The storage this instance's data sits on, in gibibytes: the size the request
+            // asked for, and for an instance whose request could carry no size at all the
+            // size its CLUSTER reports for the storage it manages.
+            allocated_storage: self.allocated_storage.or_else(|| {
+                cluster_managed
+                    .as_ref()
+                    .and_then(|managed| managed.allocated_storage)
+            }),
+            // Whether the instance runs in a virtual private cloud, and whether an HTTP
+            // endpoint answers for it: both are facts about the CLUSTER a member belongs
+            // to, reported only for an instance whose control plane publishes them.
+            vpc_networking_enabled: cluster_managed
+                .as_ref()
+                .map(|managed| managed.vpc_networking_enabled),
+            http_endpoint_enabled: cluster_managed
+                .as_ref()
+                .map(|managed| managed.http_endpoint_enabled),
             instance_create_time: Some(self.instance_create_time),
             preferred_backup_window: self.preferred_backup_window.clone(),
             backup_retention_period: Some(self.backup_retention_period),
@@ -804,8 +910,14 @@ impl DbInstanceRecord {
             preferred_maintenance_window: self.preferred_maintenance_window.clone(),
             // `PendingModifiedValues` is "returned only when there are pending changes":
             // what this instance still has pending, and nothing at all once it has none
-            // ([`Self::pending_modified_values`]).
-            pending_modified_values: self.pending_modified_values(),
+            // ([`Self::pending_modified_values`]) — except on an instance whose control
+            // plane reports the element on every instance it returns, where one with
+            // nothing pending carries it EMPTY, the form that identifies no change.
+            pending_modified_values: self.pending_modified_values().or_else(|| {
+                cluster_managed
+                    .as_ref()
+                    .map(|_| PendingModifiedValues::default())
+            }),
             upgrade_rollout_order: Some(DEFAULT_UPGRADE_ROLLOUT_ORDER.to_string()),
             multi_az: Some(self.multi_az),
             engine_version: self.engine_version.clone(),
@@ -830,11 +942,23 @@ impl DbInstanceRecord {
             // `StatusInfos`: the replication status of a READ REPLICA, and blank for an
             // instance that is not one ([`Self::status_infos`]).
             status_infos: self.status_infos(),
-            license_model: self.license_model.clone(),
-            iops: self.iops,
-            storage_throughput: Some(self.storage_throughput),
-            publicly_accessible: Some(self.publicly_accessible),
-            storage_type: Some(self.storage_type.clone()),
+            license_model: cluster_managed.as_ref().map_or_else(
+                || self.license_model.clone(),
+                |managed| managed.license_model.map(str::to_string),
+            ),
+            iops: cluster_managed.as_ref().map_or(self.iops, |_| None),
+            storage_throughput: Some(cluster_managed.as_ref().map_or(
+                self.storage_throughput,
+                |managed| managed.storage_throughput,
+            )),
+            publicly_accessible: Some(cluster_managed.as_ref().map_or(
+                self.publicly_accessible,
+                |managed| managed.publicly_accessible,
+            )),
+            storage_type: cluster_managed.as_ref().map_or_else(
+                || Some(self.storage_type.clone()),
+                |managed| managed.storage_type.clone(),
+            ),
             db_instance_port: Some(self.db_instance_port()),
             // `PromotionTier`: the failover order of a cluster member
             // ([`Self::promotion_tier`]).

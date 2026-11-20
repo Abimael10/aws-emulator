@@ -228,6 +228,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .db_instances
             .get(&key)
             .and_then(|record| store.db_parameter_group_of(record));
+        // And so is the DB cluster whose storage and master user a member of one reports.
+        let db_cluster = store
+            .db_instances
+            .get(&key)
+            .and_then(|record| store.db_cluster_of(record));
         let record = store
             .db_instances
             .get_mut(&key)
@@ -256,7 +261,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // puts a parameter change that was waiting for a reboot into force.
         record.engine_started_at = crate::state::now_as_wire_timestamp();
         let instance_arn = record.arn();
-        let db_instance = record.to_wire(db_subnet_group.as_ref(), db_parameter_group.as_ref());
+        let db_instance = record.to_wire(
+            db_subnet_group.as_ref(),
+            db_parameter_group.as_ref(),
+            db_cluster.as_ref(),
+        );
         // "Rebooting a DB instance restarts the database engine service": the sessions
         // the engine held do not survive the restart, and whatever they had not committed
         // is rolled back with them. The endpoint stays bound — a reboot does not move the

@@ -379,6 +379,36 @@ pub struct StorageQuotaExceededFault {
 #[smithy_macros::smithy(shape = "com.amazonaws.docdb#DBInstance")]
 #[derive(Debug, Clone, Default)]
 pub struct DBInstance {
+    /// The storage, in gibibytes, the instance stores its data on. The member was added to
+    /// this service's on-disk model from the recorded AWS responses — the shipped model
+    /// snapshot carries no such member on this shape, while the shared Amazon RDS wire API
+    /// Amazon DocumentDB is fronted by reports it on every instance — and its value is
+    /// projected by [`crate::state::instance_to_shape`], the one place a stored instance
+    /// becomes this shape.
+    pub allocated_storage: Option<i32>,
+    /// The master user name of the cluster the instance belongs to; added to the on-disk
+    /// model from the recorded AWS responses, like [`DBInstance::allocated_storage`].
+    pub master_username: Option<String>,
+    /// The license model the instance's engine is licensed under; added to the on-disk
+    /// model from the recorded AWS responses, like [`DBInstance::allocated_storage`].
+    pub license_model: Option<String>,
+    /// The storage type the instance's data sits on, which its cluster manages; added to
+    /// the on-disk model from the recorded AWS responses, like
+    /// [`DBInstance::allocated_storage`].
+    pub storage_type: Option<String>,
+    /// The storage throughput provisioned for the instance; added to the on-disk model
+    /// from the recorded AWS responses, like [`DBInstance::allocated_storage`].
+    pub storage_throughput: Option<i32>,
+    /// The instance's own port, as opposed to the one its cluster's endpoint publishes;
+    /// added to the on-disk model from the recorded AWS responses, like
+    /// [`DBInstance::allocated_storage`].
+    pub db_instance_port: Option<i32>,
+    /// Whether the instance runs inside a virtual private cloud; added to the on-disk
+    /// model from the recorded AWS responses, like [`DBInstance::allocated_storage`].
+    pub vpc_networking_enabled: Option<bool>,
+    /// Whether an HTTP endpoint is enabled for the instance; added to the on-disk model
+    /// from the recorded AWS responses, like [`DBInstance::allocated_storage`].
+    pub http_endpoint_enabled: Option<bool>,
     pub db_instance_identifier: Option<String>,
     pub db_instance_class: Option<String>,
     pub engine: Option<String>,

@@ -61,10 +61,27 @@ impl Docdb {
     /// A router carrying only this service, over one shared engine — exactly what
     /// `core/router` builds, minus the other services.
     pub(crate) fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// A harness whose emulator is SERVED at `base` — the data port's published URL, which
+    /// `OperationContext::endpoint` reports and which an address a resource announces is
+    /// read off where one is.
+    pub(crate) fn served_at(base: &str) -> Self {
+        Self::build(Some(
+            smithy_server_runtime::EndpointUrl::parse(base)
+                .expect("the test's served base is an absolute https URL with a host"),
+        ))
+    }
+
+    fn build(base: Option<smithy_server_runtime::EndpointUrl>) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // These tests exercise handler behaviour, not SigV4 verification.
         router.set_request_authentication(false);
+        if let Some(base) = base {
+            router.set_url_base(base);
+        }
         router.register_service(EmulatedService::new(engine));
         Self { router }
     }
@@ -110,6 +127,27 @@ impl Docdb {
 
     /// Call `action` with the given query parameters and return the raw reply.
     pub(crate) async fn call(&self, action: &str, params: &[(&str, &str)]) -> Reply {
+        self.dispatch(None, action, params).await
+    }
+
+    /// [`Self::call`] with the request ADDRESSED to `host` — the `Host` header a client
+    /// configured with one endpoint URL sends. What a resource announces is read against
+    /// it, so a suite asserting on an announced host drives the service through this.
+    pub(crate) async fn call_addressed_to(
+        &self,
+        host: &str,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Reply {
+        self.dispatch(Some(host), action, params).await
+    }
+
+    async fn dispatch(
+        &self,
+        host: Option<&str>,
+        action: &str,
+        params: &[(&str, &str)],
+    ) -> Reply {
         let mut body = format!("Action={action}&Version={API_VERSION}");
         for (name, value) in params {
             body.push('&');
@@ -117,7 +155,7 @@ impl Docdb {
             body.push('=');
             body.push_str(&form_encode(value));
         }
-        let request = http::Request::builder()
+        let mut builder = http::Request::builder()
             .method(http::Method::POST)
             .uri(format!("https://{ROUTE_KEY}.{REGION}.amazonaws.com/"))
             .header(
@@ -135,7 +173,11 @@ impl Docdb {
                     "AWS4-HMAC-SHA256 Credential=AKIDDOCDBTESTKEY/20260101/{REGION}/{ROUTE_KEY}/\
                      aws4_request, SignedHeaders=host, Signature=00"
                 ),
-            )
+            );
+        if let Some(host) = host {
+            builder = builder.header(http::header::HOST, host);
+        }
+        let request = builder
             .body(bytes::Bytes::from(body))
             .expect("the test request is well formed");
         let response = self.router.dispatch(request).await;

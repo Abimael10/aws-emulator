@@ -1083,6 +1083,15 @@ pub struct CreateDBClusterEndpointOutput {
 #[smithy_macros::smithy(shape = "com.amazonaws.rds#DBInstance")]
 #[derive(Debug, Clone, Default)]
 pub struct DBInstance {
+    /// Whether the instance runs inside a virtual private cloud. The member was added to
+    /// this service's on-disk model from the recorded AWS responses — the shipped model
+    /// snapshot carries no such member on this shape — and is projected for an instance of
+    /// a sibling control plane's engine, whose own API reports it; see
+    /// [`crate::state::DbInstanceRecord::to_wire`].
+    pub vpc_networking_enabled: Option<bool>,
+    /// Whether an HTTP endpoint is enabled for the instance; added to the on-disk model
+    /// from the recorded AWS responses, like [`DBInstance::vpc_networking_enabled`].
+    pub http_endpoint_enabled: Option<bool>,
     pub db_instance_identifier: Option<String>,
     pub db_instance_class: Option<String>,
     pub engine: Option<String>,

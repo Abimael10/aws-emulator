@@ -326,8 +326,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .cloned()
                 .unwrap_or_else(|| format!("{region}a"))
         });
-        // An instance endpoint shares its cluster's DNS suffix.
-        let endpoint_address = format!("{identifier}.{}", cluster.endpoint_suffix);
+        // An instance's endpoint shares its cluster's DNS suffix; see
+        // [`docdb::announced_address`].
+        let endpoint_address =
+            docdb::announced_instance_host(&identifier, &cluster.endpoint_suffix);
         let preferred_maintenance_window = input
             .preferred_maintenance_window
             .unwrap_or_else(|| cluster.preferred_maintenance_window.clone());

@@ -448,6 +448,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .db_instances
             .get(&key)
             .and_then(|record| store.db_parameter_group_of(record));
+        // And so is the DB cluster whose storage and master user a member of one reports.
+        let db_cluster = store
+            .db_instances
+            .get(&key)
+            .and_then(|record| store.db_cluster_of(record));
         let record = store
             .db_instances
             .get_mut(&key)
@@ -464,7 +469,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let managed_secret = crate::state::owned_master_user_secret(record);
         let replicated_source = record.read_replica_source_db_instance_identifier.clone();
         let replicas = record.read_replica_db_instance_identifiers.clone();
-        let db_instance = record.to_wire(db_subnet_group.as_ref(), db_parameter_group.as_ref());
+        let db_instance = record.to_wire(
+            db_subnet_group.as_ref(),
+            db_parameter_group.as_ref(),
+            db_cluster.as_ref(),
+        );
         // The relationship this instance was half of ends with it. A replica that is being
         // deleted is no longer one of its source's replicas, and the replicas of a SOURCE
         // that is being deleted are promoted to standalone DB instances — so neither side

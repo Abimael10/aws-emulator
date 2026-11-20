@@ -1256,7 +1256,8 @@ impl ComAmazonawsRdsAmazonrdsv19State {
 
     /// Project a stored DB instance onto the modelled `DBInstance` output shape, with the
     /// nested `DBSubnetGroup` read from the DB subnet group record the instance's own
-    /// `DBSubnetGroupName` resolves to ([`Self::db_subnet_group_of`]).
+    /// `DBSubnetGroupName` resolves to ([`Self::db_subnet_group_of`]) and the DB CLUSTER it
+    /// belongs to read from that cluster's own record ([`Self::db_cluster_of`]).
     ///
     /// The one way a handler projects an instance — the instance-level counterpart of
     /// [`Self::cluster_to_wire`] — so every operation that reports a DB instance reports
@@ -1266,7 +1267,20 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         record.to_wire(
             self.db_subnet_group_of(record).as_ref(),
             self.db_parameter_group_of(record).as_ref(),
+            self.db_cluster_of(record).as_ref(),
         )
+    }
+
+    /// The DB cluster `record` is a member of, as this store holds it, or `None` for an
+    /// instance that belongs to none and for a cluster this store no longer resolves.
+    ///
+    /// Taken by VALUE for the reason [`Self::db_subnet_group_of`] is. What a MEMBER of a
+    /// cluster reports for the members its cluster owns — its storage, its master user —
+    /// is read off this record, so the member and `DescribeDBClusters` cannot disagree
+    /// about them.
+    pub fn db_cluster_of(&self, record: &DbInstanceRecord) -> Option<DbClusterRecord> {
+        self.resolve_db_cluster(&record.region, record.db_cluster_identifier.as_deref()?)
+            .cloned()
     }
 
     /// The DB parameter group `record` names, as this store holds it, or `None` for an
