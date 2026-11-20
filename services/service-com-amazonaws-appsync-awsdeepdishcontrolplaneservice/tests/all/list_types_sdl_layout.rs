@@ -99,7 +99,10 @@ async fn walk(
 }
 
 /// The type named `name` in a collected listing.
-fn reported<'a>(collected: &'a [Value], name: &str, case: &str) -> &'a Value {
+///
+/// Shared with the suites that assert the same rendering over other inputs, so one lookup
+/// serves them all.
+pub(crate) fn reported<'a>(collected: &'a [Value], name: &str, case: &str) -> &'a Value {
     collected
         .iter()
         .find(|listed| listed["name"].as_str() == Some(name))
