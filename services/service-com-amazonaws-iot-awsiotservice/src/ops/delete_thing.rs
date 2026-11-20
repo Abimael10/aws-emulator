@@ -183,8 +183,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         VersionConflictException {
                             message: Some(crate::state::thing_version_conflict_message(
                                 &registered.thing_name,
-                                expected,
-                                registered.version,
                             )),
                         },
                     )

@@ -319,9 +319,9 @@ impl ThingRegistrationRefusal {
             Self::MissingThingType(thing_type_name) => {
                 not_found::missing_thing_type_message(thing_type_name)
             }
-            Self::DeprecatedThingType(thing_type_name) => format!(
-                "Can not create new thing with deprecated thing type:{thing_type_name}"
-            ),
+            Self::DeprecatedThingType(thing_type_name) => {
+                deprecated_thing_type_creation_message(thing_type_name)
+            }
             Self::MissingBillingGroup(billing_group_name) => {
                 format!("Billing group {billing_group_name} does not exist")
             }
@@ -330,21 +330,37 @@ impl ThingRegistrationRefusal {
     }
 }
 
+/// How AWS IoT states that a `CreateThing` named a thing type nothing new may be
+/// associated with.
+///
+/// One fixed sentence whose only variable part is the `thingTypeName` the request carried.
+/// The fixed half is reproduced as AWS IoT emits it, down to its spelling of the word for a
+/// type that has been deprecated — the text is what clients match and log-scrape on, so
+/// re-spelling it would be a message this service emits and AWS never does.
+pub fn deprecated_thing_type_creation_message(thing_type_name: &str) -> String {
+    format!("Can not create new thing with depreated thing type:{thing_type_name}")
+}
+
 /// How this service states that an `expectedVersion` does not match the registry.
 ///
 /// `VersionConflictException` is "An exception thrown when the version of an entity
 /// specified with the expectedVersion parameter does not match the latest version in
 /// the system", and `UpdateThing`/`DeleteThing` both check a thing's version against
-/// it, so the refusal is worded once here from the version the request asked for and
-/// the one the record holds.
-pub fn thing_version_conflict_message(thing_name: &str, expected: i64, registered: i64) -> String {
-    format!("expectedVersion {expected} does not match the version {registered} of thing {thing_name}")
+/// it, so the refusal is worded once here.
+///
+/// It is ONE fixed sentence whose only variable part is the thing the request addressed —
+/// the same shape this family's other version conflict takes
+/// ([`thing_group_version_conflict_message`]). Neither the version the request asked for
+/// nor the one the registry holds is part of it, so the refusal discloses nothing about the
+/// record beyond the fact that the caller has not seen it.
+pub fn thing_version_conflict_message(thing_name: &str) -> String {
+    format!("The version for thing {thing_name} does not match the expected version.")
 }
 
 /// How AWS IoT states that an `expectedVersion` does not match a THING GROUP's version:
-/// one fixed sentence whose only variable part is the group the request addressed. The
-/// versions themselves are NOT part of it — unlike a thing's refusal, this family's
-/// sentence reports neither the version asked for nor the one the registry holds.
+/// one fixed sentence whose only variable part is the group the request addressed, and
+/// which reports neither the version asked for nor the one the registry holds — the
+/// thing family's sentence ([`thing_version_conflict_message`]) with this family's noun.
 pub fn thing_group_version_conflict_message(thing_group_name: &str) -> String {
     format!("The version for thing group {thing_group_name} does not match the expected version.")
 }
@@ -3493,6 +3509,17 @@ pub use thing_group_membership::{
     DEFAULT_DYNAMIC_GROUP_QUERY_VERSION, DYNAMIC_GROUP_ACTIVE, MAX_DYNAMIC_THING_GROUPS,
     MAX_THING_GROUPS_PER_THING, MAX_THINGS_PER_THING_GROUP,
 };
+
+// HOW DEEP a thing-group hierarchy may go, and how a create that would go deeper is
+// refused, lives in `state/thing_group_hierarchy.rs` — beside the membership rules, since
+// both are read off the one record of the parent relation.
+pub mod thing_group_hierarchy;
+pub use thing_group_hierarchy::{over_deep_hierarchy_message, MAX_THING_GROUP_HIERARCHY_DEPTH};
+
+// WHEN a thing type may be DELETED — the steps of the documented delete procedure and the
+// wait a deprecation owes — lives in `state/thing_type_deletion.rs`.
+pub mod thing_type_deletion;
+pub use thing_type_deletion::{ThingTypeDeletionRefusal, DEPRECATION_DELETION_WAIT};
 
 // What a DOMAIN CONFIGURATION is — the record one holds, the server certificate it
 // presents and what every reader of one reports — lives in

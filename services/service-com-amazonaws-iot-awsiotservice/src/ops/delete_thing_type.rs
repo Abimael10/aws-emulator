@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteThingType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteThingType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteThingType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the thing type the request names from the thing-type registry
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::thing_types`]), so a later
+//! `DescribeThingType` of that name is the modelled 404 and a `CreateThing` naming it
+//! resolves to nothing.
+//!
+//! The operation's own documentation states the procedure a caller has to have followed,
+//! and each step of it is a precondition read before anything is removed — the type has to
+//! exist, it has to have been deprecated, the deprecation has to have had time to take
+//! effect, and no thing may still be associated with it. The rules and their wording live
+//! in [`crate::state::thing_type_deletion`], beside the record they are about; a refused
+//! delete writes nothing, so the type survives still (un)deprecated.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +112,34 @@ impl From<DeleteThingTypeErrorModeled> for DeleteThingTypeError {
     }
 }
 
+/// Record this state-changing call for attribution: the operation, the identity the request
+/// PRESENTED (the SigV4 access key id, a public identifier and never a secret), the request
+/// target, the thing type the call named and how the call ended.
+///
+/// A delete is the one call that makes a thing type stop existing, so without a record
+/// nothing about it is observable afterwards — the type it removed is gone. Every
+/// request-derived field goes through [`crate::state::audit_field`], which bounds it and
+/// strips the control characters that would otherwise forge a second record; the subscriber
+/// supplies the timestamp.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    thing_type_name: &str,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation = "DeleteThingType",
+        access_key_id = %crate::state::audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target =
+            %crate::state::audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        thing_type_name = %crate::state::audit_field(thing_type_name),
+        outcome,
+        "state-changing operation"
+    );
+}
+
 /// The `DeleteThingType` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -145,18 +176,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteThingType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteThingTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteThingType"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteThingTypeErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // The whole decision and the whole write happen under one lock, so no caller can
+        // observe the registry between the preconditions and the removal. The clock is read
+        // once, for the one precondition that depends on it: how long ago the type was
+        // deprecated.
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let outcome = store.delete_thing_type(&input.thing_type_name, now);
+        drop(store);
+
+        match outcome {
+            Ok(()) => {
+                audit(ctx, &input.thing_type_name, "deleted");
+                // `DeleteThingType` models no output members at all, so a successful delete
+                // is an empty 200; that the type is gone is read back through
+                // `DescribeThingType`.
+                Ok(DeleteThingTypeOutput {})
+            }
+            Err(refusal) => {
+                let message = Some(refusal.message());
+                Err(match refusal {
+                    // A name the account holds no thing type under is "The specified
+                    // resource does not exist" (HTTP 404) — the modelled error for a
+                    // lookup miss, which this delete is not documented idempotent against.
+                    crate::state::ThingTypeDeletionRefusal::NotRegistered(name) => {
+                        audit(ctx, &name, "no-such-thing-type");
+                        DeleteThingTypeErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException { message },
+                        )
+                    }
+                    // Every other refusal is about a type that EXISTS and may not be
+                    // deleted yet, which `InvalidRequestException` ("The request is not
+                    // valid", HTTP 400) is the modelled error for; the record is left for
+                    // the caller to deprecate, wait out or detach.
+                    crate::state::ThingTypeDeletionRefusal::NotDeprecated(name) => {
+                        audit(ctx, &name, "not-deprecated");
+                        DeleteThingTypeErrorModeled::InvalidRequestException(
+                            InvalidRequestException { message },
+                        )
+                    }
+                    crate::state::ThingTypeDeletionRefusal::WithinDeprecationWait(name) => {
+                        audit(ctx, &name, "within-deprecation-wait");
+                        DeleteThingTypeErrorModeled::InvalidRequestException(
+                            InvalidRequestException { message },
+                        )
+                    }
+                    crate::state::ThingTypeDeletionRefusal::AssociatedThings(name) => {
+                        audit(ctx, &name, "things-associated");
+                        DeleteThingTypeErrorModeled::InvalidRequestException(
+                            InvalidRequestException { message },
+                        )
+                    }
+                }
+                .into())
+            }
+        }
     }
 }

@@ -41,6 +41,16 @@ use service_com_amazonaws_iot_awsiotservice::state::{
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// WHEN a thing type may be DELETED — the steps of `DeleteThingType`'s documented
+/// procedure, the wait a deprecation owes, and the sentence each refusal states — beside
+/// the wording a `CreateThing` naming a deprecated type is refused with. A child of THIS
+/// suite because it is coverage of the same registry resource and of the same deprecation
+/// state; the `#[path]` is what keeps it one, since this crate's `tests/all.rs` declares
+/// the suites directly under `tests/all/` and a module of a `#[path]`-declared file
+/// resolves next to that file unless it says otherwise.
+#[path = "thing_type_registry/deletion.rs"]
+mod deletion;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.

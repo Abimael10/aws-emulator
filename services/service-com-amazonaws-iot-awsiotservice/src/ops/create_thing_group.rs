@@ -204,6 +204,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // A hierarchy is capped at `MAX_THING_GROUP_HIERARCHY_DEPTH` levels, and a
+            // child sits one level below its parent, so a parent already at the deepest
+            // level takes none: the modelled `InvalidRequestException` (400), naming the
+            // parent and the ceiling, and NOTHING is written — a group this service
+            // accepted here could not exist on AWS at all
+            // ([`crate::state::thing_group_hierarchy`]).
+            if !store.admits_child_thing_group(parent_group_name) {
+                return Err(CreateThingGroupErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::over_deep_hierarchy_message(
+                            parent_group_name,
+                        )),
+                    },
+                )
+                .into());
+            }
         }
 
         // What is already registered under this name decides the call, per the

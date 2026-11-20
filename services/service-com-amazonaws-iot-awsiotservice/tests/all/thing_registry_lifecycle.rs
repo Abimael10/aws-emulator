@@ -46,6 +46,13 @@ mod dependent_resource_deletion;
 #[path = "thing_registry_lifecycle/principal_refusal_wording.rs"]
 mod principal_refusal_wording;
 
+/// HOW an `expectedVersion` that does not match a thing's record is WORDED, and that both
+/// operations taking one state the same sentence and leave the record untouched. A child of
+/// THIS suite for the reason the deletions are: it is coverage of the same registry
+/// resource, and the `#[path]` is what keeps it one.
+#[path = "thing_registry_lifecycle/version_conflict_wording.rs"]
+mod version_conflict_wording;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.

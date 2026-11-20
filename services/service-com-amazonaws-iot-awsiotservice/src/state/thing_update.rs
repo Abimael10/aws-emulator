@@ -93,6 +93,10 @@ pub enum ThingUpdateRefusal {
     MissingThing(String),
     /// `expectedVersion` does not match the version the record holds, so the caller is
     /// updating a record it has not seen.
+    ///
+    /// The two versions are carried for DIAGNOSTICS alone (a `Debug` rendering of why the
+    /// write was refused): this family's refusal sentence reports neither of them, only
+    /// the thing the request addressed.
     VersionConflict {
         /// The thing the request addressed.
         thing_name: String,
@@ -116,11 +120,9 @@ impl ThingUpdateRefusal {
     pub fn message(&self) -> String {
         match self {
             Self::MissingThing(thing_name) => missing_thing_message(thing_name),
-            Self::VersionConflict {
-                thing_name,
-                expected,
-                registered,
-            } => thing_version_conflict_message(thing_name, *expected, *registered),
+            Self::VersionConflict { thing_name, .. } => {
+                thing_version_conflict_message(thing_name)
+            }
             Self::ContradictoryThingType => {
                 "Can not remove thing type and set thing type in the same request".to_string()
             }

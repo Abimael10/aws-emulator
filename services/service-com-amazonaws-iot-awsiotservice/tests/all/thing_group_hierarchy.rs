@@ -31,6 +31,15 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// HOW DEEP the hierarchy may go: the level a create is still accepted at, the one past it
+/// that is refused, and the fact that the refused group is recorded nowhere. A child of
+/// THIS suite because it is coverage of the same hierarchy; the `#[path]` is what keeps it
+/// one, since this crate's `tests/all.rs` declares the suites directly under `tests/all/`
+/// and a module of a `#[path]`-declared file resolves next to that file unless it says
+/// otherwise.
+#[path = "thing_group_hierarchy/depth_limit.rs"]
+mod depth_limit;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.
