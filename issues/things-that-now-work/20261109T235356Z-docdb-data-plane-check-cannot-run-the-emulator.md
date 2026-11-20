@@ -32,3 +32,34 @@ Actual (emulator): Invoke returns FunctionError with payload {'errorMessage': "U
 
 ## Steps to Reproduce
 1. Replay docdb.cluster-mongo-insert-find-round-trip. 2. Or directly: lambda.create_function(Runtime='python3.12', Handler='index.handler', Code={'ZipFile': <zip with index.py containing `import ssl` at module level and a handler>}), wait for State Active, then lambda.invoke(FunctionName=...). Observe FunctionError and the Runtime.ImportModuleError payload naming `_ssl`; on AWS the invoke succeeds.
+
+## Resolution
+The cause this report names is fixed in the code base this report's own note anticipates having
+drifted: the `python3.x` runtime no longer leaves `ssl` to be built on an absent extension — the
+module is supplied on the runtime's own import path
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/execution/guest_tls.rs`) beside
+the socket interface it runs on, so a handler module body that says `import ssl` imports, the
+context it builds is real settings, and wrapping a connection to a plane this emulator serves
+negotiates a real session on it. The derivation and keyed-digest extensions a TLS-only database
+client authenticates with (`_hashlib`, `_sha1`, `_sha2`) are registered natively, so
+`hashlib.pbkdf2_hmac` and `hmac` compute the published values rather than raising.
+
+What this change adds is the end-to-end proof of the whole client shape the recorded probe is,
+which no suite covered: `services/service-com-amazonaws-lambda-awsgirapiservice/tests/all/
+handler_tls_database_client.rs` creates a `python3.12` function whose module body imports `ssl`
+beside `hashlib`, `hmac`, `struct` and `socket`, and asserts over a table that its key derivation
+answers the published vectors (RFC 6070) for both digest families, that the client proof RFC 5802
+defines is the one an independent implementation computes, and that the length-prefixed frames
+carrying that proof reach a listener this emulator's core opened — under a negotiated TLS session
+and in the clear — with the bytes intact. The invocation carries no `X-Amz-Function-Error`, which
+is the member this report's replay key asserts on.
+
+Two points of the report are declined. The `requestId` being empty in a
+`Runtime.ImportModuleError` document is not a defect: the value is per-run, and an initialization
+failure the runtime raised while it was still resolving the handler names no invocation, which is
+the rule `state/execution.rs` already implements and tests. And the replayed trace
+`docdb.cluster-mongo-insert-find-round-trip` still fails, past this report's key, on the paired half
+its own Fix paragraph assigns elsewhere: DocumentDB publishes an AWS-shaped instance endpoint it
+serves nothing at, so the probe's connect is answered by the resolver. That half is the open issue
+`20261109T120625Z-docdb-cluster-instance-endpoints-are-published-as-real`, and the trace passes
+once it lands.
