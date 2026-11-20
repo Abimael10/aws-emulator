@@ -64,18 +64,18 @@ const WINDOWS: &str = "WINDOWS";
 /// SOURCE: the `productUrl` values the recorded `GetBlueprints` answer reports,
 /// which are all under this host. Written out here rather than read off the
 /// crate, so this suite pins the host.
-const AWS_PRODUCT_PAGE_PREFIX: &str = "https://aws.amazon.com/";
+pub(crate) const AWS_PRODUCT_PAGE_PREFIX: &str = "https://aws.amazon.com/";
 
 /// The path under [`AWS_PRODUCT_PAGE_PREFIX`] an image offered through an AWS
 /// Marketplace listing is published at.
-const MARKETPLACE_LISTING_PATH: &str = "marketplace/pp/prodview-";
+pub(crate) const MARKETPLACE_LISTING_PATH: &str = "marketplace/pp/prodview-";
 
 /// Where a published blueprint's `licenseUrl` leads when AWS serves the
 /// agreement as a document of its own: the AWS licence host, at
 /// `<host>/eula/product/<product>/<agreement>.txt`.
 ///
 /// SOURCE: the `licenseUrl` values the recorded answer reports.
-const LICENSE_AGREEMENT_PREFIX: &str = "https://d7umqicpi7263.cloudfront.net/eula/product/";
+pub(crate) const LICENSE_AGREEMENT_PREFIX: &str = "https://d7umqicpi7263.cloudfront.net/eula/product/";
 
 /// The section of a Marketplace listing that carries an image's usage terms,
 /// which `licenseUrl` names where AWS publishes the terms ON the listing rather
@@ -83,7 +83,7 @@ const LICENSE_AGREEMENT_PREFIX: &str = "https://d7umqicpi7263.cloudfront.net/eul
 ///
 /// SOURCE: the `licenseUrl` the recorded answer reports for a Windows SQL Server
 /// application image — that image's own listing with this fragment.
-const LISTING_USAGE_TERMS_FRAGMENT: &str = "#pdp-usage";
+pub(crate) const LISTING_USAGE_TERMS_FRAGMENT: &str = "#pdp-usage";
 
 /// Whether `license_url` is the agreement AWS publishes for the entry `reported`:
 /// a `<product>/<agreement>.txt` document on the AWS licence host, or the usage
@@ -104,7 +104,12 @@ fn is_agreement_published_for(reported: &Value, license_url: &str) -> bool {
 }
 
 /// Every entry of a reported list, over however many pages it takes.
-async fn listing(emulator: &Emulator, operation: &str, member: &str, request: Value) -> Vec<Value> {
+pub(crate) async fn listing(
+    emulator: &Emulator,
+    operation: &str,
+    member: &str,
+    request: Value,
+) -> Vec<Value> {
     let mut entries = Vec::new();
     let mut token: Option<String> = None;
     for page in 0..50usize {
@@ -135,7 +140,7 @@ async fn listing(emulator: &Emulator, operation: &str, member: &str, request: Va
 }
 
 /// A string member of a reported entry, or a panic naming the case.
-fn text(entry: &Value, member: &str) -> String {
+pub(crate) fn text(entry: &Value, member: &str) -> String {
     entry[member]
         .as_str()
         .unwrap_or_else(|| panic!("case {entry:?}: expected a string {member}"))
@@ -213,7 +218,7 @@ const IMAGES: &[Image] = &[
 ];
 
 /// The whole blueprint catalog, retired entries included.
-async fn blueprint_catalog(emulator: &Emulator) -> Vec<Value> {
+pub(crate) async fn blueprint_catalog(emulator: &Emulator) -> Vec<Value> {
     listing(
         emulator,
         "GetBlueprints",
@@ -224,7 +229,7 @@ async fn blueprint_catalog(emulator: &Emulator) -> Vec<Value> {
 }
 
 /// The entry `blueprint_id` names, or a panic naming the case.
-fn image_of(blueprints: &[Value], blueprint_id: &str) -> Value {
+pub(crate) fn image_of(blueprints: &[Value], blueprint_id: &str) -> Value {
     blueprints
         .iter()
         .find(|blueprint| text(blueprint, "blueprintId") == blueprint_id)
@@ -1247,9 +1252,11 @@ const IMAGE_PAGES: &[(&str, Option<&str>)] = &[
         "amazon_linux_2023",
         Some("https://aws.amazon.com/linux/amazon-linux-2023"),
     ),
+    // The previous Amazon Linux release is offered through a Marketplace listing
+    // of its own, not under the product page AWS keeps for the current release.
     (
         "amazon_linux_2",
-        Some("https://aws.amazon.com/amazon-linux-2"),
+        Some("https://aws.amazon.com/marketplace/pp/prodview-s4zvkzmlirbga"),
     ),
     ("windows_server_2025", None),
     ("wordpress", None),
@@ -1289,6 +1296,23 @@ const WINDOWS_TEXT: &[&str] = &[
     "running any other application requiring Windows software.",
 ];
 
+/// The sentence the copy of an older Windows Server release's OWN Marketplace
+/// listing opens on, from the recorded answer's text for the Windows Server 2022
+/// image. That copy closes by naming the release it installs on the Marketplace.
+const WINDOWS_LISTING_OPENING: &str =
+    "Windows Server is an environment for deploying applications using the Microsoft Web \
+     Platform.";
+
+/// The Windows Server releases a recorded answer reports with the copy of their
+/// own Marketplace listing rather than with the paragraph AWS publishes for the
+/// newest release.
+///
+/// The catalog text of an entry is THAT entry's: two releases of one family carry
+/// one paragraph only where AWS publishes one for both, so a release whose
+/// listing carries its own copy reports that copy and not the neighbour's
+/// paragraph with the release word swapped.
+const WINDOWS_LISTING_RELEASES: &[&str] = &["windows_server_2022", "windows_server_2019"];
+
 /// The releases the Windows Server operating-system images install, each of which
 /// its own paragraph names.
 const WINDOWS_RELEASES: &[(&str, &str)] = &[
@@ -1320,14 +1344,23 @@ async fn the_catalog_text_of_an_image_is_the_paragraph_aws_publishes_for_it() {
     let emulator = Emulator::new();
     let catalog = blueprint_catalog(&emulator).await;
 
-    // The Windows family shares AWS's paragraph, each entry naming the release it
-    // installs — so the text is AWS's own and still tells the releases apart.
+    // Each Windows entry names the release it installs and carries the copy AWS
+    // publishes for THAT image: the family paragraph where AWS publishes one for
+    // the release, and the release's own listing copy where it does not.
     for (blueprint_id, release) in WINDOWS_RELEASES {
         let description = text(&image_of(&catalog, blueprint_id), "description");
         assert!(
             description.contains(release),
             "case {blueprint_id}: expected the paragraph to name {release:?}, got {description:?}"
         );
+        if WINDOWS_LISTING_RELEASES.contains(blueprint_id) {
+            assert!(
+                description.starts_with(WINDOWS_LISTING_OPENING),
+                "case {blueprint_id}: expected AWS's wording {WINDOWS_LISTING_OPENING:?}, got \
+                 {description:?}"
+            );
+            continue;
+        }
         for sentence in WINDOWS_TEXT {
             assert!(
                 description.contains(sentence),
@@ -1355,10 +1388,11 @@ async fn the_catalog_text_of_an_image_is_the_paragraph_aws_publishes_for_it() {
 /// template naming the `release` the image installs.
 ///
 /// SOURCE: the paragraph a recorded `GetBlueprints` answer reports for the
-/// Windows Server images — one paragraph for the family, naming the release, and
+/// Windows Server releases it publishes this copy for — naming the release, and
 /// carried WHOLE: its second sentence opens with the clause "For business IT
 /// applications, ", so a paragraph with that clause left out is no longer the
-/// text AWS publishes.
+/// text AWS publishes. A release a recorded answer reports with the copy of its
+/// own listing instead ([`WINDOWS_LISTING_RELEASES`]) does not carry this one.
 fn windows_paragraph(release: &str) -> String {
     format!(
         "Amazon Lightsail helps you build, deploy, scale, and manage Microsoft applications \
@@ -1371,22 +1405,61 @@ fn windows_paragraph(release: &str) -> String {
     )
 }
 
+/// The copy of an older Windows Server release's OWN Marketplace listing, as a template naming
+/// the `release` the image installs.
+///
+/// SOURCE: the sentence a recorded `GetBlueprints` answer reports this copy opening on
+/// ([`WINDOWS_LISTING_OPENING`]) and the sentence it closes by naming the release on the
+/// Marketplace. The sentence between them is the catalog's own text about the image, which is
+/// why it is written out here beside the recorded ones: what this case holds the column to is
+/// the whole published copy of THAT listing, so a row that drifts from it — to the paragraph
+/// published for another release, or to prose derived from the entry's name and type — fails.
+fn windows_listing_paragraph(release: &str) -> String {
+    format!(
+        "{WINDOWS_LISTING_OPENING} The image carries the Internet Information Services web \
+         server, ASP.NET and the .NET Framework, so a Windows application, its services and its \
+         management tooling run on a Lightsail instance as they do on a server of your own. Learn \
+         more about {release} on the AWS Marketplace."
+    )
+}
+
 #[tokio::test]
 async fn aws_s_paragraph_for_a_windows_image_is_reported_whole() {
     let emulator = Emulator::new();
     let catalog = blueprint_catalog(&emulator).await;
 
-    // Every release of the family, not only the one a recorded answer quotes:
-    // the paragraph is the family's, so each entry reports it entire with its own
-    // release named in it.
+    // Every release of the family, not only the one a recorded answer quotes: each reports the
+    // copy published for THAT image, entire, with its own release named in it — the family
+    // paragraph where AWS publishes it for the release, and the copy of the release's own
+    // listing where a recorded answer reports that instead.
     for (blueprint_id, release) in WINDOWS_RELEASES {
         let description = text(&image_of(&catalog, blueprint_id), "description");
+        let expected = if WINDOWS_LISTING_RELEASES.contains(blueprint_id) {
+            windows_listing_paragraph(release)
+        } else {
+            windows_paragraph(release)
+        };
         assert_eq!(
-            description,
-            windows_paragraph(release),
-            "case {blueprint_id}: expected AWS's paragraph for this image in full, got \
+            description, expected,
+            "case {blueprint_id}: expected the copy AWS publishes for this image in full, got \
              {description:?}"
         );
+        // And the copy published for one release never stands in for another's.
+        for (other, other_release) in WINDOWS_RELEASES {
+            if other == blueprint_id {
+                continue;
+            }
+            for paragraph in [
+                windows_paragraph(other_release),
+                windows_listing_paragraph(other_release),
+            ] {
+                assert_ne!(
+                    description, paragraph,
+                    "case {blueprint_id}: expected its own copy, not the one published for \
+                     {other}"
+                );
+            }
+        }
     }
 }
 
@@ -1452,6 +1525,15 @@ const IMAGE_LINKS: &[ImageLinks] = &[
     ImageLinks {
         blueprint_id: "windows_server_2022_sql_2019_express",
         product_url: "https://aws.amazon.com/marketplace/pp/prodview-xbikutlmywslu",
+        license: ExpectedLicense::ListingUsageTerms,
+    },
+    // The previous Amazon Linux release: a listing of its own, whose usage
+    // section carries the terms — the licence form is the IMAGE's, so an
+    // operating system carries it where AWS publishes it that way, exactly as an
+    // application image does.
+    ImageLinks {
+        blueprint_id: "amazon_linux_2",
+        product_url: "https://aws.amazon.com/marketplace/pp/prodview-s4zvkzmlirbga",
         license: ExpectedLicense::ListingUsageTerms,
     },
     ImageLinks {

@@ -58,3 +58,32 @@ Cause 1: call ls.get_blueprints(). For each returned blueprint assert that `desc
 Cause 2: call ls.get_blueprints() and assert the row set, not just the columns. (a) A blueprint with blueprintId 'windows_server_2022_sql_2022_express' (type 'app', platform 'WINDOWS', minPower 2000) must be present, positioned after the Windows Server OS blueprints and before the first LINUX_UNIX entry; observed 'amazon_linux_2023' (type 'os', LINUX_UNIX, minPower 0) in that position and no Windows SQL Server row anywhere in the list. (b) len(response['blueprints']) must be the full catalog (39 rows in the recording); observed 31, with the last eight asserted positions absent entirely.
 
 Both causes must be closed before submitting. Re-replay to confirm: lightsail-catalog-get-blueprints#task#1 and lightsail-catalog-and-operations-lifecycle#task#4.
+
+## Resolution
+
+The published blueprint catalog (`src/state/blueprints.rs`) now carries, per entry, the text
+and the links AWS publishes for THAT image:
+
+- Cause 1: `amazon_linux_2` is published through a Marketplace listing of its own with its
+  terms on that listing (`…/marketplace/pp/prodview-s4zvkzmlirbga` and that page plus
+  `#pdp-usage`), not under the product page and agreement document of the CURRENT Amazon
+  Linux release; and the `windows_server_2022` / `windows_server_2019` entries carry the copy
+  of their own listings rather than the paragraph AWS publishes for the newest release with
+  the release word swapped in. Every other column a recorded answer names — the Windows
+  releases' listings (both published path forms), the Windows Server family's one agreement,
+  the Windows SQL images' listing usage terms, the Amazon Linux 2023 product page, agreement,
+  group, `version` and paragraph, and the catalog build `version` of the images published by
+  build date — was already served and is unchanged.
+- Cause 2: the Windows SQL Server application tier is published between the Windows
+  operating-system block and the first Linux/Unix entry
+  (`windows_server_2022_sql_2022_express`, type `app`, platform `WINDOWS`, minPower 2000, at
+  the position the recording asserts), closed by an earlier round and pinned by a test.
+
+STILL OPEN, and re-filed as 20261118T174735Z-lightsail-getblueprints-and-getbundles-catalog-tables-are-truncated.md
+(replay key `$.blueprints[*]`): the tail of the row set, and the per-row Marketplace/EULA
+identifiers of the rows no recorded answer names. Those identifiers are opaque catalog
+contents — the replay withholds them, no report quotes them, and AWS publishes no
+machine-readable index of them — so the rows carry a listing and an agreement of their own on
+AWS's hosts, which is what this family of read-only operations owes; writing invented ids and
+rows would be the locally authored catalog data this report is about, and would make
+`CreateInstances` accept images this service does not publish.

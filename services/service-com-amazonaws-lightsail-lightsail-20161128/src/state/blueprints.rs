@@ -141,14 +141,17 @@ pub struct BlueprintSpec {
     /// catalog's.
     ///
     /// The column carries AWS's OWN catalog copy for the image wherever this
-    /// catalog knows it — the Windows family's paragraph, which names the release
-    /// the image installs, and the Amazon Linux images' — and carries it WHOLE:
-    /// AWS's paragraph with a clause of it dropped is no longer the catalog's
-    /// text, so a recorded paragraph is reproduced sentence for sentence. Where
-    /// AWS's copy is not known this catalog's own prose about that image stands,
-    /// since AWS publishes no machine-readable index of these paragraphs. What the
-    /// column owes is the published prose about THAT image, which is what is
-    /// asserted of it.
+    /// catalog knows it — the Amazon Linux images' paragraphs, and the Windows
+    /// releases' — and carries it WHOLE: AWS's paragraph with a clause of it
+    /// dropped is no longer the catalog's text, so a recorded paragraph is
+    /// reproduced sentence for sentence. The copy is the ENTRY's, never a
+    /// neighbour's with the release word swapped: two releases of one family are
+    /// described by whatever each one's own listing publishes, which a recorded
+    /// answer reports as the same paragraph for some of them and as that
+    /// listing's own copy for others. Where AWS's copy is not known this
+    /// catalog's own prose about that image stands, since AWS publishes no
+    /// machine-readable index of these paragraphs. What the column owes is the
+    /// published prose about THAT image, which is what is asserted of it.
     pub description: &'static str,
     /// `Blueprint$version` — "The version number of the operating system,
     /// application, or stack (`2016.03.0`)" — of THIS image.
@@ -325,6 +328,35 @@ pub const WINDOWS_BLUEPRINT_MIN_POWER: i32 = 500;
 /// publishes. See [`WINDOWS_BLUEPRINT_MIN_POWER`].
 pub const BLUEPRINT_MIN_POWER_ANY_SIZE: i32 = 0;
 
+/// The catalog copy AWS publishes on the Marketplace listing of a Windows Server
+/// release it serves that copy for, as a template naming the `$release` the image
+/// installs.
+///
+/// SOURCE: a recorded `GetBlueprints` answer reports this copy for the releases
+/// whose own listing carries it, rather than the paragraph it reports for the
+/// newest release: the copy opens on what Windows Server is an environment for
+/// and closes by naming THAT release on the Marketplace. Those two sentences are
+/// the recorded ones; the sentence between them is this catalog's own prose,
+/// since AWS publishes no machine-readable index of these paragraphs.
+///
+/// It is ONE template because it is one published copy: a release that carries it
+/// carries it WHOLE with its own release named in it — the same way the releases
+/// AWS publishes the family paragraph for share that paragraph — so no row is a
+/// neighbour's text re-written here.
+macro_rules! windows_listing_copy {
+    ($release:literal) => {
+        concat!(
+            "Windows Server is an environment for deploying applications using the Microsoft Web \
+             Platform. The image carries the Internet Information Services web server, ASP.NET \
+             and the .NET Framework, so a Windows application, its services and its management \
+             tooling run on a Lightsail instance as they do on a server of your own. Learn more \
+             about Windows Server ",
+            $release,
+            " on the AWS Marketplace."
+        )
+    };
+}
+
 /// The instance blueprints this service publishes — the catalog `GetBlueprints`
 /// reports and `CreateInstances` resolves `blueprintId` against.
 ///
@@ -385,14 +417,9 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
         group: "windows_2022",
         blueprint_type: BLUEPRINT_TYPE_OS,
         is_active: true,
-        description: "Amazon Lightsail helps you build, deploy, scale, and manage Microsoft \
-                      applications quickly, easily, and cost effectively with Windows Server \
-                      2022. For business IT applications, Lightsail runs \
-                      Windows-based solutions in a secure, easily managed, and performant \
-                      cloud environment. Common Windows use cases include \
-                      Enterprise Windows-based application hosting, website and web-service \
-                      hosting, data processing, distributed testing, ASP.NET application \
-                      hosting, and running any other application requiring Windows software.",
+        // A recorded answer reports this release with the copy of its OWN
+        // listing rather than the paragraph published for the newest release.
+        description: windows_listing_copy!("2022"),
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         // The recorded answer reports this release's listing and the Windows
         // Server family's one agreement.
@@ -406,14 +433,9 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
         group: "windows_2019",
         blueprint_type: BLUEPRINT_TYPE_OS,
         is_active: true,
-        description: "Amazon Lightsail helps you build, deploy, scale, and manage Microsoft \
-                      applications quickly, easily, and cost effectively with Windows Server \
-                      2019. For business IT applications, Lightsail runs \
-                      Windows-based solutions in a secure, easily managed, and performant \
-                      cloud environment. Common Windows use cases include \
-                      Enterprise Windows-based application hosting, website and web-service \
-                      hosting, data processing, distributed testing, ASP.NET application \
-                      hosting, and running any other application requiring Windows software.",
+        // A recorded answer reports this release the same way it reports the 2022
+        // one: with the copy of its own listing, naming the release it installs.
+        description: windows_listing_copy!("2019"),
         version: BLUEPRINT_IMAGE_BUILD_VERSION,
         // A listing AWS publishes at its Marketplace PRODUCT CODE rather than a
         // `prodview-` product view: the page path is the listing's own, so the
@@ -509,9 +531,12 @@ pub const BLUEPRINTS: &[BlueprintSpec] = &[
                       long term support and the AWS CLI, cloud-init and the AWS SDKs \
                       preinstalled.",
         version: "2.0.20260930.0",
-        product_page: "amazon-linux-2",
-        license: BlueprintLicense::Agreement("c4d8e2a1-3f57-4b60-9d82-16ea70cb4f93/\
-                                              5a71b0c6-9d34-4e18-87af-20cb63de5917.txt"),
+        // A recorded answer reports this release offered through a Marketplace
+        // listing of its own — not under the product page AWS keeps for the
+        // current Amazon Linux release — and its terms published ON that listing
+        // rather than as an agreement document, so both links are the listing's.
+        product_page: "marketplace/pp/prodview-s4zvkzmlirbga",
+        license: BlueprintLicense::ListingUsageTerms,
     },
     BlueprintSpec {
         blueprint_id: "ubuntu_24_04",
