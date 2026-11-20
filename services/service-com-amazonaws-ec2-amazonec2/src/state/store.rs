@@ -3283,6 +3283,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::ipam_scope_create_complete_at`], on the same monotonic clock and the same
     /// [`TRANSITION_DELAY`], applied by [`Self::materialize_due_transitions`].
     pub ipam_prefix_list_resolver_create_complete_at: BTreeMap<String, Instant>,
+    /// When a `modify-in-progress` resolver's move to `modify-complete` falls due, by
+    /// `IpamPrefixListResolverId` — what `ModifyIpamPrefixListResolver` records for the resolver
+    /// it modified ([`Self::modify_ipam_prefix_list_resolver`]), on the same monotonic clock and
+    /// the same [`TRANSITION_DELAY`] as the creation above and applied by
+    /// [`Self::materialize_due_transitions`].
+    pub ipam_prefix_list_resolver_modify_complete_at: BTreeMap<String, Instant>,
     /// When a `delete-in-progress` resolver's move to `delete-complete` falls due, by
     /// `IpamPrefixListResolverId` — the other end of the same resolver's life, owed on the same
     /// monotonic clock and the same [`TRANSITION_DELAY`] as its creation above and applied by
@@ -4085,6 +4091,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_prefix_list_resolvers: BTreeMap::new(),
             ipam_prefix_list_resolver_rules: BTreeMap::new(),
             ipam_prefix_list_resolver_create_complete_at: BTreeMap::new(),
+            ipam_prefix_list_resolver_modify_complete_at: BTreeMap::new(),
             ipam_prefix_list_resolver_delete_complete_at: BTreeMap::new(),
             ipam_prefix_list_resolver_client_tokens: HashMap::new(),
             ipam_prefix_list_resolver_targets: BTreeMap::new(),

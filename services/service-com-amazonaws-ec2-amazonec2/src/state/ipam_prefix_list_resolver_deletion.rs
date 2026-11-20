@@ -99,7 +99,7 @@ impl ComAmazonawsEc2Amazonec2State {
     /// sees the delete under way. The span is never zero and nothing is slept for.
     ///
     /// Any move the clock still owed this resolver is superseded: a resolver on its way out is
-    /// not going to land in the state its creation was moving it to.
+    /// not going to land in the state its creation or a modification was moving it to.
     ///
     /// The record STAYS in the store, because a resolver in either delete state still has a
     /// state to report — so its caller-chosen bytes and the CIDR selection rules it was created
@@ -113,6 +113,8 @@ impl ComAmazonawsEc2Amazonec2State {
         resolver.state = Some(IPAM_PREFIX_LIST_RESOLVER_STATE_DELETE_IN_PROGRESS.to_string());
         let view = resolver.clone();
         self.ipam_prefix_list_resolver_create_complete_at
+            .remove(resolver_id);
+        self.ipam_prefix_list_resolver_modify_complete_at
             .remove(resolver_id);
         self.ipam_prefix_list_resolver_delete_complete_at
             .insert(resolver_id.to_string(), Instant::now() + TRANSITION_DELAY);

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyIpamPrefixListResolver
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyIpamPrefixListResolver`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyIpamPrefixListResolver::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies an IPAM prefix list resolver and STORES the modification: the members the request
+//! names are applied to the stored resolver through the one writer of a resolver modification
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::modify_ipam_prefix_list_resolver`]), which
+//! leaves it in the non-terminal `modify-in-progress` state the clock then owes
+//! `modify-complete`, and `DescribeIpamPrefixListResolvers` reports what this answers.
 //!
 //! ## Shape of an operation
 //!
@@ -140,18 +137,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyIpamPrefixListResolver` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyIpamPrefixListResolverErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyIpamPrefixListResolver"))
+        use crate::state;
+
+        // `ctx` carries request metadata only, and this operation reads none of it: a resolver
+        // belongs to its IPAM, so "the Amazon Web Services Region where the associated IPAM is
+        // located" (`IpamPrefixListResolver$IpamRegion`) was settled when the resolver was
+        // created and no modification moves it. The store is reached through the engine held on
+        // `self`.
+        let _ = ctx;
+
+        // "The updated CIDR selection rules for the resolver. These rules replace the existing
+        // rules entirely" (`ModifyIpamPrefixListResolverRequest$Rules`): the request's own FORM
+        // first, before anything is resolved and before the DryRun arm below — the rule set is
+        // read by the one reader of a requested rule set this crate keeps, which bounds its count
+        // and checks every CIDR it carries, the same one `CreateIpamPrefixListResolver` accepts
+        // its rules by. A request naming no rule set leaves the one the resolver holds, which is
+        // what `None` carries into the modification below.
+        let rules: Option<Vec<IpamPrefixListResolverRule>> = match input.rules.as_deref() {
+            Some(requested) => Some(state::read_ipam_prefix_list_resolver_rules(requested)?),
+            None => None,
+        };
+
+        // "A check for whether you have the required permissions for the action WITHOUT
+        // ACTUALLY MAKING THE REQUEST" (`ModifyIpamPrefixListResolverRequest$DryRun`): the flag
+        // asks about PERMISSION, not about the resources the request names, so it is answered
+        // once the request's own form has been checked and before anything is resolved — the
+        // same place the create and the delete of this resource answer it. Every caller of this
+        // emulator is permitted, and nothing is stored.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let modification = state::IpamPrefixListResolverModification {
+            ipam_prefix_list_resolver_id: input.ipam_prefix_list_resolver_id.clone(),
+            description: input.description.clone(),
+            rules,
+        };
+        let resolver_id = modification.ipam_prefix_list_resolver_id.as_str();
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first, the way every other state-touching handler in this crate starts: what
+        // this modification is applied to is the resolver as it ACTUALLY stands rather than as
+        // the call before it left it.
+        store.materialize_due_transitions();
+
+        // "The ID of the IPAM prefix list resolver to modify"
+        // (`ModifyIpamPrefixListResolverRequest$IpamPrefixListResolverId`): an id this account
+        // holds no resolver for is `.NotFound`, in the wording this operation answers that code
+        // with ([`resolver_id_not_found`]). There is no form of the id to check before it: the
+        // model publishes no pattern for `IpamPrefixListResolverId`.
+        let current = store
+            .ipam_prefix_list_resolvers
+            .get(resolver_id)
+            .cloned()
+            .ok_or_else(|| resolver_id_not_found(resolver_id))?;
+        // A resolver a delete has already been asked for has nothing left to modify, so the
+        // modification is refused rather than written over a resource on its way out — in EC2's
+        // own wording for a resource refused SOLELY for the state it is in, exactly as the delete
+        // of this resource refuses a second one.
+        if state::ipam_prefix_list_resolver_is_deleting(&current) {
+            return Err(state::incorrect_state_of(
+                state::IPAM_PREFIX_LIST_RESOLVER_REFUSAL_NAME,
+                resolver_id,
+                current.state.as_deref().unwrap_or_default(),
+            ));
+        }
+
+        // The IPAM scopes the REPLACING rules select from, resolved by the one reader of that
+        // question this crate keeps: a rule selecting from a scope the account holds none of
+        // selects from nothing, so it is refused with the scope's own `NotFound` code. A request
+        // that names no rule set replaces none, so there is nothing of its own to resolve.
+        store.require_ipam_prefix_list_resolver_rule_scopes(
+            modification.rules.as_deref().unwrap_or_default(),
+        )?;
+
+        // What this call would leave behind, computed by the ONE definition of what a
+        // modification does to a resolver, so the figure checked here is exactly the one the
+        // write charges. The budget is asked about the NET change: this call stores no further
+        // resolver, so the resolver ceiling cannot bound it, while the description and the rules
+        // it sets are caller-chosen text.
+        let held_rules = store.ipam_prefix_list_resolver_rules_of(resolver_id);
+        let applied = modification.applied_to(&current);
+        let refund = state::ipam_prefix_list_resolver_modifiable_bytes(&current, &held_rules);
+        let charge = state::ipam_prefix_list_resolver_modifiable_bytes(
+            &applied,
+            &modification.rules_after(&held_rules),
+        );
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(state::resource_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, so \
+                 it cannot store this modification's {charge} bytes",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // Written through the store's ONE writer of a resolver modification, so what this answers
+        // is the stored record a later `DescribeIpamPrefixListResolvers` of the same resolver
+        // reports rather than a value built here.
+        let modified = store
+            .modify_ipam_prefix_list_resolver(&modification)
+            .ok_or_else(|| {
+                // Unreachable: the resolver was resolved above and the store is locked throughout.
+                state::internal_error(format!(
+                    "the IPAM prefix list resolver '{resolver_id}' could not be read back after \
+                     its modification"
+                ))
+            })?;
+
+        Ok(ModifyIpamPrefixListResolverOutput {
+            ipam_prefix_list_resolver: Some(modified),
+        })
     }
+}
+
+/// Refuse an `IpamPrefixListResolverId` this account holds no resolver for, as THIS operation
+/// words that refusal: HTTP 400 [`crate::state::INVALID_IPAM_PREFIX_LIST_RESOLVER_ID_NOT_FOUND`]
+/// — the resource's own code — carrying the quoted, id-interpolated sentence the rest of EC2
+/// answers an unresolvable id with ([`crate::state::id_not_found`]): `The <resource type> ID
+/// '<id>' does not exist`, over this resource's modelled type
+/// ([`crate::state::RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER`]) and the id the REQUEST named,
+/// never a stored one.
+///
+/// Worded here rather than through this family's shared refusal
+/// ([`crate::state::invalid_ipam_prefix_list_resolver_id_not_found`]): the DESCRIBES of this
+/// resource answer the same code with a sentence that interpolates NOTHING, and the sentence
+/// above is the one this operation is recorded answering, so neither can be reworded into the
+/// other.
+fn resolver_id_not_found(resolver_id: &str) -> ModifyIpamPrefixListResolverError {
+    crate::state::id_not_found(
+        crate::state::INVALID_IPAM_PREFIX_LIST_RESOLVER_ID_NOT_FOUND,
+        &format!(
+            "{resource} ID",
+            resource = crate::state::RESOURCE_TYPE_IPAM_PREFIX_LIST_RESOLVER
+        ),
+        resolver_id,
+    )
 }

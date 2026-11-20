@@ -194,21 +194,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The CIDR selection rules for the resolver … You can create a prefix list resolver
         // without any CIDR selection rules" (`CreateIpamPrefixListResolverRequest$Rules`): the
-        // rules are optional, and the ones a request names are kept for the resolver's
-        // lifetime, so their COUNT is bounded before any work proportional to it.
+        // rules are optional, and they are read — count bounded, every CIDR they carry checked —
+        // by the one reader of a requested rule set this crate keeps, which
+        // `ModifyIpamPrefixListResolver` replaces a resolver's rules through as well.
         let requested_rules: &[IpamPrefixListResolverRuleRequest] =
             input.rules.as_deref().unwrap_or_default();
-        if requested_rules.len() > state::MAX_IPAM_PREFIX_LIST_RESOLVER_RULES {
-            return Err(state::invalid_parameter_value(format!(
-                "The request carries {} CIDR selection rules, above the maximum of {max}",
-                requested_rules.len(),
-                max = state::MAX_IPAM_PREFIX_LIST_RESOLVER_RULES,
-            )));
-        }
-        let rules: Vec<IpamPrefixListResolverRule> = requested_rules
-            .iter()
-            .map(read_rule)
-            .collect::<Result<_, _>>()?;
+        let rules: Vec<IpamPrefixListResolverRule> =
+            state::read_ipam_prefix_list_resolver_rules(requested_rules)?;
 
         // "The tags to apply to the IPAM prefix list resolver during creation"
         // (`CreateIpamPrefixListResolverRequest$TagSpecifications`): the resolver is the only
@@ -259,17 +251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cloned()
             .ok_or_else(|| state::invalid_ipam_id_not_found(ipam_id))?;
 
-        // "The ID of the IPAM scope from which to select CIDRs"
-        // (`IpamPrefixListResolverRuleRequest$IpamScopeId`): a rule selecting from a scope the
-        // account holds none of selects from nothing, so it is refused with the scope's own
-        // `NotFound` code rather than stored.
-        if let Some(unknown) = rules
-            .iter()
-            .filter_map(|rule| rule.ipam_scope_id.as_deref())
-            .find(|scope_id| !store.ipam_scopes.contains_key(*scope_id))
-        {
-            return Err(state::invalid_ipam_scope_id_not_found(unknown));
-        }
+        // The IPAM scopes the rules select from, resolved by the one reader of that question
+        // this crate keeps — the same one `ModifyIpamPrefixListResolver` replaces a rule set
+        // through, so the two cannot disagree about which scopes a rule may name.
+        store.require_ipam_prefix_list_resolver_rule_scopes(&rules)?;
 
         // Idempotency: one token names the one resolver it minted, so a replay reports that
         // resolver and creates nothing.
@@ -390,66 +375,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })
     }
-}
-
-/// One requested CIDR selection rule as the resolver reports it, with every value the request
-/// may not name checked first.
-///
-/// "CIDR selection rules define the business logic for selecting CIDRs from IPAM. If a CIDR
-/// matches any of the rules, it will be included. If a rule has multiple conditions, the CIDR
-/// has to match every condition of that rule"
-/// (`CreateIpamPrefixListResolverRequest$Rules`) — so a rule is STORED as given once its own
-/// values are values: a `StaticCidr` is "a fixed list of CIDRs"
-/// (`IpamPrefixListResolverRuleRequest$StaticCidr`) and a condition's `Cidr` is an address
-/// prefix too, both read by the one CIDR reader this crate keeps
-/// (`crate::state::cidr_block_is_well_formed`). The rule type, the resource type and a
-/// condition's operation are modelled enums, so a spelling outside them was refused before
-/// this handler ran, and the IPAM scope a rule names is resolved against the store by the
-/// caller.
-fn read_rule(
-    requested: &IpamPrefixListResolverRuleRequest,
-) -> Result<IpamPrefixListResolverRule, CreateIpamPrefixListResolverError> {
-    if let Some(cidr) = requested
-        .static_cidr
-        .as_deref()
-        .filter(|cidr| !crate::state::cidr_block_is_well_formed(cidr))
-    {
-        return Err(crate::state::invalid_parameter_value(format!(
-            "Invalid value '{cidr}' for StaticCidr. It must be an address prefix in CIDR \
-             notation"
-        )));
-    }
-    let mut conditions: Vec<IpamPrefixListResolverRuleCondition> = Vec::new();
-    for condition in requested.conditions.iter().flatten() {
-        if let Some(cidr) = condition
-            .cidr
-            .as_deref()
-            .filter(|cidr| !crate::state::cidr_block_is_well_formed(cidr))
-        {
-            return Err(crate::state::invalid_parameter_value(format!(
-                "Invalid value '{cidr}' for Cidr. It must be an address prefix in CIDR notation"
-            )));
-        }
-        conditions.push(IpamPrefixListResolverRuleCondition {
-            operation: Some(condition.operation.clone()),
-            ipam_pool_id: condition.ipam_pool_id.clone(),
-            resource_id: condition.resource_id.clone(),
-            resource_owner: condition.resource_owner.clone(),
-            resource_region: condition.resource_region.clone(),
-            resource_tag: condition.resource_tag.as_ref().map(|tag| IpamResourceTag {
-                key: tag.key.clone(),
-                value: tag.value.clone(),
-            }),
-            cidr: condition.cidr.clone(),
-        });
-    }
-    Ok(IpamPrefixListResolverRule {
-        rule_type: Some(requested.rule_type.clone()),
-        static_cidr: requested.static_cidr.clone(),
-        ipam_scope_id: requested.ipam_scope_id.clone(),
-        resource_type: requested.resource_type.clone(),
-        conditions: Some(conditions),
-    })
 }
 
 /// Does `resolver`, with the `stored_rules` it was created with — the resolver a replayed

@@ -936,6 +936,10 @@ impl ComAmazonawsEc2Amazonec2State {
                 // The transition is applied once; nothing is owed on this resolver any more.
                 false
             });
+        // A resolver `ModifyIpamPrefixListResolver` answered as `modify-in-progress` reaches
+        // `modify-complete` once its due instant has passed, whether or not anybody called —
+        // the same contract as its creation above, on the same clock.
+        self.materialize_due_ipam_prefix_list_resolver_modifications(now);
         // A resolver `DeleteIpamPrefixListResolver` answered as `delete-in-progress` reaches
         // `delete-complete` once its due instant has passed, whether or not anybody called —
         // the other end of the same resolver's life, owed and applied exactly as its creation
