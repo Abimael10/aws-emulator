@@ -34,8 +34,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_emrserverless_awstoledowebservice::state::{
-    idle_span, ComAmazonawsEmrserverlessAwstoledowebserviceState, JOB_RUN_STAGES,
-    JOB_RUN_STAGE_TRANSITION,
+    idle_span, ComAmazonawsEmrserverlessAwstoledowebserviceState, JOB_RUN_STAGE_TRANSITION,
 };
 
 use super::application_lifecycle::{
@@ -43,6 +42,7 @@ use super::application_lifecycle::{
     emulator_with_engine, get_application, get_job_run, list_applications, list_job_runs,
     minimal_create, minimal_job_run, start_application, started_application, stop_application,
     wait_for_job_run_to_settle, wait_for_transition, Answer, EXECUTION_ROLE,
+    JOB_RUN_REST_DEADLINE,
 };
 
 /// The `JobRunState` values a run can be in while it is still in flight, written out
@@ -58,6 +58,9 @@ const NON_TERMINAL_JOB_RUN_STATES: &[&str] = &[
     "RUNNING",
     "CANCELLING",
 ];
+
+/// And the three a finished run carries, from the same enum.
+const TERMINAL_JOB_RUN_STATES: &[&str] = &["SUCCESS", "FAILED", "CANCELLED"];
 
 /// The query that asks `ListJobRuns` for the runs that are still in flight.
 const NON_TERMINAL_STATES_QUERY: &str =
@@ -613,13 +616,13 @@ async fn a_submitted_job_run_is_observable_in_the_non_terminal_states() {
         "the run just submitted must be listed among the non-terminal ones, got {in_flight:?}"
     );
 
-    // Sample the state across the whole lifecycle. Every sample before the run settles
-    // must be a non-terminal state, and the states must not go backwards.
-    let stages = u32::try_from(JOB_RUN_STAGES.len()).unwrap_or(1);
-    let whole_lifecycle = JOB_RUN_STAGE_TRANSITION * stages + Duration::from_millis(500);
+    // Sample the state across the whole lifecycle, looking again until the run has come to
+    // REST and giving up only past a generous deadline. Every sample before it rests must be
+    // a non-terminal state, and the states must not go backwards.
+    let deadline = Instant::now() + JOB_RUN_REST_DEADLINE;
     let started = Instant::now();
     let mut observed: Vec<(Duration, String)> = Vec::new();
-    while started.elapsed() < whole_lifecycle {
+    loop {
         let state = get_job_run(&router, &application_id, &job_run_id)
             .await
             .at("/jobRun/state")
@@ -627,6 +630,19 @@ async fn a_submitted_job_run_is_observable_in_the_non_terminal_states() {
             .unwrap_or_default()
             .to_string();
         observed.push((started.elapsed(), state));
+        // Three further samples once it has rested, so "a settled run stays settled" is
+        // judged on more than the one sample that found it.
+        let rested = observed
+            .iter()
+            .filter(|(_, state)| TERMINAL_JOB_RUN_STATES.contains(&state.as_str()))
+            .count();
+        if rested >= 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the run never came to rest, got {observed:?}"
+        );
         std::thread::sleep(JOB_RUN_STAGE_TRANSITION / 3);
     }
 
@@ -643,19 +659,26 @@ async fn a_submitted_job_run_is_observable_in_the_non_terminal_states() {
     for (at, state) in &observed {
         assert!(
             NON_TERMINAL_JOB_RUN_STATES.contains(&state.as_str()) || state == "FAILED",
-            "case {at:?}: a run nothing executed is either in flight or FAILED, got \
-             {state:?} in {observed:?}"
+            "case {at:?}: a run whose application the object store does not hold is either \
+             in flight or FAILED, got {state:?} in {observed:?}"
         );
-        assert!(
-            state != "RUNNING" && state != "SUCCESS",
-            "case {at:?}: nothing ran, so the run is never reported {state:?} \
-             ({observed:?})"
+        assert_ne!(
+            state, "SUCCESS",
+            "case {at:?}: no application ran to its end, so the run is never reported \
+             {state:?} ({observed:?})"
         );
     }
+    // `RUNNING` is one of the states it goes through: a run is executing the application its
+    // submit named for as long as that application takes.
+    assert!(
+        observed.iter().any(|(_, state)| state == "RUNNING"),
+        "a run executing its submitted application must be observable RUNNING, \
+         got {observed:?}"
+    );
     // Once a sample is terminal, every later sample is too: the lifecycle moves one way.
     let settled_at = observed.iter().position(|(_, state)| state == "FAILED");
     let settled_at = settled_at.unwrap_or_else(|| {
-        panic!("the run must settle inside its lifecycle, got {observed:?}");
+        panic!("the run must come to rest, got {observed:?}");
     });
     assert!(
         observed[settled_at..].iter().all(|(_, state)| state == "FAILED"),

@@ -26,16 +26,17 @@
 //! scheme — and it is written here once, for the publication that produces it and for
 //! any later reader of this module.
 //!
-//! No executor artifact is published, for the same reason the run reports no resource
-//! utilisation: nothing ran an executor, so there is no executor whose log could be
-//! written. Nothing is published for a run that is still in flight either: the artifacts
+//! No executor artifact is published: the submitted application runs in ONE driver process
+//! here ([`super::spark_job_run`]), so there is no executor whose log could be written.
+//! Nothing is published for a run that is still in flight either: the artifacts
 //! are what the finished run left behind.
 //!
 //! The log's TEXT is the run's own persisted record — the submit, the identity that made
 //! it, the engine and release it was admitted on, and every state the clock moved it
 //! through with the `stateDetails` of each — rendered as a driver's log lines. It states
-//! what this service did and nothing it did not: no line is written as though a workload
-//! had been executed. The driver's `@sensitive` members (a `sparkSubmit` entry point and
+//! what this service did and nothing it did not: the line for a terminal state carries the
+//! `stateDetails` that run's own execution answered with and nothing else. The driver's
+//! `@sensitive` members (a `sparkSubmit` entry point and
 //! its parameters, a `hive` query) are deliberately left OUT of the published text: the
 //! value a caller marked sensitive is not written into an object a bucket policy exposes
 //! more widely than the API does.
@@ -372,15 +373,20 @@ pub fn publication(record: &JobRunRecord) -> Option<PendingPublication> {
 /// Materialise what the clock owes this service's store and publish the log artifacts of
 /// every run it just finished.
 ///
-/// Called by each operation that settles the store, at the one instant it settles it: the
-/// publication belongs to the state change rather than to the call, so a client that only
-/// ever polls one job run still finds the artifacts of the run it polled. The state guard
-/// is taken and released before anything is written — nothing here holds it across an
-/// await.
+/// The ONE pump every operation of this service runs before it reads the store, so both
+/// things a job run is OWED happen whoever called: the WORK its `jobDriver` named is handed
+/// off first ([`super::spark_job_run::perform_owed`]) — a run finishes because its work
+/// finished, so there is nothing to publish for a run whose work nobody started — and then
+/// the artifacts of every run that has come to rest are written.
+///
+/// The publication belongs to the state change rather than to the call: a client that only
+/// ever polls one job run still finds the artifacts of the run it polled. The state guard is
+/// taken and released before anything is written — nothing here holds it across an await.
 pub async fn publish_due<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
 ) {
+    super::spark_job_run::perform_owed(engine, ctx).await;
     let Some(state) = service_state(engine) else {
         return;
     };

@@ -19,7 +19,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time", "sync"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -43,6 +43,28 @@ url = "2"
 # ... and that URI's path spells an Amazon S3 key prefix, whose percent-escaping is
 # resolved by the maintained encoder the URL parser itself uses.
 percent-encoding = "2"
+# The CONTAINED Python interpreter a job run's submitted Spark application is executed by,
+# and the AWS SDK modules that interpreter puts on the application's import path — both
+# reached through the Lambda service crate, which is where this workspace's ONE embedded
+# Python execution substrate lives (`state::execution::python`). Reused rather than stood up
+# a second time here, so a submitted application runs under exactly the containment and the
+# bounds that engine already enforces, and this crate adds no execution surface of its own:
+# it supplies the application's source, its command line and its ceilings
+# (`crate::state::spark_job_run`) and nothing else.
+#
+# Capability class: an execution substrate. What it re-opens is answered by that engine and
+# by this crate's own module docs — the interpreter is built with the engine crate's
+# host-reaching features compiled out, its native modules are an allow-list that leaves
+# every socket, subprocess, memory-map and host-library module unregistered, the
+# operating-system modules an application can import are the workspace's own in-memory ones,
+# and every bound (wall clock, steps, memory, recursion, output size) lives in host code no
+# application can reach.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# `JobRun$releaseLabel` is "The Amazon EMR release associated with the application your job
+# is running on", so the version of Spark a run's application is told it runs on is that
+# Amazon EMR release's own — read from the release catalog Amazon EMR's own service crate
+# publishes for `DescribeReleaseLabel` rather than kept a second time here.
+service-com-amazonaws-emr-elasticmapreduce = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

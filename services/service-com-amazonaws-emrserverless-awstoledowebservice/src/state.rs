@@ -20,9 +20,13 @@
 //!
 //! Two things here move with the CLOCK rather than with a call, and both are stored as a
 //! due instant that the next read materialises (nothing sleeps): the stages a submitted
-//! job run passes through before it settles ([`JOB_RUN_STAGES`]), and the automatic stop
+//! job run passes through while its work runs ([`JOB_RUN_STAGES`]), and the automatic stop
 //! an application's `autoStopConfiguration` owes it once it has been idle past the idle
 //! timeout it names ([`ApplicationRecord::auto_stop_due`]).
+//!
+//! What a job run comes to REST in is not the clock's: it is what RUNNING the work the
+//! submit named came to ([`spark_job_run`]), so a run reaches a terminal `JobRunState` only
+//! once its own execution has answered.
 //!
 //! Each record holds the MODELLED shape (`Application`, `JobRun`) verbatim, so a
 //! reporting operation returns exactly what the mutating one stored rather than
@@ -37,6 +41,10 @@
 /// `monitoringConfiguration` names, and the publication every call that settles this store
 /// drains.
 pub mod job_run_logs;
+
+/// RUNNING the work a job run submitted — the Spark submit of a Python application in
+/// Amazon S3 — and the state the run comes to rest in because of it.
+pub mod spark_job_run;
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::Debug;
@@ -328,15 +336,6 @@ pub const SUPPORTED_ENGINES: &[SupportedEngine] = &[
 /// `JobRun$stateDetails` for a job run that has been accepted but not yet run.
 pub const SUBMITTED_STATE_DETAILS: &str = "Job run submitted.";
 
-/// `JobRun$stateDetails` for the state the clock owes every submitted job run.
-///
-/// This emulator is a control plane: it records a job run faithfully, but it runs no
-/// Spark or Hive workload, so a job run can never reach `SUCCESS` — it ends in the
-/// modelled failure state with a reason that says exactly that.
-pub const NOT_EXECUTED_STATE_DETAILS: &str =
-    "This emulator records job runs but executes no Spark or Hive workload, so the job \
-     run ended without running.";
-
 /// `JobRun$stateDetails` for a job run a caller cancelled.
 pub const CANCELLED_STATE_DETAILS: &str = "Job run cancelled at the request of the caller.";
 
@@ -345,24 +344,24 @@ pub const PENDING_STATE_DETAILS: &str = "Job run accepted and pending admission.
 pub const QUEUED_STATE_DETAILS: &str = "Job run queued, waiting for capacity.";
 pub const SCHEDULED_STATE_DETAILS: &str = "Job run scheduled on the application.";
 
-/// The states a submitted job run passes through, in order, with the `stateDetails`
-/// each one carries.
+/// The NON-TERMINAL states a submitted job run passes through, in order, with the
+/// `stateDetails` each one carries.
 ///
 /// A job run is NOT terminal the instant it is submitted: it is admitted, queued and
-/// scheduled before anything runs, and each of those is a value of the `JobRunState`
-/// enum (`SUBMITTED`, `PENDING`, `SCHEDULED`, `QUEUED`, `RUNNING`, `SUCCESS`, `FAILED`,
+/// scheduled, and then it RUNS, and each of those is a value of the `JobRunState` enum
+/// (`SUBMITTED`, `PENDING`, `SCHEDULED`, `QUEUED`, `RUNNING`, `SUCCESS`, `FAILED`,
 /// `CANCELLING`, `CANCELLED`), so a client that submits work and then polls or filters
 /// for in-flight runs observes it in them.
 ///
-/// `RUNNING` is NOT among them, and neither is `SUCCESS`: this emulator is a control
-/// plane that executes no Spark or Hive workload, so it never reports a run as running
-/// or succeeded — once scheduled, the clock owes it the modelled failure state with
-/// [`NOT_EXECUTED_STATE_DETAILS`], which says exactly that.
+/// No TERMINAL state is among them, and none is owed by the clock: the state a run comes
+/// to rest in is what running the work its `jobDriver` named answered
+/// ([`spark_job_run::JobRunRecord::record_execution`]), which is why a run that has not
+/// been executed yet stays `RUNNING` rather than being reported as finished.
 pub const JOB_RUN_STAGES: &[(&str, &str)] = &[
     ("PENDING", PENDING_STATE_DETAILS),
     ("QUEUED", QUEUED_STATE_DETAILS),
     ("SCHEDULED", SCHEDULED_STATE_DETAILS),
-    ("FAILED", NOT_EXECUTED_STATE_DETAILS),
+    ("RUNNING", spark_job_run::RUNNING_STATE_DETAILS),
 ];
 
 /// The state changes the clock owes a job run submitted at `now`: one per entry of
@@ -393,6 +392,35 @@ pub const AUTO_STOPPED_STATE_DETAILS: &str =
 /// `SUCCESS`, `FAILED`, `CANCELLING`, `CANCELLED`, `QUEUED`) — the three that name a
 /// finished run.
 pub const TERMINAL_JOB_RUN_STATES: &[&str] = &["SUCCESS", "FAILED", "CANCELLED"];
+
+/// The `JobRunState` a job run carries while its own work is executing.
+pub const RUNNING_JOB_RUN_STATE: &str = "RUNNING";
+
+/// `JobRun$totalExecutionDurationSeconds` for a run that ended at `ended_at` having moved
+/// to `RUNNING` at `started_at`: the whole seconds between the two, and `None` for a run
+/// that never reached `RUNNING` and so executed nothing.
+///
+/// "The aggregate … resources used from the time the job starts to execute, until the time
+/// the job terminates, rounded up to the nearest second" is how this service states the
+/// companion measure, so a run that executed at all reports at least the one second it
+/// occupied rather than a zero.
+pub fn execution_duration_seconds(
+    started_at: Option<&DateTime>,
+    ended_at: DateTime,
+) -> Option<i32> {
+    let started = started_at?;
+    let seconds = ended_at.as_secs_f64() - started.as_secs_f64();
+    if seconds.is_nan() || seconds < 0.0 {
+        return None;
+    }
+    let rounded = seconds.ceil();
+    let whole = if rounded >= f64::from(i32::MAX) {
+        i32::MAX
+    } else {
+        rounded as i32
+    };
+    Some(whole.max(1))
+}
 
 /// `Session$stateDetails` for a session a caller has just asked for, before the service
 /// has brought it up.
@@ -759,6 +787,14 @@ pub struct JobRunRecord {
     /// reaches a state it never leaves, and cleared by the call that writes them, so one
     /// finished run publishes once however many calls arrive afterwards.
     pub log_publication_due: bool,
+    /// Whether this run still owes the WORK its `jobDriver` named: set when the submit was
+    /// accepted and cleared once one execution of that work has answered
+    /// ([`spark_job_run`]).
+    pub workload_owed: bool,
+    /// Whether an execution of that work is in flight: set by the call that claims it, so
+    /// two calls that find the same run owed cannot both run it, and cleared when the
+    /// execution answers or when nothing performed it.
+    pub workload_claimed: bool,
 }
 
 /// A dashboard URL this service minted for one job run: the token the URL carries and
@@ -797,9 +833,21 @@ impl JobRunRecord {
             }
             self.job_run.updated_at = at;
             self.job_run.attempt_updated_at = Some(at);
+            // "The date and time when the job moved to the RUNNING state"
+            // (`JobRun$startedAt`): the instant that move fell due, recorded once.
+            if self.job_run.state == RUNNING_JOB_RUN_STATE && self.job_run.started_at.is_none() {
+                self.job_run.started_at = Some(at);
+            }
             self.record_lifecycle(pending.due);
             if is_terminal_job_run_state(&self.job_run.state) {
                 self.job_run.ended_at = Some(at);
+                // "The job run total execution duration in seconds. This field is only
+                // available for job runs in a COMPLETED, FAILED, or CANCELLED state"
+                // (`JobRun$totalExecutionDurationSeconds`): the span between the instant
+                // the job moved to `RUNNING` and the instant it was terminated. A run that
+                // never reached `RUNNING` executed nothing, so it reports no duration.
+                self.job_run.total_execution_duration_seconds =
+                    execution_duration_seconds(self.job_run.started_at.as_ref(), at);
                 self.pending.clear();
                 finished_at = Some(pending.due);
                 // The artifacts a finished run leaves in its configured destinations are
@@ -1203,6 +1251,14 @@ pub struct ComAmazonawsEmrserverlessAwstoledowebserviceState {
     /// ([`session_endpoint_url`]), so two sessions carrying the same id would be reached
     /// at the same host.
     pub next_session_seq: u64,
+    /// The job-run executions this process has STARTED and that have not answered yet,
+    /// keyed by the run each belongs to ([`spark_job_run::in_flight_key`]).
+    ///
+    /// Held in the store rather than in a process-wide table, so an execution belongs to the
+    /// store whose submit started it; each is collected by the next call that settles this
+    /// store, which is what makes one submitted application run ONCE however often its run
+    /// is read ([`spark_job_run`]).
+    pub in_flight_workloads: HashMap<String, spark_job_run::PendingWorkloadRun>,
 }
 
 impl ComAmazonawsEmrserverlessAwstoledowebserviceState {

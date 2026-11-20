@@ -17,9 +17,10 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_emrserverless_awstoledowebservice::state::spark_job_run::JOB_RUN_UNREADABLE_LEAD;
 use service_com_amazonaws_emrserverless_awstoledowebservice::state::{
     DEFAULT_EXECUTION_TIMEOUT_MINUTES, JOB_RUN_STAGES, JOB_RUN_STAGE_TRANSITION,
-    LIFECYCLE_TRANSITION, PAGE_LIMIT,
+    LIFECYCLE_TRANSITION, PAGE_LIMIT, TERMINAL_JOB_RUN_STATES,
 };
 use service_com_amazonaws_emrserverless_awstoledowebservice::EmulatedService;
 
@@ -42,25 +43,68 @@ pub(crate) fn wait_for_transition() {
     std::thread::sleep(LIFECYCLE_TRANSITION + Duration::from_millis(250));
 }
 
-/// Long enough for EVERY stage the clock owes a submitted job run
-/// (`JOB_RUN_STAGES`, one `JOB_RUN_STAGE_TRANSITION` apart) to have fallen due, so the
-/// run has reached the terminal state the last of them names.
+/// Long enough for EVERY span the clock owes a submitted job run to have fallen due: one
+/// `JOB_RUN_STAGE_TRANSITION` per stage of `JOB_RUN_STAGES`, and one more for the state the
+/// run's own execution answered, which falls due a span after the last of them.
 pub(crate) fn wait_for_job_run_to_settle() {
-    let stages = u32::try_from(JOB_RUN_STAGES.len()).unwrap_or(1);
-    std::thread::sleep(JOB_RUN_STAGE_TRANSITION * stages + Duration::from_millis(250));
+    let spans = u32::try_from(JOB_RUN_STAGES.len()).unwrap_or(1) + 1;
+    std::thread::sleep(JOB_RUN_STAGE_TRANSITION * spans + Duration::from_millis(250));
 }
 
-/// One emulator: a router carrying only this service, over one shared engine, with the
+/// How long a test looks for a job run to come to REST before giving up.
+///
+/// Generous: the run rests on what RUNNING its submitted application came to, which is work
+/// of this emulator's own and not a span anybody waits out, so the deadline is far above what
+/// any of it takes on an idle host or a loaded one.
+pub(crate) const JOB_RUN_REST_DEADLINE: Duration = Duration::from_secs(120);
+/// How long a poll waits before looking again.
+const JOB_RUN_REST_POLL: Duration = Duration::from_millis(100);
+
+/// The job run `job_run_id`, read once it has come to REST — polled for the CONDITION rather
+/// than waited out, and panicking only past `JOB_RUN_REST_DEADLINE`.
+pub(crate) async fn settled_job_run(
+    router: &MultiServiceRouter,
+    application_id: &str,
+    job_run_id: &str,
+) -> Answer {
+    let deadline = Instant::now() + JOB_RUN_REST_DEADLINE;
+    loop {
+        let answer = get_job_run(router, application_id, job_run_id).await;
+        let last = answer
+            .at("/jobRun/state")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if TERMINAL_JOB_RUN_STATES.contains(&last.as_str()) {
+            return answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "job run {job_run_id} never came to rest, last saw {last:?}"
+        );
+        tokio::time::sleep(JOB_RUN_REST_POLL).await;
+    }
+}
+
+/// One emulator: this service beside the object store, over one shared engine, with the
 /// engine handed back so a test can read or rewind the state the handlers share.
+///
+/// Amazon S3 is mounted beside it because a job run's submitted application is READ from the
+/// object store before anything runs it — what the assembled emulator does — so a run of a
+/// submit whose entry point the store does not hold is answered by the store itself rather
+/// than by a call nothing served.
 pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     (router, engine)
 }
 
-/// One emulator: a router carrying only this service, over one shared engine.
+/// One emulator: this service beside the object store, over one shared engine.
 pub(crate) fn emulator() -> MultiServiceRouter {
     emulator_with_engine().0
 }
@@ -1225,11 +1269,12 @@ async fn stop_application_requires_its_job_runs_to_have_finished() {
     );
 }
 
-/// This emulator records job runs but runs no Spark or Hive workload, so a submitted
-/// job run ends in the modelled failure state with a reason that says so — never in a
-/// success nothing computed.
+/// A job run's terminal state is what RUNNING the work its driver submitted came to. This
+/// emulator runs the Spark submit of a Python application in Amazon S3, so a submit whose
+/// entry point the object store holds nothing at ends in the modelled failure state carrying
+/// what the STORE answered — and never in a success nothing computed.
 #[tokio::test]
-async fn a_submitted_job_run_ends_in_the_modelled_failure_state() {
+async fn a_job_run_whose_application_cannot_be_downloaded_ends_failed() {
     let router = emulator();
     let application_id = started_application(&router, "tok-exec").await;
     let submitted = start_job_run(&router, &application_id, minimal_job_run("job-1")).await;
@@ -1247,32 +1292,29 @@ async fn a_submitted_job_run_ends_in_the_modelled_failure_state() {
         immediately.at("/jobRun/state")
     );
     assert_eq!(
-        immediately.at("/jobRun/startedAt"),
-        Value::Null,
-        "nothing ran, so there is no start instant, got {:?}",
-        immediately.at("/jobRun/startedAt")
-    );
-    assert_eq!(
         immediately.at("/jobRun/totalResourceUtilization"),
         Value::Null,
-        "nothing ran, so there is no resource utilisation, got {:?}",
+        "nothing has executed yet, so there is no resource utilisation, got {:?}",
         immediately.at("/jobRun/totalResourceUtilization")
     );
 
-    wait_for_job_run_to_settle();
-    let settled = get_job_run(&router, &application_id, &job_run_id).await;
+    let settled = settled_job_run(&router, &application_id, &job_run_id).await;
     assert_eq!(
         settled.at("/jobRun/state"),
         json!("FAILED"),
-        "a job run nothing executed must end FAILED, got {:?}",
+        "a job run whose application could not be downloaded must end FAILED, got {:?}",
         settled.at("/jobRun/state")
     );
     let details = settled.at("/jobRun/stateDetails");
+    let details = details.as_str().unwrap_or_default();
     assert!(
-        details
-            .as_str()
-            .is_some_and(|text| text.contains("executes no Spark or Hive workload")),
-        "the failure must say why nothing ran, got {details:?}"
+        details.contains(JOB_RUN_UNREADABLE_LEAD),
+        "the failure must say the application could not be downloaded, got {details:?}"
+    );
+    assert!(
+        !details.contains("app.py"),
+        "`SparkSubmit$entryPoint` is @sensitive, so no state detail echoes it, got \
+         {details:?}"
     );
     assert_ne!(
         settled.at("/jobRun/endedAt"),
@@ -1280,11 +1322,16 @@ async fn a_submitted_job_run_ends_in_the_modelled_failure_state() {
         "a finished job run carries the instant it ended, got {:?}",
         settled.at("/jobRun/endedAt")
     );
-    assert_eq!(
-        settled.at("/jobRun/totalExecutionDurationSeconds"),
+    assert_ne!(
+        settled.at("/jobRun/startedAt"),
         Value::Null,
-        "no duration is reported for work nothing ran, got {:?}",
-        settled.at("/jobRun/totalExecutionDurationSeconds")
+        "a run whose work was executed carries the instant it moved to RUNNING, got {:?}",
+        settled.at("/jobRun/startedAt")
+    );
+    let duration = settled.at("/jobRun/totalExecutionDurationSeconds");
+    assert!(
+        duration.as_i64().is_some_and(|seconds| seconds >= 1),
+        "a run that executed reports the seconds it took, got {duration:?}"
     );
 }
 

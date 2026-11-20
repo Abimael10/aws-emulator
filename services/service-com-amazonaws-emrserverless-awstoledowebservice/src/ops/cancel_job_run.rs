@@ -214,6 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     state: "CANCELLED".to_string(),
                     state_details: Some(crate::state::CANCELLED_STATE_DETAILS.to_string()),
                 });
+                // A cancel is this caller's answer about the work, so the run stops owing
+                // it: nothing of it is started afterwards, and an execution already in
+                // flight no longer decides the state the run comes to rest in
+                // (`crate::state::spark_job_run`).
+                job_run.workload_owed = false;
                 // The cancellation is a line of the run's driver log, the same way every
                 // state the clock moves it to is: see `crate::state::job_run_logs`.
                 job_run.record_lifecycle(now);

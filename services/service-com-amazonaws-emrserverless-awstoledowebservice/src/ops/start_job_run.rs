@@ -167,6 +167,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before this call reads the store it settles (`crate::state::job_run_logs`).
         crate::state::job_run_logs::publish_due(&*self.engine, ctx).await;
 
+        // The submit itself: everything decided under this service's guard, and nothing
+        // else, so the guard is released before the work below is started.
+        let submitted = self.accept(input, ctx)?;
+
+        // The work the submit ACCEPTED is the RUN's, not this request's: it is started
+        // here, with no guard held, and this call waits for none of it — a later call
+        // collects what it answered (`crate::state::spark_job_run`).
+        crate::state::spark_job_run::start_owed(&*self.engine, ctx).await;
+
+        Ok(submitted)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartJobRun<Eng> {
+    /// ACCEPT the submit: resolve the application it names, judge the request against that
+    /// application's own lifecycle and quota, and store the job run it starts.
+    ///
+    /// Synchronous and whole: this service's guard is taken and released inside it, so the
+    /// work the accepted run owes is started by [`smithy_server_runtime::Operation::handle`]
+    /// with no guard held.
+    fn accept(
+        &self,
+        input: StartJobRunInput,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
+    ) -> Result<StartJobRunOutput, StartJobRunError> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartJobRunErrorModeled::InternalServerException(
                 InternalServerException {
@@ -282,8 +307,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             configuration_overrides: configuration_overrides.clone(),
             job_driver,
             tags: input.tags,
-            // Resource utilisation is measured while a job executes. Nothing executes
-            // here, so there is nothing to report.
+            // Resource utilisation is measured while a job executes, and is reported once
+            // the run has finished; nothing has executed at the instant the submit returns.
             total_resource_utilization: None,
             network_configuration: record.application.network_configuration.clone(),
             total_execution_duration_seconds: None,
@@ -299,7 +324,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             attempt: Some(1),
             attempt_created_at: Some(created_at),
             attempt_updated_at: Some(created_at),
-            // The job never moved to RUNNING, so it has no start instant.
+            // The job has not moved to RUNNING yet, so it has no start instant.
             started_at: None,
             ended_at: None,
             queued_duration_milliseconds: None,
@@ -315,10 +340,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // A submitted run is not finished the instant the submit returns: the
                 // clock owes it each stage it passes through
                 // (`crate::state::JOB_RUN_STAGES`), so a client polling or filtering
-                // for in-flight runs observes it in them. This emulator runs no Spark
-                // or Hive workload, so the last of those stages is the modelled failure
-                // state with a reason that says so — it can never be reported as a
-                // success nothing computed.
+                // for in-flight runs observes it in them. None of those stages is a
+                // terminal one: what the run comes to REST in is what running the work
+                // this driver named answered (`crate::state::spark_job_run`).
                 pending: crate::state::job_run_stages(now),
                 dashboard: None,
                 dashboard_grants: 0,
@@ -341,6 +365,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 log_events: Vec::new(),
                 log_publication_due: false,
+                // The work this submit named is owed from the instant it was ACCEPTED,
+                // and it is handed off below, once this service's guard is released
+                // (`crate::state::spark_job_run`). Nothing has run it yet.
+                workload_owed: true,
+                workload_claimed: false,
             },
         );
         // The submit is the first line of the run's driver log: the state it carries from
