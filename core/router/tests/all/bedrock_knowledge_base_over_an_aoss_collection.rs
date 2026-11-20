@@ -379,7 +379,7 @@ pub async fn active_collection(router: &MultiServiceRouter, name: &str) -> Value
 
 /// The index body a Bedrock knowledge base's vector index is created with, of `dimension`
 /// values: the body `opensearch-py`'s `indices.create` carries for one.
-fn knn_index_body(dimension: usize) -> Value {
+pub fn knn_index_body(dimension: usize) -> Value {
     json!({
         "settings": { "index": { "knn": true } },
         "mappings": { "properties": {
