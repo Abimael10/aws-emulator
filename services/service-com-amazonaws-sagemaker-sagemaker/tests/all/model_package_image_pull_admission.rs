@@ -5,12 +5,14 @@
 //! mounted service), so what is asserted is what a client sees.
 //!
 //! RULE: a model package is registered only around inference container images SageMaker can
-//! PULL for the request — Amazon ECR is per account and per Region, so the registry it pulls
-//! from is this account's own registry in the Region the request is made in. An image path
-//! addressing any OTHER Amazon ECR registry (another account's, or another Region's) is
-//! refused 400 `ValidationException` naming the registry id and the repository the path
-//! carries, and registers nothing; a path addressing no Amazon ECR registry at all is left to
-//! the format rule `model_package_admission` covers.
+//! PULL for the request — Amazon ECR is per account and per Region, so the registries it pulls
+//! from are this account's own registry in the Region the request is made in and the registries
+//! AWS itself publishes its SageMaker containers from in that Region (those are
+//! `model_package_aws_provided_container`'s rows). An image path addressing any OTHER Amazon
+//! ECR registry (a third account's, or another Region's) is refused 400 `ValidationException`
+//! naming the registry id and the repository the path carries, and registers nothing; a path
+//! addressing no Amazon ECR registry at all is left to the format rule
+//! `model_package_admission` covers.
 //!
 //! The rows below span what that generalises over: the registry's account and Region against
 //! the request's, the tag-versus-digest form, the repository's depth, the host's case, the
@@ -169,13 +171,31 @@ fn rows() -> Vec<Row> {
             image: "registry.example.com:5000/inference".to_string(),
             refused: None,
         },
+        // An AWS-published registry of the request's Region: SageMaker pulls it for every
+        // account, so it is admitted beside this account's own
+        // (`model_package_aws_provided_container` tables that family).
+        Row {
+            case: "a registry AWS publishes its containers from, in the request's Region",
+            region: "us-west-2",
+            image: format!("{}/xgboost:1", registry("433757028032", "us-west-2")),
+            refused: None,
+        },
+        // The same account written into ANOTHER Region's host addresses no registry AWS
+        // publishes from, so it is refused like any third account's.
+        Row {
+            case: "an AWS registry account inside another Region's host",
+            region: default,
+            image: format!("{}/xgboost:1", registry("433757028032", default)),
+            refused: Some(("433757028032".to_string(), "xgboost".to_string())),
+        },
     ]
 }
 
-/// RULE: a registration is admitted exactly when every inference container's image addresses
-/// this account's Amazon ECR registry in the Region of the request (or no Amazon ECR registry
-/// at all); any other Amazon ECR reference is refused 400 `ValidationException` naming that
-/// registry and repository, and registers nothing.
+/// RULE: a registration is admitted exactly when every inference container's image addresses a
+/// registry this request can pull from — this account's own Amazon ECR registry in the Region
+/// of the request, or one AWS publishes its SageMaker containers from in that Region — or no
+/// Amazon ECR registry at all; any other Amazon ECR reference is refused 400
+/// `ValidationException` naming that registry and repository, and registers nothing.
 #[tokio::test]
 async fn a_model_package_is_registered_only_around_an_image_this_request_can_pull() {
     let emulator = Emulator::new();

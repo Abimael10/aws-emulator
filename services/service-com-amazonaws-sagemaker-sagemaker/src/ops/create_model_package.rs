@@ -294,20 +294,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // And the registry the path addresses has to be one SageMaker can pull from on this
-        // account's behalf — this account's own Amazon ECR registry, in the Region the
-        // request is made in. A path addressing another account's registry or another
-        // Region's names an image no pull of this request's can reach, which the recorded
-        // registration refuses naming that registry and repository (see
-        // `crate::state::image_pull`), rather than registering a package around an artifact
-        // nothing can deploy.
+        // And the registry the path addresses has to be one the pull SageMaker makes for
+        // this request can reach: Amazon ECR is per account and per Region, so that pull is
+        // made in the Region the request is made in, into this account's own registry there
+        // or into one AWS itself publishes its SageMaker containers from in that Region — the
+        // algorithm, framework and deep-learning registries whose repositories grant
+        // SageMaker the pull for any account. A path addressing any other registry names an
+        // image no pull of this request's can reach, which the recorded registration refuses
+        // naming that registry and repository (see `crate::state::image_pull`), rather than
+        // registering a package around an artifact nothing can deploy.
         //
         // Unless the request asked for its model validation to be SKIPPED: resolving the
         // containers the registration points at is part of the validation
         // `SkipModelValidation` turns off ("Indicates if you want to skip model
         // validation"), so a registration asking to skip it is admitted around whatever
         // image path it names — which is what lets a caller register a package whose
-        // container this account cannot pull. The path's FORM is still settled above: that
+        // container this request cannot pull. The path's FORM is still settled above: that
         // is a property of the value the request carries, not of the model it registers.
         let skip_model_validation =
             crate::state::model_validation_is_skipped(input.skip_model_validation.as_deref());

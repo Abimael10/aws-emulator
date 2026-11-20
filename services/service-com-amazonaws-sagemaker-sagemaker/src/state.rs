@@ -199,6 +199,12 @@ pub use image_digest::{
     registry_image_digest, resolved_image_digest,
 };
 
+/// The AWS-PUBLISHED CONTAINER REGISTRY slice: the Amazon ECR registries AWS itself publishes
+/// SageMaker's algorithm, framework and deep-learning containers from, by Region. Re-exported
+/// below, so a handler names them as `crate::state::…` like every other slice.
+pub mod aws_container_registry;
+pub use aws_container_registry::aws_publishes_from;
+
 /// The IMAGE PULL slice: whether SageMaker can pull the container image a registration
 /// references out of Amazon ECR, and the sentence a reference it cannot pull is refused with.
 /// Re-exported below, so a handler names them as `crate::state::…` like every other slice.
