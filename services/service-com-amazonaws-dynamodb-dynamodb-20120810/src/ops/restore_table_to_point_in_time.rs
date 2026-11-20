@@ -18,7 +18,9 @@
 //! whose point-in-time recovery is off has no point in time to restore to
 //! (`PointInTimeRecoveryUnavailableException`), and a request outside the window those
 //! settings derive ([`crate::state::PointInTimeRecovery::restorable_window`]) is the
-//! `InvalidRestoreTimeException` the model declares. The restored data is the source
+//! `InvalidRestoreTimeException` the model declares, which STATES that window: the instant
+//! asked for, both bounds and the table they belong to ([`invalid_restore_time`]). The
+//! restored data is the source
 //! table's own items: this store keeps a table's current contents rather than a history
 //! of them, so the state it can restore is the one at the newest restorable point.
 //!
@@ -292,8 +294,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(recovery_unavailable(&source_name));
         };
         // The point in time this restore reads the source table at: the one the request
-        // names, or the newest restorable one where it asks for the latest.
-        let point = restore_point(&input, earliest, latest)?;
+        // names, or the newest restorable one where it asks for the latest. A point
+        // outside the window is refused naming that window and the table it belongs to,
+        // so the two bounds and the source name travel with the request's own instant.
+        let point = restore_point(&input, earliest, latest, &source_name)?;
 
         let (billing_mode, provisioned_throughput) =
             restored_capacity(&input, source).map_err(bad_request)?;
@@ -681,19 +685,20 @@ fn resolved_source(
 /// the latest possible time" (`$UseLatestRestorableTime`). The two selectors name
 /// different instants, so a request that sets both names no single point, and one that
 /// sets neither names none at all. A named instant must lie inside the restorable window,
-/// which is what `InvalidRestoreTimeException` states: "RestoreDateTime must be between
-/// EarliestRestorableDateTime and LatestRestorableDateTime".
+/// and one that does not is the refusal that names that window
+/// ([`invalid_restore_time`]).
 fn restore_point(
     input: &RestoreTableToPointInTimeInput,
     earliest: ::std::time::SystemTime,
     latest: ::std::time::SystemTime,
+    table: &str,
 ) -> Result<::std::time::SystemTime, RestoreTableToPointInTimeError> {
     let use_latest = input.use_latest_restorable_time.unwrap_or(false);
     match (use_latest, input.restore_date_time.as_ref()) {
         (true, None) => Ok(latest),
         (false, Some(requested)) => {
-            let point = ::std::time::SystemTime::try_from(*requested)
-                .map_err(|_| invalid_restore_time())?;
+            let outside = || invalid_restore_time(*requested, earliest, latest, table);
+            let point = ::std::time::SystemTime::try_from(*requested).map_err(|_| outside())?;
             // The window's bounds are reported at the precision a timestamp carries on
             // the wire, and the point is read back at that same precision
             // ([`crate::state::at_nearest_timestamp_precision`]), so a client that sends
@@ -701,14 +706,20 @@ fn restore_point(
             // landing a fraction outside it.
             let point = crate::state::at_nearest_timestamp_precision(point);
             if point < earliest || point > latest {
-                return Err(invalid_restore_time());
+                return Err(outside());
             }
             Ok(point)
         }
-        (true, Some(_)) => Err(crate::scaffolded::Scaffolded::validation(
-            "One or more parameter values were invalid: RestoreDateTime cannot be specified \
-             when UseLatestRestorableTime is true",
-        )),
+        // The two selectors name DIFFERENT instants, so a request that sets both names no
+        // single point: the refusal states which pair contradicts itself and which of the
+        // two the caller has to keep, under the sentence this surface states a request it
+        // cannot act on with ([`crate::state::INVALID_REQUEST_PREFIX`]).
+        (true, Some(_)) => Err(crate::scaffolded::Scaffolded::validation(format!(
+            "{}Both RestoreDateTime and UseLatestRestorableTime cannot be set for \
+             point-in-time restore request. Please specify either RestoreDateTime time or \
+             UseLatestRestorableTime",
+            crate::state::INVALID_REQUEST_PREFIX
+        ))),
         (false, None) => Err(crate::scaffolded::Scaffolded::validation(
             "One or more parameter values were invalid: either RestoreDateTime or \
              UseLatestRestorableTime must be specified",
@@ -716,25 +727,48 @@ fn restore_point(
     }
 }
 
-/// The modelled refusal of a point in time outside the source table's restorable window,
-/// worded as the model states the error: "An invalid restore time was specified.
-/// RestoreDateTime must be between EarliestRestorableDateTime and
-/// LatestRestorableDateTime" (`InvalidRestoreTimeException`), with the two member names
-/// standing for the window as the recorded refusal of this operation writes them.
+/// The modelled refusal of a point in time outside the source table's restorable window.
 ///
-/// The window's own bounds are NOT echoed: they move with the clock, and
-/// `DescribeContinuousBackups` is where a caller reads them.
-fn invalid_restore_time() -> RestoreTableToPointInTimeError {
+/// The sentence states WHICH window the instant missed: the instant the request named, the
+/// two bounds the source table's own continuous-backups settings derive
+/// ([`crate::state::PointInTimeRecovery::restorable_window`]) and the table they belong to,
+/// each interpolated into the fixed frame DynamoDB refuses such a restore with. The members
+/// it names are the ones `InvalidRestoreTimeException` is documented against —
+/// "RestoreDateTime must be between EarliestRestorableDateTime and
+/// LatestRestorableDateTime" — so a caller reads the window it has to correct the request
+/// to out of the refusal itself rather than from a second call.
+fn invalid_restore_time(
+    requested: ::aws_smithy_types::DateTime,
+    earliest: ::std::time::SystemTime,
+    latest: ::std::time::SystemTime,
+    table: &str,
+) -> RestoreTableToPointInTimeError {
     RestoreTableToPointInTimeErrorModeled::InvalidRestoreTimeException(
         InvalidRestoreTimeException {
-            message: Some(
-                "An invalid restore time was specified. RestoreDateTime must be between \
-                 EarliestRestorableDateTime and LatestRestorableDateTime"
-                    .to_string(),
-            ),
+            message: Some(format!(
+                "RestoreDateTime '{}' must be within EarliestRestorableDateTime '{}' and \
+                 LatestRestorableDateTime '{}' for table '{table}'",
+                refusal_instant(requested),
+                refusal_instant(::aws_smithy_types::DateTime::from(earliest)),
+                refusal_instant(::aws_smithy_types::DateTime::from(latest)),
+            )),
         },
     )
     .into()
+}
+
+/// One instant as this refusal names it: the date-time form (`2020-09-13T12:26:40Z`), at
+/// WHOLE-SECOND resolution, which is the precision DynamoDB states a restore window's
+/// bounds and the instant that missed them at — finer digits would state a precision the
+/// sentence does not carry, and a client comparing what it sent with what it reads back
+/// would see two different renderings of one instant.
+///
+/// An instant too far out to render in that form at all is named by the epoch second it
+/// carries, so a refusal always names the value the request sent.
+fn refusal_instant(instant: ::aws_smithy_types::DateTime) -> String {
+    ::aws_smithy_types::DateTime::from_secs(instant.secs())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| instant.secs().to_string())
 }
 
 /// The first input member present that no stored table carries yet, if any.

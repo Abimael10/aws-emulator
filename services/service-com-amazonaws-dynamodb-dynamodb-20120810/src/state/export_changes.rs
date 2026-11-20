@@ -34,6 +34,35 @@ pub const MIN_INCREMENTAL_EXPORT_PERIOD: Duration = Duration::from_secs(15 * 60)
 pub const INCREMENTAL_EXPORT_PERIOD_TOO_SHORT_MESSAGE: &str =
     "Difference between export period from time and export period to time is less than 15 minutes";
 
+/// How an INCREMENTAL export that states no period at all is refused: the sentence
+/// DynamoDB answers that request with, under the one it states a request it cannot act on
+/// with ([`INVALID_REQUEST_PREFIX`]).
+///
+/// Fixed text with no variable part: it names the specification the export cannot be taken
+/// without and the kind of export that requires it — "If INCREMENTAL_EXPORT is provided,
+/// the IncrementalExportSpecification must also be used" (`$ExportType`) — rather than the
+/// absent member's own wire path, because what is wrong is the PAIR the request stated.
+pub const INCREMENTAL_SPECIFICATION_EXPECTED_MESSAGE: &str =
+    "Incremental Export Specification expected when export type is set as Incremental Export";
+
+/// How a FULL export that states an incremental period is refused: the sentence DynamoDB
+/// answers that request with, under the same one.
+///
+/// Fixed text with no variable part, and AWS's own spacing before the comma: the period is
+/// the incremental export's own, so the kind of export the request asked for is what makes
+/// the member one it cannot carry.
+pub const INCREMENTAL_SPECIFICATION_UNEXPECTED_MESSAGE: &str =
+    "When Export Type is Full Export , Incremental Export Specification should not be provided";
+
+/// How an incremental export whose period names no START is refused: the sentence DynamoDB
+/// answers that request with, under the same one.
+///
+/// Fixed text with no variable part: it names the member the period cannot be resolved
+/// without — the "inclusive start range" of the period (`$ExportFromTime`) — and the
+/// specification it belongs to.
+pub const EXPORT_FROM_TIME_EXPECTED_MESSAGE: &str =
+    "ExportFromTime must be provided in IncrementalExportSpecification";
+
 /// The `ExportViewType` an incremental export that names none is taken with: "The view
 /// type that was chosen for the export. Valid values are NEW_AND_OLD_IMAGES and
 /// NEW_IMAGES. The default value is NEW_AND_OLD_IMAGES"
@@ -44,11 +73,9 @@ pub const DEFAULT_EXPORT_VIEW_TYPE: &str = "NEW_AND_OLD_IMAGES";
 /// each changed item.
 pub const EXPORT_VIEW_TYPE_NEW_IMAGE: &str = "NEW_IMAGE";
 
-/// How a refusal names the incremental specification and its members: the paths the
-/// request validator reports a violation of them against, as the model spells them on the
-/// wire (lowerCamel).
-pub const INCREMENTAL_SPECIFICATION_MEMBER_PATH: &str = "incrementalExportSpecification";
-pub const EXPORT_FROM_TIME_MEMBER_PATH: &str = "incrementalExportSpecification.exportFromTime";
+/// How a refusal names a member of the incremental specification: the path the request
+/// validator reports a violation of it against, as the model spells it on the wire
+/// (lowerCamel).
 pub const EXPORT_VIEW_TYPE_MEMBER_PATH: &str = "incrementalExportSpecification.exportViewType";
 
 /// One change an incremental export writes: the item's key, the images on either side of
@@ -204,7 +231,9 @@ pub fn resolved_incremental_window(
     let Some(requested) = requested else {
         return if incremental {
             Err(IncrementalRefusal::Request(RequestError::Validation(
-                absent_member_message(INCREMENTAL_SPECIFICATION_MEMBER_PATH),
+                format!(
+                    "{INVALID_REQUEST_PREFIX}{INCREMENTAL_SPECIFICATION_EXPECTED_MESSAGE}"
+                ),
             )))
         } else {
             Ok(None)
@@ -212,17 +241,7 @@ pub fn resolved_incremental_window(
     };
     if !incremental {
         return Err(IncrementalRefusal::Request(RequestError::Validation(
-            format!(
-                "{INVALID_REQUEST_PREFIX}{}",
-                validation_message([constraint_clause(
-                    INCREMENTAL_SPECIFICATION_MEMBER_PATH,
-                    None,
-                    &format!(
-                        "Member must only be stated for exportType {EXPORT_TYPE_INCREMENTAL}"
-                    ),
-                )])
-                .unwrap_or_default()
-            ),
+            format!("{INVALID_REQUEST_PREFIX}{INCREMENTAL_SPECIFICATION_UNEXPECTED_MESSAGE}"),
         )));
     }
     // The view the records are written in, held to the value set the model declares for the
@@ -240,7 +259,7 @@ pub fn resolved_incremental_window(
     };
     let Some(from) = requested.export_from_time else {
         return Err(IncrementalRefusal::Request(RequestError::Validation(
-            absent_member_message(EXPORT_FROM_TIME_MEMBER_PATH),
+            format!("{INVALID_REQUEST_PREFIX}{EXPORT_FROM_TIME_EXPECTED_MESSAGE}"),
         )));
     };
     // Each instant is read back at the precision this service reports a timestamp at, so a

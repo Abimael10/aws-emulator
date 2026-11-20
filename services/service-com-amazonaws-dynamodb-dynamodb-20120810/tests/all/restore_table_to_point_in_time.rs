@@ -562,14 +562,14 @@ async fn a_restore_the_source_table_cannot_serve_is_refused_as_the_modelled_erro
             json!({"SourceTableName": "PitrServed", "TargetTableName": "PitrOut3",
                    "RestoreDateTime": far_past}),
             "InvalidRestoreTimeException",
-            "RestoreDateTime must be between",
+            "must be within EarliestRestorableDateTime",
         ),
         (
             "a point in time after the window's newest point",
             json!({"SourceTableName": "PitrServed", "TargetTableName": "PitrOut4",
                    "RestoreDateTime": future}),
             "InvalidRestoreTimeException",
-            "RestoreDateTime must be between",
+            "must be within EarliestRestorableDateTime",
         ),
         (
             "no point in time at all",
