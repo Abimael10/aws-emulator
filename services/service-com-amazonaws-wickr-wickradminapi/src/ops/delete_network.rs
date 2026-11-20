@@ -174,20 +174,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Users and security groups exist only inside a network, so they go with it;
         // `remove_network` is the one place that drops the whole subtree, including the
         // username index, so no part of a deleted network can be left behind.
-        let Some(users_removed) = store.remove_network(&input.network_id) else {
+        if store.remove_network(&input.network_id).is_none() {
             return Err(DeleteNetworkErrorModeled::ResourceNotFoundError(
                 ResourceNotFoundError {
                     message: Some(format!("network {} does not exist", input.network_id)),
                 },
             )
             .into());
-        };
+        }
 
         Ok(DeleteNetworkOutput {
-            message: Some(format!(
-                "network {} and its {users_removed} users were deleted",
-                input.network_id,
-            )),
+            message: Some(DELETION_INITIATED_MESSAGE.to_string()),
+            // Echoes the `networkId` path label of the request, which is what lets a client
+            // correlate this answer with the delete it sent.
+            network_id: Some(input.network_id),
         })
     }
 }
+
+/// The sentence this operation's success body states the deletion in.
+///
+/// FIXED text, and it says "initiated": the model documents this member as "A message
+/// indicating that the network deletion has been initiated successfully"
+/// (`DeleteNetworkResponse$message`), so the sentence states that the deletion has STARTED
+/// and embeds no id, no count and no timestamp — nothing a caller could read as a
+/// completion tally. What identifies the network is the response's own `networkId`.
+const DELETION_INITIATED_MESSAGE: &str = "Network deletion initiated successfully";

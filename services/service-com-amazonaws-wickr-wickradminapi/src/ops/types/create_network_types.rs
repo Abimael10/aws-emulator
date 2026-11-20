@@ -20,11 +20,150 @@ pub struct CreateNetworkInput {
     pub encryption_key_arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wickr#CreateNetworkResponse")]
+/// `CreateNetwork`'s response, with its schema and codec written out instead of derived.
+///
+/// WHY: the response AWS really sends carries a `message` confirming the create beside the
+/// created network's identifiers, and the on-disk model declares only
+/// `networkId`/`networkName`/`encryptionKeyArn`
+/// (`smithy_query(query="operation",operation="CreateNetwork")`), so the model is stale
+/// here. The sibling write shapes model exactly this pairing — `CreateBotResponse` and
+/// `DeleteSecurityGroupResponse` both declare `message` beside the ids of what was touched
+/// — so the member is the shape family's, not an invention.
+/// `#[smithy_macros::smithy(shape = ...)]` admits exactly the model's member list, so a
+/// member the model omits cannot be declared through the derive at all.
+///
+/// Everything mirrors the macro's output: one `M_<MEMBER>` schema per member (index =
+/// position in the member list), the `SCHEMA` naming them in that order, the
+/// `CREATE_NETWORK_OUTPUT_SCHEMA` alias and the serialize/deserialize pair. The model's own
+/// members keep the indexes the model gives them, and the member the model omits is
+/// appended LAST with its shape id in [`RECORDED_NAMESPACE`] — so a model refresh only has
+/// to move it into place and put the derive back.
 #[derive(Debug, Clone, Default)]
 pub struct CreateNetworkOutput {
     pub network_id: Option<String>,
     pub network_name: Option<String>,
     pub encryption_key_arn: Option<String>,
+    /// The sentence confirming the create, which the model does not declare on this shape.
+    pub message: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl CreateNetworkOutput {
+    const NAMESPACE: &'static str = "com.amazonaws.wickr";
+
+    pub const M_NETWORK_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.wickr#CreateNetworkResponse$networkId",
+            Self::NAMESPACE,
+            "networkId",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "networkId",
+        0,
+    );
+
+    pub const M_NETWORK_NAME: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.wickr#CreateNetworkResponse$networkName",
+                Self::NAMESPACE,
+                "networkName",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "networkName",
+            1,
+        );
+
+    pub const M_ENCRYPTION_KEY_ARN: ::aws_smithy_schema::Schema =
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                "com.amazonaws.wickr#CreateNetworkResponse$encryptionKeyArn",
+                Self::NAMESPACE,
+                "encryptionKeyArn",
+            ),
+            ::aws_smithy_schema::ShapeType::String,
+            "encryptionKeyArn",
+            2,
+        );
+
+    /// The member the on-disk model does not declare; see [`RECORDED_NAMESPACE`].
+    pub const M_MESSAGE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.wickr.recorded#CreateNetworkResponse$message",
+            RECORDED_NAMESPACE,
+            "message",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "message",
+        3,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.wickr#CreateNetworkResponse",
+            Self::NAMESPACE,
+            "CreateNetworkResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_NETWORK_ID,
+            &Self::M_NETWORK_NAME,
+            &Self::M_ENCRYPTION_KEY_ARN,
+            &Self::M_MESSAGE,
+        ],
+    );
+}
+
+pub static CREATE_NETWORK_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &CreateNetworkOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CreateNetworkOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.network_id.as_ref() {
+            serializer.write_string(&Self::M_NETWORK_ID, value.as_str())?;
+        }
+        if let Some(value) = self.network_name.as_ref() {
+            serializer.write_string(&Self::M_NETWORK_NAME, value.as_str())?;
+        }
+        if let Some(value) = self.encryption_key_arn.as_ref() {
+            serializer.write_string(&Self::M_ENCRYPTION_KEY_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.message.as_ref() {
+            serializer.write_string(&Self::M_MESSAGE, value.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for CreateNetworkOutput {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut network_id: Option<String> = None;
+        let mut network_name: Option<String> = None;
+        let mut encryption_key_arn: Option<String> = None;
+        let mut message: Option<String> = None;
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => network_id = Some(d.read_string(&Self::M_NETWORK_ID)?),
+                Some(1) => network_name = Some(d.read_string(&Self::M_NETWORK_NAME)?),
+                Some(2) => {
+                    encryption_key_arn = Some(d.read_string(&Self::M_ENCRYPTION_KEY_ARN)?);
+                }
+                Some(3) => message = Some(d.read_string(&Self::M_MESSAGE)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            network_id,
+            network_name,
+            encryption_key_arn,
+            message,
+        })
+    }
 }
 

@@ -11,6 +11,21 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-wickr-wickradminapi.json");
 
+/// The namespace a response member the on-disk model does not declare has its own shape
+/// id in: NOT this service's, so a member this service answers with can neither claim to
+/// be modelled nor collide with a shape a later model refresh declares.
+///
+/// `#[smithy_macros::smithy(shape = ...)]` derives a structure's schema and codec from the
+/// model's member list and admits EXACTLY that list — a Rust field with no member behind it
+/// is a compile error — so a member the service answers with and the model omits is written
+/// out by hand (see `create_network_types` and `delete_network_types`) with its member
+/// schema in this namespace.
+///
+/// Those member schemas take this constant for their namespace. Their ABSOLUTE ids are
+/// still written out as one literal each, because a shape id is built in a `const` and the
+/// absolute form cannot be concatenated there — keep the two spellings in step.
+pub const RECORDED_NAMESPACE: &str = "com.amazonaws.wickr.recorded";
+
 #[smithy_macros::smithy(shape = "com.amazonaws.wickr#User")]
 #[derive(Debug, Clone, Default)]
 pub struct User {

@@ -39,9 +39,20 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! FOUR seams are taken here, three of them for one reason: every response of this service
+//! carries the envelope stated in [`response_envelope`] — the charset-qualified media type
+//! and an entity tag over the body — which is a property of the channel rather than of any
+//! one operation, so it is applied at every seam that can answer: the centralized walk
+//! (`override_operation`), an unroutable request (`override_routing_error`) and a
+//! transport-level failure (`override_framework_error`). Routing, status, codes, messages
+//! and every body byte stay with the framework.
 
+pub mod response_envelope;
+
+use response_envelope::ResponseEnvelopeOperation;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -52,6 +63,11 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The wrapper every routed request is served through, which runs the routing table's
+    /// own entry and answers it in this service's envelope (see [`response_envelope`]).
+    /// Held in a field, built once, because `override_operation` hands back a reference to
+    /// it.
+    envelope: ResponseEnvelopeOperation,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +77,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            envelope: ResponseEnvelopeOperation::new(),
         }
     }
 }
@@ -87,12 +104,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Every request the generated routing table can serve is served through the
+        // envelope wrapper, which delegates to that same routing-table entry and then puts
+        // this service's response envelope on what it answered (see
+        // [`response_envelope`]). Routing stays the model's: a request the table cannot
+        // serve is declined here, so the framework answers it as the unroutable request it
+        // is — through `override_routing_error` below, which puts the same envelope on it.
+        let definition: &dyn ErasedServiceDefinition = &self.entry;
+        service_common::response_media_type::routes(definition, req).then_some(&self.envelope as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -130,13 +149,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
-        // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // modeled operation — neither `override_operation` nor the generated routing table
+        // resolved it. The entry's own protocol-correct rendering is kept, word for word
+        // and status for status; only this service's response envelope is put on it (see
+        // [`response_envelope`]).
+        let definition: &dyn ErasedServiceDefinition = &self.entry;
+        Some(response_envelope::enveloped(
+            definition.routing_error_response(req),
+        ))
     }
 
     fn override_framework_error(
@@ -145,11 +165,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this on a transport-level failure it detects up front —
         // before (or instead of) naming an operation — such as a malformed
-        // `aws-chunked` body. Returning `None` keeps the entry's protocol-correct
-        // rendering. Return `Some(resp)` to reword that failure in your own
-        // envelope. The error is borrowed, so the default renderer can still
-        // consume it on `None`.
-        let _ = error;
-        None
+        // `aws-chunked` body. It is handed the failure ALONE, with no request to resolve an
+        // envelope from, so the one variant the router raises here is rebuilt, rendered in
+        // the JSON pre-dispatch envelope and answered with this service's response
+        // envelope on it; every other variant declines to `None`, keeping the framework's
+        // own rendering of a failure that cannot be rebuilt rather than losing what it
+        // said. That rebuild is `service_common`'s, not restated here.
+        service_common::response_media_type::reannounced_framework_error(
+            response_envelope::RESPONSE_MEDIA_TYPE,
+            error,
+        )
+        .map(response_envelope::enveloped)
     }
 }

@@ -27,6 +27,15 @@
 //!   `GetNetworkSettings` "retrieves all network-level settings" as
 //!   `Setting{optionName, value, type}`, with a boolean "represented as 'true' or
 //!   'false'" (`Setting$value` documentation).
+//! * A write operation's success envelope is the one its wire record states: the network
+//!   create answers 201 Created, a success `message` is the service's fixed sentence for
+//!   that operation — `DeleteNetworkResponse$message` is documented "A message indicating
+//!   that the network deletion has been initiated successfully" — interpolating no value of
+//!   the request or of the state, and the identifiers of the resource acted on are echoed
+//!   beside it as members (`DeleteSecurityGroupResponse` and `CreateBotResponse` model
+//!   `message` beside `networkId`/`groupId`).
+//! * Every response of this service, on every status, announces `application/json;
+//!   charset=utf-8` and carries an `etag` over its body.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -47,6 +56,12 @@ fn emulator() -> MultiServiceRouter {
     router
 }
 
+/// The status `CreateNetwork` answers a create it carried out with: 201 Created, which is
+/// what the recorded wire shows for the network create (the on-disk model's `@http` binding
+/// says 200 and is stale; see `src/ops/create_network.rs`). Named once here, so every case
+/// that creates a network reads the same value.
+const CREATE_NETWORK_STATUS: u16 = 201;
+
 /// One request/response round trip: the HTTP status and the parsed JSON body.
 async fn call(
     router: &MultiServiceRouter,
@@ -54,6 +69,18 @@ async fn call(
     uri: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    let (status, _headers, parsed) = call_with_headers(router, method, uri, body).await;
+    (status, parsed)
+}
+
+/// The same round trip, with the response HEADERS a client reads: the status, every
+/// response header as `name -> value`, and the parsed JSON body.
+async fn call_with_headers(
+    router: &MultiServiceRouter,
+    method: &str,
+    uri: &str,
+    body: Option<Value>,
+) -> (u16, BTreeMap<String, String>, Value) {
     let payload = body
         .map(|value| serde_json::to_vec(&value).expect("serialize the request body"))
         .unwrap_or_default();
@@ -74,6 +101,16 @@ async fn call(
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let headers: BTreeMap<String, String> = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_ascii_lowercase(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
     let raw = response.into_body();
     let parsed = if raw.is_empty() {
         Value::Null
@@ -81,7 +118,7 @@ async fn call(
         serde_json::from_slice(&raw)
             .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&raw).into_owned()))
     };
-    (status, parsed)
+    (status, headers, parsed)
 }
 
 /// Create a network and return its minted id, failing the test if it was refused.
@@ -94,8 +131,9 @@ async fn create_network(router: &MultiServiceRouter, name: &str, access_level: &
     )
     .await;
     assert_eq!(
-        status, 200,
-        "CreateNetwork {name:?}/{access_level}: expected 200, got {status} with {body}"
+        status, CREATE_NETWORK_STATUS,
+        "CreateNetwork {name:?}/{access_level}: expected {CREATE_NETWORK_STATUS}, got {status} \
+         with {body}"
     );
     body["networkId"]
         .as_str()
@@ -185,8 +223,8 @@ async fn the_network_and_user_lifecycle_round_trips_through_stored_state() {
     )
     .await;
     assert_eq!(
-        status, 200,
-        "CreateNetwork: expected 200, got {status} with {created}"
+        status, CREATE_NETWORK_STATUS,
+        "CreateNetwork: expected {CREATE_NETWORK_STATUS}, got {status} with {created}"
     );
     let network_id = created["networkId"].as_str().unwrap_or_default().to_string();
     assert!(
@@ -453,8 +491,9 @@ async fn create_network_enforces_the_documented_network_name_bound() {
         .await;
         if *accepted {
             assert_eq!(
-                status, 200,
-                "case {case:?} ({length} characters): expected 200, got {status} with {body}"
+                status, CREATE_NETWORK_STATUS,
+                "case {case:?} ({length} characters): expected {CREATE_NETWORK_STATUS}, got \
+                 {status} with {body}"
             );
             assert_eq!(
                 body["networkName"],
@@ -489,8 +528,9 @@ async fn create_network_enforces_the_documented_network_name_bound() {
     )
     .await;
     assert_eq!(
-        status, 200,
-        "case \"20 multi-byte characters\": expected 200, got {status} with {body}"
+        status, CREATE_NETWORK_STATUS,
+        "case \"20 multi-byte characters\": expected {CREATE_NETWORK_STATUS}, got {status} with \
+         {body}"
     );
 }
 
@@ -552,8 +592,8 @@ async fn a_premium_free_trial_is_reported_only_when_it_was_asked_for() {
         )
         .await;
         assert_eq!(
-            status, 200,
-            "case {case:?}: expected 200, got {status} with {created}"
+            status, CREATE_NETWORK_STATUS,
+            "case {case:?}: expected {CREATE_NETWORK_STATUS}, got {status} with {created}"
         );
         let network_id = created["networkId"].as_str().unwrap_or_default();
         let (_, fetched) = call(&router, "GET", &format!("/networks/{network_id}"), None).await;
@@ -1494,4 +1534,367 @@ async fn a_network_id_outside_the_modelled_pattern_is_refused() {
             );
         }
     }
+}
+
+/// The sentence `CreateNetwork` confirms a create with. FIXED text: it names neither the
+/// network nor its id, so it is one value for every create.
+const CREATED_MESSAGE: &str = "Network created successfully";
+
+/// The sentence `DeleteNetwork` states the deletion with, which the model documents as "A
+/// message indicating that the network deletion has been initiated successfully"
+/// (`DeleteNetworkResponse$message`). FIXED text, embedding no id, no count and no
+/// timestamp.
+const DELETION_INITIATED_MESSAGE: &str = "Network deletion initiated successfully";
+
+/// The media type every response of this service announces, charset parameter included.
+const ANNOUNCED_MEDIA_TYPE: &str = "application/json; charset=utf-8";
+
+/// One row of the create table: what the case is called, and the request body it sends.
+type CreateCase = (&'static str, Value);
+
+/// `CreateNetwork` answers 201 Created and states the create in the fixed `message` beside
+/// the created network's identifiers.
+///
+/// The rows span what a create can vary along — the name (short, at the documented
+/// 20-character maximum, multi-byte), the access level (both `AccessLevel` values), the
+/// optional premium free trial (set and unset) and the optional `encryptionKeyArn` (present
+/// and absent) — because the status and the sentence are the same for all of them: the
+/// confirmation carries nothing of the request, and the identifiers carry everything that
+/// is of it. Each row is also read back through `GetNetwork`, so the response is what was
+/// stored rather than what was sent.
+#[tokio::test]
+async fn create_network_answers_created_with_the_fixed_confirmation() {
+    let key_arn = "arn:aws:kms:us-east-1:000000000000:key/9b1c-demo";
+    let cases: &[CreateCase] = &[
+        (
+            "the shortest name, STANDARD",
+            json!({ "networkName": "n", "accessLevel": "STANDARD" }),
+        ),
+        (
+            "a name at the documented maximum, PREMIUM",
+            json!({ "networkName": "n".repeat(20), "accessLevel": "PREMIUM" }),
+        ),
+        (
+            "a multi-byte name",
+            json!({ "networkName": "üüü-net", "accessLevel": "STANDARD" }),
+        ),
+        (
+            "the premium free trial asked for",
+            json!({
+                "networkName": "trial-net",
+                "accessLevel": "PREMIUM",
+                "enablePremiumFreeTrial": true,
+            }),
+        ),
+        (
+            "the premium free trial declined",
+            json!({
+                "networkName": "no-trial-net",
+                "accessLevel": "STANDARD",
+                "enablePremiumFreeTrial": false,
+            }),
+        ),
+        (
+            "a customer managed key",
+            json!({
+                "networkName": "keyed-net",
+                "accessLevel": "STANDARD",
+                "encryptionKeyArn": key_arn,
+            }),
+        ),
+    ];
+
+    let router = emulator();
+    for (case, request) in cases {
+        let (status, created) = call(&router, "POST", "/networks", Some(request.clone())).await;
+        assert_eq!(
+            status, CREATE_NETWORK_STATUS,
+            "case {case:?}: expected the created status {CREATE_NETWORK_STATUS}, got {status} \
+             with {created}"
+        );
+        assert_eq!(
+            created["message"],
+            json!(CREATED_MESSAGE),
+            "case {case:?}: expected the fixed confirmation {CREATED_MESSAGE:?}, got {created}"
+        );
+
+        let network_id = created["networkId"].as_str().unwrap_or_default().to_string();
+        assert!(
+            is_network_id(&network_id),
+            "case {case:?}: networkId must match ^[0-9]{{8}}$, got {network_id:?}"
+        );
+        // The confirmation is FIXED: nothing the request carried, and nothing the create
+        // minted, is interpolated into it. Values shorter than a word are skipped, since a
+        // single letter can occur in any English sentence without having been interpolated.
+        let message = created["message"].as_str().unwrap_or_default();
+        for value in [
+            network_id.as_str(),
+            request["networkName"].as_str().unwrap_or_default(),
+            request["accessLevel"].as_str().unwrap_or_default(),
+        ] {
+            if value.len() < 3 {
+                continue;
+            }
+            assert!(
+                !message.contains(value),
+                "case {case:?}: the confirmation must name no value of the request or the \
+                 created network, but {message:?} carries {value:?}"
+            );
+        }
+        assert_eq!(
+            created["networkName"], request["networkName"],
+            "case {case:?}: expected the created name back, got {created}"
+        );
+        assert_eq!(
+            created["encryptionKeyArn"],
+            request
+                .get("encryptionKeyArn")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "case {case:?}: expected the request's encryptionKeyArn back, got {created}"
+        );
+
+        // Read back: the create answered from what it stored.
+        let (status, fetched) = call(&router, "GET", &format!("/networks/{network_id}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetNetwork after the create expected 200, got {status} with {fetched}"
+        );
+        for member in ["networkId", "networkName", "accessLevel"] {
+            let expected = match member {
+                "networkId" => json!(network_id),
+                other => request[other].clone(),
+            };
+            assert_eq!(
+                fetched[member], expected,
+                "case {case:?}: GetNetwork {member} must be what the create stored \
+                 ({expected}), got {fetched}"
+            );
+        }
+        // `message` is the create's own confirmation, not a member of the network: a read
+        // of the resource does not carry it.
+        assert_eq!(
+            fetched["message"],
+            Value::Null,
+            "case {case:?}: GetNetwork must carry no create confirmation, got {fetched}"
+        );
+    }
+}
+
+/// `DeleteNetwork` answers the fixed "initiated" sentence and echoes the `networkId` the
+/// request named.
+///
+/// The rows span how much the delete had to remove — a network with no users, one with a
+/// single user, one with several, and one carrying settings — because the sentence is the
+/// same for all of them: it states that the deletion has STARTED and tallies nothing. The
+/// echoed id is the request's own, which is what lets a client correlate the answer.
+#[tokio::test]
+async fn delete_network_states_the_initiated_deletion_and_echoes_the_network_id() {
+    let cases: &[(&str, usize, bool)] = &[
+        ("no users", 0, false),
+        ("one user", 1, false),
+        ("several users", 3, false),
+        ("users and settings", 2, true),
+    ];
+
+    let router = emulator();
+    let mut answered: Vec<String> = Vec::new();
+    for (case, users, with_settings) in cases {
+        let network_id = create_network(&router, &format!("del-{users}-net"), "STANDARD").await;
+        if *users > 0 {
+            let items: Vec<Value> = (0..*users)
+                .map(|index| {
+                    json!({
+                        "username": format!("user-{index}@example.com"),
+                        "securityGroupIds": ["0"],
+                    })
+                })
+                .collect();
+            let (status, body) = call(
+                &router,
+                "POST",
+                &format!("/networks/{network_id}/users"),
+                Some(json!({ "users": items })),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: BatchCreateUser expected 200, got {status} with {body}"
+            );
+        }
+        if *with_settings {
+            let (status, body) = call(
+                &router,
+                "PATCH",
+                &format!("/networks/{network_id}/settings"),
+                Some(json!({ "settings": { "dataRetention": true } })),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: UpdateNetworkSettings expected 200, got {status} with {body}"
+            );
+        }
+
+        let (status, deleted) =
+            call(&router, "DELETE", &format!("/networks/{network_id}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DeleteNetwork expected 200, got {status} with {deleted}"
+        );
+        assert_eq!(
+            deleted["message"],
+            json!(DELETION_INITIATED_MESSAGE),
+            "case {case:?}: expected the fixed sentence {DELETION_INITIATED_MESSAGE:?}, got \
+             {deleted}"
+        );
+        assert_eq!(
+            deleted["networkId"],
+            json!(network_id),
+            "case {case:?}: expected the request's networkId echoed, got {deleted}"
+        );
+        answered.push(deleted["message"].as_str().unwrap_or_default().to_string());
+
+        // The network really went: the delete's sentence is about state that changed.
+        let (status, gone) = call(&router, "GET", &format!("/networks/{network_id}"), None).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: GetNetwork after the delete expected 404, got {status} with {gone}"
+        );
+    }
+
+    // One sentence for every delete, whatever it removed.
+    for sentence in &answered {
+        assert_eq!(
+            sentence, &answered[0],
+            "case \"the sentence across deletes\": every delete must state the same sentence, \
+             got {answered:?}"
+        );
+    }
+}
+
+/// Every response of this service announces the charset-qualified media type and carries an
+/// entity tag over its body — on every status, success and refusal alike.
+///
+/// The rows span the response classes a client can receive: a create (201), a read (200), a
+/// listing (200), an update (200), a delete (200), a refusal a handler raises (422), a
+/// refusal the model's own constraints produce before any handler runs (400) and an error
+/// about stored state (404).
+#[tokio::test]
+async fn every_response_announces_the_charset_and_carries_an_entity_tag() {
+    let router = emulator();
+    let network_id = create_network(&router, "envelope-net", "STANDARD").await;
+
+    let cases: Vec<(&str, &str, String, Option<Value>, u16)> = vec![
+        (
+            "a create",
+            "POST",
+            "/networks".to_string(),
+            Some(json!({ "networkName": "another-net", "accessLevel": "PREMIUM" })),
+            CREATE_NETWORK_STATUS,
+        ),
+        (
+            "a read",
+            "GET",
+            format!("/networks/{network_id}"),
+            None,
+            200,
+        ),
+        ("a listing", "GET", "/networks".to_string(), None, 200),
+        (
+            "an update",
+            "PATCH",
+            format!("/networks/{network_id}/settings"),
+            Some(json!({ "settings": { "dataRetention": true } })),
+            200,
+        ),
+        (
+            "a refusal a handler raises",
+            "POST",
+            "/networks".to_string(),
+            Some(json!({ "networkName": "", "accessLevel": "STANDARD" })),
+            422,
+        ),
+        (
+            "a refusal the model's constraints produce",
+            "GET",
+            "/networks/123".to_string(),
+            None,
+            400,
+        ),
+        (
+            "an error about stored state",
+            "GET",
+            "/networks/99999999".to_string(),
+            None,
+            404,
+        ),
+        (
+            "a delete",
+            "DELETE",
+            format!("/networks/{network_id}"),
+            None,
+            200,
+        ),
+    ];
+
+    for (case, method, uri, body, expected_status) in cases {
+        let (status, headers, answer) = call_with_headers(&router, method, &uri, body).await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected {expected_status}, got {status} with {answer}"
+        );
+        let media_type = headers.get("content-type").cloned();
+        assert_eq!(
+            media_type.as_deref(),
+            Some(ANNOUNCED_MEDIA_TYPE),
+            "case {case:?}: expected content-type {ANNOUNCED_MEDIA_TYPE:?}, got {media_type:?}"
+        );
+        let etag = headers.get("etag").cloned();
+        assert!(
+            etag.as_deref().is_some_and(|tag| tag.len() > 2
+                && tag.starts_with('"')
+                && tag.ends_with('"')),
+            "case {case:?}: expected a quoted entity tag, got {etag:?}"
+        );
+    }
+}
+
+/// The entity tag identifies the body: two responses carrying the same bytes are tagged the
+/// same, and two carrying different bytes are tagged differently.
+///
+/// Read over the wire rather than over the helper, because the tag is what a client's
+/// conditional-request and caching logic keys off.
+#[tokio::test]
+async fn the_entity_tag_identifies_the_body() {
+    let router = emulator();
+    let first = create_network(&router, "tagged-net", "STANDARD").await;
+    let second = create_network(&router, "other-net", "PREMIUM").await;
+
+    let tag_of = |uri: String| {
+        let router = &router;
+        async move {
+            let (status, headers, body) = call_with_headers(router, "GET", &uri, None).await;
+            assert_eq!(status, 200, "GET {uri}: expected 200, got {status} with {body}");
+            headers
+                .get("etag")
+                .cloned()
+                .unwrap_or_else(|| panic!("GET {uri}: no etag in {headers:?}"))
+        }
+    };
+
+    let same = tag_of(format!("/networks/{first}")).await;
+    let again = tag_of(format!("/networks/{first}")).await;
+    let other = tag_of(format!("/networks/{second}")).await;
+
+    assert_eq!(
+        same, again,
+        "case \"the same resource read twice\": one body must tag the same, got {same} and \
+         {again}"
+    );
+    assert_ne!(
+        same, other,
+        "case \"two different resources\": different bodies must tag differently, both got \
+         {same}"
+    );
 }

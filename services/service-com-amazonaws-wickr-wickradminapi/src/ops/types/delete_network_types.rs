@@ -18,9 +18,101 @@ pub struct DeleteNetworkInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.wickr#DeleteNetworkResponse")]
+/// `DeleteNetwork`'s response, with its schema and codec written out instead of derived.
+///
+/// WHY: the response AWS really sends echoes the `networkId` the request named beside the
+/// `message`, and the on-disk model declares only `message`
+/// (`smithy_query(query="operation",operation="DeleteNetwork")`), so the model is stale
+/// here. The sibling delete shape models exactly this pairing —
+/// `DeleteSecurityGroupResponse` declares `message` beside `networkId` and `groupId` — so
+/// the member is the shape family's, not an invention.
+/// `#[smithy_macros::smithy(shape = ...)]` admits exactly the model's member list, so a
+/// member the model omits cannot be declared through the derive at all.
+///
+/// Everything mirrors the macro's output; the member the model omits is appended LAST with
+/// its shape id in [`RECORDED_NAMESPACE`], as in `create_network_types`.
 #[derive(Debug, Clone, Default)]
 pub struct DeleteNetworkOutput {
     pub message: Option<String>,
+    /// The id of the network that was deleted, which the model does not declare on this
+    /// shape.
+    pub network_id: Option<String>,
+}
+
+#[allow(non_upper_case_globals)]
+impl DeleteNetworkOutput {
+    const NAMESPACE: &'static str = "com.amazonaws.wickr";
+
+    pub const M_MESSAGE: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.wickr#DeleteNetworkResponse$message",
+            Self::NAMESPACE,
+            "message",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "message",
+        0,
+    );
+
+    /// The member the on-disk model does not declare; see [`RECORDED_NAMESPACE`].
+    pub const M_NETWORK_ID: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.wickr.recorded#DeleteNetworkResponse$networkId",
+            RECORDED_NAMESPACE,
+            "networkId",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "networkId",
+        1,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.wickr#DeleteNetworkResponse",
+            Self::NAMESPACE,
+            "DeleteNetworkResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[&Self::M_MESSAGE, &Self::M_NETWORK_ID],
+    );
+}
+
+pub static DELETE_NETWORK_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &DeleteNetworkOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for DeleteNetworkOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.message.as_ref() {
+            serializer.write_string(&Self::M_MESSAGE, value.as_str())?;
+        }
+        if let Some(value) = self.network_id.as_ref() {
+            serializer.write_string(&Self::M_NETWORK_ID, value.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for DeleteNetworkOutput {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut message: Option<String> = None;
+        let mut network_id: Option<String> = None;
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => message = Some(d.read_string(&Self::M_MESSAGE)?),
+                Some(1) => network_id = Some(d.read_string(&Self::M_NETWORK_ID)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            message,
+            network_id,
+        })
+    }
 }
 

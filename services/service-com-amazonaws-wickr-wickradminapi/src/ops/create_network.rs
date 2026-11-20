@@ -164,7 +164,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "CreateNetwork";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_NETWORK_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_NETWORK_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// 201 Created: the status this service answers a create that minted a network with.
+    ///
+    /// RECORDED behaviour: the on-disk model's `@http` binding says 200
+    /// (`smithy_query(query="operation",operation="CreateNetwork")` reports
+    /// `{uri:/networks, method:POST, code:200}`) and the recorded wire answers 201 — the
+    /// status a client, SDK middleware or CDK-style wrapper reads as "the resource was
+    /// created" rather than as a success that created nothing. The model is stale here, so
+    /// the wire record decides.
+    const SUCCESS_STATUS: u16 = 201u16;
 
     async fn handle(
         &self,
@@ -249,9 +257,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             network_id: Some(stored.network_id.clone()),
             network_name: Some(stored.network_name.clone()),
             encryption_key_arn: stored.encryption_key_arn.clone(),
+            message: Some(CREATED_MESSAGE.to_string()),
         })
     }
 }
+
+/// The sentence this operation's success body states the create in.
+///
+/// FIXED text: it names neither the network nor its id, so the confirmation every caller
+/// reads is one sentence and carries nothing a caller would have to parse out of it. What
+/// identifies the network that was created is the response's own members.
+const CREATED_MESSAGE: &str = "Network created successfully";
 
 /// The modelled server error for a store this service cannot reach — the one
 /// failure that is the emulator's own fault rather than the request's.

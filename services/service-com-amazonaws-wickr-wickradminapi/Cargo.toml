@@ -8,6 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The response-media-type rule every service whose recorded wire announces a media type of
+# its own takes: the pair, the re-announcer, and the operation-seam wrapper that carries it
+# around the centralized walk (see `src/service/response_envelope.rs`).
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -21,9 +25,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# SHA-256 for the content-derived `uname` / invite code a created user carries.
+# SHA-256 for the content-derived `uname` / invite code a created user carries, and for the
+# entity tag every response validates its body with.
 sha2 = { workspace = true }
-# Hex codec for those digests and for the opaque pagination tokens.
+# Hex codec for those digests, for that entity tag and for the opaque pagination tokens.
 hex = { workspace = true }
 
 [build-dependencies]
