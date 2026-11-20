@@ -40,6 +40,13 @@ pub struct ReadOnlyProperties {
 /// document as settable, which is the same classification Cloud Control API reads a
 /// resource model's identity out of.
 pub const READ_ONLY_PROPERTIES: &[ReadOnlyProperties] = &[
+    // `AWS::ApplicationInsights::Application`: the `ApplicationARN` Application Insights
+    // addresses the application by, which that service builds from the resource group the
+    // application monitors and no member of `CreateApplication` accepts.
+    ReadOnlyProperties {
+        resource_type: super::APPLICATION_INSIGHTS_APPLICATION,
+        read_only: &[super::APPLICATION_INSIGHTS_APPLICATION_ARN_ATTRIBUTE],
+    },
     // `AWS::ApiGatewayV2::Api`: the api's own id, the endpoint API Gateway v2 serves it on —
     // "the default endpoint for an API" — and the ARN of that api's own invoke surface. That
     // service assigns the id when it makes the api and the other two are built from it, and

@@ -234,6 +234,36 @@ pub const APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG: &str =
 /// instrumentation configuration's carry.
 pub const APPLICATION_SIGNALS_ARN_NAMESPACE: &str = "application-signals";
 
+/// Amazon CloudWatch Application Insights' own APPLICATION type (that model:
+/// `cloudFormationName: ApplicationInsights`, `arnNamespace: applicationinsights`). This is a
+/// type `crate::state::provisioner` creates in Application Insights itself, over the resource
+/// group the declaration names.
+///
+/// "Ref returns the `ApplicationARN`", which that service builds from its own namespace, the
+/// Region, the account and the resource group the application monitors — a total function of the
+/// template, so [`identity_is_service_assigned`] does not name the type.
+pub const APPLICATION_INSIGHTS_APPLICATION: &str = "AWS::ApplicationInsights::Application";
+
+/// Application Insights' ARN namespace, which is that model's own `awsService.arnNamespace`
+/// (`applicationinsights`) rather than the `ApplicationInsights` its resource type is spelled
+/// with.
+pub const APPLICATION_INSIGHTS_ARN_NAMESPACE: &str = "applicationinsights";
+
+/// The resource path an application's ARN carries before the group it monitors:
+/// `application/resource-group/<ResourceGroupName>`, the form that service publishes for an
+/// application. Visible to the rest of this service's state because the arm that provisions the
+/// type reads the group back out of that ARN
+/// ([`crate::state::provisioner`]), which has to agree with the ARN written here.
+pub const APPLICATION_INSIGHTS_APPLICATION_PATH: &str = "application/resource-group";
+
+/// The one `Fn::GetAtt` attribute an [`APPLICATION_INSIGHTS_APPLICATION`] publishes, which is
+/// also what its `Ref` returns: the application's own ARN.
+pub const APPLICATION_INSIGHTS_APPLICATION_ARN_ATTRIBUTE: &str = "ApplicationARN";
+
+/// The property an application declares the resource group it monitors in, which is the one
+/// part of its ARN the template decides.
+pub(super) const APPLICATION_INSIGHTS_RESOURCE_GROUP_PROPERTY: &str = "ResourceGroupName";
+
 /// The resource path an SLO's ARN carries before the objective's name, and the one an
 /// instrumentation configuration's carries before its four identity parts, from each member's
 /// own pattern above.

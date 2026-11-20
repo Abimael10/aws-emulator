@@ -62,6 +62,22 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "Application Signals",
         SdkDiagnostic::Operation,
     ),
+    // Amazon CloudWatch Application Insights' SDK names it `ApplicationInsights` — that
+    // model's own `awsService.cloudFormationName`, which is its `sdkId` (`Application
+    // Insights`, `smithy_query(query="service_info")` on that service's model) with the space
+    // closed up, as the name its SDK client carries. The shape is the ATTEMPT-counting one, as
+    // the recorded `ResourceStatusReason` of an `AWS::ApplicationInsights::Application` over a
+    // resource group the account does not hold carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check `application-insights__cloudformation__resource-\
+    // groups.deploy-applicationinsights-application-missing-resource-group-rejected`, whose
+    // reason reads `<the service's sentence> (Service: ApplicationInsights, Status Code: 400,
+    // Request ID: …) (SDK Attempt Count: …)`). The one resource type this emulator provisions
+    // over this signing name is that service's ([`provisioner::application_insights`]).
+    (
+        "applicationinsights",
+        "ApplicationInsights",
+        SdkDiagnostic::Attempts,
+    ),
     // Amazon Braket's SDK names it by that model's own `sdkId` (`Braket`), and words its
     // diagnostic with the refused OPERATION and that service's error code in it, as the
     // recorded `ResourceStatusReason` of a failed `AWS::Braket::SpendingLimit` carries it (in

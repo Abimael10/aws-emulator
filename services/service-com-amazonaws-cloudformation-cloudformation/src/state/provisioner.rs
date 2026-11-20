@@ -479,7 +479,8 @@ use super::template::{
     AOSS_SECURITY_POLICY, AOSS_VPC_ENDPOINT, APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
-    APIGATEWAYV2_STAGE, APPLICATION_SIGNALS_GROUPING_CONFIGURATION,
+    APIGATEWAYV2_STAGE, APPLICATION_INSIGHTS_APPLICATION, APPLICATION_INSIGHTS_APPLICATION_PATH,
+    APPLICATION_SIGNALS_GROUPING_CONFIGURATION,
     APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG, APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE,
     BACKUP_GATEWAY_HYPERVISOR, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT,
     BATCH_COMPUTE_ENVIRONMENT,
@@ -985,6 +986,16 @@ pub(super) enum Provisioner {
     /// one that service mints, under its own hyphenated `arnNamespace`, so it is read off the
     /// create's own answer.
     ResourceGroupsGroup,
+    /// `AWS::ApplicationInsights::Application`: an application of Amazon CloudWatch Application
+    /// Insights, which `CreateApplication` creates over the resource group the template names —
+    /// the group that service resolves in Resource Groups before it holds anything, and the
+    /// identifier every call on an application takes — and `DeleteApplication` removes. The
+    /// create answers the application `CREATING` while that service onboards the group's
+    /// resources, so its creation is held open until it reports the onboarding finished.
+    ///
+    /// Its identity is the ARN the type's `Ref` returns, which is a total function of the
+    /// Region, the account and that group, so the naming rules compute it.
+    ApplicationInsightsApplication,
     /// `AWS::SSM::Association`: a State Manager association of AWS Systems Manager, which
     /// `CreateAssociation` creates, `UpdateAssociation` changes and `DeleteAssociation`
     /// removes.
@@ -1438,6 +1449,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         EVENTS_EVENT_BUS_POLICY => Some(Provisioner::EventsEventBusPolicy),
         PIPES_PIPE => Some(Provisioner::PipesPipe),
         RESOURCE_GROUPS_GROUP => Some(Provisioner::ResourceGroupsGroup),
+        APPLICATION_INSIGHTS_APPLICATION => Some(Provisioner::ApplicationInsightsApplication),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
         SSM_ASSOCIATION => Some(Provisioner::SsmAssociation),
         ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW => Some(Provisioner::SsmMaintenanceWindow),
@@ -1993,6 +2005,13 @@ impl Provisioner {
             // declaration asks for.
             Self::ResourceGroupsGroup => {
                 create_resource_group(ctx, region, resource, propagated).await
+            }
+            // `AWS::ApplicationInsights::Application` publishes `Tags` as the `[{Key, Value}]`
+            // list most types do, which is the shape `CreateApplication`'s own `Tags` member
+            // takes, so an application a stack creates carries the tags CloudFormation gives it
+            // beside the ones the declaration asks for.
+            Self::ApplicationInsightsApplication => {
+                create_application(ctx, region, resource, propagated).await
             }
             Self::SsmParameter => put_parameter(ctx, region, resource, propagated).await,
             // `AWS::SSM::Association` publishes no `Tags` property — Systems Manager tags
@@ -2919,6 +2938,13 @@ impl Provisioner {
             // creation is finished once that service reports it there.
             Self::OpenSearchServerlessVpcEndpoint => {
                 vpc_endpoint_readiness(ctx, region, physical_resource_id).await
+            }
+            // `CreateApplication` answers the application `CREATING` — Application Insights is
+            // still onboarding the resources of the group it was created over, and the
+            // components a configuration is applied to are not there in it — so the resource is
+            // held open until that service reports the onboarding finished.
+            Self::ApplicationInsightsApplication => {
+                application_readiness(ctx, region, physical_resource_id, declared).await
             }
             _ => Ok(Readiness::Ready),
         }
@@ -4297,6 +4323,11 @@ impl Provisioner {
             Self::ResourceGroupsGroup => {
                 delete_resource_group(ctx, region, physical_resource_id).await
             }
+            // An application is addressed by the resource group it monitors, which its own
+            // declaration carries rather than the ARN that is this resource's physical id.
+            Self::ApplicationInsightsApplication => {
+                delete_application(ctx, region, resource).await
+            }
             // A schedule is addressed by its name AND the group that holds it, which only
             // the resource's own record carries, so the delete takes the record.
             Self::SchedulerSchedule => delete_schedule(ctx, region, resource).await,
@@ -4807,6 +4838,10 @@ pub(in crate::state) mod ssm_maintenance_windows;
 /// the type's own NAME lives here, beside the arms that provision it.
 pub(in crate::state) mod ssm_documents;
 mod resource_groups;
+/// The Amazon CloudWatch Application Insights arm: the application an
+/// `AWS::ApplicationInsights::Application` declares, created in the service that owns it so a
+/// client's own read of that service resolves the application the stack publishes.
+mod application_insights;
 /// The AWS Batch JOB DEFINITION arms, beside the compute environment, job queue and service
 /// environment arms the same owning service has in [`network_and_delivery`]: a revision's
 /// identity is the revision-qualified ARN that service allocates, which makes its create,
@@ -4866,6 +4901,7 @@ use ssm_associations::*;
 use ssm_maintenance_windows::*;
 use ssm_documents::*;
 use resource_groups::*;
+use application_insights::*;
 use auto_scaling_policies::*;
 use batch_job_definitions::*;
 use compute_fleet::*;

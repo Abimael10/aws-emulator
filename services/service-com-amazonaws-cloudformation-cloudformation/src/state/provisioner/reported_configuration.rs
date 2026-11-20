@@ -334,6 +334,11 @@ impl Provisioner {
             Self::ResourceGroupsGroup => {
                 describe_resource_group(ctx, region, physical_resource_id).await
             }
+            // Application Insights' own read of the application, by the resource group it
+            // monitors, which is how that service keys one.
+            Self::ApplicationInsightsApplication => {
+                describe_application(ctx, region, resource).await
+            }
             // The read is addressed by the schedule's name AND its group, which only the
             // resource's own record carries.
             Self::SchedulerSchedule => describe_schedule(ctx, region, resource).await,

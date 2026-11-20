@@ -48,6 +48,12 @@ pub fn replacement_deletes_first(resource_type: &str) -> bool {
 /// stating one of them differently asks for a different resource.
 pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
+        // An Application Insights application IS the monitoring of one resource group: that
+        // group is what the application is keyed by, every call on one takes it, and
+        // `UpdateApplication` carries no member for it — so a declaration naming another group
+        // asks for a DIFFERENT application, which CloudFormation replaces. (The type declares no
+        // name of its own, so [`name_is_create_only`] has nothing to catch here.)
+        APPLICATION_INSIGHTS_APPLICATION => &["ResourceGroupName"],
         IAM_ACCESS_KEY => &["Serial", "UserName"],
         // A published state machine VERSION keeps everything it was published with: it is the
         // snapshot `PublishStateMachineVersion` took of the machine, and Step Functions

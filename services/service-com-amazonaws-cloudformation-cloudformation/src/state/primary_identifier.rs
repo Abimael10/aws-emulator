@@ -109,6 +109,10 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE
         | APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG => "Arn",
         APPLICATION_SIGNALS_GROUPING_CONFIGURATION => "AwsAccountId",
+        // An Application Insights application, identified by the ARN that type's `Ref` returns —
+        // the `ApplicationARN` a client names one by — rather than by a name of its own, which
+        // the type does not declare.
+        APPLICATION_INSIGHTS_APPLICATION => APPLICATION_INSIGHTS_APPLICATION_ARN_ATTRIBUTE,
         // A Clean Rooms ML training dataset, identified by the ARN that service minted for it
         // ("Ref returns the training dataset ARN"), which is the `trainingDatasetArn` every
         // call on one takes; the type's own `Name` is only what the dataset is called.

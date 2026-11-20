@@ -253,8 +253,9 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     // Application Auto Scaling
     "AWS::ApplicationAutoScaling::ScalableTarget",
     "AWS::ApplicationAutoScaling::ScalingPolicy",
-    // Amazon CloudWatch Application Insights
-    "AWS::ApplicationInsights::Application",
+    // Amazon CloudWatch Application Insights: the APPLICATION this emulator creates in that
+    // service itself (`super::provisioner`), over the resource group the declaration names.
+    crate::state::template::APPLICATION_INSIGHTS_APPLICATION,
     // Amazon CloudWatch Application Signals. The three types this emulator creates in that
     // service itself (`super::provisioner`): the service level objective its
     // `CreateServiceLevelObjective` makes, the one grouping configuration per account its

@@ -927,6 +927,41 @@ pub(crate) fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // "Ref returns the ApplicationARN"; Fn::GetAtt: ApplicationARN — the one value the type
+        // publishes, and the handle a client names the application by. This is the type
+        // `crate::state::provisioner` creates in Application Insights itself, which keys an
+        // application by the RESOURCE GROUP it monitors, so the ARN is built from that group
+        // rather than from a name of the resource's own: an application has no name property at
+        // all. That service's own record of an application (`ApplicationInfo`) carries no ARN
+        // member for a create to report back, and the ARN is a total function of the partition,
+        // its namespace, the Region, the account and the group — so it is computed here, exactly
+        // as a resource group's and a schedule group's are above. The namespace is that model's
+        // `arnNamespace`, [`APPLICATION_INSIGHTS_ARN_NAMESPACE`], not the type's CloudFormation
+        // segment.
+        //
+        // A declaration that states no group yet — one whose `ResourceGroupName` is a reference
+        // this evaluation cannot resolve — publishes no ARN at all, and the resource keeps the
+        // generated name as its stand-in identity until the group's own is known
+        // ([`super::super::identity_depends_on_another_resource`]).
+        APPLICATION_INSIGHTS_APPLICATION => {
+            let Some(group) = properties
+                .get(APPLICATION_INSIGHTS_RESOURCE_GROUP_PROPERTY)
+                .and_then(|value| text(value, scope, 0, budget))
+                .filter(|group| !group.is_empty())
+            else {
+                return (name.to_string(), attributes);
+            };
+            let arn = ::emulator_server::emulator_arn(
+                APPLICATION_INSIGHTS_ARN_NAMESPACE,
+                region,
+                &format!("{APPLICATION_INSIGHTS_APPLICATION_PATH}/{group}"),
+            );
+            attributes.insert(
+                APPLICATION_INSIGHTS_APPLICATION_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            (arn, attributes)
+        }
         // "Ref returns the schedule group name"; Fn::GetAtt: Arn (and the group's State,
         // CreationDate and LastModificationDate, which are EventBridge Scheduler's own to
         // decide and are not computed here). This is the type `super::provisioning`

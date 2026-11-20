@@ -71,6 +71,9 @@ fn computed_attributes(resource_type: &str) -> BTreeMap<String, String> {
             // its entity in, which are two of the three values each of those types publishes.
             "AppId": "d1234abcdefghi",
             "EnvironmentName": "staging",
+            // The resource group an `AWS::ApplicationInsights::Application` monitors, which is
+            // what that type's one published ARN is built from.
+            "ResourceGroupName": "a-resource-group",
         }),
         condition: None,
         declaration: Value::Null,

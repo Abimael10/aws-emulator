@@ -453,6 +453,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         STEP_FUNCTIONS_STATE_MACHINE => &["Arn", "Name"],
         SCHEDULER_SCHEDULE_GROUP | SCHEDULER_SCHEDULE => &["Arn"],
         RESOURCE_GROUPS_GROUP => &["Arn"],
+        // An application publishes its own ARN, under the member name that type's return values
+        // section spells it with (`ApplicationARN`).
+        APPLICATION_INSIGHTS_APPLICATION => &[APPLICATION_INSIGHTS_APPLICATION_ARN_ATTRIBUTE],
         // Each Amazon MemoryDB group publishes its own ARN, under the upper-case member
         // name that service's model spells it with (`ParameterGroup$ARN`,
         // `SubnetGroup$ARN`).

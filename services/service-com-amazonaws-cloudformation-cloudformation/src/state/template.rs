@@ -2112,6 +2112,11 @@ fn identity_depends_on_another_resource(resource_type: &str) -> bool {
             | CODEARTIFACT_REPOSITORY
             | LAMBDA_VERSION
             | LAMBDA_ALIAS
+            // An Application Insights APPLICATION is one more: its ARN is built from the
+            // RESOURCE GROUP its declaration names, and a template that declares that group
+            // beside it states the name as a `Ref` to it — so the application's identity is
+            // settled only once the group has one.
+            | APPLICATION_INSIGHTS_APPLICATION
             // Every child of an AWS AppSync GraphQL API: each one is identified by the ARN
             // AppSync builds UNDER the API's own id, so its identity is settled only once
             // that API has one (`appsync` in the return-value catalogue).
@@ -2987,6 +2992,9 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     // service reports for each: the objective's ARN and the values it settles, the one instant
     // the account's grouping configuration carries, and the ARN, instant and location hash of
     // an instrumentation point.
+    // The Amazon CloudWatch Application Insights APPLICATION, publishing the one value its
+    // return values section names: the ARN that service addresses it by.
+    APPLICATION_INSIGHTS_APPLICATION,
     APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE,
     APPLICATION_SIGNALS_GROUPING_CONFIGURATION,
     APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG,
