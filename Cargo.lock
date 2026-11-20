@@ -18259,6 +18259,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "http",
+ "rand 0.9.5",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-paymentcryptography-paymentcryptographycontrolplane",

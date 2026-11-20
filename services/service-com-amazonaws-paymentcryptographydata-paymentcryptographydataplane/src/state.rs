@@ -271,6 +271,25 @@ pub const KEY_USAGE_CARD_VERIFICATION: &str = "TR31_C0_CARD_VERIFICATION_KEY";
 /// own documentation requires.
 pub const KEY_USAGE_EMV_APP_CRYPTOGRAMS: &str = "TR31_E0_EMV_MKEY_APP_CRYPTOGRAMS";
 
+/// The `KeyUsage` a PIN encryption key carries, from the same modelled `KeyUsage`: the
+/// TR-31 PIN encryption key, which is the PEK the PIN data operations encrypt and read
+/// a PIN block under.
+pub const KEY_USAGE_PIN_ENCRYPTION: &str = "TR31_P0_PIN_ENCRYPTION_KEY";
+
+/// The `KeyUsage` an IBM 3624 PIN verification key carries, from the same shape: the
+/// key the IBM 3624 natural PIN and offset are computed under.
+pub const KEY_USAGE_IBM3624_PIN_VERIFICATION: &str = "TR31_V1_IBM3624_PIN_VERIFICATION_KEY";
+
+/// The `KeyUsage` a Visa PIN verification key carries, from the same shape: the PVK
+/// "This operation uses a separate Pin Verification Key (PVK) for VISA PVV generation"
+/// (`GeneratePinData`) names.
+pub const KEY_USAGE_VISA_PIN_VERIFICATION: &str = "TR31_V2_VISA_PIN_VERIFICATION_KEY";
+
+/// The `PinDataLength` applied when the request names none: the shortest PIN the
+/// modelled `IntegerRangeBetween4And12` admits, which is the length of the PIN the PIN
+/// data operations generate by default.
+pub const DEFAULT_PIN_DATA_LENGTH: i32 = 4;
+
 /// The `ValidationData` length applied when the request names none: "The length of
 /// the CVV or CSC to be generated. The default value is 3"
 /// (`GenerateCardValidationData$ValidationDataLength`).
@@ -287,6 +306,9 @@ pub const VERIFICATION_FAILED_INVALID_VALIDATION_DATA: &str = "INVALID_VALIDATIO
 /// shape.
 pub const VERIFICATION_FAILED_INVALID_AUTH_REQUEST_CRYPTOGRAM: &str =
     "INVALID_AUTH_REQUEST_CRYPTOGRAM";
+
+/// The `Reason` a failed PIN verification carries, from the same shape.
+pub const VERIFICATION_FAILED_INVALID_PIN: &str = "INVALID_PIN";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifyPinData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifyPinData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifyPinData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Verifies the PIN inside an `EncryptedPinBlock` against the value a card issuer
+//! stores for that card, under the TWO keys the request names: the PIN encryption key
+//! `EncryptionKeyIdentifier` names, which the PIN block is read under, and the PIN
+//! verification key `VerificationKeyIdentifier` names, which the value is recomputed
+//! under.
+//!
+//! This is the reading half of the pair `GeneratePinData` writes: the PIN comes out of
+//! the ISO 9564 block the request carries, the derived value is recomputed from it by
+//! the same published computation ([`crate::state::crypto::pin`]) over the verification
+//! key's own working material, and the two are compared. A value that does not match is
+//! the modelled `VerificationFailedException`, which names the PIN as the datum that
+//! failed and quotes neither the PIN, the block nor the value back.
+//!
+//! Nothing is written: the comparison is a function of the request and the two keys'
+//! stored material, so verifying a PIN leaves what a later caller sees unchanged.
+//!
+//! `DukptAttributes` names a PIN block encrypted under a key derived per transaction
+//! from a base derivation key, and `EncryptionWrappedKey` one established by ECDH key
+//! exchange. Neither key is one this service's key store holds, so a request carrying
+//! either answers 501 rather than a verdict reached under a key nothing derived.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +142,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::crypto::pin;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -168,6 +181,16 @@ impl From<VerifyPinDataErrorModeled> for VerifyPinDataError {
     }
 }
 
+/// What this operation's `VerificationFailedException` states: the verification class
+/// that failed, which for this operation is the comparison of the PIN the presented PIN
+/// BLOCK carries against the value the issuer stores.
+///
+/// The model requires `Message` but does not word it, so the sentence is AWS's own
+/// wording for THIS class and it interpolates nothing: the `Reason` member carries the
+/// discriminator, and neither the message nor the reason reveals anything of the
+/// presented PIN, of the block it came in or of either key.
+const VERIFICATION_FAILED_MESSAGE: &str = "Pin block verification failed.";
+
 /// The `VerifyPinData` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -204,18 +227,206 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifyPinData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifyPinDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifyPinData"))
+        // IAM decides ahead of the service, so this is asked before anything about the
+        // request is read, and for BOTH keys the call uses: a caller whose policies do
+        // not allow this action on either of them learns nothing about either key.
+        for identifier in [
+            &input.verification_key_identifier,
+            &input.encryption_key_identifier,
+        ] {
+            crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, identifier)
+                .map_err(denied)?;
+        }
+        if input.dukpt_attributes.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "VerifyPinData with a PIN block encrypted under a DUKPT derived key",
+            ));
+        }
+        if input.encryption_wrapped_key.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "VerifyPinData with an EncryptionWrappedKey established by ECDH key exchange",
+            ));
+        }
+        let format = pin::PinBlockFormat::parse(&input.pin_block_format).map_err(refused_pin)?;
+
+        // "The keyARN of the encryption key under which the PIN block data is
+        // encrypted" (`EncryptionKeyIdentifier`): the TR-31 PIN encryption key, used
+        // here to READ the presented block, which is the key's Decrypt mode.
+        let encryption_key =
+            crate::state::resolve_key(&*self.engine, &input.encryption_key_identifier)
+                .map_err(refused)?;
+        if encryption_key.key_usage != crate::state::KEY_USAGE_PIN_ENCRYPTION {
+            return Err(invalid(format!(
+                "KeyUsage {} is not valid for this operation.",
+                encryption_key.key_usage
+            )));
+        }
+        if !encryption_key.modes.decrypt() {
+            return Err(invalid(format!(
+                "The KeyModesOfUse of key {} do not include Decrypt.",
+                encryption_key.key_arn
+            )));
+        }
+
+        // "The keyARN of the PIN verification key" (`VerificationKeyIdentifier`): the
+        // Visa PVK for a Visa verification value, the IBM 3624 key for an offset.
+        let verification_key =
+            crate::state::resolve_key(&*self.engine, &input.verification_key_identifier)
+                .map_err(refused)?;
+        let required_usage = match &input.verification_attributes {
+            PinVerificationAttributes::VisaPin(_) => {
+                crate::state::KEY_USAGE_VISA_PIN_VERIFICATION
+            }
+            PinVerificationAttributes::Ibm3624Pin(_) => {
+                crate::state::KEY_USAGE_IBM3624_PIN_VERIFICATION
+            }
+        };
+        if verification_key.key_usage != required_usage {
+            return Err(invalid(format!(
+                "KeyUsage {} is not valid for this operation.",
+                verification_key.key_usage
+            )));
+        }
+        // What this operation does with that key is VERIFY pin data, which is the mode
+        // its half of the pair requires; `GeneratePinData` requires Generate.
+        if !verification_key.modes.verify() {
+            return Err(invalid(format!(
+                "The KeyModesOfUse of key {} do not include Verify.",
+                verification_key.key_arn
+            )));
+        }
+
+        let pan = input.primary_account_number.as_deref();
+        // The PIN under verification, read out of the presented block. A block that
+        // carries no PIN field of the named format presents no PIN to compare, so it is
+        // a FAILED VERIFICATION rather than a malformed request: the block is the
+        // caller's own ciphertext, and whether it decrypts to a PIN field is exactly
+        // what the keys it was encrypted under decide.
+        let presented = pin::decrypt_pin_block(
+            format,
+            &encryption_key.key_algorithm,
+            encryption_key.material(),
+            &input.encrypted_pin_block,
+            pan,
+        )
+        .map_err(refused_pin)?;
+        // "The length of PIN being verified" (`PinDataLength`): every modelled PIN block
+        // format carries the PIN's own length in its second nibble, so a request naming
+        // a different one names a PIN this block does not carry.
+        if let Some(claimed) = input.pin_data_length {
+            let read = i32::try_from(presented.chars().count()).unwrap_or_default();
+            if claimed != read {
+                return Err(verification_failed());
+            }
+        }
+
+        let matches = match &input.verification_attributes {
+            PinVerificationAttributes::VisaPin(attributes) => {
+                // The transformed security parameter a Visa value is computed from
+                // carries the account number's own digits, so a request that names none
+                // names no value to compare against.
+                let pan = pan.ok_or_else(|| {
+                    invalid(
+                        "PrimaryAccountNumber is required for VISA PIN verification value \
+                         verification."
+                            .to_string(),
+                    )
+                })?;
+                let expected = pin::visa_pin_verification_value(
+                    &verification_key.key_algorithm,
+                    verification_key.material(),
+                    pan,
+                    attributes.pin_verification_key_index,
+                    &presented,
+                )
+                .map_err(refused_pin)?;
+                expected == attributes.verification_value
+            }
+            PinVerificationAttributes::Ibm3624Pin(attributes) => {
+                // An offset is aligned digit for digit with the PIN it describes, so the
+                // PIN the stored offset stands for is as long as that offset, and a
+                // presented PIN of another length is not that PIN.
+                let natural = pin::ibm3624_natural_pin(
+                    &verification_key.key_algorithm,
+                    verification_key.material(),
+                    &attributes.pin_validation_data,
+                    &attributes.pin_validation_data_pad_character,
+                    &attributes.decimalization_table,
+                    attributes.pin_offset.chars().count(),
+                )
+                .map_err(refused_pin)?;
+                let expected = pin::ibm3624_pin_from_offset(&natural, &attributes.pin_offset)
+                    .map_err(refused_pin)?;
+                expected == presented
+            }
+        };
+        if !matches {
+            return Err(verification_failed());
+        }
+
+        Ok(VerifyPinDataOutput {
+            verification_key_arn: verification_key.key_arn,
+            verification_key_check_value: verification_key.key_check_value,
+            encryption_key_arn: encryption_key.key_arn,
+            encryption_key_check_value: encryption_key.key_check_value,
+        })
+    }
+}
+
+/// A PIN that is not the one the stored value stands for: the modelled
+/// `VerificationFailedException`, whose `Reason` names the PIN as the datum that
+/// failed.
+fn verification_failed() -> VerifyPinDataError {
+    VerifyPinDataErrorModeled::VerificationFailedException(VerificationFailedException {
+        reason: crate::state::VERIFICATION_FAILED_INVALID_PIN.to_string(),
+        message: VERIFICATION_FAILED_MESSAGE.to_string(),
+    })
+    .into()
+}
+
+/// A request the calling principal's IAM policies do not allow: the modelled
+/// `AccessDeniedException` (HTTP 403), worded by [`crate::service::authorization`].
+fn denied(exception: AccessDeniedException) -> VerifyPinDataError {
+    VerifyPinDataErrorModeled::AccessDeniedException(exception).into()
+}
+
+/// A request this operation cannot serve as asked: the modelled `ValidationException`.
+fn invalid(message: String) -> VerifyPinDataError {
+    VerifyPinDataErrorModeled::ValidationException(ValidationException {
+        message,
+        field_list: None,
+    })
+    .into()
+}
+
+/// The refusal a PIN computation answered, in this operation's own error channel.
+///
+/// A block that carries no PIN field of the named format presented no PIN at all, which
+/// is this operation's own verdict on the PIN — the failed verification — rather than a
+/// fault in the request; every other refusal is the request's.
+fn refused_pin(refusal: pin::PinRefusal) -> VerifyPinDataError {
+    match refusal {
+        pin::PinRefusal::Invalid(message) => invalid(message),
+        pin::PinRefusal::Unreadable(_) => verification_failed(),
+    }
+}
+
+/// The refusal [`crate::state::resolve_key`] answered, in this operation's own error
+/// channel.
+fn refused(refusal: crate::state::KeyRefusal) -> VerifyPinDataError {
+    match refusal {
+        crate::state::KeyRefusal::NotFound(identifier) => {
+            VerifyPinDataErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_id: Some(identifier),
+            })
+            .into()
+        }
+        crate::state::KeyRefusal::NotUsable(message) => invalid(message),
+        crate::state::KeyRefusal::Unavailable(message) => {
+            VerifyPinDataErrorModeled::InternalServerException(InternalServerException {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }

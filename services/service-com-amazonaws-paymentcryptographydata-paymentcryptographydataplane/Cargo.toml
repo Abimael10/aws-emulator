@@ -55,6 +55,9 @@ sha2 = { workspace = true }
 sha1 = "0.10"
 # Renders a ciphertext, a plaintext and a MAC as the hex the model's patterns admit.
 hex = { workspace = true }
+# Draws the PIN `GeneratePinData` generates for a new card, and the fill digits the ISO
+# 9564 PIN block formats pad a PIN field with.
+rand = "0.9"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

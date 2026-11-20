@@ -3,7 +3,8 @@
 //! The symmetric data-protection loop of the Payment Cryptography data plane, end to
 //! end over the wire: `EncryptData`, `DecryptData`, `GenerateMac`, `VerifyMac`,
 //! `GenerateCardValidationData`, `VerifyCardValidationData`,
-//! `GenerateAuthRequestCryptogram`, `VerifyAuthRequestCryptogram`.
+//! `GenerateAuthRequestCryptogram`, `VerifyAuthRequestCryptogram`, `GeneratePinData`,
+//! `VerifyPinData`.
 //!
 //! Every call goes through the real `MultiServiceRouter`, and the keys these cases use
 //! are minted by the CONTROL plane's own `CreateKey` / `CreateAlias` on the SAME
@@ -19,8 +20,10 @@
 //! row of a table spanning the class the rule generalises over — every modelled
 //! `EncryptionMode`, every symmetric `KeyAlgorithm`, every `MacAlgorithm` with a
 //! computation, both published bounds of `PrimaryAccountNumber`, every
-//! `ValidationDataLength`, every modelled `SessionKeyDerivation` scheme and both
-//! `MajorKeyDerivationMode` options — rather than the single row the issue named.
+//! `ValidationDataLength`, every modelled `SessionKeyDerivation` scheme, both
+//! `MajorKeyDerivationMode` options, every modelled `PinBlockFormatForPinData` value
+//! and every member of `PinGenerationAttributes` and `PinVerificationAttributes` —
+//! rather than the single row the issue named.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -31,7 +34,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_paymentcryptographydata_paymentcryptographydataplane::ops::types::{
     ENCRYPTION_MODE_VALUES, MAC_ALGORITHM_VALUES, MAJOR_KEY_DERIVATION_MODE_VALUES,
-    VERIFICATION_FAILED_REASON_VALUES,
+    PIN_BLOCK_FORMAT_FOR_PIN_DATA_VALUES, VERIFICATION_FAILED_REASON_VALUES,
 };
 use service_com_amazonaws_paymentcryptographydata_paymentcryptographydataplane::EmulatedService as DataPlane;
 use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::EmulatedService as ControlPlane;
@@ -2129,4 +2132,905 @@ async fn the_cryptogram_operations_need_an_issuer_master_key_that_derives() {
         (404, "ResourceNotFoundException"),
         "an identifier naming no key must be a 404, got {status} {parsed}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PIN data: `GeneratePinData` and `VerifyPinData`
+//
+// The rule these cases pin: a PIN travels only inside the ISO 9564 PIN block the
+// request's `PinBlockFormat` names, encrypted under the PIN encryption key, and the
+// datum a card issuer stores for it is the published Visa PIN verification value or
+// IBM 3624 PIN offset computed under the PIN verification key's own material — so
+// `VerifyPinData` confirms exactly the PIN `GeneratePinData` put in that block, and
+// any other PIN is a failed verification.
+// ---------------------------------------------------------------------------
+
+/// `POST /pindata/generate`.
+const GENERATE_PIN_DATA_URI: &str = "/pindata/generate";
+
+/// `POST /pindata/verify`.
+const VERIFY_PIN_DATA_URI: &str = "/pindata/verify";
+
+/// The `KeyUsage` values the PIN data cases create keys under, from the control plane's
+/// modelled `KeyUsage`: the PIN encryption key a PIN block travels under, and the two
+/// PIN verification keys the modelled attribute families are defined for.
+const USAGE_PIN_ENCRYPTION: &str = "TR31_P0_PIN_ENCRYPTION_KEY";
+const USAGE_VISA_PIN_VERIFICATION: &str = "TR31_V2_VISA_PIN_VERIFICATION_KEY";
+const USAGE_IBM3624_PIN_VERIFICATION: &str = "TR31_V1_IBM3624_PIN_VERIFICATION_KEY";
+
+/// The account number the PIN data cases work with, within `PrimaryAccountNumberType`.
+const PIN_DATA_PAN: &str = "4111111111111111";
+
+/// The decimalization table the IBM 3624 cases supply, within the modelled
+/// `DecimalizationTableType` (sixteen decimal digits).
+const DECIMALIZATION_TABLE: &str = "0123456789012345";
+
+/// The cardholder validation data they supply, within `PinValidationDataType`.
+const PIN_VALIDATION_DATA: &str = "4111111111111111";
+
+/// The pad character they supply, within `HexLengthEquals1`.
+const PIN_VALIDATION_PAD: &str = "F";
+
+/// The `PinVerificationKeyIndex` the Visa cases run under, within the modelled
+/// `IntegerRangeBetween0And6`.
+const PIN_VERIFICATION_KEY_INDEX: i64 = 1;
+
+/// Every modelled `PinBlockFormatForPinData` value with the `KeyAlgorithm` a PIN
+/// encryption key must carry for it. Source: that shape's own documentation — "The
+/// ISO_Format_4 PIN block format is the only one supporting AES encryption" — so the
+/// other three blocks are the Triple DES block.
+fn pin_block_formats() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("ISO_FORMAT_0", "TDES_2KEY"),
+        ("ISO_FORMAT_1", "TDES_2KEY"),
+        ("ISO_FORMAT_3", "TDES_3KEY"),
+        ("ISO_FORMAT_4", "AES_128"),
+    ]
+}
+
+/// How many hexadecimal characters a block of `format` carries: one cipher block, two
+/// characters per byte.
+fn pin_block_characters(format: &str) -> usize {
+    if format == "ISO_FORMAT_4" {
+        32
+    } else {
+        16
+    }
+}
+
+/// The PIN encryption key and the PIN verification key one PIN data call runs under.
+async fn pin_keys(
+    router: &MultiServiceRouter,
+    encryption_algorithm: &str,
+    verification_usage: &str,
+) -> (Key, Key) {
+    let encryption = create_key(
+        router,
+        encryption_algorithm,
+        USAGE_PIN_ENCRYPTION,
+        encrypt_decrypt(),
+    )
+    .await;
+    let verification = create_key(router, "TDES_2KEY", verification_usage, generate_verify()).await;
+    (encryption, verification)
+}
+
+/// The `GeneratePinData` request body.
+fn generate_pin_data_body(
+    generation_key: &str,
+    encryption_key: &str,
+    attributes: Value,
+    format: &str,
+    pin_data_length: Option<i64>,
+) -> Value {
+    let mut body = json!({
+        "GenerationKeyIdentifier": generation_key,
+        "EncryptionKeyIdentifier": encryption_key,
+        "GenerationAttributes": attributes,
+        "PinBlockFormat": format,
+        "PrimaryAccountNumber": PIN_DATA_PAN,
+    });
+    if let (Some(length), Value::Object(target)) = (pin_data_length, &mut body) {
+        target.insert("PinDataLength".to_string(), json!(length));
+    }
+    body
+}
+
+/// The `VerifyPinData` request body.
+fn verify_pin_data_body(
+    verification_key: &str,
+    encryption_key: &str,
+    attributes: Value,
+    format: &str,
+    encrypted_pin_block: &str,
+) -> Value {
+    json!({
+        "VerificationKeyIdentifier": verification_key,
+        "EncryptionKeyIdentifier": encryption_key,
+        "VerificationAttributes": attributes,
+        "PinBlockFormat": format,
+        "PrimaryAccountNumber": PIN_DATA_PAN,
+        "EncryptedPinBlock": encrypted_pin_block,
+    })
+}
+
+/// The `VisaPin` generation attributes.
+fn visa_pin() -> Value {
+    json!({"VisaPin": {"PinVerificationKeyIndex": PIN_VERIFICATION_KEY_INDEX}})
+}
+
+/// One member of the IBM 3624 attribute family: the members every variant of it
+/// carries, plus the ones that variant adds.
+fn ibm3624_attributes(variant: &str, extra: &[(&str, Value)]) -> Value {
+    let mut members = json!({
+        "DecimalizationTable": DECIMALIZATION_TABLE,
+        "PinValidationDataPadCharacter": PIN_VALIDATION_PAD,
+        "PinValidationData": PIN_VALIDATION_DATA,
+    });
+    if let Value::Object(target) = &mut members {
+        for (member, value) in extra {
+            target.insert((*member).to_string(), value.clone());
+        }
+    }
+    json!({variant: members})
+}
+
+/// The one member a `PinData` union carries, and its value.
+fn pin_data_member(parsed: &Value) -> (String, String) {
+    let data = parsed
+        .get("PinData")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("expected a PinData union in {parsed}"));
+    let (member, value) = data
+        .iter()
+        .next()
+        .unwrap_or_else(|| panic!("expected one member in the PinData union of {parsed}"));
+    assert_eq!(
+        data.len(),
+        1,
+        "a PinData union carries exactly one member, got {parsed}"
+    );
+    (
+        member.clone(),
+        value
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a string {member} in {parsed}"))
+            .to_string(),
+    )
+}
+
+/// `digits` with its leading digit stepped on by one, modulo ten: a value of the same
+/// shape that is certainly not the one it was made from.
+fn stepped(digits: &str) -> String {
+    let mut characters: Vec<char> = digits.chars().collect();
+    let first = characters
+        .first()
+        .and_then(|c| c.to_digit(10))
+        .unwrap_or_default();
+    characters[0] = char::from_digit((first + 1) % 10, 10).unwrap_or('0');
+    characters.into_iter().collect()
+}
+
+/// The `EncryptedPinBlock` a `GeneratePinData` call answers.
+async fn generated_pin_block(
+    router: &MultiServiceRouter,
+    generation_key: &str,
+    encryption_key: &str,
+    attributes: Value,
+    format: &str,
+    pin_data_length: Option<i64>,
+) -> String {
+    let parsed = ok_data(
+        router,
+        GENERATE_PIN_DATA_URI,
+        &generate_pin_data_body(
+            generation_key,
+            encryption_key,
+            attributes,
+            format,
+            pin_data_length,
+        ),
+    )
+    .await;
+    string(&parsed, "EncryptedPinBlock").to_string()
+}
+
+#[tokio::test]
+async fn pin_data_round_trips_through_every_modelled_pin_block_format() {
+    let router = emulator();
+    // The table spans the whole modelled `PinBlockFormatForPinData` catalog: a value
+    // the model gains later fails this assertion rather than going untested.
+    let covered: BTreeSet<&str> = pin_block_formats().into_iter().map(|(f, _)| f).collect();
+    assert_eq!(
+        covered,
+        PIN_BLOCK_FORMAT_FOR_PIN_DATA_VALUES
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        "the format table must span the modelled catalog, which is \
+         {PIN_BLOCK_FORMAT_FOR_PIN_DATA_VALUES:?}"
+    );
+
+    for (format, encryption_algorithm) in pin_block_formats() {
+        let (pek, pvk) = pin_keys(&router, encryption_algorithm, USAGE_VISA_PIN_VERIFICATION).await;
+        // Both published bounds of `PinDataLength` (range 4..12) and one length between
+        // them: the block carries the PIN's own length, so every one has to round trip.
+        for length in [4i64, 6, 12] {
+            let case = format!("{format}/{encryption_algorithm}/PIN of {length} digits");
+            let parsed = ok_data(
+                &router,
+                GENERATE_PIN_DATA_URI,
+                &generate_pin_data_body(&pvk.arn, &pek.arn, visa_pin(), format, Some(length)),
+            )
+            .await;
+            assert_eq!(
+                string(&parsed, "GenerationKeyArn"),
+                pvk.arn,
+                "case {case}: expected the generation key's canonical ARN, got {parsed}"
+            );
+            assert_eq!(
+                string(&parsed, "GenerationKeyCheckValue"),
+                pvk.key_check_value,
+                "case {case}: expected the generation key's own check value, got {parsed}"
+            );
+            assert_eq!(
+                string(&parsed, "EncryptionKeyArn"),
+                pek.arn,
+                "case {case}: expected the encryption key's canonical ARN, got {parsed}"
+            );
+            assert_eq!(
+                string(&parsed, "EncryptionKeyCheckValue"),
+                pek.key_check_value,
+                "case {case}: expected the encryption key's own check value, got {parsed}"
+            );
+            let block = string(&parsed, "EncryptedPinBlock").to_string();
+            assert!(
+                block.len() == pin_block_characters(format)
+                    && block.chars().all(|c| c.is_ascii_hexdigit()),
+                "case {case}: expected {} hexadecimal characters of PIN block, got {block:?}",
+                pin_block_characters(format)
+            );
+            let (member, value) = pin_data_member(&parsed);
+            assert_eq!(
+                member, "VerificationValue",
+                "case {case}: a Visa PVV is answered as a VerificationValue, got {parsed}"
+            );
+            // A Visa PIN verification value is four decimal digits, whatever the PIN's
+            // own length.
+            assert!(
+                value.len() == 4 && value.bytes().all(|byte| byte.is_ascii_digit()),
+                "case {case}: expected four decimal digits of PVV, got {value:?}"
+            );
+
+            let verified = ok_data(
+                &router,
+                VERIFY_PIN_DATA_URI,
+                &verify_pin_data_body(
+                    &pvk.arn,
+                    &pek.arn,
+                    json!({"VisaPin": {
+                        "PinVerificationKeyIndex": PIN_VERIFICATION_KEY_INDEX,
+                        "VerificationValue": value,
+                    }}),
+                    format,
+                    &block,
+                ),
+            )
+            .await;
+            assert_eq!(
+                (
+                    string(&verified, "VerificationKeyArn"),
+                    string(&verified, "VerificationKeyCheckValue"),
+                    string(&verified, "EncryptionKeyArn"),
+                    string(&verified, "EncryptionKeyCheckValue"),
+                ),
+                (
+                    pvk.arn.as_str(),
+                    pvk.key_check_value.as_str(),
+                    pek.arn.as_str(),
+                    pek.key_check_value.as_str(),
+                ),
+                "case {case}: the verification must answer from the two keys it ran under, \
+                 got {verified}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_modelled_generation_attribute_answers_pin_data_a_verify_confirms() {
+    let router = emulator();
+    // Every member of the modelled `PinGenerationAttributes` union
+    // (`smithy_query(query="shape",shape="PinGenerationAttributes")`), which is the
+    // class this rule generalises over: two Visa members and four IBM 3624 members.
+    let variants = [
+        "VisaPin",
+        "VisaPinVerificationValue",
+        "Ibm3624NaturalPin",
+        "Ibm3624RandomPin",
+        "Ibm3624PinOffset",
+        "Ibm3624PinFromOffset",
+    ];
+    // The offset `Ibm3624PinFromOffset` recovers its PIN from, four digits like the PIN.
+    let from_offset = "1357";
+    for variant in variants {
+        let visa = variant.starts_with("Visa");
+        let usage = if visa {
+            USAGE_VISA_PIN_VERIFICATION
+        } else {
+            USAGE_IBM3624_PIN_VERIFICATION
+        };
+        let (pek, pvk) = pin_keys(&router, "TDES_2KEY", usage).await;
+        // The two members that carry an `EncryptedPinBlock` present the cardholder's own
+        // PIN, so a block is made for them first by the member of the same family that
+        // draws one.
+        let presented = match variant {
+            "VisaPinVerificationValue" => {
+                generated_pin_block(
+                    &router,
+                    &pvk.arn,
+                    &pek.arn,
+                    visa_pin(),
+                    "ISO_FORMAT_0",
+                    Some(6),
+                )
+                .await
+            }
+            "Ibm3624PinOffset" => {
+                generated_pin_block(
+                    &router,
+                    &pvk.arn,
+                    &pek.arn,
+                    ibm3624_attributes("Ibm3624RandomPin", &[]),
+                    "ISO_FORMAT_0",
+                    Some(6),
+                )
+                .await
+            }
+            _ => String::new(),
+        };
+        // A member that DRAWS or COMPUTES the PIN is told how long it must be; one that
+        // reads it out of a block or an offset takes the length from there.
+        let (attributes, length) = match variant {
+            "VisaPin" => (visa_pin(), Some(6)),
+            "VisaPinVerificationValue" => (
+                json!({"VisaPinVerificationValue": {
+                    "PinVerificationKeyIndex": PIN_VERIFICATION_KEY_INDEX,
+                    "EncryptedPinBlock": presented,
+                }}),
+                None,
+            ),
+            "Ibm3624NaturalPin" => (ibm3624_attributes(variant, &[]), Some(6)),
+            "Ibm3624RandomPin" => (ibm3624_attributes(variant, &[]), Some(6)),
+            "Ibm3624PinOffset" => (
+                ibm3624_attributes(variant, &[("EncryptedPinBlock", json!(presented))]),
+                None,
+            ),
+            "Ibm3624PinFromOffset" => (
+                ibm3624_attributes(variant, &[("PinOffset", json!(from_offset))]),
+                None,
+            ),
+            other => panic!("case {other:?}: the table names no member of the modelled union"),
+        };
+        let parsed = ok_data(
+            &router,
+            GENERATE_PIN_DATA_URI,
+            &generate_pin_data_body(&pvk.arn, &pek.arn, attributes, "ISO_FORMAT_0", length),
+        )
+        .await;
+        let block = string(&parsed, "EncryptedPinBlock").to_string();
+        let (member, value) = pin_data_member(&parsed);
+        let expected_member = if visa {
+            "VerificationValue"
+        } else {
+            "PinOffset"
+        };
+        assert_eq!(
+            member, expected_member,
+            "case {variant}: expected the PinData to carry a {expected_member}, got {parsed}"
+        );
+        assert!(
+            value.bytes().all(|byte| byte.is_ascii_digit()) && !value.is_empty(),
+            "case {variant}: expected decimal digits of pin data, got {value:?}"
+        );
+        if variant == "Ibm3624NaturalPin" {
+            // The natural PIN is the PIN the validation data itself computes to, so the
+            // offset between the PIN and the natural PIN is zero at every digit.
+            assert!(
+                value.chars().all(|digit| digit == '0'),
+                "case {variant}: a natural PIN has a zero offset, got {value:?}"
+            );
+        }
+        if variant == "Ibm3624PinFromOffset" {
+            assert_eq!(
+                value, from_offset,
+                "case {variant}: the offset the PIN was recovered from is the one stored, \
+                 got {value:?}"
+            );
+        }
+
+        let verification_attributes = if visa {
+            json!({"VisaPin": {
+                "PinVerificationKeyIndex": PIN_VERIFICATION_KEY_INDEX,
+                "VerificationValue": value,
+            }})
+        } else {
+            ibm3624_attributes("Ibm3624Pin", &[("PinOffset", json!(value))])
+        };
+        let (status, verified) = data(
+            &router,
+            VERIFY_PIN_DATA_URI,
+            &verify_pin_data_body(
+                &pvk.arn,
+                &pek.arn,
+                verification_attributes,
+                "ISO_FORMAT_0",
+                &block,
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {variant}: the pin data just generated must verify, got {status} {verified}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_pin_that_is_not_the_one_the_stored_value_stands_for_is_refused() {
+    let router = emulator();
+    // `INVALID_PIN` is the modelled `VerificationFailedReason` for this class.
+    assert!(
+        VERIFICATION_FAILED_REASON_VALUES.contains(&"INVALID_PIN"),
+        "INVALID_PIN must be a modelled VerificationFailedReason, the catalog is \
+         {VERIFICATION_FAILED_REASON_VALUES:?}"
+    );
+    let (pek, ibm) = pin_keys(&router, "TDES_2KEY", USAGE_IBM3624_PIN_VERIFICATION).await;
+    let (_, visa) = pin_keys(&router, "TDES_2KEY", USAGE_VISA_PIN_VERIFICATION).await;
+    // Another PIN encryption key of the same algorithm: a block encrypted under it
+    // presents no PIN this key can read.
+    let other_pek = create_key(
+        &router,
+        "TDES_2KEY",
+        USAGE_PIN_ENCRYPTION,
+        encrypt_decrypt(),
+    )
+    .await;
+
+    // Offsets of several lengths, each recovering its own PIN from the same validation
+    // data: the stored offset is one row's, and the block presented is another's.
+    let offsets = ["1357", "000000", "987654321098"];
+    for offset in offsets {
+        let block = generated_pin_block(
+            &router,
+            &ibm.arn,
+            &pek.arn,
+            ibm3624_attributes("Ibm3624PinFromOffset", &[("PinOffset", json!(offset))]),
+            "ISO_FORMAT_0",
+            None,
+        )
+        .await;
+        // The offset the issuer stores, and the block the caller presents.
+        let rows: Vec<(String, String, String, bool)> = vec![
+            (
+                format!("the PIN the stored offset stands for ({} digits)", offset.len()),
+                offset.to_string(),
+                block.clone(),
+                true,
+            ),
+            (
+                "a stored offset one digit away, which stands for another PIN".to_string(),
+                stepped(offset),
+                block.clone(),
+                false,
+            ),
+            (
+                "a block encrypted under another PIN encryption key".to_string(),
+                offset.to_string(),
+                generated_pin_block(
+                    &router,
+                    &ibm.arn,
+                    &other_pek.arn,
+                    ibm3624_attributes("Ibm3624PinFromOffset", &[("PinOffset", json!(offset))]),
+                    "ISO_FORMAT_0",
+                    None,
+                )
+                .await,
+                false,
+            ),
+        ];
+        for (case, stored, presented, served) in rows {
+            let (status, parsed) = data(
+                &router,
+                VERIFY_PIN_DATA_URI,
+                &verify_pin_data_body(
+                    &ibm.arn,
+                    &pek.arn,
+                    ibm3624_attributes("Ibm3624Pin", &[("PinOffset", json!(stored))]),
+                    "ISO_FORMAT_0",
+                    &presented,
+                ),
+            )
+            .await;
+            if served {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected 200, got {status} {parsed}"
+                );
+                continue;
+            }
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "VerificationFailedException"),
+                "case {case:?}: expected a failed verification, got {status} {parsed}"
+            );
+            assert_eq!(
+                string(&parsed, "Reason"),
+                "INVALID_PIN",
+                "case {case:?}: expected the PIN as the datum that failed, got {parsed}"
+            );
+            // One sentence for the whole PIN class, naming the PIN BLOCK as what was
+            // verified and echoing nothing of the PIN, the block or either key.
+            assert_eq!(
+                string(&parsed, "Message"),
+                "Pin block verification failed.",
+                "case {case:?}: a failed PIN verification states its own class, got {parsed}"
+            );
+        }
+    }
+
+    // The same rule on the Visa side: a verification value one digit away from the one
+    // this PIN computes to stands for another PIN.
+    let parsed = ok_data(
+        &router,
+        GENERATE_PIN_DATA_URI,
+        &generate_pin_data_body(&visa.arn, &pek.arn, visa_pin(), "ISO_FORMAT_0", Some(4)),
+    )
+    .await;
+    let block = string(&parsed, "EncryptedPinBlock").to_string();
+    let (_, value) = pin_data_member(&parsed);
+    let (status, refused) = data(
+        &router,
+        VERIFY_PIN_DATA_URI,
+        &verify_pin_data_body(
+            &visa.arn,
+            &pek.arn,
+            json!({"VisaPin": {
+                "PinVerificationKeyIndex": PIN_VERIFICATION_KEY_INDEX,
+                "VerificationValue": stepped(&value),
+            }}),
+            "ISO_FORMAT_0",
+            &block,
+        ),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (400, "VerificationFailedException"),
+        "a verification value that is not this PIN's must be refused, got {status} {refused}"
+    );
+}
+
+#[tokio::test]
+async fn the_pin_data_operations_need_the_keys_their_algorithms_are_defined_under() {
+    let router = emulator();
+    // (case, the generation key's usage, its modes of use, whether the call is served)
+    let generation_rows: Vec<(&str, &str, Value, bool)> = vec![
+        (
+            "a Visa PIN verification key that generates",
+            USAGE_VISA_PIN_VERIFICATION,
+            generate_verify(),
+            true,
+        ),
+        (
+            "a Visa PIN verification key with no restriction on its use",
+            USAGE_VISA_PIN_VERIFICATION,
+            json!({"NoRestrictions": true}),
+            true,
+        ),
+        (
+            "a Visa PIN verification key that may not generate",
+            USAGE_VISA_PIN_VERIFICATION,
+            json!({"Verify": true}),
+            false,
+        ),
+        (
+            "an IBM 3624 PIN verification key, which is another algorithm's key",
+            USAGE_IBM3624_PIN_VERIFICATION,
+            generate_verify(),
+            false,
+        ),
+        (
+            "a PIN encryption key, which verifies no PIN",
+            USAGE_PIN_ENCRYPTION,
+            generate_verify(),
+            false,
+        ),
+        (
+            "a card verification key, which belongs to another operation",
+            USAGE_CARD_VERIFICATION,
+            generate_verify(),
+            false,
+        ),
+    ];
+    for (case, usage, modes, served) in generation_rows {
+        let pek = create_key(
+            &router,
+            "TDES_2KEY",
+            USAGE_PIN_ENCRYPTION,
+            encrypt_decrypt(),
+        )
+        .await;
+        let generation = create_key(&router, "TDES_2KEY", usage, modes).await;
+        let (status, parsed) = data(
+            &router,
+            GENERATE_PIN_DATA_URI,
+            &generate_pin_data_body(
+                &generation.arn,
+                &pek.arn,
+                visa_pin(),
+                "ISO_FORMAT_0",
+                Some(4),
+            ),
+        )
+        .await;
+        if served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200, got {status} {parsed}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: expected the key to be refused, got {status} {parsed}"
+            );
+        }
+    }
+
+    // (case, the encryption key's algorithm, usage, modes, the format, whether served)
+    let encryption_rows: Vec<(&str, &str, &str, Value, &str, bool)> = vec![
+        (
+            "a Triple DES PIN encryption key that encrypts, for a Triple DES block",
+            "TDES_2KEY",
+            USAGE_PIN_ENCRYPTION,
+            json!({"Encrypt": true}),
+            "ISO_FORMAT_0",
+            true,
+        ),
+        (
+            "an AES PIN encryption key, for the one format defined over AES",
+            "AES_256",
+            USAGE_PIN_ENCRYPTION,
+            encrypt_decrypt(),
+            "ISO_FORMAT_4",
+            true,
+        ),
+        (
+            "a Triple DES PIN encryption key for the AES-only format",
+            "TDES_2KEY",
+            USAGE_PIN_ENCRYPTION,
+            encrypt_decrypt(),
+            "ISO_FORMAT_4",
+            false,
+        ),
+        (
+            "an AES PIN encryption key for a Triple DES format",
+            "AES_128",
+            USAGE_PIN_ENCRYPTION,
+            encrypt_decrypt(),
+            "ISO_FORMAT_0",
+            false,
+        ),
+        (
+            "a PIN encryption key that may not encrypt",
+            "TDES_2KEY",
+            USAGE_PIN_ENCRYPTION,
+            json!({"Decrypt": true}),
+            "ISO_FORMAT_0",
+            false,
+        ),
+        (
+            "a Visa PIN verification key, which carries no PIN block",
+            "TDES_2KEY",
+            USAGE_VISA_PIN_VERIFICATION,
+            encrypt_decrypt(),
+            "ISO_FORMAT_0",
+            false,
+        ),
+    ];
+    for (case, algorithm, usage, modes, format, served) in encryption_rows {
+        let encryption = create_key(&router, algorithm, usage, modes).await;
+        let generation = create_key(
+            &router,
+            "TDES_2KEY",
+            USAGE_VISA_PIN_VERIFICATION,
+            generate_verify(),
+        )
+        .await;
+        let (status, parsed) = data(
+            &router,
+            GENERATE_PIN_DATA_URI,
+            &generate_pin_data_body(&generation.arn, &encryption.arn, visa_pin(), format, Some(4)),
+        )
+        .await;
+        if served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200, got {status} {parsed}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: expected the key to be refused, got {status} {parsed}"
+            );
+        }
+    }
+
+    // An identifier naming no key is the modelled `ResourceNotFoundException`, for each
+    // of the two keys these operations name and for both operations.
+    let pek = create_key(
+        &router,
+        "TDES_2KEY",
+        USAGE_PIN_ENCRYPTION,
+        encrypt_decrypt(),
+    )
+    .await;
+    let pvk = create_key(
+        &router,
+        "TDES_2KEY",
+        USAGE_VISA_PIN_VERIFICATION,
+        generate_verify(),
+    )
+    .await;
+    let absent = "alias/no-such-pin-key";
+    // (case, the generation key, the encryption key)
+    let missing_rows: Vec<(&str, &str, &str)> = vec![
+        ("the generation key", absent, pek.arn.as_str()),
+        ("the encryption key", pvk.arn.as_str(), absent),
+    ];
+    for (case, generation, encryption) in missing_rows {
+        let (status, parsed) = data(
+            &router,
+            GENERATE_PIN_DATA_URI,
+            &generate_pin_data_body(generation, encryption, visa_pin(), "ISO_FORMAT_0", Some(4)),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: an identifier naming no key must be a 404, got {status} {parsed}"
+        );
+        let (status, parsed) = data(
+            &router,
+            VERIFY_PIN_DATA_URI,
+            &verify_pin_data_body(
+                generation,
+                encryption,
+                json!({"VisaPin": {
+                    "PinVerificationKeyIndex": PIN_VERIFICATION_KEY_INDEX,
+                    "VerificationValue": "1234",
+                }}),
+                "ISO_FORMAT_0",
+                "0123456789ABCDEF",
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: VerifyPinData must answer a 404 alike, got {status} {parsed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_pin_length_a_request_names_must_be_the_pin_it_works_with() {
+    let router = emulator();
+    let (pek, visa) = pin_keys(&router, "TDES_2KEY", USAGE_VISA_PIN_VERIFICATION).await;
+    let ibm = create_key(
+        &router,
+        "TDES_2KEY",
+        USAGE_IBM3624_PIN_VERIFICATION,
+        generate_verify(),
+    )
+    .await;
+    // An offset is aligned digit for digit with the PIN it describes, so this one
+    // recovers a four-digit PIN whatever `PinDataLength` says.
+    let from_offset = ibm3624_attributes("Ibm3624PinFromOffset", &[("PinOffset", json!("1357"))]);
+    // (case, the generation key, the attributes, the length named, whether served)
+    let rows: Vec<(&str, &str, Value, Option<i64>, bool)> = vec![
+        (
+            "a drawn PIN of the length the request names",
+            visa.arn.as_str(),
+            visa_pin(),
+            Some(8),
+            true,
+        ),
+        (
+            "a PIN recovered from an offset, under that offset's own length",
+            ibm.arn.as_str(),
+            from_offset.clone(),
+            Some(4),
+            true,
+        ),
+        (
+            "a PIN recovered from an offset, with no length named",
+            ibm.arn.as_str(),
+            from_offset.clone(),
+            None,
+            true,
+        ),
+        (
+            "a PIN recovered from an offset, under a length that is not its own",
+            ibm.arn.as_str(),
+            from_offset.clone(),
+            Some(8),
+            false,
+        ),
+    ];
+    for (case, generation, attributes, length, served) in rows {
+        let (status, parsed) = data(
+            &router,
+            GENERATE_PIN_DATA_URI,
+            &generate_pin_data_body(generation, &pek.arn, attributes, "ISO_FORMAT_0", length),
+        )
+        .await;
+        if served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200, got {status} {parsed}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "ValidationException"),
+                "case {case:?}: expected the length to be refused, got {status} {parsed}"
+            );
+        }
+    }
+
+    // The same rule on the verifying side: the block carries the PIN's own length, so a
+    // request naming another one names a PIN that block does not carry.
+    let block = generated_pin_block(
+        &router,
+        &ibm.arn,
+        &pek.arn,
+        from_offset,
+        "ISO_FORMAT_0",
+        None,
+    )
+    .await;
+    // (case, the length named, whether served)
+    let rows: Vec<(&str, Option<i64>, bool)> = vec![
+        ("the length the block carries", Some(4), true),
+        ("no length at all", None, true),
+        ("a length the block does not carry", Some(8), false),
+    ];
+    for (case, length, served) in rows {
+        let mut body = verify_pin_data_body(
+            &ibm.arn,
+            &pek.arn,
+            ibm3624_attributes("Ibm3624Pin", &[("PinOffset", json!("1357"))]),
+            "ISO_FORMAT_0",
+            &block,
+        );
+        if let (Some(length), Value::Object(target)) = (length, &mut body) {
+            target.insert("PinDataLength".to_string(), json!(length));
+        }
+        let (status, parsed) = data(&router, VERIFY_PIN_DATA_URI, &body).await;
+        if served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200, got {status} {parsed}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "VerificationFailedException"),
+                "case {case:?}: expected a failed verification, got {status} {parsed}"
+            );
+        }
+    }
 }

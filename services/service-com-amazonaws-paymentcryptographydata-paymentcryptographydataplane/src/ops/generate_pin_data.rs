@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GeneratePinData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GeneratePinData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GeneratePinData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Generates the PIN data a new or reissued card needs, under the TWO keys the request
+//! names: the PIN verification key `GenerationKeyIdentifier` names, which the derived
+//! value is computed under, and the PIN encryption key `EncryptionKeyIdentifier` names,
+//! which the PIN travels back out under.
+//!
+//! "PIN data is never transmitted in clear to or from Amazon Web Services Payment
+//! Cryptography" (this operation's own documentation), so the PIN itself never appears
+//! in the response: what the caller gets is the PIN inside an ISO 9564 PIN block
+//! encrypted under the PIN encryption key, plus the value the card issuer stores — a
+//! Visa PIN verification value or an IBM 3624 PIN offset, by the `GenerationAttributes`
+//! the request names. Each is the published computation over the key's own working
+//! material ([`crate::state::crypto::pin`]), so `VerifyPinData` recomputes exactly what
+//! this operation answered and nothing is kept here between calls.
+//!
+//! The `GenerationAttributes` union says which PIN this operation works with: the two
+//! variants that carry an `EncryptedPinBlock` read the cardholder's own PIN out of it,
+//! `Ibm3624PinFromOffset` recovers the PIN from the offset the request carries,
+//! `Ibm3624NaturalPin` takes the natural PIN the validation data computes to, and
+//! `VisaPin` and `Ibm3624RandomPin` draw a `PinDataLength`-digit PIN for the card.
+//!
+//! `EncryptionWrappedKey` names an ECDH key exchange — a key established outside this
+//! service's key store, which this slice does not serve — so a request carrying one
+//! answers 501 rather than a PIN block protected by a key nothing derived.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +154,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::crypto::pin;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -212,18 +228,321 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GeneratePinData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GeneratePinDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GeneratePinData"))
+        // IAM decides ahead of the service, so this is asked before anything about the
+        // request is read, and for BOTH keys the call uses: a caller whose policies do
+        // not allow this action on either of them learns nothing about either key.
+        for identifier in [
+            &input.generation_key_identifier,
+            &input.encryption_key_identifier,
+        ] {
+            crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, identifier)
+                .map_err(denied)?;
+        }
+        if input.encryption_wrapped_key.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GeneratePinData with an EncryptionWrappedKey established by ECDH key exchange",
+            ));
+        }
+        let format = pin::PinBlockFormat::parse(&input.pin_block_format).map_err(refused_pin)?;
+
+        // "The keyARN of the PEK that Amazon Web Services Payment Cryptography uses to
+        // encrypt the PIN Block" (`EncryptionKeyIdentifier`): the TR-31 PIN encryption
+        // key, used here to encrypt the PIN block this operation answers — and to read
+        // the one a request may carry, which is why a request that presents a PIN block
+        // also needs the key's Decrypt mode.
+        let encryption_key = crate::state::resolve_key(&*self.engine, &input.encryption_key_identifier)
+            .map_err(refused)?;
+        if encryption_key.key_usage != crate::state::KEY_USAGE_PIN_ENCRYPTION {
+            return Err(invalid(format!(
+                "KeyUsage {} is not valid for this operation.",
+                encryption_key.key_usage
+            )));
+        }
+        if !encryption_key.modes.encrypt() {
+            return Err(invalid(format!(
+                "The KeyModesOfUse of key {} do not include Encrypt.",
+                encryption_key.key_arn
+            )));
+        }
+
+        // "The keyARN of the PEK that Amazon Web Services Payment Cryptography uses for
+        // pin data generation" (`GenerationKeyIdentifier`) is the PIN VERIFICATION key
+        // the named algorithm is defined under: the Visa PVK for a Visa value, the IBM
+        // 3624 key for a natural PIN, an offset or a PIN from an offset.
+        let generation_key =
+            crate::state::resolve_key(&*self.engine, &input.generation_key_identifier)
+                .map_err(refused)?;
+        let required_usage = match &input.generation_attributes {
+            PinGenerationAttributes::VisaPin(_)
+            | PinGenerationAttributes::VisaPinVerificationValue(_) => {
+                crate::state::KEY_USAGE_VISA_PIN_VERIFICATION
+            }
+            _ => crate::state::KEY_USAGE_IBM3624_PIN_VERIFICATION,
+        };
+        if generation_key.key_usage != required_usage {
+            return Err(invalid(format!(
+                "KeyUsage {} is not valid for this operation.",
+                generation_key.key_usage
+            )));
+        }
+        // What this operation does with the generation key is GENERATE pin data, which
+        // is the mode its own documentation names for it; `VerifyPinData` requires
+        // Verify of the same key.
+        if !generation_key.modes.generate() {
+            return Err(invalid(format!(
+                "The KeyModesOfUse of key {} do not include Generate.",
+                generation_key.key_arn
+            )));
+        }
+
+        // "The length of PIN under generation" (`PinDataLength`), whose modelled range
+        // is 4..12 and whose shortest value is the length applied when the request names
+        // none.
+        let length = input
+            .pin_data_length
+            .unwrap_or(crate::state::DEFAULT_PIN_DATA_LENGTH);
+        let Ok(length) = usize::try_from(length) else {
+            return Err(invalid(format!(
+                "PinDataLength {length} is not a valid PIN length."
+            )));
+        };
+        let pan = input.primary_account_number.as_deref();
+        // The PIN this call works with, and the value the issuer stores for it. A
+        // variant that carries an `EncryptedPinBlock` presents the cardholder's own PIN,
+        // one that carries an offset recovers it, and the rest compute or draw it.
+        let (pin, pin_data) = match &input.generation_attributes {
+            PinGenerationAttributes::VisaPin(attributes) => {
+                let pin = pin::drawn_pin(length);
+                let value = visa_value(
+                    &generation_key,
+                    pan,
+                    attributes.pin_verification_key_index,
+                    &pin,
+                )?;
+                (pin, PinData::VerificationValue(value))
+            }
+            PinGenerationAttributes::VisaPinVerificationValue(attributes) => {
+                let pin = presented_pin(
+                    format,
+                    &encryption_key,
+                    &attributes.encrypted_pin_block,
+                    pan,
+                )?;
+                let value = visa_value(
+                    &generation_key,
+                    pan,
+                    attributes.pin_verification_key_index,
+                    &pin,
+                )?;
+                (pin, PinData::VerificationValue(value))
+            }
+            PinGenerationAttributes::Ibm3624NaturalPin(attributes) => {
+                // The natural PIN is the PIN the validation data itself computes to, so
+                // the PIN and the natural PIN are the same value and the offset between
+                // them is zero at every digit.
+                let pin = natural_pin(
+                    &generation_key,
+                    &attributes.decimalization_table,
+                    &attributes.pin_validation_data_pad_character,
+                    &attributes.pin_validation_data,
+                    length,
+                )?;
+                let offset = offset_of(&pin, &pin)?;
+                (pin, PinData::PinOffset(offset))
+            }
+            PinGenerationAttributes::Ibm3624RandomPin(attributes) => {
+                let pin = pin::drawn_pin(length);
+                let natural = natural_pin(
+                    &generation_key,
+                    &attributes.decimalization_table,
+                    &attributes.pin_validation_data_pad_character,
+                    &attributes.pin_validation_data,
+                    length,
+                )?;
+                let offset = offset_of(&pin, &natural)?;
+                (pin, PinData::PinOffset(offset))
+            }
+            PinGenerationAttributes::Ibm3624PinOffset(attributes) => {
+                let pin = presented_pin(
+                    format,
+                    &encryption_key,
+                    &attributes.encrypted_pin_block,
+                    pan,
+                )?;
+                let natural = natural_pin(
+                    &generation_key,
+                    &attributes.decimalization_table,
+                    &attributes.pin_validation_data_pad_character,
+                    &attributes.pin_validation_data,
+                    pin.chars().count(),
+                )?;
+                let offset = offset_of(&pin, &natural)?;
+                (pin, PinData::PinOffset(offset))
+            }
+            PinGenerationAttributes::Ibm3624PinFromOffset(attributes) => {
+                // An offset is aligned digit for digit with the PIN it describes, so the
+                // PIN recovered from one is as long as the offset.
+                let natural = natural_pin(
+                    &generation_key,
+                    &attributes.decimalization_table,
+                    &attributes.pin_validation_data_pad_character,
+                    &attributes.pin_validation_data,
+                    attributes.pin_offset.chars().count(),
+                )?;
+                let pin = pin::ibm3624_pin_from_offset(&natural, &attributes.pin_offset)
+                    .map_err(refused_pin)?;
+                (pin, PinData::PinOffset(attributes.pin_offset.clone()))
+            }
+        };
+
+        // "The length of PIN under generation" (`PinDataLength`) describes the PIN this
+        // call works with, so a request that names one for a PIN it did NOT generate —
+        // one read out of a presented block, or recovered from an offset, whose own
+        // length comes from there — has to name that PIN's length and not another.
+        if input.pin_data_length.is_some() && pin.chars().count() != length {
+            return Err(invalid(format!(
+                "PinDataLength {length} is not the length of the PIN this request names."
+            )));
+        }
+
+        let encrypted_pin_block = pin::encrypt_pin_block(
+            format,
+            &encryption_key.key_algorithm,
+            encryption_key.material(),
+            &pin,
+            pan,
+        )
+        .map_err(refused_pin)?;
+
+        Ok(GeneratePinDataOutput {
+            generation_key_arn: generation_key.key_arn,
+            generation_key_check_value: generation_key.key_check_value,
+            encryption_key_arn: encryption_key.key_arn,
+            encryption_key_check_value: encryption_key.key_check_value,
+            encrypted_pin_block,
+            pin_data,
+        })
+    }
+}
+
+/// The Visa PIN verification value of `pin` under the generation key.
+fn visa_value(
+    key: &crate::state::ResolvedKey,
+    pan: Option<&str>,
+    pin_verification_key_index: i32,
+    pin: &str,
+) -> Result<String, GeneratePinDataError> {
+    // The transformed security parameter a Visa value is computed from carries the
+    // account number's own digits, so a request that names none names no value.
+    let pan = pan.ok_or_else(|| {
+        invalid(
+            "PrimaryAccountNumber is required for VISA PIN verification value generation."
+                .to_string(),
+        )
+    })?;
+    pin::visa_pin_verification_value(
+        &key.key_algorithm,
+        key.material(),
+        pan,
+        pin_verification_key_index,
+        pin,
+    )
+    .map_err(refused_pin)
+}
+
+/// The IBM 3624 natural PIN of the request's validation data under the generation key.
+fn natural_pin(
+    key: &crate::state::ResolvedKey,
+    decimalization_table: &str,
+    pad_character: &str,
+    validation_data: &str,
+    length: usize,
+) -> Result<String, GeneratePinDataError> {
+    pin::ibm3624_natural_pin(
+        &key.key_algorithm,
+        key.material(),
+        validation_data,
+        pad_character,
+        decimalization_table,
+        length,
+    )
+    .map_err(refused_pin)
+}
+
+/// The offset of `pin` from `natural`.
+fn offset_of(pin: &str, natural: &str) -> Result<String, GeneratePinDataError> {
+    pin::ibm3624_offset(pin, natural).map_err(refused_pin)
+}
+
+/// The PIN a request presented inside an `EncryptedPinBlock`, read under the PIN
+/// encryption key.
+///
+/// Reading one is a DECRYPT under that key, so the key's modes have to admit it.
+fn presented_pin(
+    format: pin::PinBlockFormat,
+    key: &crate::state::ResolvedKey,
+    encrypted_pin_block: &str,
+    pan: Option<&str>,
+) -> Result<String, GeneratePinDataError> {
+    if !key.modes.decrypt() {
+        return Err(invalid(format!(
+            "The KeyModesOfUse of key {} do not include Decrypt.",
+            key.key_arn
+        )));
+    }
+    pin::decrypt_pin_block(
+        format,
+        &key.key_algorithm,
+        key.material(),
+        encrypted_pin_block,
+        pan,
+    )
+    .map_err(refused_pin)
+}
+
+/// A request the calling principal's IAM policies do not allow: the modelled
+/// `AccessDeniedException` (HTTP 403), worded by [`crate::service::authorization`].
+fn denied(exception: AccessDeniedException) -> GeneratePinDataError {
+    GeneratePinDataErrorModeled::AccessDeniedException(exception).into()
+}
+
+/// A request this operation cannot serve as asked: the modelled `ValidationException`.
+fn invalid(message: String) -> GeneratePinDataError {
+    GeneratePinDataErrorModeled::ValidationException(ValidationException {
+        message,
+        field_list: None,
+    })
+    .into()
+}
+
+/// The refusal a PIN computation answered, in this operation's own error channel.
+///
+/// A PIN block that carries no PIN of the named format is an inadmissible REQUEST here
+/// — this operation verifies nothing, so there is no failed verification to report —
+/// and so is refused with the reason, as every other refusal of a request is.
+fn refused_pin(refusal: crate::state::crypto::pin::PinRefusal) -> GeneratePinDataError {
+    match refusal {
+        crate::state::crypto::pin::PinRefusal::Invalid(message)
+        | crate::state::crypto::pin::PinRefusal::Unreadable(message) => invalid(message),
+    }
+}
+
+/// The refusal [`crate::state::resolve_key`] answered, in this operation's own error
+/// channel.
+fn refused(refusal: crate::state::KeyRefusal) -> GeneratePinDataError {
+    match refusal {
+        crate::state::KeyRefusal::NotFound(identifier) => {
+            GeneratePinDataErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                resource_id: Some(identifier),
+            })
+            .into()
+        }
+        crate::state::KeyRefusal::NotUsable(message) => invalid(message),
+        crate::state::KeyRefusal::Unavailable(message) => {
+            GeneratePinDataErrorModeled::InternalServerException(InternalServerException {
+                message: Some(message),
+            })
+            .into()
+        }
     }
 }

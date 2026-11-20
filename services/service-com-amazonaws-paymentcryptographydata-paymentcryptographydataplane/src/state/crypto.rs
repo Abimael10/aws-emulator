@@ -42,6 +42,7 @@ use hmac::Hmac;
 use sha2::{Sha224, Sha256, Sha384, Sha512};
 
 pub mod emv;
+pub mod pin;
 
 /// How many characters of a hex-coded wire value one byte of data occupies.
 ///

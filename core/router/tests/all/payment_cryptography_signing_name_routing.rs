@@ -254,7 +254,9 @@ const CASES: &[Case] = &[
         marker: ROUTING_CHECK_RESOURCE_ID,
     },
     Case {
-        // A second data-plane path space, on a loopback endpoint.
+        // A second data-plane path space, on a loopback endpoint. The operation is
+        // served now, so the marker is its own modelled refusal of the alias no key is
+        // bound to, as it is for the two `/mac/*` cases above.
         name: "GeneratePinData on a loopback endpoint",
         host: "127.0.0.1:9297",
         target: "",
@@ -266,8 +268,8 @@ const CASES: &[Case] = &[
             "GenerationAttributes":{"VisaPin":{"PinVerificationKeyIndex":1}},
             "PinBlockFormat":"ISO_FORMAT_0","PrimaryAccountNumber":"171234567890123"}"#,
         who: "the data plane",
-        status: 501,
-        marker: "operation GeneratePinData is scaffolded",
+        status: 404,
+        marker: ROUTING_CHECK_RESOURCE_ID,
     },
 ];
 
