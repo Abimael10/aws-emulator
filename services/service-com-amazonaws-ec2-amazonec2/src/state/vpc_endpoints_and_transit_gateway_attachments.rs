@@ -2310,6 +2310,12 @@ pub const TRANSIT_GATEWAY_ASSOCIATION_STATE_DISASSOCIATED: &str = "disassociated
 /// member (that enum being `pending`, `available`, `deleting`, `deleted`).
 pub const TRANSIT_GATEWAY_POLICY_TABLE_STATE_AVAILABLE: &str = "available";
 
+/// A policy table a delete has been asked for: that same enum's `deleting` member, the
+/// TRANSIENT state a delete leaves one in while the clock still owes it the move to that
+/// enum's terminal `deleted` — which is the REMOVAL, for the reason
+/// [`ComAmazonawsEc2Amazonec2State::begin_transit_gateway_policy_table_deletion`] gives.
+pub const TRANSIT_GATEWAY_POLICY_TABLE_STATE_DELETING: &str = "deleting";
+
 /// One attachment's association with a transit gateway policy table: the modelled
 /// [`TransitGatewayPolicyTableAssociation`] every operation that reports one answers with,
 /// plus the move the clock owes it.
@@ -2454,6 +2460,87 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         Some(policy_table_id)
+    }
+
+    /// Start deleting the transit gateway policy table `transit_gateway_policy_table_id`
+    /// names, and answer it as the store then holds it — `None` when the account holds no
+    /// such policy table.
+    ///
+    /// "Deletes the specified transit gateway policy table" is work AWS reports as under way:
+    /// the `TransitGatewayPolicyTableState` catalog carries `deleting` and `deleted`, so the
+    /// table is left in the TRANSIENT state with the clock owing it the REMOVAL one
+    /// [`TRANSITION_DELAY`] later ([`Self::transit_gateway_policy_table_delete_at`], applied
+    /// by [`Self::materialize_due_transitions`]) — the same arrangement, on the same clock,
+    /// as the one [`Self::begin_transit_gateway_deletion`] gives a deleted transit gateway.
+    /// So a caller that reads straight back still sees the delete under way, and a later one
+    /// finds the table gone, which is what `DescribeTransitGatewayPolicyTables` no longer
+    /// carrying it means.
+    pub fn begin_transit_gateway_policy_table_deletion(
+        &mut self,
+        transit_gateway_policy_table_id: &str,
+    ) -> Option<TransitGatewayPolicyTable> {
+        let table = self
+            .transit_gateway_policy_tables
+            .get_mut(transit_gateway_policy_table_id)?;
+        table.view.state = Some(TRANSIT_GATEWAY_POLICY_TABLE_STATE_DELETING.to_string());
+        let view = table.view.clone();
+        self.transit_gateway_policy_table_delete_at.insert(
+            transit_gateway_policy_table_id.to_string(),
+            Instant::now() + TRANSITION_DELAY,
+        );
+        Some(view)
+    }
+
+    /// Apply the removal the clock owes a deleted transit gateway policy table, as of `now`.
+    ///
+    /// A table a `DeleteTransitGatewayPolicyTable` left `deleting` was GONE at the instant
+    /// that call recorded for it, with the entries held in it, whether or not anybody called
+    /// again — so the removal is applied from [`Self::materialize_due_transitions`], its one
+    /// caller, before anything reads the store.
+    pub(super) fn materialize_due_transit_gateway_policy_table_deletions(&mut self, now: Instant) {
+        let due: Vec<String> = self
+            .transit_gateway_policy_table_delete_at
+            .iter()
+            .filter(|(_, due_at)| now >= **due_at)
+            .map(|(policy_table_id, _)| policy_table_id.clone())
+            .collect();
+        for policy_table_id in due {
+            self.remove_transit_gateway_policy_table(&policy_table_id);
+        }
+    }
+
+    /// Remove the transit gateway policy table `transit_gateway_policy_table_id` names, with
+    /// everything stored as a PART of it, and answer it as the store held it — `None` when
+    /// the account holds no such policy table.
+    ///
+    /// The entries live inside the table's record
+    /// ([`TransitGatewayPolicyTableRecord::entries`]), so they go with it: a table the store
+    /// does not hold holds no entries. Every removal gives back exactly the bytes its own
+    /// writer charged — [`tag_list_bytes`] over the table's tags and
+    /// [`crate::state::transit_gateway_policy_table_entry_payload_bytes`] over each entry, on
+    /// top of the fixed [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs — so the
+    /// charge and the release cannot drift apart. The removal the clock may still have owed
+    /// the table goes too, so nothing can be removed twice.
+    pub fn remove_transit_gateway_policy_table(
+        &mut self,
+        transit_gateway_policy_table_id: &str,
+    ) -> Option<TransitGatewayPolicyTable> {
+        let table = self
+            .transit_gateway_policy_tables
+            .remove(transit_gateway_policy_table_id)?;
+        self.transit_gateway_policy_table_delete_at
+            .remove(transit_gateway_policy_table_id);
+        self.release_stored_bytes(
+            STORED_RECORD_OVERHEAD_BYTES
+                + tag_list_bytes(table.view.tags.as_deref().unwrap_or_default()),
+        );
+        for entry in table.entries.values() {
+            self.release_stored_bytes(
+                STORED_RECORD_OVERHEAD_BYTES
+                    + transit_gateway_policy_table_entry_payload_bytes(entry),
+            );
+        }
+        Some(table.view)
     }
 }
 

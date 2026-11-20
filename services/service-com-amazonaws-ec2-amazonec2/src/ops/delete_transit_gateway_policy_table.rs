@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTransitGatewayPolicyTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTransitGatewayPolicyTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTransitGatewayPolicyTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes the specified transit gateway policy table": it resolves the policy table the
+//! request names in the one policy table store and starts its deletion there, so the table
+//! this call answers is the one `DescribeTransitGatewayPolicyTables` then reports `deleting`
+//! and, once the clock has carried that work out, stops reporting at all.
+//!
+//! Nothing about the answer is taken from a recording: the table is the one the request's id
+//! resolves to, read back out of the store as it was held, carrying the state this call put
+//! it into.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +135,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTransitGatewayPolicyTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTransitGatewayPolicyTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTransitGatewayPolicyTable"))
+        // `ctx` carries request metadata only; this operation reads none of it — a policy
+        // table is named by id and carries no Region of its own. The store is reached through
+        // the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // "The transit gateway policy table to delete" (`$TransitGatewayPolicyTableId`) is
+        // `@required` but modelled `clientOptional`, so a request that left it out reaches
+        // this handler as an empty string rather than being refused at the boundary: a
+        // parameter the request did not carry is EC2's `MissingParameter`, worded as the
+        // operations that delete a part of this table word it.
+        let policy_table_id = input.transit_gateway_policy_table_id.as_str();
+        if policy_table_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter transitGatewayPolicyTableId",
+            ));
+        }
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation" (`$DryRun`): a question about
+        // the CALLER, not about the table the request names, so it is answered before
+        // anything is resolved — the order `DeleteTransitGateway` answers it in beside this
+        // operation — and every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first: whether this delete is admissible is asked of the state the store
+        // is ACTUALLY in, so a table an earlier delete has already carried away is gone and
+        // an association whose own move had fallen due is seen in the state it was owed.
+        store.materialize_due_transitions();
+
+        // The table the request names, resolved by the crate's ONE reader of a
+        // `TransitGatewayPolicyTableId` — so something that is no policy table id at all is
+        // refused as malformed before any lookup, and an id this account holds no table for
+        // is a refusal rather than a no-op: a caller that deletes twice has to be able to
+        // tell the deletion it performed from one it did not.
+        let table = store.require_transit_gateway_policy_table(policy_table_id)?;
+
+        // An association is a part of the table the CALLER takes away first, with
+        // `DisassociateTransitGatewayPolicyTable`: removing a table an attachment is still
+        // associated with would leave that attachment reporting a
+        // `TransitGatewayPolicyTableId` nothing resolves, so the dependency is refused here
+        // rather than cleaned up after. EC2 refuses it for the STATE those associations leave
+        // the table in — `IncorrectState`, the code a client reads as "clear what holds it
+        // and ask again", the same answer `DeleteTransitGatewayRouteTable` gives a route
+        // table that still holds one — and the sentence names the table THE REQUEST NAMED and
+        // no dependent id.
+        if !table.associations.is_empty() {
+            return Err(state::incorrect_state(format!(
+                "{policy_table_id} has associated attachments"
+            )));
+        }
+
+        let Some(deleted) = store.begin_transit_gateway_policy_table_deletion(policy_table_id)
+        else {
+            // Unreachable: the table was resolved above and the store is locked throughout.
+            // Kept so a delete that moved nothing can never read as a 200 over a table the
+            // store still holds as it was.
+            return Err(state::internal_error(
+                "the transit gateway policy table resolved a moment ago could not be deleted",
+            ));
+        };
+        // "Provides details about the deleted transit gateway policy table"
+        // (`$TransitGatewayPolicyTable`) as the STORE now holds it: `deleting`, the state the
+        // `TransitGatewayPolicyTableState` catalog gives a table a delete has been asked for,
+        // with the clock owing it the removal — so the state this answer carries is one a read
+        // straight after this call corroborates.
+        Ok(DeleteTransitGatewayPolicyTableOutput {
+            transit_gateway_policy_table: Some(deleted),
+        })
     }
 }

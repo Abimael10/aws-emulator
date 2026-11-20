@@ -3092,9 +3092,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Ordered by id, the stable order every reader of it reports in.
     ///
     /// `CreateTransitGatewayPolicyTable` is the operation that adds one and
-    /// `DeleteTransitGatewayPolicyTable` the one that removes it; that delete is still a
-    /// scaffold, so nothing takes a table out of this store yet.
+    /// `DeleteTransitGatewayPolicyTable` the one that removes it, through
+    /// [`Self::begin_transit_gateway_policy_table_deletion`] and the removal the clock then
+    /// owes it.
     pub transit_gateway_policy_tables: BTreeMap<String, TransitGatewayPolicyTableRecord>,
+    /// The REMOVAL the clock owes one transit gateway policy table a
+    /// `DeleteTransitGatewayPolicyTable` left `deleting`, by `TransitGatewayPolicyTableId`,
+    /// and the instant it falls due.
+    ///
+    /// Beside [`Self::transit_gateway_policy_tables`] rather than on the record, because what
+    /// is owed is not a state move but the table's removal — the same arrangement as
+    /// [`Self::transit_gateway_delete_at`]. Only a table a delete has been asked for has an
+    /// entry here, so a table nobody deleted is never taken out of the store.
+    pub transit_gateway_policy_table_delete_at: BTreeMap<String, Instant>,
     /// Every transit gateway metering policy the account holds, by
     /// `TransitGatewayMeteringPolicyId`, as the modelled [`TransitGatewayMeteringPolicy`]
     /// shape itself — see the module docs. Ordered by id, the stable order every reader of
@@ -4043,6 +4053,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_route_table_announcements: BTreeMap::new(),
             transit_gateway_connect_peers: BTreeMap::new(),
             transit_gateway_policy_tables: BTreeMap::new(),
+            // A fresh account has created no policy table, so none is being deleted either.
+            transit_gateway_policy_table_delete_at: BTreeMap::new(),
             transit_gateway_metering_policies: BTreeMap::new(),
             transit_gateway_metering_policy_moves: BTreeMap::new(),
             // A fresh account holds no metering policy, so no policy holds an entry either.

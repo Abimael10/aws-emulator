@@ -1594,6 +1594,12 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
         }
+        // A policy table a `DeleteTransitGatewayPolicyTable` left `deleting` was GONE at the
+        // instant that call recorded for it, with the entries held in it — whether or not
+        // anybody called again. Removed rather than parked in a terminal state, for the reason
+        // [`Self::begin_transit_gateway_policy_table_deletion`] gives: a deleted policy table
+        // is one `DescribeTransitGatewayPolicyTables` stops carrying.
+        self.materialize_due_transit_gateway_policy_table_deletions(now);
         // One attachment's association with a ROUTE table, which
         // `AssociateTransitGatewayRouteTable` leaves in the transient `associating` state
         // with `associated` owed: the same contract as the policy table associations above.
