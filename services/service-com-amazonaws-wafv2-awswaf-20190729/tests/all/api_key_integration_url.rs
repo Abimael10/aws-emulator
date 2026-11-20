@@ -12,6 +12,11 @@
 //! integration id. A client reads the URL from this listing BEFORE it has a key to
 //! use with it, so an empty listing carries it too.
 //!
+//! The id itself is the account's CAPTCHA integration id, which WAF publishes as a
+//! TWELVE-character lowercase hex label — the width a client that splits the label
+//! out of the URL, or recovers the id from it, reads — so the width is asserted
+//! alongside the form on every row.
+//!
 //! Each suite asserts that over a TABLE spanning the class: both scopes (and so both
 //! endpoint regions), a scope with no keys, with one and with several, and every way
 //! a call can ask for a page — no `Limit`, a `Limit` at each published bound, a
@@ -26,6 +31,14 @@ use crate::web_acl_lifecycle::{Waf, CLOUDFRONT_ENDPOINT_REGION, TEST_REGION};
 /// independently of the service's own constant so this suite pins the host and not
 /// merely its reuse.
 const CAPTCHA_SDK_DOMAIN: &str = "captcha-sdk.awswaf.com";
+
+/// How many lowercase hex characters the integration id WAF publishes the CAPTCHA
+/// integration under carries: the recorded `ApplicationIntegrationURL` carries a
+/// six-byte id rendered as hex in both the leading host label and the path segment.
+/// `OutputUrl` is an unconstrained string
+/// (`smithy_query(query="shape",shape="OutputUrl")`), so this width is the recorded
+/// one and is spelled out here independently of the service's own constant.
+const INTEGRATION_ID_LENGTH: usize = 12;
 
 /// The bounds `PaginationLimit` allows
 /// (`smithy_query(query="shape",shape="PaginationLimit")` → `range 1..100`).
@@ -84,8 +97,16 @@ fn asserted_integration_id(url: &str, region: &str, case: &str) -> String {
         )
     });
     assert!(
-        !host_id.is_empty() && host_id.chars().all(|digit| digit.is_ascii_hexdigit()),
-        "case {case:?}: the integration id must be a non-empty id, got {host_id:?}"
+        host_id
+            .chars()
+            .all(|digit| matches!(digit, '0'..='9' | 'a'..='f')),
+        "case {case:?}: the integration id must be lowercase hex, got {host_id:?}"
+    );
+    assert_eq!(
+        host_id.chars().count(),
+        INTEGRATION_ID_LENGTH,
+        "case {case:?}: the integration id must be {INTEGRATION_ID_LENGTH} characters \
+         wide, got {host_id:?} in {url:?}"
     );
     assert_eq!(
         path,

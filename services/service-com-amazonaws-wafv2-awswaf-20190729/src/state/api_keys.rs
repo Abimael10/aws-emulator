@@ -312,10 +312,33 @@ pub fn decrypt_api_key(value: &str) -> Option<DecryptedApiKey> {
 /// account.
 const CAPTCHA_SDK_DOMAIN: &str = "captcha-sdk.awswaf.com";
 
-/// How many hex characters the integration id in [`application_integration_url`]
-/// carries: the 128 bits of the digest it is rendered from, two characters per
-/// byte.
-const CAPTCHA_INTEGRATION_ID_LENGTH: usize = 32;
+/// How many lowercase hex characters the integration id in
+/// [`application_integration_url`] carries.
+///
+/// The label WAF publishes the CAPTCHA integration under is a SIX-byte id rendered
+/// as hex, so the label and the path segment are twelve characters wide. A client
+/// that splits the label out of the URL — to build a script tag, a host allow-list
+/// entry or a CSP entry — or that recovers the integration id from it, reads an id
+/// of that width, so that is the width the URL is composed from.
+const CAPTCHA_INTEGRATION_ID_LENGTH: usize = 12;
+
+/// How many bytes of the account digest the id is rendered from: two lowercase hex
+/// characters per byte.
+const CAPTCHA_INTEGRATION_ID_BYTES: usize = CAPTCHA_INTEGRATION_ID_LENGTH / 2;
+
+/// How many bytes the digest the id is drawn from carries, read off the digest type
+/// itself rather than written out, so the bound below stays true of whichever digest
+/// [`captcha_integration_id`] renders.
+const CAPTCHA_DIGEST_BYTES: usize =
+    <<::sha2::Sha256 as ::sha2::digest::OutputSizeUser>::OutputSize as ::sha2::digest::typenum::Unsigned>::USIZE;
+
+/// The id is a whole number of bytes of a digest that HAS that many bytes, so the
+/// slice [`captcha_integration_id`] renders is always there and always renders the
+/// full width above.
+const _: () = assert!(
+    CAPTCHA_INTEGRATION_ID_BYTES <= CAPTCHA_DIGEST_BYTES
+        && CAPTCHA_INTEGRATION_ID_LENGTH.is_multiple_of(2)
+);
 
 /// The id of this account's CAPTCHA integration: the host label, and the path
 /// segment, of [`application_integration_url`].
@@ -331,11 +354,8 @@ fn captcha_integration_id() -> String {
     let mut hasher = Sha256::new();
     hasher.update(CAPTCHA_SDK_DOMAIN.as_bytes());
     hasher.update(::engine::emulator_account_id().as_bytes());
-    let digest = ::hex::encode(hasher.finalize());
-    digest
-        .chars()
-        .take(CAPTCHA_INTEGRATION_ID_LENGTH)
-        .collect()
+    let digest = hasher.finalize();
+    ::hex::encode(&digest[..CAPTCHA_INTEGRATION_ID_BYTES])
 }
 
 /// The `ApplicationIntegrationURL` this account's clients load the CAPTCHA
@@ -347,6 +367,11 @@ fn captcha_integration_id() -> String {
 /// account holds — a client reads the URL from this listing BEFORE it mints its
 /// first key — so it is reported from the account and the region alone, and is the
 /// same URL on every call.
+///
+/// The URL is `https://<id>.<region>.captcha-sdk.awswaf.com/<id>/`: the scheme, the
+/// domain, the trailing `/` and the repetition of the SAME
+/// [`CAPTCHA_INTEGRATION_ID_LENGTH`]-character id in the leading host label and the
+/// single path segment are fixed; the region and the id are the variable parts.
 pub fn application_integration_url(region: &str) -> String {
     let integration = captcha_integration_id();
     format!("https://{integration}.{region}.{CAPTCHA_SDK_DOMAIN}/{integration}/")
