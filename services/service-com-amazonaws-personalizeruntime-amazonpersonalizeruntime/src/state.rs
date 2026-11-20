@@ -205,6 +205,18 @@ impl RequiredInput {
             Self::Item => item_id,
         }
     }
+
+    /// The user a request against a resource that needs `self` personalizes FOR, out of
+    /// a request's `userId`: the user whose recorded interactions an inference call reads
+    /// (see [`ingested::Ingested::interactions_of`]).
+    ///
+    /// This is [`RequiredInput::personalization`] asked for the user input alone, so a
+    /// resource that uses the ITEM input, or neither, personalizes for no user at all: a
+    /// `userId` such a request carries anyway is not used, by a filter clause over an
+    /// interaction dataset any more than by a score.
+    pub fn personalizing_user(self, user_id: &str) -> &str {
+        self.personalization(user_id, "")
+    }
 }
 
 /// The domain (use-case) recommenders this emulator knows, and the request member

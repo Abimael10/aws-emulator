@@ -36,7 +36,10 @@
 //! 5. **Filter.** `filterArn` is resolved against the registry (400 when unknown) and
 //!    its expression, bound to `filterValues`, decides which catalog entries
 //!    come back — not what any of them scores. A clause over the `Interactions` dataset
-//!    reads the interactions THIS user recorded for the entry.
+//!    reads the interactions recorded by the user this request personalizes FOR, which
+//!    is its `userId` only when the resolved resource USES that input (see
+//!    [`crate::state::RequiredInput::personalizing_user`]), so the input the resource
+//!    does not use cannot move the filtered list either.
 //! 6. **Score and order.** Each candidate's score is [`crate::state::scoring::Seed::relevance`]
 //!    of its `base_score`, the request's `context` and only the ONE
 //!    personalization input the resolved resource uses (see
@@ -299,7 +302,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resolved.fitted_at,
         );
         let catalog = ingested.items(&resolved.items);
-        let recorded = ingested.interactions_of(user_id);
+        //    A clause over an interaction dataset reads the interactions the user this
+        //    request personalizes FOR recorded, and that user is the request's `userId`
+        //    only when the resolved resource USES it
+        //    ([`RequiredInput::personalizing_user`]). A `RELATED_ITEMS` resource
+        //    personalizes for an item and a non-personalized use case for neither, so
+        //    such a request personalizes for no user and its interaction clauses read no
+        //    rows: a spurious `userId` is as ignored here as it is by the score, and can
+        //    change neither which entries come back nor which of them a promotion takes.
+        let recorded = ingested.interactions_of(resolved.required_input.personalizing_user(user_id));
 
         // 5. Which metadata columns come back, validated against the RESOLVED resource
         //    and its catalog — the parts of `metadataColumns` that need it; the map key
