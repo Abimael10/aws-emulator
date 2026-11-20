@@ -311,6 +311,13 @@ pub struct SourceTableSnapshot {
     /// The capacity the table was provisioned for, as a description reports it: zeroes
     /// for an on-demand table ([`reported_capacity`]).
     pub provisioned_throughput: ProvisionedThroughput,
+    /// The on-demand maximum-request-units SETTING the table carried then, as a
+    /// description reports it, and `None` for a table that had no such setting
+    /// ([`Table::reported_on_demand_throughput`]) — the same member
+    /// `SourceTableDetails$OnDemandThroughput` is reported from, so a backup of a capped
+    /// table reports the cap it recorded and a backup of an uncapped one reports no block
+    /// at all.
+    pub on_demand_throughput: Option<OnDemandThroughput>,
     pub item_count: i64,
     pub table_size_bytes: i64,
     pub global_secondary_indexes: Vec<GlobalSecondaryIndexInfo>,
@@ -450,7 +457,10 @@ impl Backup {
                     self.source.table_creation_date_time,
                 ),
                 provisioned_throughput: self.source.provisioned_throughput.clone(),
-                on_demand_throughput: None,
+                // The recorded setting, reported exactly as the source table's own
+                // description reported it: a maximum that was in force is carried, and a
+                // table with no maximum has no such setting to report.
+                on_demand_throughput: self.source.on_demand_throughput.clone(),
                 item_count: Some(self.source.item_count),
                 billing_mode: Some(self.source.billing_mode.clone()),
             }),

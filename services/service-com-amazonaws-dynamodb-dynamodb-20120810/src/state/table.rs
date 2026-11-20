@@ -2185,11 +2185,26 @@ impl Table {
             // HAS a maximum — and for no other: a table nobody capped carries no such
             // setting, and a provisioned table's capacity is its `ProvisionedThroughput`
             // ([`OnDemandCeilings::describe`]).
-            on_demand_throughput: (self.billing_mode == "PAY_PER_REQUEST")
-                .then(|| self.on_demand_throughput.describe())
-                .flatten(),
+            on_demand_throughput: self.reported_on_demand_throughput(),
             ..TableDescription::default()
         }
+    }
+
+    /// The on-demand maximum-request-units setting every reader of this table reports for
+    /// it, or `None` for a table that has no such setting.
+    ///
+    /// "Sets the maximum number of read and write units for the specified on-demand table"
+    /// (the `OnDemandThroughput` doc): the pair is a SETTING of the on-demand capacity
+    /// model, so it is reported for a table in that mode that HAS a maximum and for no
+    /// other — a table nobody capped carries no such setting
+    /// ([`OnDemandCeilings::describe`]), and a provisioned table's capacity is its
+    /// `ProvisionedThroughput`. One rule, read HERE, so every surface that describes this
+    /// table's capacity settings — its own `TableDescription` and the `SourceTableDetails`
+    /// a backup of it reports ([`Table::backup_snapshot`]) — answers the same.
+    pub fn reported_on_demand_throughput(&self) -> Option<OnDemandThroughput> {
+        (self.billing_mode == "PAY_PER_REQUEST")
+            .then(|| self.on_demand_throughput.describe())
+            .flatten()
     }
 
     /// Snapshot this table as a backup taken from it records its source
@@ -2207,6 +2222,11 @@ impl Table {
             table_creation_date_time: self.creation_date_time,
             billing_mode: self.billing_mode.clone(),
             provisioned_throughput: reported_capacity(self.provisioned_throughput.as_ref()),
+            // The on-demand maximum in force when the backup was taken, recorded by the
+            // same rule the table's own description reports it with
+            // ([`Table::reported_on_demand_throughput`]): a table that had one carries it
+            // here, and a table nobody had capped records no such setting at all.
+            on_demand_throughput: self.reported_on_demand_throughput(),
             item_count: i64::try_from(self.items.len()).unwrap_or(i64::MAX),
             table_size_bytes: self.stored_bytes,
             global_secondary_indexes: self
