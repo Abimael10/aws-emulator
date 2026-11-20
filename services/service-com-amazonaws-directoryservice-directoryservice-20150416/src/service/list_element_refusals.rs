@@ -21,6 +21,12 @@
 //! any handler: nothing below re-checks anything, and a request the framework would accept is
 //! never refused by this.
 //!
+//! A refusal rendered here is the refusal of the WHOLE request: the clauses of every other
+//! constraint the request breaks are counted in this same envelope, the ones the framework's
+//! own walk found and the ones only this service's check of a `@pattern` the boundary
+//! validator cannot compile can find ([`super::model_pattern_refusals::unseen`]) — so the
+//! count, and which clauses are stated, do not depend on which class is rendered.
+//!
 //! The grouping, the nesting and the envelope are the tree's shared ones
 //! ([`::service_common::validation_message::aws_validation_refusal_over_elements_stating`]);
 //! what is this service's own is the ORDER its own validator lists an enum's value set in
@@ -56,7 +62,7 @@ use std::collections::{HashMap, HashSet};
 use ::aws_smithy_runtime_api::http::Request as RtRequest;
 use ::aws_smithy_schema::Schema;
 use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
-use ::service_common::validation::{list_of_element, refusing_violations_with_lists};
+use ::service_common::validation::{list_of_element, refusing_violations_with_lists, MAX_VIOLATIONS};
 use ::service_common::validation_message::{
     aws_validation_refusal_over_elements_stating, element_constraint_set, element_set_requirement,
     requirement,
@@ -154,7 +160,7 @@ fn stated_from_request<O: Operation>(
 ) -> Option<(Vec<Violation>, Refused)> {
     // The violations AND the lists the request carried, out of ONE walk: the value half of a
     // clause stated at a list member is that member's own value, which no violation carries.
-    let (violations, submitted) = refusing_violations_with_lists::<O>(protocol, req);
+    let (mut violations, submitted) = refusing_violations_with_lists::<O>(protocol, req);
     // Only this class is reworded here. Everything else — an absent required member, a bound
     // on a plain member, a value outside an enum a plain member targets — keeps the answer it
     // has today, including this service's own enum-order wording.
@@ -164,6 +170,16 @@ fn stated_from_request<O: Operation>(
     {
         return None;
     }
+    // ...and, counted in this same envelope, the violations of the OTHER class this service
+    // states from the request: a `@pattern` the boundary validator could not compile and so
+    // never applied ([`super::model_pattern_refusals`]). One request is ONE counted refusal,
+    // so a request that breaks a list's element constraint AND such an expression states a
+    // clause for each rather than only the clauses of whichever class is rendered here.
+    violations.extend(super::model_pattern_refusals::unseen(protocol, req));
+    // ...and still under the ceiling the collecting walk itself collects under, so the clause
+    // count of one message stays a constant of this tree rather than something one request
+    // chooses by breaking two classes at once.
+    violations.truncate(MAX_VIOLATIONS);
     let quoted = quotable_lists(&violations, submitted);
     let restated: Vec<Violation> = super::in_stated_clause_order(&violations)
         .into_iter()

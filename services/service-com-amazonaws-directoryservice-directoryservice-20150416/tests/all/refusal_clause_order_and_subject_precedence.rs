@@ -73,8 +73,9 @@ fn clause_members(message: &str, case: &str) -> Vec<String> {
         .collect()
 }
 
-/// One row of the clause-order table: a request that breaks several members' constraints, and
-/// the member paths the refusal's clauses must be stated at, in order.
+/// One row of a clause table: a request that breaks several members' constraints, and the
+/// member paths the one refusal's clauses must be stated at, in order. Shared by both tables
+/// below, so the order a row asserts means the same thing in each.
 struct ClauseOrderCase {
     case: &'static str,
     operation: &'static str,
@@ -85,15 +86,20 @@ struct ClauseOrderCase {
 /// RULE 1: the clauses of one refusal come out in this service's order — by the bucket the
 /// member path each clause is stated at sits in — whichever order the walk found them and
 /// whatever class each clause is about.
+///
+/// Each row says whether its order is one a RECORDED refusal of this service states, or one
+/// the same rule PREDICTS for a member set no recording covers: a change to the width the
+/// order is computed at (`service::stated_clause_order::FINDINGS_TABLE_BUCKETS`) may move a
+/// predicted row, and must never move a recorded one.
 #[tokio::test]
 async fn the_clauses_of_one_refusal_are_stated_in_this_services_order() {
     let router = service();
 
     let rows = vec![
         ClauseOrderCase {
-            // The administrator password's expression is one the boundary validator cannot
-            // apply and the name's is one it can, so this row is also about the two classes
-            // being counted and ordered in ONE envelope.
+            // RECORDED. The administrator password's expression is one the boundary validator
+            // cannot apply and the name's is one it can, so this row is also about the two
+            // classes being counted and ordered in ONE envelope.
             case: "a create whose password and name both break their expressions",
             operation: "CreateMicrosoftAD",
             body: json!({
@@ -104,8 +110,8 @@ async fn the_clauses_of_one_refusal_are_stated_in_this_services_order() {
             stated_at: &["password", "name"],
         },
         ClauseOrderCase {
-            // The same pair on the operation that creates a Simple AD directory: the order is
-            // the member paths', so it does not belong to one operation.
+            // PREDICTED. The same pair on the operation that creates a Simple AD directory:
+            // the order is the member paths', so it does not belong to one operation.
             case: "a Simple AD create whose password and name both break their expressions",
             operation: "CreateDirectory",
             body: json!({
@@ -116,6 +122,7 @@ async fn the_clauses_of_one_refusal_are_stated_in_this_services_order() {
             stated_at: &["password", "name"],
         },
         ClauseOrderCase {
+            // PREDICTED: a third member beside the recorded pair.
             case: "a create whose password, name and short name all break their expressions",
             operation: "CreateMicrosoftAD",
             body: json!({
@@ -127,9 +134,10 @@ async fn the_clauses_of_one_refusal_are_stated_in_this_services_order() {
             stated_at: &["password", "name", "shortName"],
         },
         ClauseOrderCase {
-            // No password violation here, so these three clauses are the framework's own walk
-            // alone — and the walk reports them in the model's member order (name, shortName,
-            // description), which is not the order they are stated in.
+            // PREDICTED. No password violation here, so these three clauses are the
+            // framework's own walk alone — and the walk reports them in the model's member
+            // order (name, shortName, description), which is not the order they are stated
+            // in.
             case: "a create whose name, short name and description break their expressions",
             operation: "CreateMicrosoftAD",
             body: json!({
@@ -139,12 +147,12 @@ async fn the_clauses_of_one_refusal_are_stated_in_this_services_order() {
                 "Password": GOOD_PASSWORD,
                 "VpcSettings": { "VpcId": "vpc-0a1b2c3d", "SubnetIds": ["subnet-0a1b2c3d", "subnet-1a2b3c4d"] },
             }),
-            stated_at: &["name", "description", "shortName"],
+            stated_at: &["description", "name", "shortName"],
         },
         ClauseOrderCase {
-            // Two members of the structure the create NESTS: the clauses state them by their
-            // dotted paths, and the order is their member NAMES' — which is the reverse of
-            // the order those paths sort in.
+            // RECORDED. Two members of the structure the create NESTS: the clauses state them
+            // by their dotted paths, and the order is their member NAMES' — which is the
+            // reverse of the order those paths sort in.
             case: "a create whose nested placement breaks both of its members",
             operation: "CreateMicrosoftAD",
             body: json!({
@@ -155,8 +163,8 @@ async fn the_clauses_of_one_refusal_are_stated_in_this_services_order() {
             stated_at: &["vpcSettings.vpcId", "vpcSettings.subnetIds"],
         },
         ClauseOrderCase {
-            // A clause stated at a LIST member beside a plain member's own clause: the walk
-            // finds the plain member first, and the list member is stated first.
+            // PREDICTED. A clause stated at a LIST member beside a plain member's own clause:
+            // the walk finds the plain member first, and the list member is stated first.
             case: "a forwarder whose remote domain and whose address list are both refused",
             operation: "CreateConditionalForwarder",
             body: json!({
@@ -254,6 +262,225 @@ async fn the_two_clauses_of_a_create_are_worded_as_aws_words_them() {
         ),
         "case {case:?}: expected the name clause second, quoting the value, got {:?}",
         clauses[1]
+    );
+}
+
+/// A `SubnetIds` entry outside the modelled `^(subnet-[0-9a-f]{8}|subnet-[0-9a-f]{17})$`, so a
+/// row about a list member is refused for its ELEMENTS.
+const BAD_SUBNET_ID: &str = "bad-subnet-1";
+
+/// The other entry of that list, also outside the expression: two offending entries are still
+/// ONE clause, so a row's count does not depend on how many of them offend.
+const OTHER_BAD_SUBNET_ID: &str = "bad-subnet-2";
+
+/// A well-formed `VpcId`, used where a row is not about that member.
+const GOOD_VPC_ID: &str = "vpc-0a1b2c3d";
+
+/// A `VpcId` outside the modelled `^(vpc-[0-9a-f]{8}|vpc-[0-9a-f]{17})$`.
+const BAD_VPC_ID: &str = "bad-vpc-id";
+
+/// RULE: the constraints one request breaks are ONE counted refusal with one clause per
+/// member, whichever layer found each — the boundary validator's own walk, this service's
+/// check of a `@pattern` that walk cannot compile, or the clause it states at a list member
+/// for a constraint the list's ELEMENTS broke. The count is the number of members refused and
+/// no clause is dropped because another class was also broken.
+#[tokio::test]
+async fn the_clauses_every_layer_found_are_counted_in_one_envelope() {
+    let router = service();
+
+    // The rows differ along which classes the request breaks together, how many members each
+    // refusal is about, the operation, and how many entries of the offending list offend.
+    let rows = vec![
+        ClauseOrderCase {
+            // RECORDED: the four members a recorded refusal of one create states together.
+            case: "a create breaking all three classes at once",
+            operation: "CreateMicrosoftAD",
+            body: json!({
+                "Name": SINGLE_LABEL_NAME,
+                "Password": WEAK_PASSWORD,
+                "VpcSettings": {
+                    "VpcId": BAD_VPC_ID,
+                    "SubnetIds": [BAD_SUBNET_ID, OTHER_BAD_SUBNET_ID],
+                },
+            }),
+            stated_at: &[
+                "password",
+                "vpcSettings.vpcId",
+                "vpcSettings.subnetIds",
+                "name",
+            ],
+        },
+        ClauseOrderCase {
+            case: "a create whose password and whose subnet list are both refused",
+            operation: "CreateMicrosoftAD",
+            body: json!({
+                "Name": "composed.example.com",
+                "Password": WEAK_PASSWORD,
+                "VpcSettings": { "VpcId": GOOD_VPC_ID, "SubnetIds": [BAD_SUBNET_ID] },
+            }),
+            stated_at: &["password", "vpcSettings.subnetIds"],
+        },
+        ClauseOrderCase {
+            case: "a Simple AD create whose password, name and subnet list are all refused",
+            operation: "CreateDirectory",
+            body: json!({
+                "Name": SINGLE_LABEL_NAME,
+                "Password": WEAK_PASSWORD,
+                "Size": "Small",
+                "VpcSettings": {
+                    "VpcId": GOOD_VPC_ID,
+                    "SubnetIds": [BAD_SUBNET_ID, OTHER_BAD_SUBNET_ID],
+                },
+            }),
+            stated_at: &["password", "vpcSettings.subnetIds", "name"],
+        },
+        ClauseOrderCase {
+            case: "a create whose password alone is refused",
+            operation: "CreateMicrosoftAD",
+            body: json!({
+                "Name": "composed.example.com",
+                "Password": WEAK_PASSWORD,
+                "VpcSettings": {
+                    "VpcId": GOOD_VPC_ID,
+                    "SubnetIds": ["subnet-0a1b2c3d", "subnet-1a2b3c4d"],
+                },
+            }),
+            stated_at: &["password"],
+        },
+        ClauseOrderCase {
+            case: "a create whose subnet list alone is refused",
+            operation: "CreateMicrosoftAD",
+            body: json!({
+                "Name": "composed.example.com",
+                "Password": GOOD_PASSWORD,
+                "VpcSettings": { "VpcId": GOOD_VPC_ID, "SubnetIds": [BAD_SUBNET_ID] },
+            }),
+            stated_at: &["vpcSettings.subnetIds"],
+        },
+    ];
+
+    for row in rows {
+        let (status, parsed) = call(&router, row.operation, row.body.clone()).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected the broken constraints to refuse the request, got {status} \
+             with {parsed}",
+            row.case
+        );
+        assert_eq!(
+            parsed["__type"],
+            json!("ValidationException"),
+            "case {:?}: expected the framework's constraint refusal, got {parsed}",
+            row.case
+        );
+        let message = parsed["message"].as_str().unwrap_or_default();
+        let expected_count = row.stated_at.len();
+        let plural = if expected_count == 1 { "error" } else { "errors" };
+        assert!(
+            message.starts_with(&format!("{expected_count} validation {plural} detected: ")),
+            "case {:?}: expected {expected_count} counted clause(s), got {message:?}",
+            row.case
+        );
+        let stated = clause_members(message, row.case);
+        assert_eq!(
+            stated, row.stated_at,
+            "case {:?}: expected the clauses stated at {:?}, got {stated:?} in {message:?}",
+            row.case, row.stated_at
+        );
+        // The password is `@sensitive`, so however the clauses compose the refusal still
+        // echoes no password.
+        assert!(
+            !message.contains(WEAK_PASSWORD),
+            "case {:?}: a @sensitive member's clause must not echo the value, got {message:?}",
+            row.case
+        );
+    }
+}
+
+/// RULE, the recorded WORDING of the composed refusal: the whole sentence AWS answers a
+/// create breaking all three classes with — the clause count, the four clauses in order, the
+/// `@sensitive` password clause stating no value, the nested placement's two clauses with the
+/// list member's whole submitted list and its element set, and the name's own clause.
+///
+/// The password's clause is read back from the refusal of a request that breaks THAT member
+/// alone rather than written out here, so this row asserts the whole composed sentence
+/// without restating a model expression a sibling clause already pins
+/// (`published_pattern_text`, `validation_pattern_wording`).
+#[tokio::test]
+async fn the_composed_refusal_is_worded_as_aws_words_it() {
+    let router = service();
+
+    // The `VpcId` and `SubnetId` expressions, as the model declares them and as a clause
+    // about those members quotes them
+    // (`smithy_query(query="shape",shape="VpcId,SubnetId")`).
+    const VPC_PATTERN: &str = r"^(vpc-[0-9a-f]{8}|vpc-[0-9a-f]{17})$";
+    const SUBNET_PATTERN: &str = r"^(subnet-[0-9a-f]{8}|subnet-[0-9a-f]{17})$";
+    // The requirement the nested element set closes with for a list member the model never
+    // leaves optional, as the framework words an absent member.
+    const ENTRY_PRESENT: &str = "Member must not be null";
+
+    let case = "the password's own clause";
+    let (status, parsed) = call(
+        &router,
+        "CreateMicrosoftAD",
+        json!({
+            "Name": "worded.example.com",
+            "Password": WEAK_PASSWORD,
+            "VpcSettings": { "VpcId": GOOD_VPC_ID, "SubnetIds": ["subnet-0a1b2c3d"] },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected the weak password to refuse the request, got {status} with \
+         {parsed}"
+    );
+    let alone = parsed["message"].as_str().unwrap_or_default().to_string();
+    let password_clause = alone
+        .strip_prefix("1 validation error detected: ")
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: expected one counted clause, got {alone:?}")
+        })
+        .to_string();
+    assert!(
+        password_clause.starts_with("Value at 'password' failed to satisfy constraint: "),
+        "case {case:?}: expected the clause to state no value for a @sensitive member, got \
+         {password_clause:?}"
+    );
+
+    let case = "all four members of one create";
+    let (status, parsed) = call(
+        &router,
+        "CreateMicrosoftAD",
+        json!({
+            "Name": SINGLE_LABEL_NAME,
+            "Password": WEAK_PASSWORD,
+            "VpcSettings": {
+                "VpcId": BAD_VPC_ID,
+                "SubnetIds": [BAD_SUBNET_ID, OTHER_BAD_SUBNET_ID],
+            },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected the broken constraints to refuse the request, got {status} \
+         with {parsed}"
+    );
+    let message = parsed["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        message,
+        format!(
+            "4 validation errors detected: {password_clause}; Value '{BAD_VPC_ID}' at \
+             'vpcSettings.vpcId' failed to satisfy constraint: Member must satisfy regular \
+             expression pattern: {VPC_PATTERN}; Value '[{BAD_SUBNET_ID}, \
+             {OTHER_BAD_SUBNET_ID}]' at 'vpcSettings.subnetIds' failed to satisfy constraint: \
+             Member must satisfy constraint: [Member must satisfy regular expression pattern: \
+             {SUBNET_PATTERN}, {ENTRY_PRESENT}]; Value '{SINGLE_LABEL_NAME}' at 'name' failed \
+             to satisfy constraint: Member must satisfy regular expression pattern: \
+             {NAME_PATTERN}"
+        ),
+        "case {case:?}: expected the whole composed sentence, got {message:?}"
     );
 }
 

@@ -26,7 +26,9 @@
 //! ([`crate::service::list_element_refusals`]), and a `@pattern` whose look-around that
 //! walk's regex engine cannot compile, which it therefore never applied
 //! ([`crate::service::model_pattern_refusals`]). A request that breaks neither is handed to
-//! the routing table's operation untouched.
+//! the routing table's operation untouched. A request that breaks BOTH is ONE refusal
+//! whichever of the two renders it: the clauses of both classes are counted in the one
+//! envelope, which is why the first statement below is asked first rather than instead.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::ProtocolError;

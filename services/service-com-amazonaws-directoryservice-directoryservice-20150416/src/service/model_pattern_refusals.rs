@@ -47,7 +47,13 @@
 //! A request that satisfies every such expression is handed on untouched, so the framework
 //! still words every other refusal, and the clauses of a request that breaks BOTH classes
 //! are counted together in the one envelope, stated in this service's own clause order
-//! ([`super::stated_clause_order`]) whichever of the two found them.
+//! ([`super::stated_clause_order`]) whichever of the two found them. That holds for the
+//! THIRD class too — a constraint a list's ELEMENTS break, which is stated at the list
+//! member and therefore rendered by [`super::list_element_refusals`]: it asks this module
+//! for the violations the boundary validator cannot see ([`unseen`]) and states them as
+//! clauses of its own envelope, so a request breaking an expression the boundary skips AND
+//! a list's elements is still ONE counted refusal rather than whichever class is looked at
+//! first.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -77,7 +83,32 @@ const PATTERN_BACKTRACK_LIMIT: usize = 1_000_000;
 /// How one operation's skipped-`@pattern` refusal is collected: over that operation's own
 /// input schema and input type, which is why a collector is needed per operation rather
 /// than one for the service.
-type Collect = fn(&dyn ServerHttpProtocol, &RtRequest) -> Option<(Vec<Violation>, Refused)>;
+type Collect = fn(&dyn ServerHttpProtocol, &RtRequest, Walked) -> Option<Found>;
+
+/// Whether a collecting walk is asked for the violations the boundary validator's own walk
+/// reports as well as the ones its skipped expressions hide from it.
+///
+/// A caller that has already walked the request for its own envelope
+/// ([`super::list_element_refusals`]) needs only the hidden ones, so it does not pay for a
+/// second walk whose result it would drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Walked {
+    Needed,
+    NotNeeded,
+}
+
+/// What one collecting walk over a request found: every violation the boundary validator's
+/// own walk reports (empty where it was not asked for, [`Walked::NotNeeded`]), and every one
+/// its skipped expressions hide from it.
+///
+/// The two are kept apart because the layer that states a refusal of ANOTHER class from the
+/// same request ([`super::list_element_refusals`]) has already collected the walk's own
+/// violations and needs only the hidden ones to count them in its envelope.
+#[derive(Debug)]
+struct Found {
+    walked: Vec<Violation>,
+    unseen: Vec<Violation>,
+}
 
 /// The collector for each operation this module checks, resolved by the operation's own
 /// wire name ([`Operation::NAME`], so no name is spelled twice).
@@ -90,7 +121,7 @@ macro_rules! collected_per_operation {
         fn collector(key: &str) -> Option<Collect> {
             $(
                 if key == <crate::ops::$module::$operation<()> as Operation>::NAME {
-                    return Some(stated_from_request::<crate::ops::$module::$operation<()>>);
+                    return Some(found_from_request::<crate::ops::$module::$operation<()>>);
                 }
             )*
             None
@@ -286,13 +317,14 @@ fn stated_pattern(pattern: &str) -> String {
     ::service_common::validation::whole_value_expression(pattern)
 }
 
-/// The refusal this service states for `req` under the operation `O`, or `None` when the
+/// What a collecting walk over `req` under the operation `O` found, or `None` when the
 /// request satisfies every `@pattern` the boundary validator skips — which leaves the
 /// framework's own answer, and this service's other wording of it, exactly as they are.
-fn stated_from_request<O: Operation>(
+fn found_from_request<O: Operation>(
     protocol: &dyn ServerHttpProtocol,
     req: &RtRequest,
-) -> Option<(Vec<Violation>, Refused)> {
+    walked: Walked,
+) -> Option<Found> {
     let skipped = skipped_patterns(O::INPUT_SCHEMA);
     if skipped.is_empty() {
         return None;
@@ -306,12 +338,55 @@ fn stated_from_request<O: Operation>(
     if unseen.is_empty() {
         return None;
     }
-    // The clauses of both classes, counted in ONE envelope and stated in the order this
-    // service states them ([`super::stated_clause_order`]): a request that breaks an
-    // expression the walk applies and one it skips is refused with one message whose clause
-    // order does not say which layer found which.
-    let mut violations = validate(&input, O::INPUT_SCHEMA);
-    violations.extend(unseen);
+    Some(Found {
+        walked: match walked {
+            Walked::Needed => validate(&input, O::INPUT_SCHEMA),
+            Walked::NotNeeded => Vec::new(),
+        },
+        unseen,
+    })
+}
+
+/// What a collecting walk over one request found, by the operation its routing key names, or
+/// `None` for an operation this class cannot arise in and for a request that breaks no such
+/// expression.
+fn found(protocol: &dyn ServerHttpProtocol, req: &RtRequest, walked: Walked) -> Option<Found> {
+    let key = protocol.routing_key(req).ok()?;
+    collector(key)?(protocol, req, walked)
+}
+
+/// Every violation of one request the boundary validator will not find, because it could not
+/// compile the expression — empty for a request that breaks none, and for an operation whose
+/// input declares no such expression.
+///
+/// What it is for: the layer that renders a refusal of a constraint a list's ELEMENTS break
+/// ([`super::list_element_refusals`]) states that clause at the list member and so renders
+/// the whole envelope itself. These violations are clauses of that SAME refusal — one
+/// request, one counted message — so it asks for them here and states them beside its own
+/// rather than leaving whichever class is looked at first to answer alone.
+pub fn unseen(protocol: &dyn ServerHttpProtocol, req: &RtRequest) -> Vec<Violation> {
+    found(protocol, req, Walked::NotNeeded).map_or_else(Vec::new, |found| found.unseen)
+}
+
+/// The refusal this service states for one request, or `None` for an operation this class
+/// cannot arise in and for a request that breaks no such expression.
+///
+/// The clauses of both classes are counted in ONE envelope and stated in the order this
+/// service states them ([`super::stated_clause_order`]): a request that breaks an expression
+/// the walk applies and one it skips is refused with one message whose clause order does not
+/// say which layer found which.
+pub fn stated(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<(Vec<Violation>, Refused)> {
+    let found = found(protocol, req, Walked::Needed)?;
+    let mut violations = found.walked;
+    violations.extend(found.unseen);
+    // Under the ceiling the collecting walk itself collects under
+    // ([`::service_common::validation::MAX_VIOLATIONS`]), so the clause count of one message
+    // stays a constant of this tree rather than something one request chooses by breaking
+    // both classes at once.
+    violations.truncate(::service_common::validation::MAX_VIOLATIONS);
     let restated: Vec<Violation> = super::in_stated_clause_order(&violations)
         .into_iter()
         .map(super::stated_violation)
@@ -326,17 +401,6 @@ fn stated_from_request<O: Operation>(
             message,
         },
     ))
-}
-
-/// The refusal this service states for one request, by the operation its routing key names,
-/// or `None` for an operation this class cannot arise in and for a request that breaks no
-/// such expression.
-pub fn stated(
-    protocol: &dyn ServerHttpProtocol,
-    req: &RtRequest,
-) -> Option<(Vec<Violation>, Refused)> {
-    let key = protocol.routing_key(req).ok()?;
-    collector(key)?(protocol, req)
 }
 
 #[cfg(test)]
