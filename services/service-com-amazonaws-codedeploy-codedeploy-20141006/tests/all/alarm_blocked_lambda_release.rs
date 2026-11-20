@@ -43,7 +43,8 @@ use crate::alarm_stopped_deployments::{
 use crate::codedeploy_lifecycle::{terminal_deployment_within, Emulator};
 use crate::lambda_traffic_shifting::{
     alias_reading, appspec_revision, function_with_versions, lambda_group, readings_until_terminal,
-    traffic_routing, AliasReading, ALARM_ACTIVE, ALIAS, CREATOR_ROLLBACK, WINDOW_DEADLINE,
+    traffic_routing, AliasReading, ALARM_ACTIVE, ALIAS, ALL_AT_ONCE, CREATOR_ROLLBACK,
+    SHIFT_WINDOW_DEADLINE, WINDOW_DEADLINE,
 };
 
 /// The version the alias invokes before anything is deployed.
@@ -120,7 +121,10 @@ async fn given_group_on_a_settled_revision(
         &application,
         &group,
         &appspec_revision(&function, ALIAS, ORIGINAL_VERSION, SETTLED_VERSION),
-        &json!({}),
+        // The control leg is the SETUP: it only has to leave the alias on a known
+        // version, so it shifts all of its traffic in one step rather than walking
+        // the window the row's own configuration states.
+        &json!({"deploymentConfigName": ALL_AT_ONCE}),
     )
     .await;
     let info = terminal_deployment_within(emulator, &control, case.case, WINDOW_DEADLINE).await;
@@ -330,7 +334,7 @@ async fn a_deployment_created_under_an_alarm_that_is_not_sounding_moves_its_alia
         .await;
 
         let info =
-            terminal_deployment_within(&emulator, &released, name, WINDOW_DEADLINE).await;
+            terminal_deployment_within(&emulator, &released, name, SHIFT_WINDOW_DEADLINE).await;
         assert_eq!(
             info["status"].as_str(),
             Some("Succeeded"),

@@ -98,21 +98,36 @@ enum Stop {
 impl Stop {
     /// The sentence `errorInformation.message` carries for this stop, naming the
     /// alarms the deployment was stopped for.
+    ///
+    /// Each activated alarm's name is DELIMITED by angle brackets, which is what
+    /// makes the list of a multi-alarm stop parseable: the brackets are fixed text
+    /// of the sentence and the names inside them come from the configuration the
+    /// gate polled.
     fn message(&self) -> String {
         match self {
             Self::Activated(alarms) => format!(
                 "One or more alarms have been activated according to the Amazon CloudWatch \
                  metrics you selected, and the affected deployments have been stopped. \
                  Activated alarms: {alarms}",
-                alarms = alarms.join(", ")
+                alarms = delimited(alarms)
             ),
             Self::Unpollable(alarms) => format!(
                 "The deployment was stopped because the state of the following alarms could \
                  not be retrieved from Amazon CloudWatch: {alarms}",
-                alarms = alarms.join(", ")
+                alarms = delimited(alarms)
             ),
         }
     }
+}
+
+/// The alarm names of a stop as its message lists them: each name wrapped in angle
+/// brackets, in the order the configuration lists them, separated by `", "`.
+fn delimited(alarms: &[String]) -> String {
+    alarms
+        .iter()
+        .map(|alarm| format!("<{alarm}>"))
+        .collect::<Vec<String>>()
+        .join(", ")
 }
 
 /// Stop every deployment in flight that the alarms it polls have stopped.

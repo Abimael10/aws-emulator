@@ -46,20 +46,27 @@ pub const TRAFFIC_ROUTING_TIME_BASED_CANARY: &str = "TimeBasedCanary";
 /// See [`TRAFFIC_ROUTING_TIME_BASED_CANARY`].
 pub const TRAFFIC_ROUTING_TIME_BASED_LINEAR: &str = "TimeBasedLinear";
 
-/// How long this emulator holds one traffic increment per MINUTE the configuration
-/// asked to wait between increments.
+/// How long one traffic increment is held per MINUTE the configuration asked to
+/// wait between increments: one minute, in milliseconds.
 ///
-/// CodeDeploy measures `canaryInterval` and `linearInterval` in minutes, and that
-/// duration is COMPRESSED here onto the same clock scale as every other transition
-/// this emulator owes: an emulated deployment is served inside one caller's poll
-/// loop, so a window measured in minutes would close after every client that reads
-/// the alias to see the increment has given up, and the increment the
-/// configuration asked for would be unobservable. The span is therefore CHOSEN,
-/// and proportional to the configured interval, so a longer interval still holds
-/// its increment longer than a shorter one; what is NOT emulator-chosen is the
-/// number of increments, their percentages and their order, which come from the
-/// configuration itself.
-const TRAFFIC_SHIFT_MILLIS_PER_CONFIGURED_MINUTE: i64 = 2_000;
+/// This is a wait the CALLER asked for, stated in minutes and measured in minutes:
+/// `canaryInterval` is "the number of minutes between the first and second traffic
+/// shifts of a TimeBasedCanary deployment" and `linearInterval` "the number of
+/// minutes between each incremental traffic shift"
+/// (`smithy_query(query="shape",shape="TimeBasedCanary")` and
+/// `smithy_query(query="shape",shape="TimeBasedLinear")`), so it keeps its value
+/// rather than being compressed onto the clock scale of the transitions this
+/// emulator CHOOSES. A client's whole reason for configuring an interval is the
+/// window it opens — the span in which both versions are live, a canary validation
+/// runs and an alarm can trip — and a deployment that finished before those
+/// minutes elapsed never had one.
+///
+/// Each increment therefore falls due on a wall-clock deadline computed from the
+/// configured interval ([`increments`]), never per state read, which is also why a
+/// deployment is non-terminal for the whole of its configured window: nothing else
+/// about the shift is this emulator's choice either — the number of increments,
+/// their percentages and their order come from the configuration itself.
+const TRAFFIC_SHIFT_MILLIS_PER_CONFIGURED_MINUTE: i64 = 60_000;
 
 /// The largest number of increments one linear configuration is walked in.
 ///
@@ -304,16 +311,19 @@ mod tests {
     }
 
     #[test]
-    fn each_increment_falls_due_one_configured_interval_after_the_one_before() {
-        let cases: &[(&str, TrafficRoutingConfig, i32)] = &[
-            ("a canary over two minutes", canary(10, 2), 2),
+    fn each_increment_falls_due_one_configured_minute_after_the_one_before() {
+        // The expected offsets are written out in MILLISECONDS rather than
+        // derived from the constant above: the rule is that a configured minute
+        // is a minute, so a row that asked for one interval of a minute is due
+        // 60_000 ms after the one before it.
+        let cases: &[(&str, TrafficRoutingConfig, i64)] = &[
+            ("a canary over two minutes", canary(10, 2), 120_000),
             ("a canary over no wait at all", canary(10, 0), 0),
-            ("a linear shift every minute", linear(25, 1), 1),
-            ("a linear shift every five minutes", linear(50, 5), 5),
+            ("a linear shift every minute", linear(25, 1), 60_000),
+            ("a linear shift every five minutes", linear(50, 5), 300_000),
         ];
-        for (case, config, minutes) in cases {
+        for (case, config, hold) in cases {
             let scheduled = increments(Some(config));
-            let hold = i64::from(*minutes) * TRAFFIC_SHIFT_MILLIS_PER_CONFIGURED_MINUTE;
             for (index, increment) in scheduled.iter().enumerate() {
                 let expected = i64::try_from(index).expect("the index fits") * hold;
                 assert_eq!(

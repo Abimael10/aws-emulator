@@ -63,8 +63,9 @@ const SUBNET_CIDRS: [(&str, &str); 2] = [
 
 /// How long the clock-owed moves below are waited for, and how often they are looked at.
 /// Generous on purpose: the deadline is only here so a failure is a failure rather than a
-/// hang, and every wait looks for its CONDITION rather than for a span to pass.
-const DEADLINE: Duration = Duration::from_secs(120);
+/// hang, and every wait looks for its CONDITION rather than for a span to pass — including
+/// the one configured interval the canary row below walks out.
+const DEADLINE: Duration = Duration::from_secs(240);
 const POLL: Duration = Duration::from_millis(50);
 
 /// `TaskSet$status`: "PRIMARY: The task set is serving production traffic", and "ACTIVE: The
@@ -74,11 +75,21 @@ const PRIMARY: &str = "PRIMARY";
 /// The terminal `DeploymentStatus` a deployment that did what it described reaches.
 const SUCCEEDED: &str = "Succeeded";
 
-/// The canary configuration the incremental test deploys under: the Amazon ECS built-in that
-/// shifts 10% of the route and then the rest, over the shorter of the two published intervals
-/// (`CodeDeployDefault.ECSCanary10Percent5Minutes`), so the deployment really walks two
-/// increments and completes only on the second.
-const CANARY_CONFIG: &str = "CodeDeployDefault.ECSCanary10Percent5Minutes";
+/// The canary configuration the incremental test deploys under: 10% of the route, then the
+/// rest one `canaryInterval` later, so the deployment really walks two increments and
+/// completes only on the second.
+///
+/// A configuration of this account's own rather than a `CodeDeployDefault.ECSCanary*`
+/// built-in: every shipped one states five minutes or more, and `canaryInterval` is "the
+/// number of minutes between the first and second traffic shifts" the caller asked for, so
+/// the shortest interval that still holds a window open is the one the row states itself.
+const CANARY_CONFIG: &str = "ecs-canary-10-percent-every-1-minute";
+
+/// The `canaryInterval`, in minutes, [`CANARY_CONFIG`] states.
+const CANARY_INTERVAL_MINUTES: i64 = 1;
+
+/// The `canaryPercentage` [`CANARY_CONFIG`] states.
+const CANARY_PERCENTAGE: i64 = 10;
 
 /// One row: the deployment configuration its deployment runs under, how many tasks its
 /// service runs, and the share of the traffic the first increment of that configuration
@@ -712,6 +723,26 @@ async fn deploy_and_move_the_route(row: &Row) {
              \x20         ContainerName: {CONTAINER}\n\
              \x20         ContainerPort: {CONTAINER_PORT}\n"
         );
+        // The configuration the row deploys under, where that is one of this account's own
+        // rather than a predefined built-in (see [`CANARY_CONFIG`]).
+        if row.deployment_config == CANARY_CONFIG {
+            codedeploy_ok(
+                &router,
+                "CreateDeploymentConfig",
+                json!({
+                    "deploymentConfigName": CANARY_CONFIG,
+                    "computePlatform": "ECS",
+                    "trafficRoutingConfig": {
+                        "type": "TimeBasedCanary",
+                        "timeBasedCanary": {
+                            "canaryPercentage": CANARY_PERCENTAGE,
+                            "canaryInterval": CANARY_INTERVAL_MINUTES,
+                        },
+                    },
+                }),
+            )
+            .await;
+        }
         let deployment = codedeploy_ok(
             &router,
             "CreateDeployment",

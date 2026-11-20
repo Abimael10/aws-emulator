@@ -49,16 +49,53 @@ const EXECUTION_ROLE: &str = "arn:aws:iam::123456789012:role/LambdaExecution";
 /// The alias every deployment here shifts traffic on.
 pub(crate) const ALIAS: &str = "live";
 
-/// How long a deployment that walks a traffic-shift window is given to reach a
-/// terminal status, and how often the alias is sampled while it does.
+/// How long a case here waits for a transition that falls due without a configured
+/// interval in front of it — a function reported `Active`, a deployment that shifts
+/// all of its traffic at once reaching a terminal status, an increment that is due
+/// the moment the deployment starts reaching the alias.
 ///
-/// Long enough for the window of every configuration below (each states a
-/// one-minute interval, so each increment is held for this emulator's own span per
-/// configured minute) and for the increments of the longest ladder among them.
+/// Generous for such a transition, and far below the span a configured interval
+/// holds an increment for.
 pub(crate) const WINDOW_DEADLINE: Duration = Duration::from_secs(30);
-/// See [`WINDOW_DEADLINE`]: fine enough to observe every increment of a shift
-/// whose increments are held for whole seconds.
+
+/// How long a case here waits for a deployment whose traffic routing configuration
+/// states an INTERVAL to walk that window out.
+///
+/// `canaryInterval` and `linearInterval` are minutes the caller asked for, so a
+/// deployment under one of them is non-terminal for at least that many minutes:
+/// every case below states a one-minute interval, and this deadline leaves that
+/// window room to close on a loaded host several times over.
+pub(crate) const SHIFT_WINDOW_DEADLINE: Duration = Duration::from_secs(240);
+
+/// See [`WINDOW_DEADLINE`]: fine enough to observe an increment while it holds.
 pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_millis(40);
+
+/// The deployment configuration that shifts all of a Lambda deployment's traffic in
+/// ONE step, which is what the setup legs of a case here run under: a leg that only
+/// has to leave the alias on a known version waits out no configured interval.
+pub(crate) const ALL_AT_ONCE: &str = "CodeDeployDefault.LambdaAllAtOnce";
+
+/// How many invocations one row of the split table draws through the alias while an
+/// increment holds.
+///
+/// Large enough that the share observed is a share and not an accident: at this
+/// many samples a correctly drawn split sits within [`SHARE_TOLERANCE`] of its
+/// weight with overwhelming probability, while a shift that cut over in full, or
+/// moved nothing at all, is far outside it.
+const DRAWS_PER_CASE: usize = 200;
+
+/// How far the observed share of the version being released may sit from the weight
+/// the increment put on it: several standard deviations of a draw of
+/// [`DRAWS_PER_CASE`] samples, and narrower than the gap between the rows below.
+const SHARE_TOLERANCE: f64 = 0.15;
+
+/// The interval, in minutes, the configurations of the split table state.
+///
+/// The round of draws is taken while the FIRST increment holds, so the window only
+/// has to outlast that round on any host: an interval of several minutes leaves it
+/// room to spare, and no case waits for the window to close — each ends its
+/// deployment with `StopDeployment`.
+const HOLDING_INTERVAL_MINUTES: i64 = 5;
 
 /// The `ErrorCode` a deployment its alarms stopped reports
 /// (`smithy_query(query="shape",shape="ErrorCode")` carries it).
@@ -265,19 +302,55 @@ async fn create_deployment(
     group: &str,
     revision: &Value,
 ) -> String {
-    emulator
-        .ok(
-            "CreateDeployment",
-            json!({
-                "applicationName": application,
-                "deploymentGroupName": group,
-                "revision": revision,
-            }),
-        )
-        .await["deploymentId"]
+    create_deployment_under(emulator, application, group, revision, None).await
+}
+
+/// [`create_deployment`] under the deployment configuration `config` names rather
+/// than the group's own, which is how a client asks one deployment for a different
+/// traffic routing configuration (`CreateDeployment$deploymentConfigName`).
+async fn create_deployment_under(
+    emulator: &Emulator,
+    application: &str,
+    group: &str,
+    revision: &Value,
+    config: Option<&str>,
+) -> String {
+    let mut request = json!({
+        "applicationName": application,
+        "deploymentGroupName": group,
+        "revision": revision,
+    });
+    if let Some(config) = config {
+        request["deploymentConfigName"] = json!(config);
+    }
+    emulator.ok("CreateDeployment", request).await["deploymentId"]
         .as_str()
         .unwrap_or_default()
         .to_string()
+}
+
+/// Sample the alias of `function` until it holds `expected`, answering nothing: the
+/// increment the clock owes the alias is written whether or not anybody polls, so
+/// a case waits for the CONDITION rather than for a span of time.
+pub(crate) async fn alias_reaches(
+    emulator: &Emulator,
+    function: &str,
+    expected: &AliasReading,
+    case: &str,
+) {
+    let deadline = Instant::now() + SHIFT_WINDOW_DEADLINE;
+    loop {
+        let reading = alias_reading(emulator, function).await;
+        if &reading == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the alias at {expected:?} within \
+             {SHIFT_WINDOW_DEADLINE:?}, last read {reading:?}"
+        );
+        tokio::time::sleep(SAMPLE_INTERVAL).await;
+    }
 }
 
 /// Sample the alias of `function` until `deployment` reaches a terminal status,
@@ -289,7 +362,19 @@ pub(crate) async fn readings_until_terminal(
     deployment: &str,
     case: &str,
 ) -> (Vec<AliasReading>, Value) {
-    let deadline = Instant::now() + WINDOW_DEADLINE;
+    readings_until_terminal_within(emulator, function, deployment, case, WINDOW_DEADLINE).await
+}
+
+/// [`readings_until_terminal`] with the deadline the caller allows, for a
+/// deployment whose configuration holds its window open for a configured interval.
+pub(crate) async fn readings_until_terminal_within(
+    emulator: &Emulator,
+    function: &str,
+    deployment: &str,
+    case: &str,
+    within: Duration,
+) -> (Vec<AliasReading>, Value) {
+    let deadline = Instant::now() + within;
     let mut observed: Vec<AliasReading> = Vec::new();
     loop {
         let reading = alias_reading(emulator, function).await;
@@ -314,8 +399,8 @@ pub(crate) async fn readings_until_terminal(
         }
         assert!(
             Instant::now() < deadline,
-            "case {case:?}: expected a terminal status within {WINDOW_DEADLINE:?}, got {:?} \
-             with the alias at {:?}",
+            "case {case:?}: expected a terminal status within {within:?}, got {:?} with the \
+             alias at {:?}",
             info["status"],
             observed.last()
         );
@@ -423,38 +508,45 @@ async fn a_deployment_walks_its_alias_through_the_increments_its_configuration_d
     /// One configuration, and the weight ladder the alias must walk under it.
     struct Case {
         case: &'static str,
-        /// `trafficRoutingConfig.type`, or `None` for the built-in that shifts
-        /// all traffic at once.
-        routing: Option<(&'static str, i64)>,
+        /// `trafficRoutingConfig.type`, the percentage one increment moves and
+        /// the interval in minutes between increments, or `None` for the built-in
+        /// that shifts all traffic at once.
+        routing: Option<(&'static str, i64, i64)>,
         /// The weights on the TARGET version, in order, before the cutover.
         ladder: Vec<f64>,
+        /// How long the whole walk may take: a configuration that states an
+        /// interval holds its first increment for it, one that states none cuts
+        /// over as soon as the deployment runs.
+        within: Duration,
     }
 
+    // Rows differ along whether the configuration shifts in increments at all and
+    // along the share its first increment moves; the configurations whose ladder
+    // has SEVERAL rungs are walked by the test below, which reads each rung as it
+    // falls due instead of waiting the whole ladder out.
     let cases = [
         Case {
             case: "a 10% canary",
-            routing: Some(("TimeBasedCanary", 10)),
+            routing: Some(("TimeBasedCanary", 10, 1)),
             ladder: vec![0.1],
-        },
-        Case {
-            case: "a 75% canary",
-            routing: Some(("TimeBasedCanary", 75)),
-            ladder: vec![0.75],
-        },
-        Case {
-            case: "a 25% linear shift",
-            routing: Some(("TimeBasedLinear", 25)),
-            ladder: vec![0.25, 0.5, 0.75],
-        },
-        Case {
-            case: "a 50% linear shift",
-            routing: Some(("TimeBasedLinear", 50)),
-            ladder: vec![0.5],
+            within: SHIFT_WINDOW_DEADLINE,
         },
         Case {
             case: "the built-in that shifts all traffic at once",
             routing: None,
             ladder: Vec::new(),
+            within: WINDOW_DEADLINE,
+        },
+        Case {
+            // `canaryInterval`/`linearInterval` have a published minimum of 0
+            // minutes, and a ladder with no wait between its rungs is owed every
+            // one of them at the same instant: the alias is owed the state it
+            // should hold NOW rather than each state it passed through, so the
+            // walk is the cutover alone.
+            case: "a 25% linear shift with no wait between its increments",
+            routing: Some(("TimeBasedLinear", 25, 0)),
+            ladder: Vec::new(),
+            within: WINDOW_DEADLINE,
         },
     ];
 
@@ -462,6 +554,7 @@ async fn a_deployment_walks_its_alias_through_the_increments_its_configuration_d
         case,
         routing,
         ladder,
+        within,
     }) in cases.iter().enumerate()
     {
         let emulator = Emulator::with_lambda_and_cloudwatch();
@@ -471,7 +564,8 @@ async fn a_deployment_walks_its_alias_through_the_increments_its_configuration_d
         let group = lambda_group(
             &emulator,
             &application,
-            routing.map(|(kind, percentage)| traffic_routing(kind, percentage, 1)),
+            routing
+                .map(|(kind, percentage, interval)| traffic_routing(kind, percentage, interval)),
             &Value::Null,
         )
         .await;
@@ -484,7 +578,8 @@ async fn a_deployment_walks_its_alias_through_the_increments_its_configuration_d
         .await;
 
         let (observed, info) =
-            readings_until_terminal(&emulator, &function, &deployment, case).await;
+            readings_until_terminal_within(&emulator, &function, &deployment, case, *within)
+                .await;
         assert_eq!(
             info["status"].as_str(),
             Some("Succeeded"),
@@ -510,6 +605,179 @@ async fn a_deployment_walks_its_alias_through_the_increments_its_configuration_d
             walked, expected,
             "case {case:?}: expected the alias to walk {expected:?}, got {observed:?}"
         );
+    }
+}
+
+/// RULE: a traffic routing configuration that states an interval moves ONE
+/// increment per interval — `linearInterval` is "the number of minutes between
+/// each incremental traffic shift" — so the increment after the first is not on
+/// the alias when the deployment starts, the deployment is still running once it
+/// arrives, and the increments after THAT are still ahead of it.
+#[tokio::test]
+async fn a_shift_moves_one_increment_per_configured_interval() {
+    let case = "a 25% linear shift every minute";
+    let emulator = Emulator::with_lambda();
+    let function = "ladder-fn";
+    let application = "ladder-app";
+    function_with_versions(&emulator, function, 2).await;
+    let group = lambda_group(
+        &emulator,
+        application,
+        Some(traffic_routing("TimeBasedLinear", 25, 1)),
+        &Value::Null,
+    )
+    .await;
+    let deployment = create_deployment(
+        &emulator,
+        application,
+        &group,
+        &appspec_revision(function, ALIAS, "1", "2"),
+    )
+    .await;
+
+    // The first increment is due as the deployment starts: a quarter of the
+    // traffic on the target version, the alias still invoking the version the
+    // deployment is shifting from.
+    let first: AliasReading = ("1".to_string(), vec![("2".to_string(), 0.25)]);
+    alias_reaches(&emulator, function, &first, case).await;
+
+    // The second falls due one configured interval later, and nothing before it
+    // may: a deployment that walked its whole ladder at once would be past both
+    // this rung and its own completion by now.
+    let second: AliasReading = ("1".to_string(), vec![("2".to_string(), 0.5)]);
+    alias_reaches(&emulator, function, &second, case).await;
+    let info = emulator
+        .ok("GetDeployment", json!({"deploymentId": deployment}))
+        .await["deploymentInfo"]
+        .clone();
+    assert_eq!(
+        info["status"].as_str(),
+        Some("InProgress"),
+        "case {case:?}: the two increments still ahead of this shift keep the deployment \
+         running, got {info:?}"
+    );
+
+    // The rest of the ladder is a wait this case does not need: the stop ends it
+    // where it stands.
+    emulator
+        .ok("StopDeployment", json!({"deploymentId": deployment}))
+        .await;
+}
+
+/// RULE: an increment other than the last is LIVE TRAFFIC ROUTING, not a report:
+/// while it holds, the alias serves the share of its invocations the increment put
+/// on the target version and the rest on the version the deployment is shifting
+/// from, so a client measuring a canary sees roughly the configured percentage on
+/// the version being released.
+#[tokio::test]
+async fn an_increment_that_holds_splits_invocations_between_the_two_versions() {
+    /// One row: the configuration, and the share of the invocations the version
+    /// being released must receive while its first increment holds.
+    struct Case {
+        case: &'static str,
+        kind: &'static str,
+        percentage: i64,
+    }
+
+    // Rows differ along the share the increment moves and along the kind of
+    // configuration that moves it. Each states a long interval, so the window the
+    // round of draws is taken in cannot close under it on any host — how long a
+    // window lasts is the test above's subject, not this one's — and the stop at
+    // the end of each row is what ends the deployment.
+    let cases = [
+        Case {
+            case: "a 10% canary",
+            kind: "TimeBasedCanary",
+            percentage: 10,
+        },
+        Case {
+            case: "a 50% canary",
+            kind: "TimeBasedCanary",
+            percentage: 50,
+        },
+        Case {
+            case: "a 75% canary",
+            kind: "TimeBasedCanary",
+            percentage: 75,
+        },
+        Case {
+            case: "the first increment of a 25% linear shift",
+            kind: "TimeBasedLinear",
+            percentage: 25,
+        },
+    ];
+
+    for (index, Case {
+        case,
+        kind,
+        percentage,
+    }) in cases.iter().enumerate()
+    {
+        let emulator = Emulator::with_lambda();
+        let function = format!("split-fn-{index}");
+        let application = format!("split-app-{index}");
+        function_with_versions(&emulator, &function, 2).await;
+        let group = lambda_group(
+            &emulator,
+            &application,
+            Some(traffic_routing(kind, *percentage, HOLDING_INTERVAL_MINUTES)),
+            &Value::Null,
+        )
+        .await;
+        let deployment = create_deployment(
+            &emulator,
+            &application,
+            &group,
+            &appspec_revision(&function, ALIAS, "1", "2"),
+        )
+        .await;
+
+        #[allow(clippy::cast_precision_loss)]
+        let weight = *percentage as f64 / 100.0;
+        let holding: AliasReading = ("1".to_string(), vec![("2".to_string(), weight)]);
+        alias_reaches(&emulator, &function, &holding, case).await;
+
+        // The draws are DRY RUNS of the alias — "validate parameter values and
+        // verify that the user or role has permission to invoke the function" —
+        // which resolve the qualifier and run nothing, so a case can take enough
+        // of them to measure a share rather than observe an accident.
+        let mut on_target = 0_usize;
+        for draw in 0..DRAWS_PER_CASE {
+            let executed = emulator.lambda_executed_version(&function, ALIAS).await;
+            assert!(
+                executed == "1" || executed == "2",
+                "case {case:?} draw {draw}: an invocation may only reach one of the two \
+                 versions the shift is between, got {executed:?}"
+            );
+            if executed == "2" {
+                on_target += 1;
+            }
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let observed = on_target as f64 / DRAWS_PER_CASE as f64;
+        assert!(
+            (observed - weight).abs() <= SHARE_TOLERANCE,
+            "case {case:?}: the version being released receives the share the increment \
+             weighted onto it, so over {DRAWS_PER_CASE} invocations its observed share must \
+             be within {SHARE_TOLERANCE} of {weight}, got {observed} ({on_target} of \
+             {DRAWS_PER_CASE})"
+        );
+
+        // The window was open for the whole round of draws: the increment that
+        // holds is one of several, and the deployment is not over while it does.
+        let info = emulator
+            .ok("GetDeployment", json!({"deploymentId": deployment}))
+            .await["deploymentInfo"]
+            .clone();
+        assert_eq!(
+            info["status"].as_str(),
+            Some("InProgress"),
+            "case {case:?}: the deployment must still be running while its increment holds, \
+             got {info:?}"
+        );
+        emulator
+            .ok("StopDeployment", json!({"deploymentId": deployment}))
+            .await;
     }
 }
 
@@ -573,12 +841,14 @@ async fn an_alarm_sounding_mid_shift_stops_the_deployment_and_its_rollback_resto
         .await;
 
         // The leg that gives the group a revision to go back to, with the alarm
-        // quiet: it moves the alias to version 2.
-        let control = create_deployment(
+        // quiet: it moves the alias to version 2, in one step — this leg is the
+        // setup, so it waits out no configured interval.
+        let control = create_deployment_under(
             &emulator,
             &application,
             &group,
             &appspec_revision(&function, ALIAS, "1", "2"),
+            Some(ALL_AT_ONCE),
         )
         .await;
         let control_info =
@@ -628,7 +898,8 @@ async fn an_alarm_sounding_mid_shift_stops_the_deployment_and_its_rollback_resto
                 .await;
         }
 
-        let info = terminal_deployment_within(&emulator, &shifting, case, WINDOW_DEADLINE).await;
+        let info =
+            terminal_deployment_within(&emulator, &shifting, case, SHIFT_WINDOW_DEADLINE).await;
         if !*breaches {
             assert_eq!(
                 info["status"].as_str(),

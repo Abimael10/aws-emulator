@@ -409,7 +409,30 @@ impl Emulator {
     /// what routes it to the `lambda` signing name; the suite verifies no
     /// signature. Only meaningful on an [`Emulator::with_lambda`].
     pub(crate) async fn lambda(&self, method: &str, uri: &str, body: Value) -> (u16, Value) {
-        let request = ::http::Request::builder()
+        let response = self.lambda_response(method, uri, body, &[]).await;
+        let status = response.status().as_u16();
+        let parsed = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, parsed)
+    }
+
+    /// The WHOLE answer to one Lambda request, headers included, with `headers`
+    /// added to the ones every such request carries.
+    ///
+    /// The one place a Lambda request of this target is built, so a case that reads
+    /// a response HEADER (see [`Emulator::lambda_executed_version`]) and one that
+    /// reads the body send the same request.
+    async fn lambda_response(
+        &self,
+        method: &str,
+        uri: &str,
+        body: Value,
+        headers: &[(&str, &str)],
+    ) -> ::http::Response<bytes::Bytes> {
+        let mut builder = ::http::Request::builder()
             .method(method)
             .uri(format!("https://lambda.us-east-1.amazonaws.com{uri}"))
             .header("host", "lambda.us-east-1.amazonaws.com")
@@ -418,17 +441,14 @@ impl Emulator {
                 "authorization",
                 "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/lambda/\
                  aws4_request, SignedHeaders=host, Signature=0000",
-            )
+            );
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder
             .body(bytes::Bytes::from(body.to_string()))
             .expect("the request is well formed");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let parsed = if response.body().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-        };
-        (status, parsed)
+        self.router.dispatch(request).await
     }
 
     /// One Lambda request that has to answer `expected`, answering its body; see
@@ -448,6 +468,41 @@ impl Emulator {
              {parsed:?}"
         );
         parsed
+    }
+
+    /// The version ONE invocation of `alias` on `function` resolves to, as Lambda
+    /// reports it on `Invoke$ExecutedVersion` ("the version of the function that
+    /// executed. When you invoke a function with an alias, this indicates which
+    /// version the alias resolved to"), which is bound to the
+    /// `X-Amz-Executed-Version` response header.
+    ///
+    /// The invocation is a DRY RUN — "validate parameter values and verify that the
+    /// user or role has permission to invoke the function" — so the qualifier is
+    /// resolved and nothing runs, which is what lets a suite take enough
+    /// invocations to measure the share a weighted alias gives each version. Only
+    /// meaningful on an [`Emulator::with_lambda`].
+    pub(crate) async fn lambda_executed_version(&self, function: &str, alias: &str) -> String {
+        let uri = format!("/2015-03-31/functions/{function}:{alias}/invocations");
+        let response = self
+            .lambda_response(
+                "POST",
+                &uri,
+                serde_json::json!({}),
+                &[("x-amz-invocation-type", "DryRun")],
+            )
+            .await;
+        assert_eq!(
+            response.status().as_u16(),
+            204,
+            "setup: expected the dry run of {function}:{alias} to be served, got {} with {:?}",
+            response.status(),
+            String::from_utf8_lossy(response.body())
+        );
+        response
+            .headers()
+            .get("x-amz-executed-version")
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string())
+            .unwrap_or_default()
     }
 
     /// One request against the Amazon S3 emulator through the same front door,

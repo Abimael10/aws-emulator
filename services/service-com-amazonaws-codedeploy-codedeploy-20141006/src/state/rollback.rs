@@ -171,9 +171,13 @@ pub fn record_rollback(
         Some(rollback_id) => RollbackInfo {
             rollback_deployment_id: Some(rollback_id.clone()),
             rollback_triggering_deployment_id: Some(deployment_id.to_string()),
+            // The subject of the sentence is the deployment that was TERMINATED,
+            // followed by the id of the rollback it triggered: both ids come from
+            // this store, and every other word of it — the trailing stop included
+            // — is fixed text.
             rollback_message: Some(format!(
-                "Deployment {rollback_id} was created to roll deployment {deployment_id} back \
-                 to the previously deployed revision"
+                "Deployment {deployment_id} terminated. Automatic rollback is triggered with \
+                 a DeploymentId {rollback_id}."
             )),
         },
         None => RollbackInfo {

@@ -469,6 +469,107 @@ async fn the_alarms_a_deployment_polls_decide_whether_it_is_stopped() {
     }
 }
 
+/// The fixed text the `ALARM_ACTIVE` message carries before the alarms it ends
+/// with; see [`the_alarm_active_message_delimits_each_activated_alarm_it_names`].
+const ALARM_ACTIVE_SENTENCE: &str =
+    "One or more alarms have been activated according to the Amazon CloudWatch metrics you \
+     selected, and the affected deployments have been stopped. Activated alarms: ";
+
+/// RULE: the `ALARM_ACTIVE` message is fixed text ending in the ACTIVATED alarms,
+/// each name delimited by angle brackets and the names separated by `", "`, in the
+/// order the effective `alarmConfiguration` lists them — the brackets are the
+/// sentence's own text and the names come from that configuration.
+#[tokio::test]
+async fn the_alarm_active_message_delimits_each_activated_alarm_it_names() {
+    /// One row: the alarms the configuration names with the state each is forced
+    /// into, and the ones the message must list.
+    struct MessageCase {
+        case: &'static str,
+        held: &'static [(&'static str, &'static str)],
+        activated: &'static [&'static str],
+    }
+
+    // Rows differ along how many alarms the configuration names, which of them
+    // sound, and the order it lists them in — the list is what the delimiting is
+    // for, so one alarm and several are both rows.
+    let cases: &[MessageCase] = &[
+        MessageCase {
+            case: "one sounding alarm",
+            held: &[("solo", STATE_ALARM)],
+            activated: &["solo"],
+        },
+        MessageCase {
+            case: "two sounding alarms, in the order the configuration lists them",
+            held: &[("beta", STATE_ALARM), ("alpha", STATE_ALARM)],
+            activated: &["beta", "alpha"],
+        },
+        MessageCase {
+            case: "three alarms, two of them sounding",
+            held: &[
+                ("first", STATE_ALARM),
+                ("middle", STATE_OK),
+                ("third", STATE_ALARM),
+            ],
+            activated: &["first", "third"],
+        },
+    ];
+
+    for (index, MessageCase {
+        case: name,
+        held,
+        activated,
+    }) in cases.iter().enumerate()
+    {
+        let emulator = Emulator::with_cloudwatch();
+        let application = format!("alarm-message-{index}");
+        let alarms: Vec<String> = held
+            .iter()
+            .map(|(alarm, _)| format!("{application}-{alarm}"))
+            .collect();
+        for ((_, state_value), alarm) in held.iter().zip(&alarms) {
+            alarm_at(&emulator, alarm, state_value).await;
+        }
+        let named: Vec<&str> = alarms.iter().map(String::as_str).collect();
+        let group = group_with(
+            &emulator,
+            &application,
+            "Lambda",
+            &json!({"alarmConfiguration": alarm_configuration(true, false, &named)}),
+        )
+        .await;
+        let deployment_id = create_deployment(
+            &emulator,
+            &application,
+            &group,
+            &s3_revision("gate-bucket", "app.zip"),
+            &json!({}),
+        )
+        .await;
+
+        let info = terminal_deployment(&emulator, &deployment_id, name).await;
+        assert_eq!(
+            (
+                info["status"].as_str(),
+                info["errorInformation"]["code"].as_str()
+            ),
+            (Some("Stopped"), Some(ALARM_ACTIVE)),
+            "case {name:?}: expected the sounding alarms to stop the deployment, got {info:?}"
+        );
+        let listed = activated
+            .iter()
+            .map(|alarm| format!("<{application}-{alarm}>"))
+            .collect::<Vec<String>>()
+            .join(", ");
+        let expected = format!("{ALARM_ACTIVE_SENTENCE}{listed}");
+        assert_eq!(
+            info["errorInformation"]["message"].as_str(),
+            Some(expected.as_str()),
+            "case {name:?}: expected the message {expected:?}, got {:?}",
+            info["errorInformation"]["message"]
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The rollback a stop on alarm creates
 // ---------------------------------------------------------------------------
@@ -623,11 +724,17 @@ async fn a_stop_on_alarm_rolls_the_deployment_back_when_its_configuration_asks()
             Some(stopped_id.as_str()),
             "case {name:?}: expected the stopped deployment as the trigger, got {rollback:?}"
         );
-        assert!(
-            rollback["rollbackMessage"]
-                .as_str()
-                .is_some_and(|message| message.contains(&rollback_id)),
-            "case {name:?}: expected the rollback message to name the rollback, got {rollback:?}"
+        // The message is fixed text whose only variable parts are the two ids,
+        // both taken from this store: the deployment that was TERMINATED is its
+        // subject, and the rollback that termination triggered follows it.
+        let expected_message = format!(
+            "Deployment {stopped_id} terminated. Automatic rollback is triggered with a \
+             DeploymentId {rollback_id}."
+        );
+        assert_eq!(
+            rollback["rollbackMessage"].as_str(),
+            Some(expected_message.as_str()),
+            "case {name:?}: expected the rollback message {expected_message:?}, got {rollback:?}"
         );
         assert!(
             listed.contains(&rollback_id),

@@ -52,8 +52,10 @@ const ALL_AT_ONCE: &str = "CodeDeployDefault.LambdaAllAtOnce";
 ///
 /// Generous: every wait here is for a CONDITION (a function reported `Active`, an
 /// increment on the alias, a deployment terminal), never for a span, so the
-/// deadline only has to sit far above the spans the emulator chooses on any host.
-const DEADLINE: Duration = Duration::from_secs(120);
+/// deadline only has to sit far above the spans the emulator chooses on any host —
+/// and above the one configured interval a row below walks out, since
+/// `canaryInterval` is minutes the caller asked for.
+const DEADLINE: Duration = Duration::from_secs(240);
 /// See [`DEADLINE`].
 const POLL: Duration = Duration::from_millis(25);
 
@@ -578,7 +580,13 @@ async fn a_succeeded_lambda_deployment_leaves_the_alias_on_the_target_version() 
             current: "3",
             target: "1",
             alias: "prod",
-            routing: Some(("TimeBasedLinear", 50, 1)),
+            // No wait between the increments (`canaryInterval`/`linearInterval`
+            // have a published minimum of 0 minutes): this row is about where the
+            // alias ENDS once the deployment succeeded, and the window a row that
+            // states an interval holds open is the CodeDeploy crate's own suite's
+            // (`tests/all/lambda_traffic_shifting.rs`), so only the row above
+            // walks one out here.
+            routing: Some(("TimeBasedLinear", 50, 0)),
             json: false,
         },
         Shift {
@@ -594,7 +602,7 @@ async fn a_succeeded_lambda_deployment_leaves_the_alias_on_the_target_version() 
             current: "2",
             target: "4",
             alias: "stage",
-            routing: Some(("TimeBasedCanary", 75, 1)),
+            routing: Some(("TimeBasedCanary", 75, 0)),
             json: false,
         },
     ];

@@ -427,7 +427,13 @@ fn rows() -> Vec<Row> {
                 "      TrafficRoutingConfig:",
                 "        Type: TimeBasedLinear",
                 "        TimeBasedLinear:",
-                "          LinearInterval: 1",
+                // No wait between the increments, the published minimum of
+                // `LinearInterval`: this row is about the members CloudFormation
+                // passes through to CodeDeploy, and a deployment it then runs
+                // under this configuration has to settle before the stack can be
+                // deleted — an interval states minutes the caller asked for, so a
+                // row that is not about a traffic window asks for none.
+                "          LinearInterval: 0",
                 "          LinearPercentage: 10",
                 "  Group:",
                 "    Type: AWS::CodeDeploy::DeploymentGroup",
@@ -459,7 +465,7 @@ fn rows() -> Vec<Row> {
                     "computePlatform": "Lambda",
                     "trafficRoutingConfig": {
                         "type": "TimeBasedLinear",
-                        "timeBasedLinear": { "linearInterval": 1, "linearPercentage": 10 },
+                        "timeBasedLinear": { "linearInterval": 0, "linearPercentage": 10 },
                     },
                 }),
             }),
