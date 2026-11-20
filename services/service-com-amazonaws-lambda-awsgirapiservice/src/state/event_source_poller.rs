@@ -34,6 +34,15 @@
 //!   records arrive meters almost nothing. The age is measured from the WRITE of that record
 //!   ([`stamped_with_the_write`]), never from a stamp a source publishes rounded down to a
 //!   coarser resolution than the write, which would meter longer than the record ever waited.
+//! * AND SO IS WHAT THE PASS DID WITH THE RECORDS, while the mapping's `MetricsConfig` asks
+//!   for it — "the metrics you want your event source mapping to produce" — whichever source
+//!   the mapping reads: how many records the pass took out of the stream, how many its
+//!   `FilterCriteria` rejected and how many an invocation accepted are published per MAPPING
+//!   ([`crate::state::metrics::FunctionMetrics::publish_event_counts`]), with a 0-valued poll
+//!   count for a minute in which the pass read nothing. Nothing is DELETED from a shard — its
+//!   records stay in it for its retention period — so that one count of the family is not a
+//!   quantity this source has at all, which is where it differs from a queue's
+//!   ([`crate::state::sqs_poller`]).
 //! * THE CRITERIA DECIDE WHICH RECORDS ARE HANDED OVER. `FilterCriteria` is "an object that
 //!   defines the filter criteria that determine whether Lambda should process an event", so
 //!   of the records a pass read off a shard exactly those at least one of the mapping's
@@ -137,7 +146,8 @@ use std::time::{Duration, SystemTime};
 use ::serde_json::{json, Value};
 
 use super::{
-    metrics::FunctionMetrics, ComAmazonawsLambdaAwsgirapiserviceState, ShardCursor, ShardSource,
+    metrics::{EventCounts, FunctionMetrics},
+    ComAmazonawsLambdaAwsgirapiserviceState, ShardCursor, ShardSource,
 };
 
 /// How a DynamoDB table's stream is listed, read and handed over.
@@ -477,6 +487,12 @@ struct ShardSourcedMapping {
     /// The tumbling window this mapping aggregates each shard's records over, from
     /// `TumblingWindowInSeconds`; `None` for a mapping with no window ([`tumbling_window`]).
     tumbling_window: Option<Duration>,
+    /// Whether this mapping's `MetricsConfig` asks for the per-mapping EVENT COUNTS — what
+    /// each pass did with the records it took out of the stream
+    /// ([`super::metrics::publishes_event_counts`]). The switch is the mapping's own and the
+    /// quantities are the poller's, whichever kind of source it reads, so a mapping on a
+    /// stream meters a pass exactly as one on a queue does ([`super::sqs_poller`]).
+    meters_event_counts: bool,
     /// Where the mapping reads next in each shard it has already read from.
     cursors: BTreeMap<String, ShardCursor>,
     /// Where it reads a shard it has not read from yet.
@@ -720,6 +736,11 @@ struct PollerWork {
     /// stream this poller reads, an entry is given up as soon as its window is finalised,
     /// and the map is empty for a mapping that configures no window.
     windows: BTreeMap<String, tumbling_window::OpenWindow>,
+    /// The minute this mapping last published a 0-valued poll count for, for a mapping that
+    /// meters its passes: such a zero says the poller looked and found nothing, and it is
+    /// published once per minute, which is the resolution the series is aggregated at
+    /// ([`claims_idle_minute`]). `None` while the poller has published none.
+    idle_minute: Option<i64>,
 }
 
 /// How many records one batch of ONE shard holds while the mapping is splitting a batch its
@@ -914,6 +935,9 @@ fn run_of(
                 .get(&mapping.function_name)
                 .and_then(|function| function.reserved_concurrent_executions),
         ),
+        meters_event_counts: super::metrics::publishes_event_counts(
+            mapping.metrics_config.as_ref(),
+        ),
         filters: super::event_source_filter::patterns_of(mapping.filter_criteria.as_ref()),
         reports_batch_item_failures: super::reports_batch_item_failures(
             &mapping.function_response_types,
@@ -972,6 +996,11 @@ async fn move_batches(
     };
     let mut delivered = false;
     let mut failure: Option<String> = None;
+    // What this pass did with the records it takes out of the stream, for a mapping that
+    // meters its passes: the quantities are counted as the pass does the work and published
+    // ONCE for the whole pass below, so a reader summing a period over any of the series
+    // gets the records of that period.
+    let mut counts = EventCounts::default();
     // The criteria this pass decides each record it reads by, read once for the pass rather
     // than per shard: the patterns are the mapping's and do not change while it runs.
     let criteria = super::event_source_filter::Filters::of(uuid, &run.filters);
@@ -1056,6 +1085,14 @@ async fn move_batches(
         // before anything is handed over: a record no pattern matches is not handed to the
         // function at all, and the shard still reads on past it ([`admitted_of`]).
         let admitted = admitted_of(&criteria, run, &records, &aged_out);
+        // What the pass took out of this shard, and what the mapping's criteria rejected of
+        // it: the records are in hand, so both are counted whatever the hand-over then comes
+        // to. A record the pass discarded for a reason of its own — one past the mapping's
+        // record age — is no part of what the criteria rejected ([`Admitted::filtered_out`]).
+        counts.polled = counts.polled.saturating_add(count_of(records.len()));
+        counts.filtered_out = counts
+            .filtered_out
+            .saturating_add(count_of(admitted.filtered_out(&aged_out)));
         let Some(invoking) = admitted.invoking() else {
             // The pass handed nothing over for what it read — its criteria admitted none of
             // it, or the mapping's record age discarded all of it — so there is no
@@ -1124,6 +1161,13 @@ async fn move_batches(
             )
             .await,
         );
+        // The records the invocations of this shard ACCEPTED, which is what the mapping's
+        // invoked count meters: a record a batch was handed but whose invocation did not
+        // process it is read again on a later pass, and counted by the pass that gets it
+        // through.
+        counts.invoked = counts
+            .invoked
+            .saturating_add(count_of(attempt.processed.len()));
         // What an invocation of a TUMBLING WINDOW returned as its state is what the next
         // invocation of that window is handed, and a state that outgrew its bound ends the
         // window at once ([`tumbling_window::carry_state`]). Only an attempt the function
@@ -1267,6 +1311,20 @@ async fn move_batches(
         failure = Some(failed.detail);
         undelivered = true;
     }
+    // What the pass came to is published ONCE, for the mapping rather than per shard: the
+    // counts are quantities of this mapping's own work, and a pass that read nothing out of
+    // any shard says so with a 0-valued poll count, at most once a minute
+    // ([`claims_idle_minute`]) — which is what makes an empty window mean "the poller looked
+    // and found nothing" rather than "it is not publishing".
+    if run.meters_event_counts {
+        let at_secs = epoch_secs(SystemTime::now());
+        if counts.polled > 0 {
+            stores.metrics.publish_event_counts(uuid, &counts, at_secs);
+            work.idle_minute = None;
+        } else if claims_idle_minute(work, at_secs) {
+            stores.metrics.publish_idle_poll(uuid, at_secs);
+        }
+    }
     match failure {
         Some(detail) => Outcome::Failed {
             detail,
@@ -1275,6 +1333,31 @@ async fn move_batches(
         None if delivered => Outcome::Delivered,
         None => Outcome::Idle,
     }
+}
+
+/// A count of records as a metric carries it.
+fn count_of(records: usize) -> u32 {
+    u32::try_from(records).unwrap_or(u32::MAX)
+}
+
+/// `at` as epoch seconds, which is how a CloudWatch datapoint carries its instant.
+fn epoch_secs(at: SystemTime) -> f64 {
+    at.duration_since(::std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// Whether this poller may publish a 0-valued poll count at `at_secs` — true once per
+/// minute, which is the resolution such a series is aggregated at — and claim that minute
+/// when it may.
+fn claims_idle_minute(work: &mut PollerWork, at_secs: f64) -> bool {
+    const SECONDS_PER_MINUTE: f64 = 60.0;
+    let minute = (at_secs / SECONDS_PER_MINUTE).trunc() as i64;
+    if work.idle_minute == Some(minute) {
+        return false;
+    }
+    work.idle_minute = Some(minute);
+    true
 }
 
 /// How many records ONE batch of this mapping holds at most, as a count of records.
@@ -1988,6 +2071,7 @@ mod tests {
             on_failure_destination: None,
             maximum_record_age: None,
             tumbling_window: None,
+            meters_event_counts: false,
             cursors: ::std::collections::BTreeMap::new(),
             initial_cursor: ShardCursor::TrimHorizon,
         }

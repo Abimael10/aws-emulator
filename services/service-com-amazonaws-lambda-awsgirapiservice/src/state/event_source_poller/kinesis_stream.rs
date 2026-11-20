@@ -456,6 +456,7 @@ mod tests {
             on_failure_destination: None,
             maximum_record_age: None,
             tumbling_window: None,
+            meters_event_counts: false,
             cursors: std::collections::BTreeMap::new(),
             initial_cursor: ShardCursor::TrimHorizon,
         }

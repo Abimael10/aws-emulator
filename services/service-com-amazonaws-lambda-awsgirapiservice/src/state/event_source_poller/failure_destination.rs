@@ -652,6 +652,7 @@ mod tests {
             ),
             maximum_record_age: None,
             tumbling_window: None,
+            meters_event_counts: false,
             cursors: BTreeMap::new(),
             initial_cursor: ShardCursor::TrimHorizon,
         }

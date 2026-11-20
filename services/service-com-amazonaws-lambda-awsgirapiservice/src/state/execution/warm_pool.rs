@@ -72,11 +72,17 @@ const IDLE_LIFETIME: Duration = Duration::from_secs(60);
 /// How many idle environments this process keeps at once.
 ///
 /// One of the two bounds on what the standing environments hold of this host, beside
-/// [`MAX_STANDING_BYTES`]: no more of them stand than the number of runs the engine-memory
-/// envelope admits at one instant ([`super::MAX_CONCURRENT_RUNS`]), and the longest-idle
-/// environment is retired to make room for a newly returned one. So what the pool holds does
-/// not grow with the number of function versions a client invokes.
-const MAX_IDLE_ENVIRONMENTS: usize = super::MAX_CONCURRENT_RUNS as usize;
+/// [`MAX_STANDING_BYTES`], and the longest-idle environment is retired to make room for a
+/// newly returned one — so what the pool holds does not grow with the number of function
+/// versions a client invokes.
+///
+/// It is a figure of its own rather than the count of runs the memory envelope admits at once
+/// ([`super::MAX_CONCURRENT_RUNS`]): what is STANDING is held in anticipation of an invocation
+/// nobody has made, so how much of this host that may take follows from what it can afford to
+/// hold IDLE and not from how many handlers it serves at one instant. It is well above the
+/// function versions one client invokes in a steady burst, so such a client is served by warm
+/// environments throughout.
+const MAX_IDLE_ENVIRONMENTS: usize = 16;
 
 /// How much memory the idle environments of this process hold between them, at most.
 ///
@@ -84,10 +90,10 @@ const MAX_IDLE_ENVIRONMENTS: usize = super::MAX_CONCURRENT_RUNS as usize;
 /// that is STANDING holds its interpreter's memory outside the per-invocation envelope (the
 /// share a run claims goes back when the invocation is answered), so the pool sums what each
 /// of its environments has grown by ([`python::Prepared::grown_bytes`]) and retires the
-/// longest-idle ones until the sum fits. The figure is the same envelope the runs in flight
-/// hold between them ([`super::MAX_CONCURRENT_RUN_MEMORY_MB`]), so what this process holds for
-/// the handlers it has run is bounded by that envelope again rather than by nothing.
-const MAX_STANDING_BYTES: u64 = super::MAX_CONCURRENT_RUN_MEMORY_MB as u64 * 1024 * 1024;
+/// longest-idle ones until the sum fits. It is stated here for the reason
+/// [`MAX_IDLE_ENVIRONMENTS`] is: this is the memory this process holds for handlers it has
+/// ALREADY run, which is not what the runs in flight may hold.
+const MAX_STANDING_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// How many invocations one environment serves before it is recycled.
 ///

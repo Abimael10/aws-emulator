@@ -60,12 +60,13 @@
 //! it can hold a share, and only an envelope still full after that is answered with the
 //! modelled throttle. Every run happens on a thread of its own with no state guard of this
 //! service held, so one caller's handler cannot stall another caller's request, and the
-//! smallest share a run can hold is what bounds those threads to [`MAX_CONCURRENT_RUNS`].
+//! number of those threads is bounded by the pool that admits a run at all
+//! ([`MAX_CONCURRENT_MOUNT_READS`], held for the whole run).
 //!
 //! An execution environment that is STANDING holds its engine's memory outside that envelope,
 //! because the share a run claimed goes back when the invocation is answered: what the
-//! environments kept for the next invocation hold is bounded by the same figure again, and by
-//! their number ([`warm_pool`]).
+//! environments kept for the next invocation hold is bounded on its own, by their number and
+//! by the memory they have grown to between them ([`warm_pool`]).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -291,11 +292,50 @@ pub mod guest_resolver;
 /// run holds at most the memory its own configuration asks for, clamped to this module's
 /// per-run ceiling ([`run_heap_bytes`], at most [`MAX_RUN_MEMORY_BYTES`]), and the runs in
 /// flight hold at most this between them — so what the engines hold does not grow with the
-/// number of callers, however many invocations arrive. It bounds the resource a run really
-/// costs rather than a COUNT of runs that ignores it: four runs of the largest per-run heap
-/// is the same envelope as sixteen of the smallest `MemorySize` the model allows, and both
-/// are what this process can hold at once.
-pub const MAX_CONCURRENT_RUN_MEMORY_MB: u32 = 4 * PER_RUN_MEMORY_CEILING_MB;
+/// number of callers, however many invocations arrive.
+///
+/// It is stated as a COUNT OF THE LARGEST RUNS ([`CONCURRENT_RUNS_OF_THE_LARGEST_HEAP`])
+/// because the concurrency a client asks for is a count: "concurrency is the number of
+/// in-flight requests your function is handling at the same time", and
+/// `PutFunctionConcurrency` reserves "the number of simultaneous executions" for a function,
+/// whatever each of those executions is configured for. A function's `MemorySize` is "the
+/// amount of memory available to the function at runtime" — the ceiling ONE run may grow to,
+/// which this module enforces per run — and not capacity taken from the invocations beside
+/// it, so a fan-out of a function configured for the most memory a run is given must still
+/// have every one of a handful of simultaneous invocations really running at once. An
+/// envelope of a few of those runs would serialise them instead, and a caller that needs its
+/// invocations in flight together — a barrier, a latch, a fan-out that samples its own
+/// concurrency — would never see more than that few.
+pub const MAX_CONCURRENT_RUN_MEMORY_MB: u32 =
+    CONCURRENT_RUNS_OF_THE_LARGEST_HEAP * PER_RUN_MEMORY_CEILING_MB;
+
+/// How many runs of the LARGEST per-run heap the envelope above holds at once, which is the
+/// concurrency this process serves whatever the functions are configured for — and four times
+/// as many runs of the smallest `MemorySize` the model allows ([`MAX_CONCURRENT_RUNS`]).
+///
+/// A HOST bound, not an API one: no emulator runs the thousand simultaneous executions an
+/// account's limit allows, and an invocation that finds the envelope full WAITS for a share
+/// rather than being refused ([`PERMIT_WAIT`]). What it has to be is the fan-out a client
+/// RESERVES for one function when it needs those invocations in flight together — a
+/// reservation made to bound a downstream, or to drive a barrier, is tens of simultaneous
+/// executions and not thousands — so that the memory a function is configured for never
+/// decides that number. It is stated at twenty of them and no higher: this is the count of
+/// handlers this process may run at once, each still stopped at its own configured memory
+/// ([`run_budget`]), so what the figure decides is how many engines are live and not how much
+/// any one of them may take.
+///
+/// What this process may therefore hold of the host, as the figure leaves it, each product
+/// stated where it is bounded: twenty run threads and their stacks ([`RUN_STACK_BYTES`], so
+/// 320 MB), twenty callers' archives inflated at once ([`MAX_CONCURRENT_MOUNT_READS`] ×
+/// [`package::ReadBudget`]), the idle environments the pool keeps ([`warm_pool`], stated on
+/// their own and unchanged by this figure), and the engine memory of twenty runs, each of
+/// which is STOPPED at the memory its own function asked for. Only the last of those grows
+/// with the figure, and it grows as the same arithmetic AWS applies to the same reservation:
+/// twenty simultaneous executions of a function configured for 512 MB are twenty environments
+/// of 512 MB there too. A run that really allocates that much is a handler the developer
+/// wrote and configured for it; a caller that cannot make the emulator run more than twenty
+/// handlers cannot reach past it however many invocations it sends.
+const CONCURRENT_RUNS_OF_THE_LARGEST_HEAP: u32 = 20;
 
 /// The per-run ceiling [`MAX_RUN_MEMORY_BYTES`] states, in those same MB.
 const PER_RUN_MEMORY_CEILING_MB: u32 = (MAX_RUN_MEMORY_BYTES / BYTES_PER_MB) as u32;
@@ -314,14 +354,20 @@ pub const PERMIT_WAIT: Duration = INIT_PHASE_LIMIT
     .saturating_add(HOST_WAIT_CEILING)
     .saturating_add(ABANDON_GRACE);
 
-/// How many handlers run at once, at most, which FOLLOWS from that envelope: every function
-/// has at least the smallest `MemorySize` the model allows ([`MIN_MEMORY_SIZE_MB`]), so no
-/// more runs than this fit in the envelope however small the functions are — which is also
-/// what bounds the run threads and the stacks they hold ([`RUN_STACK_BYTES`]).
+/// How many handlers run at once, at most, as the memory envelope ALONE bounds them: every
+/// function has at least the smallest `MemorySize` the model allows ([`MIN_MEMORY_SIZE_MB`]),
+/// so no more runs than this fit in the envelope however small the functions are.
+///
+/// It is not the number of runs this process really holds at once, which is the SMALLER of
+/// this and the mount pool ([`MAX_CONCURRENT_MOUNT_READS`]): a run takes a mount permit before
+/// it takes memory and holds it for its whole life ([`run_invocation`]), so that pool is what
+/// bounds the run THREADS and the stacks they hold ([`RUN_STACK_BYTES`]) — twenty of them,
+/// whatever the functions are configured for. What this figure bounds is the queue in front of
+/// the envelope: a burst of invocations of the smallest functions waits on memory rather than
+/// being refused for it.
 pub const MAX_CONCURRENT_RUNS: u32 = MAX_CONCURRENT_RUN_MEMORY_MB / (MIN_MEMORY_SIZE_MB as u32);
 
-/// How many invocations may hold their mounts INFLATED at once: as many as the run envelope
-/// admits runs of the smallest function ([`MAX_CONCURRENT_RUNS`]).
+/// How many invocations may hold their mounts INFLATED at once.
 ///
 /// A deployment package and the layers beside it are the caller's own bytes, expanded in
 /// memory before the handler can be loaded ([`package`]), so the number of invocations doing
@@ -329,13 +375,25 @@ pub const MAX_CONCURRENT_RUNS: u32 = MAX_CONCURRENT_RUN_MEMORY_MB / (MIN_MEMORY_
 /// bounded by [`package::ReadBudget`], so this bounds the product: at most this many
 /// invocations × that budget is inflated at once. The permit is held for as long as those
 /// EXPANDED bytes are live, which is the whole run, so a queue of invocations waiting for
-/// memory cannot hold expanded archives nothing accounts for. It is a pool of its own rather
-/// than a claim on the run envelope because the two bound different bytes, and because an
-/// invocation whose package this emulator cannot read is answered as that without ever
-/// waiting for memory it would never use.
+/// memory cannot hold expanded archives nothing accounts for.
+///
+/// It is a pool of its own, with a figure stated here rather than taken from the runs the
+/// envelope admits of the SMALLEST function ([`MAX_CONCURRENT_RUNS`]), because it bounds
+/// DIFFERENT bytes: a caller's archive expanded in memory is not the engine memory a handler
+/// runs in. What it may not be is SMALLER than the runs this process serves at once, since the
+/// permit is held for the whole run — a smaller pool here would decide the concurrency instead
+/// of the envelope — so it is the same count as the runs of the largest heap
+/// ([`CONCURRENT_RUNS_OF_THE_LARGEST_HEAP`]), and the product it bounds is that many
+/// invocations × [`package::ReadBudget`]'s own byte ceiling. An invocation past it waits for a
+/// permit exactly as one waiting for run memory does, and an invocation whose package this
+/// emulator cannot read is answered as that without ever waiting for memory it would never
+/// use.
+const MAX_CONCURRENT_MOUNT_READS: usize = CONCURRENT_RUNS_OF_THE_LARGEST_HEAP as usize;
+
+/// See [`MAX_CONCURRENT_MOUNT_READS`].
 #[must_use]
 pub fn max_concurrent_mount_reads() -> usize {
-    usize::try_from(MAX_CONCURRENT_RUNS).unwrap_or(usize::MAX)
+    MAX_CONCURRENT_MOUNT_READS
 }
 
 /// How much of that envelope one invocation of a function configured for `memory_size` MB
@@ -343,8 +401,9 @@ pub fn max_concurrent_mount_reads() -> usize {
 /// never more than the whole envelope.
 ///
 /// So a function asking for the smallest memory the model allows leaves room for
-/// [`MAX_CONCURRENT_RUNS`] runs beside it, and one asking for the per-run ceiling leaves room
-/// for three: the concurrency the substrate serves is what the memory in flight allows.
+/// [`MAX_CONCURRENT_RUNS`] runs beside it, and one asking for the per-run ceiling for
+/// [`CONCURRENT_RUNS_OF_THE_LARGEST_HEAP`] of them: the concurrency the substrate serves is
+/// what the memory in flight allows, and it never falls below that count.
 #[must_use]
 pub fn run_memory_claim_mb(memory_size: i32) -> u32 {
     let bytes = u64::try_from(run_heap_bytes(memory_size)).unwrap_or(u64::MAX);

@@ -47,6 +47,20 @@ impl Admitted<'_> {
         (!invoking.is_empty()).then_some(invoking)
     }
 
+    /// How many records of the batch the mapping's `FilterCriteria` REJECTED, of the records
+    /// the pass had not already `discarded` for a reason of its own.
+    ///
+    /// That is the quantity a client asks for as the mapping's filtered-out count: "the
+    /// filter criteria that determine whether Lambda should process an event" is what
+    /// rejected those records, while a record past the mapping's record age was never
+    /// matched against a pattern at all ([`admitted_of`]) and is no part of it.
+    pub(super) fn filtered_out(&self, discarded: &[String]) -> usize {
+        match self {
+            Self::Whole(_) => 0,
+            Self::Part { rejected, .. } => rejected.len().saturating_sub(discarded.len()),
+        }
+    }
+
     /// The records of the batch this pass HANDLED, by sequence number: the ones the
     /// invocation reported as processed, plus the ones no invocation was handed.
     ///

@@ -544,8 +544,33 @@ pub struct EventCounts {
     pub filtered_out: u32,
     /// How many of them an invocation of the mapping's function accepted.
     pub invoked: u32,
-    /// How many of them the pass deleted from the event source.
-    pub deleted: u32,
+    /// How many of them the pass deleted from the event source, for a source an event is
+    /// REMOVED from once it has been handled — a queue, whose consumer deletes the message
+    /// it processed.
+    ///
+    /// `None` for a source the poller takes nothing out of: the records of a shard stay in
+    /// it for its retention period however often they are read, so such a mapping has no
+    /// deleted count at all rather than a zero — which is what tells a client "this source
+    /// is not one events are deleted from" from "this pass deleted none of what it polled".
+    pub deleted: Option<u32>,
+}
+
+impl EventCounts {
+    /// The counts a pass over a source an event is DELETED from once it has been handled
+    /// starts with: nothing polled, and a deleted count of none rather than no such count —
+    /// that source HAS one, and this pass has not deleted anything yet.
+    #[must_use]
+    pub fn of_a_source_events_leave() -> Self {
+        Self {
+            deleted: Some(0),
+            ..Self::default()
+        }
+    }
+
+    /// Count `events` more as deleted from the event source by this pass.
+    pub fn add_deleted(&mut self, events: u32) {
+        self.deleted = Some(self.deleted.unwrap_or(0).saturating_add(events));
+    }
 }
 
 /// Whether `metrics_config` selects the event-count family, which is the documented switch
@@ -909,14 +934,19 @@ impl FunctionMetrics {
     /// Every count is published, a zero included: "the number of events" a pass filtered
     /// out, invoked the function with or deleted is as much a measurement when it is none
     /// as when it is many, and a series that skipped its zeros would leave a client unable
-    /// to tell a poller that did nothing from one that is not publishing at all.
+    /// to tell a poller that did nothing from one that is not publishing at all. The one
+    /// count a source may not HAVE is what it deleted ([`EventCounts::deleted`]): a mapping
+    /// on a source whose events are not taken out of it publishes that series not at all.
     pub fn publish_event_counts(&self, uuid: &str, counts: &EventCounts, at_secs: f64) {
         for (metric, value) in [
-            (POLLED_EVENT_COUNT_METRIC, counts.polled),
-            (FILTERED_OUT_EVENT_COUNT_METRIC, counts.filtered_out),
-            (INVOKED_EVENT_COUNT_METRIC, counts.invoked),
+            (POLLED_EVENT_COUNT_METRIC, Some(counts.polled)),
+            (FILTERED_OUT_EVENT_COUNT_METRIC, Some(counts.filtered_out)),
+            (INVOKED_EVENT_COUNT_METRIC, Some(counts.invoked)),
             (DELETED_EVENT_COUNT_METRIC, counts.deleted),
-        ] {
+        ]
+        .into_iter()
+        .filter_map(|(metric, value)| value.map(|value| (metric, value)))
+        {
             self.publish_series(
                 metric,
                 mapping_dimensions(uuid),

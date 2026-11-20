@@ -641,12 +641,7 @@ async fn poll_mapping_due<Eng: Send + Sync + 'static>(
         // What the filter admits of each batch, decided before any of them is handed over: a
         // message the filter rejected is removed from the queue, because nothing else would
         // and the mapping would otherwise be handed it again at every poll.
-        let mut counts = EventCounts {
-            polled: 0,
-            filtered_out: 0,
-            invoked: 0,
-            deleted: 0,
-        };
+        let mut counts = EventCounts::of_a_source_events_leave();
         let admitted: Vec<AdmittedBatch> = batches
             .into_iter()
             .map(|polled| {
@@ -656,7 +651,7 @@ async fn poll_mapping_due<Eng: Send + Sync + 'static>(
                 counts.filtered_out = counts
                     .filtered_out
                     .saturating_add(count_of(filtered_out.len()));
-                counts.deleted = counts.deleted.saturating_add(count_of(filtered_out.len()));
+                counts.add_deleted(count_of(filtered_out.len()));
                 AdmittedBatch {
                     payload: queue_event(&invoking, &polled),
                     links: upstream_traces(&invoking, &polled),
@@ -706,7 +701,7 @@ async fn poll_mapping_due<Eng: Send + Sync + 'static>(
                         .invoked
                         .saturating_add(count_of(batch.invoking.len()));
                     delete_messages(&queues, target, &processed);
-                    counts.deleted = counts.deleted.saturating_add(count_of(processed.len()));
+                    counts.add_deleted(count_of(processed.len()));
                     session.failures.remove(&target.uuid);
                     record_attempt(&mappings, target, LAST_PROCESSING_RESULT_OK);
                 }
