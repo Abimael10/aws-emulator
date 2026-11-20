@@ -431,6 +431,18 @@ pub struct SecurityGroupRecord {
     pub group_id: String,
     pub name: String,
     pub is_default: bool,
+    /// When the group was last changed, in epoch seconds — what
+    /// `SecurityGroup$modified` reports. A group nothing has changed since it was
+    /// stored carries the instant it came into being.
+    pub modified_at: i64,
+    /// The group's own configuration, as the modelled `SecurityGroupSettings`.
+    ///
+    /// Every member of that shape is optional, so a setting nothing has given a
+    /// value is not part of the group's configuration at all — the same reading
+    /// [`NetworkSettingsRecord`] takes for the network-level settings. The group a
+    /// new network is seeded with therefore carries no setting value until
+    /// something sets one.
+    pub settings: crate::ops::types::SecurityGroupSettings,
 }
 
 /// Per-service state for com-amazonaws-wickr-wickradminapi. A handler reaches it through [`service_state`].
@@ -522,6 +534,64 @@ impl ComAmazonawsWickrWickradminapiState {
             .unwrap_or_default()
     }
 
+    /// The security groups of `network_id`, in group id order.
+    pub fn security_groups_of(&self, network_id: &str) -> Vec<SecurityGroupRecord> {
+        self.security_groups
+            .get(network_id)
+            .map(|groups| groups.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// How many users of `network_id` are active members of `group_id`.
+    ///
+    /// A user is a member of the groups its own record names, and a suspended
+    /// user is not an active one: its account is in the group but cannot be used,
+    /// which is the distinction `SecurityGroup$activeMembers` draws by counting
+    /// the ACTIVE members rather than every member.
+    pub fn active_members_of(&self, network_id: &str, group_id: &str) -> usize {
+        self.users.get(network_id).map_or(0, |users| {
+            users
+                .values()
+                .filter(|user| {
+                    !user.suspended && user.security_group_ids.iter().any(|id| id == group_id)
+                })
+                .count()
+        })
+    }
+
+    /// One stored security group as the modelled `SecurityGroup` shape, with the
+    /// membership counts this store holds for it at this instant.
+    ///
+    /// Shared by every operation that reports a security group, so they cannot
+    /// disagree about which members a group carries. Reporting only: the counts
+    /// are derived from the users stored under the network, never cached on the
+    /// group.
+    pub fn security_group_view(
+        &self,
+        network_id: &str,
+        record: &SecurityGroupRecord,
+    ) -> crate::ops::types::SecurityGroup {
+        crate::ops::types::SecurityGroup {
+            active_members: clamp_to_i32(self.active_members_of(network_id, &record.group_id)),
+            // A bot is a member of a group only once a bot operation has created
+            // it under that group; this store holds no bot, so no bot is a member
+            // of any group in it.
+            bot_members: 0,
+            // The GUID of the Active Directory group this one mirrors, which a
+            // group has only when the network synchronizes with LDAP — nothing
+            // here does, so no group mirrors one.
+            active_directory_guid: None,
+            id: record.group_id.clone(),
+            is_default: record.is_default,
+            name: record.name.clone(),
+            // `SecurityGroup$modified` is an `Integer` of epoch seconds, so an
+            // instant past what that width expresses is reported as the largest
+            // one it does rather than wrapping into the past.
+            modified: i32::try_from(record.modified_at).unwrap_or(i32::MAX),
+            security_group_settings: record.settings.clone(),
+        }
+    }
+
     /// The user of `network_id` holding `username`, if one does.
     ///
     /// O(log n) through the username index, so deciding a batch of items costs
@@ -562,6 +632,14 @@ impl ComAmazonawsWickrWickradminapiState {
         self.username_index.remove(network_id);
         Some(removed_users.len())
     }
+}
+
+/// `count` as the `Integer` the model types a membership count as.
+///
+/// A count past what that width expresses is reported as the largest one it does
+/// rather than wrapping into a negative number of members.
+fn clamp_to_i32(count: usize) -> i32 {
+    i32::try_from(count).unwrap_or(i32::MAX)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -720,6 +798,9 @@ pub fn page<T: Clone>(
 
 /// The sort directions `SortDirection` accepts, as the model declares them.
 pub const SORT_DIRECTION_DESC: &str = "DESC";
+
+/// The other one.
+pub const SORT_DIRECTION_ASC: &str = "ASC";
 
 /// `User$type` for a human account: the member documents "the descriptive type
 /// of the user account (e.g., 'user')".

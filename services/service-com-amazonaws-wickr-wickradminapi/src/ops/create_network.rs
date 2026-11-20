@@ -237,6 +237,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     group_id: crate::state::DEFAULT_SECURITY_GROUP_ID.to_string(),
                     name: crate::state::DEFAULT_SECURITY_GROUP_NAME.to_string(),
                     is_default: true,
+                    // The group comes into being with the network and nothing has
+                    // changed it since, so that is the instant it was last modified
+                    // at; and it carries no setting value until something sets one.
+                    modified_at: created_at,
+                    settings: Default::default(),
                 },
             )]
             .into_iter()

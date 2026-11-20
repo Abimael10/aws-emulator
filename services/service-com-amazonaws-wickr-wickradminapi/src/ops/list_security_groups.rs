@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSecurityGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSecurityGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the security groups stored under one network, sorted and paginated.
+//! Reporting only: it never writes.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSecurityGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +170,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSecurityGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSecurityGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSecurityGroups"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSecurityGroupsErrorModeled::InternalServerError(InternalServerError {
+                message: "the Wickr network store is unavailable".to_string(),
+            })
+        })?;
+
+        let start = crate::state::page_start(input.max_results, input.next_token.as_deref())
+            .map_err(|problem| refused(problem.field(), problem.reason()))?;
+
+        // `sortFields` names a member of the shape being listed; `ListSecurityGroupsRequest$sortFields`
+        // documents the accepted names as "'id' and 'name'", and anything else is refused
+        // rather than silently ignored.
+        let sort_field = input
+            .sort_fields
+            .as_deref()
+            .unwrap_or(DEFAULT_SORT_FIELD)
+            .to_string();
+        let key: fn(&crate::state::SecurityGroupRecord) -> &str = match sort_field.as_str() {
+            "id" => |group| group.group_id.as_str(),
+            "name" => |group| group.name.as_str(),
+            other => {
+                return Err(refused(
+                    "sortFields",
+                    format!(
+                        "sortFields must name one of {}, got {other}",
+                        SORTABLE_FIELDS.join(", ")
+                    ),
+                ))
+            }
+        };
+
+        let store = state.lock();
+        // Security groups exist only inside a network, so a `networkId` behind which
+        // there is no network — one this store never minted, or one whose network has
+        // been deleted — has no groups to report and is answered as the resource that
+        // "doesn't exist or has been deleted" rather than as an empty listing.
+        if !store.networks.contains_key(&input.network_id) {
+            return Err(ListSecurityGroupsErrorModeled::ResourceNotFoundError(
+                ResourceNotFoundError {
+                    message: Some(crate::state::NETWORK_GONE_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        let mut records = store.security_groups_of(&input.network_id);
+
+        // The group id breaks a tie on any other key, so the order is total and two
+        // pages of the same listing cannot interleave.
+        records.sort_by(|left, right| {
+            key(left)
+                .cmp(key(right))
+                .then_with(|| left.group_id.cmp(&right.group_id))
+        });
+        // `sortDirection` "Default is 'DESC'" (`ListSecurityGroupsRequest$sortDirection`),
+        // so a listing that names no direction is descending and only an explicit `ASC`
+        // asks for the ascending order the comparison above produces.
+        if input.sort_direction.as_deref() != Some(crate::state::SORT_DIRECTION_ASC) {
+            records.reverse();
+        }
+
+        let (page, next_token) = crate::state::page(&records, start, input.max_results);
+        Ok(ListSecurityGroupsOutput {
+            security_groups: Some(
+                page.iter()
+                    .map(|record| store.security_group_view(&input.network_id, record))
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// The default `sortFields` value: a listing nobody ordered comes back in group id
+/// order.
+const DEFAULT_SORT_FIELD: &str = "id";
+
+/// The `SecurityGroup` members `sortFields` accepts, as
+/// `ListSecurityGroupsRequest$sortFields` documents them ("Accepted values include 'id'
+/// and 'name'"), for the refusal message.
+const SORTABLE_FIELDS: &[&str] = &["id", "name"];
+
+/// A `ValidationError` (HTTP 422) naming the member that was wrong and why.
+fn refused(field: &str, reason: String) -> ListSecurityGroupsError {
+    ListSecurityGroupsErrorModeled::ValidationError(crate::state::field_validation_error(
+        field, &reason,
+    ))
+    .into()
 }
