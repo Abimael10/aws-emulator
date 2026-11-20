@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAllowList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAllowList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAllowList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: edits the settings of the allow list `crate::state` holds under the
+//! requested id, so a later read reports the edited list.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +156,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAllowList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAllowListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAllowList"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateAllowListErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the allow list store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // The criteria have to specify exactly one criterion, the same rule a
+        // create is held to and one no modelled constraint can express.
+        let criterion = match crate::state::AllowListCriterion::from_modeled(&input.criteria) {
+            Ok(criterion) => criterion,
+            Err(message) => {
+                return Err(UpdateAllowListErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // What the stored list specifies now decides both whether the edit
+        // addresses a list at all and whether it changes the KIND of criterion.
+        // Resolved under the lock, which is released before the object store is
+        // asked anything.
+        refuse_unless_editable(&store.lock(), &region, &input.id, &criterion)?;
+
+        // An `s3WordsList` criterion is resolved against this emulator's own
+        // object store before it is stored, exactly as a create resolves one:
+        // an address the store answers that it holds nothing at names no list
+        // that could ever be built, so the edit is refused and the stored
+        // settings are left alone.
+        if let crate::state::AllowListCriterion::WordsList {
+            bucket_name,
+            object_key,
+        } = &criterion
+        {
+            let answered = crate::state::allow_lists::read_words_list(
+                ctx.callback(),
+                &region,
+                bucket_name,
+                object_key,
+            )
+            .await;
+            if answered.is_absent() {
+                return Err(UpdateAllowListErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::allow_lists::s3_object_absent_message(
+                            bucket_name,
+                            object_key,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut state = store.lock();
+        // The list may have gone, or had its criteria replaced, while the object
+        // store was being asked, so what the edit needs is checked once more
+        // before anything is written.
+        refuse_unless_editable(&state, &region, &input.id, &criterion)?;
+        let Some(stored) = state.allow_list_mut(&region, &input.id) else {
+            return Err(UpdateAllowListErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(
+                        crate::state::allow_lists::ALLOW_LIST_NOT_FOUND_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `name` and `criteria` are required and `description` is not, so the
+        // request carries the whole of the list's settings: a member it omits is
+        // a setting the list no longer carries.
+        let changed = stored.name != input.name
+            || stored.description != input.description
+            || stored.criteria != criterion;
+        stored.name = input.name.clone();
+        stored.description = input.description.clone();
+        stored.criteria = criterion;
+        // `updatedAt` records when the list's settings were most recently
+        // CHANGED, so a call that asks for the settings it already has does not
+        // move it.
+        if changed {
+            stored.updated_at = now;
+        }
+
+        Ok(UpdateAllowListOutput {
+            arn: Some(stored.arn.clone()),
+            id: Some(stored.id.clone()),
+        })
     }
+}
+
+/// What has to hold for an edit of the allow list `id` of `region` to go
+/// through: Macie enabled there, a list stored under the id, and `criterion` of
+/// the kind that list already specifies — "you can't change the type from
+/// s3WordsList to regex or the other way around". Stated once, because the edit
+/// checks it twice: before the object store is asked anything, and again once
+/// the lock is re-acquired, since the list may have changed in between.
+fn refuse_unless_editable(
+    state: &crate::state::ComAmazonawsMacie2Macie2State,
+    region: &str,
+    id: &str,
+    criterion: &crate::state::AllowListCriterion,
+) -> Result<(), UpdateAllowListErrorModeled> {
+    if state.session(region).is_none() {
+        return Err(UpdateAllowListErrorModeled::AccessDeniedException(
+            AccessDeniedException {
+                message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+            },
+        ));
+    }
+    let Some(stored) = state.allow_list(region, id) else {
+        return Err(UpdateAllowListErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: Some(crate::state::allow_lists::ALLOW_LIST_NOT_FOUND_MESSAGE.to_string()),
+            },
+        ));
+    };
+    if !stored.criteria.is_same_kind_as(criterion) {
+        return Err(UpdateAllowListErrorModeled::ValidationException(
+            ValidationException {
+                message: Some(
+                    crate::state::allow_lists::CRITERIA_TYPE_IS_FIXED_MESSAGE.to_string(),
+                ),
+            },
+        ));
+    }
+    Ok(())
 }

@@ -23,6 +23,16 @@ pub const CRITERIA_MUST_SPECIFY_ONE_MESSAGE: &str =
     "The criteria must specify a regular expression (regex) or an S3 object (s3WordsList). \
      It can't specify both.";
 
+/// How the service refuses an edit whose `criteria` specify a DIFFERENT kind of
+/// criterion from the one the stored list specifies. The sentence states the
+/// documented rule for `UpdateAllowListRequest$criteria` ("You can change a
+/// list's underlying criteria … However, you can't change the type from
+/// s3WordsList to regex or the other way around"), so it interpolates nothing
+/// from the request.
+pub const CRITERIA_TYPE_IS_FIXED_MESSAGE: &str =
+    "Input validation failed. You can't change the type of an allow list's criteria from \
+     s3WordsList to regex or the other way around.";
+
 /// The ONE criterion an allow list specifies.
 ///
 /// [`AllowListCriterion::from_modeled`] is where a request becomes one of
@@ -53,6 +63,17 @@ impl AllowListCriterion {
             }),
             _ => Err(CRITERIA_MUST_SPECIFY_ONE_MESSAGE.to_string()),
         }
+    }
+
+    /// Whether `other` specifies the same KIND of criterion as this one — a
+    /// regular expression, or an S3 object. An edit may change what a criterion
+    /// says but not which of the two it is.
+    pub fn is_same_kind_as(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Regex(_), Self::Regex(_))
+                | (Self::WordsList { .. }, Self::WordsList { .. })
+        )
     }
 
     /// The same criterion as the modelled shape a read reports, which carries

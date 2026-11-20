@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAllowList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAllowList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAllowList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: deletes the allow list `crate::state` holds under the requested id,
+//! unless classification jobs are still configured to use it and the request did not
+//! ask for those checks to be skipped.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAllowList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAllowListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAllowList"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteAllowListErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the allow list store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        // "To skip these checks and delete the list, set this value to true. To
+        // delete the list only if no active jobs are configured to use it, set
+        // this value to false." The member is a string, so the override is the
+        // one value the doc names; every other value, and the absent member,
+        // leave the checks in place, which is the documented default.
+        let skip_job_checks = input
+            .ignore_job_checks
+            .as_deref()
+            .is_some_and(|asked| asked.trim().eq_ignore_ascii_case("true"));
+
+        let mut state = store.lock();
+        if state.session(&region).is_none() {
+            return Err(DeleteAllowListErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        if state.allow_list(&region, &input.id).is_none() {
+            return Err(DeleteAllowListErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(
+                        crate::state::allow_lists::ALLOW_LIST_NOT_FOUND_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The jobs that still hold this list: "Amazon Macie checks for
+        // classification jobs that use the list and have a status other than
+        // COMPLETE or CANCELLED. By default, Macie rejects your request if any
+        // jobs meet these criteria." The refusal reports how many there are and
+        // leaves the list where it is.
+        if !skip_job_checks {
+            let holders = state.jobs_using_allow_list(&region, &input.id, now);
+            if holders > 0 {
+                return Err(DeleteAllowListErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::allow_lists::allow_list_in_use_message(
+                            holders,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "Deletes an allow list": the record goes, so every later call
+        // addressing the id finds nothing.
+        state.remove_allow_list(&region, &input.id);
+
+        // `DeleteAllowListResponse` models no members: success is the empty
+        // body the operation's 200 carries.
+        Ok(DeleteAllowListOutput {})
     }
 }

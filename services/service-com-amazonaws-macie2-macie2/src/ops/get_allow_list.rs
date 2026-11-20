@@ -188,9 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let Some(allow_list) = state.allow_list(&region, &input.id) else {
                 return Err(GetAllowListErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::allow_lists::allow_list_not_found_message(
-                            &input.id,
-                        )),
+                        message: Some(
+                            crate::state::allow_lists::ALLOW_LIST_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

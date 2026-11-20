@@ -24,7 +24,9 @@ use crate::ops::types::AllowListStatus;
 /// a request's `criteria` into it is its own concern; it is re-exported here, so
 /// every path that reads an allow list's criteria resolves through this module
 /// as before.
-pub use super::allow_list_criteria::{AllowListCriterion, CRITERIA_MUST_SPECIFY_ONE_MESSAGE};
+pub use super::allow_list_criteria::{
+    AllowListCriterion, CRITERIA_MUST_SPECIFY_ONE_MESSAGE, CRITERIA_TYPE_IS_FIXED_MESSAGE,
+};
 
 /// The resource-type segment of an allow list's ARN, read off the ARN grammar
 /// the model pins for `CreateAllowListResponse$arn`
@@ -123,10 +125,26 @@ impl AllowList {
 }
 
 /// How the service refuses a call addressing an allow list the addressed
-/// region holds none of. The fixed text is the service's; the only variable
-/// part is the id the request named.
-pub fn allow_list_not_found_message(id: &str) -> String {
-    format!("Allow list not found for id: {id}")
+/// region holds none of. The whole sentence is fixed text: the refusal names
+/// the kind of resource the request addressed and nothing of the request.
+pub const ALLOW_LIST_NOT_FOUND_MESSAGE: &str =
+    "Input validation failed. The request specifies an allow list that does not exist.";
+
+/// How the service refuses a delete of a list classification jobs are still
+/// configured to use.
+///
+/// The rule is `DeleteAllowListRequest$ignoreJobChecks`'s own: "Amazon Macie
+/// checks for classification jobs that use the list and have a status other
+/// than COMPLETE or CANCELLED. By default, Macie rejects your request if any
+/// jobs meet these criteria." The fixed text is the service's, as its own
+/// answer to this refusal words it, and the only variable part is how many such
+/// jobs the store holds: the sentence reads the same whatever that count is,
+/// down to one job, so nothing here is singularised.
+pub fn allow_list_in_use_message(jobs: usize) -> String {
+    format!(
+        "The allow list can't be deleted. {jobs} jobs are configured to use the list and \
+         those jobs have a status other than Complete or Cancelled."
+    )
 }
 
 /// How the service refuses a create whose `s3WordsList` names an object the

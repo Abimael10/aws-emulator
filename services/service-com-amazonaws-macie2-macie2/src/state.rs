@@ -792,6 +792,35 @@ impl ComAmazonawsMacie2Macie2State {
             .filter(|allow_list| allow_list.region == region)
     }
 
+    /// Drop the allow list `id` of `region`, handing back the record that went,
+    /// or `None` when that region holds no list under the id.
+    ///
+    /// `DeleteAllowList` "Deletes an allow list" outright — nothing of it is
+    /// reported afterwards — so the record goes rather than carrying a retired
+    /// flag, the way [`Self::remove_findings_filter`] works and for the same
+    /// reasons, including the client tokens that minted it going with it.
+    pub fn remove_allow_list(&mut self, region: &str, id: &str) -> Option<AllowList> {
+        self.allow_list(region, id)?;
+        let removed = self.allow_lists.remove(id);
+        self.idempotency.retain(|_, minted| minted != id);
+        removed
+    }
+
+    /// How many classification jobs of `region` are configured to use the allow
+    /// list `id` and are not done with it as of `now`
+    /// ([`ClassificationJob::is_done_at`]).
+    ///
+    /// This is the count a delete of the list is refused with while the caller
+    /// has not asked to skip the check.
+    pub fn jobs_using_allow_list(&self, region: &str, id: &str, now: SystemTime) -> usize {
+        self.classification_jobs
+            .values()
+            .filter(|job| job.region == region)
+            .filter(|job| job.allow_list_ids.iter().any(|used| used == id))
+            .filter(|job| !job.is_done_at(now))
+            .count()
+    }
+
     /// The allow lists `ListAllowLists` enumerates for `region`, in id order —
     /// the order the store holds them in, so the total order a page boundary
     /// rests on is stable.

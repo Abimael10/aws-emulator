@@ -99,6 +99,13 @@ pub const REQUESTABLE_JOB_STATUSES: [(&str, &[&str]); 3] = [
     ),
 ];
 
+/// The statuses in which a job is done with the resources it is configured to
+/// use: `DeleteAllowListRequest$ignoreJobChecks` singles out jobs that "have a
+/// status other than COMPLETE or CANCELLED", so these two are the statuses a
+/// job's hold on an allow list does not survive. Entries of
+/// [`crate::ops::types::JOB_STATUS_VALUES`].
+pub const TERMINAL_JOB_STATUSES: [&str; 2] = [JOB_STATUS_COMPLETE, JOB_STATUS_CANCELLED];
+
 /// The current statuses `requested` is a valid new status from, or `None` when
 /// a request may not ask for `requested` at all. The one reading of
 /// [`REQUESTABLE_JOB_STATUSES`].
@@ -299,6 +306,14 @@ pub struct ClassificationJob {
 }
 
 impl ClassificationJob {
+    /// Whether this job is done, as of `now`: its status is one of
+    /// [`TERMINAL_JOB_STATUSES`]. Read off [`Self::status_at`], so a job whose
+    /// run the CLOCK has already ended counts as done even though nothing has
+    /// written that status back.
+    pub fn is_done_at(&self, now: SystemTime) -> bool {
+        TERMINAL_JOB_STATUSES.contains(&self.status_at(now))
+    }
+
     /// This job's `allowListIds`, as a read reports them: the allow lists the
     /// job is configured to use, and absent when it uses none.
     pub fn allow_list_ids_output(&self) -> Option<Vec<String>> {
@@ -561,7 +576,7 @@ mod tests {
         JOB_STATUS_USER_PAUSED, JOB_TYPE_ONE_TIME, JOB_TYPE_SCHEDULED,
         MANAGED_DATA_IDENTIFIER_SELECTOR_NONE, PAUSE_EXPIRES_AFTER, REQUESTABLE_JOB_STATUSES,
         RUN_SETTLES_AFTER, SELECTORS_NAMING_MANAGED_DATA_IDENTIFIERS,
-        SELECTORS_NAMING_NO_MANAGED_DATA_IDENTIFIERS,
+        SELECTORS_NAMING_NO_MANAGED_DATA_IDENTIFIERS, TERMINAL_JOB_STATUSES,
         statuses_a_requested_status_is_valid_from,
     };
     use crate::ops::types::{
@@ -596,6 +611,62 @@ mod tests {
             paused_at: None,
             pause_expires_at: None,
             paused_run_remaining: None,
+        }
+    }
+
+    /// A job is done with the resources it is configured to use in exactly the
+    /// two statuses the allow-list delete check singles out, and in no other
+    /// modelled status — and the status the CLOCK owes a finished run counts,
+    /// so a one-time job whose run has settled is done without anything having
+    /// written that status back.
+    #[test]
+    fn a_job_is_done_only_in_a_terminal_status() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(600);
+        for status in JOB_STATUS_VALUES {
+            let mut stored = job();
+            stored.job_status = status.to_string();
+            let expected = TERMINAL_JOB_STATUSES.contains(status);
+            let actual = stored.is_done_at(now);
+            assert_eq!(
+                actual, expected,
+                "case {status:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        for (case, job_type, run_has_ended, expected) in [
+            ("a one-time run that has ended", JOB_TYPE_ONE_TIME, true, true),
+            (
+                "a one-time run still in progress",
+                JOB_TYPE_ONE_TIME,
+                false,
+                false,
+            ),
+            (
+                "a recurring run that has ended",
+                JOB_TYPE_SCHEDULED,
+                true,
+                false,
+            ),
+            (
+                "a recurring run still in progress",
+                JOB_TYPE_SCHEDULED,
+                false,
+                false,
+            ),
+        ] {
+            let mut stored = job();
+            stored.job_type = job_type.to_string();
+            stored.job_status = JOB_STATUS_RUNNING.to_string();
+            stored.run_settles_at = Some(if run_has_ended {
+                now - Duration::from_secs(1)
+            } else {
+                now + Duration::from_secs(1)
+            });
+            let actual = stored.is_done_at(now);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
         }
     }
 
