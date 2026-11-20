@@ -460,7 +460,12 @@ fn out_of_band_rows() -> Vec<OutOfBandRow> {
 
 /// The execution role the provider assumes, created through IAM's own `CreateRole`; answers
 /// the ARN IAM minted for it.
-async fn given_role(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+///
+/// `pub(crate)` because more than one suite of this target creates a provider OUTSIDE the
+/// stack that names it, and there is one spelling of those two calls: the suite over a
+/// provider that writes an Amazon S3 object as its execution role
+/// (`custom_resource_provider_object_write.rs`) stands its provider up through these.
+pub(crate) async fn given_role(router: &MultiServiceRouter, case: &str, name: &str) -> String {
     let trust = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -489,11 +494,14 @@ async fn given_role(router: &MultiServiceRouter, case: &str, name: &str) -> Stri
 /// The provider function, created through AWS Lambda's own `CreateFunction` before any stack
 /// declares it, and waited for until Lambda reports it `Active` — which is what a client's own
 /// waiter does; answers the ARN Lambda minted for it.
-async fn given_function(
+/// `source` is the one module of its deployment package, so a suite stands up the provider its
+/// own rule is about; `pub(crate)` for the same reason [`given_role`] is.
+pub(crate) async fn given_function(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
     role_arn: &str,
+    source: &str,
 ) -> String {
     let request = json!({
         "FunctionName": name,
@@ -503,7 +511,7 @@ async fn given_function(
         "Code": {
             "ZipFile": ::aws_smithy_types::base64::encode(package(
                 OUT_OF_BAND_SOURCE_FILE,
-                ANSWERS_FROM_ITS_PROPERTIES,
+                source,
             )),
         },
     });
@@ -606,7 +614,14 @@ async fn a_provider_created_outside_the_stack_backs_the_resource_that_names_its_
         let case = row.case;
         let (router, _engine) = router_with_engine();
         let role_arn = given_role(&router, case, row.role_name).await;
-        let function_arn = given_function(&router, case, row.function_name, &role_arn).await;
+        let function_arn = given_function(
+            &router,
+            case,
+            row.function_name,
+            &role_arn,
+            ANSWERS_FROM_ITS_PROPERTIES,
+        )
+        .await;
         let body = out_of_band_template(&row, &function_arn);
         let (status_code, created) = create_stack(
             &router,
