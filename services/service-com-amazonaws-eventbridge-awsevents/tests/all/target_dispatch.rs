@@ -788,6 +788,58 @@ pub(crate) async fn given_state_machine(emulator: &Emulator, name: &str) -> Stri
         .to_string()
 }
 
+/// The role a scheduled rule's target names, which EventBridge acts as to invoke it. No policy
+/// is written for it: nothing IAM holds says this role may not be assumed, which is the
+/// documented reading of a role provisioned outside the client that names it.
+pub(crate) fn target_role() -> String {
+    format!(
+        "arn:aws:iam::{}:role/events-start-execution",
+        engine::emulator_account_id()
+    )
+}
+
+/// The input of every execution the state machine at `arn` holds — where a client reads what a
+/// delivery to a state-machine target was handed.
+pub(crate) async fn execution_inputs(emulator: &Emulator, arn: &str) -> Vec<String> {
+    let (status, listed) = sfn(
+        emulator,
+        "ListExecutions",
+        &json!({ "stateMachineArn": arn }),
+    )
+    .await;
+    assert_eq!(status, 200, "ListExecutions answered {status} {listed}");
+    let mut inputs = Vec::new();
+    for execution in listed["executions"].as_array().cloned().unwrap_or_default() {
+        let execution_arn = execution["executionArn"].as_str().unwrap_or_default();
+        let (status, described) = sfn(
+            emulator,
+            "DescribeExecution",
+            &json!({ "executionArn": execution_arn }),
+        )
+        .await;
+        assert_eq!(status, 200, "DescribeExecution answered {status} {described}");
+        inputs.push(described["input"].as_str().unwrap_or_default().to_string());
+    }
+    inputs
+}
+
+/// [`execution_inputs`] once the machine at `arn` holds at least one execution, or an empty
+/// list once `budget` has passed with none: the condition is looked for again rather than
+/// waited out, and `budget` is only the ceiling on how long it is looked for.
+pub(crate) async fn fired_within(emulator: &Emulator, arn: &str, budget: Duration) -> Vec<String> {
+    let began = Instant::now();
+    loop {
+        let inputs = execution_inputs(emulator, arn).await;
+        if !inputs.is_empty() {
+            return inputs;
+        }
+        if began.elapsed() >= budget {
+            return Vec::new();
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// A trust policy with one statement, written as a client sends it.
 pub(crate) fn trust_policy(principal: &str) -> String {
     json!({
@@ -800,7 +852,6 @@ pub(crate) fn trust_policy(principal: &str) -> String {
     })
     .to_string()
 }
-
 /// An identity policy allowing one action on every resource.
 fn identity_policy(action: &str) -> String {
     json!({

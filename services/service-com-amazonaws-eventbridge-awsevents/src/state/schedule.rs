@@ -28,11 +28,14 @@
 //! The `ScheduleExpression` decides it: a `rate(<value> <unit>)` fires every `value` units,
 //! and a `cron(<six fields>)` fires at the instants that expression names, read through the
 //! maintained `cron` crate rather than a hand-written parser. The CADENCE is the caller's
-//! own figure and keeps its value. WHEN the first firing of a new rule falls is not something
-//! the expression states — AWS aligns a rate rule's firings to its own clock, so the first
-//! one lands somewhere inside the first period — and this emulator makes it due
-//! [`FIRST_FIRING_DELAY`] after the rule became schedulable, which is inside that span for
-//! every rate a caller can write.
+//! own figure and keeps its value — and so does every INSTANT a `cron` expression names,
+//! the first one included: an expression that names its own instants is fired at those and
+//! at no others, so the first firing of a new cron rule is the first instant it names, however
+//! long after the rule became schedulable that falls ([`Schedule::first_due`]). A `rate`
+//! expression names an interval and no instant at all — AWS aligns such a rule's firings to
+//! its own clock, so the first one lands somewhere inside the first period — and that is the
+//! one first firing this emulator places itself, [`FIRST_FIRING_DELAY`] after the rule became
+//! schedulable, which is inside that span for every rate a caller can write.
 //!
 //! A firing that was due while nothing was running is not replayed: "EventBridge doesn't
 //! guarantee that a rule fires at a precise time", and a schedule that fell many periods
@@ -57,14 +60,18 @@ const SCHEDULED_EVENT_DETAIL_TYPE: &str = "Scheduled Event";
 /// schedule, so the envelope's detail is the empty document.
 const SCHEDULED_EVENT_DETAIL: &str = "{}";
 
-/// How long after a rule becomes schedulable its FIRST firing falls due.
+/// How long after a rule carrying a `rate(...)` expression becomes schedulable its FIRST
+/// firing falls due.
 ///
-/// EMULATOR-CHOSEN, not an AWS duration: AWS states no instant for a new rule's first
-/// firing — it aligns a rate rule to its own clock, so the first firing lands somewhere
-/// inside the first period — and this is the span this emulator holds a new schedule rule
-/// before firing it. Deliberately non-zero, so a client that creates a rule and then adds
-/// its targets has them in place before the first firing, and well inside the shortest
-/// period a `rate` can state (one minute).
+/// EMULATOR-CHOSEN, not an AWS duration: AWS states no instant for a new RATE rule's first
+/// firing — it aligns such a rule to its own clock, so the first firing lands somewhere
+/// inside the first period — and this is the span this emulator holds one before firing it.
+/// Deliberately non-zero, so a client that creates a rule and then adds its targets has them
+/// in place before the first firing, and well inside the shortest period a `rate` can state
+/// (one minute).
+///
+/// It is NOT a span a `cron(...)` rule waits: such an expression names its own instants, and a
+/// rule carrying one is first due at the first instant it names ([`Schedule::first_due`]).
 pub const FIRST_FIRING_DELAY: Duration = Duration::from_secs(3);
 
 /// How often the clock wakes up to ask what is due.
@@ -97,8 +104,10 @@ const CLAIM_LAPSES_AFTER: Duration = Duration::from_secs(120);
 #[derive(Debug, Default)]
 pub struct Schedules {
     /// When each schedule rule's NEXT firing falls due, by the rule's own ARN. A rule the
-    /// clock has not seen yet has no entry, and gets one — [`FIRST_FIRING_DELAY`] ahead —
-    /// the first time the clock looks at it, so it is not fired the instant it is created.
+    /// clock has not seen yet has no entry, and gets the one its own schedule states
+    /// ([`Schedule::first_due`]) the first time the clock looks at it, so it is not fired the
+    /// instant it is created — and a schedule naming no instant ahead at all gets none, so the
+    /// clock neither fires it nor keeps anything for it.
     due: BTreeMap<String, SystemTime>,
     /// The generation of the clock currently driving these schedules, with the instant it
     /// last recorded a tick: see [`CLAIM_LAPSES_AFTER`].
@@ -170,10 +179,14 @@ impl Schedules {
         for rule in schedulable {
             let due = match self.due.get(&rule.rule_arn) {
                 Some(due) => *due,
-                // A rule the clock has not seen yet: its first firing falls due ahead of
-                // now, so it is not fired the instant it was created.
+                // A rule the clock has not seen yet: its first firing falls where its own
+                // schedule puts it, which is always ahead of now — so it is not fired the
+                // instant it was created. A schedule naming no instant ahead at all keeps no
+                // due instant, exactly as an exhausted one does below.
                 None => {
-                    known.insert(rule.rule_arn.clone(), after(now, FIRST_FIRING_DELAY));
+                    if let Some(first) = rule.schedule.first_due(now) {
+                        known.insert(rule.rule_arn.clone(), first);
+                    }
                     continue;
                 }
             };
@@ -268,6 +281,26 @@ impl Schedule {
                 let from: ::chrono::DateTime<::chrono::Utc> = now.into();
                 schedule.after(&from).next().map(SystemTime::from)
             }
+        }
+    }
+
+    /// The instant this schedule's FIRST firing — the one owed a rule the clock has not seen
+    /// before, read at `now` — falls on, or `None` when the schedule names no instant ahead
+    /// at all, which is a rule that fires no more.
+    ///
+    /// A `cron` expression NAMES the instants it fires at, so the first firing of a rule
+    /// carrying one is the first instant it names ahead of `now` and nothing else: an
+    /// expression that states its own instants is fired at those, whenever the rule it is on
+    /// happened to become schedulable. A `rate` expression states an interval and no instant
+    /// at all, so there is nothing of the caller's for its first firing to fall on, and this
+    /// emulator places that one [`FIRST_FIRING_DELAY`] ahead — inside the first period, which
+    /// is where AWS's own alignment puts it.
+    fn first_due(&self, now: SystemTime) -> Option<SystemTime> {
+        match self {
+            Self::Rate(_) => Some(after(now, FIRST_FIRING_DELAY)),
+            // The first instant ahead of now is what `next_after` answers for a cron
+            // schedule, which reads the expression and not the instant handed to it.
+            Self::Cron(_) => self.next_after(now, now),
         }
     }
 }
@@ -708,6 +741,103 @@ mod tests {
         );
     }
 
+    /// A schedule's FIRST firing falls where the expression puts it: at the first instant a
+    /// `cron` expression NAMES ahead of the clock, and — for a `rate` expression, which names
+    /// an interval and no instant — inside the first period, which is where this emulator
+    /// places it ([`FIRST_FIRING_DELAY`]).
+    ///
+    /// The rows differ along the expression family and, for the cron family, along which field
+    /// carries the value that decides the next instant: the minute, the hour, the day of the
+    /// month, the year ahead, and a year behind the clock, which names no instant at all.
+    #[test]
+    fn a_schedules_first_firing_falls_where_its_expression_puts_it() {
+        /// The clock every row is read at, so each expected instant is a fixed statement about
+        /// the expression rather than about when this test ran.
+        const NOW: &str = "2030-03-04T09:17:23Z";
+
+        let now = at(NOW);
+        // (case, the expression, the instant its first firing falls on)
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            (
+                "a cron expression naming an instant in every minute",
+                "cron(* * * * ? *)",
+                Some("2030-03-04T09:18:00Z"),
+            ),
+            (
+                "a cron expression naming a minute of every hour",
+                "cron(7 * * * ? *)",
+                Some("2030-03-04T10:07:00Z"),
+            ),
+            (
+                "a cron expression naming an instant later today",
+                "cron(0 20 * * ? *)",
+                Some("2030-03-04T20:00:00Z"),
+            ),
+            (
+                "a cron expression whose instant today has passed",
+                "cron(0 8 * * ? *)",
+                Some("2030-03-05T08:00:00Z"),
+            ),
+            (
+                "a cron expression naming a day of every month",
+                "cron(0 8 1 * ? *)",
+                Some("2030-04-01T08:00:00Z"),
+            ),
+            (
+                "a cron expression naming a year decades ahead",
+                "cron(0 0 1 1 ? 2099)",
+                Some("2099-01-01T00:00:00Z"),
+            ),
+            (
+                "a cron expression whose year is behind the clock",
+                "cron(0 20 * * ? 2020)",
+                None,
+            ),
+            // A rate expression names an interval and no instant, so its first firing is the
+            // one this emulator places, inside the first period.
+            ("a rate of one minute", "rate(1 minute)", None),
+            ("a rate of two days", "rate(2 days)", None),
+        ];
+        for (case, expression, expected) in rows {
+            let schedule =
+                Schedule::parse(expression).expect("the expression is one the service accepts");
+            let first = schedule.first_due(now);
+            match (expected, &schedule) {
+                // A rate row: the first firing is the span this emulator holds a new rate rule
+                // for, which is inside the shortest period a rate can state.
+                (None, Schedule::Rate(period)) => {
+                    assert_eq!(
+                        first,
+                        Some(now + FIRST_FIRING_DELAY),
+                        "case {case:?}: expected the first firing inside the first period, got \
+                         {first:?}"
+                    );
+                    assert!(
+                        FIRST_FIRING_DELAY < *period,
+                        "case {case:?}: expected the first firing inside the period {period:?}"
+                    );
+                }
+                // A cron row naming nothing ahead: such a rule fires no more.
+                (None, Schedule::Cron(_)) => assert!(
+                    first.is_none(),
+                    "case {case:?}: expected no instant at all for {expression:?}, got {first:?}"
+                ),
+                (Some(instant), _) => assert_eq!(
+                    first,
+                    Some(at(instant)),
+                    "case {case:?}: expected {instant} for {expression:?}, got {first:?}"
+                ),
+            }
+        }
+    }
+
+    /// An RFC 3339 instant as the clock reading it names.
+    fn at(instant: &str) -> SystemTime {
+        ::chrono::DateTime::parse_from_rfc3339(instant)
+            .expect("the instant is written in RFC 3339")
+            .into()
+    }
+
     /// One clock per store: a second caller gets nothing while the first keeps ticking, and
     /// the claim lapses once a clock stops recording ticks.
     #[test]
@@ -773,6 +903,61 @@ mod tests {
         assert!(
             again.is_empty(),
             "expected one firing per due instant, got {again:?}"
+        );
+    }
+
+    /// A rule the clock has not seen whose expression NAMES its instants is first fired at the
+    /// first of those, not at a span of the service's own: nothing fires while the clock is
+    /// short of that instant, however far past the span a rate rule waits it has come.
+    #[test]
+    fn a_new_cron_rule_is_first_due_at_the_instant_its_expression_names() {
+        let case = "a cron expression naming an instant later today";
+        let mut schedules = Schedules::default();
+        let rule = Schedulable {
+            region: "us-west-2".to_string(),
+            bus: "default".to_string(),
+            rule: "nightly".to_string(),
+            rule_arn: "arn:aws:events:us-west-2:000000000000:rule/nightly".to_string(),
+            schedule: Schedule::parse("cron(0 20 * * ? *)")
+                .expect("the expression is one the service accepts"),
+        };
+        let now = at("2030-03-04T09:17:23Z");
+        let seen = schedules.take_due(::std::slice::from_ref(&rule), now);
+        assert!(
+            seen.is_empty(),
+            "case {case:?}: expected a rule the clock has just seen not to fire yet, got {seen:?}"
+        );
+        // Past the span a new RATE rule waits, and long past it: a cron rule's firing is the
+        // instant its expression names, so neither is one.
+        for ahead in [FIRST_FIRING_DELAY, Duration::from_secs(3_600)] {
+            let early = schedules.take_due(::std::slice::from_ref(&rule), now + ahead);
+            assert!(
+                early.is_empty(),
+                "case {case:?}: expected nothing to fire {ahead:?} in, which the expression \
+                 names no instant at, got {early:?}"
+            );
+        }
+        let named = at("2030-03-04T20:00:00Z");
+        let fired = schedules.take_due(::std::slice::from_ref(&rule), named);
+        assert_eq!(
+            fired.len(),
+            1,
+            "case {case:?}: expected the firing at the instant the expression names, got {fired:?}"
+        );
+        // And the one after it is the next instant that expression names, a day on.
+        let again = schedules.take_due(::std::slice::from_ref(&rule), named);
+        assert!(
+            again.is_empty(),
+            "case {case:?}: expected one firing per named instant, got {again:?}"
+        );
+        let next = schedules.take_due(
+            ::std::slice::from_ref(&rule),
+            at("2030-03-05T20:00:00Z"),
+        );
+        assert_eq!(
+            next.len(),
+            1,
+            "case {case:?}: expected the next firing at the next instant named, got {next:?}"
         );
     }
 }

@@ -24,13 +24,16 @@
 //!
 //! The rows differ along what the rule generalises over: the form the `ScheduleExpression`
 //! takes — `rate` with a singular and with a plural unit, stated in minutes, in hours and in
-//! days, and `cron` naming its own instants. Every one of them has its FIRST firing fall due
-//! the same span after the rule can reach a target, so what a row pins is that firing; which
-//! INSTANTS each form then names is the reading pinned by the unit tests of the service's own
-//! `state::schedule`, and the cadence between two firings, together with the input overrides
-//! a target may declare, is pinned beside the service in its crate's
-//! `tests/all/scheduled_rule_firing.rs`. What needs these four services together — the role a
-//! firing is made as, and the execution it really starts — is what this suite holds.
+//! days, and `cron` naming its own instants. A `rate` row has its FIRST firing fall due the
+//! span this emulator holds a new rate rule for, because such an expression names an interval
+//! and no instant of its own; a `cron` row has its first firing fall at the first instant its
+//! expression NAMES, which is why the one here names an instant in every minute. What a row
+//! pins is that firing; which instants each form names is the reading pinned by the unit tests
+//! of the service's own `state::schedule`, and the cadence between two firings, together with
+//! the input overrides a target may declare, is pinned beside the service in its crate's
+//! `tests/all/scheduled_rule_firing.rs` and `tests/all/cron_schedule_rule_firing.rs`. What
+//! needs these four services together — the role a firing is made as, and the execution it
+//! really starts — is what this suite holds.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -89,10 +92,12 @@ const ENVELOPE_MEMBERS: [&str; 9] = [
     "version",
 ];
 
-/// How long a case waits for the FIRST firing of a rule it has just targeted: generously
-/// wider than the span this emulator holds a new schedule rule for, so a loaded host does
-/// not decide the verdict.
-const FIRING_PATIENCE: Duration = Duration::from_secs(60);
+/// How long a case waits for the FIRST firing of a rule it has just targeted: generously wider
+/// than the longest wait a row's own expression states for one — the minute between two
+/// instants the cron row names, which is longer than the span this emulator holds a new rate
+/// rule for — so a loaded host does not decide the verdict. A ceiling on patience, never a
+/// span anything here counts on.
+const FIRING_PATIENCE: Duration = Duration::from_secs(180);
 
 /// How long a case waits for an execution to leave `RUNNING`.
 const TERMINAL_PATIENCE: Duration = Duration::from_secs(30);
@@ -525,8 +530,14 @@ struct Row {
     schedule: &'static str,
 }
 
-/// Every form a `ScheduleExpression` states a cadence in. The first firing of each falls due
-/// the same span after the rule can reach its target, so a row's cadence is not waited out.
+/// Every form a `ScheduleExpression` states a cadence in.
+///
+/// A `rate` row's first firing falls due the span this emulator holds a new rate rule for, so
+/// its cadence is not waited out. The `cron` row's falls at the first instant its expression
+/// names — the expression states them, so nothing else is a firing of it — which is why the
+/// row names an instant in every minute: the sparser cadences that form can state put their
+/// first instant further ahead than any suite can wait, and which instants each one names is
+/// pinned by the service's own unit tests.
 const ROWS: &[Row] = &[
     Row {
         case: "a rate of one minute, the shortest a rate can state",
@@ -549,14 +560,9 @@ const ROWS: &[Row] = &[
         schedule: "rate(2 days)",
     },
     Row {
-        case: "a cron expression naming every minute",
+        case: "a cron expression naming an instant in every minute",
         slug: "cron-every-minute",
         schedule: "cron(* * * * ? *)",
-    },
-    Row {
-        case: "a cron expression naming one minute of each hour",
-        slug: "cron-hourly",
-        schedule: "cron(0 * * * ? *)",
     },
 ];
 
@@ -572,9 +578,9 @@ struct Wired {
 /// Every form of schedule fires, with nothing published, and what the firing starts is an
 /// execution of the target state machine carrying EventBridge's own scheduled-event envelope.
 ///
-/// The rows are wired up first and verified afterwards: each rule's first firing is owed from
-/// the moment that rule can reach its target, so one wait covers the table rather than one
-/// per row.
+/// The rows are wired up first and verified afterwards: a rate row's first firing is owed from
+/// the moment that rule can reach its target, and the cron row's at the next instant its
+/// expression names, so one wait covers the table rather than one per row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_scheduled_rule_starts_its_state_machine_with_the_scheduled_event() {
     let router = emulator();

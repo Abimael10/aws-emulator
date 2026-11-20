@@ -22,7 +22,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::target_dispatch::{emulator, events, given_state_machine, sfn, Emulator, REGION};
+use crate::target_dispatch::{
+    emulator, events, execution_inputs, fired_within, given_state_machine, target_role, Emulator,
+    REGION,
+};
 
 /// The cadence every row's rule declares: the shortest a `rate(...)` expression can state.
 const SCHEDULE_EXPRESSION: &str = "rate(1 minute)";
@@ -51,19 +54,10 @@ const QUIET_WATCH: Duration = Duration::from_secs(20);
 /// figure; this is only the ceiling on how long the firing it owes is waited for.
 const CADENCE_PATIENCE: Duration = Duration::from_secs(180);
 
-/// How long one poll of the target's executions sleeps between reads.
-const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-/// The role every target names, which EventBridge acts as to start an execution. No policy
-/// is written for it here: nothing IAM holds says this role may not be assumed, which is the
-/// documented reading of a role provisioned outside the client that names it.
-fn target_role() -> String {
-    format!(
-        "arn:aws:iam::{}:role/events-start-execution",
-        engine::emulator_account_id()
-    )
-}
-
+/// The role every target names, which EventBridge acts as to start an execution, and the
+/// readers of what a firing handed one, are the whole crate's own
+/// ([`crate::target_dispatch`]): the two schedule suites read a firing the same way.
+///
 /// Write a rule that fires on [`SCHEDULE_EXPRESSION`] with `target` as its only target.
 async fn given_schedule_rule(emulator: &Emulator, name: &str, state: &str, target: Value) {
     let (status, written) = events(
@@ -95,46 +89,6 @@ async fn given_schedule_rule(emulator: &Emulator, name: &str, state: &str, targe
         json!(0),
         "case {name}: PutTargets reported a failed entry: {targeted}"
     );
-}
-
-/// The input of every execution the state machine at `arn` holds.
-async fn execution_inputs(emulator: &Emulator, arn: &str) -> Vec<String> {
-    let (status, listed) = sfn(
-        emulator,
-        "ListExecutions",
-        &json!({ "stateMachineArn": arn }),
-    )
-    .await;
-    assert_eq!(status, 200, "ListExecutions answered {status} {listed}");
-    let mut inputs = Vec::new();
-    for execution in listed["executions"].as_array().cloned().unwrap_or_default() {
-        let execution_arn = execution["executionArn"].as_str().unwrap_or_default();
-        let (status, described) = sfn(
-            emulator,
-            "DescribeExecution",
-            &json!({ "executionArn": execution_arn }),
-        )
-        .await;
-        assert_eq!(status, 200, "DescribeExecution answered {status} {described}");
-        inputs.push(described["input"].as_str().unwrap_or_default().to_string());
-    }
-    inputs
-}
-
-/// The inputs of the executions the state machine at `arn` holds once it holds at least one,
-/// or an empty list once `budget` has passed with none.
-async fn fired_within(emulator: &Emulator, arn: &str, budget: Duration) -> Vec<String> {
-    let began = Instant::now();
-    loop {
-        let inputs = execution_inputs(emulator, arn).await;
-        if !inputs.is_empty() {
-            return inputs;
-        }
-        if began.elapsed() >= budget {
-            return Vec::new();
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
 }
 
 /// [`fired_within`] over the budget a firing this suite EXPECTS is waited for.
