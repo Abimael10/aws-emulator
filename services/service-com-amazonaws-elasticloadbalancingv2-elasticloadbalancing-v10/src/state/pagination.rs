@@ -48,6 +48,7 @@ pub enum PagedCollection {
     SslPolicies,
     TargetGroups,
     TrustStoreAssociations,
+    TrustStoreRevocations,
     TrustStores,
 }
 
@@ -63,6 +64,7 @@ impl PagedCollection {
             Self::SslPolicies => "SslPolicies",
             Self::TargetGroups => "TargetGroups",
             Self::TrustStoreAssociations => "TrustStoreAssociations",
+            Self::TrustStoreRevocations => "TrustStoreRevocations",
             Self::TrustStores => "TrustStores",
         }
     }
@@ -173,6 +175,7 @@ mod tests {
             PagedCollection::SslPolicies,
             PagedCollection::TargetGroups,
             PagedCollection::TrustStoreAssociations,
+            PagedCollection::TrustStoreRevocations,
             PagedCollection::TrustStores,
         ];
         for collection in collections {

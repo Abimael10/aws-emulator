@@ -48,7 +48,11 @@ use crate::provisioning_loop::{account, action, call, first_text, members, p, Re
 use crate::target_group_attributes_and_modification::unescaped;
 
 /// The bucket every bundle below is staged in.
-const BUNDLE_BUCKET: &str = "elbv2-trust-store-bundles";
+///
+/// `pub(crate)`: the revocation suite beside this one
+/// (`crate::trust_store_revocations`) stages its revocation files in the same bucket,
+/// through this one spelling and the harness below.
+pub(crate) const BUNDLE_BUCKET: &str = "elbv2-trust-store-bundles";
 
 /// A certificate ARN an HTTPS listener's default certificate resolves to, so a case that
 /// needs an mTLS listener reaches the association assertions rather than the certificate
@@ -75,13 +79,17 @@ const ASSOCIATION_NOT_FOUND: &str = "AssociationNotFound";
 /// This service and Amazon S3 over ONE shared engine, with a callback into the same router
 /// so this suite stages bundles through Amazon S3's own API — the very seam the handler
 /// reads them over.
-struct Emulator {
-    router: MultiServiceRouter,
+///
+/// `pub(crate)`: the revocation suite beside this one (`crate::trust_store_revocations`)
+/// needs the same two services over one engine, so there is ONE harness for the trust-store
+/// plane rather than two that could drift on how the object store is mounted.
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
     callback: EmbeddedEmulator,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -99,7 +107,7 @@ impl Emulator {
 
     /// The Amazon S3 client, built by the one shared constructor, so this suite's writes
     /// land in the store the handler reads.
-    fn s3(&self) -> aws_sdk_s3::Client {
+    pub(crate) fn s3(&self) -> aws_sdk_s3::Client {
         service_common::s3_client::s3_client(&self.callback, REGION)
     }
 
@@ -123,7 +131,7 @@ impl Emulator {
     }
 
     /// Put `body` at `key` of [`BUNDLE_BUCKET`].
-    async fn stage(&self, key: &str, body: &str) {
+    pub(crate) async fn stage(&self, key: &str, body: &str) {
         self.s3()
             .put_object()
             .bucket(BUNDLE_BUCKET)
@@ -138,7 +146,7 @@ impl Emulator {
 }
 
 /// An emulator whose bundle bucket exists.
-async fn emulator_with_bundles() -> Emulator {
+pub(crate) async fn emulator_with_bundles() -> Emulator {
     let emulator = Emulator::new();
     emulator.bundle_bucket().await;
     emulator

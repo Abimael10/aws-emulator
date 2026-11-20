@@ -231,6 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The number of revoked certificates in the trust store": a trust store is
             // created with no revocation list, so nothing is revoked in it yet.
             total_revoked_entries: 0,
+            // And no revocation file is in force in it: each one is added by its own
+            // operation (`AddTrustStoreRevocations`).
+            revocations: crate::state::RevocationList::default(),
             tags,
             // A policy is what SHARING this trust store with another account attaches, and
             // the create shares nothing.

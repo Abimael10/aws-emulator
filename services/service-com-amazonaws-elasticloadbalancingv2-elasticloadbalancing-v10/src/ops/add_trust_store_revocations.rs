@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddTrustStoreRevocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddTrustStoreRevocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddTrustStoreRevocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds one revocation file to a trust store: the list the request names is READ out of
+//! Amazon S3 ([`crate::state::trust_store_revocations`]) and the file this records on the
+//! trust store reports the entries that read counted, under the revocation id the trust
+//! store mints for it.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +141,143 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddTrustStoreRevocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddTrustStoreRevocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddTrustStoreRevocations"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("AddTrustStoreRevocations")
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        // "Adds the specified revocation file": one file per call, which the model gives
+        // `RevocationContents` no length for, so a list naming more is a bad REQUEST and
+        // nothing of it is read or stored.
+        let requested = input.revocation_contents.unwrap_or_default();
+        if requested.len() > crate::state::REVOCATION_CONTENTS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::one_revocation_content_per_call_message(),
+            ));
+        }
+
+        // The trust store this call is about has to exist before its file is read: an add
+        // to a trust store this account does not hold is the modelled refusal whatever the
+        // object store says about the object.
+        if !state
+            .lock()
+            .trust_stores
+            .contains_key(&input.trust_store_arn)
+        {
+            return Err(not_found(&input.trust_store_arn));
+        }
+
+        let mut read: Vec<(crate::state::RevocationContentLocation, String, i64)> = Vec::new();
+        for content in &requested {
+            // `NumberOfRevokedEntries` is a property of the FILE's bytes, so the add cannot
+            // answer without reading the object the request named.
+            let location = crate::state::RevocationContentLocation {
+                bucket: content.s3_bucket.clone().unwrap_or_default(),
+                key: content.s3_key.clone().unwrap_or_default(),
+                version: content.s3_object_version.clone(),
+            };
+            let counted = match crate::state::counted_revoked_entries(ctx, &region, &location).await
+            {
+                Ok(counted) => counted,
+                Err(refusal) => return Err(content_refusal(refusal)),
+            };
+            // "The type of revocation file", whose modelled enum carries one value — so a
+            // file the request named no type for is that type.
+            let revocation_type = content
+                .revocation_type
+                .clone()
+                .unwrap_or_else(|| crate::state::REVOCATION_TYPE_CRL.to_string());
+            read.push((location, revocation_type, counted));
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+        // The clock first, so the trust store this writes to is in the state it is owed at
+        // this instant rather than the one it last answered with.
+        guard.settle(now);
+        let Some(record) = guard.trust_stores.get_mut(&input.trust_store_arn) else {
+            // Released between the two guards: the trust store is gone, which is the same
+            // refusal as never having held it.
+            return Err(not_found(&input.trust_store_arn));
+        };
+
+        // The trust store's own bound, enforced before anything is stored: past it the
+        // emulator answers the modelled quota error and no file is added.
+        if record.revocations.len() + read.len() > crate::state::REVOCATIONS_PER_TRUST_STORE {
+            return Err(
+                AddTrustStoreRevocationsErrorModeled::TooManyTrustStoreRevocationEntriesException(
+                    TooManyTrustStoreRevocationEntriesException {
+                        message: Some(
+                            crate::state::too_many_trust_store_revocation_entries_message(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let added: Vec<TrustStoreRevocation> = read
+            .into_iter()
+            .map(|(location, revocation_type, counted)| {
+                let stored = record.revocations.add(&revocation_type, counted, location);
+                TrustStoreRevocation {
+                    trust_store_arn: Some(record.arn.clone()),
+                    revocation_id: Some(stored.revocation_id),
+                    revocation_type: Some(stored.revocation_type.clone()),
+                    number_of_revoked_entries: Some(stored.number_of_revoked_entries),
+                }
+            })
+            .collect();
+        // "The number of revoked certificates in the trust store" follows the files it now
+        // holds, so a read of the trust store and a read of its revocation files cannot
+        // disagree.
+        record.total_revoked_entries = record.revocations.total_revoked_entries();
+
+        Ok(AddTrustStoreRevocationsOutput {
+            trust_store_revocations: Some(added),
+        })
+    }
+}
+
+/// The modelled refusal for a `TrustStoreArn` this store holds no trust store under, worded
+/// as every refusal about a trust store addressed by ARN is.
+fn not_found(arn: &str) -> AddTrustStoreRevocationsError {
+    AddTrustStoreRevocationsErrorModeled::TrustStoreNotFoundException(TrustStoreNotFoundException {
+        message: Some(crate::state::trust_store_arn_not_found_message(arn)),
+    })
+    .into()
+}
+
+/// The refusal this operation answers a revocation file it could not read with.
+///
+/// The SPLIT is read once in `crate::state` ([`crate::state::counted_revoked_entries`]) —
+/// which read outcome is "the revocation file does not exist" and which is "these bytes are
+/// no revocation list" — and this maps those three onto the errors THIS operation declares.
+/// A read NOTHING answered is neither refusal: no object store is mounted to ask, so this
+/// emulator cannot serve the operation at all and says so rather than blaming the caller's
+/// request or storing a revocation file whose entries were never counted.
+fn content_refusal(refusal: crate::state::RevocationFileRefusal) -> AddTrustStoreRevocationsError {
+    match refusal {
+        crate::state::RevocationFileRefusal::NotFound => {
+            AddTrustStoreRevocationsErrorModeled::RevocationContentNotFoundException(
+                RevocationContentNotFoundException {
+                    message: Some(crate::state::REVOCATION_CONTENT_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
+        crate::state::RevocationFileRefusal::Invalid => {
+            AddTrustStoreRevocationsErrorModeled::InvalidRevocationContentException(
+                InvalidRevocationContentException {
+                    message: Some(crate::state::INVALID_REVOCATION_CONTENT_MESSAGE.to_string()),
+                },
+            )
+            .into()
+        }
+        crate::state::RevocationFileRefusal::Unanswered => {
+            crate::scaffolded::Scaffolded::not_implemented("AddTrustStoreRevocations")
+        }
     }
 }

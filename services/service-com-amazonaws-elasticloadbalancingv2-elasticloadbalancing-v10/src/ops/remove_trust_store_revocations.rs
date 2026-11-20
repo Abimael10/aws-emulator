@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveTrustStoreRevocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveTrustStoreRevocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveTrustStoreRevocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases revocation files from a trust store: the files the request names are removed
+//! from the record the adds wrote on it ([`crate::state::trust_store_revocations`]), ALL or
+//! NOTHING — a request naming one revocation id the trust store holds no file under
+//! releases none of them.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +130,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveTrustStoreRevocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveTrustStoreRevocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveTrustStoreRevocations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("RemoveTrustStoreRevocations")
+        })?;
+        let now = std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // The clock first, so the trust store this writes to is in the state it is owed at
+        // this instant rather than the one it last answered with.
+        guard.settle(now);
+
+        // The removal is ABOUT one trust store, so a `TrustStoreArn` this store holds none
+        // under is the modelled refusal rather than a removal of nothing.
+        let Some(record) = guard.trust_stores.get_mut(&input.trust_store_arn) else {
+            return Err(
+                RemoveTrustStoreRevocationsErrorModeled::TrustStoreNotFoundException(
+                    TrustStoreNotFoundException {
+                        message: Some(crate::state::trust_store_arn_not_found_message(
+                            &input.trust_store_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every id the request named has to name a file this trust store holds BEFORE
+        // anything is released: an unknown id is the modelled refusal, never silently
+        // accepted, and the files named beside it stay in force.
+        if let Some(absent) = record.revocations.first_absent(&input.revocation_ids) {
+            return Err(
+                RemoveTrustStoreRevocationsErrorModeled::RevocationIdNotFoundException(
+                    RevocationIdNotFoundException {
+                        message: Some(crate::state::revocation_id_not_found_message(absent)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        record.revocations.remove(&input.revocation_ids);
+        // "The number of revoked certificates in the trust store" follows the files it
+        // still holds, so what this released stops being counted.
+        record.total_revoked_entries = record.revocations.total_revoked_entries();
+
+        Ok(RemoveTrustStoreRevocationsOutput {})
     }
 }

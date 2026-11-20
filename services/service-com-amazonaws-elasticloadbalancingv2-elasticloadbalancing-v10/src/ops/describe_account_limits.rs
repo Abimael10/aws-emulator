@@ -267,7 +267,7 @@ const LIMIT_CATALOGUE: &[LimitEntry] = &[
     },
     LimitEntry {
         name: "revocations-per-trust-store",
-        published_max: Some(5),
+        published_max: None,
     },
     LimitEntry {
         name: "revoked-entries-per-trust-store",
@@ -347,7 +347,8 @@ const LIMIT_CATALOGUE: &[LimitEntry] = &[
 /// constants beside it), and `crate::state::CAPACITY_UNITS_PER_LOAD_BALANCER` (the
 /// capacity units of one load balancer, which `ModifyCapacityReservation` refuses to
 /// reserve past with `CapacityUnitsLimitExceededException`, at the same number for every
-/// family).
+/// family), and `crate::state::REVOCATIONS_PER_TRUST_STORE` (`AddTrustStoreRevocations` ->
+/// `TooManyTrustStoreRevocationEntriesException`, per trust store).
 fn enforced_max(name: &str) -> Option<usize> {
     match name {
         "application-load-balancers" | "network-load-balancers" | "gateway-load-balancers" => {
@@ -369,6 +370,7 @@ fn enforced_max(name: &str) -> Option<usize> {
         "listeners-per-application-load-balancer" | "listeners-per-network-load-balancer" => {
             Some(crate::state::LISTENERS_PER_LOAD_BALANCER)
         }
+        "revocations-per-trust-store" => Some(crate::state::REVOCATIONS_PER_TRUST_STORE),
         _ => None,
     }
 }

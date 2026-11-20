@@ -53,10 +53,12 @@ rustls = { workspace = true }
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
 # Decodes the DER inside one PEM block of a trust store's CA certificates bundle as an X.509
-# certificate, which is what makes `TrustStore$NumberOfCaCertificates` a count of
-# certificates a parser accepted rather than of markers in the text
-# (`src/state/ca_certificates_bundle.rs`). The PEM framing is read by `rustls-pemfile`
-# above; this reads the certificate inside it.
+# certificate, and the DER of a revocation file as an X.509 certificate revocation list —
+# which is what makes `TrustStore$NumberOfCaCertificates` a count of certificates a parser
+# accepted and `TrustStoreRevocation$NumberOfRevokedEntries` a count of entries one produced,
+# rather than of markers in the text (`src/state/ca_certificates_bundle.rs`,
+# `src/state/trust_store_revocations.rs`). The PEM framing is read by `rustls-pemfile`
+# above; this reads the certificate, and the revocation list, inside it.
 x509-cert = "0.2"
 serde_json = { workspace = true }
 tracing = { workspace = true }

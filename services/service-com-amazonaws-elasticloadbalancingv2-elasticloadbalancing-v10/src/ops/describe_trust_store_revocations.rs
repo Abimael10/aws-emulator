@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTrustStoreRevocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTrustStoreRevocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTrustStoreRevocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the revocation files in force in a trust store, from the record each add wrote
+//! on it ([`crate::state::trust_store_revocations`]), narrowed to the revocation ids the
+//! request named and paged the way every read of this service pages.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTrustStoreRevocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTrustStoreRevocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTrustStoreRevocations"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // Only reachable on an engine that is not the shared `InMemoryEngine`,
+            // which this service has no store on — so nothing is implemented for it.
+            crate::scaffolded::Scaffolded::not_implemented("DescribeTrustStoreRevocations")
+        })?;
+        let now = std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+        // Reporting only: the one write here materializes the `CREATING` -> `ACTIVE`
+        // move the clock already owed every stored trust store.
+        guard.settle(now);
+
+        // The read is ABOUT one trust store, so a `TrustStoreArn` this store holds none
+        // under is the modelled refusal rather than an empty collection.
+        let Some(record) = guard.trust_stores.get(&input.trust_store_arn) else {
+            return Err(
+                DescribeTrustStoreRevocationsErrorModeled::TrustStoreNotFoundException(
+                    TrustStoreNotFoundException {
+                        message: Some(crate::state::trust_store_arn_not_found_message(
+                            &input.trust_store_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "The revocation IDs of the revocation files you want to describe": a request that
+        // names none describes every file the trust store holds, and one that names an id
+        // the trust store holds no file under is the modelled refusal rather than a page
+        // missing that entry.
+        let selected: Vec<crate::state::TrustStoreRevocationRecord> =
+            match input.revocation_ids.as_deref() {
+                None | Some([]) => record.revocations.entries().to_vec(),
+                Some(named) => {
+                    if let Some(absent) = record.revocations.first_absent(named) {
+                        return Err(revocation_id_not_found(absent));
+                    }
+                    record
+                        .revocations
+                        .entries()
+                        .iter()
+                        .filter(|entry| named.contains(&entry.revocation_id))
+                        .cloned()
+                        .collect()
+                }
+            };
+
+        let (page, next_marker) = crate::state::paginate(
+            selected,
+            input.marker.as_deref(),
+            input.page_size,
+            &guard.page_token_key(),
+            crate::state::PagedCollection::TrustStoreRevocations,
+        )
+        .map_err(|_| {
+            crate::scaffolded::Scaffolded::validation_error(crate::state::invalid_marker_message(
+                input.marker.as_deref(),
+            ))
+        })?;
+
+        Ok(DescribeTrustStoreRevocationsOutput {
+            trust_store_revocations: Some(
+                page.into_iter()
+                    .map(|entry| DescribeTrustStoreRevocation {
+                        trust_store_arn: Some(input.trust_store_arn.clone()),
+                        revocation_id: Some(entry.revocation_id),
+                        revocation_type: Some(entry.revocation_type),
+                        number_of_revoked_entries: Some(entry.number_of_revoked_entries),
+                    })
+                    .collect(),
+            ),
+            next_marker,
+        })
     }
+}
+
+/// The modelled refusal for a `RevocationId` the trust store holds no revocation file
+/// under, worded as every not-found refusal of this surface is.
+fn revocation_id_not_found(revocation_id: i64) -> DescribeTrustStoreRevocationsError {
+    DescribeTrustStoreRevocationsErrorModeled::RevocationIdNotFoundException(
+        RevocationIdNotFoundException {
+            message: Some(crate::state::revocation_id_not_found_message(revocation_id)),
+        },
+    )
+    .into()
 }

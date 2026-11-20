@@ -113,6 +113,10 @@ pub(crate) fn seed_trust_store(
         // reads the address back.
         ca_certificates_bundle: None,
         total_revoked_entries: seed.revoked,
+        // The revocation files a trust store holds. A seeded record holds none: a file is
+        // added through `AddTrustStoreRevocations`, which reads the list out of an object
+        // staged in Amazon S3 (`all/trust_store_revocations.rs`).
+        revocations: Default::default(),
         tags: seed
             .tags
             .iter()

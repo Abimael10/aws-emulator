@@ -154,6 +154,19 @@ pub use trust_stores::{
     trust_store_name_not_found_message, EMPTY_RESOURCE_POLICY, TRUST_STORE_QUOTA,
 };
 
+/// The revocation files in force in a trust store: the Amazon S3 object an add names, what
+/// reading it established, and the address a later read of its content hands back.
+pub mod trust_store_revocations;
+
+pub use trust_store_revocations::{
+    counted_revoked_entries, one_revocation_content_per_call_message, resolve_revocation_file,
+    revocation_content_uri, revocation_id_not_found_message, revoked_entries_in,
+    too_many_trust_store_revocation_entries_message, RevocationContentLocation, RevocationFile,
+    RevocationFileRefusal, RevocationList, TrustStoreRevocationRecord,
+    INVALID_REVOCATION_CONTENT_MESSAGE, REVOCATIONS_PER_TRUST_STORE,
+    REVOCATION_CONTENTS_PER_CALL, REVOCATION_CONTENT_NOT_FOUND_MESSAGE, REVOCATION_TYPE_CRL,
+};
+
 /// Where a trust store's CA certificates come from: the Amazon S3 object a create or a
 /// modification names, and what reading it established.
 pub mod ca_certificates_bundle;
@@ -3497,11 +3510,17 @@ pub struct TrustStoreRecord {
     /// modification that rotates the bundle leaves it. `None` for a record no bundle
     /// address was stored with.
     pub ca_certificates_bundle: Option<CaCertificatesBundleLocation>,
-    /// How many revoked certificates the trust store's revocation lists hold. Written
-    /// by `AddTrustStoreRevocations`/`RemoveTrustStoreRevocations`, both still scaffold
-    /// stubs, so the shape is read off this field rather than restated: it follows the
-    /// store the day a revocation can be added.
+    /// How many revoked certificates the trust store's revocation lists hold: the sum
+    /// over the revocation files below, written whenever one is added or released
+    /// ([`RevocationList::total_revoked_entries`]), so the shape is read off this field
+    /// rather than recomputed per read.
     pub total_revoked_entries: i64,
+    /// The revocation files in force in this trust store, which
+    /// `AddTrustStoreRevocations` writes, `DescribeTrustStoreRevocations` and
+    /// `GetTrustStoreRevocationContent` read and `RemoveTrustStoreRevocations` releases.
+    /// Held on the record, so releasing the trust store releases its revocation files
+    /// with it.
+    pub revocations: RevocationList,
     /// The tags on this trust store, which `DescribeTags` reports. A trust store is a
     /// taggable Elastic Load Balancing resource — `AddTags`/`RemoveTags` both model
     /// `TrustStoreNotFoundException` — so the tags live on the record beside every
