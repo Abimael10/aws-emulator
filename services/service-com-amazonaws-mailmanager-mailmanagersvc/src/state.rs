@@ -11,7 +11,10 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::ops::types::{ArchiveFilters, ArchiveRetention, ExportStatus, SearchStatus, Tag};
+use crate::ops::types::{
+    ArchiveBooleanToEvaluate, ArchiveFilterCondition, ArchiveFilters, ArchiveRetention,
+    ArchiveStringToEvaluate, ExportStatus, Row, SearchStatus, Tag,
+};
 
 /// The two `ArchiveState` values this service's model declares; see
 /// `crate::ops::types::ARCHIVE_STATE_VALUES`, which is generated from the model's
@@ -481,6 +484,178 @@ impl ExportJobRecord {
     }
 }
 
+/// The one `ArchiveStringOperator` value the model declares; see
+/// `crate::ops::types::ARCHIVE_STRING_OPERATOR_VALUES`, generated from that enum.
+pub const ARCHIVE_STRING_OPERATOR_CONTAINS: &str = "CONTAINS";
+
+/// One of the six `ArchiveStringEmailAttribute` values the model declares; see
+/// `crate::ops::types::ARCHIVE_STRING_EMAIL_ATTRIBUTE_VALUES`, generated from that enum.
+/// The six of them are what a string filter condition can be evaluated over.
+pub const ARCHIVE_STRING_ATTRIBUTE_TO: &str = "TO";
+/// See [`ARCHIVE_STRING_ATTRIBUTE_TO`].
+pub const ARCHIVE_STRING_ATTRIBUTE_FROM: &str = "FROM";
+/// See [`ARCHIVE_STRING_ATTRIBUTE_TO`].
+pub const ARCHIVE_STRING_ATTRIBUTE_CC: &str = "CC";
+/// See [`ARCHIVE_STRING_ATTRIBUTE_TO`].
+pub const ARCHIVE_STRING_ATTRIBUTE_SUBJECT: &str = "SUBJECT";
+/// See [`ARCHIVE_STRING_ATTRIBUTE_TO`]: read off the SMTP envelope rather than a header.
+pub const ARCHIVE_STRING_ATTRIBUTE_ENVELOPE_FROM: &str = "ENVELOPE_FROM";
+/// See [`ARCHIVE_STRING_ATTRIBUTE_ENVELOPE_FROM`].
+pub const ARCHIVE_STRING_ATTRIBUTE_ENVELOPE_TO: &str = "ENVELOPE_TO";
+
+/// The one `ArchiveBooleanEmailAttribute` value the model declares; see
+/// `crate::ops::types::ARCHIVE_BOOLEAN_EMAIL_ATTRIBUTE_VALUES`.
+pub const ARCHIVE_BOOLEAN_ATTRIBUTE_HAS_ATTACHMENTS: &str = "HAS_ATTACHMENTS";
+
+/// One of the two `ArchiveBooleanOperator` values; see
+/// `crate::ops::types::ARCHIVE_BOOLEAN_OPERATOR_VALUES`.
+pub const ARCHIVE_BOOLEAN_OPERATOR_IS_TRUE: &str = "IS_TRUE";
+/// See [`ARCHIVE_BOOLEAN_OPERATOR_IS_TRUE`]: the other `ArchiveBooleanOperator` value.
+pub const ARCHIVE_BOOLEAN_OPERATOR_IS_FALSE: &str = "IS_FALSE";
+
+/// One stored archived email message: what an archive holds, and what an archive search
+/// over that archive reports one `Row` of.
+///
+/// The two values a search RESOLVES a message by — the archive it was archived into and
+/// the instant it was received — are held beside the metadata rather than read back out of
+/// it, so neither the range match nor the ordering depends on a rendered timestamp. The
+/// rest of the modelled `Row` is carried exactly as it was archived.
+#[derive(Debug, Clone)]
+pub struct ArchivedMessageRecord {
+    pub archived_message_id: String,
+    /// The archive this message lives in. The message is bound to it exactly as a job is
+    /// (see [`SearchJobRecord::archive_id`]): the archive going away takes its messages
+    /// with it.
+    pub archive_id: String,
+    /// When this message was received, in epoch milliseconds: what `Row$ReceivedTimestamp`
+    /// reports, and what a search's `FromTimestamp`..`ToTimestamp` range is matched
+    /// against.
+    pub received_at_millis: i64,
+    /// The message's remaining metadata, as the search reports it. `ArchivedMessageId` and
+    /// `ReceivedTimestamp` are filled from the two members above on the way out, so the
+    /// identity and the instant a reader sees are the ones this record is keyed and
+    /// ordered by.
+    pub metadata: Row,
+}
+
+impl ArchivedMessageRecord {
+    /// This message as the modelled `Row` an archive search reports.
+    pub fn row(&self) -> Row {
+        Row {
+            archived_message_id: Some(self.archived_message_id.clone()),
+            received_timestamp: Some(timestamp(self.received_at_millis)),
+            ..self.metadata.clone()
+        }
+    }
+
+    /// Whether `filters` admit this message.
+    ///
+    /// `ArchiveFilters` carries "the filter conditions for emails to include" and "the
+    /// filter conditions for emails to exclude", so a message is admitted when EVERY
+    /// `Include` condition holds for it and NO `Unless` condition does. Filters a search
+    /// was started without admit every message of the archive.
+    pub fn admitted_by(&self, filters: Option<&ArchiveFilters>) -> bool {
+        let Some(filters) = filters else {
+            return true;
+        };
+        let included = filters
+            .include
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .all(|condition| self.matches(condition));
+        let excluded = filters
+            .unless
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|condition| self.matches(condition));
+        included && !excluded
+    }
+
+    /// Whether one filter condition holds for this message.
+    ///
+    /// A string condition holds when one of the attribute's values CONTAINS one of the
+    /// strings the condition lists, compared without regard to case: an address's domain is
+    /// a DNS name, which is case-insensitive, and a header's text is matched the way a mail
+    /// client searches it — the same case-folding this store applies to an address-list
+    /// member (see [`member_address_key`]). A boolean condition holds when the attribute's
+    /// flag has the asserted value. An operator or attribute outside what the model declares
+    /// holds for no message, so a condition this service cannot evaluate admits nothing
+    /// rather than everything.
+    fn matches(&self, condition: &ArchiveFilterCondition) -> bool {
+        match condition {
+            ArchiveFilterCondition::StringExpression(expression) => {
+                if expression.operator != ARCHIVE_STRING_OPERATOR_CONTAINS {
+                    return false;
+                }
+                let ArchiveStringToEvaluate::Attribute(attribute) = &expression.evaluate;
+                let evaluated = self.string_values(attribute);
+                expression.values.iter().any(|wanted| {
+                    let wanted = wanted.to_lowercase();
+                    evaluated
+                        .iter()
+                        .any(|value| value.to_lowercase().contains(&wanted))
+                })
+            }
+            ArchiveFilterCondition::BooleanExpression(expression) => {
+                let ArchiveBooleanToEvaluate::Attribute(attribute) = &expression.evaluate;
+                if attribute != ARCHIVE_BOOLEAN_ATTRIBUTE_HAS_ATTACHMENTS {
+                    return false;
+                }
+                // "A flag indicating if the email has attachments": a message archived
+                // without the flag carries none.
+                let has_attachments = self.metadata.has_attachments.unwrap_or(false);
+                match expression.operator.as_str() {
+                    ARCHIVE_BOOLEAN_OPERATOR_IS_TRUE => has_attachments,
+                    ARCHIVE_BOOLEAN_OPERATOR_IS_FALSE => !has_attachments,
+                    _ => false,
+                }
+            }
+        }
+    }
+
+    /// The values a string condition over `attribute` evaluates, where `attribute` is one of
+    /// `crate::ops::types::ARCHIVE_STRING_EMAIL_ATTRIBUTE_VALUES` (generated from the
+    /// model's `ArchiveStringEmailAttribute` enum).
+    ///
+    /// The envelope attributes read the SMTP envelope rather than the headers, and the
+    /// envelope carries every recipient, so `ENVELOPE_TO` evaluates each of them. An
+    /// attribute this message does not carry evaluates nothing, so no condition over it
+    /// holds.
+    fn string_values(&self, attribute: &str) -> Vec<&str> {
+        let envelope = self.metadata.envelope.as_ref();
+        let header = match attribute {
+            ARCHIVE_STRING_ATTRIBUTE_TO => self.metadata.to.as_deref(),
+            ARCHIVE_STRING_ATTRIBUTE_FROM => self.metadata.from.as_deref(),
+            ARCHIVE_STRING_ATTRIBUTE_CC => self.metadata.cc.as_deref(),
+            ARCHIVE_STRING_ATTRIBUTE_SUBJECT => self.metadata.subject.as_deref(),
+            ARCHIVE_STRING_ATTRIBUTE_ENVELOPE_FROM => {
+                envelope.and_then(|envelope| envelope.from.as_deref())
+            }
+            ARCHIVE_STRING_ATTRIBUTE_ENVELOPE_TO => {
+                return envelope
+                    .and_then(|envelope| envelope.to.as_deref())
+                    .unwrap_or_default()
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            }
+            _ => None,
+        };
+        header.into_iter().collect()
+    }
+}
+
+/// How `GetArchiveSearchResults` words the refusal of a search job that has not completed.
+///
+/// The operation "returns the results of a COMPLETED email archive search job", so a job
+/// still on its way to [`SEARCH_STATE_COMPLETED`] has no results to report and the request
+/// conflicts with the state the job is in — the modelled `ConflictException` ("The request
+/// configuration has conflicts", `@httpError 409`). The text is entirely fixed and echoes
+/// no id back.
+pub const SEARCH_NOT_COMPLETED: &str = "Search is not completed yet.";
+
 /// How `GetArchiveSearch` words the refusal of a `SearchId` that resolves to no search job
 /// this store serves — one that was never minted, and one whose archive is gone or no
 /// longer [`ARCHIVE_STATE_ACTIVE`].
@@ -555,6 +730,15 @@ pub struct ComAmazonawsMailmanagerMailmanagersvcState {
     /// which no export has been started has none, which is a listing of zero jobs and not a
     /// failure.
     pub archive_exports: BTreeMap<String, ExportJobRecord>,
+    /// Archived email messages by `ArchivedMessageId`, across every archive — what an
+    /// archive search searches.
+    ///
+    /// Ordered and keyed exactly as [`Self::archive_searches`] is, and written by mail
+    /// ARRIVING in an archive, which no operation this crate serves does yet: an archive
+    /// nothing has been archived into holds none, which is a search that matches zero
+    /// messages and not a failure. Bounded by the archives it belongs to: a message of a
+    /// permanently deleted archive goes with it.
+    pub archived_messages: BTreeMap<String, ArchivedMessageRecord>,
     /// The secret THIS store's pagination tokens are authenticated under; see
     /// [`encode_page_token`].
     pub page_token_key: PageTokenKey,
@@ -600,6 +784,11 @@ impl ComAmazonawsMailmanagerMailmanagersvcState {
             .retain(|_, job| live.contains(&job.archive_id));
         self.archive_exports
             .retain(|_, job| live.contains(&job.archive_id));
+        // "The archive and all of its contents will be permanently deleted": the mail the
+        // archive held goes with it, so a search can never report a message of an archive
+        // that is gone.
+        self.archived_messages
+            .retain(|_, message| live.contains(&message.archive_id));
     }
 
     /// Whether this store serves archive-scoped job operations (an archive search, an
@@ -647,6 +836,56 @@ impl ComAmazonawsMailmanagerMailmanagersvcState {
     pub fn mint_import_job_id(&mut self, now_millis: i64) -> String {
         self.import_job_sequence = self.import_job_sequence.wrapping_add(1);
         mint_id(self.import_job_sequence, now_millis)
+    }
+
+    /// The search job `search_id` names, if this store still serves it.
+    ///
+    /// Shared by the two search reads, so one `SearchId` resolves the same way for both: a
+    /// job of an archive that is gone, or one no longer [`ARCHIVE_STATE_ACTIVE`], is no
+    /// longer reachable and is reported exactly as one that was never minted (see
+    /// [`SEARCH_ID_INVALID`]).
+    pub fn resolve_search_job(&self, search_id: &str) -> Option<&SearchJobRecord> {
+        self.archive_searches
+            .get(search_id)
+            .filter(|job| self.check_archive_for_job(&job.archive_id).is_ok())
+    }
+
+    /// The rows a COMPLETED archive search reports: the messages of the archive it searched
+    /// whose received instant is inside the job's range and which the job's filters admit,
+    /// most recently received first, capped at the job's `MaxResults`.
+    ///
+    /// Computed from the store on every read rather than frozen when the job completed:
+    /// the two are the same answer, because a message is archived by mail arriving and the
+    /// range a job searches is fixed when it is submitted.
+    ///
+    /// The ORDER is CHOSEN — the model publishes none — but it is total: two messages
+    /// received in the same millisecond are ordered by their id, so one job reports one
+    /// stable sequence of rows and the cap always drops the same messages.
+    pub fn search_rows(&self, job: &SearchJobRecord) -> Vec<Row> {
+        // A bound this emulator cannot represent as an instant cannot exclude anything:
+        // such a range is read as open at that end.
+        let from = job.from_timestamp.to_millis().unwrap_or(i64::MIN);
+        let to = job.to_timestamp.to_millis().unwrap_or(i64::MAX);
+        let mut matching: Vec<&ArchivedMessageRecord> = self
+            .archived_messages
+            .values()
+            .filter(|message| {
+                message.archive_id == job.archive_id
+                    && (from..=to).contains(&message.received_at_millis)
+                    && message.admitted_by(job.filters.as_ref())
+            })
+            .collect();
+        matching.sort_by(|left, right| {
+            right
+                .received_at_millis
+                .cmp(&left.received_at_millis)
+                .then_with(|| left.archived_message_id.cmp(&right.archived_message_id))
+        });
+        matching
+            .into_iter()
+            .take(usize::try_from(job.max_results).unwrap_or(0))
+            .map(ArchivedMessageRecord::row)
+            .collect()
     }
 
     /// Mint a fresh `SearchId`, the same way [`Self::mint_archive_id`] mints an archive id:
