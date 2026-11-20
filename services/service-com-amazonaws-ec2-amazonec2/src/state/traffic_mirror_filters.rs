@@ -99,6 +99,35 @@ pub fn traffic_mirror_filter_limit_exceeded<E>(message: impl Into<String>) -> Sc
     Scaffolded::service_error(TRAFFIC_MIRROR_FILTER_LIMIT_EXCEEDED, 400, message)
 }
 
+/// Is `allowed` the `TrafficMirrorNetworkService` catalog — the value set the model declares
+/// for the network services a Traffic Mirror filter can mirror
+/// (`crate::ops::types::TRAFFIC_MIRROR_NETWORK_SERVICE_VALUES`)?
+///
+/// Keyed to the TYPE's value set, the way every catalog-keyed refusal of this crate is
+/// ([`super::is_modelled_catalog`] records that rule), so every member of this model that names
+/// a mirrored network service is refused an unpublished one in the same words.
+pub fn is_traffic_mirror_network_service_catalog(allowed: &[String]) -> bool {
+    super::is_modelled_catalog(
+        allowed,
+        crate::ops::types::TRAFFIC_MIRROR_NETWORK_SERVICE_VALUES,
+    )
+}
+
+/// How EC2 states a network service the catalog does not hold: HTTP 400
+/// `InvalidParameterValue`, "'`<value>`' is not a valid network service".
+///
+/// RECORDED: EC2 does not state this refusal as the generic validation clause, and it names
+/// neither the parameter nor the catalog — only the value it could not read, which is the one
+/// part of the sentence built from the request. That echo is bounded the way every refusal of
+/// this crate bounds a value the caller chose the length of, so echoing it cannot amplify a
+/// request into an arbitrarily long response.
+pub fn traffic_mirror_network_service_refusal_message(value: &str) -> String {
+    format!(
+        "'{value}' is not a valid network service",
+        value = super::echoed_resource_id(value),
+    )
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// Whether another Traffic Mirror filter fits inside the store's ceiling
     /// ([`MAX_TRAFFIC_MIRROR_FILTERS`]).
@@ -172,6 +201,54 @@ impl ComAmazonawsEc2Amazonec2State {
         // filter's own ([`Self::release_traffic_mirror_filter_rules`]).
         self.release_traffic_mirror_filter_rules(&filter);
         Some(filter)
+    }
+
+    /// Add `add` to and remove `remove` from the network services of the filter
+    /// `traffic_mirror_filter_id` names, and answer the record as it now stands — `None` when
+    /// the store holds no such filter.
+    ///
+    /// The ONE way a filter's network services change, so the set a reader reports is the set
+    /// a write left behind. The member is a SET of modelled enum members
+    /// (`TrafficMirrorFilter$NetworkServices`), so naming a service twice, or naming one the
+    /// filter already mirrors, leaves one entry and no second copy, and the set is held in the
+    /// order the modelled `TrafficMirrorNetworkService` enum declares its members
+    /// ([`crate::ops::types::TRAFFIC_MIRROR_NETWORK_SERVICE_VALUES`]) rather than in the order
+    /// one request happened to list them. Removals are applied before additions, so a service
+    /// a single request both adds and removes is mirrored afterwards: "Use AddNetworkServices
+    /// to add network services to a Traffic Mirror filter … use RemoveNetworkServices to
+    /// remove the network services" (`ModifyTrafficMirrorFilterNetworkServices`) leaves the
+    /// combination undefined, and this is the one reading of it every caller gets.
+    ///
+    /// Nothing is charged against the store's byte budget: every member of this set is drawn
+    /// from a modelled enum, which is bounded already and so uncounted by
+    /// [`traffic_mirror_filter_payload_bytes`].
+    pub fn modify_traffic_mirror_filter_network_services(
+        &mut self,
+        traffic_mirror_filter_id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> Option<TrafficMirrorFilter> {
+        let filter = self.traffic_mirror_filters.get_mut(traffic_mirror_filter_id)?;
+        let mut network_services: std::collections::BTreeSet<String> = filter
+            .network_services
+            .take()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for network_service in remove {
+            network_services.remove(network_service);
+        }
+        for network_service in add {
+            network_services.insert(network_service.clone());
+        }
+        filter.network_services = Some(
+            crate::ops::types::TRAFFIC_MIRROR_NETWORK_SERVICE_VALUES
+                .iter()
+                .filter(|declared| network_services.contains(**declared))
+                .map(|declared| (*declared).to_string())
+                .collect(),
+        );
+        Some(filter.clone())
     }
 
     /// The ids of the Traffic Mirror sessions that mirror through the filter

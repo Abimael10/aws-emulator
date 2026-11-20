@@ -155,6 +155,11 @@ fn nonexistent_instance_types(
 /// a launch, a Spot Instance request, a Spot Fleet pool and a launch template's own data are
 /// each refused an unpublished type identically.
 ///
+/// A network service outside the `TrafficMirrorNetworkService` catalog is the next: EC2 answers
+/// its own `InvalidParameterValue` naming the value it could not read
+/// ([`crate::state::traffic_mirror_network_service_refusal_message`]), which is the sentence the
+/// handler that resolves those members answers with, so the two cannot disagree.
+///
 /// A `MaxResults` below the smallest page the operation publishes is the other refusal this
 /// service states: EC2 answers its own code and sentence for it, naming the value and the
 /// bound ([`crate::state::max_results_refusal`]). It is keyed on the member the constraint
@@ -340,6 +345,24 @@ pub(super) fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation)
             Some(Refused {
                 code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
                 message: crate::state::instance_bandwidth_weighting_refusal_message(
+                    violation.value.as_deref().unwrap_or_default(),
+                ),
+            })
+        }
+        ViolationKind::EnumValue(allowed)
+            if crate::state::is_traffic_mirror_network_service_catalog(allowed) =>
+        {
+            // A network service outside the `TrafficMirrorNetworkService` catalog is EC2's own
+            // `InvalidParameterValue` rather than a validation clause, in the sentence EC2
+            // words for that parameter type
+            // ([`crate::state::traffic_mirror_network_service_refusal_message`], which the
+            // handler that resolves those members answers with too, so a caller reads one
+            // wording whichever side of dispatch refused the value). The value it names is
+            // already elided to the framework's `MAX_ECHOED_VALUE`, so echoing it cannot
+            // amplify a request into an arbitrarily long response.
+            Some(Refused {
+                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
+                message: crate::state::traffic_mirror_network_service_refusal_message(
                     violation.value.as_deref().unwrap_or_default(),
                 ),
             })

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyTrafficMirrorFilterNetworkServices
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyTrafficMirrorFilterNetworkServices`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyTrafficMirrorFilterNetworkServices::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Allows or restricts the network services a Traffic Mirror filter mirrors: this is the one
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +138,110 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyTrafficMirrorFilterNetworkServices` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyTrafficMirrorFilterNetworkServicesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — a Traffic
+        // Mirror filter is named by an id that is unique across this store, and the modelled
+        // `TrafficMirrorFilter` names neither a Region nor an ARN. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+
+        // Every member of the REQUEST is read before the store is asked anything, so a
+        // request with two faults is refused for the first of them whatever the store holds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyTrafficMirrorFilterNetworkServices"))
+        // "The ID of the Traffic Mirror filter" (`$TrafficMirrorFilterId`) is `@required` but
+        // modelled `clientOptional`, so a request that left it out reaches this handler as an
+        // empty string rather than being refused at the boundary. The boundary refuses a
+        // request that omits the member in this same sentence; this is the backstop for the
+        // empty string that reaches here instead, worded through the one definition of that
+        // sentence so the two sides of dispatch cannot disagree.
+        if input.traffic_mirror_filter_id.is_empty() {
+            return Err(state::missing_parameter(
+                state::missing_required_parameter_message("TrafficMirrorFilterId"),
+            ));
+        }
+
+        // "The network service, for example Amazon DNS, that you want to mirror"
+        // (`$AddNetworkServices`) and the one "you no longer want to mirror"
+        // (`$RemoveNetworkServices`): both target `TrafficMirrorNetworkServiceList`, whose
+        // member is the modelled `TrafficMirrorNetworkService` enum
+        // ([`TRAFFIC_MIRROR_NETWORK_SERVICE_VALUES`]). The boundary validator refuses a
+        // spelling outside that enum in EC2's own words for the catalog
+        // ([`crate::service::parameter_refusals`]); this is the backstop that keeps a word the
+        // readers would then report out of a stored filter, whatever reaches the handler, and
+        // it words the refusal through the same sentence.
+        let add_network_services =
+            requested_network_services(input.add_network_services.as_deref())?;
+        let remove_network_services =
+            requested_network_services(input.remove_network_services.as_deref())?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+
+        // The named filter is resolved BEFORE anything is written: an id this account holds
+        // no filter for has no network services to allow or restrict, which is the refusal
+        // every other operation of this service answers for an unknown Traffic Mirror filter
+        // id.
+        if !store
+            .traffic_mirror_filters
+            .contains_key(&input.traffic_mirror_filter_id)
+        {
+            return Err(state::invalid_traffic_mirror_filter_id_not_found(
+                &input.traffic_mirror_filter_id,
+            ));
+        }
+
+        // DryRun sits AFTER every parameter has been read and the named filter resolved, and
+        // BEFORE the write: the flag asks whether the request WOULD have succeeded, so one
+        // that would have been refused is refused with that reason instead, and one that
+        // would have succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The write itself, onto the record every reader of this filter reads, through the
+        // one path that changes the set — so what this call reports is what a later
+        // `DescribeTrafficMirrorFilters` reports.
+        let Some(traffic_mirror_filter) = store.modify_traffic_mirror_filter_network_services(
+            &input.traffic_mirror_filter_id,
+            &add_network_services,
+            &remove_network_services,
+        ) else {
+            return Err(state::internal_error(format!(
+                "the Traffic Mirror filter '{filter_id}' resolved a moment ago is not in the \
+                 store any more",
+                filter_id = input.traffic_mirror_filter_id,
+            )));
+        };
+
+        // "The Traffic Mirror filter that the network service is associated with"
+        // (`$TrafficMirrorFilter`): the stored record, as the store now holds it.
+        Ok(ModifyTrafficMirrorFilterNetworkServicesOutput {
+            traffic_mirror_filter: Some(traffic_mirror_filter),
+        })
     }
+}
+
+/// `requested` as the network services one list member of this request names, or the refusal
+/// the request earns: EC2's `InvalidParameterValue` for a word the modelled
+/// `TrafficMirrorNetworkService` enum does not carry.
+///
+/// Both list members are read through it, so neither can be refused for a different fault
+/// than the other. A request that named no list at all names no network service, which is the
+/// empty list rather than a fault: the operation then reports the filter it resolved with its
+/// set unchanged. The sentence is the ONE this service words a value outside that catalog with
+/// ([`crate::state::traffic_mirror_network_service_refusal_message`]) — the same one the
+/// boundary's own refusal carries, so the two cannot disagree.
+fn requested_network_services(
+    requested: Option<&[String]>,
+) -> Result<Vec<String>, ModifyTrafficMirrorFilterNetworkServicesError> {
+    let requested = requested.unwrap_or_default();
+    for network_service in requested {
+        if !TRAFFIC_MIRROR_NETWORK_SERVICE_VALUES.contains(&network_service.as_str()) {
+            return Err(crate::state::invalid_parameter_value(
+                crate::state::traffic_mirror_network_service_refusal_message(network_service),
+            ));
+        }
+    }
+    Ok(requested.to_vec())
 }
