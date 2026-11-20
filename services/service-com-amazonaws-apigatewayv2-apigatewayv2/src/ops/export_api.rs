@@ -15,13 +15,14 @@
 //!
 //! The document is the INVERSE of the definition this service already reads
 //! ([`super::import_api::parse_definition`]): `info` carries the api's name, description
-//! and version, `paths` one operation per route, and — unless `IncludeExtensions` turns
-//! them off — the API Gateway extensions that reader reads back (the integration behind
-//! each route, the api's CORS configuration and its endpoint configuration). Every value
-//! comes from the store, so an exported definition re-imported describes the same api.
-//! What the reader does not read is not written into it: an api's tags and its
-//! authorizers are reported by the operations that own them, never invented into a
-//! document nothing could read back.
+//! and version, `servers` the one address the configuration is called at, `paths` one
+//! operation per route, and — unless `IncludeExtensions` turns them off — the API Gateway
+//! extensions that describe what no standard OpenAPI member can (the integration behind
+//! each route, the api's CORS configuration, its endpoint configuration, its tag set and
+//! the import/export algorithm version the document was written under). Every value comes
+//! from the store, so an exported definition states the api a later reader reports. An
+//! api's authorizers are reported by the operations that own them and are written into no
+//! document here.
 //!
 //! ## Shape of an operation
 //!
@@ -317,6 +318,38 @@ const LATEST_EXPORT_VERSION: &str = "1.0";
 /// `/v2/apis/{ApiId}/exports/{Specification}`, in the plural that gate's sentence takes.
 const EXPORT_RESOURCE_PLURAL: &str = "Exports";
 
+/// The Server Variable an exported document templates its one server url's BASE PATH with.
+///
+/// The url names the api's endpoint, under which "The stage name is typically appended to
+/// this URI to form a complete path to a deployed API stage" (`Api$ApiEndpoint`), so the
+/// segment that varies between what the api serves at its root and what a named stage
+/// serves is a VARIABLE of the Server Object rather than a value baked into the url: a
+/// reader of the document substitutes it to reach the configuration being exported.
+const BASE_PATH_VARIABLE: &str = "basePath";
+
+/// The key a Server Variable Object states its value under, from the OpenAPI Server
+/// Variable Object (`default`, the one member it requires).
+const VARIABLE_DEFAULT: &str = "default";
+
+/// The root member an exported definition states the api's TAG SET under: the OpenAPI
+/// document's own `tags` array, one entry per tag the api carries.
+const TAGS_MEMBER: &str = "tags";
+
+/// The member of one `tags` entry that names the tag's KEY, from the OpenAPI Tag Object
+/// (`name`, the one member it requires).
+const TAG_NAME: &str = "name";
+
+/// The API Gateway extension one `tags` entry carries the tag's VALUE under: an OpenAPI Tag
+/// Object has no member for a value, so a `(key, value)` tag of this service travels as the
+/// entry's `name` plus this extension — the one spelling a definition states an api's tags
+/// in.
+const TAG_VALUE_EXTENSION: &str = "x-amazon-apigateway-tag-value";
+
+/// The extension an exported definition declares the IMPORT/EXPORT ALGORITHM VERSION under,
+/// so a reader of the document can tell which algorithm wrote it. Its value is
+/// [`LATEST_EXPORT_VERSION`], the one version this service exports under.
+const IMPORTEXPORT_VERSION_EXTENSION: &str = "x-amazon-apigateway-importexport-version";
+
 /// The key of the Response Object an exported operation declares. An HTTP api's route
 /// holds no response resource of its own — route responses and integration responses are
 /// WebSocket-only children — while the OpenAPI Operation Object requires a `responses`
@@ -361,6 +394,16 @@ fn exported_document(
         Value::Array(vec![Value::Object(server_object(api, stage_name))]),
     );
     if include_extensions {
+        // The algorithm this document was written by, which every exported definition
+        // declares: a reader branches on it rather than guessing which extensions the
+        // document can carry.
+        document.insert(
+            IMPORTEXPORT_VERSION_EXTENSION.to_string(),
+            Value::String(LATEST_EXPORT_VERSION.to_string()),
+        );
+        if let Some(tags) = tags_array(&api.tags) {
+            document.insert(TAGS_MEMBER.to_string(), tags);
+        }
         if let Some(cors) = &api.cors_configuration {
             document.insert(
                 super::import_api::CORS_EXTENSION.to_string(),
@@ -390,8 +433,9 @@ fn exported_document(
 ///
 /// `title` is the api's `Name` and `description` its `Description` — the two members this
 /// service's definition reader takes out of `info` — and `version` is the api's `Version`
-/// when it carries one. The Info Object REQUIRES a version, so an api that carries none
-/// states its own creation instant there: a value the record already holds, so two
+/// when it carries one, so a document always states the version a later reader of the api
+/// reports. The Info Object REQUIRES a version, so an api that carries none states its own
+/// creation instant there ([`created_instant`]): a value the record already holds, so two
 /// exports of an unchanged api carry the same one.
 fn info_object(api: &crate::state::Api) -> Value {
     let mut info = Map::new();
@@ -417,34 +461,95 @@ fn info_object(api: &crate::state::Api) -> Value {
 /// this export declares itself to be.
 const LAST_RESORT_INFO_VERSION: &str = "1.0";
 
-/// One instant as a document states it: the `date-time` of RFC 3339, the form every
-/// timestamp this service reports carries. `None` for an instant that has no such
-/// rendering, so a version is never stated as the empty string.
+/// One instant as an exported definition STATES a version: the date and the time of day it
+/// names, to the second, followed by the zone that time of day is stated in
+/// ([`EXPORTED_VERSION_ZONE`]) — `2024-07-01 09:30:15UTC`. It identifies the definition
+/// rather than timing it, so it carries no sub-second part.
+///
+/// This is the form API Gateway v2 states an exported version in, and it is NOT the RFC
+/// 3339 form a REST API's export states one in (the sibling exporter's `document_version`),
+/// so the two exports of this tree state their fallback version differently on purpose.
+///
+/// Derived from the one RFC 3339 rendering this service states every timestamp in, so the
+/// instant stated here and the api's own `CreatedDate` are the same instant read the same
+/// way. `None` for an instant with no such rendering, so a version is never stated as the
+/// empty string.
 fn created_instant(at: ::std::time::SystemTime) -> Option<String> {
-    crate::state::to_timestamp(at)
+    let rendered = crate::state::to_timestamp(at)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .ok()
-        .filter(|rendered| !rendered.is_empty())
+        .ok()?;
+    // `YYYY-MM-DDThh:mm:ss[.fraction]Z`: the date, then the time of day up to the
+    // sub-second part or the zone designator, whichever ends it.
+    let (date, after_date) = rendered.split_once('T')?;
+    let time = after_date.split(['.', 'Z']).next()?;
+    if date.is_empty() || time.is_empty() {
+        return None;
+    }
+    Some(format!("{date} {time}{EXPORTED_VERSION_ZONE}"))
 }
 
-/// The document's one Server Object: the address the exported configuration is CALLED at.
+/// The zone an exported version's time of day is stated in, named after it: every instant
+/// this service holds is UTC.
+const EXPORTED_VERSION_ZONE: &str = "UTC";
+
+/// The document's one Server Object: the address the exported configuration is CALLED at,
+/// templated by the base path it is served under.
 ///
-/// "The stage name is typically appended to this URI to form a complete path to a deployed
-/// API stage" (`Api$ApiEndpoint`), so a named stage's export is served under its name,
-/// while the stage that serves the api's root ([`crate::state::DEFAULT_STAGE_NAME`]) is
-/// reached with no stage segment at all. The path of this url is also the base path this
-/// service's own definition reader takes out of `servers`, so an export re-imported under
-/// `prepend` carries the paths it was served under.
+/// The url is the api's own endpoint followed by the [`BASE_PATH_VARIABLE`] template, and
+/// that variable's default is the base path THIS export is of: "The stage name is typically
+/// appended to this URI to form a complete path to a deployed API stage"
+/// (`Api$ApiEndpoint`), so a named stage's export carries its name there, while the stage
+/// that serves the api's root ([`crate::state::DEFAULT_STAGE_NAME`]) and the api's latest
+/// configuration — which no stage name selects — are reached with no stage segment at all
+/// and carry an empty one. Substituting the variable therefore yields the address the
+/// exported configuration answers on, whichever of the two it describes.
 fn server_object(api: &crate::state::Api, stage_name: Option<&str>) -> Map<String, Value> {
-    let url = match stage_name {
-        Some(stage_name) if stage_name != crate::state::DEFAULT_STAGE_NAME => {
-            format!("{}/{stage_name}", api.api_endpoint)
-        }
-        _ => api.api_endpoint.clone(),
+    let base_path = match stage_name {
+        Some(stage_name) if stage_name != crate::state::DEFAULT_STAGE_NAME => stage_name,
+        _ => "",
     };
+    let mut variable = Map::new();
+    variable.insert(
+        VARIABLE_DEFAULT.to_string(),
+        Value::String(base_path.to_string()),
+    );
+    let mut variables = Map::new();
+    variables.insert(BASE_PATH_VARIABLE.to_string(), Value::Object(variable));
     let mut server = Map::new();
-    server.insert("url".to_string(), Value::String(url));
+    server.insert(
+        "url".to_string(),
+        Value::String(format!(
+            "{}/{{{BASE_PATH_VARIABLE}}}",
+            api.api_endpoint.trim_end_matches('/')
+        )),
+    );
+    server.insert("variables".to_string(), Value::Object(variables));
     server
+}
+
+/// The api's tag set as the document's root `tags` array: one entry per tag, naming the
+/// tag's KEY under [`TAG_NAME`] and carrying its VALUE under [`TAG_VALUE_EXTENSION`].
+///
+/// In the order the store holds the tags, so two exports of one api carry one array.
+/// `None` for an api carrying no tag at all: there is no entry to state, and a document
+/// stating an empty array would say the api has a tag set rather than no tags.
+fn tags_array(tags: &::std::collections::BTreeMap<String, String>) -> Option<Value> {
+    if tags.is_empty() {
+        return None;
+    }
+    Some(Value::Array(
+        tags.iter()
+            .map(|(key, value)| {
+                let mut entry = Map::new();
+                entry.insert(TAG_NAME.to_string(), Value::String(key.clone()));
+                entry.insert(
+                    TAG_VALUE_EXTENSION.to_string(),
+                    Value::String(value.clone()),
+                );
+                Value::Object(entry)
+            })
+            .collect(),
+    ))
 }
 
 /// The document's Paths Object: one Path Item per path the configuration's route keys

@@ -21,6 +21,26 @@
 //! exported under the key itself and is the one key this service's own reader does not read
 //! back, which is why it has a test of its own rather than a row of the round-tripped table
 //! — and every value outside the catalogs the operation serves.
+//!
+//! The last three tests assert what the document says about the API ITSELF rather than
+//! about its routes:
+//!
+//! > The one Server Object names the api's own endpoint with the base path TEMPLATED as a
+//! > `basePath` server variable, whose default is the base path the exported configuration
+//! > is served under — a named stage's own name, and nothing for the stage that serves the
+//! > api's root and for the api's latest configuration — so substituting the variable
+//! > yields the address that configuration answers on. With API Gateway extensions
+//! > included, the document also states what no standard OpenAPI member can: the
+//! > import/export algorithm version it was written under, and one `tags` entry per tag the
+//! > api carries, naming the tag's key and carrying its value under the API Gateway
+//! > tag-value extension. And `info.version` is the api's CURRENT `Version` — whatever a
+//! > patch last left there, and a value of the api's own once the member is carried no
+//! > longer.
+//!
+//! Their rows span how many tags an api carries and which characters their keys and values
+//! use, which stage a request names, and how the api's `Version` was last written (set at
+//! the create, patched, and cleared); the `IncludeExtensions` axis of that rule is one more
+//! row set in the extensions test above.
 
 use std::collections::BTreeMap;
 
@@ -103,6 +123,7 @@ fn rows() -> Vec<Row> {
                 "protocolType": "HTTP",
                 "description": "the orders service",
                 "version": "2024-07-01",
+                "tags": { "team": "platform", "env": "test" },
                 "corsConfiguration": {
                     "allowOrigins": ["https://shop.example.com"],
                     "allowMethods": ["GET", "POST"],
@@ -317,6 +338,21 @@ fn served_url(document: &Value) -> String {
         .to_string()
 }
 
+/// The default of the document's one Server Object's `basePath` variable, or `None` when
+/// the document declares no such variable.
+fn served_base_path(document: &Value) -> Option<String> {
+    document
+        .pointer("/servers/0/variables/basePath/default")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The address a reader of the document reaches by substituting the `basePath` variable
+/// into the server url — the invoke address the exported configuration answers on.
+fn resolved_url(document: &Value) -> String {
+    served_url(document).replace("{basePath}", &served_base_path(document).unwrap_or_default())
+}
+
 #[tokio::test]
 async fn an_exported_definition_states_the_apis_configuration() {
     let emulator = emulator();
@@ -359,11 +395,19 @@ async fn an_exported_definition_states_the_apis_configuration() {
             );
         }
 
-        // The server the exported configuration is called at is the api's own endpoint.
+        // The server the exported configuration is called at is the api's own endpoint,
+        // with the base path it is served under left as a substitutable variable.
         assert_eq!(
             served_url(&document),
-            created.api_endpoint,
-            "case {case:?}: servers[0].url must be the api's ApiEndpoint, got {document}"
+            format!("{}/{{basePath}}", created.api_endpoint),
+            "case {case:?}: servers[0].url must be the api's ApiEndpoint under a templated \
+             base path, got {document}"
+        );
+        assert_eq!(
+            served_base_path(&document).as_deref(),
+            Some(""),
+            "case {case:?}: an export naming no stage is served at the api's root, so its \
+             basePath variable defaults to the empty string, got {document}"
         );
 
         // One path item per path the route keys name, each declaring the operation of
@@ -856,6 +900,29 @@ async fn an_export_without_extensions_carries_no_api_gateway_extension() {
             "case {case:?}: the integration extension must be present only with \
              extensions on, got {document}"
         );
+        // The api's tag set travels as `tags` entries whose VALUE is an API Gateway
+        // extension, and the import/export algorithm version is an extension itself, so
+        // both follow the same switch.
+        assert_eq!(
+            document.get(TAGS_MEMBER).is_some(),
+            extensions,
+            "case {case:?}: a tag's value travels in an API Gateway extension, so the \
+             {TAGS_MEMBER} array must be present only with extensions on, got {document}"
+        );
+        assert_eq!(
+            document.get(IMPORTEXPORT_VERSION_EXTENSION).is_some(),
+            extensions,
+            "case {case:?}: the import/export version extension must be present only with \
+             extensions on, got {document}"
+        );
+        // The address the configuration is served at is no extension either, so the
+        // templated server variable is stated whatever the switch says.
+        assert_eq!(
+            served_base_path(&document).as_deref(),
+            Some(""),
+            "case {case:?}: the server variable describes the address, not an extension, \
+             got {document}"
+        );
         // The document itself is still served either way: the paths are the api's
         // configuration, not an extension.
         assert!(
@@ -959,9 +1026,23 @@ async fn a_stage_export_states_the_configuration_that_stage_serves() {
         );
         assert_eq!(
             served_url(&staged),
+            format!("{api_endpoint}/{{basePath}}"),
+            "case {case:?}: a stage export must name the api's endpoint under a templated \
+             base path, got {staged}"
+        );
+        assert_eq!(
+            served_base_path(&staged).as_deref(),
+            Some(suffix.trim_start_matches('/')),
+            "case {case:?}: the basePath variable must default to the base path the stage \
+             is served under, got {staged}"
+        );
+        // Substituting the variable yields the stage's own address — the empty base path
+        // of the stage that serves the api's root leaves only the url's own separator.
+        assert_eq!(
+            resolved_url(&staged).trim_end_matches('/'),
             format!("{api_endpoint}{suffix}"),
-            "case {case:?}: a stage export must be served under the stage's own address, \
-             got {staged}"
+            "case {case:?}: a stage export must resolve to the stage's own address, got \
+             {staged}"
         );
 
         // And the other side of "the configuration that stage SERVES": a stage the api
@@ -1169,5 +1250,375 @@ async fn an_export_request_outside_what_the_operation_serves_is_refused() {
             expected_message,
             "case {case:?}: the refusal must say what the caller has to fix, got {text}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What the document says about the API ITSELF: its address, its tag set, the
+// import/export algorithm version, and the version `info` states
+// ---------------------------------------------------------------------------
+
+/// The extension an exported definition declares the import/export algorithm version
+/// under, and the version this service exports under: "Currently, the only supported
+/// version is 1.0" (`ExportApi$ExportVersion`).
+const IMPORTEXPORT_VERSION_EXTENSION: &str = "x-amazon-apigateway-importexport-version";
+const IMPORTEXPORT_VERSION: &str = "1.0";
+
+/// The root member a document states an api's tag set under, and the two members one entry
+/// of it carries: the OpenAPI Tag Object's own `name`, and the API Gateway extension the
+/// tag's VALUE travels in.
+const TAGS_MEMBER: &str = "tags";
+const TAG_NAME: &str = "name";
+const TAG_VALUE_EXTENSION: &str = "x-amazon-apigateway-tag-value";
+
+/// The reserved name of the stage that serves an api's root, which is reached with no stage
+/// segment at all (`CreateStage$StageName`).
+const DEFAULT_STAGE_NAME: &str = "$default";
+
+/// Create one HTTP api from `request` and answer `(apiId, apiEndpoint)`.
+async fn created_api(emulator: &MultiServiceRouter, case: &str, request: Value) -> (String, String) {
+    let (status, api) = call(emulator, "POST", "/v2/apis", Some(request)).await;
+    assert_eq!(
+        status, 201,
+        "case {case:?}: expected 201 from CreateApi, got {status} {api}"
+    );
+    (as_str(&api, "apiId"), as_str(&api, "apiEndpoint"))
+}
+
+/// The api's tag set as `GetApi` reports it: the state the document has to agree with.
+async fn reported_tags(emulator: &MultiServiceRouter, case: &str, api_id: &str) -> Value {
+    let (status, api) = call(emulator, "GET", &format!("/v2/apis/{api_id}"), None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200 from GetApi, got {status} {api}"
+    );
+    api.get(TAGS_MEMBER).cloned().unwrap_or(json!({}))
+}
+
+/// The document's `tags` array as sorted `(name, value)` pairs; `None` when the document
+/// carries no `tags` member at all.
+fn document_tags(document: &Value) -> Option<Vec<(String, String)>> {
+    let entries = document.get(TAGS_MEMBER)?.as_array()?;
+    let mut pairs: Vec<(String, String)> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry
+                    .get(TAG_NAME)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                entry
+                    .get(TAG_VALUE_EXTENSION)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        })
+        .collect();
+    pairs.sort();
+    Some(pairs)
+}
+
+/// A tag map as sorted `(key, value)` pairs — of what a row created, or of what `GetApi`
+/// reports.
+fn reported_pairs(tags: &Value) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = tags
+        .as_object()
+        .map(|members| {
+            members
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    pairs.sort();
+    pairs
+}
+
+#[tokio::test]
+async fn an_exported_document_states_the_apis_tag_set_and_importexport_version() {
+    let emulator = emulator();
+
+    // The rows span how many tags an api carries and which characters a tag key and value
+    // use: the namespace punctuation an AWS tag key carries, a value that is the empty
+    // string, one outside ASCII, and a long one.
+    for (case, tags) in [
+        ("an api carrying no tag at all", json!({})),
+        ("an api carrying one tag", json!({ "team": "platform" })),
+        (
+            "an api carrying several tags, spanning the characters a key and a value use",
+            json!({
+                "env": "test",
+                "cost.center:api": "cc-00042",
+                "owner": "",
+                "説明": "注文",
+                "long": "v".repeat(256)
+            }),
+        ),
+    ] {
+        let mut request = json!({ "name": "tagged-api", "protocolType": "HTTP" });
+        request[TAGS_MEMBER] = tags.clone();
+        let (api_id, _) = created_api(&emulator, case, request).await;
+        wire_route(
+            &emulator,
+            case,
+            &api_id,
+            "GET /orders",
+            "https://upstream.example.com/orders",
+        )
+        .await;
+
+        let document = exported(&emulator, case, &api_id, "outputType=JSON").await;
+
+        // The document declares the algorithm it was written by, whatever the api holds.
+        assert_eq!(
+            document
+                .get(IMPORTEXPORT_VERSION_EXTENSION)
+                .and_then(Value::as_str),
+            Some(IMPORTEXPORT_VERSION),
+            "case {case:?}: the document must declare the import/export version, got \
+             {document}"
+        );
+
+        // The tag set the api was CREATED with is what the document has to state, and the
+        // operation that owns tags has to report the same set.
+        let expected = reported_pairs(&tags);
+        if expected.is_empty() {
+            assert!(
+                document.get(TAGS_MEMBER).is_none(),
+                "case {case:?}: an untagged api has no tag to state, so the document must \
+                 carry no {TAGS_MEMBER} member, got {document}"
+            );
+        } else {
+            assert_eq!(
+                document_tags(&document),
+                Some(expected.clone()),
+                "case {case:?}: the document must state the api's own tags as {TAGS_MEMBER} \
+                 entries, expected {expected:?}, got {document}"
+            );
+        }
+        let held = reported_tags(&emulator, case, &api_id).await;
+        assert_eq!(
+            reported_pairs(&held),
+            expected,
+            "case {case:?}: GetApi must report the same tag set the document states, got \
+             {held}"
+        );
+
+        // A report, not a write: the tag set a later reader sees is the one just stated.
+        let after = reported_tags(&emulator, case, &api_id).await;
+        assert_eq!(
+            after, held,
+            "case {case:?}: exporting an api must not change its tags, got {after}"
+        );
+    }
+}
+
+
+#[tokio::test]
+async fn the_exported_server_templates_the_base_path_it_is_served_under() {
+    let emulator = emulator();
+
+    let case = "the base path a configuration is served under";
+    let (api_id, api_endpoint) = created_api(
+        &emulator,
+        case,
+        json!({ "name": "served-api", "protocolType": "HTTP" }),
+    )
+    .await;
+    wire_route(
+        &emulator,
+        case,
+        &api_id,
+        "GET /orders",
+        "https://upstream.example.com/orders",
+    )
+    .await;
+
+    // Every stage of the api is deployed, so each export below states a configuration that
+    // stage really serves.
+    for stage_name in [DEFAULT_STAGE_NAME, "prod", "v1-beta"] {
+        let (status, stage) = call(
+            &emulator,
+            "POST",
+            &format!("/v2/apis/{api_id}/stages"),
+            Some(json!({ "stageName": stage_name })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {stage_name:?}: expected 201 from CreateStage, got {status} {stage}"
+        );
+        let (status, deployment) = call(
+            &emulator,
+            "POST",
+            &format!("/v2/apis/{api_id}/deployments"),
+            Some(json!({ "stageName": stage_name })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {stage_name:?}: expected 201 from CreateDeployment, got {status} \
+             {deployment}"
+        );
+    }
+
+    // The rows span which base path the exported configuration is served under: the api's
+    // latest configuration, which no stage name selects; the stage that serves the api's
+    // root; and named stages, whose own name is that base path.
+    for (case, named, base_path) in [
+        ("no stage named, so the api's latest configuration", None, ""),
+        (
+            "the stage that serves the api's root",
+            Some(DEFAULT_STAGE_NAME),
+            "",
+        ),
+        ("a named stage", Some("prod"), "prod"),
+        ("a second named stage", Some("v1-beta"), "v1-beta"),
+    ] {
+        let query = match named {
+            Some(stage_name) => format!(
+                "outputType=JSON&stageName={}",
+                crate::path_label::addressed(stage_name)
+            ),
+            None => "outputType=JSON".to_string(),
+        };
+        let document = exported(&emulator, case, &api_id, &query).await;
+
+        // One server, naming the api's endpoint with the base path templated.
+        assert_eq!(
+            document
+                .get("servers")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1),
+            "case {case:?}: an exported document names one server, got {document}"
+        );
+        assert_eq!(
+            served_url(&document),
+            format!("{api_endpoint}/{{basePath}}"),
+            "case {case:?}: servers[0].url must be the api's ApiEndpoint under the \
+             templated base path, got {document}"
+        );
+        assert_eq!(
+            served_base_path(&document).as_deref(),
+            Some(base_path),
+            "case {case:?}: the basePath variable must default to the base path the \
+             exported configuration is served under, got {document}"
+        );
+        // And substituting it yields the address that configuration answers on: the api's
+        // endpoint, followed by the stage name when a named stage was asked for.
+        assert_eq!(
+            resolved_url(&document).trim_end_matches('/'),
+            if base_path.is_empty() {
+                api_endpoint.clone()
+            } else {
+                format!("{api_endpoint}/{base_path}")
+            },
+            "case {case:?}: the resolved server url must be the invoke address, got \
+             {document}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_exported_info_version_follows_the_apis_current_version() {
+    let emulator = emulator();
+
+    let case = "the api's current version";
+    let (api_id, _) = created_api(
+        &emulator,
+        case,
+        json!({ "name": "versioned-api", "protocolType": "HTTP", "version": "v1" }),
+    )
+    .await;
+    wire_route(
+        &emulator,
+        case,
+        &api_id,
+        "GET /orders",
+        "https://upstream.example.com/orders",
+    )
+    .await;
+
+    // Each row patches `Version` and states what the api then carries: a value replaces the
+    // stored one, and the empty string clears the member, after which the api reports none.
+    let patched_versions = ["v1", "2024-07-01", "v2.1.0-rc.1"];
+    for (case, patched, held) in [
+        ("the version the create set", None, Some("v1")),
+        (
+            "a version a patch replaced it with",
+            Some("2024-07-01"),
+            Some("2024-07-01"),
+        ),
+        (
+            "a version a patch replaced again",
+            Some("v2.1.0-rc.1"),
+            Some("v2.1.0-rc.1"),
+        ),
+        ("a version a patch cleared", Some(""), None),
+    ] {
+        if let Some(version) = patched {
+            let (status, updated) = call(
+                &emulator,
+                "PATCH",
+                &format!("/v2/apis/{api_id}"),
+                Some(json!({ "version": version })),
+            )
+            .await;
+            assert!(
+                (200..300).contains(&status),
+                "case {case:?}: a patch of Version must be accepted, got {status} {updated}"
+            );
+        }
+
+        // What the api CARRIES, read back through the operation that owns it.
+        let (status, api) = call(&emulator, "GET", &format!("/v2/apis/{api_id}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetApi, got {status} {api}"
+        );
+        assert_eq!(
+            api.get("version").and_then(Value::as_str),
+            held,
+            "case {case:?}: GetApi must report the version the patch left, got {api}"
+        );
+
+        let document = exported(&emulator, case, &api_id, "outputType=JSON").await;
+        let stated = text_at(&document, &["info", "version"]);
+        match held {
+            Some(version) => assert_eq!(
+                stated, version,
+                "case {case:?}: info.version must be the api's current Version, got \
+                 {document}"
+            ),
+            // The Info Object requires a version, so an api carrying none is exported under
+            // a value of its own — never one it carries no longer, and never empty. What it
+            // states is the api's own creation instant, to the second, with the zone it is
+            // stated in named after it.
+            None => {
+                let created = as_str(&api, "createdDate");
+                let (date, after_date) = created
+                    .split_once('T')
+                    .unwrap_or_else(|| panic!("case {case:?}: GetApi must report a createdDate, got {api}"));
+                let seconds = after_date
+                    .split(['.', 'Z'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                assert_eq!(
+                    stated,
+                    format!("{date} {seconds}UTC"),
+                    "case {case:?}: an api carrying no Version is exported under its own \
+                     creation instant, got {document}"
+                );
+                assert!(
+                    !patched_versions.contains(&stated.as_str()),
+                    "case {case:?}: info.version must not report a Version the api carries \
+                     no longer, got {stated:?} in {document}"
+                );
+            }
+        }
     }
 }

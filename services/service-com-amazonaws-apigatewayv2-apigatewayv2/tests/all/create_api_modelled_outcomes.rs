@@ -402,19 +402,43 @@ async fn create_api_answers_only_a_status_its_model_declares() {
     );
 }
 
-/// The windows above, as the patch that rewrites each member: (member, the value, and
-/// whether the api must accept it). A value AT a bound is in range; one past it is not.
-fn patch_rows() -> Vec<(&'static str, String, bool)> {
+/// What a patch of one member leaves behind: the value STORED, the member CLEARED (what a
+/// member whose shape admits no empty value asks for when it is carried empty), or the
+/// patch REFUSED for a value outside the member's documented window.
+#[derive(Debug, PartialEq, Eq)]
+enum Patched {
+    Stored,
+    Cleared,
+    Refused,
+}
+
+/// The windows above, as the patch that rewrites each member: (member, the value, and what
+/// the api does with it). A value AT a bound is in range and one past it is not; the empty
+/// string is a VALUE for `description`, whose shape admits it, and a CLEAR for `version`,
+/// whose shape does not, while `name` — required on the modelled `Api` — refuses it.
+fn patch_rows() -> Vec<(&'static str, String, Patched)> {
     vec![
-        ("name", "n".repeat(MAX_NAME_CHARS), true),
-        ("name", "n".repeat(MAX_NAME_CHARS + 1), false),
-        ("name", String::new(), false),
-        ("description", "d".repeat(MAX_DESCRIPTION_CHARS), true),
-        ("description", "d".repeat(MAX_DESCRIPTION_CHARS + 1), false),
-        ("description", String::new(), true),
-        ("version", "v".repeat(MAX_VERSION_CHARS), true),
-        ("version", "v".repeat(MAX_VERSION_CHARS + 1), false),
-        ("version", String::new(), false),
+        ("name", "n".repeat(MAX_NAME_CHARS), Patched::Stored),
+        ("name", "n".repeat(MAX_NAME_CHARS + 1), Patched::Refused),
+        ("name", String::new(), Patched::Refused),
+        (
+            "description",
+            "d".repeat(MAX_DESCRIPTION_CHARS),
+            Patched::Stored,
+        ),
+        (
+            "description",
+            "d".repeat(MAX_DESCRIPTION_CHARS + 1),
+            Patched::Refused,
+        ),
+        ("description", String::new(), Patched::Stored),
+        ("version", "v".repeat(MAX_VERSION_CHARS), Patched::Stored),
+        (
+            "version",
+            "v".repeat(MAX_VERSION_CHARS + 1),
+            Patched::Refused,
+        ),
+        ("version", String::new(), Patched::Cleared),
     ]
 }
 
@@ -436,7 +460,7 @@ async fn update_api_holds_a_patch_to_the_same_documented_windows() {
     let api_id = as_str(&created, "apiId");
     let uri = format!("/v2/apis/{api_id}");
 
-    for (member, value, accepted) in patch_rows() {
+    for (member, value, outcome) in patch_rows() {
         let case = format!("{member} of {} characters", value.chars().count());
         let (before_status, before) = call(&emulator, "GET", &uri, None).await;
         assert_eq!(
@@ -451,33 +475,53 @@ async fn update_api_holds_a_patch_to_the_same_documented_windows() {
             Some(json!({ member: value.clone() })),
         )
         .await;
-        if accepted {
-            assert_eq!(
-                status, 201,
-                "case {case:?}: a value inside the documented window must be accepted, \
-                 got {status} {body}"
-            );
-            assert_eq!(
-                as_str(&body, member),
-                value,
-                "case {case:?}: UpdateApi must report the value it stored, got {body}"
-            );
-        } else {
-            assert_eq!(
-                status, 400,
-                "case {case:?}: a value outside the documented window must be refused, \
-                 got {status} {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "BadRequestException",
-                "case {case:?}: expected BadRequestException, got {body}"
-            );
-            let (_, after) = call(&emulator, "GET", &uri, None).await;
-            assert_eq!(
-                after, before,
-                "case {case:?}: a refused patch must leave the api exactly as it was"
-            );
+        match outcome {
+            Patched::Stored => {
+                assert_eq!(
+                    status, 201,
+                    "case {case:?}: a value inside the documented window must be accepted, \
+                     got {status} {body}"
+                );
+                assert_eq!(
+                    as_str(&body, member),
+                    value,
+                    "case {case:?}: UpdateApi must report the value it stored, got {body}"
+                );
+            }
+            Patched::Cleared => {
+                assert_eq!(
+                    status, 201,
+                    "case {case:?}: a member whose shape admits no empty value is cleared \
+                     by one, which is accepted, got {status} {body}"
+                );
+                assert!(
+                    body.get(member).is_none(),
+                    "case {case:?}: a cleared member is reported by nobody, got {body}"
+                );
+                let (_, after) = call(&emulator, "GET", &uri, None).await;
+                assert!(
+                    after.get(member).is_none(),
+                    "case {case:?}: GetApi must report the cleared member no longer, got \
+                     {after}"
+                );
+            }
+            Patched::Refused => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: a value outside the documented window must be refused, \
+                     got {status} {body}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "BadRequestException",
+                    "case {case:?}: expected BadRequestException, got {body}"
+                );
+                let (_, after) = call(&emulator, "GET", &uri, None).await;
+                assert_eq!(
+                    after, before,
+                    "case {case:?}: a refused patch must leave the api exactly as it was"
+                );
+            }
         }
     }
 }

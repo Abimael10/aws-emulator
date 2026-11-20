@@ -70,16 +70,32 @@ async fn update_api(
     .await
 }
 
-/// The record `created` becomes once `patch` is applied: every member the patch names
-/// takes the patch's value, every other member keeps the stored one. That is the patch
-/// rule itself, written once, so a row only has to supply the patch.
+/// The record `created` becomes once `patch` is applied: every member the patch names takes
+/// the patch's value, every other member keeps the stored one, and a member of
+/// [`CLEARED_BY_EMPTY`] sent as the EMPTY STRING is REMOVED — its shape admits no empty
+/// value, so an empty one asks for the stored member to be cleared rather than rewritten
+/// and no reader reports it afterwards. That is the patch rule itself, written once, so a
+/// row only has to supply the patch.
 fn patched_record(created: &Value, patch: &Value) -> Value {
     let mut expected = created.clone();
     for (member, value) in patch.as_object().expect("the patch is a JSON object") {
-        expected[member] = value.clone();
+        if CLEARED_BY_EMPTY.contains(&member.as_str()) && value.as_str() == Some("") {
+            expected
+                .as_object_mut()
+                .expect("the api record is a JSON object")
+                .remove(member);
+        } else {
+            expected[member] = value.clone();
+        }
     }
     expected
 }
+
+/// The members of an api a patch CLEARS by carrying them empty: the ones whose shape admits
+/// no empty value (`Version` targets `StringWithLengthBetween1And64`). `Description`
+/// (`StringWithLengthBetween0And1024`) is not one of them — the empty string is a value
+/// there and is stored.
+const CLEARED_BY_EMPTY: &[&str] = &["version"];
 
 /// One patch row: the request body sent to `UpdateApi`.
 struct PatchRow {
@@ -111,6 +127,11 @@ fn patch_rows() -> Vec<PatchRow> {
             case: "the version",
             http: true,
             patch: json!({ "version": "2026-01-01" }),
+        },
+        PatchRow {
+            case: "the version cleared to the empty string",
+            http: true,
+            patch: json!({ "version": "" }),
         },
         PatchRow {
             case: "one boolean member, flipped",

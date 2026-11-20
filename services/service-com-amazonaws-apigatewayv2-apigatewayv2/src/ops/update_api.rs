@@ -4,7 +4,9 @@
 //! IMPLEMENTED: patches the members the request names onto the [`crate::state::Api`]
 //! its `ApiId` names — refusing the `ProtocolType`-restricted ones on an api of another
 //! protocol, and a CORS document the api could never serve — and reports the stored
-//! record back. This is the ONLY file to touch for this operation.
+//! record back. A string member whose shape admits no empty value is CLEARED when the
+//! request carries it empty ([`cleared_by_empty`]). This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -261,20 +263,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // members THIS request rewrites: a patch cannot put a value outside the shape's
         // documented length on an api a later reader reports back. Checked BEFORE
         // anything is written, so a refused patch leaves the api exactly as it was.
-        for (member, value, window) in [
-            ("Name", input.name.as_deref(), crate::state::API_NAME_LEN),
+        //
+        // A member whose shape admits NO empty value is the exception: carried empty, it
+        // describes no value to hold to a window at all — it asks for the stored one to be
+        // removed ([`cleared_by_empty`]). `Name` is one such member and is NOT cleared
+        // either, because the modelled `Api` requires one, so the empty string stays
+        // outside its window there; `Description` admits the empty string, so an empty one
+        // is a value and is stored as written.
+        for (member, value, window, clearable) in [
+            (
+                "Name",
+                input.name.as_deref(),
+                crate::state::API_NAME_LEN,
+                false,
+            ),
             (
                 "Description",
                 input.description.as_deref(),
                 crate::state::API_DESCRIPTION_LEN,
+                false,
             ),
             (
                 "Version",
                 input.version.as_deref(),
                 crate::state::API_VERSION_LEN,
+                true,
             ),
         ] {
-            if let Some(value) = value {
+            if let Some(value) = value.filter(|value| !(clearable && value.is_empty())) {
                 crate::state::validate_member_length(member, value, window)
                     .map_err(|message| bad_request(&message))?;
             }
@@ -293,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.description = Some(description);
         }
         if let Some(version) = input.version {
-            updated.version = Some(version);
+            updated.version = cleared_by_empty(version);
         }
         if let Some(expression) = input.route_selection_expression {
             updated.route_selection_expression = expression;
@@ -481,6 +497,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             warnings: stored.warnings,
         })
     }
+}
+
+/// What a patch stores for a string member whose shape admits NO empty value.
+///
+/// Such a member sent EMPTY asks for the stored one to be REMOVED rather than rewritten:
+/// `UpdateApi$Version` targets `StringWithLengthBetween1And64`, which has no empty value at
+/// all, so a request carrying one describes an api that carries the member no longer and no
+/// reader reports a value the shape cannot hold. Any other value replaces the stored one as
+/// written. A member whose shape DOES admit the empty string (`UpdateApi$Description`,
+/// `StringWithLengthBetween0And1024`) is not read this way — there the empty string is a
+/// value, and it is stored.
+fn cleared_by_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
 }
 
 /// This operation's refusal of a request it models no more specific error for: the
