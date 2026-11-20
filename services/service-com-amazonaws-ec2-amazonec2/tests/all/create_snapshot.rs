@@ -15,9 +15,9 @@
 //!    id and in the listing filtered on the source volume, which is how a backup flow finds
 //!    it;
 //! 4. A `VolumeId` THIS OPERATION CANNOT RESOLVE IS REFUSED BY FORM THEN BY EXISTENCE — a
-//!    value outside the printed form EC2 issues before any lookup, and a value inside it that
-//!    names no volume of the account (a volume the account DELETED included) as absent — and
-//!    nothing is stored;
+//!    value this service cannot READ as a volume id before any lookup, and a value it can read
+//!    that names no volume of the account (a volume the account DELETED included) as absent —
+//!    and nothing is stored;
 //! 5. ANY OTHER REQUEST THAT CANNOT BE SERVED IS REFUSED WITH EC2'S OWN CODE AND NOTHING IS
 //!    STORED: a location or an Outpost this emulator has none of, a value outside a modelled
 //!    enum's catalog, and a `DryRun` that reports whether the call would have worked.
@@ -37,8 +37,10 @@ use ec2::state::{
 use super::ec2_query::{element, elements, error_code, error_message};
 use super::volume_lifecycle::{p, past_the_transition, zone_name, REGION};
 
-/// A volume id of the long form this service mints that no volume of the account carries.
-const UNKNOWN_VOLUME_ID: &str = "vol-0123456789abcdef0";
+/// A volume id of the long form this service mints that no volume of the account carries, and
+/// whose identifier this store's mint has never reached — the `vol-0123456789abcdef0` shape a
+/// hand-written probe reaches for, which EC2 cannot decode back to any volume.
+const UNREADABLE_VOLUME_ID: &str = "vol-0123456789abcdef0";
 
 /// One `action` call signed for the Region the suite works in.
 async fn op(
@@ -209,33 +211,41 @@ async fn a_snapshot_reports_the_volume_it_was_taken_of() {
 }
 
 /// RULE 4: a `VolumeId` this operation cannot resolve is answered the FORM question before the
-/// EXISTENCE question — a value outside the printed form EC2 ISSUES is 400
+/// EXISTENCE question — a value this service cannot READ as a volume id is 400
 /// `InvalidVolumeID.Malformed` with the service's parameter-layer sentence naming the value,
-/// and a value INSIDE that form which names no volume of the account is 400
+/// and a value it CAN read which names no volume of the account is 400
 /// `InvalidVolume.NotFound` with the sentence naming the volume absent — and nothing is stored
 /// either way.
 ///
-/// The recorded wire units `ec2-ebs-volume-delete-and-snapshot-not-found` (a volume of the
-/// account deleted, then snapshotted by that same id) and `ec2-volume-snapshot-copy-lifecycle`
-/// (an id of the published long form nothing was created under) carry the not-found half; the
-/// recorded behavioral unit `ec2.op-contract-create-snapshot` carries the parameter-layer
-/// refusal for a value outside the issued form.
+/// The recorded wire unit `ec2-ebs-volume-delete-and-snapshot-not-found` (a volume of the
+/// account deleted, then snapshotted by that same id) carries the not-found half; the recorded
+/// behavioral unit `ec2.op-contract-create-snapshot` carries the parameter-layer refusal for a
+/// value this service cannot read.
 ///
 /// The rows span both id forms EC2 has issued (8 and 17 hexadecimal digits), the all-zero
-/// placeholder, a long form whose leading digit no issued id carries, values outside that form,
-/// and the id of another kind of resource.
+/// placeholder, a long form whose leading digit no issued id carries, a long-form identifier
+/// the mint never handed out, values outside that form, and the id of another kind of
+/// resource.
 #[tokio::test]
 async fn a_volume_id_this_operation_cannot_resolve_is_refused_by_form_then_existence() {
     let (router, _engine) = super::ec2_query::emulator();
     // One volume the account DOES hold, so each refusal below is about the id the request
     // named rather than about an empty store.
     let held = create_volume(&router, 1, false).await;
+    // And one the account held and DELETED: its id is one EC2 issued, so it stays readable
+    // and names no volume — the long-form row of the not-found half.
+    let withdrawn = create_volume(&router, 1, false).await;
+    let (status, body) = op(&router, "DeleteVolume", &[p("VolumeId", &withdrawn)]).await;
+    assert_eq!(
+        status, 200,
+        "expected the second volume to be deletable, got {status} with body {body}"
+    );
 
-    // The ids of the ISSUED form that name no volume of the account: reported absent.
+    // The ids this service CAN read that name no volume of the account: reported absent.
     let absent: [(&str, &str); 2] = [
         (
-            "a long id of the issued form naming no volume",
-            UNKNOWN_VOLUME_ID,
+            "a long id this service issued whose volume is gone",
+            &withdrawn,
         ),
         ("a short id naming no volume", "vol-1a2b3c4d"),
     ];
@@ -258,9 +268,9 @@ async fn a_volume_id_this_operation_cannot_resolve_is_refused_by_form_then_exist
         );
     }
 
-    // The values OUTSIDE that form: refused before any lookup, in the parameter layer's own
-    // wording.
-    let unreadable: [(&str, &str); 7] = [
+    // The values this service cannot READ: refused before any lookup, in the parameter
+    // layer's own wording.
+    let unreadable: [(&str, &str); 8] = [
         (
             "the all-zero placeholder no mint can issue",
             "vol-00000000000000000",
@@ -268,6 +278,10 @@ async fn a_volume_id_this_operation_cannot_resolve_is_refused_by_form_then_exist
         (
             "a long form whose leading digit no issued id carries",
             "vol-10000000000000001",
+        ),
+        (
+            "a long-form identifier the mint never handed out",
+            UNREADABLE_VOLUME_ID,
         ),
         ("a value that is not a volume id at all", "not-a-volume"),
         ("the prefix with no digits", "vol-"),

@@ -53,8 +53,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sesv2_simpleemailservice_v2::ops::types::SUPPRESSION_LIST_REASON_VALUES;
 use service_com_amazonaws_sesv2_simpleemailservice_v2::state::{
     encode_tagged_page_token, identity_key, suppression_key, suppression_list_prefix,
-    window_runs_backwards, ComAmazonawsSesv2SimpleemailserviceV2State,
-    SuppressedDestinationRecord, CONTACTS_PAGE_TOKEN_TAG, MAX_TENANT_NAME_CHARS,
+    ComAmazonawsSesv2SimpleemailserviceV2State, SuppressedDestinationRecord,
+    CONTACTS_PAGE_TOKEN_TAG, MAX_TENANT_NAME_CHARS,
 };
 use service_com_amazonaws_sesv2_simpleemailservice_v2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -1381,12 +1381,16 @@ async fn a_listing_window_whose_end_precedes_its_start_is_refused() {
             reply.error_code(),
             reply.body
         );
-        // The refusal states the requirement the two bounds broke, in the one wording
-        // every windowed operation of this service answers an inverted window with.
+        // The refusal NAMES the two bounds it was given and states the order they have to
+        // be in, which is how this listing words an inverted window.
         assert_eq!(
             reply.message(),
-            window_runs_backwards(),
-            "case {case:?}: expected the inverted-window sentence, got {:?}",
+            format!(
+                "Start date {} must be before end date {}",
+                civil_bound(start),
+                civil_bound(end)
+            ),
+            "case {case:?}: expected the sentence naming both bounds, got {:?}",
             reply.message()
         );
     }
@@ -1415,6 +1419,77 @@ async fn a_listing_window_whose_end_precedes_its_start_is_refused() {
             vec!["bravo@example.com".to_string()],
             "case {case:?}: expected the entry stamped inside the window, got {:?}",
             reply.body
+        );
+    }
+}
+
+/// `at` as the inverted-window refusal names a bound: the civil ISO-8601 date and time, with
+/// the zone designator dropped and the seconds written only when they are not zero.
+fn civil_bound(at: SystemTime) -> String {
+    let rendered = date_time(at);
+    let civil = rendered.trim_end_matches('Z');
+    civil.strip_suffix(":00").unwrap_or(civil).to_string()
+}
+
+/// `seconds` after the epoch, as an absolute instant a row can name.
+fn at_epoch(seconds: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+/// The SENTENCE the suppression-list listing refuses an inverted window with, over bounds
+/// whose rendering differs: whole minutes, a minute inside the hour, and bounds that name
+/// seconds too (the shortest ISO-8601 civil form writes the seconds only then).
+///
+/// The instants are ABSOLUTE, so each row's whole expected sentence is written out rather
+/// than rebuilt from the service's own renderer.
+#[tokio::test]
+async fn the_inverted_window_sentence_names_both_bounds_as_civil_date_times() {
+    // (case, StartDate, EndDate, the whole message the refusal must carry)
+    let rows: [(&str, u64, u64, &str); 3] = [
+        (
+            "bounds a day apart, each on a whole minute",
+            // 2027-03-05T00:00:00Z and 2027-03-04T00:00:00Z
+            1_804_204_800,
+            1_804_118_400,
+            "Start date 2027-03-05T00:00 must be before end date 2027-03-04T00:00",
+        ),
+        (
+            "bounds inside one day, each on a minute of the hour",
+            // 2027-03-04T18:45:00Z and 2027-03-04T06:30:00Z
+            1_804_185_900,
+            1_804_141_800,
+            "Start date 2027-03-04T18:45 must be before end date 2027-03-04T06:30",
+        ),
+        (
+            "bounds that name seconds as well",
+            // 2027-03-04T00:00:30Z and 2027-03-04T00:00:05Z
+            1_804_118_430,
+            1_804_118_405,
+            "Start date 2027-03-04T00:00:30 must be before end date 2027-03-04T00:00:05",
+        ),
+    ];
+
+    let (ses, _base) = seeded().await;
+    for (case, start, end, expected) in rows {
+        let reply = ses
+            .list_suppressed(&[
+                ("StartDate", date_time(at_epoch(start))),
+                ("EndDate", date_time(at_epoch(end))),
+            ])
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "BadRequestException"),
+            "case {case:?}: expected 400 BadRequestException, got {} {} {:?}",
+            reply.status,
+            reply.error_code(),
+            reply.body
+        );
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            reply.message()
         );
     }
 }

@@ -192,13 +192,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "after a specific date" and `EndDate` those added "before a specific date" —
         // so a request whose end precedes its start describes no window at all. That is
         // invalid input, refused with the error the model binds for it and the sentence
-        // every windowed operation of this service refuses it with, rather than answered
+        // this listing words that class with — which NAMES the two bounds it was given
+        // ([`crate::state::suppression_window_runs_backwards`]) — rather than answered
         // with the empty page the comparison would otherwise produce.
         if let (Some(start), Some(end)) = (input.start_date.as_ref(), input.end_date.as_ref()) {
             if end.as_secs_f64() < start.as_secs_f64() {
                 return Err(ListSuppressedDestinationsErrorModeled::BadRequestException(
                     BadRequestException {
-                        message: Some(crate::state::window_runs_backwards()),
+                        message: Some(crate::state::suppression_window_runs_backwards(start, end)),
                     },
                 )
                 .into());

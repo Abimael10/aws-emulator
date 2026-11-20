@@ -30,8 +30,11 @@
 //! created-then-deleted volume through it.
 //!
 //! Every row is asked of SEVERAL operations, because the reading belongs to the service and
-//! not to one handler: `ModifyVolumeAttribute`, `DescribeVolumeAttribute` and
-//! `EnableVolumeIO` each act on the one volume their request names.
+//! not to one handler: `ModifyVolumeAttribute`, `DescribeVolumeAttribute`, `EnableVolumeIO`,
+//! `DeleteVolume`, `DescribeVolumesModifications` and `CreateSnapshot` each resolve the one
+//! volume their request names. WHICH code states the unreadable class is each operation's own
+//! (the reads that take the id as a request PARAMETER answer EC2's parameter-value code for
+//! it), so each operation carries the code it answers.
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -276,7 +279,12 @@ async fn every_operation_on_one_named_volume_splits_the_same_two_classes() {
     // (the operation, how it names the volume — a scalar `VolumeId` member for the three
     // that act on ONE volume, an indexed `VolumeId.N` list for the describe that takes
     // several — and the code it answers for a value it cannot read)
-    let operations: [(&str, VolumeParams, &str); 4] = [
+    let operations: [(&str, VolumeParams, &str); 5] = [
+        (
+            "CreateSnapshot",
+            |volume_id| vec![param("VolumeId", volume_id)],
+            MALFORMED,
+        ),
         (
             "DescribeVolumeAttribute",
             |volume_id| {

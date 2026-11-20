@@ -151,3 +151,45 @@ pub fn suppressed_destination_not_found(tenant_name: Option<&str>, email_address
     };
     format!("Email address {email_address} does not exist on your {list}.")
 }
+
+/// How the suppression-list LISTING words the refusal of a window that runs backwards: the
+/// start it was given, the end it was given, and the requirement between them.
+///
+/// `ListSuppressedDestinationsRequest$StartDate` and `$EndDate` arrive as DATES the caller
+/// chose, and this listing's refusal NAMES them — which bound is the mistaken one is not
+/// derivable from the member names alone, so the sentence states both moments and the order
+/// they have to be in. Fixed text apart from the two instants, which are the request's own
+/// ([`window_bound`] renders them).
+///
+/// It is this OPERATION's wording of the inverted-window class, not the service's: the metric
+/// read and the export job's data source state the same requirement without naming the bounds
+/// ([`crate::state::window_runs_backwards`]), each on its own recorded refusal.
+pub fn suppression_window_runs_backwards(
+    start: &::aws_smithy_types::DateTime,
+    end: &::aws_smithy_types::DateTime,
+) -> String {
+    format!(
+        "Start date {} must be before end date {}",
+        window_bound(start),
+        window_bound(end)
+    )
+}
+
+/// One bound of that sentence: the instant as a LOCAL ISO-8601 date and time — no zone
+/// designator, and the seconds written only when they are not zero.
+///
+/// The shortest ISO-8601 form of a civil date and time, which is how this refusal carries a
+/// bound it was given (`2026-06-01T00:00` for a whole minute, `2026-06-01T00:00:30` when the
+/// bound names a second as well). The instant is read in UTC, the zone every timestamp of
+/// this API arrives in, and truncated to the second rather than rounded, so a rendered bound
+/// never names a moment later than the one the request sent.
+fn window_bound(at: &::aws_smithy_types::DateTime) -> String {
+    let whole_seconds = ::aws_smithy_types::DateTime::from_secs(at.secs());
+    let rendered = whole_seconds
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default();
+    // `Format::DateTime` is `<date>T<time>Z` at whole-second resolution for the instant
+    // above: the zone designator goes, and the seconds with it when they are zero.
+    let civil = rendered.trim_end_matches('Z');
+    civil.strip_suffix(":00").unwrap_or(civil).to_string()
+}

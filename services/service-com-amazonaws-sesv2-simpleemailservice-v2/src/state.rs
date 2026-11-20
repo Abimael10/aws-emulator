@@ -3763,15 +3763,17 @@ pub fn invalid_next_token() -> String {
     "Invalid next token.".to_string()
 }
 
-/// How this service words the refusal of a request whose window runs backwards — an end
-/// bound that precedes the start bound, which describes no interval at all.
+/// How this service words the refusal of a METRIC READ or an EXPORT JOB whose window runs
+/// backwards — an end bound that precedes the start bound, which describes no interval at all.
 ///
-/// AWS's own sentence for that class, which is wholly FIXED text: the two bounds are the
-/// caller's own and the sentence states the requirement they broke rather than echoing
-/// them back. ONE wording for every windowed operation of this service — the metric
-/// queries, the export job's data source and the suppression-list listing — because it is
-/// one condition, and a second sentence for it would be exactly the drift this function
-/// exists to prevent.
+/// AWS's own sentence for that class on those operations, which is wholly FIXED text: the two
+/// bounds are the caller's own and the sentence states the requirement they broke rather than
+/// echoing them back. ONE wording for both of them — the metric queries and the export job's
+/// data source — because it is one condition, and a second sentence for it would be exactly
+/// the drift this function exists to prevent. The suppression-list LISTING words the same
+/// class by naming the two bounds it was given
+/// ([`crate::state::suppression_window_runs_backwards`]), which is that operation's own
+/// recorded wording.
 pub fn window_runs_backwards() -> String {
     "Expected start date to be before the end date.".to_string()
 }
