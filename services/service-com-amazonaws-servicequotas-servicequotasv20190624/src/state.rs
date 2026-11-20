@@ -2894,6 +2894,18 @@ impl QuotaRow {
         self
     }
 
+    /// AWS publishes this quota as adjustable, for a row whose CLASS is published as not
+    /// adjustable.
+    ///
+    /// A row built by a class constructor carries the adjustability that class is
+    /// published with. Where a service publishes one row of such a class the other way
+    /// round, this is how that row states it, so the rest of the class's published members
+    /// still come from the one constructor.
+    fn adjustable(mut self) -> Self {
+        self.adjustable = true;
+        self
+    }
+
     /// AWS counts this quota account-wide rather than per region.
     fn global(mut self) -> Self {
         self.global_quota = true;
@@ -3475,7 +3487,15 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "codecommit",
             "AWS CodeCommit",
-            vec![quota("Repositories per account", 5000.0).code("L-81790602")],
+            // AWS publishes the repository plane of an account under the name and the
+            // sentence the recorded default-quota listing of this code carries, which is
+            // what a client matching a quota by name resolves it by.
+            vec![quota("Allowed repositories", 5000.0)
+                .code("L-81790602")
+                .describe(
+                    "The maximum number of repositories that you can create in this \
+                     account.",
+                )],
         ),
         service("codedeploy", "AWS CodeDeploy", codedeploy_quotas()),
         service("codepipeline", "AWS CodePipeline", codepipeline_quotas()),

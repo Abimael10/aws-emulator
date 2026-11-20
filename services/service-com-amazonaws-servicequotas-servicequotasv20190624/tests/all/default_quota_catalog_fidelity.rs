@@ -197,11 +197,13 @@ fn rows() -> Vec<Row> {
         Row {
             service_code: "codecommit",
             quota_code: "L-81790602",
-            quota_name: "Repositories per account",
+            quota_name: "Allowed repositories",
             value: 5000.0,
             unit: "None",
             adjustable: true,
-            description: None,
+            description: Some(
+                "The maximum number of repositories that you can create in this account.",
+            ),
             period: None,
             metric: None,
         },
@@ -269,7 +271,11 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     ("acm", "Certificate Manager"),
     ("agent-registry", "Agent Registry"),
     ("aiops", "Amazon AI Operations"),
+    // `AWS/Usage` publishes AWS AppConfig's API call counts under the service's short
+    // display name and its RESOURCE counts under the product's full one, which is what
+    // the recorded default-quota listing of `appconfig` carries on its resource planes.
     ("appconfig", "AppConfig"),
+    ("appconfig", "AWS AppConfig"),
     ("athena", "Athena"),
     ("autoscaling", "AutoScaling"),
     // Amazon Cognito User Pools' call counts are published under the user-pool display
