@@ -1938,27 +1938,9 @@ pub fn validate_single_state(definition: &str) -> Result<(), String> {
     }
 }
 
-/// The members the Amazon States Language requires of a state, as alternatives: a
-/// state carries the first member of each entry, or one of the members beside it.
-///
-/// Every state names what it does with `Type`, and a type whose work ONE member
-/// declares requires that member too: a `Task` "requires a `Resource` field", a
-/// `Choice` carries the `Choices` array its rules live in, a `Parallel` the `Branches`
-/// it runs, and a `Map` the `ItemProcessor` its items go through (the language's
-/// earlier `Iterator` names the same work). A `Pass`, `Succeed`, `Fail` or `Wait`
-/// state declares its work through members none of which it must carry alone.
-fn required_state_members(state_type: &str) -> &'static [&'static [&'static str]] {
-    match state_type {
-        "Task" => &[&["Resource"]],
-        "Choice" => &[&["Choices"]],
-        "Parallel" => &[&["Branches"]],
-        "Map" => &[&["ItemProcessor", "Iterator"]],
-        _ => &[],
-    }
-}
-
 /// The first member `state` must carry and does not: `Type`, and then the member the
-/// type it names requires ([`required_state_members`]).
+/// type it names requires ([`state_required_fields`], the one table a state is held to
+/// the fields of its type with, wherever the service judges one).
 ///
 /// `None` for a state that carries each of them, and for a `definition` that is not a
 /// state object at all — which is not a member that is missing, and is reported as the
@@ -1972,14 +1954,10 @@ fn missing_required_member(state: &Value) -> Option<String> {
     // members the state owes is not decided here: that is a defect in the member it
     // carries rather than a member it is missing.
     let state_type = state.get("Type").and_then(Value::as_str)?;
-    required_state_members(state_type)
-        .iter()
-        .find(|alternatives| {
-            !alternatives
-                .iter()
-                .any(|member| state.contains_key(*member))
-        })
-        .and_then(|alternatives| alternatives.first().map(|member| (*member).to_string()))
+    missing_state_fields(state_type, |member| state.contains_key(member))
+        .first()
+        .and_then(|alternatives| alternatives.first())
+        .map(|member| (*member).to_string())
 }
 
 /// What the service reports for a required member the state under test does not

@@ -511,6 +511,98 @@ pub fn state_fields(state_type: &str) -> &'static [&'static str] {
     }
 }
 
+/// The fields the Amazon States Language requires of a state of each type, as
+/// ALTERNATIVES: a state carries the first field of each entry, or one of the fields
+/// beside it.
+///
+/// Every state names what it does with `Type`, and a type whose work ONE field declares
+/// requires that field too: a `Task` "requires a `Resource` field", a `Choice` carries
+/// the `Choices` array its rules live in, a `Parallel` the `Branches` it runs, and a
+/// `Map` the `ItemProcessor` its items go through (the language's earlier `Iterator`
+/// names the same work). A `Pass`, `Succeed`, `Fail` or `Wait` state declares its work
+/// through fields none of which it must carry alone, and a type the language does not
+/// define at all requires nothing, because nothing says what such a state would do.
+///
+/// This is the ONE table the service holds a state to the fields its type owes with:
+/// the walk reports a state missing one ([`diagnose_state`], hence every create,
+/// update and validation of a DEFINITION), and [`super::validate_single_state`] reports
+/// the same field for the lone state `TestState` is handed.
+pub fn state_required_fields(state_type: &str) -> &'static [&'static [&'static str]] {
+    match state_type {
+        "Task" => &[&["Resource"]],
+        "Choice" => &[&["Choices"]],
+        "Parallel" => &[&["Branches"]],
+        "Map" => &[PROCESSOR_FIELDS_OF_A_MAP],
+        _ => &[],
+    }
+}
+
+/// The requirements of `state_type` the state does not satisfy: the entries of
+/// [`state_required_fields`] none of whose fields the state carries.
+pub fn missing_state_fields<'a>(
+    state_type: &str,
+    carried: impl Fn(&str) -> bool + 'a,
+) -> Vec<&'static [&'static str]> {
+    state_required_fields(state_type)
+        .iter()
+        .copied()
+        .filter(|alternatives| !alternatives.iter().any(|field| carried(field)))
+        .collect()
+}
+
+/// What a schema diagnostic says about a requirement a state does not satisfy: the
+/// field it owes, as the one-field list [`required_fields_message`] states.
+///
+/// RECORDED sentence, the one every missing field of an object is reported with. Where
+/// the language declares the same work under more than one name, the field named is the
+/// FIRST of the entry — the name the language declares that work under now — since that
+/// is the field a caller is told to add.
+pub fn missing_fields_message(alternatives: &[&str]) -> String {
+    required_fields_message(&alternatives[..alternatives.len().min(1)])
+}
+
+/// Where the state `name` of the state machine at `prefix` is: the `/States/<StateName>`
+/// pointer the `location` member of `ValidateStateMachineDefinitionDiagnostic`
+/// documents ("the location could be in the format /States/<StateName>/<FieldName>").
+///
+/// The name is the one the definition DECLARES, so the pointer resolves the state in
+/// the submitted document; it is bounded by the ceiling every path the walk builds
+/// carries ([`nested_at`]) rather than by [`MAX_ECHOED_CHARS`], which bounds a caller
+/// value quoted inside a sentence about something else.
+pub fn state_pointer(prefix: &str, name: &str) -> String {
+    nested_at(prefix, format_args!("/States/{name}"))
+}
+
+/// What a diagnostic says about a state whose name is longer than the Amazon States
+/// Language admits ([`MAX_STATE_NAME_CHARS`], which is also the modelled `StateName`'s
+/// maximum): the offending name and the limit it is past.
+///
+/// RECORDED text. The name is the only variable part of it, and it is quoted as the
+/// definition DECLARES it rather than shortened: this diagnostic is ABOUT that name, so
+/// a sentence that cut it short would not name its own subject. It is bounded like the
+/// pointer reported beside it ([`MAX_LOCATION_CHARS`]), so the two name the same text.
+pub fn state_name_too_long_message(name: &str) -> String {
+    format!(
+        "Invalid State name: State '{}' exceeds the {MAX_STATE_NAME_CHARS}-character limit \
+         allowed by the service",
+        clipped(name, MAX_LOCATION_CHARS)
+    )
+}
+
+/// The member every state names what it DOES with, which is the one field a state of
+/// any type owes.
+pub const STATE_TYPE_MEMBER: &str = "Type";
+
+/// What a schema diagnostic says about a state whose `Type` is not one of the state
+/// types the Amazon States Language defines: the member, and the values it admits.
+///
+/// RECORDED text, bracketed list and ORDER included, and it is the whole sentence: the
+/// rejected value is not echoed, so what a caller is told is which values the member
+/// admits. The order is the service's own and not the sorted [`STATE_TYPES`], so the
+/// list is written here as the diagnostic states it.
+pub const STATE_TYPE_VALUES_MESSAGE: &str = "The field 'Type' should have one of these values: \
+     [Task, Wait, Pass, Succeed, Fail, Choice, Parallel, Map]";
+
 /// What a diagnostic says about a transition target no state declares: the name it
 /// named, as the value of the transition field the language calls `Next`.
 ///
@@ -681,6 +773,11 @@ const EXCLUSIVE_FIELD_GROUPS: &[&[&str]] = &[
     &["ToleratedFailureCount", "ToleratedFailureCountPath"],
     &["ToleratedFailurePercentage", "ToleratedFailurePercentagePath"],
 ];
+
+/// The two names the Amazon States Language declares a `Map` state's processor under,
+/// of which a `Map` state carries one: `ItemProcessor`, and the earlier `Iterator`
+/// naming the same work — which is why the one the diagnostic names is the first.
+const PROCESSOR_FIELDS_OF_A_MAP: &[&str] = &["ItemProcessor", "Iterator"];
 
 /// What a schema diagnostic says about an entry of an `ErrorEquals` that is not an
 /// error NAME.
@@ -1139,10 +1236,7 @@ pub(super) fn diagnose_machine(
         }
         into.push(error(
             MISSING_TRANSITION_TARGET,
-            at(
-                &nested_at(prefix, format_args!("/States/{}", echoed(name))),
-                "",
-            ),
+            at(&state_pointer(prefix, name), ""),
             unreachable_state_message(name),
         ));
     }
@@ -1244,26 +1338,29 @@ fn diagnose_state<'a>(
         depth,
     } = *machine;
     // The name the state is DECLARED under, which is what its machine's analysis
-    // answers for; the one quoted below is the clipped one.
+    // answers for.
     let declared = name;
     // A state name is a caller-chosen JSON object key and lands in every history
     // event of that state, so its LENGTH is bounded here, not only the number of
-    // events: this is what keeps a history's bytes bounded. The name a message
-    // quotes, and the one the location carries, is the clipped one, for the reason
-    // [`echoed`] and [`nested_at`] record; the length checked and reported is the
-    // DECLARED one.
+    // events: this is what keeps a history's bytes bounded. The length checked and
+    // reported is the DECLARED one.
     let declared_chars = name.chars().count();
+    // WHERE this state is: the pointer every diagnostic about it is located at, and
+    // the prefix the machines nested in it are judged under. It names the state as the
+    // DEFINITION declares it ([`state_pointer`]) — a pointer carrying a shortened
+    // rendering of the name would resolve to no state of the submitted document, which
+    // is what a client reads it to find.
+    let here = state_pointer(prefix, declared);
+    // The name a sentence about one of the state's OTHER rules quotes is the clipped
+    // one, for the reason [`echoed`] records: it is a caller value quoted inside a
+    // sentence about something else.
     let shown = echoed(name);
     let name = shown.as_str();
-    let here = nested_at(prefix, format_args!("/States/{name}"));
     if declared_chars > MAX_STATE_NAME_CHARS {
         into.push(error(
             INVALID_STATE_NAME,
             at(&here, ""),
-            format!(
-                "a state name may carry at most {MAX_STATE_NAME_CHARS} characters, and this \
-                 definition declares one of {declared_chars}"
-            ),
+            state_name_too_long_message(declared),
         ));
     }
     let Some(state) = state.as_object() else {
@@ -1274,31 +1371,46 @@ fn diagnose_state<'a>(
         ));
         return;
     };
-    let Some(state_type) = state.get("Type").and_then(Value::as_str) else {
+    // `Type` is the field EVERY state owes, whatever work it does, so a state that
+    // does not carry it is reported the way every object's missing fields are: the
+    // field it owes, located at the state ([`required_fields_message`]).
+    let Some(declared_type) = state.get("Type") else {
         into.push(error(
             SCHEMA_VALIDATION_FAILED,
-            at(&here, "/Type"),
-            format!("state '{name}' must carry a string 'Type' member"),
+            at(&here, ""),
+            required_fields_message(&[STATE_TYPE_MEMBER]),
         ));
         return;
     };
     // `Type` selects one of the state types the Amazon States Language DEFINES
-    // ([`STATE_TYPES`]), so a state naming any other one describes no state at all:
-    // nothing says what it reads, what it writes or where it goes next, which is why
-    // the walk stops here rather than judging the state's other members under rules
-    // that are keyed on its type.
-    if !STATE_TYPES.contains(&state_type) {
+    // ([`STATE_TYPES`]), so a state whose `Type` is not one of them describes no state
+    // at all: nothing says what it reads, what it writes or where it goes next, which
+    // is why the walk stops here rather than judging the state's other members under
+    // rules that are keyed on its type. A value of any OTHER JSON type is outside that
+    // set like any unknown name is, and is reported as the member it is written at.
+    let Some(state_type) = declared_type
+        .as_str()
+        .filter(|declared| STATE_TYPES.contains(declared))
+    else {
         into.push(error(
             SCHEMA_VALIDATION_FAILED,
-            at(&here, "/Type"),
-            format!(
-                "state '{name}' is of type '{}', which is not one of the state types the \
-                 Amazon States Language defines ({})",
-                echoed(state_type),
-                STATE_TYPES.join(", ")
-            ),
+            at(&here, &format!("/{STATE_TYPE_MEMBER}")),
+            STATE_TYPE_VALUES_MESSAGE,
         ));
         return;
+    };
+    // The language's schema for a state says which fields the type it names OWES
+    // ([`state_required_fields`]) as well as which it may carry: a state satisfying
+    // none of a requirement declares no work for the thing its type does, so it is
+    // reported exactly as a state machine object's missing fields are — stated as the
+    // requirement it broke ([`missing_fields_message`]) and located at the STATE,
+    // which is what owes it.
+    for alternatives in missing_state_fields(state_type, |field| state.contains_key(field)) {
+        into.push(error(
+            SCHEMA_VALIDATION_FAILED,
+            at(&here, ""),
+            missing_fields_message(alternatives),
+        ));
     }
     // The language's schema for a state is CLOSED per TYPE, exactly as a state
     // machine object's is: the type selects what the state does, and the fields
