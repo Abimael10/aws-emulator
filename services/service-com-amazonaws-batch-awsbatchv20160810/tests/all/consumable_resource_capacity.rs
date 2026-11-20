@@ -327,39 +327,45 @@ async fn a_claimant_waits_while_the_quantity_it_needs_is_held() {
     // past the queue, and every other is either still waiting for it or already done with it.
     // A terminal job claims nothing any more, so the count is of the LIVE admitted statuses —
     // otherwise it would depend on which of the consecutive hold windows the loop looked in.
-    // Where every claimant has finished without the loop having looked inside a window, two
-    // more are submitted, so what it waits for is the CONDITION and not a window of time.
+    //
+    // Every look is one CONSISTENT snapshot ([`Snapshot::of`]), because the quantity in use
+    // and the claimants' statuses are separate calls and the clock moves between them. What
+    // the loop ENDS on is the condition — the unit in use by exactly one live claimant — so a
+    // look that falls inside a narrower window of the same run (the unit charged to a
+    // claimant whose placement is not reported yet, or every claimant already finished, which
+    // submits two more) is taken again rather than judged, and nothing here is bounded by how
+    // fast the host runs.
     let mut witnessed = false;
     for _ in 0..POLLS {
-        let described = describe_resource(&batch, "cr-gate").await;
-        let mut statuses: Vec<Value> = Vec::with_capacity(claimants.len());
-        for id in &claimants {
-            statuses.push(describe_job(&batch, id).await);
-        }
-        if described["inUseQuantity"].as_i64() == Some(1) {
+        let Some(snapshot) = Snapshot::of(&batch, "cr-gate", &claimants).await else {
+            // The clock moved through the reads, so they describe no one state of the store:
+            // look again rather than judge a state nothing was ever in.
+            tokio::time::sleep(poll_gap()).await;
+            continue;
+        };
+        let live_on_the_unit = snapshot.live_past_the_queue();
+        assert!(
+            live_on_the_unit <= 1,
+            "case the gate: at most one claimant of the single unit is live on it, got \
+             {live_on_the_unit} of {:?}",
+            snapshot.claimants
+        );
+        if snapshot.in_use_quantity() == Some(1) {
             assert_eq!(
-                described["availableQuantity"].as_i64(),
+                snapshot.resource["availableQuantity"].as_i64(),
                 Some(0),
-                "case the gate: the single unit in use leaves none available, got {described}"
+                "case the gate: the single unit in use leaves none available, got {}",
+                snapshot.resource
             );
-            let live_on_the_unit = statuses
-                .iter()
-                .filter(|detail| {
-                    LIVE_PAST_THE_QUEUE.contains(&detail["status"].as_str().unwrap_or_default())
-                })
-                .count();
-            assert_eq!(
-                live_on_the_unit, 1,
-                "case the gate: exactly one claimant of the single unit is live on it, got \
-                 {statuses:?}"
-            );
-            witnessed = true;
-            break;
-        }
-        let all_done = statuses.iter().all(|detail| {
-            TERMINAL.contains(&detail["status"].as_str().unwrap_or_default())
-        });
-        if all_done {
+            if live_on_the_unit == 1 {
+                witnessed = true;
+                break;
+            }
+            // The unit is charged to a claimant the scheduler has admitted but whose
+            // placement has not been reported yet, so it is still where a job waits to be
+            // placed: that is a narrower window of the same hold, and the next look sees the
+            // claimant live on the unit.
+        } else if snapshot.all_terminal() {
             let next = claimants.len();
             claimants.push(submit(&batch, &queue_arn, &definition, &format!("claimant-{next}")).await);
             claimants
@@ -369,17 +375,38 @@ async fn a_claimant_waits_while_the_quantity_it_needs_is_held() {
     }
     assert!(
         witnessed,
-        "case the gate: the single unit was never observed in use"
+        "case the gate: the single unit was never observed in use by exactly one live claimant"
     );
 
     // Every claimant gets its turn: the next is admitted once the one before it releases the
     // unit, and the resource is whole again at the end.
+    let mut turns: Vec<(String, i64, i64)> = Vec::with_capacity(claimants.len());
     for (position, id) in claimants.iter().enumerate() {
-        let detail = until_terminal(&batch, &format!("claimant {position}"), id).await;
+        let case = format!("claimant {position}");
+        let detail = until_terminal(&batch, &case, id).await;
+        let started = detail["startedAt"].as_i64().unwrap_or_default();
         assert!(
-            detail["startedAt"].as_i64().unwrap_or_default() > 0,
-            "case claimant {position}: a job that was admitted and ran reports when it \
-             started, got {detail}"
+            started > 0,
+            "case {case}: a job that was admitted and ran reports when it started, got {detail}"
+        );
+        let stopped = detail["stoppedAt"].as_i64().unwrap_or_default();
+        assert!(
+            stopped >= started,
+            "case {case}: a job that ran reports when its work stopped, got {detail}"
+        );
+        turns.push((case, started, stopped));
+    }
+    // The turns do not OVERLAP: the quantity is a concurrency bound, so no two claimants of
+    // the one unit ever ran at the same instant. The same rule the snapshot above witnessed,
+    // stated over what the FINISHED jobs report, which no window of the clock can hide.
+    turns.sort_by_key(|(_, started, _)| *started);
+    for consecutive in turns.windows(2) {
+        let (earlier, _, earlier_stopped) = &consecutive[0];
+        let (later, later_started, _) = &consecutive[1];
+        assert!(
+            later_started >= earlier_stopped,
+            "case {later}: a claimant of the single unit runs only once {earlier} has given \
+             it back, got a start at {later_started} against a stop at {earlier_stopped}"
         );
     }
     let after = describe_resource(&batch, "cr-gate").await;
@@ -598,6 +625,85 @@ async fn deleting_a_resource_in_use_is_refused_and_removes_nothing() {
             "case {case}: the deleted resource resolves to nothing, got {status} {body}"
         );
     }
+}
+
+/// What the gate reported at ONE state of the store: every claimant's `JobDetail` and what
+/// the resource reported.
+///
+/// Each of those is its own call, so three calls in a row describe three instants and the
+/// clock can move between them — which is exactly what a test must not depend on.
+/// [`Snapshot::of`] is what pins them to one state, so reading a snapshot is reading the store
+/// at a single instant.
+#[derive(Debug)]
+struct Snapshot {
+    /// Every claimant's `JobDetail`, in the order the claimants were submitted.
+    claimants: Vec<Value>,
+    /// What `DescribeConsumableResource` reported inside the same state.
+    resource: Value,
+}
+
+impl Snapshot {
+    /// Read `claimants` and the resource `reference` names at ONE state of the store, or `None`
+    /// when the clock moved while they were being read.
+    ///
+    /// A job's `JobStatus` only ever moves FORWARD (`SUBMITTED`, `PENDING`, `RUNNABLE`,
+    /// `STARTING`, `RUNNING`, then terminal), so a claimant reporting the same status before
+    /// and after the resource was read held that status through the whole of that interval —
+    /// and the resource read, made inside it, describes the same state of the store as the
+    /// statuses do. When any claimant moved, the three reads straddle a transition and
+    /// describe no single state, so there is nothing to judge and the caller looks again.
+    async fn of(batch: &Batch, reference: &str, claimants: &[String]) -> Option<Self> {
+        let before = statuses(batch, claimants).await;
+        let resource = describe_resource(batch, reference).await;
+        let after = statuses(batch, claimants).await;
+        let moved = before
+            .iter()
+            .zip(after.iter())
+            .any(|(before, after)| status_of(before) != status_of(after));
+        if moved {
+            return None;
+        }
+        Some(Self {
+            claimants: after,
+            resource,
+        })
+    }
+
+    /// What the resource reported as the quantity in use.
+    fn in_use_quantity(&self) -> Option<i64> {
+        self.resource["inUseQuantity"].as_i64()
+    }
+
+    /// How many claimants were LIVE past the queue — admitted onto capacity and not finished
+    /// with it, so holding whatever they claimed.
+    fn live_past_the_queue(&self) -> usize {
+        self.claimants
+            .iter()
+            .filter(|detail| LIVE_PAST_THE_QUEUE.contains(&status_of(detail)))
+            .count()
+    }
+
+    /// Whether every claimant had reached a terminal `JobStatus`, so none of them claims
+    /// anything any more.
+    fn all_terminal(&self) -> bool {
+        self.claimants
+            .iter()
+            .all(|detail| TERMINAL.contains(&status_of(detail)))
+    }
+}
+
+/// `DescribeJobs` for each of `claimants`, in order.
+async fn statuses(batch: &Batch, claimants: &[String]) -> Vec<Value> {
+    let mut details = Vec::with_capacity(claimants.len());
+    for id in claimants {
+        details.push(describe_job(batch, id).await);
+    }
+    details
+}
+
+/// The `status` of one `JobDetail`.
+fn status_of(detail: &Value) -> &str {
+    detail["status"].as_str().unwrap_or_default()
 }
 
 /// Poll `job_id` until it reports a terminal `JobStatus`, and answer its last `JobDetail`.
