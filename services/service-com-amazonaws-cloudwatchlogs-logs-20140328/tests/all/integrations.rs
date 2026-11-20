@@ -34,7 +34,7 @@ use service_com_amazonaws_cloudwatchlogs_logs_20140328::ops::types::OpenSearchRe
 use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     ComAmazonawsCloudwatchlogsLogs20140328State, IntegrationRecord,
     INTEGRATION_PROVISIONING_DELAY_MS, INTEGRATION_STATUS_ACTIVE, INTEGRATION_STATUS_FAILED,
-    INTEGRATION_STATUS_PROVISIONING, INTEGRATION_TYPE_OPENSEARCH, MAX_INTEGRATIONS,
+    INTEGRATION_STATUS_PROVISIONING, INTEGRATION_TYPE_OPENSEARCH,
 };
 
 use crate::harness::{now_ms, Logs, REGION};
@@ -55,6 +55,10 @@ const NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// The code answered when a create would grow the account past a limit.
 const LIMIT_EXCEEDED: &str = "LimitExceededException";
+
+/// The whole sentence of that class, which is what a refusal of an AWS-documented resource
+/// limit carries: it names neither the limit nor the resource.
+const LIMIT_TEXT: &str = "Resource limit exceeded.";
 
 /// The code answered for a request whose parameters cannot hold together.
 const VALIDATION: &str = "ValidationException";
@@ -904,7 +908,8 @@ async fn a_put_the_service_will_not_accept_persists_nothing() {
          {message:?}"
     );
 
-    // "Currently you can have only one integration in your account."
+    // "Currently you can have only one integration in your account." The limit is AWS's own,
+    // so the refusal carries the fixed text of the limit class rather than naming the limit.
     let (code, message) = logs
         .refusal(
             PUT,
@@ -915,10 +920,9 @@ async fn a_put_the_service_will_not_accept_persists_nothing() {
         code, LIMIT_EXCEEDED,
         "case \"a put past the account limit\": expected {LIMIT_EXCEEDED}, got {code} {message:?}"
     );
-    assert!(
-        message.contains(&MAX_INTEGRATIONS.to_string()),
-        "case \"a put past the account limit\": the refusal states the limit \
-         ({MAX_INTEGRATIONS}), got {message:?}"
+    assert_eq!(
+        message, LIMIT_TEXT,
+        "case \"a put past the account limit\": expected {LIMIT_TEXT:?}, got {message:?}"
     );
 
     let listed = listed_names(&logs, &json!({})).await;

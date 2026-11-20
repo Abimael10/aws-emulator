@@ -5,16 +5,19 @@
 //!
 //! These endpoints are not in this service's Smithy model — no operation binds them — so
 //! their addressing, their body forms and their answers are stated here once, and read by
-//! the service seam that serves them (`crate::service::http_ingestion`). Two forms are
+//! the service seam that serves them (`crate::service::http_ingestion`). Three forms are
 //! served on the one endpoint this emulator answers at:
 //!
 //! * the HTTP log collector form, which takes a record whose `event` member IS the log
 //!   event, as a single object or an array of them ([`Endpoint::HttpLogCollector`]);
 //! * the structured JSON form, which takes records spelling a timestamp and a message the
-//!   way `PutLogEvents`' own `InputLogEvent` does ([`Endpoint::StructuredJson`]).
+//!   way `PutLogEvents`' own `InputLogEvent` does ([`Endpoint::StructuredJson`]);
+//! * the OpenTelemetry form, which takes one OTLP logs export document whose log records
+//!   are the events to ingest ([`Endpoint::OpenTelemetry`]).
 //!
-//! Both name their destination in the query string — the log group and the log stream the
-//! records are ingested into ([`destination`]) — and both authenticate with a bearer
+//! Each names its destination — the log group and the log stream the records are ingested
+//! into — in the headers CloudWatch Logs reads it from or in the query string
+//! ([`named_destination`], [`destination`]), and each authenticates with a bearer
 //! credential rather than with a SigV4 signature: a CloudWatch Logs API key, which is a
 //! service-specific credential IAM issues for [`API_KEY_SERVICE_NAME`].
 //!
@@ -33,11 +36,24 @@ pub const HTTP_LOG_COLLECTOR_PATH: &str = "/services/collector/event";
 /// The path the structured JSON form is addressed at.
 pub const STRUCTURED_JSON_PATH: &str = "/ingest/json";
 
+/// The path the OpenTelemetry form is addressed at: the path an OTLP/HTTP exporter ships a
+/// LOGS export request to, which is where CloudWatch Logs takes one — the OpenTelemetry
+/// ingestion `GetLogObject` names as the path large log objects are made on.
+pub const OPEN_TELEMETRY_PATH: &str = "/v1/logs";
+
 /// The query parameter naming the log group a request's records are ingested into.
 pub const LOG_GROUP_PARAMETER: &str = "logGroup";
 
 /// The query parameter naming the log stream a request's records are ingested into.
 pub const LOG_STREAM_PARAMETER: &str = "logStream";
+
+/// The header naming the log group a request's records are ingested into, which is how a
+/// client that ships a body of its own (an OTLP exporter) addresses its destination.
+pub const LOG_GROUP_HEADER: &str = "x-aws-log-group";
+
+/// The header naming the log stream a request's records are appended to, the companion of
+/// [`LOG_GROUP_HEADER`].
+pub const LOG_STREAM_HEADER: &str = "x-aws-log-stream";
 
 /// The service principal a CloudWatch Logs API key is issued for: the `ServiceName` an
 /// `iam:CreateServiceSpecificCredential` names to be handed the long-term API key —
@@ -62,9 +78,37 @@ const MESSAGE_MEMBER: &str = "message";
 /// 1, 1970 00:00:00 UTC" (`PutLogEvents`).
 const TIMESTAMP_MEMBER: &str = "timestamp";
 
+/// The member an OTLP logs export document carries its per-resource lists in, the outermost
+/// level of the OpenTelemetry logs encoding.
+const RESOURCE_LOGS_MEMBER: &str = "resourceLogs";
+
+/// The member one resource's entry carries its per-scope lists in, the middle level of that
+/// encoding.
+const SCOPE_LOGS_MEMBER: &str = "scopeLogs";
+
+/// The member one scope's entry carries its log records in, the level the events to ingest
+/// are at.
+const LOG_RECORDS_MEMBER: &str = "logRecords";
+
+/// The member an OTLP log record carries its log event in: a record that carries no body
+/// carries nothing to ingest, as a record of either other form that carries no event does.
+const BODY_MEMBER: &str = "body";
+
+/// The member an OTLP log record carries its instant in, in NANOSECONDS since the epoch,
+/// the unit that encoding counts a time in.
+const TIME_UNIX_NANO_MEMBER: &str = "timeUnixNano";
+
+/// The member an OTLP log record carries the instant it was OBSERVED at, in the same unit:
+/// the instant a record states for itself when it states no `timeUnixNano`.
+const OBSERVED_TIME_UNIX_NANO_MEMBER: &str = "observedTimeUnixNano";
+
 /// Milliseconds in one second, the factor between the two units the two forms spell an
 /// instant in.
 const MILLIS_PER_SECOND: f64 = 1_000.0;
+
+/// Milliseconds in one nanosecond, the factor between the unit the OpenTelemetry form counts
+/// an instant in and the milliseconds a log event's timestamp is counted in.
+const MILLIS_PER_NANOSECOND: f64 = 1.0 / 1_000_000.0;
 
 /// The body a request every record of which was ingested is answered with: an empty JSON
 /// object, carrying nothing because there is nothing to report.
@@ -74,23 +118,26 @@ pub const ACCEPTED_BODY: &str = "{}";
 /// carried nothing to ingest, so there is no partial success to report.
 pub const ALL_EVENTS_INVALID_MESSAGE: &str = "All events were invalid";
 
-/// Which of the two forms a path addresses, or `None` for a path neither is served at.
+/// Which of the forms a path addresses, or `None` for a path none of them is served at.
 #[must_use]
 pub fn endpoint_at(path: &str) -> Option<Endpoint> {
     match path.trim_end_matches('/') {
         HTTP_LOG_COLLECTOR_PATH => Some(Endpoint::HttpLogCollector),
         STRUCTURED_JSON_PATH => Some(Endpoint::StructuredJson),
+        OPEN_TELEMETRY_PATH => Some(Endpoint::OpenTelemetry),
         _ => None,
     }
 }
 
-/// One of the two forms the HTTP ingestion endpoints serve.
+/// One of the forms the HTTP ingestion endpoints serve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Endpoint {
     /// `event`-carrying records, one object or an array of them.
     HttpLogCollector,
     /// Records spelling a timestamp and a message.
     StructuredJson,
+    /// One OTLP logs export document, whose log records are the events to ingest.
+    OpenTelemetry,
 }
 
 /// The log group and log stream a request's query string names, or `None` when it names
@@ -107,9 +154,29 @@ pub fn destination(query: Option<&str>) -> Option<Destination> {
             .map(::smithy_server_runtime::percent_decode)
             .filter(|value| !value.is_empty())
     };
+    named_destination(read(LOG_GROUP_PARAMETER), read(LOG_STREAM_PARAMETER))
+}
+
+/// The destination two named values address, or `None` when either is absent or blank: a
+/// record is ingested into a stream OF a group, so one name alone addresses nothing.
+///
+/// The one rule both the headers ([`LOG_GROUP_HEADER`], [`LOG_STREAM_HEADER`]) and the
+/// query parameters are read through, so a client that addresses its destination either way
+/// reaches the same resource and is refused the same way.
+#[must_use]
+pub fn named_destination<S: Into<String>>(
+    log_group: Option<S>,
+    log_stream: Option<S>,
+) -> Option<Destination> {
+    let named = |value: Option<S>| {
+        value
+            .map(Into::into)
+            .map(|value: String| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
     Some(Destination {
-        log_group: read(LOG_GROUP_PARAMETER)?,
-        log_stream: read(LOG_STREAM_PARAMETER)?,
+        log_group: named(log_group)?,
+        log_stream: named(log_stream)?,
     })
 }
 
@@ -147,8 +214,10 @@ pub struct ReadRecords {
 
 /// The records `body` carries, read in the form `endpoint` serves.
 ///
-/// A body is a single record or an ARRAY of them in both forms, because a client ships one
-/// event or a batch of them over the same endpoint.
+/// A body is a single record or an ARRAY of them in the two record-shaped forms, because a
+/// client ships one event or a batch of them over the same endpoint; in the OpenTelemetry
+/// form it is ONE export document and the records are the log records nested inside it
+/// ([`open_telemetry_log_records`]).
 ///
 /// At most one record PAST [`MAX_RECORDS_PER_REQUEST`] is read: a batch that carries more
 /// than the maximum is refused whole, so one record past it is all that has to be seen and
@@ -161,9 +230,12 @@ pub fn read_records(endpoint: Endpoint, body: &[u8]) -> ReadRecords {
             unreadable: 1,
         };
     };
-    let items: Vec<&Value> = match &document {
-        Value::Array(items) => items.iter().take(MAX_RECORDS_PER_REQUEST + 1).collect(),
-        other => vec![other],
+    let items: Vec<&Value> = match endpoint {
+        Endpoint::OpenTelemetry => open_telemetry_log_records(&document),
+        Endpoint::HttpLogCollector | Endpoint::StructuredJson => match &document {
+            Value::Array(items) => items.iter().take(MAX_RECORDS_PER_REQUEST + 1).collect(),
+            other => vec![other],
+        },
     };
     let mut read = ReadRecords::default();
     for item in items {
@@ -175,14 +247,38 @@ pub fn read_records(endpoint: Endpoint, body: &[u8]) -> ReadRecords {
     read
 }
 
+/// The log records one OTLP logs export document carries, in the order it lists them.
+///
+/// The encoding nests them three levels deep — `resourceLogs[].scopeLogs[].logRecords[]` —
+/// so one request ships the records of several resources and scopes together; what is
+/// ingested is every log record of all of them, because each one is one log event. A
+/// document that nests no log record carries nothing to ingest, which is the empty list.
+fn open_telemetry_log_records(document: &Value) -> Vec<&Value> {
+    nested_items(document, RESOURCE_LOGS_MEMBER)
+        .iter()
+        .flat_map(|resource| nested_items(resource, SCOPE_LOGS_MEMBER))
+        .flat_map(|scope| nested_items(scope, LOG_RECORDS_MEMBER))
+        .take(MAX_RECORDS_PER_REQUEST + 1)
+        .collect()
+}
+
+/// The entries one member of a document lists, or nothing when the member is absent or is
+/// not a list — a level of the OpenTelemetry nesting that names none carries no record.
+fn nested_items<'a>(value: &'a Value, member: &str) -> &'a [Value] {
+    value
+        .get(member)
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+}
+
 /// One record, or `None` when the item carries no log event in the form `endpoint` serves.
 ///
 /// What is STORED is the record itself, as its own JSON text: each form ships one document
-/// per log event — the `event` member carries the event in one and the `message` member in
-/// the other, beside the instant the record states — so what a reader gets back is that
-/// document, canonically spelled, and not one member lifted out of it. The member order the
-/// record arrived in is part of the document and is kept (this crate reads JSON with
-/// `serde_json`'s `preserve_order`).
+/// per log event — the `event` member carries the event in one, the `message` member in the
+/// next and the `body` member in the OpenTelemetry one, beside the instant the record states
+/// — so what a reader gets back is that document, canonically spelled, and not one member
+/// lifted out of it. The member order the record arrived in is part of the document and is
+/// kept (this crate reads JSON with `serde_json`'s `preserve_order`).
 fn record_of(endpoint: Endpoint, item: &Value) -> Option<Record> {
     let object = item.as_object()?;
     let timestamp = match endpoint {
@@ -204,6 +300,21 @@ fn record_of(endpoint: Endpoint, item: &Value) -> Option<Record> {
             // one.
             object.get(TIMESTAMP_MEMBER).and_then(millis_of)
         }
+        Endpoint::OpenTelemetry => {
+            object.get(BODY_MEMBER)?;
+            // Both instants this form spells are NANOSECONDS since the epoch, and the
+            // observed one is what a record that states no `timeUnixNano` states for
+            // itself; a client writes either as a JSON number or, as the encoding spells a
+            // 64-bit integer, as a string.
+            object
+                .get(TIME_UNIX_NANO_MEMBER)
+                .and_then(nanos_as_millis)
+                .or_else(|| {
+                    object
+                        .get(OBSERVED_TIME_UNIX_NANO_MEMBER)
+                        .and_then(nanos_as_millis)
+                })
+        }
     };
     Some(Record {
         timestamp,
@@ -222,6 +333,12 @@ fn seconds_as_millis(value: &Value) -> Option<i64> {
 /// member counts and in nothing else.
 fn millis_of(value: &Value) -> Option<i64> {
     scaled(value, 1.0)
+}
+
+/// A number of NANOSECONDS since the epoch as those same milliseconds, read from the same
+/// spellings: the OpenTelemetry form differs from the other two in its UNIT alone.
+fn nanos_as_millis(value: &Value) -> Option<i64> {
+    scaled(value, MILLIS_PER_NANOSECOND)
 }
 
 /// `value`, read as a number or as a string spelling one, multiplied by `factor` and
@@ -502,7 +619,7 @@ mod tests {
         );
     }
 
-    /// RULE: only the two paths the endpoints are served at name an endpoint, and a
+    /// RULE: only the paths the endpoints are served at name an endpoint, and a
     /// trailing slash addresses the same one.
     #[test]
     fn only_the_served_paths_name_an_endpoint() {
@@ -511,9 +628,13 @@ mod tests {
             ("/services/collector/event/", Some(Endpoint::HttpLogCollector)),
             (STRUCTURED_JSON_PATH, Some(Endpoint::StructuredJson)),
             ("/ingest/json/", Some(Endpoint::StructuredJson)),
+            (OPEN_TELEMETRY_PATH, Some(Endpoint::OpenTelemetry)),
+            ("/v1/logs/", Some(Endpoint::OpenTelemetry)),
             ("/services/collector", None),
             ("/services/collector/raw", None),
             ("/ingest", None),
+            ("/v1", None),
+            ("/v1/metrics", None),
             ("/", None),
         ];
         for (path, expected) in rows {
@@ -627,5 +748,102 @@ mod tests {
             },
             "case unreadable: got {unreadable:?}"
         );
+    }
+
+    /// RULE: an OpenTelemetry body is ONE export document, whose records are every log
+    /// record nested under its resources and scopes; a record with no body carries nothing
+    /// to ingest, and a document nesting no log record carries nothing at all.
+    #[test]
+    fn an_open_telemetry_body_is_every_log_record_it_nests() {
+        let nested = read_records(
+            Endpoint::OpenTelemetry,
+            br#"{"resourceLogs": [
+                   {"scopeLogs": [
+                      {"logRecords": [
+                         {"timeUnixNano": "1700000000000000000", "body": {"stringValue": "a"}},
+                         {"observedTimeUnixNano": 1700000000500000000, "body": {"stringValue": "b"}},
+                         {"timeUnixNano": "1700000001000000000"}
+                      ]},
+                      {"logRecords": [{"body": {"stringValue": "c"}}]}
+                   ]},
+                   {"scopeLogs": [{"logRecords": [{"body": {"stringValue": "d"}}]}]}
+                 ]}"#,
+        );
+        assert_eq!(
+            nested
+                .records
+                .iter()
+                .map(|record| record.timestamp)
+                .collect::<Vec<_>>(),
+            vec![
+                Some(1_700_000_000_000),
+                Some(1_700_000_000_500),
+                None,
+                None
+            ],
+            "case nested records: expected each record's own instant in milliseconds, \
+             got {nested:?}"
+        );
+        assert_eq!(
+            nested
+                .records
+                .iter()
+                .map(|record| record.message.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                r#"{"timeUnixNano":"1700000000000000000","body":{"stringValue":"a"}}"#,
+                r#"{"observedTimeUnixNano":1700000000500000000,"body":{"stringValue":"b"}}"#,
+                r#"{"body":{"stringValue":"c"}}"#,
+                r#"{"body":{"stringValue":"d"}}"#,
+            ],
+            "case nested records: expected the documents they arrived as, got {nested:?}"
+        );
+        assert_eq!(
+            nested.unreadable, 1,
+            "case nested records: the record with no body carries nothing, got {nested:?}"
+        );
+        for (case, body) in [
+            ("no resourceLogs at all", &br#"{}"#[..]),
+            ("an empty resourceLogs", &br#"{"resourceLogs": []}"#[..]),
+            (
+                "a scope nesting no log record",
+                &br#"{"resourceLogs": [{"scopeLogs": [{"logRecords": []}]}]}"#[..],
+            ),
+        ] {
+            let read = read_records(Endpoint::OpenTelemetry, body);
+            assert_eq!(
+                read,
+                ReadRecords::default(),
+                "case {case}: expected nothing to ingest, got {read:?}"
+            );
+        }
+    }
+
+    /// RULE: a destination is the log group AND the log stream a request names, whether it
+    /// names them in the headers or in the query string; one name alone addresses nothing.
+    #[test]
+    fn a_destination_is_both_names_however_they_are_given() {
+        let named = named_destination(Some("group"), Some("stream"));
+        assert_eq!(
+            named,
+            Some(Destination {
+                log_group: "group".to_string(),
+                log_stream: "stream".to_string(),
+            }),
+            "case both headers: expected the named pair, got {named:?}"
+        );
+        for (case, group, stream) in [
+            ("no group", None, Some("stream")),
+            ("no stream", Some("group"), None),
+            ("neither", None, None),
+            ("a blank group", Some("  "), Some("stream")),
+            ("a blank stream", Some("group"), Some("")),
+        ] {
+            let actual = named_destination(group, stream);
+            assert!(
+                actual.is_none(),
+                "case {case}: expected no destination, got {actual:?}"
+            );
+        }
     }
 }

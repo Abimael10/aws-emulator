@@ -332,17 +332,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ));
                 }
                 // "An account can have a maximum of 10 policies without resourceARN."
-                // Replacing a policy that already exists is an update, not a new one.
+                // Replacing a policy that already exists is an update, not a new one. The
+                // refusal is the limit class's own fixed sentence
+                // ([`crate::state::LIMIT_EXCEEDED_MESSAGE`]), which names neither the quota
+                // nor the resource whose slots are full.
                 if !store.account_resource_policies.contains_key(policy_name)
                     && store.account_resource_policies.len()
                         >= crate::state::MAX_ACCOUNT_RESOURCE_POLICIES
                 {
                     return Err(PutResourcePolicyErrorModeled::LimitExceededException(
                         LimitExceededException {
-                            message: Some(format!(
-                                "an account can have a maximum of {} resource policies without a resourceArn",
-                                crate::state::MAX_ACCOUNT_RESOURCE_POLICIES
-                            )),
+                            message: Some(crate::state::LIMIT_EXCEEDED_MESSAGE.to_string()),
                         },
                     )
                     .into());

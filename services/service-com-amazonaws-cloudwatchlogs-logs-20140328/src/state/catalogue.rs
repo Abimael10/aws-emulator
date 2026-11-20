@@ -493,11 +493,20 @@ pub const RETENTION_IN_DAYS_VALUES: [i32; 22] = [
 pub const MAX_SUBSCRIPTION_FILTERS_PER_GROUP: usize = 5;
 
 /// The refusal CloudWatch Logs answers when a request would take the account, or one log
-/// group, past the resources it may hold at one time: the subscription filters one group can
-/// have attached ([`MAX_SUBSCRIPTION_FILTERS_PER_GROUP`]), or the single export task an
-/// account can have active ([`ExportTaskRecord::is_active`]). The text is FIXED for the error
-/// class — it names neither the limit that was reached, nor anything from the request, nor the
-/// resource holding the slot — so every refusal of that class reads identically.
+/// group, past the resources AWS DOCUMENTS it may hold at one time: the resource policies an
+/// account may hold without a `resourceArn` ([`MAX_ACCOUNT_RESOURCE_POLICIES`]), its log
+/// groups ([`MAX_LOG_GROUPS`]) and its single integration ([`MAX_INTEGRATIONS`]), the metric
+/// filters ([`MAX_METRIC_FILTERS_PER_GROUP`]) and subscription filters
+/// ([`MAX_SUBSCRIPTION_FILTERS_PER_GROUP`]) one group can have attached, and the single
+/// export task an account can have active ([`ExportTaskRecord::is_active`]). The text is
+/// FIXED for the error class — it names neither the limit that was reached, nor anything
+/// from the request, nor the resource holding the slot — so every refusal of that class
+/// reads identically.
+///
+/// A ceiling THIS EMULATOR sets on what it retains, which AWS has no quota for and therefore
+/// no sentence for ([`MAX_ANOMALY_DETECTORS`], [`MAX_QUERY_DEFINITIONS`],
+/// [`MAX_LOOKUP_TABLES`], [`MAX_LOOKUP_TABLE_BYTES_TOTAL`]), is refused with its own
+/// sentence naming that ceiling instead, so a caller can tell the two apart.
 pub const LIMIT_EXCEEDED_MESSAGE: &str = "Resource limit exceeded.";
 
 /// The destinations `PutSubscriptionFilter` documents as supported, as the service

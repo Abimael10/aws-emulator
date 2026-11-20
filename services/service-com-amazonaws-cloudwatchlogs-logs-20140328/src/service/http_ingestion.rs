@@ -112,6 +112,21 @@ fn query_of(uri: &str) -> Option<&str> {
     uri.split_once('?').map(|(_, query)| query)
 }
 
+/// WHERE a request's records go: the destination its HEADERS name, or the one its query
+/// string names.
+///
+/// One rule over every form these endpoints serve: a client that ships a body of its own
+/// addresses its destination in the headers CloudWatch Logs reads it from, and one that
+/// ships records addresses it in the query string, so both are read and neither form is tied
+/// to one of them.
+fn addressed_destination(req: &RtRequest) -> Option<ingestion::Destination> {
+    ingestion::named_destination(
+        req.headers().get(ingestion::LOG_GROUP_HEADER),
+        req.headers().get(ingestion::LOG_STREAM_HEADER),
+    )
+    .or_else(|| ingestion::destination(query_of(req.uri())))
+}
+
 /// The bearer token a request presents, or `None` when it presents no bearer credential.
 ///
 /// STRICT, which is why `service_common::jwt::without_bearer_scheme` is not what reads it:
@@ -234,9 +249,10 @@ impl<Eng: Send + Sync + 'static> HttpIngestion<Eng> {
             return self.forbidden(None);
         };
         // WHERE the records go: a record is ingested into a log stream of a log group, so a
-        // request whose query names neither addresses no destination at all — which is a
-        // fault of the ADDRESSING rather than of the batch, and is reported as one.
-        let Some(destination) = ingestion::destination(query_of(req.uri())) else {
+        // request that names neither in its headers nor in its query string addresses no
+        // destination at all — which is a fault of the ADDRESSING rather than of the batch,
+        // and is reported as one.
+        let Some(destination) = addressed_destination(req) else {
             return self.refused(
                 BAD_REQUEST_STATUS,
                 &ingestion::no_destination_message(),

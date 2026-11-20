@@ -336,16 +336,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The maximum number of metric filters that can be associated with a log group is
         // 100" — and a put under a name the group already holds is an UPDATE of that
-        // filter, so only a put that would ADD one can exceed the quota.
+        // filter, so only a put that would ADD one can exceed the quota. The refusal is the
+        // limit class's own fixed sentence, which names neither the quota nor the group
+        // whose slots are full.
         if !group.metric_filters.contains_key(&input.filter_name)
             && group.metric_filters.len() >= crate::state::MAX_METRIC_FILTERS_PER_GROUP
         {
             return Err(PutMetricFilterErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "a log group can have up to {} metric filters associated with it",
-                        crate::state::MAX_METRIC_FILTERS_PER_GROUP
-                    )),
+                    message: Some(crate::state::LIMIT_EXCEEDED_MESSAGE.to_string()),
                 },
             )
             .into());

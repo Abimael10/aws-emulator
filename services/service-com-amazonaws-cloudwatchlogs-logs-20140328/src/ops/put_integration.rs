@@ -274,14 +274,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Currently you can have only one integration in your account" — the account's
         // integration limit, answered with the `LimitExceededException` this operation
-        // models ("You have reached the maximum number of resources that can be created").
+        // models, carrying that class's own fixed sentence.
         if store.integrations.len() >= crate::state::MAX_INTEGRATIONS {
             return Err(PutIntegrationErrorModeled::LimitExceededException(
                 LimitExceededException {
-                    message: Some(format!(
-                        "the maximum of {} integration(s) per account has been reached",
-                        crate::state::MAX_INTEGRATIONS
-                    )),
+                    message: Some(crate::state::LIMIT_EXCEEDED_MESSAGE.to_string()),
                 },
             )
             .into());

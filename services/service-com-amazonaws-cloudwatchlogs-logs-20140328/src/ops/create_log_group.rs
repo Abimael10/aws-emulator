@@ -240,11 +240,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             let store = state.lock();
 
-            // "You can create up to 1,000,000 log groups per Region per account."
+            // "You can create up to 1,000,000 log groups per Region per account." The
+            // refusal is the limit class's own fixed sentence, which names neither the
+            // quota nor the resource whose slots are full.
             if store.log_groups.len() >= crate::state::MAX_LOG_GROUPS {
                 return Err(CreateLogGroupErrorModeled::LimitExceededException(
                     LimitExceededException {
-                        message: Some(crate::state::log_groups_quota_message()),
+                        message: Some(crate::state::LIMIT_EXCEEDED_MESSAGE.to_string()),
                     },
                 )
                 .into());

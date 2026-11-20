@@ -24,12 +24,15 @@ use serde_json::{json, Value};
 use crate::delivery_identity_authorization::{form_encode, statement, xml_element, Emulator};
 use crate::harness::{messages, now_ms};
 
-/// The two paths the endpoints are served at.
-const COLLECTOR_PATH: &str = "/services/collector/event";
-const STRUCTURED_JSON_PATH: &str = "/ingest/json";
+/// The two paths the record-shaped endpoints are served at.
+///
+/// `pub(crate)` because the suite about the OpenTelemetry form drives the same surface and
+/// states these paths once rather than transcribing them again.
+pub(crate) const COLLECTOR_PATH: &str = "/services/collector/event";
+pub(crate) const STRUCTURED_JSON_PATH: &str = "/ingest/json";
 
 /// The IAM `ServiceName` a CloudWatch Logs API key is created for.
-const LOGS_API_KEY_SERVICE: &str = "logs.amazonaws.com";
+pub(crate) const LOGS_API_KEY_SERVICE: &str = "logs.amazonaws.com";
 
 /// A service whose service-specific credentials are NOT CloudWatch Logs API keys, for the
 /// row that presents one of those instead.
@@ -57,16 +60,18 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 /// One IAM user holding one CloudWatch Logs API key: the key's secret, which is the bearer
 /// credential a client presents, and the credential's id, so a row can make it inactive or
 /// delete it.
-struct ApiKey {
-    user: String,
-    id: String,
-    secret: String,
+///
+/// `pub(crate)` because the OpenTelemetry suite authenticates with a key made the same way.
+pub(crate) struct ApiKey {
+    pub(crate) user: String,
+    pub(crate) id: String,
+    pub(crate) secret: String,
 }
 
 /// Create an IAM user holding the grant every ingesting client needs — `logs:PutLogEvents`
 /// on this service's resources — and issue it a service-specific credential for
 /// `service_name`.
-async fn api_key(aws: &Emulator, user: &str, service_name: &str) -> ApiKey {
+pub(crate) async fn api_key(aws: &Emulator, user: &str, service_name: &str) -> ApiKey {
     api_key_granted(
         aws,
         user,
@@ -134,7 +139,7 @@ async fn api_key_granted(
 
 /// A log group with bearer token authentication enabled and one log stream in it, and a
 /// retention period where one is given.
-async fn ingestible_group(
+pub(crate) async fn ingestible_group(
     aws: &Emulator,
     group: &str,
     stream: &str,
@@ -159,7 +164,7 @@ async fn ingestible_group(
 
 /// Enable or disable bearer token authentication on `group`, through the operation that
 /// owns that state.
-async fn bearer_token_authentication(aws: &Emulator, group: &str, enabled: bool) {
+pub(crate) async fn bearer_token_authentication(aws: &Emulator, group: &str, enabled: bool) {
     aws.ok(
         "PutBearerTokenAuthentication",
         &json!({"logGroupIdentifier": group, "bearerTokenAuthenticationEnabled": enabled}),
@@ -198,7 +203,7 @@ async fn post(
 }
 
 /// The messages `GetLogEvents` reads back from `group`/`stream`, oldest first.
-async fn stored(aws: &Emulator, group: &str, stream: &str) -> Vec<String> {
+pub(crate) async fn stored(aws: &Emulator, group: &str, stream: &str) -> Vec<String> {
     let page = aws
         .ok(
             "GetLogEvents",
@@ -209,7 +214,7 @@ async fn stored(aws: &Emulator, group: &str, stream: &str) -> Vec<String> {
 }
 
 /// The events `GetLogEvents` reads back, as `(timestamp, message)` pairs.
-async fn stored_events(aws: &Emulator, group: &str, stream: &str) -> Vec<(i64, String)> {
+pub(crate) async fn stored_events(aws: &Emulator, group: &str, stream: &str) -> Vec<(i64, String)> {
     let page = aws
         .ok(
             "GetLogEvents",
