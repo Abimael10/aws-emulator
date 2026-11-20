@@ -236,18 +236,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // batch is refused with `InvalidInputException` BEFORE any item is applied, so a
         // batch carrying one such item creates nothing and reports no `Errors` list at
         // all. The refusal is the same fixed sentence a single-partition create is refused
-        // with, in either direction of the mismatch: it discloses neither count.
+        // with, chosen by the one reading both share
+        // (`crate::state::PartitionCreateRefusal::for_value_count`): it discloses neither
+        // count, and a table declaring no partition keys at all is worded apart from a
+        // partitioned table whose key count the list missed.
         let keys = table.partition_key_count();
-        if input
+        if let Some(refusal) = input
             .partition_input_list
             .iter()
-            .any(|requested| requested.values.as_ref().map_or(0, Vec::len) != keys)
+            .find_map(|requested| {
+                crate::state::PartitionCreateRefusal::for_value_count(
+                    keys,
+                    requested.values.as_ref().map_or(0, Vec::len),
+                )
+            })
         {
             return Err(BatchCreatePartitionErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some(
-                        crate::state::messages::PARTITION_KEYS_DO_NOT_MATCH_VALUES.to_string(),
-                    ),
+                    message: Some(refusal.message()),
                     from_federation_source: None,
                 },
             )

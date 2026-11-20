@@ -557,37 +557,37 @@ async fn a_refused_update_leaves_the_stored_definition_unchanged() {
             "a bare cron body",
             "SCHEDULED",
             json!({ "Schedule": "15 12 * * ? *", "Actions": actions }),
-            messages::schedule_not_a_cron_expression("15 12 * * ? *"),
+            messages::trigger_schedule_invalid("15 12 * * ? *"),
         ),
         (
             "a rate expression",
             "SCHEDULED",
             json!({ "Schedule": "rate(5 minutes)", "Actions": actions }),
-            messages::schedule_not_a_cron_expression("rate(5 minutes)"),
+            messages::trigger_schedule_invalid("rate(5 minutes)"),
         ),
         (
             "too few cron fields",
             "SCHEDULED",
             json!({ "Schedule": "cron(15 12 * * ?)", "Actions": actions }),
-            messages::schedule_not_a_cron_expression("cron(15 12 * * ?)"),
+            messages::trigger_schedule_invalid("cron(15 12 * * ?)"),
         ),
         (
             "too many cron fields",
             "SCHEDULED",
             json!({ "Schedule": "cron(15 12 * * ? * *)", "Actions": actions }),
-            messages::schedule_not_a_cron_expression("cron(15 12 * * ? * *)"),
+            messages::trigger_schedule_invalid("cron(15 12 * * ? * *)"),
         ),
         (
             "an unclosed cron expression",
             "SCHEDULED",
             json!({ "Schedule": "cron(15 12 * * ? *", "Actions": actions }),
-            messages::schedule_not_a_cron_expression("cron(15 12 * * ? *"),
+            messages::trigger_schedule_invalid("cron(15 12 * * ? *"),
         ),
         (
             "the empty schedule",
             "SCHEDULED",
             json!({ "Schedule": "", "Actions": actions }),
-            messages::schedule_not_a_cron_expression(""),
+            messages::trigger_schedule_invalid(""),
         ),
         (
             // A conditional trigger is as refusable for its schedule as a scheduled one:
@@ -599,7 +599,7 @@ async fn a_refused_update_leaves_the_stored_definition_unchanged() {
                 "Predicate": { "Conditions": one_condition },
                 "Actions": actions,
             }),
-            messages::schedule_not_a_cron_expression("every day"),
+            messages::trigger_schedule_invalid("every day"),
         ),
     ];
 

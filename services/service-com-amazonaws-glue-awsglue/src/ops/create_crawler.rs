@@ -231,7 +231,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !crate::state::has_crawl_target(&input.targets) {
             return Err(CreateCrawlerErrorModeled::InvalidInputException(
                 InvalidInputException {
-                    message: Some("Targets must specify at least one crawl target".to_string()),
+                    message: Some(
+                        crate::state::messages::CRAWLER_TARGETS_NOT_DEFINED.to_string(),
+                    ),
                     from_federation_source: None,
                 },
             )

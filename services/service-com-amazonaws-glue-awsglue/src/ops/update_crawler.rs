@@ -235,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|targets| !crate::state::has_crawl_target(targets))
         {
             return Err(invalid_input(
-                "Targets must specify at least one crawl target".to_string(),
+                crate::state::messages::CRAWLER_TARGETS_NOT_DEFINED.to_string(),
             ));
         }
 

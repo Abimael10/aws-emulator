@@ -395,17 +395,17 @@ async fn the_role_is_judged_before_every_other_member_of_the_request() {
         (
             "no Targets member at all",
             json!({ "Targets": {} }),
-            "Targets must specify at least one crawl target",
+            "Targets are not defined",
         ),
         (
             "a Targets whose S3 list is empty",
             json!({ "Targets": { "S3Targets": [] } }),
-            "Targets must specify at least one crawl target",
+            "Targets are not defined",
         ),
         (
             "a Targets whose every list is empty",
             json!({ "Targets": { "S3Targets": [], "JdbcTargets": [], "DynamoDBTargets": [] } }),
-            "Targets must specify at least one crawl target",
+            "Targets are not defined",
         ),
         (
             "a Schedule that is no cron expression",

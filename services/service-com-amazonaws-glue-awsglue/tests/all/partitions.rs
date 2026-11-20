@@ -23,7 +23,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::messages::{
-    PARTITION_KEYS_DO_NOT_MATCH_VALUES, PARTITION_NOT_FOUND,
+    PARTITIONS_IN_UNPARTITIONED_TABLE, PARTITION_KEYS_DO_NOT_MATCH_VALUES, PARTITION_NOT_FOUND,
 };
 use service_com_amazonaws_glue_awsglue::state::MAX_PARTITIONS_PER_TABLE;
 use smithy_server_runtime::MultiServiceRouter;
@@ -520,6 +520,10 @@ struct ArityCase {
     /// The batch's `PartitionInputList`, at least one item of which carries a value count
     /// other than the table's key count.
     inputs: Vec<Value>,
+    /// The fixed sentence the condition is refused with: the arity sentence for a
+    /// PARTITIONED table whose key count an item missed, and the unpartitioned-table
+    /// sentence for a table that defines no partition keys at all.
+    expected_message: &'static str,
     /// Value lists a read must NOT serve after the refused batch, because a refused
     /// request creates nothing at all — including the items that were well-formed.
     created_nothing: Vec<Vec<&'static str>>,
@@ -530,9 +534,9 @@ struct ArityCase {
 /// partition key of its table, so such an item describes a slice of no table and the
 /// request is malformed rather than partly servable. The response carries no `Errors` list
 /// at all, and nothing is created — not even the items of the same batch that were
-/// well-formed. The refusal's message is the one FIXED sentence for the condition: it
-/// varies with nothing the request or the table carries, so every row below is answered
-/// with the same text.
+/// well-formed. The refusal's message is a FIXED sentence for the condition: it varies with
+/// nothing the request or the table carries, and a table declaring NO partition keys is
+/// refused with the service's own sentence for that table rather than with the arity one.
 ///
 /// The rows differ along how the count is wrong (fewer values than keys, more values than
 /// keys, no `Values` member at all, a value for a table that defines no partition keys),
@@ -547,24 +551,28 @@ async fn an_arity_mismatch_refuses_the_whole_request() {
             case: "fewer values than the table has partition keys",
             keys: vec!["dt", "region"],
             inputs: vec![json!({ "Values": ["2026-01-01"] })],
+            expected_message: PARTITION_KEYS_DO_NOT_MATCH_VALUES,
             created_nothing: vec![vec!["2026-01-01", "us-east-1"]],
         },
         ArityCase {
             case: "more values than the table has partition keys",
             keys: vec!["dt"],
             inputs: vec![json!({ "Values": ["2026-01-01", "us-east-1"] })],
+            expected_message: PARTITION_KEYS_DO_NOT_MATCH_VALUES,
             created_nothing: vec![vec!["2026-01-01"]],
         },
         ArityCase {
             case: "an input that names no values at all",
             keys: vec!["dt"],
             inputs: vec![json!({ "Parameters": { "classification": "csv" } })],
+            expected_message: PARTITION_KEYS_DO_NOT_MATCH_VALUES,
             created_nothing: vec![vec!["2026-01-01"]],
         },
         ArityCase {
             case: "a table that defines no partition keys",
             keys: vec![],
             inputs: vec![json!({ "Values": ["2026-01-01"] })],
+            expected_message: PARTITIONS_IN_UNPARTITIONED_TABLE,
             created_nothing: vec![vec!["2026-01-01"]],
         },
         ArityCase {
@@ -575,6 +583,7 @@ async fn an_arity_mismatch_refuses_the_whole_request() {
                 json!({ "Values": ["2026-01-02"] }),
                 json!({ "Values": ["2026-01-03", "extra"] }),
             ],
+            expected_message: PARTITION_KEYS_DO_NOT_MATCH_VALUES,
             created_nothing: vec![vec!["2026-01-01"], vec!["2026-01-02"]],
         },
         ArityCase {
@@ -584,6 +593,7 @@ async fn an_arity_mismatch_refuses_the_whole_request() {
                 json!({ "Values": ["2026", "01"] }),
                 json!({ "Values": ["2026", "01", "02"] }),
             ],
+            expected_message: PARTITION_KEYS_DO_NOT_MATCH_VALUES,
             created_nothing: vec![vec!["2026", "01", "02"]],
         },
     ];
@@ -619,8 +629,8 @@ async fn an_arity_mismatch_refuses_the_whole_request() {
         );
         assert_eq!(
             error_message(&body),
-            PARTITION_KEYS_DO_NOT_MATCH_VALUES,
-            "case {case}: the arity refusal must be the fixed sentence for the condition, \
+            row.expected_message,
+            "case {case}: the refusal must be the fixed sentence for the condition, \
              whatever the counts; got {body}"
         );
 

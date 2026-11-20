@@ -72,19 +72,34 @@ pub fn scheduler_not_running(name: &str) -> String {
 /// crawler. The refusal is the operation's modelled `NoScheduleException`.
 pub const NO_SCHEDULE_FOUND: &str = "No schedule found.";
 
-/// A write whose `Schedule` is not the `cron(..)` expression the service
+/// A CRAWLER-surface write whose `Schedule` is not the `cron(..)` expression the service
 /// documents ([`super::is_cron_expression`]). NOT recorded: what is pinned is the
 /// behaviour — 400 with the operation's modelled `InvalidInputException` — and a
 /// sentence carrying only the requested expression plus the form it has to take.
-/// Shared by every operation that writes that member (`CreateCrawler`,
-/// `UpdateCrawler`, `UpdateCrawlerSchedule`, `CreateTrigger`), so one refusal cannot
-/// drift from another's.
+/// Shared by every crawler-surface operation that writes that member (`CreateCrawler`,
+/// `UpdateCrawler`, `UpdateCrawlerSchedule`, and the column statistics task settings,
+/// which schedule a run the same way), so one refusal cannot drift from another's.
+///
+/// The TRIGGER surface words the same defect its own way
+/// ([`trigger_schedule_invalid`]), which is why the two are not one string.
 pub fn schedule_not_a_cron_expression(expression: &str) -> String {
     format!(
         "Schedule {expression} is not a cron expression of the form \
              cron(<minutes> <hours> <day-of-month> <month> <day-of-week> <year>)"
     )
 }
+
+/// `CreateCrawler` (and the `UpdateCrawler` that would replace a crawler's targets with
+/// none) whose `CrawlerTargets` names no crawl target at all — no `S3Targets`,
+/// `JdbcTargets`, `DynamoDBTargets`, or any other target list the shape carries
+/// ([`super::has_crawl_target`]), whether the member is absent, empty, or carries only
+/// empty lists.
+///
+/// RECORDED constant, and the whole message: the service states that the targets are not
+/// defined and names neither the crawler the request asked for nor the lists it looked in,
+/// so a client recognises the condition by the wording whichever crawler write reported it.
+/// No trailing full stop, as recorded.
+pub const CRAWLER_TARGETS_NOT_DEFINED: &str = "Targets are not defined";
 
 /// `CreateCrawler` for a name already taken. NOT recorded: inferred from the
 /// recorded `CreateDatabase` duplicate, whose already-exists wording states the
@@ -397,6 +412,20 @@ pub fn already_submitted_with_different_configuration(resource: &str) -> String 
 /// submitted it.
 pub fn trigger_member_required(member: &str) -> String {
     format!("{member} cannot be null or empty")
+}
+
+/// A trigger definition whose `Schedule` is not the `cron(..)` expression the member
+/// documents ("a `cron` expression used to specify the schedule",
+/// `CreateTriggerRequest$Schedule`), on the create that would store it or the update that
+/// would overwrite one with it ([`super::is_cron_expression`]).
+///
+/// RECORDED template: the fixed text `The schedule ` and ` is invalid.` around ONE variable
+/// part, the expression the request sent, taken verbatim. The TRIGGER surface words this
+/// defect its own way; the crawler surface keeps its own sentence
+/// ([`schedule_not_a_cron_expression`]), so a client can tell which surface refused its
+/// schedule.
+pub fn trigger_schedule_invalid(expression: &str) -> String {
+    format!("The schedule {expression} is invalid.")
 }
 
 /// A CONDITIONAL trigger definition naming one job both in a condition of its
@@ -1096,11 +1125,14 @@ pub fn federation_source_not_registered(source: &str) -> String {
     format!("The data source [{source}] is not registered.")
 }
 
-/// `CreateCatalog` for a `Name` the account already holds a catalog under. NOT
-/// recorded: inferred from the recorded `CreateDatabase` duplicate, like
-/// [`CRAWLER_ALREADY_EXISTS`] — 400, `AlreadyExistsException`, and no disclosure of
-/// the requested name.
-pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists.";
+/// `CreateCatalog` for a `Name` the account already holds a catalog under.
+///
+/// RECORDED constant, and the whole message: the sentence is fixed text that names the
+/// resource kind and withholds the requested name, and it carries NO trailing full stop —
+/// unlike the database duplicate ([`DATABASE_ALREADY_EXISTS`]), whose own recorded wording
+/// ends in one. One character of fixed text is still fixed text, so the two are two
+/// strings rather than one.
+pub const CATALOG_ALREADY_EXISTS: &str = "Catalog already exists";
 
 /// `CreateCatalog` whose `Name` is the account's own id. Stated by the model: the
 /// catalog's name "Cannot be the same as the account ID" (`Catalog$Name`), because
@@ -2062,6 +2094,18 @@ pub const PARTITION_VALUES_REQUIRED: &str = "PartitionInput must specify Values.
 pub const PARTITION_KEYS_DO_NOT_MATCH_VALUES: &str =
     "The number of partition keys do not match the number of partition values";
 
+/// A partition create addressed at a table that declares NO partition keys at all, so no
+/// value list names a slice of it.
+///
+/// RECORDED constant, and the whole message: the sentence is fixed and names neither the
+/// table nor the values the request sent. It is a DIFFERENT sentence from the arity refusal
+/// a partitioned table answers ([`PARTITION_KEYS_DO_NOT_MATCH_VALUES`]): a table with no
+/// partition keys holds no partitions whatever is sent, while a partitioned table refuses
+/// only the lists whose length is not its key count, and the service words the two
+/// conditions apart.
+pub const PARTITIONS_IN_UNPARTITIONED_TABLE: &str =
+    "Cannot create partitions in table without partition keys";
+
 /// A partition create for a value list the addressed table already holds a partition
 /// for. NOT recorded: inferred from the recorded `CreateDatabase` duplicate, like
 /// [`TABLE_ALREADY_EXISTS`] — `AlreadyExistsException`, and no disclosure of the
@@ -2177,12 +2221,16 @@ pub fn usage_profile_not_found(name: &str) -> String {
     format!("UsageProfile {name} does not exists")
 }
 
-/// A session create for an `Id` this Region already holds a session under. NOT
-/// recorded: the sentence follows the per-resource template of [`session_not_found`],
-/// built from the id the request sent, which is the whole address of a session, and the
-/// behaviour it goes with is 400 with the create's modelled `AlreadyExistsException`.
+/// A session create for an `Id` this Region already holds a session under — whatever the
+/// rest of the request carries: the same definition again, a different one, or a different
+/// idempotency token.
+///
+/// RECORDED template: the fixed text `Session already created, sessionId=` and ONE variable
+/// part, the `Id` the request sent, taken verbatim (no trailing full stop). The id is the
+/// whole address of a session and the client's own value, so the sentence states which
+/// create collided.
 pub fn session_already_exists(id: &str) -> String {
-    format!("Session {id} already exists.")
+    format!("Session already created, sessionId={id}")
 }
 
 /// A session create whose `GlueVersion` fails the restriction the model states for it

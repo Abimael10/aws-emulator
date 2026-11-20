@@ -245,7 +245,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let message = Some(refusal.message());
                 Err(match refusal {
                     crate::state::PartitionCreateRefusal::ValuesRequired
-                    | crate::state::PartitionCreateRefusal::ValuesDoNotMatchPartitionKeys => {
+                    | crate::state::PartitionCreateRefusal::ValuesDoNotMatchPartitionKeys
+                    | crate::state::PartitionCreateRefusal::TableHasNoPartitionKeys => {
                         CreatePartitionErrorModeled::InvalidInputException(
                             InvalidInputException {
                                 message,

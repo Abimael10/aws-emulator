@@ -520,10 +520,11 @@ pub fn trigger_definition_refusal(
     }
 
     // Anything but a `cron(<six fields>)` expression is not a schedule this service can
-    // run, so it is refused rather than stored and reported back.
+    // run, so it is refused rather than stored and reported back. The trigger surface words
+    // this refusal its own way (`messages::trigger_schedule_invalid`).
     if let Some(schedule) = schedule {
         if !is_cron_expression(schedule) {
-            return Some(messages::schedule_not_a_cron_expression(schedule));
+            return Some(messages::trigger_schedule_invalid(schedule));
         }
     }
 

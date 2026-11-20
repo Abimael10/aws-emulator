@@ -1048,6 +1048,11 @@ pub enum PartitionCreateRefusal {
     /// name a slice of this table. Carries neither count, because the refusal discloses
     /// neither ([`messages::PARTITION_KEYS_DO_NOT_MATCH_VALUES`]).
     ValuesDoNotMatchPartitionKeys,
+    /// The table declares NO partition keys, so it holds no partitions at all and no value
+    /// list can name a slice of it. Worded apart from the arity mismatch above
+    /// ([`messages::PARTITIONS_IN_UNPARTITIONED_TABLE`]), because the service states the
+    /// two conditions in two sentences.
+    TableHasNoPartitionKeys,
     /// The table already holds a partition with those values.
     AlreadyExists,
     /// The store cannot hold another partition ([`MAX_PARTITIONS_PER_TABLE`],
@@ -1064,7 +1069,9 @@ impl PartitionCreateRefusal {
     /// raises.
     pub fn error_code(&self) -> &'static str {
         match self {
-            Self::ValuesRequired | Self::ValuesDoNotMatchPartitionKeys => "InvalidInputException",
+            Self::ValuesRequired
+            | Self::ValuesDoNotMatchPartitionKeys
+            | Self::TableHasNoPartitionKeys => "InvalidInputException",
             Self::AlreadyExists => "AlreadyExistsException",
             Self::LimitExceeded { .. } => "ResourceNumberLimitExceededException",
         }
@@ -1078,6 +1085,9 @@ impl PartitionCreateRefusal {
             Self::ValuesDoNotMatchPartitionKeys => {
                 messages::PARTITION_KEYS_DO_NOT_MATCH_VALUES.to_string()
             }
+            Self::TableHasNoPartitionKeys => {
+                messages::PARTITIONS_IN_UNPARTITIONED_TABLE.to_string()
+            }
             Self::AlreadyExists => messages::PARTITION_ALREADY_EXISTS.to_string(),
             Self::LimitExceeded { limit } => {
                 format!("the Data Catalog already holds the maximum of {limit} partitions")
@@ -1088,6 +1098,26 @@ impl PartitionCreateRefusal {
     /// This refusal as the per-item error shape a batch reports it in.
     pub fn to_error_detail(self) -> ErrorDetail {
         catalog_error_detail(self.error_code(), self.message())
+    }
+
+    /// The refusal a list of `values` values earns on a table declaring `partition_keys`
+    /// partition keys, or `None` where the two line up and the list names a slice of that
+    /// table.
+    ///
+    /// The ONE place the two arity refusals are told apart, so the single-partition create
+    /// and the batch create — which judges every item before it applies any of them —
+    /// answer the same sentence for the same table: a table declaring no partition keys
+    /// holds no partitions at all, whatever was sent, while a partitioned table refuses the
+    /// lists whose length is not its key count.
+    pub fn for_value_count(partition_keys: usize, values: usize) -> Option<Self> {
+        if values == partition_keys {
+            return None;
+        }
+        Some(if partition_keys == 0 {
+            Self::TableHasNoPartitionKeys
+        } else {
+            Self::ValuesDoNotMatchPartitionKeys
+        })
     }
 }
 
@@ -1436,8 +1466,10 @@ impl TableEntry {
         if values.is_empty() {
             return Err(PartitionCreateRefusal::ValuesRequired);
         }
-        if values.len() != self.partition_key_count() {
-            return Err(PartitionCreateRefusal::ValuesDoNotMatchPartitionKeys);
+        if let Some(refusal) =
+            PartitionCreateRefusal::for_value_count(self.partition_key_count(), values.len())
+        {
+            return Err(refusal);
         }
         if self.partitions.contains_key(&values) {
             return Err(PartitionCreateRefusal::AlreadyExists);
