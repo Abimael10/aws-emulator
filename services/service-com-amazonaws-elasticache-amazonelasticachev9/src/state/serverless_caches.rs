@@ -58,6 +58,39 @@ pub const SERVERLESS_CACHE_SNAPSHOT_QUOTA: usize = 300;
 /// earliest.
 pub const SERVERLESS_SNAPSHOT_TYPE_MANUAL: &str = SNAPSHOT_SOURCE_MANUAL;
 
+/// The other `ServerlessCacheSnapshot$SnapshotType` ElastiCache reports, for a
+/// snapshot it took itself during a cache's `DailySnapshotTime`; see
+/// [`SERVERLESS_SNAPSHOT_TYPE_MANUAL`] for why none is ever stored here.
+pub const SERVERLESS_SNAPSHOT_TYPE_AUTOMATED: &str = SNAPSHOT_SOURCE_AUTOMATED;
+
+/// The stored `SnapshotType` a `DescribeServerlessCacheSnapshots$SnapshotType`
+/// value selects, or the reason it names no type of snapshot.
+///
+/// The member is "the type of snapshot that is being described" and carries no
+/// modelled enum, so the vocabulary is the one the service reports a snapshot's
+/// own type under ([`SERVERLESS_SNAPSHOT_TYPE_AUTOMATED`] /
+/// [`SERVERLESS_SNAPSHOT_TYPE_MANUAL`]) and nothing else: a value outside it
+/// describes no type of snapshot and is a bad parameter value rather than a
+/// filter that selects nothing. That is what makes "read a snapshot's
+/// `SnapshotType`, then list only the snapshots of that type" a round trip.
+/// Matched ignoring ASCII case, as this service's other unconstrained filter
+/// vocabularies are (see [`snapshot_source_filter`]): a type is a vocabulary
+/// word, not an identity.
+pub fn serverless_snapshot_type_filter(value: &str) -> Result<&'static str, String> {
+    for reported in [
+        SERVERLESS_SNAPSHOT_TYPE_AUTOMATED,
+        SERVERLESS_SNAPSHOT_TYPE_MANUAL,
+    ] {
+        if value.eq_ignore_ascii_case(reported) {
+            return Ok(reported);
+        }
+    }
+    Err(format!(
+        "Invalid SnapshotType Specified. If specified, should be either \
+         '{SERVERLESS_SNAPSHOT_TYPE_AUTOMATED}' or '{SERVERLESS_SNAPSHOT_TYPE_MANUAL}'"
+    ))
+}
+
 /// The page a `DescribeServerlessCacheSnapshots` serves when the request names
 /// no `MaxResults`, and the largest page it serves at all: "The default is 50.
 /// The Validation Constraints are a maximum of 50."
@@ -197,18 +230,35 @@ pub fn serverless_cache_snapshot_arn(region: &str, name: &str) -> String {
     )
 }
 
-/// How ElastiCache words `ServerlessCacheSnapshotNotFoundFault` ("this
-/// serverless cache snapshot could not be found or does not exist"): the
-/// sentence says only that no snapshot is held under the name the request
-/// specified, naming neither that name nor anything else about the request —
-/// the whole sentence is fixed text, like
+/// How ElastiCache words `ServerlessCacheSnapshotNotFoundFault` where an
+/// operation ACTS on a named snapshot ("this serverless cache snapshot could
+/// not be found or does not exist"): the sentence says only that no snapshot is
+/// held under the name the request specified, naming neither that name nor
+/// anything else about the request — the whole sentence is fixed text, like
 /// [`SERVERLESS_CACHE_ALREADY_EXISTS_MESSAGE`].
 ///
-/// One statement, so every operation that resolves a serverless cache snapshot
-/// by name — `DescribeServerlessCacheSnapshots` and
-/// `ExportServerlessCacheSnapshot` — words that fault the same way.
+/// One statement, so every operation that acts on a serverless cache snapshot
+/// by name — `ExportServerlessCacheSnapshot` today — words that fault the same
+/// way. The READ words it differently, as
+/// [`serverless_cache_snapshot_not_described_message`] states.
 pub const SERVERLESS_CACHE_SNAPSHOT_NOT_FOUND_MESSAGE: &str =
     "Serverless cache snapshot with specified name does not exists.";
+
+/// How `DescribeServerlessCacheSnapshots` words the same fault: a READ names
+/// the snapshot it was asked for, as the fixed text "Serverless Cache Snapshot
+/// with name " + the requested name + " not found".
+///
+/// Each surface words a not-found the way the service words it THERE — the same
+/// split this service already makes for a missing cache cluster, where the
+/// describe names the resource as the shape spells it and the snapshot creator
+/// answers prose ([`cache_cluster_not_found_message`] /
+/// [`snapshot_source_cluster_not_found_message`]) — so the sentence a read
+/// answers with is stated here rather than shared with the acting operations.
+/// The name is taken from the REQUEST, which is the only place it exists: the
+/// store holds no snapshot under it.
+pub fn serverless_cache_snapshot_not_described_message(requested: &str) -> String {
+    format!("Serverless Cache Snapshot with name {requested} not found")
+}
 
 /// How many default subnets a serverless cache created in `region` without
 /// `SubnetIds` is given; see [`TWO_DEFAULT_SUBNET_REGION`].

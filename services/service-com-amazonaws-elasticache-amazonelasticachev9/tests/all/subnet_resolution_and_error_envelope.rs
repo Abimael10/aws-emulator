@@ -552,8 +552,10 @@ async fn a_lookup_refuses_a_malformed_identifier_before_it_resolves_it() {
         ("a trailing hyphen", "group-", false),
         ("two consecutive hyphens", "gr--oup", false),
     ];
-    // Each describe that RESOLVES an identifier, with the not-found it answers
-    // for a well-formed id it does not hold.
+    // Each describe and the answer a well-formed id it does not hold gets: the
+    // two that RESOLVE the id answer their not-found fault, while the snapshot
+    // describe FILTERS its list by it and answers a successful empty page. The
+    // FORM of the id is refused the same way by all three.
     let lookups: [(&str, &str, u16, &str); 3] = [
         (
             "DescribeReplicationGroups",
@@ -567,12 +569,7 @@ async fn a_lookup_refuses_a_malformed_identifier_before_it_resolves_it() {
             404,
             "CacheClusterNotFound",
         ),
-        (
-            "DescribeSnapshots",
-            "CacheClusterId",
-            404,
-            "CacheClusterNotFound",
-        ),
+        ("DescribeSnapshots", "CacheClusterId", 200, ""),
     ];
 
     for (action, member, missing_status, missing_code) in lookups {

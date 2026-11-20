@@ -10,6 +10,18 @@ use super::*;
 /// [`STATUS_AVAILABLE`].
 pub const SNAPSHOT_STATUS_RESTORING: &str = "restoring";
 
+/// What a `DescribeSnapshots` naming BOTH `ReplicationGroupId` and
+/// `CacheClusterId` is refused with.
+///
+/// The two members are the two sides of one selection — "only snapshots
+/// associated with that specific replication group" / "that specific cluster" —
+/// so a request that names both does not select a source at all and is refused
+/// with the operation's modelled `InvalidParameterCombinationException` ("two or
+/// more incompatible parameters were specified"). The whole sentence is fixed
+/// text: it names the two members, not their values.
+pub const SNAPSHOT_SOURCE_EXCLUSIVE_MESSAGE: &str =
+    "Cannot specify both ReplicationGroupId and CacheClusterId";
+
 /// One snapshot, as this emulator persists it: the source cluster's
 /// configuration as it stood when the snapshot was taken, plus the snapshot's
 /// own identity and status.

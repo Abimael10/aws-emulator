@@ -518,8 +518,9 @@ async fn a_refused_modify_is_worded_from_the_stored_identity() {
     );
 }
 
-/// The modify is recorded as an event of the group, beside its create — the log a
-/// `DescribeEvents` reader sees, which is the other place a state change shows up.
+/// The modify is recorded as an event of the group — the log a `DescribeEvents` reader
+/// sees, which is the other place a state change shows up. The CREATE records none: a
+/// group a create answers with is already the one every later read reports.
 #[tokio::test]
 async fn a_subnet_group_modify_is_recorded_as_an_event() {
     let emulator = Emulator::new();
@@ -556,8 +557,8 @@ async fn a_subnet_group_modify_is_recorded_as_an_event() {
     let messages = events.all("Event/Message");
     assert_eq!(
         messages.len(),
-        2,
-        "expected the create and the modify to be logged, got {messages:?} from {}",
+        1,
+        "expected the modify alone to be logged, got {messages:?} from {}",
         events.body
     );
     assert!(

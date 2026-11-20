@@ -739,7 +739,21 @@ async fn the_describe_pages_and_filters_what_the_store_holds() {
     for (cache, engine) in [("first-cache", "redis"), ("second-cache", "valkey")] {
         create_cache(&emulator, cache, cache, engine, &[]).await;
     }
-    std::thread::sleep(PAST_TRANSITION);
+    // A snapshot is taken of a SETTLED cache, so the suite looks again until each
+    // create has settled rather than waiting a fixed time: what it asserts must
+    // not depend on how fast the host runs.
+    for cache in ["first-cache", "second-cache"] {
+        poll_until(
+            &emulator,
+            REGION,
+            cache,
+            "the serverless cache settling at available",
+            "DescribeServerlessCaches",
+            &params(&[("ServerlessCacheName", cache)]),
+            |reply| reply.text("Status") == Some(state::STATUS_AVAILABLE),
+        )
+        .await;
+    }
     // Five snapshots over two caches, named out of alphabetical order: a page is
     // served in the store's own total order, not in the order they were taken.
     let taken = [
@@ -842,9 +856,14 @@ async fn the_describe_pages_and_filters_what_the_store_holds() {
             filtered.body
         );
     }
-    // A type no stored snapshot carries selects nothing — the store holds no
-    // snapshot ElastiCache took on its own.
-    let other_type = describe_snapshots(&emulator, &[("SnapshotType", "automatic")]).await;
+    // The other type of the vocabulary selects nothing — the store holds no
+    // snapshot ElastiCache took on its own — while a type outside it is a
+    // refusal rather than an empty page (the `filtered_reads` suite).
+    let other_type = describe_snapshots(
+        &emulator,
+        &[("SnapshotType", state::SERVERLESS_SNAPSHOT_TYPE_AUTOMATED)],
+    )
+    .await;
     assert_eq!(
         other_type.status, 200,
         "a type filter nothing matches must still answer 200, got {} {}",

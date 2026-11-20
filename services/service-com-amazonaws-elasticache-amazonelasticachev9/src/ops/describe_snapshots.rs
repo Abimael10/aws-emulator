@@ -178,6 +178,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // The FORM of the request first, before any lookup: the two source
+        // filters are the two sides of one selection ("only snapshots
+        // associated with that specific replication group" / "that specific
+        // cluster"), so a request naming both names no source and is refused
+        // with the modelled `InvalidParameterCombinationException` rather than
+        // being resolved against either one.
+        if input.replication_group_id.is_some() && input.cache_cluster_id.is_some() {
+            return Err(
+                DescribeSnapshotsErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            crate::state::SNAPSHOT_SOURCE_EXCLUSIVE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // This operation's own `MaxRecords` bounds: "Default: 50. Constraints:
         // minimum 20; maximum 50."
         let page_size = match crate::state::snapshot_page_size(input.max_records) {
@@ -244,16 +263,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_all(now);
 
-        // A named cluster has to be one this service knows about: either a
-        // stored cluster, or the source of a stored snapshot, because a snapshot
-        // outlives the cluster it was taken from. Anything else names no
-        // cluster, which is what the modelled `CacheClusterNotFoundFault`
-        // refuses.
+        // `CacheClusterId`: "If this parameter is specified, only snapshots
+        // associated with that specific cluster are described" — the member
+        // NARROWS the page. A cluster is not a resource this reporting
+        // operation acts on, so an id no stored snapshot was taken from selects
+        // no record and the answer is a successful empty page; the modelled
+        // `CacheClusterNotFoundFault` is what the operations that DO act on a
+        // named cluster (`CreateSnapshot`, `RebootCacheCluster`,
+        // `DescribeCacheClusters`) answer. The FORM of the identifier is still
+        // refused: a value no cluster could ever carry is a bad parameter
+        // value rather than a filter that selects nothing. The stored id is the
+        // lowercased one, so the filter lowercases too.
         let cluster_filter = match input.cache_cluster_id.as_deref() {
             Some(id) => {
-                // The FORM of the identifier first: a value no cluster could
-                // ever carry is a bad parameter value rather than a cluster
-                // that does not exist.
                 if let Some(message) = crate::state::parameter_identifier_refusal(
                     "CacheClusterIdentifier",
                     "Cache Cluster ID",
@@ -269,21 +291,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .into(),
                     );
                 }
-                let key = id.to_ascii_lowercase();
-                let known = store.cache_clusters.contains_key(&key)
-                    || store
-                        .snapshots
-                        .values()
-                        .any(|snapshot| snapshot.cache_cluster_id.as_deref() == Some(key.as_str()));
-                if !known {
-                    return Err(DescribeSnapshotsErrorModeled::CacheClusterNotFoundFault(
-                        CacheClusterNotFoundFault {
-                            message: Some(crate::state::cache_cluster_not_found_message(id)),
-                        },
-                    )
-                    .into());
-                }
-                Some(key)
+                Some(id.to_ascii_lowercase())
             }
             None => None,
         };
@@ -296,11 +304,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored name is the lowercased one, so the filter lowercases too.
         let name_filter = input.snapshot_name.as_deref().map(str::to_ascii_lowercase);
         // `ReplicationGroupId` selects "only snapshots associated with that
-        // specific replication group". This operation models no not-found for a
-        // group, so the id filters the stored value rather than refusing the
-        // request: a group this account does not hold simply owns no snapshot,
-        // and a group it does hold reports the snapshots stored against it.
-        let group_filter = input.replication_group_id.as_deref();
+        // specific replication group" — the same NARROWING the two members
+        // above do, so a group this account does not hold simply owns no
+        // snapshot and the answer is an empty page. The stored id is the
+        // lowercased one, so the filter lowercases too.
+        let group_filter = input
+            .replication_group_id
+            .as_deref()
+            .map(str::to_ascii_lowercase);
 
         let mut page: Vec<Snapshot> = Vec::new();
         let mut marker = None;
@@ -317,7 +328,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .is_none_or(|id| snapshot.cache_cluster_id.as_deref() == Some(id.as_str()))
             })
             .filter(|(_, snapshot)| {
-                group_filter.is_none_or(|id| snapshot.replication_group_id.as_deref() == Some(id))
+                group_filter
+                    .as_ref()
+                    .is_none_or(|id| snapshot.replication_group_id.as_deref() == Some(id.as_str()))
             })
             .filter(|(_, snapshot)| source_filter.is_none_or(|source| snapshot.source == source))
         {

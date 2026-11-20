@@ -618,8 +618,11 @@ async fn a_missing_cache_cluster_is_worded_the_way_each_surface_words_it() {
     let prose_wording = format!("Cache cluster not found: {ghost}");
 
     // `(case, Action, the form pairs)`: every surface that resolves a
-    // `CacheClusterId` against the store.
-    let cases: [CallCase; 8] = [
+    // `CacheClusterId` against the store. `DescribeSnapshots` is not one of
+    // them: there the member FILTERS the snapshot list rather than naming a
+    // resource the call acts on, so an id nothing was created under is a
+    // successful empty page (the `filtered_reads` suite).
+    let cases: [CallCase; 7] = [
         (
             "modify",
             "ModifyCacheCluster",
@@ -651,11 +654,6 @@ async fn a_missing_cache_cluster_is_worded_the_way_each_surface_words_it() {
         (
             "allowed node types",
             "ListAllowedNodeTypeModifications",
-            params(&[("CacheClusterId", ghost)]),
-        ),
-        (
-            "describe snapshots",
-            "DescribeSnapshots",
             params(&[("CacheClusterId", ghost)]),
         ),
         (

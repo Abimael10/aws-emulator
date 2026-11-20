@@ -335,7 +335,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let subnets: Vec<crate::state::SubnetRecord> =
             crate::state::ec2_live_subnets::group_subnets(resolved);
 
-        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         if store.cache_subnet_groups.contains_key(&name) {
@@ -367,14 +366,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
         };
         store.cache_subnet_groups.insert(name.clone(), record);
-        // Creating a cache subnet group is one of the events this service
-        // records; see `crate::state::EventRecord`.
-        store.record_event(
-            crate::state::SOURCE_TYPE_CACHE_SUBNET_GROUP,
-            &name,
-            "Cache subnet group created",
-            now,
-        );
+        // No event: a group this call answers with is already the one every
+        // later read reports, so the clock owes it no transition and the log
+        // has nothing to narrate. The `cache-subnet-group` source carries what
+        // is later done TO a group (a modify, a delete).
 
         // Read back out of the store, so the response is the persisted group
         // rather than the request echoed.

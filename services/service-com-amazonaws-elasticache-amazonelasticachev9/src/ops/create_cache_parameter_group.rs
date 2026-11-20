@@ -238,7 +238,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One store lock spans the existence check and the insert, so of two
         // concurrent creates of the same name exactly one can be the one that
         // finds the name free.
-        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // A name already taken — by a custom group or by a family default, which
@@ -304,15 +303,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             parameter_values: ::std::collections::BTreeMap::new(),
         };
         store.cache_parameter_groups.insert(name.clone(), record);
-        // Creating a cache parameter group is one of the events this service
-        // records, under its own `cache-parameter-group` source; see
-        // `crate::state::EventRecord`.
-        store.record_event(
-            crate::state::SOURCE_TYPE_CACHE_PARAMETER_GROUP,
-            &name,
-            "Cache parameter group created",
-            now,
-        );
+        // No event: the event log narrates the work this service goes on to do
+        // to a resource, and a group this call answers with is already the one
+        // every later read reports — there is no transition for the clock to
+        // owe it and so nothing to record. The `cache-parameter-group` source
+        // carries what is later done TO a group (a modify, a reset, a delete).
 
         // Read back out of the store, so the response is the persisted group
         // rather than the request echoed. The lookup cannot miss — the insert

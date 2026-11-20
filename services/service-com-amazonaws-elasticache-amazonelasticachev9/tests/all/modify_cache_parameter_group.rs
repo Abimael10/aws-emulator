@@ -713,12 +713,13 @@ async fn the_change_is_recorded_as_an_event_of_the_group() {
         "DescribeEvents must answer 200, got {} {}",
         reply.status, reply.body
     );
-    // The create records one event and the change another, both under the
-    // group's own source.
+    // The change is recorded under the group's own source; its CREATE records
+    // nothing, because a group a create answers with is already the one every
+    // later read reports.
     let messages = reply.all("Event/Message");
     assert!(
-        messages.len() >= 2,
-        "a changed group must have recorded an event beside its create, got {messages:?}"
+        messages.len() == 1,
+        "a changed group must have recorded exactly the change, got {messages:?}"
     );
     for identifier in reply.all("Event/SourceIdentifier") {
         assert_eq!(

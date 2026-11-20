@@ -442,13 +442,9 @@ async fn a_describe_naming_what_the_store_does_not_hold_is_refused() {
     // Each row: the filter, and the HTTP status plus `awsQuery` error code it
     // must be answered with. `MaxRecords` walks its published bounds
     // ("Default: 50. Constraints: minimum 20; maximum 50") and one past each.
-    let cases: [RefusalCase; 9] = [
-        (
-            "unknown cluster id",
-            &[("CacheClusterId", "no-such-cluster")],
-            404,
-            "CacheClusterNotFound",
-        ),
+    // A filter that merely SELECTS nothing is not here: it is a successful
+    // empty page, which the `filtered_reads` suite covers.
+    let cases: [RefusalCase; 8] = [
         (
             "a SnapshotSource in neither vocabulary",
             &[("SnapshotSource", "scheduled")],

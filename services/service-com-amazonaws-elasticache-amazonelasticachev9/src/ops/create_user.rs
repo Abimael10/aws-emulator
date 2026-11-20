@@ -378,14 +378,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let user = stored.to_modeled_in(user_group_ids);
-        // Creating a user is one of the events this service records; see
-        // `crate::state::EventRecord`.
-        store.record_event(
-            crate::state::SOURCE_TYPE_USER,
-            &user_id,
-            "User created",
-            now,
-        );
+        // No event: a user this call answers with is already `active`, so the
+        // clock owes it no transition and the log has nothing to narrate. The
+        // `user` source carries what is later done TO a user (a modify, a
+        // delete).
         Ok(user)
     }
 }

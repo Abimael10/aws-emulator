@@ -339,7 +339,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store locks are ever held at once (see `crate::state::ec2_live_subnets`).
         let stored = group.clone();
         // Modifying a cache subnet group is one of the events this service records,
-        // under the source type its create and its delete record it under; see
+        // under the same source type its delete records it under; see
         // `crate::state::EventRecord`.
         store.record_event(
             crate::state::SOURCE_TYPE_CACHE_SUBNET_GROUP,

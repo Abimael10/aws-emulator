@@ -272,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // counted against frees up, and a create of the same name finds it vacant.
         store.cache_parameter_groups.remove(&name);
         // Deleting a cache parameter group is one of the events this service
-        // records, under the same source type the create records; see
+        // records, under the group's own source type; see
         // `crate::state::EventRecord`. The log outlives the record, so the events of
         // a deleted group are still reported.
         store.record_event(

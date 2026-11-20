@@ -708,12 +708,13 @@ async fn the_reset_is_recorded_as_an_event_of_the_group() {
         "DescribeEvents must answer 200, got {} {}",
         reply.status, reply.body
     );
-    // The create records one event, the change another and each reset one more.
+    // The change records one event and each reset one more; the CREATE records
+    // none, because a group a create answers with is already the one every
+    // later read reports.
     let messages = reply.all("Event/Message");
     assert!(
-        messages.len() >= 4,
-        "each reset must have recorded an event beside the create and the change, got \
-         {messages:?}"
+        messages.len() >= 3,
+        "each reset must have recorded an event beside the change, got {messages:?}"
     );
     for identifier in reply.all("Event/SourceIdentifier") {
         assert_eq!(

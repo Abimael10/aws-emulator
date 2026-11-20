@@ -35,6 +35,10 @@ pub const PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT: &str = "engine-default";
 /// whose value is the engine's own. Matched ignoring ASCII case, as this
 /// service's other unconstrained filter vocabularies are (see
 /// [`snapshot_source_filter`]): a source is a vocabulary word, not an identity.
+///
+/// A value outside that vocabulary is refused with ElastiCache's own sentence,
+/// which names the rejected value and then the allowed ones in the order the
+/// service lists them.
 pub fn parameter_source_filter(value: &str) -> Result<&'static str, String> {
     for (spelling, selected) in [
         (PARAMETER_SOURCE_USER, PARAMETER_SOURCE_USER),
@@ -49,8 +53,9 @@ pub fn parameter_source_filter(value: &str) -> Result<&'static str, String> {
         }
     }
     Err(format!(
-        "Invalid value {value} for Source: must be one of {PARAMETER_SOURCE_USER} | \
-         {PARAMETER_SOURCE_SYSTEM} | {PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT}."
+        "Invalid Source: {value}. Allowed values are: \
+         {PARAMETER_SOURCE_FILTER_ENGINE_DEFAULT}, {PARAMETER_SOURCE_SYSTEM}, \
+         {PARAMETER_SOURCE_USER}"
     ))
 }
 

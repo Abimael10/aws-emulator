@@ -3,7 +3,9 @@
 //! End-to-end tests for `DescribeEvents`.
 //!
 //! The rule under test: every change this service makes to one of its resources
-//! records an event under that resource, and `DescribeEvents` reports the
+//! records an event under that resource — a change being work it performs
+//! BEYOND storing the request, so a resource a create answers with ready
+//! records nothing for its creation — and `DescribeEvents` reports the
 //! recorded log over the time interval the request bounds, filtered by source,
 //! NEWEST FIRST and paginated. Nothing here reaches into the service's state
 //! struct — every event is written by a real `awsQuery` call through the
@@ -230,15 +232,13 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
     // the log its own calls wrote.
     let scenarios = [
         Scenario {
-            name: "a cache subnet group is created",
+            name: "a cache subnet group create records nothing",
             steps: &[Step::SubnetGroup("Events-Subnets", 2)],
-            // `CacheSubnetGroupName` "is stored as a lowercase string", so that
-            // is the source the event is recorded under.
-            expected: &[(
-                "cache-subnet-group",
-                "events-subnets",
-                "Cache subnet group created",
-            )],
+            // A group a create answers with is already the one every later read
+            // reports: the clock owes it no transition, so the service has no
+            // work on it to narrate and the log stays empty. What is later done
+            // TO the group (a modify, a delete) IS recorded.
+            expected: &[],
         },
         Scenario {
             name: "a cluster is created and the clock settles it",
@@ -422,9 +422,9 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
             ],
         },
         Scenario {
-            name: "an RBAC user is created",
+            name: "an RBAC user create records nothing",
             // A user ElastiCache has accepted is active at once, so the clock
-            // owes it no transition and the log holds the create alone.
+            // owes it no transition and there is nothing to narrate.
             steps: &[Step::User(
                 "Events-User",
                 &[
@@ -434,12 +434,13 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
                     ("NoPasswordRequired", "true"),
                 ],
             )],
-            expected: &[("user", "events-user", "User created")],
+            expected: &[],
         },
         Scenario {
-            name: "a cache parameter group is created",
-            // A parameter group is usable as soon as it exists, so the clock
-            // owes it no transition and the log holds the create alone.
+            name: "a cache parameter group create records nothing",
+            // A parameter group is usable as soon as it exists — it holds its
+            // family's published defaults and nothing was done to it — so the
+            // log has nothing to narrate.
             steps: &[Step::ParameterGroup(
                 "Events-Params",
                 &[
@@ -447,29 +448,38 @@ async fn every_change_this_service_makes_is_reported_as_an_event() {
                     ("Description", "the events suite"),
                 ],
             )],
-            expected: &[(
-                "cache-parameter-group",
-                "events-params",
-                "Cache parameter group created",
-            )],
+            expected: &[],
         },
         Scenario {
             name: "two resources of different kinds share one log",
+            // Each create is settled before the next one is made, so the two
+            // resources' events interleave in a fixed order rather than falling
+            // in the same instant.
             steps: &[
-                Step::SubnetGroup("evt-group", 2),
-                Step::Cluster("evt-in-group", &[("CacheSubnetGroupName", "evt-group")]),
+                Step::ServerlessCache("Events-Shared", &[("Engine", "redis")]),
+                Step::Settle,
+                Step::Cluster("evt-beside-serverless", &[]),
                 Step::Settle,
             ],
             expected: &[
                 (
-                    "cache-subnet-group",
-                    "evt-group",
-                    "Cache subnet group created",
+                    "serverless-cache",
+                    "events-shared",
+                    "Serverless cache created",
                 ),
-                ("cache-cluster", "evt-in-group", "Cache cluster created"),
+                (
+                    "serverless-cache",
+                    "events-shared",
+                    "Serverless cache status changed from creating to available",
+                ),
                 (
                     "cache-cluster",
-                    "evt-in-group",
+                    "evt-beside-serverless",
+                    "Cache cluster created",
+                ),
+                (
+                    "cache-cluster",
+                    "evt-beside-serverless",
                     "Cache cluster status changed from creating to available",
                 ),
             ],
@@ -689,13 +699,30 @@ async fn source_identifier_and_source_type_filter_the_log() {
         "the subnet group must be created, got {}",
         created.body
     );
+    // A create records nothing (there is no work on a group a create answers
+    // with to narrate), so the group becomes a source of this log by having
+    // something DONE to it.
+    let modified = emulator
+        .call(
+            "ModifyCacheSubnetGroup",
+            &params(&[
+                ("CacheSubnetGroupName", "filter-group"),
+                ("CacheSubnetGroupDescription", "a modified description"),
+            ]),
+        )
+        .await;
+    assert_eq!(
+        modified.status, 200,
+        "the subnet group must be modified, got {}",
+        modified.body
+    );
     create_available_cluster(&emulator, "filter-cluster", &[]).await;
     create_available_cluster(&emulator, "other-cluster", &[]).await;
 
     let group_events = expect(&[(
         "cache-subnet-group",
         "filter-group",
-        "Cache subnet group created",
+        "Cache subnet group modified",
     )]);
     let cluster_events = |id: &str| -> Vec<WireEvent> {
         vec![

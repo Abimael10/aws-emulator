@@ -197,12 +197,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
         // `SnapshotType` is "the type of snapshot that is being described". The
-        // member carries no modelled enum and AWS documents no vocabulary for
-        // it, so a value is matched against the type a stored snapshot reports
-        // (`ServerlessCacheSnapshot$SnapshotType`), ignoring ASCII case as this
-        // service's other unconstrained filter vocabularies are: a type no
-        // stored snapshot carries selects nothing rather than being refused.
-        let snapshot_type = input.snapshot_type.as_deref();
+        // member carries no modelled enum, so the vocabulary it is held to is
+        // the one a snapshot reports its own type under
+        // (`ServerlessCacheSnapshot$SnapshotType`): a value outside it
+        // describes no type of snapshot and is refused with the modelled
+        // `InvalidParameterValueException` before any lookup, rather than
+        // accepted as a filter that selects nothing — see
+        // `crate::state::serverless_snapshot_type_filter`.
+        let snapshot_type = match input.snapshot_type.as_deref() {
+            None => None,
+            Some(value) => match crate::state::serverless_snapshot_type_filter(value) {
+                Ok(kind) => Some(kind),
+                Err(message) => return Err(invalid_value(message)),
+            },
+        };
 
         // A report answers from the records as they stand at the instant it
         // answers: the one write it makes is materialising the changes the clock
@@ -225,8 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     DescribeServerlessCacheSnapshotsErrorModeled::ServerlessCacheSnapshotNotFoundFault(
                         ServerlessCacheSnapshotNotFoundFault {
                             message: Some(
-                                crate::state::SERVERLESS_CACHE_SNAPSHOT_NOT_FOUND_MESSAGE
-                                    .to_string(),
+                                crate::state::serverless_cache_snapshot_not_described_message(
+                                    requested,
+                                ),
                             ),
                         },
                     )

@@ -822,6 +822,15 @@ pub const SCALE_IN_SELECTION_MESSAGE: &str =
 /// record. A snapshot of a cluster is reported under the CLUSTER it was taken
 /// from, which is the source the event happened to — the enum has no member
 /// for a cache-cluster snapshot.
+///
+/// A CREATE records an event only where the service goes on to do the work the
+/// event would narrate: a resource it answers with in a transient status, which
+/// the clock later settles (a cache cluster, a replication group, a serverless
+/// cache, a snapshot). A resource a create answers with ready — a cache
+/// parameter group, a cache subnet group, a cache security group, an RBAC user
+/// or user group — is already the one every later read reports, so there is
+/// nothing to narrate and no event; those source types carry what is later done
+/// TO such a resource instead.
 pub const SOURCE_TYPE_CACHE_CLUSTER: &str = "cache-cluster";
 /// See [`SOURCE_TYPE_CACHE_CLUSTER`].
 pub const SOURCE_TYPE_CACHE_SUBNET_GROUP: &str = "cache-subnet-group";
@@ -885,6 +894,12 @@ pub const SNAPSHOT_SOURCE_FILTER_USER: &str = "user";
 /// case, as this service's other unconstrained filter vocabularies are (see
 /// [`canonical_offering_type`]): a creation source is a vocabulary word, not an
 /// identity.
+///
+/// A value in neither vocabulary is refused with ElastiCache's own sentence for
+/// a snapshot-filter value, which names the two sources a snapshot is ever of
+/// rather than listing the spellings this filter also accepts — the same
+/// sentence the serverless snapshot filter answers with
+/// ([`serverless_snapshot_type_filter`]).
 pub fn snapshot_source_filter(value: &str) -> Result<&'static str, String> {
     for (filter_spelling, reported_spelling) in [
         (SNAPSHOT_SOURCE_FILTER_SYSTEM, SNAPSHOT_SOURCE_AUTOMATED),
@@ -897,9 +912,8 @@ pub fn snapshot_source_filter(value: &str) -> Result<&'static str, String> {
         }
     }
     Err(format!(
-        "Invalid value {value} for SnapshotSource: must be one of \
-         {SNAPSHOT_SOURCE_FILTER_SYSTEM} | {SNAPSHOT_SOURCE_AUTOMATED} | \
-         {SNAPSHOT_SOURCE_FILTER_USER} | {SNAPSHOT_SOURCE_MANUAL}."
+        "Invalid snapshot source specified. If specified, should be either \
+         '{SNAPSHOT_SOURCE_AUTOMATED}' or '{SNAPSHOT_SOURCE_MANUAL}'"
     ))
 }
 
