@@ -99,7 +99,7 @@ const SIDE_CHANNEL: &str = "alb-request-metrics-side-channel";
 /// a row answered without the handler having run leaves the queue empty — and then decides what
 /// to return from the LAST SEGMENT of the path the event carries, so one package serves every
 /// row.
-const HANDLER_SOURCE: &str = r#"
+pub(crate) const HANDLER_SOURCE: &str = r#"
 import os
 
 import boto3
@@ -123,7 +123,11 @@ def lambda_handler(event, context):
 
 /// A .zip deployment package holding [`HANDLER_SOURCE`] as `lambda_function.py`, written in
 /// memory the way a caller uploads one.
-fn package() -> Vec<u8> {
+///
+/// `pub(crate)` because the sibling suite that reads these same series back through
+/// CloudWatch's OWN readers ([`crate::alb_target_metric_rate_alarms`]) drives the same
+/// outcome classes: one handler for both, so the two cannot drift on what a path returns.
+pub(crate) fn package() -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
