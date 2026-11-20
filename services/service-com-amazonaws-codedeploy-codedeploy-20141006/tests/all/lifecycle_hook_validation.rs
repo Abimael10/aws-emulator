@@ -42,6 +42,16 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 /// deployment itself takes.
 const HOOKED_DEADLINE: Duration = Duration::from_secs(30);
 
+/// How long the cases that read a target's whole lifecycle sequence wait for a
+/// deployment to reach its terminal status.
+///
+/// None of those cases is about how FAST anything is — each waits for the
+/// deployment's own outcome, which the clock owes it after its validation
+/// function has run — so the budget is deliberately generous: a loaded host runs
+/// a Python handler and this emulator's own clock no faster than it runs
+/// everything else on it.
+const SEQUENCE_DEADLINE: Duration = Duration::from_secs(180);
+
 /// The alias every deployment of this suite moves.
 const ALIAS: &str = "live";
 
@@ -228,6 +238,69 @@ fn app_spec_from(
     document
 }
 
+/// How the KEYS of an AppSpec document are spelled; see [`app_spec_cased`].
+#[derive(Debug, Clone, Copy)]
+enum KeyCase {
+    /// As the AWS CodeDeploy User Guide writes them.
+    Reference,
+    /// All in lower case.
+    Lower,
+    /// All in upper case.
+    Upper,
+}
+
+impl KeyCase {
+    /// `key` spelled in this case.
+    fn spell(self, key: &str) -> String {
+        match self {
+            Self::Reference => key.to_string(),
+            Self::Lower => key.to_ascii_lowercase(),
+            Self::Upper => key.to_ascii_uppercase(),
+        }
+    }
+}
+
+/// [`app_spec_from`] with every structural KEY — and every lifecycle event name a
+/// hook is declared under — spelled in `case`.
+///
+/// The document says exactly the same thing in each of them: the resource type
+/// and the values it carries are untouched, only the keys are respelled.
+fn app_spec_cased(
+    case: KeyCase,
+    function: &str,
+    current: &str,
+    target: &str,
+    hooks: &[(&str, &str)],
+) -> String {
+    let key = |name: &str| case.spell(name);
+    let mut document = format!(
+        "{version}: 0.0\n\
+         {resources}:\n\
+         \x20 - {function}:\n\
+         \x20     {kind}: AWS::Lambda::Function\n\
+         \x20     {properties}:\n\
+         \x20       {name}: {function}\n\
+         \x20       {alias}: {ALIAS}\n\
+         \x20       {current_version}: \"{current}\"\n\
+         \x20       {target_version}: \"{target}\"\n",
+        version = key("version"),
+        resources = key("Resources"),
+        kind = key("Type"),
+        properties = key("Properties"),
+        name = key("Name"),
+        alias = key("Alias"),
+        current_version = key("CurrentVersion"),
+        target_version = key("TargetVersion"),
+    );
+    if !hooks.is_empty() {
+        document.push_str(&format!("{}:\n", key("Hooks")));
+        for (event, hook_function) in hooks {
+            document.push_str(&format!("  - {}: \"{hook_function}\"\n", key(event)));
+        }
+    }
+    document
+}
+
 /// Create a deployment of `content` as an `appSpecContent` revision, answering its
 /// minted id.
 async fn deploy(emulator: &Emulator, application: &str, group: &str, content: &str) -> String {
@@ -249,19 +322,19 @@ async fn deploy(emulator: &Emulator, application: &str, group: &str, content: &s
         .to_string()
 }
 
-/// The `status` the lifecycle event `event` of `deployment_id`'s one target
-/// reads, through the target readers a client uses.
+/// Every lifecycle event of `deployment_id`'s one target, as `(lifecycle event
+/// name, status)` pairs in the order the target reports them, read through the
+/// target readers a client uses.
 ///
 /// A Lambda deployment's one target is reported under the function its revision
 /// names, so the listing answers that id and the single-target reader answers the
-/// `lambdaTarget` whose `lifecycleEvents` carry what each validation function
-/// reported.
-async fn lifecycle_event_status(
+/// `lambdaTarget` whose `lifecycleEvents` carry the deployment's progression
+/// through the lifecycle events of its compute platform.
+async fn lifecycle_events(
     emulator: &Emulator,
     case: &str,
     deployment_id: &str,
-    event: &str,
-) -> Option<String> {
+) -> Vec<(String, String)> {
     let listed = emulator
         .ok(
             "ListDeploymentTargets",
@@ -285,8 +358,32 @@ async fn lifecycle_event_status(
         .cloned()
         .unwrap_or_default()
         .iter()
-        .find(|reported| reported["lifecycleEventName"].as_str() == Some(event))
-        .and_then(|reported| reported["status"].as_str().map(str::to_string))
+        .map(|event| {
+            (
+                event["lifecycleEventName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                event["status"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The `status` the lifecycle event `event` of `deployment_id`'s one target
+/// reads; `None` for a target that reports no such event. One reading of
+/// [`lifecycle_events`], so both read a target the same way.
+async fn lifecycle_event_status(
+    emulator: &Emulator,
+    case: &str,
+    deployment_id: &str,
+    event: &str,
+) -> Option<String> {
+    lifecycle_events(emulator, case, deployment_id)
+        .await
+        .into_iter()
+        .find(|(name, _)| name == event)
+        .map(|(_, status)| status)
 }
 
 /// One row of the hook table.
@@ -914,5 +1011,303 @@ async fn a_failed_deployments_shift_stands_until_its_rollback_puts_the_alias_bac
             );
             tokio::time::sleep(ALIAS_SAMPLE_INTERVAL).await;
         }
+    }
+}
+
+/// The lifecycle events a Lambda deployment RUNS, in the order it runs them: the
+/// AWS CodeDeploy User Guide's lifecycle events for the Lambda compute platform
+/// are BeforeAllowTraffic, AllowTraffic and AfterAllowTraffic, and the two around
+/// the move are the ones a validation function may be declared for ("For Lambda
+/// deployments, the available lifecycle hooks are BeforeAllowTraffic and
+/// AfterAllowTraffic",
+/// `smithy_query(query="doc",shape="PutLifecycleEventHookExecutionStatus")`).
+const LAMBDA_SEQUENCE: [&str; 3] = ["BeforeAllowTraffic", "AllowTraffic", "AfterAllowTraffic"];
+
+/// One row of the lifecycle-sequence table.
+struct Sequenced {
+    /// What the row is about.
+    case: &'static str,
+    /// The lifecycle event the revision's AppSpec declares a validation function
+    /// for and the result that function reports, or `None` for a revision that
+    /// declares no hook at all.
+    hook: Option<(&'static str, &'static str)>,
+    /// Whether AWS Lambda HOLDS that function, so a row can declare a hook whose
+    /// function reports nothing because there is none to invoke.
+    function_exists: bool,
+    /// The terminal status the deployment reaches.
+    status: &'static str,
+    /// The `LifecycleEventStatus` of each step of [`LAMBDA_SEQUENCE`], in that
+    /// order.
+    events: [&'static str; 3],
+}
+
+/// RULE: a deployment target reports ONE lifecycle event per step of the
+/// lifecycle sequence its compute platform runs, in the order that platform runs
+/// them, each carrying the `LifecycleEventStatus` that step reached — the result
+/// its validation function reported where the revision declared one, and
+/// otherwise how far the deployment itself took the step — so a Lambda target
+/// always reports BeforeAllowTraffic, AllowTraffic and AfterAllowTraffic, whether
+/// or not the revision declared a hook for either of them.
+#[tokio::test]
+async fn a_lambda_targets_lifecycle_events_are_the_whole_sequence_its_deployment_runs() {
+    // Rows differ along which step of the sequence carries a validation function,
+    // what that function reports — and whether it reports at all — and so along
+    // which step the deployment got to.
+    let cases: &[Sequenced] = &[
+        Sequenced {
+            case: "a revision that declares no hook at all",
+            hook: None,
+            function_exists: false,
+            status: "Succeeded",
+            // Nothing validated the two hook events, but the deployment ran
+            // them: it moved the traffic and reached its outcome.
+            events: ["Succeeded", "Succeeded", "Succeeded"],
+        },
+        Sequenced {
+            case: "a pre-traffic hook that approves",
+            hook: Some(("BeforeAllowTraffic", "Succeeded")),
+            function_exists: true,
+            status: "Succeeded",
+            events: ["Succeeded", "Succeeded", "Succeeded"],
+        },
+        Sequenced {
+            case: "a pre-traffic hook that fails",
+            hook: Some(("BeforeAllowTraffic", "Failed")),
+            function_exists: true,
+            status: "Failed",
+            // The step that failed is the one its function vetoed; the move it
+            // gated, and the step after that move, never ran.
+            events: ["Failed", "Skipped", "Skipped"],
+        },
+        Sequenced {
+            case: "a post-traffic hook that fails",
+            hook: Some(("AfterAllowTraffic", "Failed")),
+            function_exists: true,
+            status: "Failed",
+            // This hook runs after the move, so everything before it completed.
+            events: ["Succeeded", "Succeeded", "Failed"],
+        },
+        Sequenced {
+            case: "a pre-traffic hook whose function AWS Lambda does not hold",
+            hook: Some(("BeforeAllowTraffic", "Succeeded")),
+            function_exists: false,
+            status: "Failed",
+            // No result arrived for the step, which is not a result to deploy
+            // on: the step failed and the rest never ran.
+            events: ["Failed", "Skipped", "Skipped"],
+        },
+    ];
+
+    for (index, case) in cases.iter().enumerate() {
+        let emulator = Emulator::with_lambda();
+        let application = format!("sequenced-{index:02}");
+        let function = format!("sequenced{index:02}");
+        let hook_function = format!("validator{index:02}");
+        let group = given_lambda_group(&emulator, &application, json!({})).await;
+        given_function(
+            &emulator,
+            case.case,
+            &function,
+            "def lambda_handler(e, c):\n    return e\n",
+        )
+        .await;
+        given_versions_and_alias(&emulator, case.case, &function, 2).await;
+        let hooks: Vec<(&str, &str)> = case
+            .hook
+            .map(|(event, _)| vec![(event, hook_function.as_str())])
+            .unwrap_or_default();
+        // The function that reports the row's result, created through AWS
+        // Lambda's own front door — except on the row that declares a hook AWS
+        // Lambda holds no function for, where nothing reports for the step.
+        if let Some((_, reports)) = case.hook.filter(|_| case.function_exists) {
+            given_function(
+                &emulator,
+                case.case,
+                &hook_function,
+                &validation_function_source(reports, 0.0),
+            )
+            .await;
+        }
+
+        let content = app_spec(&function, "2", &hooks);
+        let deployment_id = deploy(&emulator, &application, &group, &content).await;
+        let info =
+            terminal_deployment_within(&emulator, &deployment_id, case.case, SEQUENCE_DEADLINE)
+                .await;
+        assert_eq!(
+            info["status"].as_str(),
+            Some(case.status),
+            "case {:?}: expected the deployment to end {}, got {info:?}",
+            case.case,
+            case.status
+        );
+
+        let expected: Vec<(String, String)> = LAMBDA_SEQUENCE
+            .iter()
+            .zip(case.events)
+            .map(|(name, status)| ((*name).to_string(), status.to_string()))
+            .collect();
+        let reported = lifecycle_events(&emulator, case.case, &deployment_id).await;
+        assert_eq!(
+            reported, expected,
+            "case {:?}: expected the Lambda lifecycle sequence {expected:?}, got {reported:?}",
+            case.case
+        );
+    }
+}
+
+/// Every case an AppSpec's keys are spelled in here, with what the row calls it:
+/// the reference's own spelling, and the two whole-document respellings a client
+/// can write the same declaration in.
+const KEY_CASES: [(&str, KeyCase); 3] = [
+    ("the reference's own case", KeyCase::Reference),
+    ("lower-case keys", KeyCase::Lower),
+    ("upper-case keys", KeyCase::Upper),
+];
+
+/// Deploy one revision whose AppSpec is written with its keys in `key_case` and
+/// whose BeforeAllowTraffic validation function reports `reports`, and hold the
+/// deployment to the rule: the declaration is read the same way whichever case
+/// its keys are in, so the deployment reports its one target under the function
+/// the declaration names, its lifecycle sequence reads `events`, and the alias
+/// ends on version `alias`.
+///
+/// `slot` keeps one row's resources apart from another's.
+async fn a_cased_deployment_is_read_the_same_way(
+    spelling: &str,
+    key_case: KeyCase,
+    slot: &str,
+    reports: &str,
+    events: [&str; 3],
+    alias: &str,
+) {
+    let case = format!("{spelling} with a hook that reports {reports}");
+    let emulator = Emulator::with_lambda();
+    let application = format!("cased-{slot}");
+    let function = format!("cased{slot}");
+    let hook_function = format!("casedhook{slot}");
+    let group = given_lambda_group(&emulator, &application, json!({})).await;
+    given_function(
+        &emulator,
+        &case,
+        &function,
+        "def lambda_handler(e, c):\n    return e\n",
+    )
+    .await;
+    given_versions_and_alias(&emulator, &case, &function, 2).await;
+    given_function(
+        &emulator,
+        &case,
+        &hook_function,
+        &validation_function_source(reports, 0.0),
+    )
+    .await;
+
+    let content = app_spec_cased(
+        key_case,
+        &function,
+        "1",
+        "2",
+        &[("BeforeAllowTraffic", hook_function.as_str())],
+    );
+    let deployment_id = deploy(&emulator, &application, &group, &content).await;
+    let info =
+        terminal_deployment_within(&emulator, &deployment_id, &case, SEQUENCE_DEADLINE).await;
+    let expected_status = if reports == "Failed" {
+        "Failed"
+    } else {
+        "Succeeded"
+    };
+    assert_eq!(
+        info["status"].as_str(),
+        Some(expected_status),
+        "case {case:?}: expected the deployment to end on its hook's verdict \
+         ({expected_status}), got {info:?}"
+    );
+
+    // The one target the declaration names, listed and read under the function it
+    // deploys to.
+    let listed = emulator
+        .ok(
+            "ListDeploymentTargets",
+            json!({"deploymentId": deployment_id}),
+        )
+        .await;
+    assert_eq!(
+        listed["targetIds"].as_array().map(Vec::len),
+        Some(1),
+        "case {case:?}: expected exactly the declared function as the target, got {listed:?}"
+    );
+    assert_eq!(
+        listed["targetIds"][0].as_str(),
+        Some(function.as_str()),
+        "case {case:?}: expected the target to be reported under the function the declaration \
+         names, got {listed:?}"
+    );
+
+    let reported = lifecycle_events(&emulator, &case, &deployment_id).await;
+    let expected: Vec<(String, String)> = LAMBDA_SEQUENCE
+        .iter()
+        .zip(events)
+        .map(|(name, status)| ((*name).to_string(), status.to_string()))
+        .collect();
+    assert_eq!(
+        reported, expected,
+        "case {case:?}: expected the lifecycle sequence {expected:?}, got {reported:?}"
+    );
+
+    let moved = alias_version(&emulator, &case, &function).await;
+    assert_eq!(
+        moved, alias,
+        "case {case:?}: expected the alias to invoke version {alias}, got {moved}"
+    );
+}
+
+/// RULE: an AppSpec declares the same deployment whichever case its keys are
+/// written in — CodeDeploy reads the document for the sections and properties it
+/// HAS, not for one spelling of them — so the function, alias and versions its
+/// Lambda declaration names, and the validation function its hooks section
+/// declares, are read the same way: the deployment reports its one target under
+/// that function, runs that hook, and ends on the hook's verdict with the alias
+/// where that verdict leaves it.
+///
+/// Here with a hook that APPROVES, so the declaration's own traffic move happens.
+#[tokio::test]
+async fn an_app_spec_whose_keys_are_in_any_case_deploys_what_it_declares() {
+    for (index, (spelling, key_case)) in KEY_CASES.iter().enumerate() {
+        a_cased_deployment_is_read_the_same_way(
+            spelling,
+            *key_case,
+            &format!("ok{index:02}"),
+            "Succeeded",
+            // Every step of the sequence ran: the hook approved, the move
+            // happened, and the deployment reached its outcome.
+            ["Succeeded", "Succeeded", "Succeeded"],
+            // The approved deployment moves the alias to the version its
+            // declaration targets.
+            "2",
+        )
+        .await;
+    }
+}
+
+/// The same rule, with a hook that FAILS: the declaration is read the same way,
+/// so the hook it names runs and its veto is what the deployment and the alias
+/// come to.
+#[tokio::test]
+async fn an_app_spec_whose_keys_are_in_any_case_runs_the_hook_it_declares() {
+    for (index, (spelling, key_case)) in KEY_CASES.iter().enumerate() {
+        a_cased_deployment_is_read_the_same_way(
+            spelling,
+            *key_case,
+            &format!("no{index:02}"),
+            "Failed",
+            // The step that failed is the one the function vetoed; the move it
+            // gated, and the step after that move, never ran.
+            ["Failed", "Skipped", "Skipped"],
+            // So the alias stays where it was.
+            "1",
+        )
+        .await;
     }
 }

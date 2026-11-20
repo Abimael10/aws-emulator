@@ -94,10 +94,10 @@ const MAX_DECLARED_LIST_ENTRIES: usize = 16;
 /// file"
 /// (`smithy_query(query="doc",shape="PutLifecycleEventHookExecutionStatusInput",member="lifecycleEventHookExecutionId")`).
 ///
-/// The key is matched without regard to case: the AppSpec reference spells the
-/// section `Hooks` for the Lambda and Amazon ECS compute platforms and `hooks`
-/// for EC2/on-premises, so a document is read for the section it HAS rather than
-/// for one spelling of it.
+/// The key is matched without regard to case, as every key of the document is
+/// ([`mapping_get`]): the AppSpec reference spells the section `Hooks` for the
+/// Lambda and Amazon ECS compute platforms and `hooks` for EC2/on-premises, so a
+/// document is read for the section it HAS rather than for one spelling of it.
 const HOOKS_KEY: &str = "Hooks";
 
 /// The longest revision content this emulator parses an AppSpec out of.
@@ -367,7 +367,7 @@ pub fn declared_hooks_in_app_spec(content: &str) -> Vec<DeclaredHook> {
 /// The section is written as a sequence of single-entry mappings (the form AWS
 /// documents) or as one mapping of event name to function, so both are read.
 fn hooks_in_document(document: &Yaml) -> Vec<DeclaredHook> {
-    let Some(hooks) = mapping_get_ignoring_case(document, HOOKS_KEY) else {
+    let Some(hooks) = mapping_get(document, HOOKS_KEY) else {
         return Vec::new();
     };
     match hooks {
@@ -570,24 +570,25 @@ fn text_list(node: &Yaml, key: &str) -> Vec<String> {
 
 /// One key of a YAML mapping; `None` for a node that is no mapping, and for a
 /// mapping that does not carry the key.
+///
+/// The key is matched WITHOUT REGARD TO CASE, for every section and every
+/// property of the document alike: CodeDeploy reads an AppSpec for the section
+/// it HAS rather than for one spelling of it — the AppSpec reference itself
+/// spells the hooks section `Hooks` for the Lambda and Amazon ECS compute
+/// platforms and `hooks` for EC2/on-premises — so a document whose keys are
+/// written in another case declares exactly what the same document in the
+/// reference's case declares.
 fn mapping_get<'a>(node: &'a Yaml, key: &str) -> Option<&'a Yaml> {
     let Yaml::Hash(mapping) = node else {
         return None;
     };
     mapping
         .iter()
-        .find(|(stored, _)| stored.as_str() == Some(key))
-        .map(|(_, value)| value)
-}
-
-/// [`mapping_get`] without regard to the key's case; see [`HOOKS_KEY`].
-fn mapping_get_ignoring_case<'a>(node: &'a Yaml, key: &str) -> Option<&'a Yaml> {
-    let Yaml::Hash(mapping) = node else {
-        return None;
-    };
-    mapping
-        .iter()
-        .find(|(stored, _)| stored.as_str().is_some_and(|stored| stored.eq_ignore_ascii_case(key)))
+        .find(|(stored, _)| {
+            stored
+                .as_str()
+                .is_some_and(|stored| stored.eq_ignore_ascii_case(key))
+        })
         .map(|(_, value)| value)
 }
 
@@ -666,6 +667,22 @@ mod tests {
                    \x20       TaskDefinition: arn:aws:ecs:us-east-1:1234:task-definition/web:1\n";
         let aliased = "version: &anchor 0.0\n\
                        Resources: *anchor\n";
+        // The SAME declaration with its keys spelled in another case, in both
+        // forms the content is written in: CodeDeploy reads the document for the
+        // sections and properties it HAS rather than for one spelling of them.
+        let lower_case = r#"{"version": "0.0", "resources": [{"handler": {
+            "type": "AWS::Lambda::Function",
+            "properties": {"name": "handler", "alias": "live",
+                           "currentversion": "1", "targetversion": "2"}}}]}"#;
+        let upper_case = "VERSION: 0.0\n\
+                          RESOURCES:\n\
+                          \x20 - handler:\n\
+                          \x20     TYPE: AWS::Lambda::Function\n\
+                          \x20     PROPERTIES:\n\
+                          \x20       NAME: handler\n\
+                          \x20       ALIAS: live\n\
+                          \x20       CURRENTVERSION: \"1\"\n\
+                          \x20       TARGETVERSION: \"2\"\n";
 
         let declared = shift("handler", "live", "2");
         let with_current = LambdaTrafficShift {
@@ -679,7 +696,17 @@ mod tests {
                 unquoted,
                 Some(with_current.clone()),
             ),
-            ("a JSON AppSpec", json, Some(with_current)),
+            ("a JSON AppSpec", json, Some(with_current.clone())),
+            (
+                "a JSON AppSpec whose keys are in lower case",
+                lower_case,
+                Some(with_current.clone()),
+            ),
+            (
+                "a YAML AppSpec whose keys are in upper case",
+                upper_case,
+                Some(with_current),
+            ),
             (
                 "a YAML AppSpec whose Resources is a mapping",
                 mapping,
@@ -954,6 +981,9 @@ mod tests {
         let lower_case = "version: 0.0\n\
                           hooks:\n\
                           \x20 - BeforeAllowTraffic: check-before\n";
+        let upper_case = "VERSION: 0.0\n\
+                          HOOKS:\n\
+                          \x20 - BEFOREALLOWTRAFFIC: check-before\n";
 
         let hook = |event: &str, function: &str| DeclaredHook {
             lifecycle_event_name: event.to_string(),
@@ -997,6 +1027,15 @@ mod tests {
                 "a lower-case hooks section naming a function",
                 lower_case,
                 vec![hook("BeforeAllowTraffic", "check-before")],
+            ),
+            (
+                // The document's own spelling is what a declaration reports;
+                // the hook EXECUTION it becomes takes the platform's spelling
+                // of the event (`executions_of` in `super::lifecycle_hook`),
+                // which is pinned by the end-to-end suite.
+                "an upper-case hooks section naming a function",
+                upper_case,
+                vec![hook("BEFOREALLOWTRAFFIC", "check-before")],
             ),
             ("hooks that name script locations", scripts, vec![]),
             ("content that is no document at all", "\tnot: yaml\n", vec![]),

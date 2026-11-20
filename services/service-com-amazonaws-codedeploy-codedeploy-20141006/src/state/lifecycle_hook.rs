@@ -90,6 +90,35 @@ pub fn platform_hooks(compute_platform: &str) -> Option<&'static [&'static str]>
     }
 }
 
+/// The lifecycle events a deployment of `compute_platform` RUNS, in the order it
+/// runs them — the sequence a target of such a deployment reports one event per
+/// step of.
+///
+/// `Lambda` is the one platform whose whole sequence this service carries out:
+/// the AWS CodeDeploy User Guide's lifecycle events for a Lambda deployment are
+/// BeforeAllowTraffic, AllowTraffic and AfterAllowTraffic — the two validation
+/// hooks [`platform_hooks`] names, around the alias move this service performs
+/// itself ([`super::lambda_traffic_shift`]) — so every step of it is a step whose
+/// progress this service holds.
+///
+/// `None` for every other platform, whose sequence contains steps this service
+/// does not run and so holds no progress of: an Amazon ECS deployment's install
+/// and test-traffic events, and the EC2/on-premises events the CodeDeploy agent
+/// runs. Such a deployment's target reports the events it HAS — the hooks its
+/// revision declared and the results reported against it — rather than steps
+/// nothing ran.
+#[must_use]
+pub fn platform_lifecycle_events(compute_platform: &str) -> Option<&'static [&'static str]> {
+    match compute_platform {
+        "Lambda" => Some(&[
+            LIFECYCLE_EVENT_BEFORE_ALLOW_TRAFFIC,
+            LIFECYCLE_EVENT_ALLOW_TRAFFIC,
+            LIFECYCLE_EVENT_AFTER_ALLOW_TRAFFIC,
+        ]),
+        _ => None,
+    }
+}
+
 /// One hook execution of a deployment: which lifecycle event, which validation
 /// function, and how far that execution has got.
 ///
@@ -151,6 +180,12 @@ pub fn allow_traffic_event(deployment: &Deployment) -> Option<&'static str> {
         return Some(super::LIFECYCLE_EVENT_STATUS_SUCCEEDED);
     }
     Some(match deployment.status.as_str() {
+        // A deployment that ended before the hooks gating the move let it
+        // through never carried the move out, so the event did not fail: it
+        // never ran.
+        super::DEPLOYMENT_STATUS_FAILED if !traffic_is_allowed(deployment) => {
+            super::LIFECYCLE_EVENT_STATUS_SKIPPED
+        }
         super::DEPLOYMENT_STATUS_FAILED => super::LIFECYCLE_EVENT_STATUS_FAILED,
         super::DEPLOYMENT_STATUS_STOPPED => super::LIFECYCLE_EVENT_STATUS_SKIPPED,
         // A deployment that reached `Succeeded` moved every increment, so the

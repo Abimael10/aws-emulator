@@ -64,6 +64,10 @@ pub mod lifecycle_hook;
 /// The INVOCATION of one of those validation functions, in AWS Lambda itself.
 pub mod hook_invocation;
 
+/// The LIFECYCLE EVENTS a deployment target reports: the one place a deployment's
+/// progression through its compute platform's lifecycle sequence is projected.
+pub mod target_lifecycle;
+
 /// The Amazon SNS notifications a deployment group's stored
 /// `triggerConfigurations` publish: the one place a trigger is ACTED on.
 pub mod trigger_notifications;
@@ -3255,125 +3259,6 @@ pub fn target_last_updated_at_ms(deployment: &Deployment) -> i64 {
         .unwrap_or(deployment.create_time_ms)
 }
 
-/// The lifecycle events of `deployment`, as the modelled `LifecycleEvent` list a
-/// target carries.
-///
-/// CodeDeploy reports a target's lifecycle events as the events its deployment ran
-/// on that target. Three kinds of event are held here, and all three are reported,
-/// in the order the deployment runs them:
-///
-/// * the hooks the revision DECLARED, which this service dispatched to a Lambda
-///   validation function ([`lifecycle_hook`]) — each as far as its own execution
-///   has got ([`hook_event_status`]), in the order its platform runs them;
-/// * the event that MOVES the traffic, for a deployment that performs a traffic
-///   shift: work this service does itself rather than through a function, so it is
-///   reported from that shift's own progress
-///   ([`lifecycle_hook::allow_traffic_event`]) and sits between the hook that runs
-///   before traffic and the one that runs after it;
-/// * a result reported against a hook execution this deployment did not mint,
-///   which is a report of one of the platform's lifecycle events made directly
-///   rather than by a function this service invoked.
-///
-/// Nothing here runs the EC2/on-premises hooks the CodeDeploy agent runs, so a
-/// deployment that declared no hook, performs no shift and nothing reported for
-/// carries no lifecycle event rather than events nothing ran. A report says what
-/// the lifecycle event ended as and when it was made, which is when that event
-/// ENDED; when it started is not something a report carries, so it is left absent.
-fn target_lifecycle_events(
-    deployment: &Deployment,
-) -> Option<Vec<crate::ops::types::LifecycleEvent>> {
-    let hook_event = |hook: &lifecycle_hook::HookExecution| crate::ops::types::LifecycleEvent {
-        lifecycle_event_name: Some(hook.lifecycle_event_name.clone()),
-        diagnostics: None,
-        start_time: None,
-        end_time: hook.update_time_ms.map(timestamp),
-        status: Some(hook_event_status(deployment, hook).to_string()),
-    };
-    let before_traffic = deployment
-        .hook_executions
-        .iter()
-        .filter(|hook| !hook.runs_after_traffic())
-        .map(hook_event);
-    // The traffic move itself, for a deployment that performs one: the alias write
-    // this service carries out ([`lambda_traffic_shift`]). The instant it ended is
-    // the instant the deployment it completed ended, which is the only instant
-    // this service holds for it.
-    let allow_traffic = lifecycle_hook::allow_traffic_event(deployment).map(|status| {
-        crate::ops::types::LifecycleEvent {
-            lifecycle_event_name: Some(lifecycle_hook::LIFECYCLE_EVENT_ALLOW_TRAFFIC.to_string()),
-            diagnostics: None,
-            start_time: None,
-            end_time: (status == LIFECYCLE_EVENT_STATUS_SUCCEEDED)
-                .then(|| timestamp(target_last_updated_at_ms(deployment))),
-            status: Some(status.to_string()),
-        }
-    });
-    let after_traffic = deployment
-        .hook_executions
-        .iter()
-        .filter(|hook| hook.runs_after_traffic())
-        .map(hook_event);
-    // A report that landed on a declared hook is already one of the events above,
-    // so it is not reported twice.
-    let reported = deployment
-        .lifecycle_hook_executions
-        .iter()
-        .filter(|execution| {
-            !deployment.hook_executions.iter().any(|hook| {
-                hook.lifecycle_event_hook_execution_id.as_deref()
-                    == Some(execution.lifecycle_event_hook_execution_id.as_str())
-            })
-        })
-        .map(|execution| crate::ops::types::LifecycleEvent {
-            lifecycle_event_name: Some(execution.lifecycle_event_name.clone()),
-            diagnostics: None,
-            start_time: None,
-            end_time: Some(timestamp(execution.update_time_ms)),
-            status: Some(execution.status.clone()),
-        });
-    let events: Vec<crate::ops::types::LifecycleEvent> = before_traffic
-        .chain(allow_traffic)
-        .chain(after_traffic)
-        .chain(reported)
-        .collect();
-    non_empty(&events)
-}
-
-/// The `LifecycleEventStatus` one declared hook's lifecycle event carries
-/// (`smithy_query(query="shape",shape="LifecycleEventStatus")`: Failed |
-/// InProgress | Pending | Skipped | Succeeded | Unknown).
-///
-/// The result its validation function reported, when it reported one: that result
-/// IS what the lifecycle event completed with. Otherwise the event is as far along
-/// as the deployment has taken it — dispatched to the function and awaiting its
-/// report (`InProgress`), not dispatched yet (`Pending`), or ended with the
-/// deployment itself: a deployment that FAILED for a hook that reported nothing
-/// has a failed lifecycle event, and one a caller stopped never ran the rest of
-/// them (`Skipped`).
-fn hook_event_status(
-    deployment: &Deployment,
-    hook: &lifecycle_hook::HookExecution,
-) -> &'static str {
-    if let Some(reported) = hook.status.as_deref() {
-        return match reported {
-            LIFECYCLE_EVENT_STATUS_FAILED => LIFECYCLE_EVENT_STATUS_FAILED,
-            LIFECYCLE_EVENT_STATUS_SUCCEEDED => LIFECYCLE_EVENT_STATUS_SUCCEEDED,
-            // Only the two results above are reportable, so anything else is a
-            // status this service does not hold for the event.
-            _ => LIFECYCLE_EVENT_STATUS_UNKNOWN,
-        };
-    }
-    match deployment.status.as_str() {
-        DEPLOYMENT_STATUS_FAILED => LIFECYCLE_EVENT_STATUS_FAILED,
-        DEPLOYMENT_STATUS_STOPPED => LIFECYCLE_EVENT_STATUS_SKIPPED,
-        DEPLOYMENT_STATUS_SUCCEEDED => LIFECYCLE_EVENT_STATUS_SUCCEEDED,
-        _ if hook.lifecycle_event_hook_execution_id.is_some() => {
-            LIFECYCLE_EVENT_STATUS_IN_PROGRESS
-        }
-        _ => LIFECYCLE_EVENT_STATUS_PENDING,
-    }
-}
-
 /// What a Lambda deployment's target reports about the function it deploys:
 /// `LambdaFunctionInfo`, built from the shift its revision's AppSpec DECLARED
 /// ([`appspec::declared_shift`]) and how far that shift has got.
@@ -3427,7 +3312,7 @@ pub fn deployment_target_view(
     let target_id = target.target_id.clone();
     let status = Some(target_status(deployment).to_string());
     let last_updated_at = Some(timestamp(target_last_updated_at_ms(deployment)));
-    let lifecycle_events = target_lifecycle_events(deployment);
+    let lifecycle_events = target_lifecycle::events_of(deployment);
     let mut view = crate::ops::types::DeploymentTarget {
         deployment_target_type: Some(target.target_type.clone()),
         instance_target: None,
@@ -3484,7 +3369,7 @@ pub fn deployment_target_view(
 /// the same derivations: the status its progress gives the target
 /// ([`target_status`]), the instant that status last changed
 /// ([`target_last_updated_at_ms`]), and the lifecycle event results reported
-/// against the deployment ([`target_lifecycle_events`]). The environment the
+/// against the deployment ([`target_lifecycle::events_of`]). The environment the
 /// instance belongs to is the `TargetLabel` the snapshot resolved, whose members
 /// `InstanceType` repeats (`smithy_query(query="shape",shape="InstanceType")`:
 /// Blue | Green), so an instance of an in-place deployment — which has one
@@ -3498,7 +3383,7 @@ pub fn instance_summary(
         instance_id: target.target_id.clone(),
         status: Some(target_status(deployment).to_string()),
         last_updated_at: Some(timestamp(target_last_updated_at_ms(deployment))),
-        lifecycle_events: target_lifecycle_events(deployment),
+        lifecycle_events: target_lifecycle::events_of(deployment),
         instance_type: target.instance_label.clone(),
     }
 }
