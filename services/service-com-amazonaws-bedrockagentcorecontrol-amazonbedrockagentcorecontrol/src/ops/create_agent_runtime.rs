@@ -265,16 +265,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // One runtime per name, so a repeated name is a conflict, not a second
-            // runtime that later reads cannot tell apart.
-            if let Some(existing) = store.runtime_names.get(&input.agent_runtime_name) {
+            // runtime that later reads cannot tell apart. The refusal names the name
+            // the REQUEST carried and nothing of the runtime already holding it
+            // (`crate::state::name_conflicts`).
+            if store.runtime_names.contains_key(&input.agent_runtime_name) {
                 return Err(CreateAgentRuntimeErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(format!(
-                            "an agent runtime named {} already exists (agentRuntimeId \
-                             {existing})",
-                            input.agent_runtime_name
-                        )),
-                    },
+                    crate::state::agent_runtime_name_conflict(&input.agent_runtime_name),
                 )
                 .into());
             }

@@ -1712,8 +1712,15 @@ pub mod memory_stream_delivery;
 /// previous change is still in flight earns. Re-exported, so a handler names
 /// `crate::state::…` for it exactly as it does for the harness itself.
 pub mod harness_updates;
+/// How this control plane refuses a create whose `name` the account already
+/// holds, for the families that had been wording that refusal in their own
+/// handler: the one duplicate-name sentence, and the subject each family spells
+/// it with. Re-exported, so a handler names `crate::state::…` for it exactly as
+/// it does for the resource itself.
+pub mod name_conflicts;
 mod harnesses;
 pub use harnesses::*;
+pub use name_conflicts::*;
 pub use agent_runtime_default_endpoint::*;
 pub use agent_runtime_deletion::*;
 pub use harness_updates::*;
@@ -2167,20 +2174,32 @@ pub const BROWSER_STATUS_READY: &str = "READY";
 pub const BROWSER_STATUS_DELETED: &str = "DELETED";
 
 /// How this control plane words a create refused because the account already
-/// holds the requested name: the resource type, the name the request carried
-/// quoted, and the account the name is held in — "<resource> with name '<name>'
-/// already exists in this account".
+/// holds the requested name: the resource the sentence is about, the name the
+/// request carried quoted, and the account the name is held in — "<resource>
+/// with name '<name>' already exists in this account".
+///
+/// `resource` is the SUBJECT the family being refused words the sentence with,
+/// spelled as that family's recorded refusal spells it (a bare noun for most of
+/// them, the noun with its article for the gateway family), because each
+/// AgentCore service behind this one endpoint words its own subject.
 ///
 /// Everything but the name is fixed, the name is the caller's own value, and the
 /// resource already holding it is NOT disclosed: an identifier this service
-/// generated for another resource is no part of the refusal, and would make the
-/// message differ between runs that asked the same thing.
+/// generated for another resource is no part of the refusal, would make the
+/// message differ between runs that asked the same thing, and is an id the
+/// caller was not authorized to learn from a create it was refused.
 fn name_conflict(resource: &str, name: &str) -> ConflictException {
     ConflictException {
-        message: Some(format!(
-            "{resource} with name '{name}' already exists in this account"
-        )),
+        message: Some(name_conflict_message(resource, name)),
     }
+}
+
+/// The SENTENCE [`name_conflict`] carries, on its own, for the one family whose
+/// create models no conflict error at all and states this refusal in its
+/// modelled `ValidationException` instead: the words are the same wherever the
+/// refusal is carried, so the two cannot drift apart.
+fn name_conflict_message(resource: &str, name: &str) -> String {
+    format!("{resource} with name '{name}' already exists in this account")
 }
 
 /// The modelled conflict for a browser `name` this account already holds.

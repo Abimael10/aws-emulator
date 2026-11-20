@@ -50,6 +50,11 @@
 //!    type, which for a type the shipped model's snapshot lags is wider than the set that
 //!    snapshot declares ([`published_value_sets`]). Only the sentence is reconciled: what
 //!    ADMITS a value is still the model, walked by the framework.
+//! 8. the value a clause quotes for a member the model types as `float` or `double` is
+//!    written the way a service writes a floating-point value — with a fractional part or
+//!    an exponent — rather than as the integer digits the framework's numeric rendering
+//!    produces for a whole one ([`float_values`]). The REQUIREMENT's bound is untouched:
+//!    only the submitted value is re-rendered.
 //!
 //! Rule 4's constraint set is read off the MODEL, not off the refusal: the structured
 //! refusal carries only the constraints that failed, so the ones a value satisfied would
@@ -74,6 +79,7 @@ use aws_smithy_schema_server::constraints::{
 use service_common::validation::{list_of_element, unanchored};
 use smithy_server_runtime::Refused;
 
+mod float_values;
 pub(super) mod pointer_form;
 mod published_value_sets;
 
@@ -226,12 +232,15 @@ fn message(
     if violations.is_empty() {
         return None;
     }
-    // Rule 7: the values an enum clause enumerates are the ones this endpoint publishes for
-    // the type, before anything is read off the violations — the clauses and the element
-    // sets below are then built from one statement of each set rather than from two.
+    // Rules 7 and 8: the values an enum clause enumerates are the ones this endpoint
+    // publishes for the type, and a floating-point member's submitted value is written the
+    // way this service writes one — both before anything is read off the violations, so the
+    // clauses and the element sets below are built from one statement of each rather than
+    // from two.
     let violations: Vec<Violation> = violations
         .iter()
         .map(published_value_sets::restated)
+        .map(|violation| float_values::restated(&violation))
         .collect();
     let violations = violations.as_slice();
     // Rule 6: the form is the serving backend's, read off the operation's own input schema.

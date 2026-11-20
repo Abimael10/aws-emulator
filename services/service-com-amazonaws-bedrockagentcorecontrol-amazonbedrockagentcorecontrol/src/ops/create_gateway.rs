@@ -286,14 +286,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The name must be unique within your account", so a repeated name is a
-        // conflict, not a second gateway that later reads cannot tell apart.
-        if let Some(existing) = store.gateway_names.get(&input.name) {
-            return Err(CreateGatewayErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "a gateway named {} already exists (gatewayId {existing})",
-                    input.name
-                )),
-            })
+        // conflict, not a second gateway that later reads cannot tell apart. The
+        // refusal names the name the REQUEST carried and nothing of the gateway
+        // already holding it (`crate::state::name_conflicts`).
+        if store.gateway_names.contains_key(&input.name) {
+            return Err(CreateGatewayErrorModeled::ConflictException(
+                crate::state::gateway_name_conflict(&input.name),
+            )
             .into());
         }
 

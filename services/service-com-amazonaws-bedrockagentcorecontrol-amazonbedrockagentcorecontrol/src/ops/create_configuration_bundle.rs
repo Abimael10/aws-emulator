@@ -217,15 +217,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Names must be unique within your account", so a repeated name is a
-        // conflict, not a second bundle that later reads cannot tell apart.
-        if let Some(existing) = store.configuration_bundle_names.get(&input.bundle_name) {
+        // conflict, not a second bundle that later reads cannot tell apart. The
+        // refusal names the name the REQUEST carried and nothing of the bundle
+        // already holding it (`crate::state::name_conflicts`).
+        if store
+            .configuration_bundle_names
+            .contains_key(&input.bundle_name)
+        {
             return Err(CreateConfigurationBundleErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "a configuration bundle named {} already exists (bundleId {existing})",
-                        input.bundle_name
-                    )),
-                },
+                crate::state::configuration_bundle_name_conflict(&input.bundle_name),
             )
             .into());
         }

@@ -174,10 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the enum has for a request the stored state refuses.
         if store.workload_identities.contains_key(&input.name) {
             return Err(CreateWorkloadIdentityErrorModeled::ValidationException(
-                crate::state::resource_conflict(format!(
-                    "a workload identity named {} already exists in this account",
-                    input.name
-                )),
+                crate::state::resource_conflict(
+                    crate::state::workload_identity_name_conflict_message(&input.name),
+                ),
             )
             .into());
         }

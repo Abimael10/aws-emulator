@@ -220,14 +220,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "The name must be unique within your account", so a repeated name is a
-        // conflict, not a second registry that later reads cannot tell apart.
-        if let Some(existing) = store.registry_names.get(&input.name) {
-            return Err(CreateRegistryErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "a registry named {} already exists (registryId {existing})",
-                    input.name
-                )),
-            })
+        // conflict, not a second registry that later reads cannot tell apart. The
+        // refusal names the name the REQUEST carried and nothing of the registry
+        // already holding it (`crate::state::name_conflicts`).
+        if store.registry_names.contains_key(&input.name) {
+            return Err(CreateRegistryErrorModeled::ConflictException(
+                crate::state::registry_name_conflict(&input.name),
+            )
             .into());
         }
 

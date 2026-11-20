@@ -229,14 +229,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The name "must be unique within the account", so a repeated name is a
-        // conflict rather than a second dataset later reads cannot tell apart.
-        if let Some(existing) = store.dataset_names.get(&input.dataset_name) {
-            return Err(CreateDatasetErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "a dataset named {} already exists (datasetId {existing})",
-                    input.dataset_name
-                )),
-            })
+        // conflict rather than a second dataset later reads cannot tell apart. The
+        // refusal names the name the REQUEST carried and nothing of the dataset
+        // already holding it (`crate::state::name_conflicts`).
+        if store.dataset_names.contains_key(&input.dataset_name) {
+            return Err(CreateDatasetErrorModeled::ConflictException(
+                crate::state::dataset_name_conflict(&input.dataset_name),
+            )
             .into());
         }
 
