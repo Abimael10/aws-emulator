@@ -1319,17 +1319,20 @@ impl ComAmazonawsCodepipelineCodepipeline20150709State {
     /// What the third-party webhook operations resolve a webhook name to, or `None`
     /// when the account holds no webhook of that name.
     ///
-    /// The one question both of them put to the store: the connection they make and
-    /// break is the GitHub HMAC one the webhook's own shared secret authenticates, so
-    /// what decides whether either serves a webhook is the authentication it was
-    /// configured with ([`webhook_authentication_unsupported_message`]) and nothing
-    /// else about it. `WebhookDefinition$targetPipeline` is a stored NAME that
-    /// `PutWebhook` accepts without resolving, so whether the account still holds a
-    /// pipeline of that name is not part of this answer.
+    /// The one question both of them put to the store, so neither can judge a webhook
+    /// differently from the other: the connection they make and break is between a
+    /// PIPELINE's source action and the external tool, authenticated by the webhook's
+    /// own shared secret, so what either needs of the stored webhook is the pipeline its
+    /// `WebhookDefinition$targetPipeline` names — and whether the account still holds
+    /// one ([`webhook_target_pipeline_absent_message`]) — beside the authentication it
+    /// was configured with ([`webhook_authentication_unsupported_message`]).
     pub fn webhook_connection(&self, name: &str) -> Option<WebhookConnection> {
         let webhook = self.webhooks.get(name)?;
+        let target_pipeline = webhook.definition.target_pipeline.clone();
         Some(WebhookConnection {
             authentication: webhook.definition.authentication.clone(),
+            target_pipeline_held: self.pipelines.contains_key(&target_pipeline),
+            target_pipeline,
         })
     }
 
@@ -1771,9 +1774,12 @@ impl TagTarget {
 /// answers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebhookConnection {
-    /// The `WebhookDefinition$authentication` the stored webhook carries — the one
-    /// member of the webhook either operation turns on.
+    /// The `WebhookDefinition$authentication` the stored webhook carries.
     pub authentication: String,
+    /// The `WebhookDefinition$targetPipeline` the stored webhook names.
+    pub target_pipeline: String,
+    /// Whether the account still holds a pipeline of that name.
+    pub target_pipeline_held: bool,
 }
 
 /// One stored webhook: the definition exactly as the caller sent it, plus the
@@ -4320,6 +4326,20 @@ pub fn invalid_approval_token_message(token: &str, action_name: &str, stage_name
 /// ([`invalid_approval_token_message`] is the other).
 pub fn not_an_approval_action_message(pipeline_name: &str, action_name: &str) -> String {
     format!("{pipeline_name} does not include an approval action named {action_name}.")
+}
+
+/// The message `ValidationException` carries for a webhook whose target pipeline the
+/// account does not hold.
+///
+/// The connection the third-party webhook operations make and break is between the
+/// SOURCE ACTION of the pipeline the webhook's `WebhookDefinition$targetPipeline` names
+/// and the external tool, so neither can be served while no pipeline of that name is
+/// held: there is no action for the connection to reach. `PutWebhook` stores the
+/// reference without resolving it, so the dangling reference surfaces here — the refusal
+/// names the webhook the request addressed and the pipeline its definition points at,
+/// which is the only place the caller learns WHICH reference is dangling.
+pub fn webhook_target_pipeline_absent_message(name: &str, target_pipeline: &str) -> String {
+    format!("Webhook {name} references a pipeline {target_pipeline} which does not exist")
 }
 
 /// The message `ValidationException` carries for a webhook the third-party webhook

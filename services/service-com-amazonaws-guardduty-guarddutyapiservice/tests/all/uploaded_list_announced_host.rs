@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! WHICH HOST an uploaded list's `Location` is announced at, end to end over the wire.
+//! WHAT an uploaded list's `Location` reads back as, end to end over the wire.
 //!
 //! Every request goes through [`smithy_server_runtime::MultiServiceRouter::dispatch`]
 //! (the harness lives in the `detector_lifecycle` suite), so routing, restJson1
@@ -8,36 +8,33 @@
 //! together.
 //!
 //! The rule under test, asserted over a TABLE of inputs rather than over one recorded
-//! call: a `Location` is the address of the FILE an uploaded list was uploaded as, which a
-//! caller follows to read it, so the address a read reports leads back to THIS emulator.
-//! The caller's own value fixes WHICH object — the bucket and the key it names — and the
-//! read answers that object addressed path-style at the endpoint serving the read; it never
-//! answers a host AWS publishes its own endpoints at, which resolves nowhere near this
-//! process or, worse, to genuine AWS infrastructure.
+//! call: a `Location` is the URI of the file an uploaded list was uploaded as, submitted by
+//! the account, so a read reports that URI character for character — in the spelling the
+//! writer chose, scheme and host included. It is a record of what was configured, not an
+//! address this service mints, so nothing about the request reading it takes part in the
+//! answer.
 //!
 //! The rows therefore span what the rule generalises over:
 //!
-//! * the SPELLING of the submitted address — every S3 URL form names one and the same
-//!   object, so every row of the table must be announced at the SAME address;
+//! * the SPELLING of the submitted URI — every S3 URL form is kept as written, so no two
+//!   rows read back as one value;
 //! * the uploaded-list FAMILY, since the rule is the family's and not the IPSet's: the
 //!   IPSet, the threat list and the two entity sets each store a location;
-//! * the ENDPOINT the read arrives at, which is what decides the announced host: a client
-//!   configured with the emulator's own endpoint resolves nothing else and is handed that
-//!   very address, port included, while a caller that resolves this service's own published
-//!   host is answered the base the framework reports for an emulator served on no port of
-//!   its own.
+//! * the ENDPOINT the read arrives at, which takes no part in the answer: a client
+//!   configured with the emulator's own endpoint and a caller that resolves this service's
+//!   own published host are told the same URI.
 
 use serde_json::json;
 
 use crate::detector_lifecycle::{
-    call_at, enabled_detector, new_router, Router, ABSENT_DETECTOR_ID, EMULATOR_BASE,
+    call_at, enabled_detector, new_router, Router, ABSENT_DETECTOR_ID,
 };
 
 /// The bucket every row's location names.
 const BUCKET: &str = "gd-uploaded-lists";
 
 /// The object key every row's location names, deep enough that the whole path and not
-/// just a last segment has to survive the announcement.
+/// just a last segment has to survive the read-back.
 const KEY: &str = "lists/2026/trusted.txt";
 
 /// One uploaded-list family: the route segment its sub-resource hangs off, the `Format`
@@ -55,8 +52,8 @@ const FAMILIES: [(&str, &str, &str); 4] = [
 /// The spellings of the ONE object [`BUCKET`] and [`KEY`] name: the `s3://` scheme, the
 /// Region-less and the regional path-style public endpoints, the virtual-hosted-style one,
 /// an object URL on a private S3 endpoint reached over `http` on a port of its own, and an
-/// object URL on a host that is no S3 endpoint at all. Each addresses the same file, so
-/// each must be announced at the same address.
+/// object URL on a host that is no S3 endpoint at all. Each addresses the same file, and
+/// each reads back as the URI it was written as.
 fn spellings() -> [(&'static str, String); 6] {
     [
         ("the s3:// scheme", format!("s3://{BUCKET}/{KEY}")),
@@ -83,20 +80,18 @@ fn spellings() -> [(&'static str, String); 6] {
     ]
 }
 
-/// The endpoint authorities every row is read at, and the base a location announced to
-/// such a caller is rooted at: the emulator's own endpoint as a loopback literal with a
-/// port and by its loopback name on another, each the only address such a client resolves,
-/// and this service's own published host, which is no address of this emulator's.
-fn read_endpoints() -> [(&'static str, String); 3] {
-    [
-        ("127.0.0.1:39461", "https://127.0.0.1:39461".to_string()),
-        ("localhost:4566", "https://localhost:4566".to_string()),
-        ("guardduty.us-east-1.amazonaws.com", EMULATOR_BASE.to_string()),
-    ]
-}
+/// The endpoint authorities every row is read at: the emulator's own endpoint as a loopback
+/// literal with a port and by its loopback name on another, each the only address such a
+/// client resolves, and this service's own published host. None of them takes part in the
+/// answer.
+const READ_ENDPOINTS: [&str; 3] = [
+    "127.0.0.1:39461",
+    "localhost:4566",
+    "guardduty.us-east-1.amazonaws.com",
+];
 
 /// The endpoint the creates of this suite are sent to: a location is read by its own
-/// syntax, so where the create landed is no part of what a read announces.
+/// syntax, so where the create landed is no part of what a read reports either.
 const CREATE_ENDPOINT: &str = "127.0.0.1:39461";
 
 /// A router holding one enabled detector. One per row: a detector holds at most one
@@ -109,7 +104,7 @@ async fn detector() -> (Router, String) {
 }
 
 #[tokio::test]
-async fn an_uploaded_lists_location_is_announced_at_the_endpoint_serving_the_read() {
+async fn an_uploaded_lists_location_reads_back_as_the_uri_that_was_stored() {
     for (segment, id_member, format) in FAMILIES {
         for (why, location) in spellings() {
             let (router, detector_id) = detector().await;
@@ -138,7 +133,7 @@ async fn an_uploaded_lists_location_is_announced_at_the_endpoint_serving_the_rea
                 })
                 .to_string();
 
-            for (endpoint, base) in read_endpoints() {
+            for endpoint in READ_ENDPOINTS {
                 let case = format!("{create_case} read at {endpoint}");
                 let (status, read) = call_at(
                     &router,
@@ -152,41 +147,25 @@ async fn an_uploaded_lists_location_is_announced_at_the_endpoint_serving_the_rea
                     status, 200,
                     "case {case:?}: the stored list must read back, got {status} {read:?}"
                 );
-                let announced = read["location"].as_str().unwrap_or_default();
-                // The SAME object the create named — bucket and key — at the endpoint
-                // this read arrived at, path-style, whichever spelling was submitted.
-                let expected = format!("{base}/{BUCKET}/{KEY}");
+                let reported = read["location"].as_str().unwrap_or_default();
                 assert_eq!(
-                    announced, expected,
-                    "case {case:?}: expected the object announced as {expected:?}, got \
-                     {announced:?}"
-                );
-                // And never a host AWS publishes its own endpoints at: the file is in
-                // this emulator's object storage, and a client following an AWS host
-                // leaves the emulated environment carrying its credentials. The list of
-                // those zones is the shared one
-                // (`service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`).
-                let host = ::service_common::data_plane_addressing::host_only(
-                    ::service_common::data_plane_addressing::url_authority(announced),
-                );
-                assert!(
-                    !::service_common::data_plane_addressing::addresses_an_aws_endpoint(host),
-                    "case {case:?}: an announced location must not name a host AWS \
-                     publishes, got {announced:?}"
+                    reported, location,
+                    "case {case:?}: expected the stored URI {location:?}, got {reported:?}"
                 );
             }
         }
     }
 }
 
-/// The announcement is a READ-side projection, so it changes nothing: a second read
-/// answers the same address, a relocation is announced at the object the UPDATE named, and
-/// a read of a detector nothing minted is still refused rather than answered an address.
+/// The read is a report, so it changes nothing: a second read answers the same URI, a
+/// relocation reads back as the URI the UPDATE named, and a read under a detector nothing
+/// minted is still refused rather than answered a location.
 #[tokio::test]
-async fn a_relocation_is_announced_at_the_object_the_update_named() {
+async fn a_relocation_reads_back_as_the_uri_the_update_named() {
     for (segment, id_member, format) in FAMILIES {
         let (router, detector_id) = detector().await;
         let case = segment;
+        let created_location = format!("s3://{BUCKET}/{KEY}");
         let (status, created) = call_at(
             &router,
             CREATE_ENDPOINT,
@@ -195,7 +174,7 @@ async fn a_relocation_is_announced_at_the_object_the_update_named() {
             Some(json!({
                 "name": "relocated-list",
                 "format": format,
-                "location": format!("s3://{BUCKET}/{KEY}"),
+                "location": created_location,
                 "activate": false
             })),
         )
@@ -209,7 +188,6 @@ async fn a_relocation_is_announced_at_the_object_the_update_named() {
             .unwrap_or_else(|| panic!("case {case:?}: expected an id, got {created:?}"))
             .to_string();
         let path = format!("/detector/{detector_id}/{segment}/{id}");
-        let expected = format!("{EMULATOR_BASE}/{BUCKET}/{KEY}");
 
         // Twice, with nothing in between: a read reports and does not re-address.
         for attempt in 1..=2 {
@@ -220,24 +198,20 @@ async fn a_relocation_is_announced_at_the_object_the_update_named() {
             );
             assert_eq!(
                 read["location"].as_str(),
-                Some(expected.as_str()),
-                "case {case:?} read {attempt}: expected {expected:?}, got {read:?}"
+                Some(created_location.as_str()),
+                "case {case:?} read {attempt}: expected {created_location:?}, got {read:?}"
             );
         }
 
-        // A relocation: the announced address follows the object the update named, in
-        // another bucket and under another key, submitted in another spelling again.
-        let moved_bucket = "gd-moved-lists";
-        let moved_key = "moved/list.txt";
+        // A relocation: the read follows the URI the update named, in another bucket and
+        // under another key, submitted in another spelling again.
+        let moved = "https://gd-moved-lists.s3.amazonaws.com/moved/list.txt";
         let (status, updated) = call_at(
             &router,
             CREATE_ENDPOINT,
             "POST",
             &path,
-            Some(json!({
-                "location":
-                    format!("https://{moved_bucket}.s3.amazonaws.com/{moved_key}")
-            })),
+            Some(json!({"location": moved})),
         )
         .await;
         assert_eq!(
@@ -249,15 +223,13 @@ async fn a_relocation_is_announced_at_the_object_the_update_named() {
             status, 200,
             "case {case:?}: the relocated list must read back, got {status} {read:?}"
         );
-        let expected_moved = format!("{EMULATOR_BASE}/{moved_bucket}/{moved_key}");
         assert_eq!(
             read["location"].as_str(),
-            Some(expected_moved.as_str()),
-            "case {case:?}: expected the relocation announced as {expected_moved:?}, got \
-             {read:?}"
+            Some(moved),
+            "case {case:?}: expected the relocation read back as {moved:?}, got {read:?}"
         );
 
-        // And nothing is announced for a list no create minted: the same read under a
+        // And nothing is reported for a list no create minted: the same read under a
         // detector id nothing minted is refused.
         let (status, refused) = call_at(
             &router,
@@ -274,11 +246,11 @@ async fn a_relocation_is_announced_at_the_object_the_update_named() {
         );
         assert!(
             refused.get("location").is_none(),
-            "case {case:?}: a refusal must announce no location, got {refused:?}"
+            "case {case:?}: a refusal must report no location, got {refused:?}"
         );
     }
 }
 
-/// The published host of this service, which is no address of this emulator's — the
-/// endpoint the reads of the relocation test arrive at.
+/// The published host of this service — the endpoint the reads of the relocation test
+/// arrive at, which takes no part in what they report.
 const PUBLIC_READ_ENDPOINT: &str = "guardduty.us-east-1.amazonaws.com";

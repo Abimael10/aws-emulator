@@ -43,7 +43,7 @@ use serde_json::{json, Value};
 
 use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
-    announced_location, call, call_in, enabled_detector, error_code, new_router, Router,
+    reported_list_location, call, call_in, enabled_detector, error_code, new_router, Router,
     ABSENT_DETECTOR_ID,
 };
 use crate::ip_set_lifecycle::past_the_transition;
@@ -337,7 +337,7 @@ async fn an_update_replaces_only_the_members_it_carries() {
             .or_else(|| create.get("location"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let expected = announced_location(stored_location);
+        let expected = reported_list_location(stored_location);
         assert_eq!(
             body["location"],
             json!(expected),
@@ -404,7 +404,7 @@ async fn successive_updates_accumulate_on_the_stored_ip_set() {
         let body = read(&router, &detector, &id, case).await;
         let name = body["name"].as_str().unwrap_or_default();
         let location = body["location"].as_str().unwrap_or_default();
-        let expected_location = announced_location(expected_location);
+        let expected_location = reported_list_location(expected_location);
         assert_eq!(
             name, expected_name,
             "case {case:?}: expected the name {expected_name:?}, got {name:?}"
@@ -856,7 +856,7 @@ async fn an_update_touches_only_the_ip_set_it_names() {
     );
     assert_eq!(
         sibling["location"].as_str().unwrap_or_default(),
-        announced_location("s3://my-bucket/second.xml"),
+        reported_list_location("s3://my-bucket/second.xml"),
         "case \"the second list\": the sibling's location must not move, got {:?}",
         sibling["location"]
     );

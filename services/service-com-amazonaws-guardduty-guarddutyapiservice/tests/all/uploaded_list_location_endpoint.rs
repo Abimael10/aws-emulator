@@ -21,13 +21,10 @@
 //!    nothing. The rule is the uploaded-list FAMILY's, so the rows span all four
 //!    families — the IPSet, the threat list and the two entity sets — on the create
 //!    that stores a location.
-//! 2. A read-back ANNOUNCES that location at the endpoint serving the read: the BUCKET
-//!    and the KEY are the caller's own, taken out of the value it submitted, and the host
-//!    is this emulator's — a `Location` is an address a caller FOLLOWS to read the
-//!    uploaded file, and the file lives in the object storage of this emulator, not under
-//!    a host AWS publishes. The object is addressed path-style beneath that endpoint,
-//!    whichever spelling the submitted value used, so a read at any endpoint names the
-//!    same object.
+//! 2. A read-back reports that location as the URI it was stored as: a `Location` is the
+//!    caller's own value, kept as a record of what it configured, so a read answers the
+//!    same URI whichever endpoint it arrives at and whichever S3 URL spelling the write
+//!    used.
 //! 3. A change to a list whose own delete has already been accepted collides with
 //!    work in flight rather than naming an absent resource, so `UpdateIPSet` and
 //!    `UpdateThreatIntelSet` refuse it under the `InternalServerErrorException` class
@@ -39,8 +36,8 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    announced_location, announced_location_at, call, call_at, enabled_detector, error_code,
-    error_shape, new_router, Router, EMULATOR_BASE,
+    reported_list_location, call, call_at, enabled_detector, error_code, error_shape, new_router,
+    Router,
 };
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     OPERATION_IN_PROGRESS_MESSAGE, SET_ID_NOT_FOUND_MESSAGE,
@@ -72,18 +69,6 @@ const PUBLIC_ENDPOINT: &str = "guardduty.us-east-1.amazonaws.com";
 /// must get the same answer at every one of them.
 fn endpoints() -> [&'static str; 3] {
     [LOOPBACK_ENDPOINT, NAMED_ENDPOINT, PUBLIC_ENDPOINT]
-}
-
-/// The base a location announced to a read that arrived at `endpoint` is rooted at: that
-/// very endpoint for a client configured with one of its own, which resolves nothing else,
-/// and [`EMULATOR_BASE`] for a caller that resolves this service's own published host —
-/// which is no address of this emulator's, so the base reported for an emulator served on
-/// no port of its own stands in its place.
-fn announced_base(endpoint: &str) -> String {
-    if endpoint == PUBLIC_ENDPOINT {
-        return EMULATOR_BASE.to_string();
-    }
-    format!("https://{endpoint}")
 }
 
 /// One uploaded-list family: the route segment its sub-resource hangs off, the
@@ -128,8 +113,7 @@ fn families() -> Vec<Family> {
 }
 
 /// One `Location` case: the location a create carries and whether the service may store
-/// it — and, when it may, the object a read-back announces. Every row is sent to each of
-/// [`endpoints`].
+/// it. Every row is sent to each of [`endpoints`].
 struct LocationCase {
     why: &'static str,
     location: String,
@@ -146,8 +130,8 @@ struct LocationCase {
 /// The catalogue of values that are no S3 URL at all is the `ip_set_location_syntax`
 /// suite's; the rows here carry one as a control and own the half of the rule that says
 /// WHETHER a location is accepted depends on neither the endpoint the object URL names nor
-/// the one the GuardDuty request arrived at — while the object every spelling names is the
-/// same one, which is what a read announces at its own endpoint.
+/// the one the GuardDuty request arrived at — while an accepted value is the one a read
+/// reports back, in the spelling it was written in.
 fn location_cases() -> Vec<LocationCase> {
     vec![
         LocationCase {
@@ -316,23 +300,18 @@ async fn a_location_is_accepted_exactly_when_it_addresses_an_object_at_any_s3_en
                         .as_str()
                         .unwrap_or_else(|| panic!("case {case:?}: expected an id, got {body:?}"))
                         .to_string();
-                    // The SAME object the create submitted, read back at every endpoint
-                    // a read can arrive at: the bucket and the key are the caller's,
-                    // whichever spelling it wrote them in, and the host is the endpoint
-                    // serving that read — never a host this emulator does not answer on.
+                    // The SAME URI the create submitted, read back at every endpoint a
+                    // read can arrive at: the value is the caller's own record of where
+                    // the file sits, so nothing about the read re-spells it.
                     for read_endpoint in endpoints() {
                         let stored =
                             read_at(&router, read_endpoint, &detector_id, &family, &id).await;
                         let reported = stored["location"].as_str().unwrap_or_default();
-                        let expected = announced_location_at(
-                            &announced_base(read_endpoint),
-                            &row.location,
-                        );
                         assert_eq!(
-                            reported, expected,
-                            "case {case:?}: a read at {read_endpoint} must announce the \
-                             submitted object at that endpoint, expected {expected:?}, got \
-                             {reported:?}"
+                            reported, row.location,
+                            "case {case:?}: a read at {read_endpoint} must report the \
+                             submitted URI, expected {:?}, got {reported:?}",
+                            row.location
                         );
                     }
                 } else {
@@ -429,7 +408,7 @@ async fn an_update_reads_a_location_by_its_own_syntax_whatever_endpoint_it_arriv
             let kept = read(&router, &detector_id, &family, &id).await;
             assert_eq!(
                 kept["location"].as_str(),
-                Some(announced_location(stored_location).as_str()),
+                Some(reported_list_location(stored_location).as_str()),
                 "case {case:?}: a refused update must keep the stored location, got {kept:?}"
             );
 
@@ -451,7 +430,7 @@ async fn an_update_reads_a_location_by_its_own_syntax_whatever_endpoint_it_arriv
             let after = read(&router, &detector_id, &family, &id).await;
             assert_eq!(
                 after["location"].as_str(),
-                Some(announced_location(&object_url).as_str()),
+                Some(reported_list_location(&object_url).as_str()),
                 "case {case:?}: expected the updated location read back, got {after:?}"
             );
         }

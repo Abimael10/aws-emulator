@@ -40,7 +40,7 @@ use serde_json::{json, Value};
 
 use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
-    announced_location, call, call_in, enabled_detector, error_code, new_router, Router,
+    reported_list_location, call, call_in, enabled_detector, error_code, new_router, Router,
     ABSENT_DETECTOR_ID,
 };
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
@@ -223,7 +223,7 @@ async fn an_ip_set_read_reports_what_the_create_stored() {
         // `Location` round-trips as the stored list OBJECT announced at the endpoint
         // this emulator is reached at, so the advertised list is fetchable from it
         // (the `uploaded_list_location_endpoint` suite owns that rule).
-        let expected = announced_location(request["location"].as_str().unwrap_or_default());
+        let expected = reported_list_location(request["location"].as_str().unwrap_or_default());
         let actual = body["location"].as_str().unwrap_or_default();
         assert_eq!(
             actual, expected,

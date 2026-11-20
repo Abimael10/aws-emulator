@@ -220,11 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetThreatEntitySetOutput {
             name: set.name.clone(),
             format: set.format.clone(),
-            // "The URI of the file that contains the threat entity set": the object
-            // the create or update named, addressed at the endpoint this emulator
-            // serves it at — the one projection every uploaded-list read-back shares
-            // ([`crate::state::announced_list_location`]).
-            location: crate::state::announced_list_location(ctx, &set.location),
+            // "The URI of the file that contains the threat entity set": the URI the
+            // create or the update stored, reported as it was given — the one projection
+            // every uploaded-list read-back shares
+            // ([`crate::state::stored_list_location`]).
+            location: crate::state::stored_list_location(&set.location),
             expected_bucket_owner: set.expected_bucket_owner.clone(),
             status: set.status.clone(),
             // Projected through the ONE tag-map rule every read of this service

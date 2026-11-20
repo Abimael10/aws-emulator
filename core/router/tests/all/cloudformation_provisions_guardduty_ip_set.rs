@@ -51,13 +51,6 @@ const PAST_EVERY_SPAN: Duration = Duration::from_millis(1200);
 /// alike.
 const GUARDDUTY_ID_LEN: usize = 32;
 
-/// The base GuardDuty announces an uploaded list's `Location` at for a request that
-/// addressed one of its own published hosts — which every call of this suite does: a
-/// `Location` is the address of the file the list was uploaded as, so a read answers that
-/// object at the endpoint serving it, and an emulator served on no port of its own reports
-/// the base the framework names for it.
-const ANNOUNCED_BASE: &str = smithy_server_runtime::UNSERVED_URL_BASE;
-
 /// The logical ids both resources of every row are declared under.
 const DETECTOR_LOGICAL_ID: &str = "GDDetector";
 const IP_SET_LOGICAL_ID: &str = "GDIPSet";
@@ -174,13 +167,11 @@ struct Row {
     expected_name: Option<&'static str>,
     /// The `Format` `GetIPSet` must report, which the template declares.
     expected_format: &'static str,
-    /// The OBJECT `GetIPSet` must announce for the list the template declares, as the
-    /// `/<bucket>/<key>` its own `Location` names — whichever S3 URL spelling that
-    /// `Location` is written in. The address the read reports is that object beneath
-    /// [`ANNOUNCED_BASE`], the endpoint serving the read, because a `Location` is an
-    /// address a caller follows to read the uploaded file and the file is in this
-    /// emulator's object storage.
-    expected_object: &'static str,
+    /// The `Location` `GetIPSet` must report for the list the template declares: the URI the
+    /// template wrote, character for character, whichever S3 URL spelling that is — a
+    /// `Location` is the account's own record of where the uploaded file sits, so a read
+    /// reports it as it was configured.
+    expected_location: &'static str,
     /// The `Status` `GetIPSet` must report once the activation span has come due, which the
     /// template's `Activate` decides.
     expected_status: &'static str,
@@ -232,7 +223,7 @@ const ROWS: &[Row] = &[
         },
         expected_name: Some("office-ranges"),
         expected_format: "TXT",
-        expected_object: "/lists/office.txt",
+        expected_location: "https://s3.us-east-1.amazonaws.com/lists/office.txt",
         expected_status: "ACTIVE",
         expected_bucket_owner: None,
         // `TagKey`'s pattern admits no digits (`^(?!aws:)[a-zA-Z+-=._:/]+$`), so the keys here
@@ -269,7 +260,7 @@ const ROWS: &[Row] = &[
         // dash (-), and underscores (_)" (`CreateIPSetRequest$Name`).
         expected_name: Some("dormant list"),
         expected_format: "STIX",
-        expected_object: "/threat-lists/dormant.stix",
+        expected_location: "s3://threat-lists/dormant.stix",
         expected_status: "INACTIVE",
         expected_bucket_owner: None,
         expected_tags: &[],
@@ -318,7 +309,7 @@ const ROWS: &[Row] = &[
         expected_format: "ALIEN_VAULT",
         // The virtual-hosted-style S3 URL form, the third `Location` spelling that service
         // admits beside the path-style and `s3://` ones above.
-        expected_object: "/partner-lists/ranges",
+        expected_location: "https://partner-lists.s3.eu-west-1.amazonaws.com/ranges",
         expected_status: "ACTIVE",
         expected_bucket_owner: Some("000000000000"),
         expected_tags: &[],
@@ -353,7 +344,7 @@ const ROWS: &[Row] = &[
         expected_name: None,
         expected_format: "OTX_CSV",
         // The dashed regional path-style S3 endpoint spelling.
-        expected_object: "/lists/unnamed.csv",
+        expected_location: "https://s3-ap-northeast-1.amazonaws.com/lists/unnamed.csv",
         expected_status: "ACTIVE",
         expected_bucket_owner: None,
         expected_tags: &[],
@@ -520,11 +511,11 @@ async fn a_stack_provisions_the_guardduty_ip_set_its_template_declares() {
             "case {case:?}: expected format {:?}, got {ip_set}",
             row.expected_format
         );
-        let expected_location = format!("{ANNOUNCED_BASE}{}", row.expected_object);
         assert_eq!(
             ip_set.get("location").and_then(Value::as_str),
-            Some(expected_location.as_str()),
-            "case {case:?}: expected location {expected_location:?}, got {ip_set}"
+            Some(row.expected_location),
+            "case {case:?}: expected location {:?}, got {ip_set}",
+            row.expected_location
         );
         assert_eq!(
             ip_set.get("status").and_then(Value::as_str),

@@ -190,7 +190,7 @@ pub fn is_s3_location(location: &str) -> bool {
 /// [`is_s3_location`] refuses.
 ///
 /// The ONE reading of an uploaded list's `Location`, so what a create and an update
-/// VALIDATE and what a read ANNOUNCES ([`announced_list_location`]) cannot drift: the
+/// VALIDATE and what a read REPORTS ([`stored_list_location`]) cannot drift: the
 /// accepted spellings are the ones [`is_s3_location`] documents, and the bucket and the
 /// key are read off whichever of them the caller wrote — the authority of an `s3://` URL
 /// is the bucket and its path the key, a virtual-hosted-style object URL carries the

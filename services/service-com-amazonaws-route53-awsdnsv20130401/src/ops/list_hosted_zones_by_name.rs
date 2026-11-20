@@ -298,9 +298,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next = Some(zone);
                 break;
             }
-            // The same LISTING projection the account-wide listing uses: a zone
-            // this enumeration reports carries its feature posture.
-            hosted_zones.push(zone.to_listed_hosted_zone());
+            // The one hosted-zone projection every operation of this service
+            // shares ([`crate::state::StoredZone::to_hosted_zone`]).
+            hosted_zones.push(zone.to_hosted_zone());
         }
 
         Ok(ListHostedZonesByNameOutput {

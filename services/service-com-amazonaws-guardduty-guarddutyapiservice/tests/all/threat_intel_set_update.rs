@@ -42,7 +42,7 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 
 use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
-    announced_location, call, call_in, enabled_detector, error_code, new_router, Router,
+    reported_list_location, call, call_in, enabled_detector, error_code, new_router, Router,
     ABSENT_DETECTOR_ID,
 };
 use crate::threat_intel_set_delete::{past_activation, past_deletion};
@@ -334,7 +334,7 @@ async fn an_update_replaces_only_the_members_it_carries() {
             .or_else(|| create.get("location"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let expected = announced_location(stored_location);
+        let expected = reported_list_location(stored_location);
         assert_eq!(
             body["location"],
             json!(expected),
@@ -410,7 +410,7 @@ async fn successive_updates_accumulate_on_the_stored_threat_list() {
         let body = read(&router, &detector, &id, case).await;
         let name = body["name"].as_str().unwrap_or_default();
         let location = body["location"].as_str().unwrap_or_default();
-        let expected_location = announced_location(expected_location);
+        let expected_location = reported_list_location(expected_location);
         assert_eq!(
             name, expected_name,
             "case {case:?}: expected the name {expected_name:?}, got {name:?}"

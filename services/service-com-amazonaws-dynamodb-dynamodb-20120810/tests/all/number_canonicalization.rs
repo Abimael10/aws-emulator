@@ -82,8 +82,8 @@ fn canonical_rows() -> Vec<(&'static str, String, String)> {
         ("a negative decimal with padding", "-012.3400", "-12.34"),
         ("a fraction that an exponent turns into an integer", "0.0025e4", "25"),
         ("an integer that an exponent turns into a fraction", "250e-4", "0.025"),
-        // The exponent's TEXT may carry padding like the mantissa's, up to this
-        // emulator's input-size limit for it, and normalises away the same way.
+        // The exponent's TEXT may carry padding like the mantissa's, however much of
+        // it, and normalises away the same way.
         ("an exponent padded with leading zeros", "1e0009", "1000000000"),
         ("a signed exponent padded with leading zeros", "1e-0002", "0.01"),
     ]
@@ -110,6 +110,19 @@ fn canonical_rows() -> Vec<(&'static str, String, String)> {
         "the full documented precision",
         THIRTY_EIGHT_DIGITS.to_string(),
         THIRTY_EIGHT_DIGITS.to_string(),
+    ));
+    // The exponent's padding is unbounded: a run of zeros states the same magnitude
+    // however long it is written, so the value reads back as the one that magnitude
+    // denotes.
+    rows.push((
+        "an exponent padded with a long run of zeros",
+        format!("1e{}2", "0".repeat(64)),
+        "100".to_string(),
+    ));
+    rows.push((
+        "a negative exponent padded with a long run of zeros",
+        format!("1e-{}2", "0".repeat(256)),
+        "0.01".to_string(),
     ));
     rows
 }
@@ -170,16 +183,16 @@ fn refusal_rows() -> Vec<(&'static str, Value)> {
         "an exponent one past the documented minimum",
         json!({"v": {"N": format!("1e{}", MIN_EXPONENT - 1)}}),
     ));
-    // PAST the emulator's own input-size limit for the exponent's text: a run of
-    // leading zeros denotes the same exponent however long it is, so a text wider than
-    // the integer the exponent is read into is refused rather than retained.
+    // PAST the documented range, with the exponent's TEXT padded far wider than the
+    // magnitude it states needs: the padding denotes nothing, so what decides the
+    // refusal is the magnitude behind it, either way out.
     rows.push((
-        "an exponent spelled with more text than its value can need",
-        json!({"v": {"N": format!("1e{}9", "0".repeat(32))}}),
+        "a long run of leading zeros ahead of an exponent past the documented maximum",
+        json!({"v": {"N": format!("1e{}{}", "0".repeat(32), MAX_EXPONENT + 1)}}),
     ));
     rows.push((
-        "a negative exponent spelled with more text than its value can need",
-        json!({"v": {"N": format!("1e-{}9", "0".repeat(512))}}),
+        "a long run of leading zeros ahead of an exponent past the documented minimum",
+        json!({"v": {"N": format!("1e-{}{}", "0".repeat(512), (MIN_EXPONENT - 1).unsigned_abs())}}),
     ));
     rows
 }

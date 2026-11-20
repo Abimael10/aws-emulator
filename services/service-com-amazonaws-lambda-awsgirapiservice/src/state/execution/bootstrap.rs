@@ -77,6 +77,7 @@ import importlib
 import importlib.util
 import io
 import json
+import linecache
 import logging
 import time
 import traceback
@@ -397,6 +398,18 @@ class _PackageLoader:
         source = self._sources[self._path]
         filename = self._root + "/" + self._path
         module.__dict__["__file__"] = filename
+        # The source is held in memory, not on a filesystem, so the lookup a traceback
+        # does for the SOURCE LINE of a frame — `linecache`, which stats the file the
+        # frame names — would find nothing and the frame would be rendered as its location
+        # alone. Seeding the cache with the lines this mount holds under that name is what
+        # makes a frame of this module read the way the managed runtime renders it: the
+        # location line and the source line at it.
+        linecache.cache[filename] = (
+            len(source),
+            None,
+            source.splitlines(True),
+            filename,
+        )
         code = compile(source, filename, "exec")
         exec(code, module.__dict__)
 

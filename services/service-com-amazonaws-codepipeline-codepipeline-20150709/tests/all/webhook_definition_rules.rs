@@ -15,9 +15,9 @@
 //!   `WebhookAuthenticationType` uses, so a configuration that is not EXACTLY that one
 //!   property is refused with `InvalidWebhookAuthenticationParametersException` naming
 //!   the single permitted property, and nothing is stored;
-//! * the operations that connect a webhook to the external tool do not resolve that
-//!   reference either — the only member of the webhook they turn on is its
-//!   authentication type — so a dangling one is served exactly as a resolvable one;
+//! * the operations that connect a webhook to the external tool DO resolve that
+//!   reference, because the connection runs to the source action of the pipeline it
+//!   names, so a dangling one is refused naming the webhook and that pipeline;
 //! * `DeleteWebhook` stops the account holding the webhook, "returns successfully when
 //!   trying to delete a webhook that is already deleted", and a webhook re-created
 //!   under the same name "will have a different URL".
@@ -28,7 +28,7 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_codepipeline_codepipeline_20150709::state::{
-    authentication_configuration_single_property_message,
+    authentication_configuration_single_property_message, webhook_target_pipeline_absent_message,
     AUTHENTICATION_CONFIGURATION_NO_PROPERTY_MESSAGE, AUTHENTICATION_GITHUB_HMAC,
     AUTHENTICATION_IP, AUTHENTICATION_UNAUTHENTICATED, AUTH_PROPERTY_ALLOWED_IP_RANGE,
     AUTH_PROPERTY_SECRET_TOKEN, REDACTED_SECRET_TOKEN,
@@ -391,11 +391,13 @@ async fn an_authentication_configuration_must_be_exactly_the_property_its_type_u
     }
 }
 
-/// RULE: the third-party operations do not resolve the webhook's `targetPipeline`
-/// either, so a dangling reference is served exactly as a resolvable one — however the
-/// reference came to be dangling.
+/// RULE: the third-party operations DO resolve the webhook's `targetPipeline`, because
+/// the connection they make and break runs to that pipeline's source action: a dangling
+/// reference is refused naming the webhook and the pipeline it points at — however the
+/// reference came to be dangling — and the same call is served once the account holds a
+/// pipeline of that name.
 #[tokio::test]
-async fn connecting_a_webhook_does_not_resolve_the_pipeline_its_definition_references() {
+async fn connecting_a_webhook_resolves_the_pipeline_its_definition_references() {
     // (case, the webhook's targetPipeline, whether the held pipeline is deleted first)
     let rows: Vec<(&str, String, bool)> = vec![
         (
@@ -434,10 +436,28 @@ async fn connecting_a_webhook_does_not_resolve_the_pipeline_its_definition_refer
             let (status, response) = emulator
                 .call(operation, &json!({"webhookName": "hook"}))
                 .await;
+            if held {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} through {operation}: a resolvable reference is served, \
+                     got {status} with {response}"
+                );
+                continue;
+            }
+            let expected = webhook_target_pipeline_absent_message("hook", &target_pipeline);
             assert_eq!(
-                status, 200,
-                "case {case:?} through {operation}: the pipeline the definition names is \
-                 not resolved, got {status} with {response}"
+                (
+                    status,
+                    response["__type"].as_str().unwrap_or_default().to_string(),
+                    response["message"].as_str().unwrap_or_default().to_string(),
+                ),
+                (
+                    REFUSAL_STATUS,
+                    "ValidationException".to_string(),
+                    expected.clone(),
+                ),
+                "case {case:?} through {operation}: expected {expected:?}, got {status} \
+                 with {response}"
             );
         }
         // Neither call stored nor removed anything: the webhook is still there.
@@ -448,8 +468,8 @@ async fn connecting_a_webhook_does_not_resolve_the_pipeline_its_definition_refer
             "case {case:?}: the webhook itself is left where it is, got {listed:?}"
         );
 
-        // And once the account DOES hold a pipeline of that name the answer is the same
-        // one, so neither call turned on the reference.
+        // And once the account DOES hold a pipeline of that name the call is served, so
+        // what the refusal reported was the reference and nothing else.
         if !held {
             emulator
                 .ok(
@@ -464,7 +484,7 @@ async fn connecting_a_webhook_does_not_resolve_the_pipeline_its_definition_refer
                 .await;
             assert_eq!(
                 status, 200,
-                "case {case:?} through {operation}: a resolvable reference is served too, \
+                "case {case:?} through {operation}: a resolvable reference is served, \
                  got {status} with {response}"
             );
         }

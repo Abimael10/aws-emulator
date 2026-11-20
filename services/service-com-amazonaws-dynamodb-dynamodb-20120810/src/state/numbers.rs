@@ -24,26 +24,9 @@ impl NumberKey {
             Some(rest) => (true, rest),
             None => (false, text.strip_prefix('+').unwrap_or(text)),
         };
-        let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
-            Some(at) => {
-                let text = &unsigned[at + 1..];
-                // A decimal exponent is carried in a 32-BIT integer — the width a
-                // decimal value's scale is held in — and only then held to the documented
-                // range below, so the two defects stay apart: a text whose exponent that
-                // integer can hold states a magnitude, which over- or underflows the
-                // documented range, and only a text whose exponent is NO such integer —
-                // not digits at all, or wider than that integer can hold — is a text this
-                // service cannot convert to a number at all. Bounded before it is parsed,
-                // because `parse` reads through any number of leading zeros.
-                if text.len() > MAX_EXPONENT_TEXT_CHARS {
-                    return Err(NumberFault::NotNumeric);
-                }
-                (
-                    &unsigned[..at],
-                    i64::from(text.parse::<i32>().map_err(|_| NumberFault::NotNumeric)?),
-                )
-            }
-            None => (unsigned, 0),
+        let (mantissa, exponent_text) = match unsigned.find(['e', 'E']) {
+            Some(at) => (&unsigned[..at], Some(&unsigned[at + 1..])),
+            None => (unsigned, None),
         };
         let (integral, fractional) = match mantissa.find('.') {
             Some(at) => (&mantissa[..at], &mantissa[at + 1..]),
@@ -55,6 +38,15 @@ impl NumberKey {
         if !integral.bytes().chain(fractional.bytes()).all(|b| b.is_ascii_digit()) {
             return Err(NumberFault::NotNumeric);
         }
+        // WHETHER a text is an exponent at all is told apart from WHAT magnitude it
+        // states: a signed run of decimal digits is an exponent however wide it is
+        // written, and the magnitude it states is then held to the documented range as
+        // the over- or underflow it is. Only a text that is no signed decimal integer
+        // leaves the value one this service cannot convert to a number at all.
+        let exponent = match exponent_text {
+            Some(text) => signed_exponent(text)?,
+            None => 0,
+        };
         // The TEXT is bounded before anything is normalised: the digits a longer one
         // carries cannot change which documented value it denotes, and the parsed
         // value's accounted size is computed from its significant digits, not its
@@ -228,4 +220,44 @@ impl NumberKey {
             magnitude
         }
     }
+}
+
+/// The decimal exponent `text` states, or the rule it breaks.
+///
+/// `NotNumeric` only when the text is no signed run of decimal digits — nothing after the
+/// exponent marker, a sign with no digits behind it, or a character that is not a digit —
+/// because that is the one case where the value cannot be read as a number at all. A text
+/// that IS such a run always states a magnitude, so a magnitude wider than the arithmetic
+/// below reaches is the over- or underflow its SIGN names, the same answer the documented
+/// range gives for a narrower exponent just outside it.
+fn signed_exponent(text: &str) -> Result<i64, NumberFault> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(NumberFault::NotNumeric);
+    }
+    // Leading zeros denote nothing, so they are dropped before the width is judged: an
+    // exponent spelled with a run of them states the same magnitude a shorter spelling
+    // does.
+    let significant = digits.trim_start_matches('0');
+    if significant.is_empty() {
+        return Ok(0);
+    }
+    if significant.len() > MAX_EXPONENT_TEXT_DIGITS {
+        return Err(if negative {
+            NumberFault::Underflow
+        } else {
+            NumberFault::Overflow
+        });
+    }
+    let magnitude = significant.parse::<i64>().map_err(|_| {
+        if negative {
+            NumberFault::Underflow
+        } else {
+            NumberFault::Overflow
+        }
+    })?;
+    Ok(if negative { -magnitude } else { magnitude })
 }

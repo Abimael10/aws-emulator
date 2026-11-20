@@ -45,7 +45,7 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    announced_location, call, call_in, enabled_detector, error_code, new_router, Router,
+    reported_list_location, call, call_in, enabled_detector, error_code, new_router, Router,
     ABSENT_DETECTOR_ID,
 };
 use crate::entity_set_id_refusal_classes::assert_entity_set_id_constraint_violation;
@@ -370,7 +370,7 @@ async fn an_update_replaces_only_the_members_it_carries() {
             .or_else(|| create.get("location"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let expected = announced_location(stored_location);
+        let expected = reported_list_location(stored_location);
         assert_eq!(
             got["location"],
             json!(expected),
@@ -478,7 +478,7 @@ async fn successive_updates_accumulate_on_the_stored_set() {
         let got = read(&router, &detector_id, &set_id, case).await;
         let name = got["name"].as_str().unwrap_or_default();
         let location = got["location"].as_str().unwrap_or_default();
-        let expected_location = announced_location(expected_location);
+        let expected_location = reported_list_location(expected_location);
         assert_eq!(
             name, expected_name,
             "case {case:?}: expected the name {expected_name:?}, got {name:?}"

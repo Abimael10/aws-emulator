@@ -534,7 +534,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deletion_protection_enabled: false,
             delegation_set_id,
             // CreateHostedZone carries no features input, so a zone is created
-            // with no features configuration and accelerated recovery off;
+            // with accelerated recovery off and no status for it yet;
             // UpdateHostedZoneFeatures is what configures it afterwards.
             accelerated_recovery: None,
             // A zone is created with public DNS fallback off; nothing in this

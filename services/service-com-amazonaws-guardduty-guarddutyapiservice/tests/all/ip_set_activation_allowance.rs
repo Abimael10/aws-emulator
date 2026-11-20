@@ -26,7 +26,7 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    announced_location, call, call_in, create_detector, error_code, new_router, Router,
+    reported_list_location, call, call_in, create_detector, error_code, new_router, Router,
 };
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     ACCOUNT_LIMIT_MESSAGE, ACTIVATED_IP_SETS_PER_ACCOUNT, IP_SET_ACTIVATING, IP_SET_INACTIVE,
@@ -251,7 +251,7 @@ async fn a_create_past_the_allowance_is_refused_only_when_it_asks_for_the_list_t
             "case {case:?}: a list nobody asked GuardDuty to use is stored unused, got {reported:?}"
         );
         let location = stored["location"].as_str().unwrap_or_default();
-        let expected = announced_location(body["location"].as_str().unwrap_or_default());
+        let expected = reported_list_location(body["location"].as_str().unwrap_or_default());
         assert_eq!(
             location, expected,
             "case {case:?}: expected the stored list announced as {expected:?}, got {location:?}"
@@ -363,7 +363,7 @@ async fn an_update_that_asks_for_a_list_to_be_used_is_held_to_the_allowance() {
             ("name", "unused".to_string()),
             (
                 "location",
-                announced_location("s3://my-bucket/unused.txt"),
+                reported_list_location("s3://my-bucket/unused.txt"),
             ),
         ] {
             let actual = stored[member].as_str().unwrap_or_default();

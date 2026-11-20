@@ -248,9 +248,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_marker = Some(zone.id.clone());
                 break;
             }
-            // The LISTING projection: an account-wide enumeration reports each
-            // zone's feature posture, not only the features configured on it.
-            hosted_zones.push(zone.to_listed_hosted_zone());
+            // The one hosted-zone projection every operation of this service
+            // shares ([`crate::state::StoredZone::to_hosted_zone`]).
+            hosted_zones.push(zone.to_hosted_zone());
         }
 
         Ok(ListHostedZonesOutput {

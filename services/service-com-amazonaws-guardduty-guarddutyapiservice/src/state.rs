@@ -17,8 +17,8 @@
 //! child module beside it. Each operation builds its own modelled output in its
 //! own `src/ops/<op>.rs`.
 
-/// Where an uploaded list's `Location` is announced on a read-back: the object the
-/// create stored, addressed at the endpoint this emulator serves it at.
+/// What an uploaded list's `Location` reads back as: the URI the create or the update
+/// stored, reported as it was given.
 mod announced_list_location;
 /// The Runtime Monitoring coverage of the account's compute resources, which more than
 /// one operation reports on.

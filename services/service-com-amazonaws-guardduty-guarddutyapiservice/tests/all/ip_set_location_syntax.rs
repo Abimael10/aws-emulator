@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    announced_location, call, enabled_detector, error_code, new_router, Router,
+    reported_list_location, call, enabled_detector, error_code, new_router, Router,
 };
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     invalid_parameter_message, IP_SET_LOCATION_MEMBER, THREAT_INTEL_SET_LOCATION_MEMBER,
@@ -265,7 +265,7 @@ async fn every_s3_url_spelling_is_accepted_and_the_stored_object_is_announced_ba
                 "case {case:?}: the stored list must read back, got {status} {stored:?}"
             );
             let reported = stored["location"].as_str().unwrap_or_default();
-            let expected = announced_location(&location);
+            let expected = reported_list_location(&location);
             assert_eq!(
                 reported, expected,
                 "case {case:?}: expected the stored list announced as {expected:?}, got \
@@ -404,11 +404,11 @@ async fn an_update_whose_location_is_no_s3_url_is_refused_and_keeps_the_stored_o
                     "case {case:?}: the list must still read back, got {status} {stored:?}"
                 );
                 let reported = stored["location"].as_str().unwrap_or_default();
-                let expected = announced_location(stored_location);
+                let expected = reported_list_location(stored_location);
                 assert_eq!(
                     reported, expected,
                     "case {case:?}: a refused update must keep the stored location \
-                     {stored_location:?}, announced as {expected:?}, got {reported:?}"
+                     {stored_location:?}, reported as {expected:?}, got {reported:?}"
                 );
                 let name = stored["name"].as_str().unwrap_or_default();
                 assert_eq!(

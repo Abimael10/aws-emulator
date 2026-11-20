@@ -32,7 +32,7 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::SET_ID_NOT_FOUND_MESSAGE;
 
 use crate::detector_lifecycle::{
-    announced_location, call, call_in, enabled_detector, error_code, error_shape, new_router,
+    reported_list_location, call, call_in, enabled_detector, error_code, error_shape, new_router,
     Router, ABSENT_DETECTOR_ID,
 };
 
@@ -266,7 +266,7 @@ async fn a_read_reports_every_member_the_create_stored() {
             // `Location` reports the stored list OBJECT announced at the endpoint this
             // emulator is reached at (the `uploaded_list_location_endpoint` suite owns
             // that rule).
-            let expected = announced_location(request["location"].as_str().unwrap_or_default());
+            let expected = reported_list_location(request["location"].as_str().unwrap_or_default());
             assert_eq!(
                 got["location"],
                 json!(expected),
@@ -445,7 +445,7 @@ async fn activate_decides_the_status_and_the_clock_settles_an_activation() {
         );
         assert_eq!(
             settled["location"].as_str(),
-            Some(announced_location("s3://threat-lists/status.txt").as_str()),
+            Some(reported_list_location("s3://threat-lists/status.txt").as_str()),
             "case {case:?}: settling must not touch the stored members, got {settled:?}"
         );
     }
@@ -764,7 +764,7 @@ async fn a_create_or_read_against_a_detector_this_region_does_not_hold_is_refuse
     );
     assert_eq!(
         got["location"].as_str(),
-        Some(announced_location("s3://threat-lists/regional.txt").as_str()),
+        Some(reported_list_location("s3://threat-lists/regional.txt").as_str()),
         "case \"read through its own Region\": got {got:?}"
     );
 }

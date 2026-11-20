@@ -4,12 +4,13 @@
 //! the set of inputs it holds for rather than over one statement.
 //!
 //! 1. A numeric PARAMETER is a number this service can CONVERT or it is not, and those are
-//!    two different refusals: the decimal exponent of an `N` text is carried in a 32-bit
-//!    integer, so a text whose exponent that integer cannot hold is reported as a parameter
-//!    that cannot be converted to a numeric value (echoing the text), while a text whose
-//!    exponent it CAN hold and whose magnitude leaves the documented 10^-130..10^125 range
-//!    is reported as the over- or underflow it is. The rows walk both sides of that width
-//!    and both ends of the documented range, on every surface that binds a parameter.
+//!    two different refusals: a text whose exponent is no signed run of decimal digits is
+//!    reported as a parameter that cannot be converted to a numeric value (echoing the
+//!    text), while a text whose exponent IS such a run states a magnitude, and a magnitude
+//!    outside the documented 10^-130..10^125 range is reported as the over- or underflow it
+//!    is — however many digits that exponent is written with. The rows walk both sides of
+//!    the width the decimal scale is held in and both ends of the documented range, on
+//!    every surface that binds a parameter.
 //! 2. A request that mixes reads and writes is refused as a whole, in the sentence the
 //!    SURFACE states for its own shape: a batch and a transaction word it differently, and
 //!    neither wording mentions the statements, so the rows vary how many statements the
@@ -146,29 +147,39 @@ async fn a_numeric_parameter_outside_the_numeric_domain_states_the_rule_it_broke
 
     // Each row: the case, the `N` text the parameter carries, and the whole sentence the
     // refusal must state. The rows walk the two sides of the width the exponent is carried
-    // in — one past each of its limits, and far past it — beside one past each end of the
-    // documented range, and a mantissa that normalises to zero under an exponent outside
-    // the documented range.
+    // in — one past each of its limits, and far past it both ways — beside one past each
+    // end of the documented range, a text that is no number at all, and a mantissa that
+    // normalises to zero under an exponent outside the documented range.
     let rows: Vec<(&str, String, String)> = vec![
         (
-            "an exponent one past the top of the integer it is carried in",
+            "an exponent one past the top of the integer the scale is held in",
             "1e2147483648".to_string(),
-            conversion_clause("1e2147483648"),
+            OVERFLOW_CLAUSE.to_string(),
         ),
         (
             "an exponent one past the bottom of that integer",
             "1e-2147483649".to_string(),
-            conversion_clause("1e-2147483649"),
+            UNDERFLOW_CLAUSE.to_string(),
         ),
         (
             "an exponent far past the width of that integer",
             "1e99999999999".to_string(),
-            conversion_clause("1e99999999999"),
+            OVERFLOW_CLAUSE.to_string(),
+        ),
+        (
+            "an exponent far past that width, the other way",
+            "1e-99999999999".to_string(),
+            UNDERFLOW_CLAUSE.to_string(),
         ),
         (
             "a text that is no number at all",
             "not-a-number".to_string(),
             conversion_clause("not-a-number"),
+        ),
+        (
+            "an exponent marker with nothing behind it",
+            "1e".to_string(),
+            conversion_clause("1e"),
         ),
         (
             "an exponent at the top of that integer, which states a magnitude",

@@ -36,7 +36,8 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    announced_location, call, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
+    reported_list_location, call, enabled_detector, error_code, new_router, Router,
+    ABSENT_DETECTOR_ID,
 };
 use crate::entity_set_id_refusal_classes::assert_entity_set_id_constraint_violation;
 use crate::set_delete_terminality::assert_entity_set_absent;
@@ -236,7 +237,7 @@ async fn a_created_threat_entity_set_is_read_back_from_stored_state() {
         // `Location` reports the stored list OBJECT announced at the endpoint this
         // emulator is reached at (the `uploaded_list_location_endpoint` suite owns
         // that rule).
-        let expected = announced_location(body["location"].as_str().unwrap_or_default());
+        let expected = reported_list_location(body["location"].as_str().unwrap_or_default());
         assert_eq!(
             got["location"],
             json!(expected),
@@ -524,7 +525,7 @@ async fn a_location_is_accepted_exactly_when_it_is_a_valid_s3_url() {
         )
         .await;
         let got = read(&router, &detector_id, &set_id, location).await;
-        let expected = announced_location(location);
+        let expected = reported_list_location(location);
         assert_eq!(
             got["location"],
             json!(expected),
@@ -576,7 +577,7 @@ async fn a_location_is_accepted_exactly_when_it_is_a_valid_s3_url() {
             let got = read(&router, &detector_id, &set_id, &case).await;
             assert_eq!(
                 got["location"],
-                json!(announced_location(VALID_LOCATIONS[0])),
+                json!(reported_list_location(VALID_LOCATIONS[0])),
                 "case {case:?}: the refused create must have persisted nothing, got {got:?}"
             );
         }

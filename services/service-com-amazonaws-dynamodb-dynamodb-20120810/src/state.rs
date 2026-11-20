@@ -495,18 +495,18 @@ const MAX_EXPONENT: i32 = 125;
 const MAX_NUMBER_TEXT_DIGITS: usize =
     MAX_SIGNIFICANT_DIGITS + (MAX_POINT - MIN_POINT) as usize;
 
-/// The most CHARACTERS one `N` value's EXPONENT text may carry, sign included: the
-/// widest decimal spelling of the 32-bit integer a decimal exponent is carried in
-/// (`-2147483648`).
+/// The most SIGNIFICANT DIGITS one `N` value's EXPONENT text may carry, leading zeros
+/// dropped, before the magnitude it states is further than the decimal-point arithmetic
+/// below reaches.
 ///
-/// An exponent is read with `parse::<i32>`, which accepts any run of leading zeros, so a
-/// bound on the exponent's VALUE (the documented range, enforced below as an over- or
-/// underflow) bounds no amount of exponent TEXT. A text wider than that integer's widest
-/// spelling carries no exponent that integer can hold — the same fault as an exponent
-/// that is not digits at all — and bounding the text keeps what one value retains
-/// bounded, which is what the byte budgets measured against a number's accounted size
-/// ([`attribute_value_size`], which sizes a number from its significant digits) rely on.
-const MAX_EXPONENT_TEXT_CHARS: usize = 11;
+/// Eleven digits already state a magnitude far past the documented exponent range, so an
+/// exponent written with more of them cannot denote a value this service stores: it is
+/// held to the range as the over- or underflow its SIGN names, exactly as a narrower
+/// exponent outside that range is. The bound exists so the arithmetic that shifts the
+/// decimal point is done in a width that cannot overflow, not to tell an exponent from a
+/// text that is no exponent at all — that is a question of syntax, decided by
+/// [`NumberKey::try_parse`].
+const MAX_EXPONENT_TEXT_DIGITS: usize = 11;
 
 /// How often the figures a description reports as `ItemCount` and
 /// `TableSizeBytes`/`IndexSizeBytes` are recomputed from what is stored.

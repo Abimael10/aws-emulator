@@ -41,7 +41,7 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::SET_ID_NOT_FOUND_MESSAGE;
 
 use crate::detector_lifecycle::{
-    announced_location, call, call_in, enabled_detector, error_code, error_shape, new_router,
+    reported_list_location, call, call_in, enabled_detector, error_code, error_shape, new_router,
     Router, ABSENT_DETECTOR_ID,
 };
 
@@ -313,7 +313,7 @@ async fn a_delete_settles_any_status_on_deleted() {
         // `Location` survives it too, reported as the stored list OBJECT announced at
         // the endpoint this emulator is reached at (the
         // `uploaded_list_location_endpoint` suite owns that rule).
-        let expected = announced_location(request["location"].as_str().unwrap_or_default());
+        let expected = reported_list_location(request["location"].as_str().unwrap_or_default());
         assert_eq!(
             deleted["location"],
             json!(expected),
