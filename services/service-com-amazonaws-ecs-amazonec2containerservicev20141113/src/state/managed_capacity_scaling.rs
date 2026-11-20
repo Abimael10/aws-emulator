@@ -280,6 +280,7 @@ pub fn settle_managed_capacity_scaling<Eng: Send + Sync + 'static>(engine: &Eng,
                 continue;
             };
             let cause = auto_scaling::ComAmazonawsAutoscalingAutoscaling20110101State::capacity_change_cause(
+                now,
                 &managed_scaling_reason(&action.provider_name),
                 from,
                 target,

@@ -320,6 +320,12 @@ pub use instance_health::{
 /// group's `DesiredCapacityType` counts its capacity in.
 pub mod instance_requirements;
 
+/// What ONE scaling activity records: the step it reports, the milestone that step is at,
+/// and the placement of the instance it moved.
+pub mod activity_records;
+
+pub use activity_records::{ActivityMilestone, ActivityRecord};
+
 /// How long a lifecycle transition this service owes takes to come due.
 ///
 /// Amazon EC2 Auto Scaling reports a freshly launched instance as `Pending` and an
@@ -477,6 +483,12 @@ pub const MAX_RETAINED_INSTANCE_REFRESHES: usize = 1_000;
 // through, from the model's `com.amazonaws.autoscaling#ScalingActivityStatusCode`.
 /// A scaling activity that has started and not yet finished.
 pub const ACTIVITY_IN_PROGRESS: &str = "InProgress";
+/// A scaling activity whose instance exists and is on its way into service, but is not in
+/// service yet — the step a return from `Standby` is at while it runs.
+pub const ACTIVITY_PRE_IN_SERVICE: &str = "PreInService";
+/// A scaling activity paused at a lifecycle hook: the step it is making is waiting for the
+/// hold that hook has taken on the instance to resolve.
+pub const ACTIVITY_MID_LIFECYCLE_ACTION: &str = "MidLifecycleAction";
 /// A scaling activity that finished.
 pub const ACTIVITY_SUCCESSFUL: &str = "Successful";
 /// A scaling activity that did not place the instance it was started for.
@@ -1888,101 +1900,6 @@ impl AutoScalingState {
             .then(|| SSM_PARAMETER_IMAGE_ID_MESSAGE.to_string())
     }
 
-    /// Append a scaling activity that finishes at `completes_at`, answering its id.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_activity(
-        &mut self,
-        group_name: &str,
-        group_arn: &str,
-        description: String,
-        cause: String,
-        group_state: &str,
-        start_time: SystemTime,
-        completes_at: Option<SystemTime>,
-    ) -> String {
-        let finished = completes_at.is_none();
-        let status_code = if finished {
-            ACTIVITY_SUCCESSFUL
-        } else {
-            ACTIVITY_IN_PROGRESS
-        };
-        self.push_activity(StoredActivity {
-            activity_id: String::new(),
-            auto_scaling_group_name: group_name.to_string(),
-            auto_scaling_group_arn: Some(group_arn.to_string()),
-            description: Some(description),
-            cause,
-            start_time,
-            end_time: if finished { Some(start_time) } else { None },
-            status_code: status_code.to_string(),
-            // An activity that did not fail carries no status message.
-            status_message: None,
-            progress: if finished { 100 } else { 50 },
-            details: None,
-            auto_scaling_group_state: Some(group_state.to_string()),
-            completes_at,
-        })
-    }
-
-    /// Append a scaling activity that placed NOTHING: the capacity change asked for an
-    /// instance that was not placed, so the group reports no instance for it and the
-    /// activity it recorded says so instead of claiming a launch that never happened.
-    ///
-    /// `description` is what the activity set out to do and `status_message` is why it
-    /// did not — the two the API reports apart
-    /// ([`StoredActivity::to_activity`]); [`failed_launch_description`] builds the one
-    /// from the other for a launch. `status_code` is the terminal code the reason ends the
-    /// activity in ([`BlockedLaunch`]), so the one recorder serves both of the two the
-    /// operation documents for a launch that placed nothing.
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_failed_activity(
-        &mut self,
-        group_name: &str,
-        group_arn: &str,
-        description: String,
-        status_message: String,
-        status_code: &str,
-        cause: String,
-        start_time: SystemTime,
-    ) -> String {
-        self.push_activity(StoredActivity {
-            activity_id: String::new(),
-            auto_scaling_group_name: group_name.to_string(),
-            auto_scaling_group_arn: Some(group_arn.to_string()),
-            description: Some(description),
-            cause,
-            start_time,
-            // Nothing is owed on a launch that placed nothing: it ended when it did.
-            end_time: Some(start_time),
-            status_code: status_code.to_string(),
-            status_message: Some(status_message),
-            progress: 100,
-            details: None,
-            auto_scaling_group_state: Some(GROUP_STATE_IN_SERVICE.to_string()),
-            completes_at: None,
-        })
-    }
-
-    /// Store one activity under a freshly minted id, keeping the log bounded, and answer
-    /// that id.
-    ///
-    /// The ONE writer of [`Self::activities`], so the id every activity carries comes
-    /// from one minter and the retention bound is applied in one place however the
-    /// activity ended: `activity_id` on the way in is ignored.
-    fn push_activity(&mut self, activity: StoredActivity) -> String {
-        let activity_id = self.mint_activity_id();
-        self.activities.push(StoredActivity {
-            activity_id: activity_id.clone(),
-            ..activity
-        });
-        // Keep the activity log bounded: the oldest activity is the first to go.
-        if self.activities.len() > MAX_RETAINED_ACTIVITIES {
-            let excess = self.activities.len() - MAX_RETAINED_ACTIVITIES;
-            self.activities.drain(..excess);
-        }
-        activity_id
-    }
-
     /// Materialise everything the clock has already made due at `now`: deferred
     /// capacity changes whose cooldown has elapsed, the replacements a running
     /// instance refresh owes, instance lifecycle transitions, the capacity a group was
@@ -2255,6 +2172,10 @@ impl AutoScalingState {
         // The capacity the group holds as this change is applied, which is what says whether
         // this change is a scaling activity at all ([`Self::cooldown_until`] below).
         let held_capacity = group.desired_capacity;
+        // And the capacity its members actually MEET, which is the difference the
+        // convergence below acts on — and what the activity of each instance it moves states
+        // it moved the group from ([`Self::convergence_cause`]).
+        let met_capacity = group.active_capacity_units();
         let headroom = group.launch_headroom();
         // A scale-out is the `Launch` process and a scale-in is the `Terminate` process, so
         // a group that has either suspended does not do that half of the change: the
@@ -2332,6 +2253,15 @@ impl AutoScalingState {
         self.terminate_group_instances(engine, group_name, &terminated_ids, now, due);
 
         for instance_id in launched_ids {
+            // The activity of an instance the CONVERGENCE launched states both what asked
+            // for the capacity and the step the group took to meet it.
+            let cause = Self::convergence_cause(
+                cause,
+                InstanceLifecycle::Launched,
+                now,
+                met_capacity,
+                desired_capacity,
+            );
             self.record_instance_lifecycle_change(
                 engine,
                 &InstanceLifecycleChange {
@@ -2339,13 +2269,20 @@ impl AutoScalingState {
                     group_name,
                     group_arn: &arn,
                     instance_id: &instance_id,
-                    cause,
+                    cause: &cause,
                     start_time: now,
                     due,
                 },
             );
         }
         for instance_id in terminated_ids {
+            let cause = Self::convergence_cause(
+                cause,
+                InstanceLifecycle::Terminated,
+                now,
+                met_capacity,
+                desired_capacity,
+            );
             self.record_instance_lifecycle_change(
                 engine,
                 &InstanceLifecycleChange {
@@ -2353,7 +2290,7 @@ impl AutoScalingState {
                     group_name,
                     group_arn: &arn,
                     instance_id: &instance_id,
-                    cause,
+                    cause: &cause,
                     start_time: now,
                     due,
                 },
@@ -2554,12 +2491,13 @@ impl AutoScalingState {
         };
         let cause = if should_decrement {
             Self::capacity_change_cause(
+                now,
                 TERMINATE_INSTANCE_REASON,
                 desired_capacity,
                 new_desired_capacity,
             )
         } else {
-            format!("{TERMINATE_INSTANCE_REASON}.")
+            Self::reason_cause(now, TERMINATE_INSTANCE_REASON)
         };
 
         let due = now + LIFECYCLE_TRANSITION;
@@ -3087,9 +3025,9 @@ impl AutoScalingState {
                 desired_configuration.as_ref()
             },
             &if rolling_back {
-                Self::instance_refresh_rollback_cause(&instance_refresh_id)
+                Self::instance_refresh_rollback_cause(due, &instance_refresh_id)
             } else {
-                Self::instance_refresh_cause(&instance_refresh_id)
+                Self::instance_refresh_cause(due, &instance_refresh_id)
             },
             due,
         );
@@ -3245,28 +3183,28 @@ impl AutoScalingState {
         launched_ids.first().cloned()
     }
 
-    /// The cause an Auto Scaling capacity change records: what asked for it, and
-    /// the capacities it moved between.
-    pub fn capacity_change_cause(reason: &str, from: i32, to: i32) -> String {
-        format!("{reason}: changing the desired capacity from {from} to {to}.")
-    }
-
-    /// The cause the replacements of an instance refresh record: which refresh asked
-    /// for them.
-    pub fn instance_refresh_cause(instance_refresh_id: &str) -> String {
-        format!(
-            "an instance refresh is replacing the instances of the group: instance refresh \
-             {instance_refresh_id}."
+    /// The cause the replacements of an instance refresh record: when the replacement was
+    /// made and which refresh asked for it.
+    pub fn instance_refresh_cause(at: SystemTime, instance_refresh_id: &str) -> String {
+        Self::reason_cause(
+            at,
+            &format!(
+                "an instance refresh is replacing the instances of the group: instance refresh \
+                 {instance_refresh_id}"
+            ),
         )
     }
 
     /// The cause the replacements of an instance refresh ROLLBACK record: which
     /// refresh's rollback asked for them, so the activity log tells the replacements a
     /// refresh made apart from the ones that put them back.
-    pub fn instance_refresh_rollback_cause(instance_refresh_id: &str) -> String {
-        format!(
-            "an instance refresh rollback is replacing the instances of the group: instance \
-             refresh {instance_refresh_id}."
+    pub fn instance_refresh_rollback_cause(at: SystemTime, instance_refresh_id: &str) -> String {
+        Self::reason_cause(
+            at,
+            &format!(
+                "an instance refresh rollback is replacing the instances of the group: instance \
+                 refresh {instance_refresh_id}"
+            ),
         )
     }
 }
@@ -3889,6 +3827,20 @@ pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     ::aws_smithy_types::DateTime::from_secs_f64(since_epoch.as_secs_f64())
+}
+
+/// `at` as RFC 3339 UTC text truncated to the second, which is the precision this service
+/// states an instant to inside a sentence a client reads — the reason a process reports
+/// for being suspended ([`suspended_processes::suspension_reason`]) and the instant a
+/// scaling activity's cause names.
+pub fn whole_seconds_text(at: SystemTime) -> String {
+    let seconds = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    ::aws_smithy_types::DateTime::from_secs(i64::try_from(seconds).unwrap_or(i64::MAX))
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
 }
 
 /// The ARN of an Auto Scaling group, in the form the service reports:
@@ -4551,4 +4503,3 @@ pub const DEFAULT_ACTIVITY_MAX_RECORDS: i32 = 100;
 /// maximum value is 100" — the same larger default the scaling activities take, stated
 /// separately because it is that operation's documentation that says so.
 pub const DEFAULT_ATTACHMENT_MAX_RECORDS: i32 = 100;
-

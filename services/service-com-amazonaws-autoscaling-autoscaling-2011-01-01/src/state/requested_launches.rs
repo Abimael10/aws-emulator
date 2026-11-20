@@ -253,9 +253,15 @@ impl AutoScalingState {
 
         // The group holds the instances its capacity says it holds, so the capacity rises by
         // the instances this launch actually placed — never by the ones it could not.
+        //
+        // The ceiling is never below the floor: a capacity is a count, so the highest the
+        // group may be left at is its own `MaxSize` or the capacity it already holds,
+        // whichever is greater, and never below zero.
         let placed = i32::try_from(launched_ids.len()).unwrap_or(i32::MAX);
-        let new_desired = desired.saturating_add(placed).clamp(0, max_size.max(desired));
-        let cause = AutoScalingState::capacity_change_cause(LAUNCH_INSTANCES_REASON, desired, new_desired);
+        let ceiling = max_size.max(desired).max(0);
+        let new_desired = desired.saturating_add(placed).clamp(0, ceiling);
+        let cause =
+            AutoScalingState::capacity_change_cause(now, LAUNCH_INSTANCES_REASON, desired, new_desired);
         // The units this launch could not place are retried from the group's own
         // configuration when the request asked for that, and the retry is ASYNCHRONOUS: the
         // capacity it adds falls due on the clock, which is what applies it and launches
@@ -263,11 +269,8 @@ impl AutoScalingState {
         // request named.
         let retried = if request.retry_with_group_configuration && unplaced > 0 {
             let shortfall = i32::try_from(unplaced).unwrap_or(i32::MAX);
-            Some(
-                new_desired
-                    .saturating_add(shortfall)
-                    .clamp(0, max_size.max(new_desired)),
-            )
+            let ceiling = max_size.max(new_desired).max(0);
+            Some(new_desired.saturating_add(shortfall).clamp(0, ceiling))
         } else {
             None
         };
@@ -287,6 +290,7 @@ impl AutoScalingState {
                     desired_capacity,
                     due,
                     cause: AutoScalingState::capacity_change_cause(
+                        now,
                         RETRY_LAUNCH_REASON,
                         new_desired,
                         desired_capacity,

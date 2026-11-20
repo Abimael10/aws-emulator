@@ -222,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         if converge {
-            let cause = crate::state::resumed_convergence_cause(desired_capacity);
+            let cause = crate::state::resumed_convergence_cause(now, desired_capacity);
             state.apply_capacity(&*self.engine, &group_name, desired_capacity, &cause, now);
         }
 

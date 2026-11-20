@@ -923,7 +923,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.groups.insert(name.clone(), group);
 
         let cause = crate::state::AutoScalingState::capacity_change_cause(
-            "an Auto Scaling group was created",
+            now,
+            "a user request created an AutoScalingGroup",
             0,
             desired_capacity,
         );

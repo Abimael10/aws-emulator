@@ -769,8 +769,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // launch for it. An update that changes neither must not restart the
         // group's cooldown.
         if desired_capacity != current_capacity || launches_needed > 0 {
-            let cause = crate::state::AutoScalingState::capacity_change_cause(
+            let cause = crate::state::AutoScalingState::constraints_change_cause(
+                now,
                 "a user request update of AutoScalingGroup constraints",
+                (min_size, max_size, desired_capacity),
                 current_capacity,
                 desired_capacity,
             );

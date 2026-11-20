@@ -320,20 +320,25 @@ impl AutoScalingState {
         // reports an instance's tags.
         ec2_instances::record_group_membership(engine, &attached_ids, group_name);
 
-        let cause = Self::capacity_change_cause(ATTACH_REASON, desired_capacity, after);
+        let cause = Self::capacity_change_cause(now, ATTACH_REASON, desired_capacity, after);
         // One activity per instance attached, completing when its transient state does, so
         // the activity a client reads reports the attach it is watching.
         let activity_ids: Vec<String> = attached_ids
             .iter()
             .map(|instance_id| {
                 self.record_activity(
-                    group_name,
-                    &arn,
-                    attach_description(instance_id),
-                    cause.clone(),
-                    GROUP_STATE_IN_SERVICE,
-                    now,
-                    Some(due),
+                    engine,
+                    &super::ActivityRecord {
+                        group_name,
+                        group_arn: &arn,
+                        description: attach_description(instance_id),
+                        cause: cause.clone(),
+                        group_state: GROUP_STATE_IN_SERVICE,
+                        start_time: now,
+                        completes_at: Some(due),
+                        milestone: super::ActivityMilestone::InProgress,
+                        instance_id: Some(instance_id),
+                    },
                 )
             })
             .collect();

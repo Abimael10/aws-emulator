@@ -142,13 +142,13 @@ pub enum PolicyTrigger<'a> {
 impl PolicyTrigger<'_> {
     /// The cause the capacity change this trigger asks for records.
     #[must_use]
-    pub fn cause(&self, policy_name: &str, from: i32, to: i32) -> String {
+    pub fn cause(&self, at: SystemTime, policy_name: &str, from: i32, to: i32) -> String {
         match self {
-            Self::UserRequest => policy_execution_cause(policy_name, from, to),
+            Self::UserRequest => policy_execution_cause(at, policy_name, from, to),
             Self::Alarm {
                 alarm_name,
                 state_value,
-            } => alarm_execution_cause(alarm_name, state_value, policy_name, from, to),
+            } => alarm_execution_cause(at, alarm_name, state_value, policy_name, from, to),
         }
     }
 }
@@ -466,7 +466,7 @@ impl AutoScalingState {
         if request.honor_cooldown && policy_type == POLICY_TYPE_SIMPLE_SCALING && in_cooldown {
             return Err(PolicyExecutionRefusal::CooldownInProgress);
         }
-        let cause = trigger.cause(&key.policy_name, from, to);
+        let cause = trigger.cause(now, &key.policy_name, from, to);
 
         self.apply_capacity(engine, &key.auto_scaling_group_name, to, &cause, now);
         // The cooldown the change leaves behind is the POLICY's when it carries one, which
@@ -615,8 +615,9 @@ pub fn percentage_magnitude(
 /// The subject of [`AutoScalingState::capacity_change_cause`], as every other capacity
 /// change of this service words its own.
 #[must_use]
-pub fn policy_execution_cause(policy_name: &str, from: i32, to: i32) -> String {
+pub fn policy_execution_cause(at: SystemTime, policy_name: &str, from: i32, to: i32) -> String {
     AutoScalingState::capacity_change_cause(
+        at,
         &format!("a user request executed policy {policy_name}"),
         from,
         to,
@@ -633,6 +634,7 @@ pub fn policy_execution_cause(policy_name: &str, from: i32, to: i32) -> String {
 /// that this change was driven by the alarm it configured.
 #[must_use]
 pub fn alarm_execution_cause(
+    at: SystemTime,
     alarm_name: &str,
     state_value: &str,
     policy_name: &str,
@@ -640,6 +642,7 @@ pub fn alarm_execution_cause(
     to: i32,
 ) -> String {
     AutoScalingState::capacity_change_cause(
+        at,
         &format!(
             "a monitor alarm {alarm_name} in state {state_value} triggered policy {policy_name}"
         ),

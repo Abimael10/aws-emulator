@@ -444,10 +444,13 @@ pub fn no_active_action_under_hook_message(instance_id: &str, hook_name: &str) -
 /// this one is the hook's own result: the instance never came into service, so the group
 /// gives it back to Amazon EC2. One variable part, the hook that abandoned it.
 #[must_use]
-pub fn abandoned_launch_cause(hook_name: &str) -> String {
-    format!(
-        "the lifecycle hook {hook_name} abandoned the instance while it was in a wait state, so \
-         it was not brought into service"
+pub fn abandoned_launch_cause(at: SystemTime, hook_name: &str) -> String {
+    AutoScalingState::reason_cause(
+        at,
+        &format!(
+            "the lifecycle hook {hook_name} abandoned the instance while it was in a wait state, \
+             so it was not brought into service"
+        ),
     )
 }
 
@@ -918,7 +921,7 @@ impl AutoScalingState {
                     group_name,
                     group_arn: &group_arn,
                     instance_id,
-                    cause: &abandoned_launch_cause(&action.hook_name),
+                    cause: &abandoned_launch_cause(now, &action.hook_name),
                     start_time: now,
                     due,
                 },
@@ -1156,6 +1159,11 @@ impl AutoScalingState {
             .find(|activity| activity.activity_id == step.activity_id)
         {
             activity.completes_at = Some(at);
+            // Nothing is holding the step any more, so the activity is no longer paused at
+            // a hold: it is under way again until it completes at `at`.
+            let milestone = super::ActivityMilestone::InProgress;
+            activity.status_code = milestone.status_code().to_string();
+            activity.progress = milestone.progress();
         }
         if happened {
             for event in &mut self.pending_lifecycle_events {

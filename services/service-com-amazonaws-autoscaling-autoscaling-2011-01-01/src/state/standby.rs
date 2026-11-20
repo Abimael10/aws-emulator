@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::{
-    AutoScalingState, StoredActivity, StoredInstance, GROUP_STATE_IN_SERVICE,
+    ActivityMilestone, AutoScalingState, StoredActivity, StoredInstance, GROUP_STATE_IN_SERVICE,
     LIFECYCLE_ENTERING_STANDBY, LIFECYCLE_IN_SERVICE, LIFECYCLE_PENDING, LIFECYCLE_STANDBY,
     LIFECYCLE_TRANSITION,
 };
@@ -86,12 +86,52 @@ impl StandbyMove {
     ///
     /// Reads as the subject of [`AutoScalingState::capacity_change_cause`] when the move
     /// also changed the group's desired capacity, and as a sentence of its own when it did
-    /// not.
+    /// not. This is the reason the CONVERGENCE the move triggers records; the activities of
+    /// the move itself carry [`Self::activity_cause`].
     #[must_use]
     fn reason(self) -> &'static str {
         match self {
             Self::Enter => "a user request explicitly moved an instance of the group to Standby",
             Self::Exit => "a user request explicitly moved an instance of the group out of Standby",
+        }
+    }
+
+    /// The `Activity$Cause` of the activity this move records for ONE instance: when the
+    /// move began, which instance moved, that a user asked for it, and — when the group's
+    /// desired capacity moved with the instance — the capacities it moved between.
+    ///
+    /// The fixed text states the direction the instance went and the direction the capacity
+    /// went with it; the variable parts are the instant, the instance id from the request
+    /// and the two capacities from the group's own state. A move that left the capacity
+    /// where it was (a park without the decrement, a return of a group already at its
+    /// `MaxSize`) states no capacity clause: there is no change for it to name.
+    #[must_use]
+    fn activity_cause(self, at: SystemTime, instance_id: &str, from: i32, to: i32) -> String {
+        let moved = match self {
+            Self::Enter => "was moved to standby",
+            Self::Exit => "was moved out of standby",
+        };
+        let at = super::whole_seconds_text(at);
+        if from == to {
+            return format!("At {at} instance {instance_id} {moved} in response to a user request.");
+        }
+        let direction = if to > from { "increasing" } else { "shrinking" };
+        format!(
+            "At {at} instance {instance_id} {moved} in response to a user request, \
+             {direction} the capacity from {from} to {to}."
+        )
+    }
+
+    /// The milestone the activity of this move is at while it runs.
+    ///
+    /// A return from `Standby` is bringing an instance that already exists back into
+    /// service, which is the pre-service step; a park is taking one out of service, which
+    /// the service reports no finer step than being under way.
+    #[must_use]
+    fn milestone(self) -> ActivityMilestone {
+        match self {
+            Self::Enter => ActivityMilestone::InProgress,
+            Self::Exit => ActivityMilestone::PreInService,
         }
     }
 }
@@ -103,12 +143,10 @@ pub enum StandbyRefusal {
     /// `instance_id` is not an instance of the group the request named.
     NotInGroup(String),
     /// `instance_id` is an instance of the group but not in the state this move starts
-    /// from; carries the state it is in.
+    /// from.
     WrongState {
         /// The instance the request named.
         instance_id: String,
-        /// The `LifecycleState` the group reports it in.
-        lifecycle_state: String,
     },
     /// Parking the named instances and decrementing the capacity would leave the group
     /// below its own `MinSize`.
@@ -123,21 +161,18 @@ pub enum StandbyRefusal {
 impl StandbyRefusal {
     /// The sentence this refusal carries.
     ///
-    /// Each is about ONE thing the request asked for: the fixed text states the rule and
-    /// the variable parts — the instance id, the group name, the state the instance is in
-    /// and the two sizes the decrement crossed — come from the request and the group.
+    /// Each is about ONE thing the request asked for: the fixed text states the rule — for
+    /// an instance on the wrong side of the move, the state the operation REQUIRES it to be
+    /// in — and the variable parts come from the request and the group: the instance id, the
+    /// group name and the two sizes the decrement crossed.
     #[must_use]
     pub fn message(&self, group_name: &str, move_kind: StandbyMove) -> String {
         match self {
             Self::NotInGroup(instance_id) => {
                 super::the_instance_not_in_group_message(instance_id, group_name)
             }
-            Self::WrongState {
-                instance_id,
-                lifecycle_state,
-            } => format!(
-                "Instance {instance_id} is in {lifecycle_state} state, not in {} state, and \
-                 cannot be moved.",
+            Self::WrongState { instance_id } => format!(
+                "The instance {instance_id} is not in {}.",
                 move_kind.from_state()
             ),
             Self::BelowMinSize { after, min_size } => format!(
@@ -200,7 +235,6 @@ impl AutoScalingState {
             if instance.lifecycle_state != move_kind.from_state() {
                 return Err(StandbyRefusal::WrongState {
                     instance_id: instance_id.clone(),
-                    lifecycle_state: instance.lifecycle_state.clone(),
                 });
             }
             if admitted.insert(instance_id.as_str()) {
@@ -232,9 +266,10 @@ impl AutoScalingState {
             StandbyMove::Exit => desired_capacity.saturating_add(units).min(max_size),
         };
         let cause = if new_desired_capacity == desired_capacity {
-            format!("{}.", move_kind.reason())
+            Self::reason_cause(now, move_kind.reason())
         } else {
             Self::capacity_change_cause(
+                now,
                 move_kind.reason(),
                 desired_capacity,
                 new_desired_capacity,
@@ -252,18 +287,29 @@ impl AutoScalingState {
         }
 
         // One activity per instance moved, completing when its transient state does, so
-        // the activity a client reads reports the move it is watching.
+        // the activity a client reads reports the move it is watching — each one naming
+        // the instance it moved and where that instance is.
         let activity_ids: Vec<String> = moving
             .iter()
             .map(|instance_id| {
                 self.record_activity(
-                    group_name,
-                    &arn,
-                    move_kind.description(instance_id),
-                    cause.clone(),
-                    GROUP_STATE_IN_SERVICE,
-                    now,
-                    Some(due),
+                    engine,
+                    &super::ActivityRecord {
+                        group_name,
+                        group_arn: &arn,
+                        description: move_kind.description(instance_id),
+                        cause: move_kind.activity_cause(
+                            now,
+                            instance_id,
+                            desired_capacity,
+                            new_desired_capacity,
+                        ),
+                        group_state: GROUP_STATE_IN_SERVICE,
+                        start_time: now,
+                        completes_at: Some(due),
+                        milestone: move_kind.milestone(),
+                        instance_id: Some(instance_id),
+                    },
                 )
             })
             .collect();

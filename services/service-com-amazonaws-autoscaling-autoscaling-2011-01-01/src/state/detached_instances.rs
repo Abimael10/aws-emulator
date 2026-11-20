@@ -218,9 +218,14 @@ impl AutoScalingState {
             desired_capacity
         };
         let cause = if new_desired_capacity == desired_capacity {
-            format!("{DETACH_REASON}.")
+            Self::reason_cause(now, DETACH_REASON)
         } else {
-            Self::capacity_change_cause(DETACH_REASON, desired_capacity, new_desired_capacity)
+            Self::capacity_change_cause(
+                now,
+                DETACH_REASON,
+                desired_capacity,
+                new_desired_capacity,
+            )
         };
 
         let due = now + LIFECYCLE_TRANSITION;
@@ -252,13 +257,18 @@ impl AutoScalingState {
             .iter()
             .map(|instance_id| {
                 self.record_activity(
-                    group_name,
-                    &arn,
-                    detach_description(instance_id),
-                    cause.clone(),
-                    GROUP_STATE_IN_SERVICE,
-                    now,
-                    Some(due),
+                    engine,
+                    &super::ActivityRecord {
+                        group_name,
+                        group_arn: &arn,
+                        description: detach_description(instance_id),
+                        cause: cause.clone(),
+                        group_state: GROUP_STATE_IN_SERVICE,
+                        start_time: now,
+                        completes_at: Some(due),
+                        milestone: super::ActivityMilestone::InProgress,
+                        instance_id: Some(instance_id),
+                    },
                 )
             })
             .collect();

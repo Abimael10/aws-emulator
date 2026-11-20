@@ -181,31 +181,23 @@ pub fn named_processes(requested: &[String]) -> Result<Vec<String>, ProcessRefus
 /// One variable part — the instant, in RFC 3339 UTC to the second, which is the form this
 /// member carries it in; the rest is fixed text.
 pub fn suspension_reason(suspended_at: SystemTime) -> String {
-    format!("User suspended at {}", whole_seconds_text(suspended_at))
+    format!("User suspended at {}", super::whole_seconds_text(suspended_at))
 }
 
-/// The cause the capacity change a RESUMPTION makes records: that the group is doing again
-/// what the resumed process does, and the capacity it brings its instances to.
+/// The cause the capacity change a RESUMPTION makes records: when it was asked for, that
+/// the group is doing again what the resumed process does, and the capacity it brings its
+/// instances to.
 ///
-/// One variable part — the capacity the group holds, which the changes made while the
-/// process was suspended recorded; the rest is fixed text.
-pub fn resumed_convergence_cause(desired_capacity: i32) -> String {
-    format!(
-        "a user request resumed the scaling processes of the group: bringing its instances to \
-         the desired capacity of {desired_capacity}."
+/// One variable part beside the instant — the capacity the group holds, which the changes
+/// made while the process was suspended recorded; the rest is fixed text.
+pub fn resumed_convergence_cause(at: SystemTime, desired_capacity: i32) -> String {
+    super::AutoScalingState::reason_cause(
+        at,
+        &format!(
+            "a user request resumed the scaling processes of the group, bringing its instances \
+             to the desired capacity of {desired_capacity}"
+        ),
     )
-}
-
-/// `at` as RFC 3339 UTC text truncated to the second, which is the precision a suspension
-/// reason states an instant to.
-fn whole_seconds_text(at: SystemTime) -> String {
-    let seconds = at
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    ::aws_smithy_types::DateTime::from_secs(i64::try_from(seconds).unwrap_or(i64::MAX))
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .unwrap_or_default()
 }
 
 /// The message a request naming processes outside this service's own catalog is refused

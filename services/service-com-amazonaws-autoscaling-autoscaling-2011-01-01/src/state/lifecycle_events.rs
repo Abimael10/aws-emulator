@@ -203,6 +203,25 @@ impl InstanceLifecycle {
             Self::Terminated => format!("Terminating EC2 instance: {instance_id}"),
         }
     }
+
+    /// What the group's own convergence on its desired capacity DID for this step, as the
+    /// clause the activity's cause carries for it: the step the group took, and the
+    /// capacities it moved the group between.
+    ///
+    /// The fixed text names the step and why the group took it — the difference between the
+    /// capacity it wants and the capacity it holds — and the variable parts are the two
+    /// capacities, read from the group's own state.
+    #[must_use]
+    pub fn convergence_sentence(self, from: i32, to: i32) -> String {
+        let (step, direction) = match self {
+            Self::Launched => ("an instance was started", "increasing"),
+            Self::Terminated => ("an instance was taken out of service", "shrinking"),
+        };
+        format!(
+            "{step} in response to a difference between desired and actual capacity, \
+             {direction} the capacity from {from} to {to}."
+        )
+    }
 }
 
 /// One lifecycle step of one instance, for the activity it records and the event it
@@ -292,13 +311,26 @@ impl AutoScalingState {
         let held = self.held_step_deadline(change);
         let due = held.unwrap_or(change.due);
         let activity_id = self.record_activity(
-            change.group_name,
-            change.group_arn,
-            description.clone(),
-            change.cause.to_string(),
-            GROUP_STATE_IN_SERVICE,
-            change.start_time,
-            Some(due),
+            engine,
+            &super::ActivityRecord {
+                group_name: change.group_name,
+                group_arn: change.group_arn,
+                description: description.clone(),
+                cause: change.cause.to_string(),
+                group_state: GROUP_STATE_IN_SERVICE,
+                start_time: change.start_time,
+                completes_at: Some(due),
+                // A step a hook is holding the instance at is paused at that hold, which
+                // the vocabulary has its own milestone for; otherwise the launch or the
+                // termination is simply under way.
+                milestone: if held.is_some() {
+                    super::ActivityMilestone::MidLifecycleAction
+                } else {
+                    super::ActivityMilestone::InProgress
+                },
+                // The instance that moved, whose placement the activity reports.
+                instance_id: Some(change.instance_id),
+            },
         );
         if held.is_some() {
             self.remember_held_step(change, &activity_id);
@@ -335,16 +367,6 @@ impl AutoScalingState {
             due,
         });
         activity_id
-    }
-
-    /// The Availability Zone the group's own record holds for `instance_id`.
-    fn instance_zone(&self, group_name: &str, instance_id: &str) -> Option<String> {
-        self.groups
-            .get(group_name)?
-            .instances
-            .iter()
-            .find(|instance| instance.instance_id == instance_id)
-            .map(|instance| instance.availability_zone.clone())
     }
 
     /// Queue one lifecycle event for publication, keeping the queue bounded.

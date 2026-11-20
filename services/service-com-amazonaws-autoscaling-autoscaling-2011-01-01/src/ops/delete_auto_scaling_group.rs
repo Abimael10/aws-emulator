@@ -340,18 +340,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The warm pool goes with the group's record, so the instances it was holding are
         // terminated where they live too.
         crate::state::ec2_instances::terminate(&*self.engine, &warm_pool_instance_ids, now);
-        let cause = format!(
-            "a user request deleted the AutoScalingGroup, terminating {instance_count} \
-             instance(s)."
+        let cause = crate::state::AutoScalingState::reason_cause(
+            now,
+            &format!(
+                "a user request deleted the AutoScalingGroup, terminating {instance_count} \
+                 instance(s)"
+            ),
         );
         let activity_id = state.record_activity(
-            &name,
-            &arn,
-            format!("Deleting the Auto Scaling group: {name}"),
-            cause.clone(),
-            crate::state::GROUP_STATE_DELETED,
-            now,
-            None,
+            &*self.engine,
+            &crate::state::ActivityRecord {
+                group_name: &name,
+                group_arn: &arn,
+                description: format!("Deleting the Auto Scaling group: {name}"),
+                cause: cause.clone(),
+                group_state: crate::state::GROUP_STATE_DELETED,
+                start_time: now,
+                completes_at: None,
+                milestone: crate::state::ActivityMilestone::InProgress,
+                // The delete is about the GROUP, not about one instance, so it reports no
+                // one placement: the instances it terminated are each announced on their
+                // own below.
+                instance_id: None,
+            },
         );
         // Each instance the forced delete shut down is a termination the group took, so
         // each is announced on the account's default event bus exactly as a scale-in's is

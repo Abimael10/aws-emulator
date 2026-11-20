@@ -112,13 +112,16 @@ pub fn too_large_warm_pool_message(size: i32) -> String {
 }
 
 /// The `Activity$Cause` the launches and terminations that bring a warm pool to its
-/// target size record: what asked for them, and the sizes they moved the pool between —
-/// the shape every cause this service records takes
-/// ([`AutoScalingState::capacity_change_cause`]).
-pub fn warm_pool_change_cause(from: i32, to: i32) -> String {
-    format!(
-        "a warm pool of the Auto Scaling group is being maintained: changing the warm pool size \
-         from {from} to {to}."
+/// target size record: when the pool was brought to size, what asked for it, and the sizes
+/// they moved the pool between — the shape every cause this service records takes
+/// ([`AutoScalingState::reason_cause`]).
+pub fn warm_pool_change_cause(at: ::std::time::SystemTime, from: i32, to: i32) -> String {
+    AutoScalingState::reason_cause(
+        at,
+        &format!(
+            "a warm pool of the Auto Scaling group is being maintained, changing the warm pool \
+             size from {from} to {to}"
+        ),
     )
 }
 
@@ -466,7 +469,7 @@ impl AutoScalingState {
             return;
         }
 
-        let cause = warm_pool_change_cause(held, target);
+        let cause = warm_pool_change_cause(now, held, target);
         let due = now + LIFECYCLE_TRANSITION;
         let launch = self.launch_into_group(
             engine,
@@ -504,24 +507,34 @@ impl AutoScalingState {
 
         for instance_id in &launched_ids {
             self.record_activity(
-                group_name,
-                &arn,
-                warm_pool_launch_description(instance_id),
-                cause.clone(),
-                GROUP_STATE_IN_SERVICE,
-                now,
-                Some(due),
+                engine,
+                &super::ActivityRecord {
+                    group_name,
+                    group_arn: &arn,
+                    description: warm_pool_launch_description(instance_id),
+                    cause: cause.clone(),
+                    group_state: GROUP_STATE_IN_SERVICE,
+                    start_time: now,
+                    completes_at: Some(due),
+                    milestone: super::ActivityMilestone::InProgress,
+                    instance_id: Some(instance_id),
+                },
             );
         }
         for instance_id in &taken {
             self.record_activity(
-                group_name,
-                &arn,
-                warm_pool_termination_description(instance_id),
-                cause.clone(),
-                GROUP_STATE_IN_SERVICE,
-                now,
-                Some(due),
+                engine,
+                &super::ActivityRecord {
+                    group_name,
+                    group_arn: &arn,
+                    description: warm_pool_termination_description(instance_id),
+                    cause: cause.clone(),
+                    group_state: GROUP_STATE_IN_SERVICE,
+                    start_time: now,
+                    completes_at: Some(due),
+                    milestone: super::ActivityMilestone::InProgress,
+                    instance_id: Some(instance_id),
+                },
             );
         }
         // A shortfall Amazon EC2 could not place is re-attempted on the next pass, so the

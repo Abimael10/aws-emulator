@@ -262,6 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let cause = crate::state::AutoScalingState::capacity_change_cause(
+            now,
             "a user request explicitly set group desired capacity",
             current,
             desired_capacity,

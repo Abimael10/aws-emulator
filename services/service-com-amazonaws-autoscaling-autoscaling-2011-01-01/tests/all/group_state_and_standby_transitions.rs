@@ -1001,9 +1001,10 @@ async fn a_standby_move_the_group_cannot_make_is_refused() {
     .await;
     assert_eq!(status, 400, "a return of an in-service instance: got {status}: {body}");
     let message = xml_unescape(&tag_value(&body, "Message"));
-    assert!(
-        message.contains("is in InService state, not in Standby state"),
-        "the refusal must state the two states, got {message:?}"
+    assert_eq!(
+        message,
+        format!("The instance {instance_id} is not in Standby."),
+        "the refusal must state the state the return requires, got {message:?}"
     );
 
     // More instance ids than one call may name.

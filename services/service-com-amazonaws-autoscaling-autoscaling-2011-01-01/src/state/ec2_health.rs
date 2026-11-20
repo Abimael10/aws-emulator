@@ -153,8 +153,8 @@ impl AutoScalingState {
         // The capacity the group is configured for does not change: the instances went out
         // of service under it, so what it is short of is what it launches.
         let desired_capacity = group.desired_capacity;
-        let cause = format!("{reason}.");
-        let replacement_cause = format!("{UNHEALTHY_REPLACEMENT_REASON}.");
+        let cause = Self::reason_cause(now, reason);
+        let replacement_cause = Self::reason_cause(now, UNHEALTHY_REPLACEMENT_REASON);
         let due = now + LIFECYCLE_TRANSITION;
         self.terminate_group_instances(engine, group_name, instance_ids, now, due);
         for instance_id in instance_ids {
