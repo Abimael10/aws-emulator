@@ -39,6 +39,11 @@ use service_com_amazonaws_sts_awssecuritytokenservicev20110615::state as sts_sta
 
 use crate::ops::types::{Insight, Tag};
 
+/// The DB SESSION ACTIVITY this service reports on — the samples the database data planes
+/// record as their engines run sessions, and the dimensions a request groups, partitions and
+/// filters that activity by.
+pub mod activity;
+
 /// `AnalysisStatus` while Performance Insights is still analysing the window.
 pub const STATUS_RUNNING: &str = "RUNNING";
 

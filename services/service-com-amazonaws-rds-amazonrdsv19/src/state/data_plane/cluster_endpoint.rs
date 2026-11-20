@@ -242,6 +242,13 @@ pub(super) fn cluster_facts(
             // `FailoverDBCluster` moves.
             read_only: serves_reads_only(store, record, &role),
             runtime: cluster_runtime_of(store, record),
+            // A session on a MEMBER's own endpoint is activity of that member, which
+            // Performance Insights monitors as its own data source; a session on one of the
+            // cluster's two endpoints is the cluster's.
+            data_source_id: member.map_or_else(
+                || record.resource_id.clone(),
+                |member| member.dbi_resource_id.clone(),
+            ),
         },
         database,
     ))

@@ -91,6 +91,23 @@ pub fn register_data_source(
     }
 }
 
+/// Record one unit of DB SESSION ACTIVITY in the shared activity store, the way a
+/// database data plane records what a statement cost as its engine finishes running
+/// it. ONE seeding helper for the suites in this crate that report on activity a
+/// one-service emulator has no engine to produce.
+pub fn record_activity(
+    engine: &engine::InMemoryEngine,
+    resource_id: &str,
+    sample: ::service_common::db_activity_samples::ActivitySample,
+) {
+    let store =
+        service_com_amazonaws_pi_performanceinsightsv20180227::state::activity::activity_store(
+            engine,
+        )
+        .expect("the shared activity store is reachable from the engine");
+    store.lock().record(resource_id, sample);
+}
+
 /// One answer off the wire: the HTTP status and the parsed JSON body.
 #[derive(Debug, Clone)]
 pub struct Answer {

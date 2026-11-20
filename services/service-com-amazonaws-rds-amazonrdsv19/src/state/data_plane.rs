@@ -74,6 +74,9 @@ use tokio::sync::watch;
 use super::{ComAmazonawsRdsAmazonrdsv19State, DbInstanceRecord, RegionalKey};
 use super::snapshot_data_bytes;
 
+/// What each statement a session ran COST this engine, recorded as the session activity the
+/// monitoring services report on.
+pub mod activity_samples;
 pub mod cluster_endpoint;
 pub mod constraint_names;
 // The CONTINUOUS BACKUP of a DB instance: the recovery points `RestoreDBInstanceToPointInTime`
@@ -728,6 +731,11 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
             generation: generation_rx.clone(),
             next_connection_id: Arc::clone(&next_connection_id),
             callback: callback.clone(),
+            // The SHARED activity store on that same engine, where every statement a
+            // session of this endpoint runs leaves what it cost — the record Performance
+            // Insights reports this resource's load from
+            // ([`activity_samples`]).
+            activity: activity_samples::ActivityStore::of(engine),
         })
     };
     let (listener, writing) = open_wire_listener(&listeners, wire, context_for(role)?).await?;

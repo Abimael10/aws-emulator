@@ -404,6 +404,11 @@ pub mod cloudwatch_logs;
 /// for every service whose operations require a usable Connect instance, so two of them
 /// cannot disagree about a request they both refuse.
 pub mod connect_instance_registry;
+/// The DB SESSION ACTIVITY the engines this emulator runs have had — one sample per unit of
+/// work a session did, written by the database DATA plane as each statement finishes and read
+/// by the services that report on database load, which measure none of it themselves and
+/// cannot see a past window at all unless it was recorded as it happened.
+pub mod db_activity_samples;
 pub mod db_data_sources;
 /// What each GRAPH DB CLUSTER this emulator provisioned runs — its engine version and the
 /// feature configuration its create settled — written by the graph control plane that

@@ -46,7 +46,7 @@ pub(crate) const REGION: &str = "us-west-2";
 /// The master user every cluster below is created with, and its password — a test
 /// credential, and the only place it appears.
 pub(crate) const MASTER_USER: &str = "pgadmin";
-const MASTER_PASSWORD: &str = "emu-Secret-99";
+pub(crate) const MASTER_PASSWORD: &str = "emu-Secret-99";
 
 /// The database every cluster below carries.
 pub(crate) const DATABASE: &str = "obsdb";

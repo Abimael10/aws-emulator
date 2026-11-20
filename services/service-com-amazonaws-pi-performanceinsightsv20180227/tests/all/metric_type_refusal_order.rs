@@ -25,8 +25,9 @@
 //! recorded unit (`DOCDB` with `db`) are ONE row among them.
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
-use crate::pi_harness::{call, emulator};
+use crate::pi_harness::{call, emulator, emulator_with_engine, register_data_source};
 
 /// The answer a metric-type list earns on a data source this account monitors —
 /// what the authorization gate must NOT replace, and must not have been replaced
@@ -146,6 +147,20 @@ const UNMONITORED: &[&str] = &[
 /// db-ABCDEFGHIJKLMNOPQRSTU1VW2X").
 const MONITORED: &str = "db-ABCDEFGHIJKLMNOPQRSTU1VW2X";
 
+/// The engine the monitored data source runs, recorded by the database control plane
+/// that minted it: which metrics a data source can be queried for is a property of its
+/// ENGINE FAMILY, so the catalog rows below are answered for a data source whose engine
+/// is on record.
+const MONITORED_ENGINE: &str = "mysql";
+
+/// The emulator of the rows below: one holding [`MONITORED`] in the shared data-source
+/// directory, recorded the way Amazon RDS records a DB instance it has just minted.
+fn emulator_monitoring_the_data_source() -> MultiServiceRouter {
+    let (router, engine) = emulator_with_engine();
+    register_data_source(&engine, MONITORED, "RDS", MONITORED_ENGINE, None);
+    router
+}
+
 /// The two values of the modelled `ServiceType` enum, with the answer column
 /// each selects from a row.
 const SERVICE_TYPES: &[&str] = &["RDS", "DOCDB"];
@@ -226,7 +241,7 @@ async fn an_unmonitored_data_source_is_not_authorized_whatever_metric_types_it_n
 /// the gate first replaced no answer of its own.
 #[tokio::test]
 async fn a_monitored_data_source_still_earns_its_metric_type_answer() {
-    let emulator = emulator();
+    let emulator = emulator_monitoring_the_data_source();
 
     for service_type in SERVICE_TYPES {
         for row in ROWS {

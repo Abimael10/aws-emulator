@@ -174,6 +174,11 @@ pub async fn open_proxy_endpoint<Eng: Send + Sync + 'static>(
         generation: generation_rx,
         next_connection_id: Arc::new(AtomicU32::new(1)),
         callback,
+        // A session through a proxy runs its statements on the database of the target the
+        // proxy resolved, so its activity is that TARGET's: the store is the same one, and
+        // which data source a sample is filed under comes from the session's own facts
+        // ([`super::activity_samples`]).
+        activity: super::activity_samples::ActivityStore::of(engine),
     };
     let (listener, plane) = super::open_wire_listener(&listeners, wire, context).await?;
     let dialable = super::dialable_plane(engine, &listener, &plane);

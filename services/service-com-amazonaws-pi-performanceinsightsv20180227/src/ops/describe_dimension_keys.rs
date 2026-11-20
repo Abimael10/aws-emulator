@@ -7,11 +7,23 @@
 //!
 //! A dimension key is one group of DB SESSIONS sampled on a running engine (the
 //! top N SQL digests, hosts, users or wait events of a window, each with the
-//! load they accounted for). The data sources this emulator serves run no
-//! engine and hold no sessions, so a window over them holds NO dimension keys
-//! and `Keys` is empty — the honest report of that absence, not a 501 ("nobody
-//! wrote this yet") and not a top-N list of invented sessions. `PartitionKeys`
-//! is the same empty breakdown when `PartitionBy` asks for one.
+//! load they accounted for). The sessions run on the engines the database
+//! services in this emulator serve, and each statement those engines run
+//! records what it cost in the shared activity store
+//! ([`::service_common::db_activity_samples`]) — so the keys this operation
+//! reports are that recorded activity, grouped by the request's `GroupBy`,
+//! broken down by its `PartitionBy`, selected by its `Filter` and ordered by
+//! the load each group accounted for, DESCENDING ("the top N dimension keys for
+//! a metric"). The load itself is the average active sessions of the group over
+//! the window, the same figure `GetResourceMetrics` reports for `db.load.avg`
+//! ([`crate::state::activity`]), so the two operations cannot disagree about
+//! how busy a resource was.
+//!
+//! A window over a data source whose engine recorded no activity — an idle
+//! resource, one this emulator runs no engine for, or one its owning service
+//! records Performance Insights as turned off for — holds NO dimension keys and
+//! `Keys` is empty: the honest report of that absence, not a top-N list of
+//! invented sessions.
 //!
 //! The window arithmetic, the aggregate-function rule on `Metric` and
 //! `AdditionalMetrics`, the `StartTime`-before-`EndTime` ordering refusal and
@@ -23,15 +35,15 @@
 //! silently omitted:
 //!
 //! * whether `GroupBy.Group` names a dimension group the engine publishes —
-//!   that catalogue is what `ListAvailableResourceDimensions` enumerates, which
-//!   this emulator does not hold, so a well-formed group name is answered with
-//!   the empty key list rather than refused on a guess at the catalogue;
+//!   that catalogue is what `ListAvailableResourceDimensions` enumerates, so a
+//!   well-formed group name whose dimensions nothing here records is answered
+//!   with the empty key list rather than refused on a guess at the catalogue;
 //! * the `Filter` restrictions the member documents (one filter per dimension
 //!   outside the `GroupBy`/`PartitionBy` group, and `db.sql.db_id` being
-//!   unavailable on RDS for SQL Server) — a filter selects among DB sessions,
-//!   and over the empty session set every filter selects the same empty key
-//!   list, so refusing a filter combination would change no answer this
-//!   emulator can give;
+//!   unavailable on RDS for SQL Server) — a filter here selects among the
+//!   sampled sessions by the dimension values they had, so a combination the
+//!   real service refuses selects what it names rather than being rejected on a
+//!   rule the model does not carry;
 //! * the documented recency bound on `StartTime` ("You must specify a StartTime
 //!   within the past 7 days"), for the reason `GetResourceMetrics` documents for
 //!   the same bound: this emulator monitors no resource that has been retaining
@@ -291,29 +303,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(invalid_argument)?;
 
-        // The key list is empty for every window (there are no DB sessions to
-        // group), so no page can ever be partial and this operation hands out
-        // no `NextToken`. A token presented here is therefore not one it
-        // issued, which is what it is told — rather than being ignored, which
-        // would answer the first page again under a cursor that claimed to
-        // resume.
-        if input.next_token.is_some() {
-            return Err(invalid_argument(
-                "The NextToken was not issued for this request's resource, window, period, \
-                 metric and dimension group.",
-            ));
-        }
+        // The activity the data source's engine RECORDED inside the window
+        // ([`crate::state::activity`]): the sessions it ran, each with the time it was
+        // active and what it was waiting on. A window holding none reports no key — the
+        // honest report of a resource that was idle, or whose engine this emulator does not
+        // run.
+        //
+        // The window is the one the request asked about: from `AlignedStartTime` — the
+        // boundary at or before its `StartTime` — up to its own `EndTime`, whose value "is
+        // exclusive, which means that data points less than (but not equal to) EndTime are
+        // returned". The series grid's end bound (`AlignedWindow::series_end`) is what
+        // stops a time SERIES at the last period the service holds; it does not decide
+        // which activity the window held, so it cannot cut a key's load short.
+        let window_start = window.start as f64;
+        let window_end = input.end_time.as_secs_f64().max(window_start + 1.0);
+        let span = window_end - window_start;
+        let samples = crate::state::activity::sampled_activity(
+            &*self.engine,
+            &input.identifier,
+            window_start,
+            window_end,
+        );
+        // A `Filter` selects among DB SESSIONS: "one or more filters to apply in the
+        // request", each naming a dimension and the value a session must have for it. A
+        // dimension a sample holds no value for selects that sample out, because the sample
+        // does not have that value.
+        let filter: std::collections::BTreeMap<String, String> = input
+            .filter
+            .iter()
+            .flatten()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        let selected: Vec<_> = samples
+            .iter()
+            .filter(|sample| crate::state::activity::matches_dimensions(sample, &filter))
+            .cloned()
+            .collect();
+        // "If PartitionBy was present in the request, PartitionKeys contains the breakdown
+        // of dimension keys by the specified partitions": the partitions are computed first,
+        // because each key's own breakdown is reported in their order.
+        let partitions = match &input.partition_by {
+            Some(partition_by) => crate::state::activity::partition_keys(
+                &selected,
+                &partition_by.group,
+                partition_by.dimensions.as_deref(),
+                partition_by.limit.and_then(|limit| usize::try_from(limit).ok()),
+                span,
+            ),
+            None => Vec::new(),
+        };
+        let mut keys = crate::state::activity::dimension_keys(
+            &selected,
+            &input.group_by.group,
+            input.group_by.dimensions.as_deref(),
+            &partitions,
+            span,
+        );
+        // `DimensionGroup$Limit`: "You can also request that Performance Insights return a
+        // limited number of values for a dimension" — the top N of the ordering above. With
+        // no `Limit` named the answer is held to the maximum the model admits for one
+        // ([`crate::state::activity::MAX_REPORTED_KEYS`]), so neither the key list nor the
+        // per-key breakdown grows with however many distinct sessions a window held.
+        let limit = input
+            .group_by
+            .limit
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(crate::state::activity::MAX_REPORTED_KEYS)
+            .min(crate::state::activity::MAX_REPORTED_KEYS);
+        keys.truncate(limit);
+
+        // `MaxResults` pages the keys. A page size of zero could never advance a cursor, so
+        // 0 — which the modelled `range` 0..25 admits — reads as "no caller-imposed page
+        // size".
+        let page_size = match input.max_results {
+            Some(max) if max > 0 => max as usize,
+            _ => keys.len().max(1),
+        };
+        // The result set a cursor was handed out for: the resource, the window as the
+        // caller REQUESTED it (the aligned end moves with the service's clock, the key list
+        // a cursor walks does not), the period, the metric and the two dimension groups —
+        // the members that fix which keys are listed and in which order.
+        let period_text = window.period.to_string();
+        let requested_start_text = format!(
+            "{}.{}",
+            input.start_time.secs(),
+            input.start_time.subsec_nanos()
+        );
+        let requested_end_text =
+            format!("{}.{}", input.end_time.secs(), input.end_time.subsec_nanos());
+        let partition_group = input
+            .partition_by
+            .as_ref()
+            .map(|group| group.group.clone())
+            .unwrap_or_default();
+        let scope = crate::state::page_scope(&[
+            &input.service_type,
+            &input.identifier,
+            &period_text,
+            &requested_start_text,
+            &requested_end_text,
+            &input.metric,
+            &input.group_by.group,
+            &partition_group,
+        ]);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(token, &scope) {
+                // A cursor this operation issued always resumes INSIDE the key list (it is
+                // handed out only for a page that stopped short of the end), so an offset at
+                // or past the list's length is not one it issued either — told so, rather
+                // than answered as an empty page that claimed to resume something.
+                Some(offset) if offset < keys.len() => offset,
+                _ => {
+                    return Err(invalid_argument(
+                        "The NextToken was not issued for this request's resource, window, \
+                         period, metric and dimension group.",
+                    ))
+                }
+            },
+        };
+        let total_keys = keys.len();
+        let page: Vec<DimensionKeyDescription> = keys
+            .into_iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|key| DimensionKeyDescription {
+                dimensions: Some(key.dimensions.into_iter().collect()),
+                total: Some(key.total),
+                // "Additional metrics for the top N dimension keys" are the per-SQL
+                // counters of a statement digest, which this emulator holds none of: the
+                // member is left out rather than carrying a figure nothing measured.
+                additional_metrics: None,
+                partitions: input
+                    .partition_by
+                    .as_ref()
+                    .map(|_| key.partitions.clone()),
+            })
+            .collect();
+        let resumed_at = offset.saturating_add(page.len());
+        let next_token = (resumed_at < total_keys)
+            .then(|| crate::state::encode_page_token(&scope, resumed_at));
 
         Ok(DescribeDimensionKeysOutput {
             aligned_start_time: Some(::aws_smithy_types::DateTime::from_secs(window.start)),
             aligned_end_time: Some(::aws_smithy_types::DateTime::from_secs(window.end)),
-            // "If PartitionBy was present in the request, PartitionKeys
-            // contains the breakdown of dimension keys by the specified
-            // partitions" — a breakdown of no keys, and absent altogether when
-            // the request asked for none.
-            partition_keys: input.partition_by.as_ref().map(|_| Vec::new()),
-            keys: Some(Vec::new()),
-            next_token: None,
+            // "If PartitionBy was present in the request, PartitionKeys contains the
+            // breakdown of dimension keys by the specified partitions" — and the member is
+            // absent altogether when the request asked for none.
+            partition_keys: input.partition_by.as_ref().map(|_| {
+                partitions
+                    .into_iter()
+                    .map(|dimensions| ResponsePartitionKey {
+                        dimensions: dimensions.into_iter().collect(),
+                    })
+                    .collect()
+            }),
+            keys: Some(page),
+            next_token,
         })
     }
 }

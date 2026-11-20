@@ -18,15 +18,26 @@
 //! period from `AlignedStartTime` up to the requested window's own aligned end,
 //! never past the latest boundary the service holds, stamped at that period's
 //! start or end as `PeriodAlignment` asks. `DataPoint$Value` is `@required` in
-//! the model, so a point cannot omit it, and the value every point carries here
-//! is zero: Performance Insights reports the activity a running DB engine had
-//! in each period, and the data sources this emulator serves run none, so there
-//! was no activity in any period of the window. That is a report of absence,
-//! not a magnitude invented to look measured — which is also why a query that
-//! asks for dimension-grouped or filtered data (`MetricQuery.GroupBy` /
-//! `MetricQuery.Filter`) is answered with the scaffold's 501: there are no DB
-//! sessions to group or filter, and the ungrouped series under a grouped key
-//! would be a different claim.
+//! the model, so a point cannot omit it, and WHAT a point values follows the
+//! metric it is a point of:
+//!
+//! * the Active Session History load series (`db.load`, `db.sampledload`) is
+//!   measured: the engines the database services in this emulator serve record
+//!   what each statement of each session cost them, so a point reports the
+//!   average active sessions that recorded activity accounts for in its period
+//!   — the same figure `DescribeDimensionKeys` totals its dimension keys by
+//!   ([`crate::state::activity`]), which is what keeps the two operations from
+//!   disagreeing about how busy a resource was;
+//! * every other metric is an engine or OS COUNTER of a running engine's own
+//!   internals, which this emulator does not instrument, so its points are zero
+//!   — a report of absence, not a magnitude invented to look measured.
+//!
+//! A query that asks for dimension-grouped or filtered data
+//! (`MetricQuery.GroupBy` / `MetricQuery.Filter`) is still answered with the
+//! scaffold's 501: a grouped series is one series per dimension key, and the
+//! ungrouped series under a grouped key would be a different claim.
+//! `DescribeDimensionKeys` is the operation that reports the load per dimension
+//! key here.
 //!
 //! A metric a query names must carry its aggregate function (`.avg`, `.min`,
 //! `.max` or `.sum`), as `MetricQueries` documents; one that does not is
@@ -399,9 +410,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One entry per requested metric, keyed by that query's metric, each
         // carrying the whole grid the aligned window holds: one point per
         // period, stamped as `PeriodAlignment` asks. The grid is what a client
-        // charts, aggregates or waits on, and it is computed from the request,
-        // so a repeated call answers identically.
-        let series = data_point_grid(window, input.period_alignment.as_deref())?;
+        // charts, aggregates or waits on.
+        //
+        // What each point VALUES depends on the metric. The Active Session History load
+        // series (`db.load`, `db.sampledload`) is measured from the activity the data
+        // source's engine recorded ([`crate::state::activity`]), period by period, which is
+        // the figure `DescribeDimensionKeys` totals its keys by — so the two operations
+        // cannot disagree about how busy a resource was. Every other metric is a counter
+        // this emulator measures nothing for ([`UNMONITORED_PERIOD_VALUE`]).
+        let periods_end = window.start + window.period_count() * window.period;
+        let samples = crate::state::activity::sampled_activity(
+            &*self.engine,
+            &input.identifier,
+            window.start as f64,
+            periods_end as f64,
+        );
+        let unmonitored = data_point_grid(window, input.period_alignment.as_deref())?;
         let metric_list: Vec<MetricKeyDataPoints> = input
             .metric_queries
             .iter()
@@ -412,7 +436,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     metric: query.metric.clone(),
                     dimensions: None,
                 }),
-                data_points: Some(series.clone()),
+                data_points: Some(
+                    match crate::state::activity::names_the_load_series(&query.metric) {
+                        true => load_grid(window, input.period_alignment.as_deref(), &samples),
+                        false => unmonitored.clone(),
+                    },
+                ),
             })
             .collect();
 
@@ -430,16 +459,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The value every data point of a series carries.
+/// The value every data point of a series carries for a metric this emulator
+/// measures nothing for.
 ///
 /// Performance Insights reports the activity a running DB engine had in each
-/// period. The data sources this emulator serves run no engine, so no period of
-/// any window holds activity, and the measurement of "how much happened" over a
-/// period in which nothing ran is zero. The model makes `DataPoint$Value`
-/// `@required`, so a point cannot leave it out: this is the report of that
-/// absence, and deliberately NOT a plausible-looking magnitude a client could
-/// not tell from a counter something measured.
+/// period. The engine COUNTERS (`os.*`, `db.*`) are counters of a running
+/// engine's own internals, which this emulator does not instrument, so no
+/// period of any window holds a reading for one, and the measurement of "how
+/// much happened" over a period in which nothing was measured is zero. The
+/// model makes `DataPoint$Value` `@required`, so a point cannot leave it out:
+/// this is the report of that absence, and deliberately NOT a plausible-looking
+/// magnitude a client could not tell from a counter something measured.
+///
+/// The Active Session History load series is NOT one of them: the sessions this
+/// emulator's engines run are recorded as they run, so `db.load` and
+/// `db.sampledload` report what those sessions actually cost
+/// ([`load_grid`]).
 const UNMONITORED_PERIOD_VALUE: f64 = 0.0;
+
+/// The series the ACTIVE SESSION HISTORY load holds over `window`: one point per period,
+/// valuing the average active sessions the samples inside that period account for.
+///
+/// Each point covers the period it is stamped for — `[start + i × period, start + (i+1) ×
+/// period)` — whatever end of it `PeriodAlignment` stamps the point with, so the value and
+/// the timestamp describe the same span. The grid itself is [`data_point_grid`]'s, so a load
+/// series and a counter series over one window carry the same timestamps and the same count
+/// of points — and it is built only after that function has taken the response's data-point
+/// budget ([`crate::state::data_point_budget_refusal`]), so the number of points here is
+/// already bounded by it rather than by the window a caller asked for.
+fn load_grid(
+    window: crate::state::AlignedWindow,
+    alignment: Option<&str>,
+    samples: &[::service_common::db_activity_samples::ActivitySample],
+) -> Vec<DataPoint> {
+    let period = window.period as f64;
+    (0..window.period_count())
+        .map(|index| {
+            let from = (window.start + index * window.period) as f64;
+            let until = from + period;
+            let inside = samples
+                .iter()
+                .filter(|sample| {
+                    sample.at_epoch_seconds >= from && sample.at_epoch_seconds < until
+                });
+            DataPoint {
+                timestamp: ::aws_smithy_types::DateTime::from_secs(
+                    window.period_timestamp(index, alignment),
+                ),
+                value: crate::state::activity::average_active_sessions(inside, period),
+            }
+        })
+        .collect()
+}
 
 /// The series an aligned window holds: one point per period from
 /// `AlignedStartTime` up to the window's series end (its requested end aligned

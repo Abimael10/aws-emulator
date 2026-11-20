@@ -23,8 +23,11 @@
 //! ONE row among them.
 
 use serde_json::{json, Value};
+use smithy_server_runtime::MultiServiceRouter;
 
-use crate::pi_harness::{call, emulator, is_modelled_next_token};
+use crate::pi_harness::{
+    call, emulator, emulator_with_engine, is_modelled_next_token, register_data_source,
+};
 
 /// A data source addressed by an immutable DB resource id, so the service's
 /// authorization gate serves it (the form the model documents on every
@@ -44,15 +47,40 @@ const UNIFORM_MESSAGE: &str =
 ///
 /// SOURCE: the `MetricTypes` member's own documentation — "os (OS counter
 /// metrics) - All engines", "db (DB load metrics) - All engines except for Amazon
-/// DocumentDB". The per-SQL types that documentation also lists carry an
-/// engine-specific catalog and are covered by their own test below. The last
-/// field is whether this emulator discovers any counter of the type at all: the
-/// `db` type's counters are the DB engine's own, and this emulator monitors no
-/// running engine, so it discovers none (see the `db`-catalog test below).
+/// DocumentDB". The per-SQL types that documentation also lists carry a
+/// statement-level catalog nothing here collects and are covered by their own test
+/// below. Both types answer a non-empty catalog for the data sources these rows
+/// address: the OS counters of the host, and the engine counters of the family the
+/// data source's recorded engine belongs to.
 const CATALOGUED_TYPES: &[(&str, &[&str], &str, bool)] = &[
     ("os", &["RDS", "DOCDB"], "os.", true),
-    ("db", &["RDS"], "db.", false),
+    ("db", &["RDS"], "db.", true),
 ];
+
+/// The engine [`IDENTIFIER`] runs, as the database control plane that minted it
+/// recorded it, and the engine [`OTHER_IDENTIFIER`] runs: two FAMILIES, because the
+/// `db` catalog is the engine family's own published counter set.
+const IDENTIFIER_ENGINE: &str = "mysql";
+
+/// The second data source's engine, of the other family this emulator publishes a
+/// counter catalog for.
+const OTHER_IDENTIFIER_ENGINE: &str = "aurora-postgresql";
+
+/// The emulator every row below is driven against: one holding both data sources in
+/// the shared data-source directory, recorded the way the database control planes
+/// record a resource id they have just minted.
+fn monitored_emulator() -> MultiServiceRouter {
+    let (router, engine) = emulator_with_engine();
+    register_data_source(&engine, IDENTIFIER, "RDS", IDENTIFIER_ENGINE, None);
+    register_data_source(
+        &engine,
+        OTHER_IDENTIFIER,
+        "RDS",
+        OTHER_IDENTIFIER_ENGINE,
+        None,
+    );
+    router
+}
 
 /// The per-SQL metric types the same documentation lists: "db.sql.stats (per-SQL
 /// metrics)" and "db.sql_tokenized.stats (per-SQL digest metrics)", both "All
@@ -129,7 +157,7 @@ async fn whole_catalog(
 /// measured or stored.
 #[tokio::test]
 async fn each_published_metric_type_answers_its_catalog() {
-    let emulator = emulator();
+    let emulator = monitored_emulator();
 
     for (metric_type, service_types, prefix, discovers_counters) in CATALOGUED_TYPES {
         for service_type in *service_types {
@@ -282,7 +310,7 @@ async fn each_published_metric_type_answers_its_catalog() {
 /// type was repeated.
 #[tokio::test]
 async fn several_metric_types_answer_their_catalogs_in_order() {
-    let emulator = emulator();
+    let emulator = monitored_emulator();
 
     let os = whole_catalog(&emulator, "RDS", &["os"]).await;
     let db = whole_catalog(&emulator, "RDS", &["db"]).await;
@@ -324,7 +352,7 @@ async fn several_metric_types_answer_their_catalogs_in_order() {
 /// a cursor is handed out only while metrics remain.
 #[tokio::test]
 async fn paging_visits_every_metric_exactly_once() {
-    let emulator = emulator();
+    let emulator = monitored_emulator();
 
     // The rows differ along the page size — including both published
     // `MaxResults` bounds, 0 and 25 — and along the result set being paged.
@@ -404,7 +432,7 @@ async fn paging_visits_every_metric_exactly_once() {
 /// ones.
 #[tokio::test]
 async fn a_page_size_past_the_published_bound_is_refused() {
-    let emulator = emulator();
+    let emulator = monitored_emulator();
 
     for page_size in [-1_i64, 26, 100] {
         let answer = call(
@@ -433,7 +461,7 @@ async fn a_page_size_past_the_published_bound_is_refused() {
 /// `InvalidArgumentException`.
 #[tokio::test]
 async fn a_cursor_from_another_result_set_is_refused() {
-    let emulator = emulator();
+    let emulator = monitored_emulator();
 
     let first = call(
         &emulator,
@@ -509,7 +537,7 @@ async fn a_cursor_from_another_result_set_is_refused() {
 /// `InvalidArgumentException` — never served as an empty catalog.
 #[tokio::test]
 async fn a_metric_type_that_is_not_published_is_refused() {
-    let emulator = emulator();
+    let emulator = monitored_emulator();
 
     // Rows vary the form of the unpublished value: an unrelated word, the
     // documented types miscased, a metric name instead of a type, a prefix of a
@@ -599,7 +627,7 @@ async fn a_metric_type_that_is_not_published_is_refused() {
 /// catalog.
 #[tokio::test]
 async fn the_per_sql_metric_types_are_answered_as_not_implemented() {
-    let emulator = emulator();
+    let emulator = monitored_emulator();
 
     for metric_type in PER_SQL_TYPES {
         for metric_types in [vec![*metric_type], vec!["os", *metric_type]] {
@@ -688,7 +716,7 @@ async fn an_unmonitored_data_source_is_refused_as_not_authorized() {
 /// every metric the service publishes.
 #[tokio::test]
 async fn naming_no_metric_type_answers_an_empty_catalog() {
-    let emulator = emulator();
+    let emulator = monitored_emulator();
 
     for service_type in SERVICE_TYPES {
         let answer = call(
@@ -712,6 +740,157 @@ async fn naming_no_metric_type_answers_an_empty_catalog() {
             answer.member("NextToken").is_null(),
             "case {service_type}: expected no NextToken, got {:?}",
             answer.body
+        );
+    }
+}
+
+/// RULE: the `db` type's catalog is the published counter set of the ENGINE FAMILY
+/// the addressed data source runs — `MetricTypes` scopes every type it documents by
+/// engine — so two data sources of different families are answered different
+/// counters, two engines of ONE family are answered the same ones, and no family's
+/// catalog advertises the Active Session History load series.
+///
+/// The rows span every engine name the two families this emulator publishes a catalog
+/// for are created under, which is wider than the one the recorded unit uses.
+#[tokio::test]
+async fn the_db_catalog_follows_the_data_sources_engine_family() {
+    // Each row is a data source's recorded engine and the family it belongs to.
+    let rows: &[(&str, &str)] = &[
+        ("mysql", "mysql"),
+        ("mariadb", "mysql"),
+        ("aurora-mysql", "mysql"),
+        ("aurora", "mysql"),
+        ("postgres", "postgres"),
+        ("aurora-postgresql", "postgres"),
+    ];
+
+    let mut by_family: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (engine, family) in rows {
+        let (emulator, shared) = emulator_with_engine();
+        register_data_source(&shared, IDENTIFIER, "RDS", engine, None);
+        let answer = call(
+            &emulator,
+            "ListAvailableResourceMetrics",
+            list_input("RDS", IDENTIFIER, &["db"], None, None),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case the engine {engine}: expected 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        let catalog = metric_names(&answer.body);
+        assert!(
+            !catalog.is_empty(),
+            "case the engine {engine}: expected the family's counters, got {:?}",
+            answer.body
+        );
+        assert!(
+            catalog.iter().all(|metric| metric.starts_with("db.")),
+            "case the engine {engine}: expected every entry to be of the requested type, \
+             got {catalog:?}"
+        );
+        // The load series belongs to no engine's counter catalog: it is the
+        // dimensional metric `ListAvailableResourceDimensions` enumerates.
+        assert!(
+            catalog
+                .iter()
+                .all(|metric| !metric.starts_with("db.load")
+                    && !metric.starts_with("db.sampledload")),
+            "case the engine {engine}: expected no load counter in the catalog, got {catalog:?}"
+        );
+        match by_family.get(family) {
+            // Two engines of one family publish the same counters.
+            Some(expected) => assert_eq!(
+                &catalog, expected,
+                "case the engine {engine}: expected the {family} family's catalog, got \
+                 {catalog:?}"
+            ),
+            None => {
+                by_family.insert(family, catalog);
+            }
+        }
+    }
+
+    // And the two families' catalogs are NOT the same set: the counters are each
+    // engine's own.
+    let families: Vec<&Vec<String>> = by_family.values().collect();
+    assert_eq!(
+        families.len(),
+        2,
+        "case the rows above: expected both families answered, got {}",
+        families.len()
+    );
+    assert_ne!(
+        families[0], families[1],
+        "case two families: expected each family's own counters, got the same catalog twice"
+    );
+}
+
+/// RULE (the other side of it): a data source whose engine family this emulator
+/// publishes no counter catalog for — and one whose engine nothing here recorded —
+/// cannot have its engine counters enumerated at all, so the `db` type answers the
+/// scaffold's 501 naming the metric type, exactly as the per-SQL types do. It is
+/// never an empty catalog, which a client would read as "this instance publishes no
+/// DB metrics".
+#[tokio::test]
+async fn a_data_source_of_an_unpublished_engine_family_is_answered_as_not_implemented() {
+    // Each row is a recorded engine whose counter set this emulator does not publish,
+    // and the last row is a data source no database service here minted at all.
+    let engines: &[Option<&str>] = &[
+        Some("oracle-ee"),
+        Some("sqlserver-ex"),
+        Some("db2-se"),
+        Some("custom-oracle-ee"),
+        None,
+    ];
+
+    for engine in engines {
+        let (emulator, shared) = emulator_with_engine();
+        if let Some(engine) = engine {
+            register_data_source(&shared, IDENTIFIER, "RDS", engine, None);
+        }
+        let case = format!("the engine {engine:?}");
+        let answer = call(
+            &emulator,
+            "ListAvailableResourceMetrics",
+            list_input("RDS", IDENTIFIER, &["db"], None, None),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 501,
+            "case {case}: expected 501, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "NotImplemented",
+            "case {case}: expected NotImplemented, got {:?}",
+            answer.body
+        );
+        assert!(
+            answer.error_message().contains("db"),
+            "case {case}: expected a message naming the metric type, got {:?}",
+            answer.body
+        );
+        assert!(
+            answer.member("Metrics").is_null(),
+            "case {case}: expected no catalog at all, got {:?}",
+            answer.body
+        );
+        // The OS counters are the HOST's and are published for every engine, so the
+        // same data source still answers them.
+        let os = call(
+            &emulator,
+            "ListAvailableResourceMetrics",
+            list_input("RDS", IDENTIFIER, &["os"], None, None),
+        )
+        .await;
+        assert_eq!(
+            os.status, 200,
+            "case {case} / os: expected the host counters regardless, got {} {:?}",
+            os.status, os.body
         );
     }
 }

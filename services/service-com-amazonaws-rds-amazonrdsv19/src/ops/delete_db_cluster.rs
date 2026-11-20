@@ -601,6 +601,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
             directory.lock().forget(&resource_id);
         }
+        // And the activity its engine had goes with it: the resource is gone, so its load is
+        // not something this emulator still reports
+        // ([`crate::state::data_plane::activity_samples`]).
+        if let Some(samples) =
+            crate::state::data_plane::activity_samples::sample_store(&*self.engine)
+        {
+            samples.lock().forget(&resource_id);
+        }
         // The same for a GRAPH cluster's record in the directory its own data plane reads:
         // the cluster is on its way out, so nothing may go on reporting an engine for it
         // ([`crate::state::graph_db_clusters`]).

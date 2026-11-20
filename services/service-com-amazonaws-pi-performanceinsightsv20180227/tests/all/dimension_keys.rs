@@ -10,13 +10,19 @@
 //! requested start, `AlignedEndTime` the latest period boundary the service
 //! holds — its own clock floored to the effective period — both on a boundary of
 //! that period); and the key list is what the window HOLDS — a dimension key is
-//! a group of DB sessions sampled on a running engine, and the data sources this
-//! emulator serves run none, so `Keys` is empty rather than a top-N list of
-//! invented sessions.
+//! a group of the DB sessions sampled on the engine, so the keys of a window are
+//! the activity the data source's engine recorded inside it, grouped by the
+//! request's `GroupBy`, selected by its `Filter`, broken down by its
+//! `PartitionBy` and ordered by the load each group accounted for, descending. A
+//! window over a data source whose engine recorded nothing holds no keys, which
+//! is reported as the empty list rather than as invented sessions.
 
 use serde_json::{json, Value};
+use service_common::db_activity_samples::{ActivitySample, WaitEvent};
+use service_common::db_data_sources::MonitoringConfiguration;
+use smithy_server_runtime::MultiServiceRouter;
 
-use crate::pi_harness::{call, emulator};
+use crate::pi_harness::{call, emulator, emulator_with_engine, record_activity, register_data_source};
 
 /// One day in seconds — a multiple of every documented period.
 const ONE_DAY: i64 = 86_400;
@@ -523,4 +529,701 @@ async fn repeating_the_same_request_answers_the_same_keys() {
         "case after two reads: expected the report store untouched, got {:?}",
         listed.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// The keys of a window that HELD session activity
+// ---------------------------------------------------------------------------
+
+/// The window every test below reports on: one hour, entirely in the past so the
+/// service's own clock cannot move either bound under the assertions.
+const WINDOW_SPAN: i64 = 3_600;
+
+/// One unit of recorded session activity, as a database data plane records it when its
+/// engine finishes a statement: the instant it was observed, how long the session was
+/// active for it, what it was waiting on, who ran it and what they ran.
+fn activity(
+    at: i64,
+    active_seconds: f64,
+    wait: (&str, &str),
+    user: &str,
+    statement: &str,
+) -> ActivitySample {
+    ActivitySample {
+        at_epoch_seconds: at as f64,
+        active_seconds,
+        wait_event: WaitEvent {
+            name: wait.0.to_string(),
+            event_type: wait.1.to_string(),
+        },
+        session_id: 42,
+        user: user.to_string(),
+        host: "10.0.1.7".to_string(),
+        database: "appdb".to_string(),
+        application: String::new(),
+        statement: statement.to_string(),
+        statement_digest: statement
+            .split_whitespace()
+            .map(|word| match word.chars().all(|c| c.is_ascii_digit()) {
+                true => "?",
+                false => word,
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// An emulator holding `samples` as the activity of [`IDENTIFIER`]'s engine, with the
+/// data source itself on record the way the RDS control plane records a DB instance it
+/// minted — and with the monitoring configuration `monitoring`, which is what decides
+/// whether Performance Insights collects activity for it at all.
+fn emulator_with_activity(
+    samples: &[ActivitySample],
+    monitoring: Option<MonitoringConfiguration>,
+) -> MultiServiceRouter {
+    let (router, engine) = emulator_with_engine();
+    register_data_source(&engine, IDENTIFIER, "RDS", "mysql", monitoring);
+    for sample in samples {
+        record_activity(&engine, IDENTIFIER, sample.clone());
+    }
+    router
+}
+
+/// The wait events the two engine families publish for a session waiting on a row lock
+/// and for one that was running: the pairs the RDS data plane files its samples under.
+const LOCK_WAIT: (&str, &str) = ("synch/cond/mysys/my_thread_var::suspend", "synch");
+const CPU: (&str, &str) = ("CPU", "CPU");
+
+/// The `Total` of every key of an answer, in the order answered.
+fn totals(answer: &Value) -> Vec<f64> {
+    answer
+        .get("Keys")
+        .and_then(Value::as_array)
+        .map(|keys| {
+            keys.iter()
+                .map(|key| key.get("Total").and_then(Value::as_f64).unwrap_or(f64::NAN))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `Dimensions` map of key `index`.
+fn dimensions(answer: &Value, index: usize) -> serde_json::Map<String, Value> {
+    answer
+        .get("Keys")
+        .and_then(Value::as_array)
+        .and_then(|keys| keys.get(index))
+        .and_then(|key| key.get("Dimensions"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// RULE: the keys of a window are the recorded activity of the window, each with its
+/// `Dimensions` and a float `Total` — the average active sessions that group accounted
+/// for — ordered by `Total` DESCENDING.
+#[tokio::test]
+async fn keys_report_the_recorded_activity_ordered_by_total_descending() {
+    let t0 = past_start(WINDOW_SPAN);
+    // Three samples: two sessions blocked on a row lock and one on CPU, so the window
+    // holds two differently weighted wait events.
+    let samples = [
+        activity(t0 + 10, 60.0, LOCK_WAIT, "appuser", "UPDATE ledger SET amount = 1"),
+        activity(t0 + 90, 30.0, LOCK_WAIT, "reporter", "UPDATE ledger SET amount = 2"),
+        activity(t0 + 120, 45.0, CPU, "appuser", "SELECT BENCHMARK(1, MD5('x'))"),
+    ];
+    let emulator = emulator_with_activity(&samples, None);
+
+    let answer = call(
+        &emulator,
+        "DescribeDimensionKeys",
+        dimension_keys_input(
+            IDENTIFIER,
+            "db.wait_event",
+            "db.load.avg",
+            t0,
+            t0 + WINDOW_SPAN,
+            Some(60),
+        ),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "case a window that held activity: expected 200, got {} {:?}",
+        answer.status, answer.body
+    );
+
+    let reported = totals(&answer.body);
+    let span = WINDOW_SPAN as f64;
+    let expected = vec![90.0 / span, 45.0 / span];
+    assert_eq!(
+        reported.len(),
+        expected.len(),
+        "case a window that held activity: expected {} keys, got {:?}",
+        expected.len(),
+        answer.body
+    );
+    for (index, (got, want)) in reported.iter().zip(&expected).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "case key {index}: expected the average active sessions {want}, got {got}"
+        );
+    }
+    assert!(
+        reported.windows(2).all(|pair| pair[0] >= pair[1]),
+        "case a window that held activity: expected the totals ordered descending, got \
+         {reported:?}"
+    );
+    assert_eq!(
+        dimensions(&answer.body, 0)
+            .get("db.wait_event.name")
+            .and_then(Value::as_str),
+        Some(LOCK_WAIT.0),
+        "case the heaviest key: expected the lock wait on top, got {:?}",
+        answer.body
+    );
+    assert_eq!(
+        dimensions(&answer.body, 0)
+            .get("db.wait_event.type")
+            .and_then(Value::as_str),
+        Some(LOCK_WAIT.1),
+        "case the heaviest key: expected every dimension of the group, got {:?}",
+        answer.body
+    );
+
+    // A window BEFORE the activity holds none of it: the keys follow the window.
+    let earlier = call(
+        &emulator,
+        "DescribeDimensionKeys",
+        dimension_keys_input(
+            IDENTIFIER,
+            "db.wait_event",
+            "db.load.avg",
+            t0 - WINDOW_SPAN,
+            t0,
+            Some(60),
+        ),
+    )
+    .await;
+    assert_eq!(
+        earlier.member("Keys").as_array().map(Vec::len),
+        Some(0),
+        "case the window before the activity: expected no keys, got {:?}",
+        earlier.body
+    );
+}
+
+/// RULE: the keys are grouped by the dimension group the request names, so each group
+/// reports its own dimensions and its own number of keys; a group whose dimensions the
+/// recorded activity does not fill reports no key at all rather than one filled from
+/// something else.
+#[tokio::test]
+async fn keys_are_grouped_by_the_dimension_group_the_request_names() {
+    let t0 = past_start(WINDOW_SPAN);
+    let samples = [
+        activity(t0 + 10, 60.0, LOCK_WAIT, "appuser", "UPDATE ledger SET amount = 1"),
+        activity(t0 + 90, 30.0, LOCK_WAIT, "reporter", "UPDATE ledger SET amount = 2"),
+        activity(t0 + 120, 45.0, CPU, "appuser", "SELECT BENCHMARK(1, MD5('x'))"),
+    ];
+    let emulator = emulator_with_activity(&samples, None);
+
+    // Each row is a dimension group, how many keys the samples above hold for it, and a
+    // dimension every one of those keys must carry.
+    let rows: &[(&str, usize, &str)] = &[
+        ("db.wait_event", 2, "db.wait_event.name"),
+        ("db.wait_event_type", 2, "db.wait_event_type.name"),
+        ("db.user", 2, "db.user.name"),
+        ("db.host", 1, "db.host.name"),
+        // The two UPDATEs differ in the value they set, so they are two statements and
+        // one digest.
+        ("db.sql", 3, "db.sql.statement"),
+        ("db.sql_tokenized", 2, "db.sql_tokenized.statement"),
+        ("db", 1, "db.name"),
+        // Groups whose dimensions name what a blocking session was doing, which this
+        // emulator's engines record nothing of.
+        ("db.blocking_session", 0, "db.blocking_session.id"),
+        ("db.query", 0, "db.query.statement"),
+    ];
+
+    for (group, keys, dimension) in rows {
+        let answer = call(
+            &emulator,
+            "DescribeDimensionKeys",
+            dimension_keys_input(
+                IDENTIFIER,
+                group,
+                "db.load.avg",
+                t0,
+                t0 + WINDOW_SPAN,
+                Some(60),
+            ),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case the group {group}: expected 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.member("Keys").as_array().map(Vec::len),
+            Some(*keys),
+            "case the group {group}: expected {keys} key(s), got {:?}",
+            answer.body
+        );
+        for index in 0..*keys {
+            assert!(
+                dimensions(&answer.body, index).contains_key(*dimension),
+                "case the group {group}, key {index}: expected the dimension {dimension}, \
+                 got {:?}",
+                answer.body
+            );
+        }
+        // Every key weighs something: a group with no load is not a key.
+        assert!(
+            totals(&answer.body).iter().all(|total| *total > 0.0),
+            "case the group {group}: expected every key to carry its load, got {:?}",
+            answer.body
+        );
+    }
+
+    // `GroupBy.Dimensions` restricts which of the group's dimensions come back:
+    // "Performance Insights returns all dimensions within this group, unless you provide
+    // the names of specific dimensions within this group".
+    let mut input = dimension_keys_input(
+        IDENTIFIER,
+        "db.wait_event",
+        "db.load.avg",
+        t0,
+        t0 + WINDOW_SPAN,
+        Some(60),
+    );
+    input["GroupBy"] = json!({"Group": "db.wait_event", "Dimensions": ["db.wait_event.name"]});
+    let restricted = call(&emulator, "DescribeDimensionKeys", input).await;
+    assert_eq!(
+        dimensions(&restricted.body, 0).keys().collect::<Vec<_>>(),
+        vec!["db.wait_event.name"],
+        "case a restricted dimension list: expected only the named dimension, got {:?}",
+        restricted.body
+    );
+}
+
+/// RULE: `GroupBy.Limit` asks for "a limited number of values for a dimension" — the top
+/// N of the descending order — and `MaxResults`/`NextToken` page what is left, visiting
+/// every key exactly once.
+#[tokio::test]
+async fn the_limit_takes_the_top_n_and_max_results_pages_the_rest() {
+    let t0 = past_start(WINDOW_SPAN);
+    // Four users, each with a different load, so the top-N cut is observable.
+    let samples: Vec<ActivitySample> = [("u1", 80.0), ("u2", 40.0), ("u3", 20.0), ("u4", 10.0)]
+        .iter()
+        .enumerate()
+        .map(|(index, (user, active))| {
+            activity(t0 + 10 + index as i64, *active, CPU, user, "SELECT 1")
+        })
+        .collect();
+    let emulator = emulator_with_activity(&samples, None);
+
+    let whole = call(
+        &emulator,
+        "DescribeDimensionKeys",
+        dimension_keys_input(IDENTIFIER, "db.user", "db.load.avg", t0, t0 + WINDOW_SPAN, Some(60)),
+    )
+    .await;
+    let all_totals = totals(&whole.body);
+    assert_eq!(
+        all_totals.len(),
+        4,
+        "case the whole key list: expected one key per user, got {:?}",
+        whole.body
+    );
+
+    // Each row is a `Limit`, including one past the number of keys the window holds.
+    for limit in [1_usize, 2, 3, 4, 25] {
+        let mut input = dimension_keys_input(
+            IDENTIFIER,
+            "db.user",
+            "db.load.avg",
+            t0,
+            t0 + WINDOW_SPAN,
+            Some(60),
+        );
+        input["GroupBy"] = json!({"Group": "db.user", "Limit": limit});
+        let answer = call(&emulator, "DescribeDimensionKeys", input).await;
+        let reported = totals(&answer.body);
+        assert_eq!(
+            reported,
+            all_totals[..limit.min(all_totals.len())].to_vec(),
+            "case Limit={limit}: expected the top {limit} of the descending order, got {:?}",
+            answer.body
+        );
+    }
+
+    // Paging a `MaxResults` of one visits each key once, in the same order, and the
+    // cursor stops when the keys run out.
+    for page_size in [1_i64, 2, 3] {
+        let case = format!("MaxResults={page_size}");
+        let mut seen: Vec<f64> = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..=all_totals.len() {
+            let mut input = dimension_keys_input(
+                IDENTIFIER,
+                "db.user",
+                "db.load.avg",
+                t0,
+                t0 + WINDOW_SPAN,
+                Some(60),
+            );
+            input["MaxResults"] = json!(page_size);
+            if let Some(token) = &token {
+                input["NextToken"] = json!(token);
+            }
+            let answer = call(&emulator, "DescribeDimensionKeys", input).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case}: expected 200, got {} {:?}",
+                answer.status, answer.body
+            );
+            let page = totals(&answer.body);
+            assert!(
+                page.len() <= page_size as usize,
+                "case {case}: expected at most {page_size} keys in a page, got {page:?}"
+            );
+            seen.extend(page);
+            match answer.member("NextToken").as_str() {
+                Some(next) => token = Some(next.to_string()),
+                None => {
+                    token = None;
+                    break;
+                }
+            }
+        }
+        assert!(
+            token.is_none(),
+            "case {case}: expected paging to finish, still holding {token:?}"
+        );
+        assert_eq!(
+            seen, all_totals,
+            "case {case}: expected paging to visit every key once, in order, got {seen:?}"
+        );
+    }
+}
+
+/// RULE: a `Filter` selects among the sampled sessions by the dimension values they had,
+/// so the keys and their totals are the load of the sessions it names — and a filter
+/// nothing matches reports no keys.
+#[tokio::test]
+async fn a_filter_selects_the_sessions_it_names() {
+    let t0 = past_start(WINDOW_SPAN);
+    let samples = [
+        activity(t0 + 10, 60.0, LOCK_WAIT, "appuser", "UPDATE ledger SET amount = 1"),
+        activity(t0 + 90, 30.0, CPU, "appuser", "SELECT 1"),
+        activity(t0 + 120, 45.0, CPU, "reporter", "SELECT 2"),
+    ];
+    let emulator = emulator_with_activity(&samples, None);
+    let span = WINDOW_SPAN as f64;
+
+    // Each row is a filter and the total load the keys it selects must add up to.
+    let rows: &[(&str, Value, f64)] = &[
+        ("no filter at all", json!({}), 135.0 / span),
+        (
+            "one user",
+            json!({"db.user.name": "appuser"}),
+            90.0 / span,
+        ),
+        (
+            "one wait event",
+            json!({"db.wait_event.name": CPU.0}),
+            75.0 / span,
+        ),
+        (
+            "a user and a wait event together",
+            json!({"db.user.name": "appuser", "db.wait_event.name": CPU.0}),
+            30.0 / span,
+        ),
+        (
+            "a value no session had",
+            json!({"db.user.name": "nobody"}),
+            0.0,
+        ),
+        (
+            "a dimension nothing records",
+            json!({"db.blocking_session.id": "7"}),
+            0.0,
+        ),
+    ];
+
+    for (case, filter, expected) in rows {
+        let mut input = dimension_keys_input(
+            IDENTIFIER,
+            "db.wait_event",
+            "db.load.avg",
+            t0,
+            t0 + WINDOW_SPAN,
+            Some(60),
+        );
+        if !filter.as_object().is_none_or(serde_json::Map::is_empty) {
+            input["Filter"] = filter.clone();
+        }
+        let answer = call(&emulator, "DescribeDimensionKeys", input).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        let summed: f64 = totals(&answer.body).iter().sum();
+        assert!(
+            (summed - expected).abs() < 1e-9,
+            "case {case}: expected the selected load {expected}, got {summed} in {:?}",
+            answer.body
+        );
+    }
+}
+
+/// RULE: "If PartitionBy was present in the request, PartitionKeys contains the breakdown
+/// of dimension keys by the specified partitions" — the partitions are the values of the
+/// secondary group inside the window, and each key carries one value per partition,
+/// aligned to that order and adding up to its own total.
+#[tokio::test]
+async fn partitions_break_each_key_down_in_the_partition_keys_order() {
+    let t0 = past_start(WINDOW_SPAN);
+    let samples = [
+        activity(t0 + 10, 60.0, LOCK_WAIT, "appuser", "UPDATE ledger SET amount = 1"),
+        activity(t0 + 90, 30.0, CPU, "appuser", "SELECT 1"),
+        activity(t0 + 120, 45.0, CPU, "reporter", "SELECT 2"),
+    ];
+    let emulator = emulator_with_activity(&samples, None);
+
+    let mut input = dimension_keys_input(
+        IDENTIFIER,
+        "db.user",
+        "db.load.avg",
+        t0,
+        t0 + WINDOW_SPAN,
+        Some(60),
+    );
+    input["PartitionBy"] = json!({"Group": "db.wait_event_type"});
+    let answer = call(&emulator, "DescribeDimensionKeys", input).await;
+    assert_eq!(
+        answer.status, 200,
+        "case a partitioned request: expected 200, got {} {:?}",
+        answer.status, answer.body
+    );
+
+    let partition_keys = answer
+        .member("PartitionKeys")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        partition_keys.len(),
+        2,
+        "case a partitioned request: expected one partition per wait-event type, got {:?}",
+        answer.body
+    );
+    for (index, partition) in partition_keys.iter().enumerate() {
+        assert!(
+            partition
+                .get("Dimensions")
+                .and_then(Value::as_object)
+                .is_some_and(|map| map.contains_key("db.wait_event_type.name")),
+            "case partition {index}: expected the secondary group's dimension, got {partition:?}"
+        );
+    }
+
+    let keys = answer.member("Keys").as_array().cloned().unwrap_or_default();
+    for (index, key) in keys.iter().enumerate() {
+        let partitions = key
+            .get("Partitions")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            partitions.len(),
+            partition_keys.len(),
+            "case key {index}: expected one value per partition key, got {key:?}"
+        );
+        let summed: f64 = partitions
+            .iter()
+            .map(|value| value.as_f64().unwrap_or(f64::NAN))
+            .sum();
+        let total = key.get("Total").and_then(Value::as_f64).unwrap_or(f64::NAN);
+        assert!(
+            (summed - total).abs() < 1e-9,
+            "case key {index}: expected the breakdown to add up to the total {total}, got \
+             {summed} from {partitions:?}"
+        );
+    }
+}
+
+/// RULE: the load the keys total is the load `GetResourceMetrics` reports for
+/// `db.load.avg` over the same window — one measurement of the same recorded activity,
+/// read two ways — and `db.sampledload.avg` reports the same figure, which the `Metric`
+/// member itself allows when no sampling threshold is reached.
+#[tokio::test]
+async fn the_keys_total_the_load_get_resource_metrics_reports() {
+    let t0 = past_start(WINDOW_SPAN);
+    let samples = [
+        activity(t0 + 10, 60.0, LOCK_WAIT, "appuser", "UPDATE ledger SET amount = 1"),
+        activity(t0 + 90, 30.0, CPU, "appuser", "SELECT 1"),
+        activity(t0 + 120, 45.0, CPU, "reporter", "SELECT 2"),
+    ];
+    let emulator = emulator_with_activity(&samples, None);
+
+    let keys = call(
+        &emulator,
+        "DescribeDimensionKeys",
+        dimension_keys_input(
+            IDENTIFIER,
+            "db.wait_event",
+            "db.load.avg",
+            t0,
+            t0 + WINDOW_SPAN,
+            Some(WINDOW_SPAN),
+        ),
+    )
+    .await;
+    let keyed: f64 = totals(&keys.body).iter().sum();
+
+    for metric in ["db.load.avg", "db.sampledload.avg"] {
+        let series = call(
+            &emulator,
+            "GetResourceMetrics",
+            json!({
+                "ServiceType": "RDS",
+                "Identifier": IDENTIFIER,
+                "MetricQueries": [{"Metric": metric}],
+                "StartTime": t0,
+                "EndTime": t0 + WINDOW_SPAN,
+                "PeriodInSeconds": WINDOW_SPAN,
+            }),
+        )
+        .await;
+        assert_eq!(
+            series.status, 200,
+            "case {metric}: expected 200, got {} {:?}",
+            series.status, series.body
+        );
+        let points: Vec<f64> = series
+            .member("MetricList")
+            .as_array()
+            .and_then(|list| list.first().cloned())
+            .and_then(|entry| entry.get("DataPoints").cloned())
+            .and_then(|points| points.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .map(|point| point.get("Value").and_then(Value::as_f64).unwrap_or(f64::NAN))
+            .collect();
+        assert_eq!(
+            points.len(),
+            1,
+            "case {metric}: expected one point for a one-period window, got {:?}",
+            series.body
+        );
+        assert!(
+            (points[0] - keyed).abs() < 1e-9,
+            "case {metric}: expected the same load the keys total ({keyed}), got {}",
+            points[0]
+        );
+        assert!(
+            points[0] > 0.0,
+            "case {metric}: expected the recorded activity to be reported, got {}",
+            points[0]
+        );
+    }
+
+    // An engine COUNTER is not the load series: nothing here instruments one, so its
+    // points stay at zero over the same window.
+    let counter = call(
+        &emulator,
+        "GetResourceMetrics",
+        json!({
+            "ServiceType": "RDS",
+            "Identifier": IDENTIFIER,
+            "MetricQueries": [{"Metric": "db.SQL.Innodb_rows_read.avg"}],
+            "StartTime": t0,
+            "EndTime": t0 + WINDOW_SPAN,
+            "PeriodInSeconds": WINDOW_SPAN,
+        }),
+    )
+    .await;
+    let counter_point = counter
+        .member("MetricList")
+        .as_array()
+        .and_then(|list| list.first().cloned())
+        .and_then(|entry| entry.get("DataPoints").cloned())
+        .and_then(|points| points.as_array().cloned())
+        .unwrap_or_default()
+        .first()
+        .and_then(|point| point.get("Value").and_then(Value::as_f64))
+        .unwrap_or(f64::NAN);
+    assert_eq!(
+        counter_point, 0.0,
+        "case an engine counter: expected no reading for a counter nothing measures, got \
+         {counter_point}"
+    );
+}
+
+/// RULE: Performance Insights is what collects the activity, so a data source its owning
+/// service records the feature as turned OFF for reports no keys and no load, whatever
+/// its engine did.
+#[tokio::test]
+async fn activity_is_not_reported_for_a_data_source_the_feature_is_off_for() {
+    let t0 = past_start(WINDOW_SPAN);
+    let samples = [activity(
+        t0 + 10,
+        60.0,
+        LOCK_WAIT,
+        "appuser",
+        "UPDATE ledger SET amount = 1",
+    )];
+
+    // Each row is the monitoring configuration the owning service persisted, and whether
+    // the activity is reported under it.
+    let rows: &[(&str, Option<MonitoringConfiguration>, bool)] = &[
+        ("nothing on record", None, true),
+        (
+            "performance insights on",
+            Some(MonitoringConfiguration {
+                performance_insights_enabled: true,
+                database_insights_mode: Some("advanced".to_string()),
+            }),
+            true,
+        ),
+        (
+            "performance insights off",
+            Some(MonitoringConfiguration {
+                performance_insights_enabled: false,
+                database_insights_mode: Some("standard".to_string()),
+            }),
+            false,
+        ),
+    ];
+
+    for (case, monitoring, reported) in rows {
+        let emulator = emulator_with_activity(&samples, monitoring.clone());
+        let answer = call(
+            &emulator,
+            "DescribeDimensionKeys",
+            dimension_keys_input(
+                IDENTIFIER,
+                "db.wait_event",
+                "db.load.avg",
+                t0,
+                t0 + WINDOW_SPAN,
+                Some(60),
+            ),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.member("Keys").as_array().map(Vec::len) == Some(0),
+            !*reported,
+            "case {case}: expected the activity reported = {reported}, got {:?}",
+            answer.body
+        );
+    }
 }

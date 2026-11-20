@@ -230,6 +230,11 @@ pub struct SessionContext {
     /// request context of its own: it is what the engine's log lines are delivered to
     /// CloudWatch Logs over ([`super::log_export`]).
     pub callback: ::smithy_server_runtime::EmbeddedEmulator,
+    /// The SHARED activity store every statement of every session on this endpoint records
+    /// what it cost in ([`super::activity_samples`]), which is what the monitoring services
+    /// report this resource's load from. `None` when no such store is reachable from the
+    /// engine this service is mounted on, which records nothing and reports nothing.
+    pub activity: Option<super::activity_samples::ActivityStore>,
 }
 
 impl SessionContext {
@@ -442,6 +447,9 @@ pub(super) fn instance_facts(
             // (`ComAmazonawsRdsAmazonrdsv19State::serves_reads_only_in_a_blue_green_deployment`).
             read_only: serves_reads_only(store, record),
             runtime: engine_runtime_of(store, record),
+            // The instance's own immutable id, which is the data source Performance
+            // Insights monitors this engine as.
+            data_source_id: record.dbi_resource_id.clone(),
         },
         database,
     ))
@@ -614,6 +622,11 @@ pub(super) struct RecordFacts {
     /// [`read_only`].
     pub read_only: bool,
     pub runtime: EngineRuntime,
+    /// The IMMUTABLE resource id of the DATA SOURCE a session on this endpoint is
+    /// attributable to: `DbiResourceId` for a DB instance's own endpoint (a cluster
+    /// member's included, since Performance Insights monitors the member), the cluster's
+    /// own `DbClusterResourceId` for a cluster endpoint.
+    pub data_source_id: String,
 }
 
 /// The facts a login is admitted against, derived from what one record says ([`RecordFacts`])
@@ -683,6 +696,7 @@ pub(super) fn facts_of(record: RecordFacts, database: &Arc<InstanceDatabase>) ->
         iam_database_authentication_enabled: record.iam_database_authentication_enabled,
         read_only: record.read_only,
         runtime: replaying(record.runtime, record.read_only),
+        data_source_id: record.data_source_id,
     }
 }
 
@@ -917,6 +931,9 @@ pub struct InstanceFacts {
     /// What the instance's engine is running with: its parameters, its start time, its
     /// role.
     pub runtime: EngineRuntime,
+    /// The data source a session on this endpoint is attributable to, as
+    /// [`RecordFacts::data_source_id`] holds it.
+    pub data_source_id: String,
 }
 
 impl InstanceFacts {
@@ -1265,6 +1282,17 @@ pub struct SessionFacts {
     /// What the server has to say about this session's last statement, which its
     /// `SHOW WARNINGS` reports ([`super::mysql_diagnostics`]).
     pub diagnostics: super::mysql_diagnostics::SessionDiagnostics,
+    /// The DATA SOURCE this session's activity is attributable to — the immutable resource
+    /// id of the resource whose engine it is running on
+    /// ([`InstanceFacts::data_source_id`]), which is the id a monitoring service names.
+    pub data_source_id: String,
+    /// Where each statement of this session records what it cost
+    /// ([`super::activity_samples`]). `None` when no activity store is reachable from the
+    /// engine this service is mounted on.
+    pub activity: Option<super::activity_samples::ActivityStore>,
+    /// How long the statement running now has spent WAITING for a row another transaction
+    /// held, which is the wait the sampler files under the engine's row-lock wait event.
+    pub lock_wait: super::activity_samples::LockWaitClock,
 }
 
 impl SessionFacts {
@@ -1636,12 +1664,25 @@ pub fn run_statement(
     sql: &str,
     params: &[Option<String>],
 ) -> Result<StatementAnswer, EngineError> {
+    // What this statement costs the session is measured here, around the whole of it, and
+    // recorded as the session activity the monitoring services report
+    // ([`super::activity_samples`]): the wait this statement does for a row another
+    // transaction holds is counted by the statement path itself, and the rest of the time
+    // is the time the engine spent running it.
+    let started = ::std::time::Instant::now();
+    facts.lock_wait.reset();
     let answer = run_statement_at(
         database,
         facts,
         sql,
         params,
         &mut super::pg_code_block::BlockBudget::default(),
+    );
+    super::activity_samples::record_statement(
+        facts,
+        sql,
+        facts.lock_wait.waited(),
+        started.elapsed(),
     );
     // What the server has to say about the statement it has just run: a refusal leaves its
     // own condition in the session's diagnostics area, where a MySQL client reads it back
@@ -2004,13 +2045,19 @@ fn take_the_rows_it_locks(
         .map(|rowid| (target.to_string(), table.clone(), rowid))
         .collect();
     let deadline = super::sql_engine::statement_deadline(&server_view(facts)).0;
-    match database.locks().acquire(
+    // Taking the rows is where a statement WAITS: the time spent here is the time the
+    // session was blocked on a row another transaction held, which the sampler files under
+    // the engine's own row-lock wait event ([`super::activity_samples`]).
+    let asked_at = ::std::time::Instant::now();
+    let outcome = database.locks().acquire(
         facts.connection_id,
         &rows,
         plan.mode,
         plan.policy,
         deadline,
-    ) {
+    );
+    facts.lock_wait.add(asked_at.elapsed());
+    match outcome {
         row_locks::LockOutcome::Granted(granted) => {
             let ids: Vec<i64> = granted.iter().map(|(_, _, rowid)| *rowid).collect();
             // `SKIP LOCKED` asks for the rows another transaction does NOT hold, so the

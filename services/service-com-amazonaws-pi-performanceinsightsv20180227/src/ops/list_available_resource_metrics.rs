@@ -8,18 +8,24 @@
 //! persists nothing — repeating it answers identically.
 //!
 //! What it does NOT do is invent telemetry or a catalog it cannot know. The
-//! per-SQL metric types (`db.sql.stats`, `db.sql_tokenized.stats`) name counters
-//! whose set differs per DB engine, and this emulator monitors no running engine,
-//! so it cannot know which engine's per-SQL catalog a data source would publish:
-//! those types are answered with the scaffold's 501 rather than with another
-//! engine's names. The `db` type's counters are the engine's own in the same way,
-//! so its catalog is EMPTY here rather than carrying invented counter names — and
-//! it never carries the Active Session History load series (`db.load`,
-//! `db.sampledload`), which is queryable through `GetResourceMetrics` and
-//! enumerated by `ListAvailableResourceDimensions` as the dimensional metric, but
-//! is not a counter this catalog advertises (see [`DB_COUNTER_METRICS`]). A metric
-//! type the service does not publish at all, and one the requested `ServiceType`
-//! does not publish, are refused with the modelled `InvalidArgumentException`.
+//! per-SQL metric types (`db.sql.stats`, `db.sql_tokenized.stats`) name the
+//! statement-level statistics a running engine collects, which nothing here
+//! collects, so those types are answered with the scaffold's 501 rather than
+//! with another engine's names. The `db` type's counters ARE known: they are the
+//! engine family's own published set ([`MYSQL_ENGINE_COUNTERS`],
+//! [`POSTGRES_ENGINE_COUNTERS`]), and which family a data source belongs to is
+//! the engine the owning database service recorded for it in the shared
+//! data-source directory — so a MySQL data source is answered the MySQL
+//! family's counters and a PostgreSQL one the PostgreSQL family's. A data source
+//! whose engine family this emulator publishes no counter set for, and one whose
+//! engine nothing here recorded, are answered with the 501 for the same reason
+//! the per-SQL types are. No catalog ever carries the Active Session History
+//! load series (`db.load`, `db.sampledload`): that is queryable through
+//! `GetResourceMetrics` and enumerated by `ListAvailableResourceDimensions` as
+//! the dimensional metric, and is not a counter this catalog advertises. A
+//! metric type the service does not publish at all, and one the requested
+//! `ServiceType` does not publish, are refused with the modelled
+//! `InvalidArgumentException`.
 //!
 //! A request that addresses no data source this account may see is refused with
 //! the modelled `NotAuthorizedException`, the uniform answer the real service
@@ -249,16 +255,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // WHICH counters the engine-metric type covers is a property of the
+        // ENGINE FAMILY the addressed data source runs — `MetricTypes` scopes
+        // every type by engine — so the catalog is scoped by the engine the
+        // owning database service recorded for this resource id in the shared
+        // data-source directory ([`::service_common::db_data_sources`]), the
+        // same record `GetResourceMetadata` projects its features from.
+        let recorded_engine = recorded_engine(&*self.engine, &input.identifier);
         // The metrics of the requested types, in the order the caller named the
         // types and in catalog order within each one.
         let mut available: Vec<&CatalogMetric> = Vec::new();
         for catalog in &requested {
-            match catalog.metrics {
-                Some(metrics) => available.extend(metrics),
-                // A per-SQL catalog is the engine's, and this emulator monitors
-                // none. Answer that honestly rather than publishing one engine's
-                // per-SQL counter names for every data source.
-                None => {
+            match catalog.catalog {
+                PublishedCatalog::HostCounters(metrics) => available.extend(metrics),
+                PublishedCatalog::EngineCounters => {
+                    match recorded_engine
+                        .as_deref()
+                        .and_then(engine_family)
+                        .map(engine_counters)
+                    {
+                        Some(metrics) => available.extend(metrics),
+                        // An engine family this emulator publishes no counter
+                        // catalog for: answer that honestly rather than
+                        // publishing another family's counter names for it.
+                        None => {
+                            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                                "ListAvailableResourceMetrics for the metric type {} on {}",
+                                catalog.name,
+                                data_source_engine_phrase(recorded_engine.as_deref())
+                            )))
+                        }
+                    }
+                }
+                // A per-SQL catalog names the statement-level counters of a
+                // running engine, which this emulator collects none of. Answer
+                // that honestly rather than publishing one engine's per-SQL
+                // counter names for every data source.
+                PublishedCatalog::NotKnown => {
                     return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                         "ListAvailableResourceMetrics for the metric type {}",
                         catalog.name
@@ -335,10 +368,25 @@ struct MetricTypeCatalog {
     /// All engines", and the three `db` types "All engines except for Amazon
     /// DocumentDB".
     docdb: bool,
-    /// The metrics of this type, or `None` when their set is the DB engine's own
-    /// and this emulator — which monitors no running engine — cannot know which
-    /// engine's applies.
-    metrics: Option<&'static [CatalogMetric]>,
+    /// Where the metrics of this type come from.
+    catalog: PublishedCatalog,
+}
+
+/// WHOSE counters a metric type's catalog holds, which is what decides whether the
+/// catalog can be answered for one data source at all.
+enum PublishedCatalog {
+    /// Counters of the HOST the data source runs on, published the same way whatever
+    /// engine it runs: the operating-system counters, which `MetricTypes` documents
+    /// for "All engines".
+    HostCounters(&'static [CatalogMetric]),
+    /// The DB ENGINE's OWN counters, whose set is a property of the engine family the
+    /// data source runs ([`engine_counters`]) — so which of them a request is answered
+    /// with follows the engine the owning service recorded for the resource.
+    EngineCounters,
+    /// A catalog whose counter set this emulator cannot know: the per-SQL types name
+    /// the statement-level statistics a running engine collects, which nothing here
+    /// collects.
+    NotKnown,
 }
 
 impl MetricTypeCatalog {
@@ -353,30 +401,418 @@ impl MetricTypeCatalog {
 /// one the `db` metric types are documented NOT to be published for.
 const DOCDB_SERVICE_TYPE: &str = "DOCDB";
 
-/// The catalog of the `db` ("DB load metrics") type: the DB engine's own counter
-/// metrics, which a data source publishes only while an engine is running on it.
+/// The DB engine families whose published counter catalog this emulator holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineFamily {
+    /// Amazon RDS for MySQL and for MariaDB, and the Aurora MySQL-compatible
+    /// editions: one engine family, whose counters are the MySQL server's own status
+    /// variables.
+    MySql,
+    /// Amazon RDS for PostgreSQL and the Aurora PostgreSQL-compatible editions,
+    /// whose counters are the PostgreSQL statistics collector's own.
+    Postgres,
+}
+
+/// The family the DB engine `engine` belongs to, or `None` for an engine family this
+/// emulator publishes no counter catalog for.
 ///
-/// EMPTY here, and deliberately so. Two different things could go in it, and
-/// neither may:
+/// The names are the values the database control planes' `Engine` member takes
+/// (`mysql`, `mariadb`, `aurora-mysql`, `aurora`, `postgres`,
+/// `aurora-postgresql`); the Oracle, SQL Server and Db2 engines publish counter sets
+/// of their own, which this emulator holds none of.
+fn engine_family(engine: &str) -> Option<EngineFamily> {
+    match engine.to_ascii_lowercase().as_str() {
+        "mysql" | "mariadb" | "aurora" | "aurora-mysql" => Some(EngineFamily::MySql),
+        "postgres" | "aurora-postgresql" => Some(EngineFamily::Postgres),
+        _ => None,
+    }
+}
+
+/// The engine counters one family publishes, which is the `db` type's catalog for a
+/// data source of that family.
+fn engine_counters(family: EngineFamily) -> &'static [CatalogMetric] {
+    match family {
+        EngineFamily::MySql => MYSQL_ENGINE_COUNTERS,
+        EngineFamily::Postgres => POSTGRES_ENGINE_COUNTERS,
+    }
+}
+
+/// The engine the owning database service recorded for the data source `identifier`,
+/// or `None` when the shared directory holds no record of the id at all — which is
+/// every id this emulator did not mint itself.
+fn recorded_engine<Eng: Send + Sync + 'static>(engine: &Eng, identifier: &str) -> Option<String> {
+    let directory = crate::state::data_source_directory(engine)?;
+    let guard = directory.lock();
+    guard.get(identifier).map(|record| record.engine.clone())
+}
+
+/// How the 501 above names the data source whose engine counters it cannot
+/// enumerate: the engine the directory recorded, or the fact that it recorded none.
+fn data_source_engine_phrase(engine: Option<&str>) -> String {
+    match engine {
+        Some(engine) => format!("a {engine} data source"),
+        None => "a data source whose engine this emulator did not record".to_string(),
+    }
+}
+
+/// The counters the MYSQL engine family publishes, which is the `db` ("DB load
+/// metrics") catalog of a MySQL, MariaDB or Aurora MySQL data source.
 ///
-/// * the engine's native counters (`db.<category>.<counter>`) are the engine's
-///   own set, differing per engine family, and this emulator monitors no running
-///   engine — publishing one engine's counter names for every data source would
-///   be inventing a catalog, exactly as the per-SQL types below would be; and
-/// * the Active Session History load series (`db.load`, `db.sampledload`) is
-///   QUERYABLE — `GetResourceMetrics` takes `db.load.avg` and
-///   `DescribeDimensionKeys` takes it as its `Metric` — but it is not a member of
-///   this catalog: it is the DIMENSIONAL metric, which
-///   `ListAvailableResourceDimensions` is the operation that enumerates ("Valid
-///   values include db.load"), and a live service never lists it here. A client
-///   that reads catalog membership as the set of counters it may query would be
-///   handed a name the real service does not advertise.
+/// SOURCE: the "Performance Insights counter metrics" tables the Amazon RDS and
+/// Amazon Aurora user guides publish per engine, whose MySQL entries are the server's
+/// own `SHOW GLOBAL STATUS` variables under the `db.<category>.<variable>` names
+/// Performance Insights reports them by; each description is what that status
+/// variable counts. The Aurora-only families (the `db.IO.aurora_*` and
+/// `db.Transactions.*` counters a cluster volume publishes) are left out: they are
+/// counters of a storage layer this emulator does not have, and the native engine
+/// ones below are what every build of the family publishes.
 ///
-/// So the type is published (`MetricTypes` documents it for every engine except
-/// Amazon DocumentDB, and naming it is not an argument error), and the catalog it
-/// answers is the honest report that this emulator discovers no counter on a data
-/// source whose engine it does not run.
-const DB_COUNTER_METRICS: &[CatalogMetric] = &[];
+/// The Active Session History load series (`db.load`, `db.sampledload`) is NOT here
+/// and belongs in no engine's catalog: it is the DIMENSIONAL metric, which
+/// `ListAvailableResourceDimensions` enumerates and `DescribeDimensionKeys` groups,
+/// not a counter this catalog advertises.
+const MYSQL_ENGINE_COUNTERS: &[CatalogMetric] = &[
+    CatalogMetric {
+        metric: "db.Cache.Innodb_buffer_pool_pages_data",
+        description: "The number of pages in the InnoDB buffer pool containing data.",
+        unit: "Pages",
+    },
+    CatalogMetric {
+        metric: "db.Cache.Innodb_buffer_pool_pages_free",
+        description: "The number of free pages in the InnoDB buffer pool.",
+        unit: "Pages",
+    },
+    CatalogMetric {
+        metric: "db.Cache.Innodb_buffer_pool_pages_total",
+        description: "The total size of the InnoDB buffer pool, in pages.",
+        unit: "Pages",
+    },
+    CatalogMetric {
+        metric: "db.Cache.Innodb_buffer_pool_read_requests",
+        description: "The number of logical read requests served from the InnoDB buffer pool.",
+        unit: "Requests/Second",
+    },
+    CatalogMetric {
+        metric: "db.Cache.Innodb_buffer_pool_reads",
+        description: "The number of logical reads the InnoDB buffer pool could not satisfy, \
+                      so the engine read the page from disk.",
+        unit: "Reads/Second",
+    },
+    CatalogMetric {
+        metric: "db.IO.Innodb_data_reads",
+        description: "The number of data reads the engine made.",
+        unit: "Reads/Second",
+    },
+    CatalogMetric {
+        metric: "db.IO.Innodb_data_writes",
+        description: "The number of data writes the engine made.",
+        unit: "Writes/Second",
+    },
+    CatalogMetric {
+        metric: "db.IO.Innodb_log_writes",
+        description: "The number of physical writes to the InnoDB redo log.",
+        unit: "Writes/Second",
+    },
+    CatalogMetric {
+        metric: "db.IO.Innodb_os_log_fsyncs",
+        description: "The number of fsync writes the engine made to the redo log.",
+        unit: "Writes/Second",
+    },
+    CatalogMetric {
+        metric: "db.IO.Innodb_pages_read",
+        description: "The number of pages the engine read from the tablespace.",
+        unit: "Pages/Second",
+    },
+    CatalogMetric {
+        metric: "db.IO.Innodb_pages_written",
+        description: "The number of pages the engine wrote to the tablespace.",
+        unit: "Pages/Second",
+    },
+    CatalogMetric {
+        metric: "db.Locks.Innodb_row_lock_time",
+        description: "The time spent acquiring row locks for InnoDB tables.",
+        unit: "Milliseconds",
+    },
+    CatalogMetric {
+        metric: "db.Locks.Innodb_row_lock_waits",
+        description: "The number of times a row lock for an InnoDB table had to be waited for.",
+        unit: "Waits/Second",
+    },
+    CatalogMetric {
+        metric: "db.Locks.Table_locks_immediate",
+        description: "The number of requests for a table lock that were granted immediately.",
+        unit: "Locks/Second",
+    },
+    CatalogMetric {
+        metric: "db.Locks.Table_locks_waited",
+        description: "The number of requests for a table lock that could not be granted \
+                      immediately and had to be waited for.",
+        unit: "Locks/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Com_analyze",
+        description: "The number of ANALYZE statements executed.",
+        unit: "Queries/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Com_optimize",
+        description: "The number of OPTIMIZE statements executed.",
+        unit: "Queries/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Com_select",
+        description: "The number of SELECT statements executed.",
+        unit: "Queries/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Innodb_rows_deleted",
+        description: "The number of rows deleted from InnoDB tables.",
+        unit: "Rows/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Innodb_rows_inserted",
+        description: "The number of rows inserted into InnoDB tables.",
+        unit: "Rows/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Innodb_rows_read",
+        description: "The number of rows read from InnoDB tables.",
+        unit: "Rows/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Innodb_rows_updated",
+        description: "The number of rows updated in InnoDB tables.",
+        unit: "Rows/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Questions",
+        description: "The number of statements executed by the server, not counting the \
+                      statements executed inside stored programs.",
+        unit: "Queries/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Select_full_join",
+        description: "The number of joins that performed a full scan because they used no \
+                      index.",
+        unit: "Queries/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Select_range",
+        description: "The number of joins that used a range search on a reference table.",
+        unit: "Queries/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Select_scan",
+        description: "The number of joins that performed a full scan of the first table.",
+        unit: "Queries/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Slow_queries",
+        description: "The number of statements that took longer than long_query_time seconds.",
+        unit: "Queries/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Sort_merge_passes",
+        description: "The number of merge passes the sort algorithm had to do.",
+        unit: "Count/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Sort_range",
+        description: "The number of sorts that were done using ranges.",
+        unit: "Count/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Sort_rows",
+        description: "The number of rows sorted.",
+        unit: "Rows/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.Sort_scan",
+        description: "The number of sorts that were done by scanning a table.",
+        unit: "Count/Second",
+    },
+    CatalogMetric {
+        metric: "db.Temp.Created_tmp_disk_tables",
+        description: "The number of internal temporary tables the server created on disk \
+                      while executing statements.",
+        unit: "Tables/Second",
+    },
+    CatalogMetric {
+        metric: "db.Temp.Created_tmp_files",
+        description: "The number of temporary files the server created.",
+        unit: "Files/Second",
+    },
+    CatalogMetric {
+        metric: "db.Temp.Created_tmp_tables",
+        description: "The number of internal temporary tables the server created in memory \
+                      while executing statements.",
+        unit: "Tables/Second",
+    },
+    CatalogMetric {
+        metric: "db.Users.Aborted_clients",
+        description: "The number of connections aborted because the client died without \
+                      closing the connection properly.",
+        unit: "Connections/Second",
+    },
+    CatalogMetric {
+        metric: "db.Users.Aborted_connects",
+        description: "The number of failed attempts to connect to the server.",
+        unit: "Connections/Second",
+    },
+    CatalogMetric {
+        metric: "db.Users.Connections",
+        description: "The number of connection attempts to the server, successful or not.",
+        unit: "Connections/Second",
+    },
+    CatalogMetric {
+        metric: "db.Users.Threads_created",
+        description: "The number of threads the server created to handle connections.",
+        unit: "Threads/Second",
+    },
+    CatalogMetric {
+        metric: "db.Users.Threads_running",
+        description: "The number of threads that are not sleeping.",
+        unit: "Threads",
+    },
+];
+
+/// The counters the POSTGRESQL engine family publishes, which is the `db` catalog of a
+/// PostgreSQL or Aurora PostgreSQL data source.
+///
+/// SOURCE: the same "Performance Insights counter metrics" tables, whose PostgreSQL
+/// entries are the columns of the engine's own statistics views —
+/// `pg_stat_database` (transactions, tuples, blocks, temporary files, deadlocks,
+/// backends) and `pg_stat_bgwriter` (checkpoints and the buffers each writer wrote) —
+/// under the `db.<category>.<column>` names Performance Insights reports them by;
+/// each description is what that column counts. As above, the load series is not a
+/// member of this catalog.
+const POSTGRES_ENGINE_COUNTERS: &[CatalogMetric] = &[
+    CatalogMetric {
+        metric: "db.Cache.blks_hit",
+        description: "The number of times a disk block was found in the buffer cache, so no \
+                      read was needed.",
+        unit: "Blocks/Second",
+    },
+    CatalogMetric {
+        metric: "db.Checkpoint.buffers_checkpoint",
+        description: "The number of buffers written during checkpoints.",
+        unit: "Buffers/Second",
+    },
+    CatalogMetric {
+        metric: "db.Checkpoint.checkpoint_sync_time",
+        description: "The time spent synchronising files to disk during checkpoint \
+                      processing.",
+        unit: "Milliseconds",
+    },
+    CatalogMetric {
+        metric: "db.Checkpoint.checkpoint_write_time",
+        description: "The time spent writing files to disk during checkpoint processing.",
+        unit: "Milliseconds",
+    },
+    CatalogMetric {
+        metric: "db.Checkpoint.checkpoints_req",
+        description: "The number of requested checkpoints that have been performed.",
+        unit: "Checkpoints/Minute",
+    },
+    CatalogMetric {
+        metric: "db.Checkpoint.checkpoints_timed",
+        description: "The number of scheduled checkpoints that have been performed.",
+        unit: "Checkpoints/Minute",
+    },
+    CatalogMetric {
+        metric: "db.Checkpoint.maxwritten_clean",
+        description: "The number of times the background writer stopped a cleaning scan \
+                      because it had written too many buffers.",
+        unit: "Count/Minute",
+    },
+    CatalogMetric {
+        metric: "db.Concurrency.deadlocks",
+        description: "The number of deadlocks detected in the database.",
+        unit: "Deadlocks/Minute",
+    },
+    CatalogMetric {
+        metric: "db.IO.blk_read_time",
+        description: "The time spent reading data file blocks by backends.",
+        unit: "Milliseconds",
+    },
+    CatalogMetric {
+        metric: "db.IO.blks_read",
+        description: "The number of disk blocks read in the database.",
+        unit: "Blocks/Second",
+    },
+    CatalogMetric {
+        metric: "db.IO.buffers_alloc",
+        description: "The number of buffers allocated.",
+        unit: "Buffers/Second",
+    },
+    CatalogMetric {
+        metric: "db.IO.buffers_backend",
+        description: "The number of buffers written directly by a backend.",
+        unit: "Buffers/Second",
+    },
+    CatalogMetric {
+        metric: "db.IO.buffers_backend_fsync",
+        description: "The number of times a backend had to execute its own fsync call \
+                      instead of handing the write to the background writer.",
+        unit: "Count/Second",
+    },
+    CatalogMetric {
+        metric: "db.IO.buffers_clean",
+        description: "The number of buffers written by the background writer.",
+        unit: "Buffers/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.tup_deleted",
+        description: "The number of rows deleted by queries in the database.",
+        unit: "Rows/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.tup_fetched",
+        description: "The number of rows fetched by queries in the database.",
+        unit: "Rows/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.tup_inserted",
+        description: "The number of rows inserted by queries in the database.",
+        unit: "Rows/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.tup_returned",
+        description: "The number of rows returned by queries in the database.",
+        unit: "Rows/Second",
+    },
+    CatalogMetric {
+        metric: "db.SQL.tup_updated",
+        description: "The number of rows updated by queries in the database.",
+        unit: "Rows/Second",
+    },
+    CatalogMetric {
+        metric: "db.Temp.temp_bytes",
+        description: "The amount of data written to temporary files by queries in the \
+                      database.",
+        unit: "Bytes/Second",
+    },
+    CatalogMetric {
+        metric: "db.Temp.temp_files",
+        description: "The number of temporary files created by queries in the database.",
+        unit: "Files/Minute",
+    },
+    CatalogMetric {
+        metric: "db.Transactions.xact_commit",
+        description: "The number of transactions in the database that have been committed.",
+        unit: "Commits/Second",
+    },
+    CatalogMetric {
+        metric: "db.Transactions.xact_rollback",
+        description: "The number of transactions in the database that have been rolled back.",
+        unit: "Rollbacks/Second",
+    },
+    CatalogMetric {
+        metric: "db.User.numbackends",
+        description: "The number of backends currently connected to the database.",
+        unit: "Connections",
+    },
+];
 
 /// The OS counter metrics, the catalog of the `os` ("OS counter metrics") type,
 /// published for all engines.
@@ -552,22 +988,22 @@ const PUBLISHED_METRIC_TYPES: &[MetricTypeCatalog] = &[
     MetricTypeCatalog {
         name: "os",
         docdb: true,
-        metrics: Some(OS_COUNTER_METRICS),
+        catalog: PublishedCatalog::HostCounters(OS_COUNTER_METRICS),
     },
     MetricTypeCatalog {
         name: "db",
         docdb: false,
-        metrics: Some(DB_COUNTER_METRICS),
+        catalog: PublishedCatalog::EngineCounters,
     },
     MetricTypeCatalog {
         name: "db.sql.stats",
         docdb: false,
-        metrics: None,
+        catalog: PublishedCatalog::NotKnown,
     },
     MetricTypeCatalog {
         name: "db.sql_tokenized.stats",
         docdb: false,
-        metrics: None,
+        catalog: PublishedCatalog::NotKnown,
     },
 ];
 

@@ -520,6 +520,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
             directory.lock().forget(&dbi_resource_id);
         }
+        // And the activity its engine had goes with it: the resource is gone, so its load
+        // is not something this emulator still reports
+        // ([`crate::state::data_plane::activity_samples`]).
+        if let Some(samples) =
+            crate::state::data_plane::activity_samples::sample_store(&*self.engine)
+        {
+            samples.lock().forget(&dbi_resource_id);
+        }
 
         (db_instance, managed_secret)
         };

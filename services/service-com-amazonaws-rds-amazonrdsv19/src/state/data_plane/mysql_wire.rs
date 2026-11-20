@@ -283,6 +283,9 @@ async fn serve_session(
         sessions: context.sessions.clone(),
         insert_id: super::mysql_insert_id::SessionInsertId::default(),
         diagnostics: super::mysql_diagnostics::SessionDiagnostics::default(),
+        data_source_id: facts.data_source_id.clone(),
+        activity: context.activity.clone(),
+        lock_wait: super::activity_samples::LockWaitClock::default(),
     };
     // `max_connections` bounds the sessions a MySQL server holds at once too, and the
     // server refuses the connection that would exceed it.
