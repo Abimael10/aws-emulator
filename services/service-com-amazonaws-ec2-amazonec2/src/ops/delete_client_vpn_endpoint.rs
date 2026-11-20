@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteClientVpnEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteClientVpnEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: begins deleting the stored Client VPN endpoint the request names — refusing
+//! one that still has a target network associated, as the operation's own documentation
+//! requires — and answers it `deleting`, the state the clock owes `deleted`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteClientVpnEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,10 +167,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // as deleted.
         state::require_known_client_vpn_endpoint(&store, &input.client_vpn_endpoint_id)?;
 
-        // Taking the endpoint down is still unwritten, so the operation answers the
-        // scaffold's 501 rather than a success it cannot back with state. Every refusal the
-        // request earns is minted above, before this point, so a client learns that its
-        // input is wrong from the code the real service answers rather than from this.
-        Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME))
+        // "You must disassociate all target networks before you can delete a Client VPN
+        // endpoint" (`DeleteClientVpnEndpoint`): an endpoint that still has one is refused
+        // with EC2's own code for a delete the resource's dependencies forbid, naming what
+        // has to go first — rather than deleting an endpoint whose associations would be left
+        // pointing at nothing.
+        if let Some(association_id) =
+            store.client_vpn_endpoint_target_network_association(&input.client_vpn_endpoint_id)
+        {
+            return Err(state::dependency_violation(format!(
+                "The Client VPN endpoint '{endpoint_id}' has the target network association \
+                 '{association_id}' and cannot be deleted",
+                endpoint_id = input.client_vpn_endpoint_id,
+            )));
+        }
+
+        // "The current state of the Client VPN endpoint"
+        // (`DeleteClientVpnEndpointResult$Status`): the delete moves the endpoint to
+        // `deleting` and the clock owes it `deleted`, both of which
+        // `ClientVpnEndpointStatusCode` declares — so the endpoint goes on being reported
+        // while it is taken down, which is what lets a client watch a delete finish. An
+        // endpoint already on its way out keeps the state it is in, so a repeated delete
+        // reports that state rather than restarting the move.
+        let Some(status) = store.delete_client_vpn_endpoint(&input.client_vpn_endpoint_id) else {
+            return Err(state::invalid_client_vpn_endpoint_id_not_found(
+                &input.client_vpn_endpoint_id,
+            ));
+        };
+        Ok(DeleteClientVpnEndpointOutput {
+            status: Some(status),
+        })
     }
 }

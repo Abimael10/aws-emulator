@@ -60,6 +60,17 @@ pub const CLIENT_VPN_ENDPOINT_STATUS_PENDING_ASSOCIATE: &str = "pending-associat
 /// ([`ComAmazonawsEc2Amazonec2State::mark_client_vpn_endpoint_associated`]).
 pub const CLIENT_VPN_ENDPOINT_STATUS_AVAILABLE: &str = "available";
 
+/// "deleting" — the state `DeleteClientVpnEndpoint` answers for an endpoint it has begun
+/// taking down (`ClientVpnEndpointStatusCode`, which declares `pending-associate | available
+/// | deleting | deleted | pending`).
+pub const CLIENT_VPN_ENDPOINT_STATUS_DELETING: &str = "deleting";
+
+/// "deleted" — the terminal state the clock owes a `deleting` endpoint ([`TRANSITION_DELAY`]
+/// later, through [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`]). The model
+/// declares it, so an endpoint that has been taken down is still REPORTED in it rather than
+/// disappearing from the store.
+pub const CLIENT_VPN_ENDPOINT_STATUS_DELETED: &str = "deleted";
+
 /// `InvalidClientVpnDuplicateAssociation` (HTTP 400): the target network the request names is
 /// already associated with that Client VPN endpoint, so associating it would make a second
 /// association of one network.
@@ -239,22 +250,30 @@ pub const CLIENT_VPN_AUTHENTICATION_FEDERATED: &str = "federated-authentication"
 pub const CLIENT_VPN_ATTRIBUTE_STATUS_APPLIED: &str = "applied";
 
 /// Refuse a client CIDR range of a size Client VPN does not serve: HTTP 400
-/// `InvalidParameterValue`, in the sentence `ClientCidrBlock` documents its rule with —
-/// "Client CIDR range must have a size of at least /22 and must not be greater than /12." —
-/// with the two prefix lengths taken from [`CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS`] rather
-/// than written into the sentence twice.
+/// `InvalidParameterValue`, in the sentence EC2 answers for the BOUND the value crossed.
 ///
-/// A bare sentence carrying no part of the request, as the refusals of this surface read
-/// ([`client_vpn_certificate_not_found`] is the one a recorded response pins): what was wrong
-/// with the value is the SIZE the rule names, which the sentence states — to the closing full
-/// stop the member's own documentation ends it with.
-pub fn client_vpn_client_cidr_size_refusal<E>() -> Scaffolded<E> {
+/// "Client CIDR range must have a size of at least /22 and must not be greater than /12"
+/// (`CreateClientVpnEndpointRequest$ClientCidrBlock`) is the RULE; the sentence that states a
+/// value broke it names the one bound it broke — `Client cidr block must be at least a /22
+/// range` for a range SMALLER than the published minimum, which is the wording a recorded
+/// refusal of this operation pins, and its counterpart for one LARGER than the published
+/// maximum. Both prefix lengths are taken from [`CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS`]
+/// rather than written into a sentence, so the rule is stated in one place.
+///
+/// A bare sentence carrying no part of the request, as the refusals of this surface read: what
+/// was wrong with the value is the SIZE the rule names, which the sentence states.
+pub fn client_vpn_client_cidr_size_refusal<E>(prefix_length: u32) -> Scaffolded<E> {
     // The SMALLEST range the rule admits is the one with the LONGEST prefix (the range's end),
-    // and the largest is the one with the shortest (its start).
+    // and the largest is the one with the shortest (its start) — so a prefix past the end is a
+    // range too small, and one before the start a range too large.
+    if prefix_length > *CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS.end() {
+        return invalid_parameter_value(format!(
+            "Client cidr block must be at least a /{longest_prefix} range",
+            longest_prefix = CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS.end(),
+        ));
+    }
     invalid_parameter_value(format!(
-        "Client CIDR range must have a size of at least /{longest_prefix} and must not be \
-         greater than /{shortest_prefix}.",
-        longest_prefix = CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS.end(),
+        "Client cidr block must be at most a /{shortest_prefix} range",
         shortest_prefix = CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS.start(),
     ))
 }
@@ -644,6 +663,108 @@ impl ComAmazonawsEc2Amazonec2State {
                     .flatten()
                     .any(|zone| zone == zone_name)
         })
+    }
+
+    /// The id of a target network association `endpoint_id` still has, or `None` when it has
+    /// none.
+    ///
+    /// "You must disassociate all target networks before you can delete a Client VPN
+    /// endpoint" (`DeleteClientVpnEndpoint`): what that delete is held to is whether ANY
+    /// association is left, so the first one found answers for all of them.
+    pub fn client_vpn_endpoint_target_network_association(
+        &self,
+        endpoint_id: &str,
+    ) -> Option<String> {
+        self.client_vpn_target_networks
+            .iter()
+            .find(|(_, record)| {
+                record.view.client_vpn_endpoint_id.as_deref() == Some(endpoint_id)
+            })
+            .map(|(association_id, _)| association_id.clone())
+    }
+
+    /// Begin deleting the Client VPN endpoint `endpoint_id` and answer the status it now
+    /// holds — or `None` when the store holds no endpoint under that id.
+    ///
+    /// The seam `DeleteClientVpnEndpoint` calls. The endpoint moves to `deleting`, carries
+    /// the instant it was deleted at ("The date and time the Client VPN endpoint was
+    /// deleted" — `ClientVpnEndpoint$DeletionTime`) and is owed `deleted` one
+    /// [`TRANSITION_DELAY`] later through [`Self::materialize_due_transitions`]: the span is
+    /// never zero, so a caller describing the endpoint straight after the call that deleted
+    /// it still sees `deleting`.
+    ///
+    /// An endpoint already on its way out keeps the state it is in and is owed nothing new,
+    /// so a repeated delete reports that state rather than restarting the move or recording a
+    /// second deletion instant.
+    pub fn delete_client_vpn_endpoint(
+        &mut self,
+        endpoint_id: &str,
+    ) -> Option<crate::ops::types::ClientVpnEndpointStatus> {
+        let deleted_at = iso8601_utc(::std::time::SystemTime::now());
+        let charge = deleted_at.len();
+        let endpoint = self.client_vpn_endpoints.get_mut(endpoint_id)?;
+        let held = endpoint
+            .status
+            .as_ref()
+            .and_then(|status| status.code.as_deref())
+            .unwrap_or_default();
+        if held == CLIENT_VPN_ENDPOINT_STATUS_DELETING
+            || held == CLIENT_VPN_ENDPOINT_STATUS_DELETED
+        {
+            return endpoint.status.clone();
+        }
+        let status = crate::ops::types::ClientVpnEndpointStatus {
+            code: Some(CLIENT_VPN_ENDPOINT_STATUS_DELETING.to_string()),
+            message: None,
+        };
+        endpoint.status = Some(status.clone());
+        endpoint.deletion_time = Some(deleted_at);
+        self.client_vpn_endpoint_moves.insert(
+            endpoint_id.to_string(),
+            PendingStateMove::starting_now(CLIENT_VPN_ENDPOINT_STATUS_DELETED),
+        );
+        self.add_stored_bytes(charge);
+        // "Deletes the specified Client VPN endpoint": an ingress authorization rule is a
+        // grant ON an endpoint rather than a resource of its own, so the rules of an endpoint
+        // that is being taken down go with it — there is nothing left for them to grant access
+        // through — and their bytes and their client tokens go back to the budget with them
+        // ([`Self::revoke_client_vpn_authorization_rule`]). An endpoint already on its way out
+        // returned above, so this is done once per endpoint.
+        let granted: Vec<ClientVpnAuthorizationRuleKey> = self
+            .client_vpn_authorization_rules
+            .keys()
+            .filter(|key| key.client_vpn_endpoint_id == endpoint_id)
+            .cloned()
+            .collect();
+        for key in granted {
+            let _ = self.revoke_client_vpn_authorization_rule(&key);
+        }
+        Some(status)
+    }
+
+    /// Apply the `deleting` -> `deleted` move every endpoint that has reached its due instant
+    /// by `now` owes.
+    ///
+    /// Called by [`Self::materialize_due_transitions`]: the move was owed at its instant
+    /// whether or not anybody asked, so applying it on a read changes nothing a later caller
+    /// would not have seen anyway. The `pending-associate` -> `available` move is NOT here —
+    /// it belongs to the operation that associates a target network
+    /// ([`Self::mark_client_vpn_endpoint_associated`]).
+    pub(crate) fn materialize_due_client_vpn_endpoints(&mut self, now: Instant) {
+        let endpoints = &mut self.client_vpn_endpoints;
+        self.client_vpn_endpoint_moves.retain(|endpoint_id, owed| {
+            let Some(code) = owed.due_by(now).map(str::to_string) else {
+                return true;
+            };
+            if let Some(endpoint) = endpoints.get_mut(endpoint_id) {
+                endpoint.status = Some(crate::ops::types::ClientVpnEndpointStatus {
+                    code: Some(code),
+                    message: None,
+                });
+            }
+            // The move is applied once; nothing is owed on this endpoint any more.
+            false
+        });
     }
 
     /// Apply the `associating` -> `associated` move every target network association that

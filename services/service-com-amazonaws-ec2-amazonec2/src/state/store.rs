@@ -1763,6 +1763,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `ClientVpnEndpointId` resolves it here, through
     /// [`require_known_client_vpn_endpoint`].
     pub client_vpn_endpoints: BTreeMap<String, crate::ops::types::ClientVpnEndpoint>,
+    /// The `deleting` -> `deleted` move the clock owes a Client VPN endpoint
+    /// `DeleteClientVpnEndpoint` has begun taking down, by `ClientVpnEndpointId` — see
+    /// [`PendingStateMove`]. The endpoint itself is the modelled shape above, which carries
+    /// no room for an owed move, so the move is kept beside it the way a NAT gateway's and a
+    /// VPC endpoint's are ([`Self::nat_gateway_moves`], [`Self::vpc_endpoint_moves`]).
+    pub client_vpn_endpoint_moves: BTreeMap<String, PendingStateMove>,
     /// Every target network associated with one of those endpoints, by the association's own
     /// id, as the modelled [`crate::ops::types::TargetNetwork`] shape plus the move the clock
     /// owes it ([`ClientVpnTargetNetworkRecord`]).
@@ -1801,11 +1807,35 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// EC2 call, so [`ComAmazonawsEc2Amazonec2State::insert_client_vpn_connection`] is the
     /// one way one enters this map.
     pub client_vpn_connections: BTreeMap<String, ClientVpnConnectionRecord>,
+    /// Every ingress authorization rule of those endpoints, by
+    /// [`ClientVpnAuthorizationRuleKey`] — the endpoint, the network and the group that name
+    /// ONE rule — as the modelled [`crate::ops::types::AuthorizationRule`] shape plus the
+    /// move the clock owes it ([`ClientVpnAuthorizationRuleRecord`]).
+    ///
+    /// Keyed by those three rather than by an id because a rule HAS no id of its own: it is
+    /// what `RevokeClientVpnIngress` names one by, and it is what makes a second
+    /// `AuthorizeClientVpnIngress` for the same network and group a duplicate
+    /// ([`client_vpn_duplicate_authorization_rule`]) rather than a second rule. The key order
+    /// is the order `DescribeClientVpnAuthorizationRules` reports and pages over.
+    /// [`ComAmazonawsEc2Amazonec2State::insert_client_vpn_authorization_rule`] is the one way
+    /// a rule is stored.
+    pub client_vpn_authorization_rules:
+        BTreeMap<ClientVpnAuthorizationRuleKey, ClientVpnAuthorizationRuleRecord>,
     /// A `CreateClientVpnRoute` `ClientToken` and the route that request added, so a repeat
     /// of the same request answers with that route instead of refusing it as a duplicate —
     /// "Unique, case-sensitive identifier that you provide to ensure the idempotency of the
     /// request" (`CreateClientVpnRouteRequest$ClientToken`).
     pub client_vpn_route_client_tokens: HashMap<String, ClientVpnRouteKey>,
+    /// An `AuthorizeClientVpnIngress` `ClientToken` and the authorization rule that request
+    /// added, so a repeat of the same request answers with that rule instead of refusing it
+    /// as a duplicate — "Unique, case-sensitive identifier that you provide to ensure the
+    /// idempotency of the request" (`AuthorizeClientVpnIngressRequest$ClientToken`).
+    ///
+    /// One entry per stored rule at most: the revoke that drops a rule drops every token that
+    /// names it ([`ComAmazonawsEc2Amazonec2State::revoke_client_vpn_authorization_rule`]), so
+    /// the map is bounded by the rule ceiling and by [`MAX_CLIENT_TOKEN_CHARS`].
+    pub client_vpn_authorization_rule_client_tokens:
+        HashMap<String, ClientVpnAuthorizationRuleKey>,
     /// An `AssociateClientVpnTargetNetwork` `ClientToken` and the `AssociationId` that
     /// request minted, so a repeat of the same request answers with that association instead
     /// of refusing it as a duplicate — "Unique, case-sensitive identifier that you provide to
@@ -3866,12 +3896,16 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A fresh account has created no Client VPN endpoint, so it holds none and no
             // target network is associated with one either.
             client_vpn_endpoints: BTreeMap::new(),
+            client_vpn_endpoint_moves: BTreeMap::new(),
             client_vpn_target_networks: BTreeMap::new(),
             // No endpoint, so no route table of one holds a route either.
             client_vpn_routes: BTreeMap::new(),
             // No endpoint, so no client has connected to one either.
             client_vpn_connections: BTreeMap::new(),
+            // No endpoint, so no authorization rule grants access through one either.
+            client_vpn_authorization_rules: BTreeMap::new(),
             client_vpn_route_client_tokens: HashMap::new(),
+            client_vpn_authorization_rule_client_tokens: HashMap::new(),
             client_vpn_target_network_client_tokens: HashMap::new(),
             client_vpn_endpoint_client_tokens: HashMap::new(),
             // A fresh account has associated no IAM role with an ACM certificate, so no

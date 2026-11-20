@@ -402,6 +402,32 @@ const SDK_PROVIDER_SHAPES: &[(&str, &str, SdkDiagnostic)] = &[
     ("mediaconvert", "CreatePreset", SdkDiagnostic::Attempts),
     ("mediaconvert", "UpdatePreset", SdkDiagnostic::Attempts),
     ("mediaconvert", "DeletePreset", SdkDiagnostic::Attempts),
+    // The AWS Client VPN types of Amazon EC2 — the endpoint and an ingress authorization rule
+    // of one ([`crate::state::provisioner::client_vpn`]) — are provisioned by a provider that
+    // words the ATTEMPT-counting shape, where that service's entry above carries the
+    // semicolon-separated one its launch template's provider words. Read from the recorded
+    // `ResourceStatusReason` of an `AWS::EC2::ClientVpnEndpoint` whose declared client address
+    // range is smaller than the published minimum (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check
+    // `acm__cloudformation__ec2.deploy-ec2-client-vpn-endpoint-invalid-client-cidr-rejected`,
+    // whose reason reads `Resource handler returned message: "<the service's sentence>
+    // (Service: Ec2, Status Code: 400, Request ID: …)" …`). That is the one reason RECORDED
+    // for these providers; the other rows are the same providers' other calls, which word the
+    // shape they word — a recording of one of them is what would correct them.
+    ("ec2", "CreateClientVpnEndpoint", SdkDiagnostic::Attempts),
+    ("ec2", "DeleteClientVpnEndpoint", SdkDiagnostic::Attempts),
+    (
+        "ec2",
+        "DescribeClientVpnEndpoints",
+        SdkDiagnostic::Attempts,
+    ),
+    ("ec2", "AuthorizeClientVpnIngress", SdkDiagnostic::Attempts),
+    ("ec2", "RevokeClientVpnIngress", SdkDiagnostic::Attempts),
+    (
+        "ec2",
+        "DescribeClientVpnAuthorizationRules",
+        SdkDiagnostic::Attempts,
+    ),
 ];
 
 /// The shape the provider that called `operation` of `signing_name` words, where that differs

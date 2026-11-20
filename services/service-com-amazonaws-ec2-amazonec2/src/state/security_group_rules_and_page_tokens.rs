@@ -1156,6 +1156,41 @@ pub fn tags_from_specifications<E>(
     resource_type: &str,
     operation: &str,
 ) -> Result<Vec<Tag>, Scaffolded<E>> {
+    tags_from_specifications_of(specifications, resource_type, operation, false)
+}
+
+/// [`tags_from_specifications`] for a create reached over this emulator's own in-process
+/// callback rather than from a client: the reserved `aws:` namespace is ADMITTED on the tag
+/// specification, exactly as `CreateTags` admits it on the same path
+/// ([`is_cross_service_request`] records why).
+///
+/// "Do not use the `aws:` prefix … it is reserved for AWS use" is a rule about a CALLER's
+/// request: the AWS services that provision resources on a caller's behalf are what SET those
+/// tags on what they provision, so a resource one of them creates for a stack of its own
+/// carries them. Every other bound a tag payload is held to is the same one a client's request
+/// is held to.
+pub fn cross_service_tags_from_specifications<E>(
+    parts: &::http::request::Parts,
+    specifications: Option<&[TagSpecification]>,
+    resource_type: &str,
+    operation: &str,
+) -> Result<Vec<Tag>, Scaffolded<E>> {
+    tags_from_specifications_of(
+        specifications,
+        resource_type,
+        operation,
+        is_cross_service_request(parts),
+    )
+}
+
+/// The one walk both readings above make, with `sets_aws_managed_tags` saying whether the
+/// reserved namespace is admitted — the same name and the same meaning `CreateTags` gives it.
+fn tags_from_specifications_of<E>(
+    specifications: Option<&[TagSpecification]>,
+    resource_type: &str,
+    operation: &str,
+    sets_aws_managed_tags: bool,
+) -> Result<Vec<Tag>, Scaffolded<E>> {
     let mut tags: Vec<Tag> = Vec::new();
     for specification in specifications.unwrap_or_default() {
         match specification.resource_type.as_deref() {
@@ -1187,7 +1222,7 @@ pub fn tags_from_specifications<E>(
         if key.is_empty() {
             return Err(invalid_parameter_value("A tag key cannot be empty"));
         }
-        if key.starts_with(RESERVED_TAG_PREFIX) {
+        if !sets_aws_managed_tags && key.starts_with(RESERVED_TAG_PREFIX) {
             return Err(invalid_parameter_value(format!(
                 "Tag key '{key}' is invalid: the '{prefix}' prefix is reserved",
                 prefix = RESERVED_TAG_PREFIX,

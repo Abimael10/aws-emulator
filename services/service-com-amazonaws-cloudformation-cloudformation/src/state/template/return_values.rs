@@ -973,6 +973,12 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // `vol-` id, and "Ref returns the volume ID", so the identifier in force is the one
         // that service answered.
         || resource_type == EC2_VOLUME
+        // A CLIENT VPN ENDPOINT is one more: `CreateClientVpnEndpoint` takes no identifier
+        // either — the declaration states the client address range, the certificates the
+        // endpoint presents and the options it authenticates a client against — Amazon EC2
+        // assigns the `cvpn-endpoint-` id, and "Ref returns the Client VPN endpoint ID", so
+        // the identifier in force is the one that service answered the create with.
+        || resource_type == crate::state::provisioner::client_vpn::EC2_CLIENT_VPN_ENDPOINT
         // The VPC-NETWORK resources whose identifier Amazon EC2 ASSIGNS are in exactly the
         // same position as the VPC and the subnet above, and for the same reason: each of
         // their creates takes no identifier for the resource it makes and answers the id that
@@ -1202,6 +1208,13 @@ pub fn composite_identity_properties(resource_type: &str) -> &'static [&'static 
         COGNITO_IDENTITY_POOL_PRINCIPAL_TAG => &["IdentityPoolId", "IdentityProviderName"],
         ACMPCA_PERMISSION => &["CertificateAuthorityArn", "Principal"],
         GLUE_TABLE_OPTIMIZER => &["CatalogId", "DatabaseName", "TableName", "Type"],
+        // An `AWS::EC2::ClientVpnAuthorizationRule` is `<ClientVpnEndpointId>|<TargetNetworkCidr>`:
+        // Amazon EC2 mints no identifier for an authorization rule, every call on one naming
+        // it by the endpoint it is on and the network it grants access to, and the type
+        // declares no name of its own.
+        crate::state::provisioner::client_vpn::EC2_CLIENT_VPN_AUTHORIZATION_RULE => {
+            crate::state::provisioner::client_vpn::EC2_CLIENT_VPN_AUTHORIZATION_RULE_IDENTITY
+        }
         CODEPIPELINE_CUSTOM_ACTION_TYPE => CODEPIPELINE_ACTION_TYPE_IDENTITY,
         S3TABLES_NAMESPACE => S3TABLES_NAMESPACE_IDENTITY,
         // An `AWS::EMR::StudioSessionMapping` is `<StudioId>|<IdentityType>|<IdentityName>`,

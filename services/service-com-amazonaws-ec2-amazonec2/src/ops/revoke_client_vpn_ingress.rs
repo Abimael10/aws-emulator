@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeClientVpnIngress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeClientVpnIngress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes ONE ingress authorization rule off a stored Client VPN endpoint — the
+//! rule for the network the request names, granted either to the group it names or to all
+//! clients — and answers it `revoking`, the state the revoke left it in.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeClientVpnIngress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +139,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeClientVpnIngress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeClientVpnIngressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeClientVpnIngress"))
+        // `ctx` carries request metadata only; the rule is named by its endpoint, its network
+        // and its group, and resolved against the store the engine on `self` holds.
+        let _ = ctx;
+        use crate::state;
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation" (`$DryRun`): a question about
+        // the CALLER, answered before anything is resolved or written — the position
+        // `AuthorizeClientVpnIngress` answers its own at.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `ClientVpnEndpointId` and `TargetNetworkCidr` are modelled `@required` AND
+        // `@clientOptional`, so a request that left one out reaches this handler with it
+        // empty rather than being refused at the boundary.
+        if input.client_vpn_endpoint_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter clientVpnEndpointId",
+            ));
+        }
+        if input.target_network_cidr.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter targetNetworkCidr",
+            ));
+        }
+
+        // "The ID of the Active Directory group for which to revoke access"
+        // (`$AccessGroupId`) and "Indicates whether access should be revoked for all groups
+        // for a single TargetNetworkCidr that earlier authorized ingress for all groups using
+        // AuthorizeAllGroups. This does not impact other authorization rules that allowed
+        // ingress to the same TargetNetworkCidr with a specific AccessGroupId"
+        // (`$RevokeAllGroups`): a revoke takes off ONE rule, so it names either the group
+        // whose rule it revokes or the all-groups rule — never both, and never neither.
+        let access_group_id = input
+            .access_group_id
+            .as_deref()
+            .filter(|group| !group.is_empty())
+            .map(str::to_string);
+        let revoke_all_groups = input.revoke_all_groups.unwrap_or(false);
+        if revoke_all_groups && access_group_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "You cannot specify both RevokeAllGroups and AccessGroupId",
+            ));
+        }
+        if !revoke_all_groups && access_group_id.is_none() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter accessGroupId",
+            ));
+        }
+
+        // The network the rule covers, read the one way this surface reads a CIDR member and
+        // stored in the canonical spelling of its range — so a revoke resolves the rule an
+        // authorize added however either request spelled the block.
+        let destination_cidr = state::canonical_ipv4_cidr(&input.target_network_cidr)
+            .ok()
+            .filter(|_| state::cidr_block_names_its_range(&input.target_network_cidr))
+            .ok_or_else(|| {
+                state::invalid_parameter_value(format!(
+                    "Value ({requested}) for parameter targetNetworkCidr is invalid. This is \
+                     not a valid CIDR block.",
+                    requested = input.target_network_cidr,
+                ))
+            })?;
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // The endpoint the rule is on, resolved by the ONE lookup every operation taking a
+        // `ClientVpnEndpointId` resolves it through: an id this account holds no endpoint for
+        // is refused as such rather than reported as a rule that is not there.
+        state::require_known_client_vpn_endpoint(&store, &input.client_vpn_endpoint_id)?;
+
+        let key = state::ClientVpnAuthorizationRuleKey {
+            client_vpn_endpoint_id: input.client_vpn_endpoint_id.clone(),
+            destination_cidr: destination_cidr.clone(),
+            group_id: access_group_id.unwrap_or_default(),
+        };
+        // A rule the endpoint does not have is refused rather than reported as revoked: a
+        // caller that revoked the wrong grant has to be told so.
+        let Some(revoked) = store.revoke_client_vpn_authorization_rule(&key) else {
+            return Err(state::client_vpn_authorization_rule_not_found(
+                &destination_cidr,
+                &input.client_vpn_endpoint_id,
+            ));
+        };
+
+        // "The current state of the authorization rule"
+        // (`RevokeClientVpnIngressResult$Status`) is the state the revoke left the rule in,
+        // read off the record this call took out of the store.
+        Ok(RevokeClientVpnIngressOutput {
+            status: revoked.status,
+        })
     }
 }

@@ -856,6 +856,9 @@ impl ComAmazonawsEc2Amazonec2State {
         // `associating` is `associated` once its due instant has passed, whether or not
         // anybody called again — the same contract as a `pending` VPC's move above.
         self.materialize_due_client_vpn_target_networks(now);
+        // A Client VPN endpoint `DeleteClientVpnEndpoint` answered as `deleting` is `deleted`
+        // once its due instant has passed, on the same contract.
+        self.materialize_due_client_vpn_endpoints(now);
         // A route `CreateClientVpnRoute` answered as `creating` is `active` once its due
         // instant has passed, whether or not anybody called again — the same contract as the
         // target network association above.
@@ -864,6 +867,10 @@ impl ComAmazonawsEc2Amazonec2State {
         // `terminated` once its due instant has passed, whether or not anybody called again —
         // the same contract as the route above.
         self.materialize_due_client_vpn_connections(now);
+        // An authorization rule `AuthorizeClientVpnIngress` answered as `authorizing` is
+        // `active` once its due instant has passed, whether or not anybody called again —
+        // the same contract as the client connection above.
+        self.materialize_due_client_vpn_authorization_rules(now);
         // An IPAM pool `CreateIpamPool` answered as `create-in-progress` reaches
         // `create-complete` once its due instant has passed, whether or not anybody called —
         // the same contract as the `pending` VPC above, and the reason the pool's due

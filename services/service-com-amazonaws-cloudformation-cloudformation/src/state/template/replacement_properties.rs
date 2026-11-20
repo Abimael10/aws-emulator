@@ -490,6 +490,26 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
             "TransferAddress",
         ],
         EC2_VPC_ENDPOINT => &["ServiceName", "VpcEndpointType", "VpcId"],
+        // A CLIENT VPN ENDPOINT's three create-only properties: "the address range cannot be
+        // changed after the Client VPN endpoint has been created"
+        // (`CreateClientVpnEndpointRequest$ClientCidrBlock`), and neither the authentication
+        // options an endpoint checks clients against nor the transport protocol a session
+        // speaks is a member of `ModifyClientVpnEndpoint` — the one call that reconfigures an
+        // endpoint that exists — so a declaration restating one asks for a different endpoint.
+        crate::state::provisioner::client_vpn::EC2_CLIENT_VPN_ENDPOINT => {
+            &["AuthenticationOptions", "ClientCidrBlock", "TransportProtocol"]
+        }
+        // An AUTHORIZATION RULE has no updatable property at all: Amazon EC2 publishes no
+        // call that changes a rule that exists — the surface is the authorize that adds one
+        // and the revoke that takes it off — so every property of the type is create-only and
+        // a declaration restating any of them asks for a different rule.
+        crate::state::provisioner::client_vpn::EC2_CLIENT_VPN_AUTHORIZATION_RULE => &[
+            "AccessGroupId",
+            "AuthorizeAllGroups",
+            "ClientVpnEndpointId",
+            "Description",
+            "TargetNetworkCidr",
+        ],
         // An attachment IS the pair of a VPC and a gateway, and its physical id is built from
         // the VPC half ([`vpc_gateway_attachment_identity`]) — so a declaration naming another
         // VPC names a different attachment, while the GATEWAY it puts on that VPC is swapped on

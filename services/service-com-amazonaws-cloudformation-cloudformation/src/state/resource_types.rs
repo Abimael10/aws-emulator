@@ -78,6 +78,9 @@
 //! template to this catalogue would refuse types the expansion would have produced. Such a
 //! template is admitted, and its resources are recorded as declared.
 
+use super::provisioner::client_vpn::{
+    EC2_CLIENT_VPN_AUTHORIZATION_RULE, EC2_CLIENT_VPN_ENDPOINT,
+};
 use super::provisioner::redshift_snapshot_copy_grants::REDSHIFT_SNAPSHOT_COPY_GRANT;
 use super::provisioner::ssm_maintenance_windows::SSM_MAINTENANCE_WINDOW_TARGET;
 use super::template::{
@@ -497,6 +500,11 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::DynamoDB::GlobalTable",
     "AWS::DynamoDB::Table",
     // Amazon EC2
+    // The two Client VPN types are the endpoint AWS Client VPN terminates sessions at and an
+    // ingress authorization rule of one, both created in that service
+    // (`super::provisioner::client_vpn`).
+    EC2_CLIENT_VPN_AUTHORIZATION_RULE,
+    EC2_CLIENT_VPN_ENDPOINT,
     "AWS::EC2::CustomerGateway",
     "AWS::EC2::DHCPOptions",
     "AWS::EC2::EC2Fleet",

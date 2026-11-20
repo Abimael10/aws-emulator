@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AuthorizeClientVpnIngress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AuthorizeClientVpnIngress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds ONE ingress authorization rule to a stored Client VPN endpoint — the
+//! network the request names, granted either to one Active Directory or identity-provider
+//! group or to every client — and answers it `authorizing`, the state a rule sits in until
+//! the clock owes it `active`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AuthorizeClientVpnIngress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +147,209 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AuthorizeClientVpnIngress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AuthorizeClientVpnIngressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AuthorizeClientVpnIngress"))
+        // `ctx` carries request metadata only; the endpoint is named by id and resolved
+        // against the store the engine on `self` holds.
+        let _ = ctx;
+        use crate::state;
+
+        // "Checks whether you have the required permissions for the action, without actually
+        // making the request, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation"
+        // (`AuthorizeClientVpnIngressRequest$DryRun`). That is a PERMISSION check and nothing
+        // else: every caller of this emulator is permitted, so a dry run reports that outcome
+        // FIRST and neither reads nor writes anything — the position `CreateClientVpnRoute`
+        // and `CreateClientVpnEndpoint` answer their own at.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `ClientVpnEndpointId` and `TargetNetworkCidr` are modelled `@required` AND
+        // `@clientOptional`, so a request that left one out reaches this handler with it
+        // empty rather than being refused at the boundary. A parameter the request did not
+        // carry is EC2's `MissingParameter`, reported before anything is resolved.
+        if input.client_vpn_endpoint_id.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter clientVpnEndpointId",
+            ));
+        }
+        if input.target_network_cidr.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter targetNetworkCidr",
+            ));
+        }
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`$ClientToken`). The model puts no `@length` on it and the index
+        // keeps it for the process's lifetime, so the bound this crate holds every client
+        // token to is enforced here.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // "The ID of the group to grant access to … Required if AuthorizeAllGroups is false
+        // or not specified" (`$AccessGroupId`) and "Must be set to true if AccessGroupId is
+        // not specified" (`$AuthorizeAllGroups`): a rule grants access either to ONE group or
+        // to every client, so a request naming both asks for two rules at once and one naming
+        // neither names nobody to grant access to.
+        let access_group_id = input
+            .access_group_id
+            .as_deref()
+            .filter(|group| !group.is_empty())
+            .map(str::to_string);
+        let authorize_all_groups = input.authorize_all_groups.unwrap_or(false);
+        if authorize_all_groups && access_group_id.is_some() {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_combination(
+                "You cannot specify both AuthorizeAllGroups and AccessGroupId",
+            ));
+        }
+        if !authorize_all_groups && access_group_id.is_none() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter accessGroupId",
+            ));
+        }
+
+        // "The IPv4 address range, in CIDR notation, of the network for which access is being
+        // authorized" (`$TargetNetworkCidr`): what a rule covers is a RANGE, so the value has
+        // to be an IPv4 CIDR block that names its own range — a value that is not a block at
+        // all, and one whose host bits are set so that it names an ADDRESS INSIDE a range
+        // instead of the range, are both refused, and refused before anything is looked up.
+        // The block is then stored in the canonical spelling of that range, so the network
+        // identifies ONE rule of the endpoint however the request spelled it — the same
+        // reading `CreateClientVpnRoute` gives its own destination.
+        let destination_cidr = state::canonical_ipv4_cidr(&input.target_network_cidr)
+            .ok()
+            .filter(|_| state::cidr_block_names_its_range(&input.target_network_cidr))
+            .ok_or_else(|| {
+                state::invalid_parameter_value(format!(
+                    "Value ({requested}) for parameter targetNetworkCidr is invalid. This is \
+                     not a valid CIDR block.",
+                    requested = input.target_network_cidr,
+                ))
+            })?;
+
+        let handle = state::require_service_state(&*self.engine)?;
+        let mut store = handle.lock();
+        // A move the clock already owes a record of this store fell due whether or not
+        // anybody called, so those moves are applied before this call reads it.
+        store.materialize_due_transitions();
+
+        // "Adds an ingress authorization rule to a Client VPN endpoint": the endpoint the
+        // rule is added to is resolved by the ONE lookup every operation taking a
+        // `ClientVpnEndpointId` resolves it through, so an id this account holds no endpoint
+        // for is refused the one way this surface refuses it whatever form the value takes.
+        state::require_known_client_vpn_endpoint(&store, &input.client_vpn_endpoint_id)?;
+
+        let description = input
+            .description
+            .as_deref()
+            .filter(|description| !description.is_empty())
+            .map(str::to_string);
+        // What names the rule this request would add: the endpoint, the network and the group
+        // it grants that network to — the empty group being the rule that grants it to all
+        // clients.
+        let key = state::ClientVpnAuthorizationRuleKey {
+            client_vpn_endpoint_id: input.client_vpn_endpoint_id.clone(),
+            destination_cidr: destination_cidr.clone(),
+            group_id: access_group_id.clone().unwrap_or_default(),
+        };
+
+        // Idempotency: one token names the one rule it added, so a replay of the SAME request
+        // reports that rule and adds nothing. Read before the duplicate check, which is what
+        // a replay would otherwise be refused by.
+        let replayed = match input.client_token.as_deref().and_then(|token| {
+            store
+                .client_vpn_authorization_rule_client_tokens
+                .get(token)
+                .cloned()
+        }) {
+            None => None,
+            Some(named) => {
+                let rule = store
+                    .client_vpn_authorization_rule(&named)
+                    .map(|record| record.view.clone());
+                let Some(rule) = rule else {
+                    return Err(state::internal_error(
+                        "a client token names a Client VPN authorization rule that is not stored",
+                    ));
+                };
+                // A token is only idempotent for the REQUEST it was first given with: replayed
+                // with another network, group or description it names a rule the caller did not
+                // ask for, which EC2 refuses rather than answers.
+                if named != key || rule.description != description {
+                    return Err(state::idempotent_parameter_mismatch());
+                }
+                Some(rule)
+            }
+        };
+
+        // One endpoint grants one network to one group once: a second request for the same
+        // pair would make a SECOND rule of one grant, which EC2 refuses rather than storing
+        // twice.
+        if replayed.is_none() && store.client_vpn_authorization_rule(&key).is_some() {
+            return Err(state::client_vpn_duplicate_authorization_rule(
+                &destination_cidr,
+                &input.client_vpn_endpoint_id,
+            ));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of. A
+        // replay stores nothing, so it is charged nothing and clears both gates.
+        if replayed.is_none() && !store.has_client_vpn_authorization_rule_capacity() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "This emulator holds {max} Client VPN authorization rules, which is as \
+                     many as it stores",
+                    max = state::MAX_STORED_RECORDS_PER_STORE,
+                ),
+            ));
+        }
+
+        // The rule that token already added, with the status it has reached by now. Nothing is
+        // written for a replay, and the dry-run caller was answered at the top of this
+        // handler, so from here on the request is one that writes.
+        if let Some(rule) = replayed {
+            return Ok(AuthorizeClientVpnIngressOutput {
+                status: rule.status,
+            });
+        }
+
+        let Some((stored_key, rule)) =
+            store.insert_client_vpn_authorization_rule(state::ClientVpnAuthorizationRuleSpec {
+                client_vpn_endpoint_id: input.client_vpn_endpoint_id.clone(),
+                destination_cidr,
+                group_id: access_group_id,
+                // "Indicates whether the authorization rule grants access to all clients"
+                // (`AuthorizationRule$AccessAll`) — which is what `AuthorizeAllGroups` asked
+                // for, the two members being the same fact on either side of the call.
+                access_all: authorize_all_groups,
+                description,
+            })
+        else {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                "This emulator cannot store another Client VPN authorization rule",
+            ));
+        };
+        // The token is recorded with the rule it added, so a replay of this request reports
+        // that rule instead of adding a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            store
+                .client_vpn_authorization_rule_client_tokens
+                .insert(token.to_string(), stored_key);
+        }
+
+        // "The current state of the authorization rule"
+        // (`AuthorizeClientVpnIngressResult$Status`) is the status the rule was STORED with,
+        // so this call and `DescribeClientVpnAuthorizationRules` cannot drift apart.
+        Ok(AuthorizeClientVpnIngressOutput {
+            status: rule.status,
+        })
     }
 }

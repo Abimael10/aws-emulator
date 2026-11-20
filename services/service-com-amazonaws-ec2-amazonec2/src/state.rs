@@ -2837,6 +2837,16 @@ mod client_vpn_connections;
 
 pub use client_vpn_connections::*;
 
+/// The ingress authorization rules of those endpoints: what names one, the store's record,
+/// the status codes one moves through, the refusals for a rule an endpoint already has and
+/// for one it does not have, and the writers an authorize and a revoke call — in a file of
+/// its own rather than as more lines here, because a rule is a record of its own beside the
+/// endpoint it is on. Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::insert_client_vpn_authorization_rule` like any helper of this module.
+mod client_vpn_authorization_rules;
+
+pub use client_vpn_authorization_rules::*;
+
 /// The IAM roles each ACM certificate is associated with for ACM for Nitro Enclaves: the
 /// store's record, the form of the two ARNs the surface takes, the refusals for a value that
 /// is neither, and the projection every report of an association reads — in a file of their

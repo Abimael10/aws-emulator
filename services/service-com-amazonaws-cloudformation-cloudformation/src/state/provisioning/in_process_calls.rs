@@ -149,11 +149,17 @@ pub(crate) async fn call_query_carrying(
     // An awsQuery error answer is `<ErrorResponse><Error><Code/><Message/></Error>…`, and
     // the code is the one the model's `awsQueryError` trait fixes for that error shape
     // (`NotFoundException` -> `NotFound`), which is what a client branches on.
+    //
+    // The `Action` the body named IS the operation that was refused, so it is stated with the
+    // refusal: that is what says which of a service's resource PROVIDERS made the call, and so
+    // which diagnostic shape the exception its SDK raised carries
+    // ([`sdk_diagnostics::SDK_PROVIDER_SHAPES`]).
     let code = xml_element(&document, "Code")
         .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));
     Err(Refusal {
-        message: sdk_message(
+        message: sdk_message_of(
             signing_name,
+            Some(action),
             status,
             &code,
             &xml_element(&document, "Message").unwrap_or_default(),

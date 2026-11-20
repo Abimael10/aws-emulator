@@ -536,26 +536,45 @@ async fn each_authentication_kind_is_stored_as_it_was_given() {
 // Rule 2: the client CIDR range
 // ---------------------------------------------------------------------------
 
-/// The message AWS words the published size rule with
+/// The messages AWS words each bound of the published size rule with
 /// (`CreateClientVpnEndpointRequest$ClientCidrBlock`: "Client CIDR range must have a size of at
-/// least /22 and must not be greater than /12."), spelled here independently of the handler.
-const CIDR_SIZE_MESSAGE: &str =
-    "Client CIDR range must have a size of at least /22 and must not be greater than /12.";
+/// least /22 and must not be greater than /12."): the sentence names the ONE bound the value
+/// crossed, spelled here independently of the handler.
+const RANGE_TOO_SMALL_MESSAGE: &str = "Client cidr block must be at least a /22 range";
+const RANGE_TOO_LARGE_MESSAGE: &str = "Client cidr block must be at most a /12 range";
 
-/// Both published bounds are accepted, and one past each is refused with AWS's own sentence.
+/// Both published bounds are accepted, and one past each is refused with AWS's own sentence
+/// for that bound.
 #[tokio::test]
 async fn the_client_range_must_be_of_a_published_size() {
-    // Rows span the two published bounds, the sizes between them, and one past each bound.
-    let rows: Vec<(&str, &str, bool)> = vec![
-        ("the smallest published range", "10.0.0.0/22", true),
-        ("a range between the bounds", "10.0.0.0/18", true),
-        ("the largest published range", "10.0.0.0/12", true),
-        ("one size past the small bound", "10.0.0.0/23", false),
-        ("far past the small bound", "10.0.0.0/32", false),
-        ("one size past the large bound", "10.0.0.0/11", false),
-        ("far past the large bound", "0.0.0.0/0", false),
+    // Rows span the two published bounds, the sizes between them, and one past each bound —
+    // with the sentence the refusal names the bound it broke with.
+    let rows: Vec<(&str, &str, Option<&str>)> = vec![
+        ("the smallest published range", "10.0.0.0/22", None),
+        ("a range between the bounds", "10.0.0.0/18", None),
+        ("the largest published range", "10.0.0.0/12", None),
+        (
+            "one size past the small bound",
+            "10.0.0.0/23",
+            Some(RANGE_TOO_SMALL_MESSAGE),
+        ),
+        (
+            "far past the small bound",
+            "10.0.0.0/32",
+            Some(RANGE_TOO_SMALL_MESSAGE),
+        ),
+        (
+            "one size past the large bound",
+            "10.0.0.0/11",
+            Some(RANGE_TOO_LARGE_MESSAGE),
+        ),
+        (
+            "far past the large bound",
+            "0.0.0.0/0",
+            Some(RANGE_TOO_LARGE_MESSAGE),
+        ),
     ];
-    for (case, block, accepted) in rows {
+    for (case, block, refused_with) in rows {
         let router = emulator();
         let server = certificate(&router, case, "vpn.example.com").await;
         let client_root = certificate(&router, case, "clients.example.com").await;
@@ -565,13 +584,13 @@ async fn the_client_range_must_be_of_a_published_size() {
         );
 
         let (status, body) = create(&router, &params).await;
-        if accepted {
+        let Some(expected) = refused_with else {
             assert_eq!(
                 status, 200,
                 "case {case:?}: {block} is a published size, got {status} with body {body}"
             );
             continue;
-        }
+        };
         assert_eq!(
             (status, error_code(&body).as_str()),
             (400, "InvalidParameterValue"),
@@ -580,7 +599,7 @@ async fn the_client_range_must_be_of_a_published_size() {
         );
         assert_eq!(
             error_message(&body),
-            CIDR_SIZE_MESSAGE,
+            expected,
             "case {case:?}: expected AWS's own sentence for {block}, got {:?}",
             error_message(&body)
         );

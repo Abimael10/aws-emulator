@@ -711,6 +711,16 @@ impl Provisioner {
             Self::LakeFormationPermissions(grant) => {
                 describe_lake_formation_permissions(ctx, region, grant, resource).await
             }
+            // Amazon EC2's own read of the Client VPN endpoint, by the id it minted for it.
+            Self::Ec2ClientVpnEndpoint => {
+                describe_client_vpn_endpoint(ctx, region, physical_resource_id).await
+            }
+            // Its own read of the authorization rule, out of the rules it reports for the
+            // endpoint the declaration names — which, with the network, is the only handle
+            // that service publishes for one.
+            Self::Ec2ClientVpnAuthorizationRule => {
+                describe_client_vpn_authorization_rule(ctx, region, resource).await
+            }
         }
     }
 }

@@ -1438,6 +1438,17 @@ pub(crate) fn return_values(
             let id = ec2_network_identity("vol", "VolumeId", name, &mut attributes);
             (id, attributes)
         }
+        // A CLIENT VPN ENDPOINT, whose identity Amazon EC2 assigns the same way again: "Ref
+        // returns the Client VPN endpoint ID" — the `cvpn-endpoint-` + 17 hexadecimal form —
+        // while the type publishes no `Fn::GetAtt` attribute at all, so no attribute is
+        // recorded beside it. The computed id is only the stand-in a declaration is resolved
+        // against before the endpoint exists ([`identity_is_service_assigned`] names the
+        // type); the deployment re-points it at the id that service minted
+        // ([`crate::state::provisioner::client_vpn`]).
+        crate::state::provisioner::client_vpn::EC2_CLIENT_VPN_ENDPOINT => (
+            generated_service_id("cvpn-endpoint", name, EC2_ID_HEX_DIGITS),
+            attributes,
+        ),
         // A LAUNCH TEMPLATE, whose identity Amazon EC2 assigns the same way: "Ref returns the
         // launch template ID" (the `lt-` + 17 hexadecimal form), and whose published
         // `Fn::GetAtt` attributes are that same id and the two VERSION numbers of the

@@ -235,8 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The tags to apply to the Client VPN endpoint during creation"
         // (`CreateClientVpnEndpointRequest$TagSpecifications`) — the shared reader refuses a
         // specification naming any other resource type and holds the payload to the
-        // documented bounds.
-        let tags: Vec<Tag> = state::tags_from_specifications(
+        // documented bounds. A create reached over this emulator's own in-process callback
+        // may set the reserved `aws:` namespace, the same allowance `CreateTags` makes on
+        // that path: the service provisioning the endpoint for a caller is what sets those
+        // tags on it.
+        let tags: Vec<Tag> = state::cross_service_tags_from_specifications(
+            ctx.parts(),
             input.tag_specifications.as_deref(),
             state::RESOURCE_TYPE_CLIENT_VPN_ENDPOINT,
             Self::NAME,
@@ -422,10 +426,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         // "Client CIDR range must have a size of at least /22 and must not be greater than
         // /12" (`CreateClientVpnEndpointRequest$ClientCidrBlock`), which is the one range
-        // [`crate::state::CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS`] holds.
+        // [`crate::state::CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS`] holds. Which BOUND the
+        // value crossed decides the sentence, so the refusal says which way the range is
+        // wrong ([`crate::state::client_vpn_client_cidr_size_refusal`]).
         let prefix_length = state::cidr_block_prefix_length(&client_cidr_block).unwrap_or_default();
         if !state::CLIENT_VPN_CLIENT_CIDR_PREFIX_LENGTHS.contains(&prefix_length) {
-            return Err(state::client_vpn_client_cidr_size_refusal());
+            return Err(state::client_vpn_client_cidr_size_refusal(prefix_length));
         }
 
         // "A Client VPN endpoint can have up to two DNS servers. If no DNS server is
