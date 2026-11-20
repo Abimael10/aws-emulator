@@ -55,6 +55,28 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
         members
     }
 
+    /// Removes the role memberships naming the group
+    /// `(aws_account_id, namespace, member_name)`, across every role of that namespace,
+    /// answering how many went.
+    ///
+    /// A role membership names a group, so it goes when that group does — whichever roles
+    /// held it.
+    pub fn remove_role_memberships_of(
+        &mut self,
+        aws_account_id: &str,
+        namespace: &str,
+        member_name: &str,
+    ) -> usize {
+        let before = self.role_memberships.len();
+        self.role_memberships
+            .retain(|(account, member_namespace, _, member)| {
+                account != aws_account_id
+                    || member_namespace != namespace
+                    || member != member_name
+            });
+        before - self.role_memberships.len()
+    }
+
     /// Removes the role memberships the groups of `(aws_account_id, namespace)` hold,
     /// answering how many went.
     ///

@@ -1,17 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The connection test a data source's create and update settle on, and what a data
-//! set may be built on.
+//! The connection test a data source's create and update settle on, what a data set may
+//! be built on, and the connection target a write must declare before either runs.
 //!
 //! Every case drives the real wire path — `MultiServiceRouter::dispatch` with a signed
 //! request, QuickSight over restJson1 and Athena over awsJson1_1 on the same emulator —
 //! so what is asserted is what an SDK client would see.
 //!
-//! The rule under test: the TERMINAL `ResourceStatus` of a data source is the outcome
-//! of the connection test of the source its `DataSourceParameters` describe. A test
-//! that resolves settles the resource successfully with no `ErrorInfo`; one that names
-//! a resource the owning service does not hold settles it in the failed status of that
-//! write — `CREATION_FAILED` for a create, `UPDATE_FAILED` for an update — carrying
+//! The first rule under test: a write does not register a connection target the service
+//! cannot route to. An address outside the globally routable unicast space is refused
+//! synchronously with `InvalidParameterValueException` naming that address, and nothing
+//! is written — unless the request supplies the VPC connection that reaches it. A target
+//! named by anything but a bare address carries no address to classify.
+//!
+//! The second rule under test: the TERMINAL `ResourceStatus` of a data source is the
+//! outcome of the connection test of the source its `DataSourceParameters` describe. A
+//! test that resolves settles the resource successfully with no `ErrorInfo`; one that
+//! names a resource the owning service does not hold settles it in the failed status of
+//! that write — `CREATION_FAILED` for a create, `UPDATE_FAILED` for an update — carrying
 //! `ErrorInfo` of type `GENERIC_SQL_FAILURE` whose message names what was missing. A
 //! data source in a failed status cannot back a data set, so a physical table naming
 //! one is refused with `InvalidParameterValueException`.
@@ -716,4 +722,406 @@ async fn the_failed_outcome_is_stored_on_the_record() {
             .is_some_and(|message| message.contains("absent-workgroup")),
         "expected the stored message to name the workgroup, got {error_info:?}"
     );
+}
+
+/// The refusal a write whose declared connection target cannot be routed to carries:
+/// fixed text and the address the request submitted, with no trailing period.
+fn unroutable_message(host: &str) -> String {
+    format!("Unable to route to the host address {host}")
+}
+
+/// How many data sources the store holds.
+fn held_data_sources(harness: &Harness) -> usize {
+    let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+    let store = state.lock();
+    store.data_sources.len()
+}
+
+/// The rows of the unroutable-address table: the parameter set carrying the address and
+/// the address it carries.
+///
+/// The addresses span the blocks reserved for something other than global unicast — a
+/// private network, the loopback, the link-local scope, the unspecified address, the
+/// shared (carrier) space, documentation, benchmarking, the reserved top blocks and the
+/// broadcast address, in both address families — and each is carried by a DIFFERENT
+/// `DataSourceParameters` member, since every member that names its target by an address
+/// names it in the same `Host` field. Each row's `Type` is a member of the model's
+/// `DataSourceType` enum.
+/// Source: smithy_query(query="shape", shape="DataSourceParameters") and
+/// smithy_query(query="shape", shape="DataSourceType").
+fn unroutable_rows() -> Vec<(&'static str, &'static str, &'static str, Value)> {
+    vec![
+        (
+            "private-10",
+            "MYSQL",
+            "10.255.255.1",
+            json!({ "MySqlParameters": { "Host": "10.255.255.1", "Port": 3306, "Database": "app" } }),
+        ),
+        (
+            "private-172-16",
+            "POSTGRESQL",
+            "172.16.0.5",
+            json!({ "PostgreSqlParameters": { "Host": "172.16.0.5", "Port": 5432, "Database": "sales" } }),
+        ),
+        (
+            "private-192-168",
+            "AURORA",
+            "192.168.1.10",
+            json!({ "AuroraParameters": { "Host": "192.168.1.10", "Port": 3306, "Database": "app" } }),
+        ),
+        (
+            "loopback",
+            "MARIADB",
+            "127.0.0.1",
+            json!({ "MariaDbParameters": { "Host": "127.0.0.1", "Port": 3306, "Database": "app" } }),
+        ),
+        (
+            "link-local",
+            "ORACLE",
+            "169.254.169.254",
+            json!({ "OracleParameters": { "Host": "169.254.169.254", "Port": 1521, "Database": "orcl" } }),
+        ),
+        (
+            "unspecified",
+            "SQLSERVER",
+            "0.0.0.0",
+            json!({ "SqlServerParameters": { "Host": "0.0.0.0", "Port": 1433, "Database": "app" } }),
+        ),
+        (
+            "shared-carrier-space",
+            "TERADATA",
+            "100.64.0.1",
+            json!({ "TeradataParameters": { "Host": "100.64.0.1", "Port": 1025, "Database": "app" } }),
+        ),
+        (
+            "documentation",
+            "PRESTO",
+            "192.0.2.1",
+            json!({ "PrestoParameters": { "Host": "192.0.2.1", "Port": 8080, "Catalog": "hive" } }),
+        ),
+        (
+            "benchmarking",
+            "SPARK",
+            "198.18.0.1",
+            json!({ "SparkParameters": { "Host": "198.18.0.1", "Port": 10000 } }),
+        ),
+        (
+            "reserved-top-block",
+            "SNOWFLAKE",
+            "240.0.0.1",
+            json!({ "SnowflakeParameters": { "Host": "240.0.0.1", "Database": "app", "Warehouse": "wh" } }),
+        ),
+        (
+            "broadcast",
+            "EXASOL",
+            "255.255.255.255",
+            json!({ "ExasolParameters": { "Host": "255.255.255.255", "Port": 8563 } }),
+        ),
+        (
+            "ipv6-loopback",
+            "TRINO",
+            "::1",
+            json!({ "TrinoParameters": { "Host": "::1", "Port": 8080, "Catalog": "hive" } }),
+        ),
+        (
+            "ipv6-unique-local",
+            "DATABRICKS",
+            "fd00::1",
+            json!({ "DatabricksParameters": { "Host": "fd00::1", "Port": 443, "SqlEndpointPath": "/sql/1.0/wh" } }),
+        ),
+        (
+            "ipv6-link-local",
+            "STARBURST",
+            "fe80::1",
+            json!({ "StarburstParameters": { "Host": "fe80::1", "Port": 443, "Catalog": "hive" } }),
+        ),
+        (
+            "ipv6-documentation",
+            "AURORA_POSTGRESQL",
+            "2001:db8::1",
+            json!({ "AuroraPostgreSqlParameters": { "Host": "2001:db8::1", "Port": 5432, "Database": "app" } }),
+        ),
+        (
+            "optional-host-member",
+            "REDSHIFT",
+            "10.1.2.3",
+            json!({ "RedshiftParameters": { "Host": "10.1.2.3", "Port": 5439, "Database": "dev" } }),
+        ),
+        // The same IPv4 hosts written in IPv6 form name the same hosts, so they are
+        // read the same way: the mapped form, the compatible form and the 6to4 prefix
+        // that tunnels to a private address.
+        (
+            "ipv4-mapped-private",
+            "MYSQL",
+            "::ffff:10.0.0.1",
+            json!({ "MySqlParameters": { "Host": "::ffff:10.0.0.1", "Port": 3306, "Database": "app" } }),
+        ),
+        (
+            "ipv4-compatible-loopback",
+            "POSTGRESQL",
+            "::127.0.0.1",
+            json!({ "PostgreSqlParameters": { "Host": "::127.0.0.1", "Port": 5432, "Database": "sales" } }),
+        ),
+        (
+            "6to4-to-a-private-address",
+            "TERADATA",
+            "2002:a00:1::1",
+            json!({ "TeradataParameters": { "Host": "2002:a00:1::1", "Port": 1025, "Database": "app" } }),
+        ),
+        (
+            "ipv6-discard-only",
+            "SPARK",
+            "100::1",
+            json!({ "SparkParameters": { "Host": "100::1", "Port": 10000 } }),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_create_naming_an_unroutable_address_is_refused_and_registers_nothing() {
+    let harness = Harness::new();
+
+    for (case, kind, host, parameters) in unroutable_rows() {
+        let data_source_id = format!("ds-{case}");
+        let before = held_data_sources(&harness);
+        let (status, body) = create_data_source(
+            &harness,
+            ACCOUNT,
+            json!({
+                "DataSourceId": data_source_id,
+                "Name": data_source_id,
+                "Type": kind,
+                "DataSourceParameters": parameters,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a create naming an address with no route expected 400, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("InvalidParameterValueException"),
+            "case {case:?}: the refused parameter value is what is reported: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(unroutable_message(host)),
+            "case {case:?}: the refusal must name the address the request carried: {body}"
+        );
+        assert!(
+            body["RequestId"]
+                .as_str()
+                .is_some_and(|request_id| !request_id.is_empty()),
+            "case {case:?}: the refusal reported no RequestId: {body}"
+        );
+
+        // The refused create registered nothing, so the id resolves to no data source.
+        assert_eq!(
+            held_data_sources(&harness),
+            before,
+            "case {case:?}: the refused create must write no record"
+        );
+        let (status, body) = describe_data_source(&harness, ACCOUNT, &data_source_id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a data source the refused create did not register expected \
+             404, got {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("ResourceNotFoundException"),
+            "case {case:?}: an id nothing was registered under is not found: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(format!(
+                "DataSource {} is not found",
+                data_source_arn(ACCOUNT, &data_source_id)
+            )),
+            "case {case:?}: the miss must name the data source by its ARN: {body}"
+        );
+        assert_eq!(
+            body["ResourceType"],
+            Value::Null,
+            "case {case:?}: the data-source miss reports no ResourceType: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_target_the_service_can_reach_is_accepted() {
+    let harness = Harness::new();
+
+    // Rows: a target named by a DNS name (nothing here resolves one, so there is no
+    // routing failure to report), one named by a globally routable address in either
+    // family, one named by something that is no address at all, a parameter set that
+    // declares no target, and a private address submitted WITH the VPC connection that
+    // is how a caller reaches a source inside a VPC.
+    let rows: Vec<(&str, &str, Value, Option<Value>)> = vec![
+        (
+            "dns-name",
+            "MYSQL",
+            json!({ "MySqlParameters": { "Host": "db.example.com", "Port": 3306, "Database": "app" } }),
+            None,
+        ),
+        (
+            "public-ipv4",
+            "POSTGRESQL",
+            json!({ "PostgreSqlParameters": { "Host": "8.8.8.8", "Port": 5432, "Database": "sales" } }),
+            None,
+        ),
+        (
+            "public-ipv6",
+            "ORACLE",
+            json!({ "OracleParameters": { "Host": "2606:4700::1111", "Port": 1521, "Database": "orcl" } }),
+            None,
+        ),
+        (
+            "ipv4-mapped-public",
+            "MARIADB",
+            json!({ "MariaDbParameters": { "Host": "::ffff:8.8.8.8", "Port": 3306, "Database": "app" } }),
+            None,
+        ),
+        (
+            "6to4-to-a-public-address",
+            "SQLSERVER",
+            json!({ "SqlServerParameters": { "Host": "2002:808:808::1", "Port": 1433, "Database": "app" } }),
+            None,
+        ),
+        (
+            "target-that-is-not-an-address",
+            "REDSHIFT",
+            json!({ "RedshiftParameters": { "ClusterId": "warehouse-1", "Port": 5439, "Database": "dev" } }),
+            None,
+        ),
+        (
+            "parameters-naming-no-address",
+            "S3",
+            json!({ "S3Parameters": { "ManifestFileLocation": { "Bucket": "b", "Key": "k" } } }),
+            None,
+        ),
+        (
+            "private-address-through-a-vpc-connection",
+            "MYSQL",
+            json!({ "MySqlParameters": { "Host": "10.0.0.7", "Port": 3306, "Database": "app" } }),
+            Some(json!({
+                "VpcConnectionArn":
+                    format!("arn:aws:quicksight:{REGION}:{ACCOUNT}:vpcConnection/vpc-conn-1"),
+            })),
+        ),
+    ];
+
+    for (case, kind, parameters, vpc_connection_properties) in rows {
+        let data_source_id = format!("ds-ok-{case}");
+        let mut request = json!({
+            "DataSourceId": data_source_id,
+            "Name": data_source_id,
+            "Type": kind,
+            "DataSourceParameters": parameters,
+        });
+        if let Some(properties) = vpc_connection_properties {
+            request["VpcConnectionProperties"] = properties;
+        }
+        let (status, body) = create_data_source(&harness, ACCOUNT, request).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: a create the service can route expected 202, got {status} \
+             with {body}"
+        );
+
+        let (status, body) = describe_data_source(&harness, ACCOUNT, &data_source_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the created data source must read back, got {status} with \
+             {body}"
+        );
+        assert_eq!(
+            body["DataSource"]["Arn"],
+            json!(data_source_arn(ACCOUNT, &data_source_id)),
+            "case {case:?}: the read must report the created source: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_update_naming_an_unroutable_address_is_refused_and_changes_nothing() {
+    let harness = Harness::new();
+    let data_source_id = "ds-rehosted";
+    let (status, body) = create_data_source(
+        &harness,
+        ACCOUNT,
+        json!({
+            "DataSourceId": data_source_id,
+            "Name": "rehosted",
+            "Type": "MYSQL",
+            "DataSourceParameters": {
+                "MySqlParameters": { "Host": "db.example.com", "Port": 3306, "Database": "app" }
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 202, "fixture create: got {status} with {body}");
+    harness.settle_data_source(ACCOUNT, data_source_id);
+
+    // An update re-states the target, so it is validated the same way a create is: the
+    // rows are the same classes of address, each submitted to the update.
+    for (case, host, parameters) in [
+        (
+            "private",
+            "10.0.0.9",
+            json!({ "MySqlParameters": { "Host": "10.0.0.9", "Port": 3306, "Database": "app" } }),
+        ),
+        (
+            "loopback",
+            "127.0.0.1",
+            json!({ "MySqlParameters": { "Host": "127.0.0.1", "Port": 3306, "Database": "app" } }),
+        ),
+        (
+            "ipv6-unique-local",
+            "fd00::9",
+            json!({ "MySqlParameters": { "Host": "fd00::9", "Port": 3306, "Database": "app" } }),
+        ),
+    ] {
+        let (status, body) = update_data_source(
+            &harness,
+            ACCOUNT,
+            data_source_id,
+            json!({ "Name": "rehosted", "DataSourceParameters": parameters }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: an update naming an address with no route expected 400, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("InvalidParameterValueException"),
+            "case {case:?}: the refused parameter value is what is reported: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(unroutable_message(host)),
+            "case {case:?}: the refusal must name the address the request carried: {body}"
+        );
+
+        // The refused update left the stored target where it was.
+        let (status, body) = describe_data_source(&harness, ACCOUNT, data_source_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the data source must still read back, got {status} with {body}"
+        );
+        assert_eq!(
+            body["DataSource"]["DataSourceParameters"]["MySqlParameters"]["Host"],
+            json!("db.example.com"),
+            "case {case:?}: the refused update must not change the stored target: {body}"
+        );
+        assert_eq!(
+            body["DataSource"]["Status"],
+            json!(CREATION_SUCCESSFUL),
+            "case {case:?}: the refused update must not move the status: {body}"
+        );
+    }
 }

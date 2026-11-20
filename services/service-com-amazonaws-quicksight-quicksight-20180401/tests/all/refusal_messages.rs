@@ -9,11 +9,12 @@
 //! The rule under test: a refusal reports the resource it is about the way the service
 //! does. A resource addressed by an ARN is named by that ARN — `"<Kind> <arn> already
 //! exists"` when a create collides with it and `"<Kind> <arn> is not found"` when an
-//! operation is keyed on one that is absent, neither ending in a period — with the ARN
-//! assembled from the region the request was signed for and the request's own path
-//! labels; a group, which the identity path serves, is named by its name together with
-//! the account that holds it. The same template serves every operation of a resource,
-//! so the wording does not depend on which call a client made.
+//! operation is keyed on one that is absent, neither ending in a period (a folder's
+//! miss, which the service words its own way, is `"Folder: <arn> not found"`) — with
+//! the ARN assembled from the region the request was signed for and the request's own
+//! path labels; a group, which the identity path serves, is named by its name together
+//! with the account that holds it. The same template serves every operation of a
+//! resource, so the wording does not depend on which call a client made.
 //!
 //! So the rows below vary what the rule generalises over — the resource kind, the
 //! operation that refuses, the account, the region, and the form and length of the id
@@ -372,7 +373,7 @@ async fn a_folder_the_account_holds_none_of_is_not_found_by_its_arn() {
             "case {case:?}: expected ResourceNotFoundException, got {body}"
         );
         let expected = format!(
-            "Folder {} is not found",
+            "Folder: {} not found",
             quicksight_arn(region, account, &format!("folder/{folder_id}"))
         );
         assert_eq!(

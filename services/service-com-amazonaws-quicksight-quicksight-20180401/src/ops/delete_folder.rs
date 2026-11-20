@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteFolder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteFolder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteFolder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deleting a folder removes the stored record the folder reads answer from, so the
+//! next `DescribeFolder` of that id reports the miss every folder operation reports.
+//! The operation deletes an EMPTY folder: a folder another folder of the account still
+//! names among its ancestors holds those folders, so deleting it would leave their
+//! path naming a folder that no longer exists, and it is refused instead.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteFolder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteFolderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteFolder"))
+        // `ctx` carries the region a refusal's ARN is scoped to.
+        let region = crate::state::request_region(ctx.parts());
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteFolderErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The id identifies the folder inside its account, so an id the account holds no
+        // folder under is nothing to delete.
+        let Some(record) = store.folder(&input.aws_account_id, &input.folder_id) else {
+            return Err(DeleteFolderErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::folder_not_found_message(
+                        &region,
+                        &input.aws_account_id,
+                        &input.folder_id,
+                    )),
+                    // `ExceptionResourceType` declares no member for a folder, so this
+                    // refusal reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+        // The response reports the folder that is about to go, read from the record
+        // itself: the ARN it carries is the one its create minted.
+        let arn = record.arn.clone();
+        let folder_id = record.folder_id.clone();
+
+        // Only an empty folder is deleted: the folders nested inside this one are
+        // reached through it, so the precondition this operation states is not met
+        // while it still holds any.
+        if store.folder_has_children(&input.aws_account_id, &arn) {
+            return Err(DeleteFolderErrorModeled::PreconditionNotMetException(
+                PreconditionNotMetException {
+                    message: Some(format!("Folder: {arn} is not empty")),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        store.remove_folder(&input.aws_account_id, &input.folder_id);
+
+        Ok(DeleteFolderOutput {
+            arn: Some(arn),
+            folder_id: Some(folder_id),
+            request_id: Some(request_id),
+            // `Status` is this response's `@httpResponseCode` member, so it IS the
+            // call's HTTP status, which the model binds to 200 for a deletion this call
+            // carried out.
+            status: 200,
+        })
     }
 }

@@ -65,6 +65,25 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
         before - self.group_members.len()
     }
 
+    /// Removes the memberships the group `(aws_account_id, namespace, group_name)`
+    /// holds, answering how many went: a membership is held inside one group, so it goes
+    /// when that group does.
+    pub fn remove_group_members_of(
+        &mut self,
+        aws_account_id: &str,
+        namespace: &str,
+        group_name: &str,
+    ) -> usize {
+        let before = self.group_members.len();
+        self.group_members
+            .retain(|(account, member_namespace, member_group, _), _| {
+                account != aws_account_id
+                    || member_namespace != namespace
+                    || member_group != group_name
+            });
+        before - self.group_members.len()
+    }
+
     /// Removes the memberships naming the user `(aws_account_id, namespace, user_name)`,
     /// answering how many went: a group's members are users, so a user that no longer
     /// exists is a member of nothing.

@@ -11,10 +11,12 @@
 //! defaulting the folder type and the sharing model the model gives defaults for,
 //! nesting the folder under the folder its `ParentFolderArn` names so that its ancestor
 //! path is the parent's path followed by the parent, and refusing a second create of the
-//! same id; `DescribeFolder` answers from that stored record. So the rows below vary what
-//! the rule generalises over (the id's form, whether a name is given and how long it is,
-//! the folder type, the sharing model, the tags and permissions submitted, the nesting
-//! depth and the account) rather than re-running one recorded call.
+//! same id; `DescribeFolder` answers from that stored record, and `DeleteFolder` removes
+//! it — only while it is empty — so that every later read reports the miss. So the rows
+//! below vary what the rule generalises over (the id's form, whether a name is given and
+//! how long it is, the folder type, the sharing model, the tags and permissions
+//! submitted, the nesting depth and the account) rather than re-running one recorded
+//! call.
 //!
 //! The update cases at the end of the suite are the same rule read through a write that
 //! is not the create: an accepted `UpdateFolder` writes the `Name` it submitted to that
@@ -471,7 +473,7 @@ async fn folder_identity_is_the_account_and_the_id() {
         assert_eq!(
             body["Message"],
             json!(format!(
-                "Folder {} is not found",
+                "Folder: {} not found",
                 folder_arn(account, folder_id)
             )),
             "case {case:?}: the refusal must name the folder that was not found by its \
@@ -640,6 +642,171 @@ async fn a_parent_folder_arn_naming_no_folder_is_not_found() {
         body["Folder"]["FolderPath"],
         json!([]),
         "a root-level folder reports the empty ancestor path: {body}"
+    );
+}
+
+/// `DeleteFolder`: `DELETE /accounts/{AwsAccountId}/folders/{FolderId}`.
+/// Source: smithy_query(query="operation", operation="DeleteFolder").
+async fn delete_folder(harness: &Harness, account: &str, folder_id: &str) -> (u16, Value) {
+    harness
+        .call(
+            "DELETE",
+            &format!("/accounts/{account}/folders/{folder_id}"),
+            None,
+        )
+        .await
+}
+
+/// Whether the store still holds the folder `(account, folder_id)`.
+fn holds_folder(harness: &Harness, account: &str, folder_id: &str) -> bool {
+    let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+    let store = state.lock();
+    store.folder(account, folder_id).is_some()
+}
+
+#[tokio::test]
+async fn deleting_a_folder_removes_it_and_every_later_read_reports_the_miss() {
+    let harness = Harness::new();
+
+    // Rows vary what the rule generalises over: the form and length of the `FolderId`
+    // (len 1..2048 over the pattern `^[\w\-]+$`), whether the folder was created with a
+    // name, whether it sits at the root or inside another folder, and the account.
+    // Source: smithy_query(query="operation", operation="DeleteFolder").
+    let nested_parent = "delete-parent";
+    let (status, body) = create_folder(&harness, ACCOUNT, nested_parent, json!({})).await;
+    assert_eq!(
+        status, 200,
+        "the parent of the nested row expected 200, got {status} with {body}"
+    );
+    let rows: Vec<(&str, &str, String, Value)> = vec![
+        (
+            "named-root-folder",
+            ACCOUNT,
+            "reports".to_string(),
+            json!({ "Name": "Reports" }),
+        ),
+        ("unnamed-folder", ACCOUNT, "no_name-1".to_string(), json!({})),
+        (
+            "nested-folder",
+            ACCOUNT,
+            "nested-child".to_string(),
+            json!({ "ParentFolderArn": folder_arn(ACCOUNT, nested_parent) }),
+        ),
+        (
+            "long-id",
+            ACCOUNT,
+            "d".repeat(2048),
+            json!({ "Name": "Long id" }),
+        ),
+        (
+            "another-account",
+            OTHER_ACCOUNT,
+            "reports".to_string(),
+            json!({ "Name": "Reports" }),
+        ),
+    ];
+
+    for (case, account, folder_id, create_body) in &rows {
+        let folder_id = folder_id.as_str();
+        let (status, body) = create_folder(&harness, account, folder_id, create_body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the fixture create expected 200, got {status} with {body}"
+        );
+
+        let (status, body) = delete_folder(&harness, account, folder_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: deleting the folder expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Arn"],
+            json!(folder_arn(account, folder_id)),
+            "case {case:?}: the delete reports the deleted folder's ARN: {body}"
+        );
+        assert_eq!(
+            body["FolderId"],
+            json!(folder_id),
+            "case {case:?}: the delete reports the deleted folder's id: {body}"
+        );
+        assert!(
+            body["RequestId"]
+                .as_str()
+                .is_some_and(|request_id| !request_id.is_empty()),
+            "case {case:?}: the delete reported no RequestId: {body}"
+        );
+        assert!(
+            !holds_folder(&harness, account, folder_id),
+            "case {case:?}: the deleted folder is still in the store"
+        );
+
+        // Reading the deleted folder is the miss every folder read reports, twice over:
+        // the refusal changes nothing.
+        for attempt in ["first-read", "second-read"] {
+            let (status, body) = describe_folder(&harness, account, folder_id).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}/{attempt}: describing a deleted folder expected 404, got \
+                 {status} with {body}"
+            );
+            assert_eq!(
+                body["__type"],
+                json!("ResourceNotFoundException"),
+                "case {case:?}/{attempt}: a deleted folder is not found: {body}"
+            );
+            assert_eq!(
+                body["Message"],
+                json!(format!("Folder: {} not found", folder_arn(account, folder_id))),
+                "case {case:?}/{attempt}: the refusal must name the folder by its ARN: \
+                 {body}"
+            );
+        }
+
+        // A second delete has nothing to delete, so it is the same miss.
+        let (status, body) = delete_folder(&harness, account, folder_id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: deleting a folder twice expected 404, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(format!("Folder: {} not found", folder_arn(account, folder_id))),
+            "case {case:?}: the repeated delete must name the folder by its ARN: {body}"
+        );
+
+        // The id is free again: the create that would have collided now succeeds.
+        let (status, body) = create_folder(&harness, account, folder_id, create_body.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: re-creating the deleted folder expected 200, got {status} \
+             with {body}"
+        );
+    }
+
+    // An id no folder is held under is nothing to delete.
+    for (case, account, folder_id) in [
+        ("never-created", ACCOUNT, "no-such-folder"),
+        ("held-by-another-account-only", "123456789012", "reports"),
+    ] {
+        let (status, body) = delete_folder(&harness, account, folder_id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: deleting a folder that does not exist expected 404, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(format!("Folder: {} not found", folder_arn(account, folder_id))),
+            "case {case:?}: the refusal must name the folder by its ARN: {body}"
+        );
+    }
+
+    // The folders the rows did not delete are still there: one delete removes one
+    // folder.
+    let (status, body) = describe_folder(&harness, ACCOUNT, nested_parent).await;
+    assert_eq!(
+        status, 200,
+        "the parent folder must still answer, got {status} with {body}"
     );
 }
 
@@ -903,6 +1070,76 @@ async fn updating_a_nested_folder_leaves_its_ancestor_path_alone() {
 }
 
 #[tokio::test]
+async fn only_an_empty_folder_is_deleted() {
+    let harness = Harness::new();
+
+    // A chain root -> middle -> leaf: every folder above the leaf holds the ones below
+    // it, so only the leaf is empty.
+    let mut parent: Option<String> = None;
+    for folder_id in ["chain-root", "chain-middle", "chain-leaf"] {
+        let mut body = json!({ "Name": folder_id });
+        if let Some(parent_folder_arn) = &parent {
+            body["ParentFolderArn"] = json!(parent_folder_arn);
+        }
+        let (status, response) = create_folder(&harness, ACCOUNT, folder_id, body).await;
+        assert_eq!(
+            status, 200,
+            "fixture {folder_id:?}: expected 200, got {status} with {response}"
+        );
+        parent = Some(folder_arn(ACCOUNT, folder_id));
+    }
+
+    // Rows: the folder holding a folder directly, and the one holding it two levels
+    // down. Each is refused, and the folder it holds is still there afterwards.
+    for (case, folder_id) in [
+        ("holds-a-folder-two-levels-down", "chain-root"),
+        ("holds-a-folder-directly", "chain-middle"),
+    ] {
+        let (status, body) = delete_folder(&harness, ACCOUNT, folder_id).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: deleting a folder that holds folders expected 400, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("PreconditionNotMetException"),
+            "case {case:?}: only an empty folder is deleted: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(format!(
+                "Folder: {} is not empty",
+                folder_arn(ACCOUNT, folder_id)
+            )),
+            "case {case:?}: the refusal must name the folder that is not empty: {body}"
+        );
+        assert!(
+            holds_folder(&harness, ACCOUNT, folder_id),
+            "case {case:?}: the refused delete must leave the folder where it was"
+        );
+    }
+
+    // The leaf holds nothing, so it goes — and its parent, now empty, goes next.
+    for folder_id in ["chain-leaf", "chain-middle", "chain-root"] {
+        let (status, body) = delete_folder(&harness, ACCOUNT, folder_id).await;
+        assert_eq!(
+            status, 200,
+            "case {folder_id:?}: an empty folder is deleted, got {status} with {body}"
+        );
+    }
+    assert_eq!(
+        {
+            let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+            let store = state.lock();
+            store.folder_count(ACCOUNT)
+        },
+        0,
+        "the whole chain was deleted from the leaf upwards"
+    );
+}
+
+#[tokio::test]
 async fn updating_a_folder_id_no_folder_is_held_under_is_not_found() {
     let harness = Harness::new();
 
@@ -930,10 +1167,7 @@ async fn updating_a_folder_id_no_folder_is_held_under_is_not_found() {
         );
         assert_eq!(
             body["Message"],
-            json!(format!(
-                "Folder {} is not found",
-                folder_arn(account, folder_id)
-            )),
+            json!(format!("Folder: {} not found", folder_arn(account, folder_id))),
             "case {case:?}: the refusal must name the folder that was not found by its \
              ARN: {body}"
         );

@@ -192,6 +192,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let updated_time = crate::state::now_timestamp(now);
 
+        // An update re-states how this data source connects, so the target it declares
+        // is validated exactly as the create validates it: an address no route leaves
+        // the service for is refused before the stored record is touched.
+        if let Some(host) = crate::state::unroutable_host(
+            input.data_source_parameters.as_ref(),
+            input.vpc_connection_properties.as_ref(),
+        ) {
+            return Err(UpdateDataSourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::unroutable_host_message(host)),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
         // An update re-states how this data source connects, so QuickSight tests the
         // connection again and the terminal status of the update IS that test's
         // outcome. The test reads another service's store, so it runs before this

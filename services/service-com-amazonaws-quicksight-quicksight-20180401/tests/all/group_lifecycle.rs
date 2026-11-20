@@ -12,10 +12,11 @@
 //! group — its ARN, its name, the description it was given and the `PrincipalId` that
 //! names it inside its namespace — and `DescribeGroup` answers from that same record. A
 //! name the namespace already holds is refused as an existing resource, and a namespace
-//! the account does not hold is not found. So the rows below vary what the rule
-//! generalises over (the group name's form and length, whether a description is
-//! submitted and how long it is, the namespace, and the account) rather than re-running
-//! one recorded call.
+//! the account does not hold is not found. `DeleteGroup` removes that record together
+//! with what the group held, so every later read of the name reports the miss instead.
+//! So the rows below vary what the rule generalises over (the group name's form and
+//! length, whether a description is submitted and how long it is, the namespace, and the
+//! account) rather than re-running one recorded call.
 //!
 //! The update cases further down are the same rule read through a write that is not the
 //! create: an accepted `UpdateGroup` writes the `Description` it submitted to that
@@ -645,9 +646,14 @@ fn membership_locator(
     )
 }
 
-/// What a group operation reports for a `GroupName` the namespace holds no group under.
+/// What a group operation reports for a `GroupName` the namespace holds no group under:
+/// the sentence stating that no group of that name exists at the address the call named,
+/// closed by the identity path's labelled fields (ending in a period and a space).
 fn group_miss_message(account: &str, namespace: &str, group_name: &str) -> String {
-    format!("Group {group_name} not found in namespace {namespace} in account {account}.")
+    format!(
+        "Group {group_name} does not exist in the namespace {namespace} of account \
+         {account}. AWS account id: {account}, groupName: {group_name}. "
+    )
 }
 
 /// Create [`CUSTOM_NAMESPACE`] under `account` and bring its creation transition forward,
@@ -1886,6 +1892,267 @@ async fn removing_a_group_from_a_role_takes_it_out_of_the_listing() {
     );
 }
 
+/// `DeleteGroup`:
+/// `DELETE /accounts/{AwsAccountId}/namespaces/{Namespace}/groups/{GroupName}`.
+/// Source: smithy_query(query="operation", operation="DeleteGroup").
+async fn delete_group(
+    harness: &Harness,
+    account: &str,
+    namespace: &str,
+    group_name: &str,
+) -> (u16, Value) {
+    harness
+        .call(
+            "DELETE",
+            &format!(
+                "/accounts/{account}/namespaces/{namespace}/groups/{}",
+                group_label(group_name)
+            ),
+            None,
+        )
+        .await
+}
+
+/// Whether the store still holds the group at `(account, namespace, group_name)`.
+fn holds_group(harness: &Harness, account: &str, namespace: &str, group_name: &str) -> bool {
+    let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+    let store = state.lock();
+    store.group(account, namespace, group_name).is_some()
+}
+
+#[tokio::test]
+async fn deleting_a_group_removes_it_and_every_later_read_reports_the_miss() {
+    let harness = Harness::new();
+    create_custom_namespace(&harness, ACCOUNT).await;
+
+    // Rows vary what the rule generalises over: the form and length of the name
+    // (`GroupName` is len 1.. over the pattern `^[\u0020-\u00FF]+$`, so a space and a
+    // non-ASCII letter are both admitted), the namespace the group lives in, and the
+    // account that holds it.
+    // Source: smithy_query(query="shape", shape="GroupName").
+    let long_name = "L".repeat(120);
+    let rows: Vec<(&str, &str, &str, String)> = vec![
+        ("plain-name", ACCOUNT, DEFAULT_NAMESPACE, "Sales".to_string()),
+        (
+            "name-with-a-space",
+            ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "Data Science".to_string(),
+        ),
+        (
+            "non-ascii-name",
+            ACCOUNT,
+            CUSTOM_NAMESPACE,
+            "Groupe Générée".to_string(),
+        ),
+        (
+            "same-name-another-account",
+            OTHER_ACCOUNT,
+            DEFAULT_NAMESPACE,
+            "Sales".to_string(),
+        ),
+        ("long-name", ACCOUNT, DEFAULT_NAMESPACE, long_name),
+    ];
+
+    for (case, account, namespace, group_name) in &rows {
+        let group_name = group_name.as_str();
+        given_group(&harness, case, account, namespace, group_name).await;
+
+        let (status, body) = delete_group(&harness, account, namespace, group_name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: deleting the group expected 200, got {status} with {body}"
+        );
+        assert!(
+            body["RequestId"]
+                .as_str()
+                .is_some_and(|request_id| !request_id.is_empty()),
+            "case {case:?}: the delete reported no RequestId: {body}"
+        );
+        assert!(
+            !holds_group(&harness, account, namespace, group_name),
+            "case {case:?}: the deleted group is still in the store"
+        );
+
+        // Reading the deleted group is the miss every group read reports, and reading it
+        // twice reports it twice: the refusal changes nothing.
+        for attempt in ["first-read", "second-read"] {
+            let (status, body) = describe_group(&harness, account, namespace, group_name).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}/{attempt}: describing a deleted group expected 404, got \
+                 {status} with {body}"
+            );
+            assert_eq!(
+                body["__type"],
+                json!("ResourceNotFoundException"),
+                "case {case:?}/{attempt}: a deleted group is not found: {body}"
+            );
+            assert_eq!(
+                body["Message"],
+                json!(group_miss_message(account, namespace, group_name)),
+                "case {case:?}/{attempt}: the refusal must name what was not found: {body}"
+            );
+            assert_eq!(
+                body["ResourceType"],
+                json!("GROUP"),
+                "case {case:?}/{attempt}: the refusal is about a group: {body}"
+            );
+        }
+
+        // A second delete has nothing to delete, so it is the same miss.
+        let (status, body) = delete_group(&harness, account, namespace, group_name).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: deleting a group twice expected 404, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(group_miss_message(account, namespace, group_name)),
+            "case {case:?}: the repeated delete must name what was not found: {body}"
+        );
+        assert_eq!(
+            body["ResourceType"],
+            json!("GROUP"),
+            "case {case:?}: the repeated delete is about a group: {body}"
+        );
+
+        // The name is free again: the create that collided before the delete succeeds
+        // after it.
+        let (status, body) =
+            create_group(&harness, account, namespace, json!({ "GroupName": group_name })).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: re-creating the deleted group expected 201, got {status} with \
+             {body}"
+        );
+        assert_eq!(
+            body["Group"]["Arn"],
+            json!(group_arn(account, namespace, group_name)),
+            "case {case:?}: the re-created group carries the same ARN: {body}"
+        );
+    }
+
+    // A name no group is held under is nothing to delete, whichever part of the address
+    // is the one that holds no group.
+    let rows: [(&str, &str, &str, &str); 3] = [
+        ("never-created", ACCOUNT, DEFAULT_NAMESPACE, "No Such Group"),
+        (
+            "held-in-another-namespace-only",
+            ACCOUNT,
+            CUSTOM_NAMESPACE,
+            "Sales",
+        ),
+        ("account-that-created-nothing", "123456789012", DEFAULT_NAMESPACE, "Sales"),
+    ];
+    for (case, account, namespace, group_name) in rows {
+        let (status, body) = delete_group(&harness, account, namespace, group_name).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: deleting a group that does not exist expected 404, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(group_miss_message(account, namespace, group_name)),
+            "case {case:?}: the refusal must name what was not found: {body}"
+        );
+    }
+
+    // Deleting one group leaves every other group where it was: the group the first row
+    // re-created is still readable.
+    let (status, body) = describe_group(&harness, ACCOUNT, DEFAULT_NAMESPACE, "Sales").await;
+    assert_eq!(
+        status, 200,
+        "an untouched group must still answer, got {status} with {body}"
+    );
+    assert_eq!(
+        body["Group"]["GroupName"],
+        json!("Sales"),
+        "the untouched group must report its own name: {body}"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_group_takes_its_memberships_and_its_roles_with_it() {
+    let harness = Harness::new();
+    sign_up_for_quicksight_identities(&harness, ACCOUNT).await;
+
+    let doomed = "Doomed Group";
+    let kept = "Kept Group";
+    let member = "analyst";
+    given_user(&harness, "cascade", ACCOUNT, DEFAULT_NAMESPACE, member).await;
+    for group_name in [doomed, kept] {
+        given_group(&harness, "cascade", ACCOUNT, DEFAULT_NAMESPACE, group_name).await;
+        let (status, body) =
+            add_group_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, group_name, member).await;
+        assert_eq!(
+            status, 200,
+            "fixture {group_name:?}: the membership expected 200, got {status} with {body}"
+        );
+        let (status, body) =
+            add_role_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, "ADMIN", group_name).await;
+        assert_eq!(
+            status, 200,
+            "fixture {group_name:?}: the role membership expected 200, got {status} with \
+             {body}"
+        );
+    }
+
+    let (status, body) = delete_group(&harness, ACCOUNT, DEFAULT_NAMESPACE, doomed).await;
+    assert_eq!(
+        status, 200,
+        "deleting the group expected 200, got {status} with {body}"
+    );
+
+    // What the group held is gone with it: the membership it carried is no longer
+    // readable, and the read reports the group it was reached through as missing.
+    let (status, body) =
+        describe_group_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, doomed, member).await;
+    assert_eq!(
+        status, 404,
+        "a membership of a deleted group expected 404, got {status} with {body}"
+    );
+    assert_eq!(
+        body["Message"],
+        json!(group_miss_message(ACCOUNT, DEFAULT_NAMESPACE, doomed)),
+        "the refusal must name the group that is gone: {body}"
+    );
+
+    // And the role no longer holds it, while the other group's membership survives.
+    let (status, body) = list_role_members(&harness, ACCOUNT, DEFAULT_NAMESPACE, "ADMIN", "").await;
+    assert_eq!(
+        status, 200,
+        "listing the role's members expected 200, got {status} with {body}"
+    );
+    assert_eq!(
+        reported_members("after-delete", &body),
+        vec![kept.to_string()],
+        "a deleted group holds no role, and only that group's membership goes: {body}"
+    );
+    assert_eq!(
+        held_memberships(&harness),
+        1,
+        "the memberships of a deleted group go with it, and only those"
+    );
+    assert_eq!(
+        held_role_memberships(&harness),
+        1,
+        "the role memberships naming a deleted group go with it, and only those"
+    );
+    let (status, body) =
+        describe_group_member(&harness, ACCOUNT, DEFAULT_NAMESPACE, kept, member).await;
+    assert_eq!(
+        status, 200,
+        "the other group's membership must survive the deletion, got {status} with {body}"
+    );
+    assert_eq!(
+        body["GroupMember"]["MemberName"],
+        json!(member),
+        "the surviving membership must report its member: {body}"
+    );
+}
+
 /// The descriptions the update rows submit, one per row of [`rows`], so the table varies
 /// what the read-your-write rule generalises over: the shortest and the longest
 /// `GroupDescription` the model admits (len 1..512), a non-ASCII one, one holding
@@ -2145,9 +2412,7 @@ async fn updating_a_group_name_no_namespace_holds_is_not_found() {
         );
         assert_eq!(
             body["Message"],
-            json!(format!(
-                "Group {group_name} not found in namespace {namespace} in account {account}."
-            )),
+            json!(group_miss_message(account, namespace, group_name)),
             "case {case:?}: the refusal must name the group, its namespace and its \
              account: {body}"
         );

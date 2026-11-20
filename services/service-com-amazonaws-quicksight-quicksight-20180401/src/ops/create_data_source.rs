@@ -230,6 +230,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let created_time = crate::state::now_timestamp(now);
 
+        // QuickSight validates the connection target the parameters declare before it
+        // registers anything: an address no route leaves the service for is a parameter
+        // value that is not valid, refused here rather than stored and reported as a
+        // failed connection test afterwards.
+        if let Some(host) = crate::state::unroutable_host(
+            input.data_source_parameters.as_ref(),
+            input.vpc_connection_properties.as_ref(),
+        ) {
+            return Err(CreateDataSourceErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::unroutable_host_message(host)),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
         // QuickSight tests the connection the submitted parameters describe, and the
         // terminal status this data source settles in IS that test's outcome. The test
         // reads another service's store, so it runs before this service's guard is

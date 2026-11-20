@@ -11,6 +11,7 @@
 //! concern of its own, so it lives in [`refusals`] and is re-exported from here.
 
 mod authorization;
+mod connection_target;
 mod connection_test;
 mod external_login;
 mod group_members;
@@ -23,6 +24,7 @@ mod user_deletions;
 mod users;
 
 pub use authorization::*;
+pub use connection_target::*;
 pub use connection_test::*;
 pub use external_login::*;
 pub use group_members::*;
@@ -257,6 +259,28 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
         self.folders
             .get(&(aws_account_id.to_string(), folder_id.to_string()))
             .filter(|record| record.arn == arn)
+    }
+
+    /// Whether any folder of `aws_account_id` sits inside the folder whose ARN is
+    /// `arn` — what makes that folder non-empty.
+    ///
+    /// Nesting is held on the child as its ancestors' ARNs, so a folder holds whatever
+    /// names it among them, at any depth.
+    pub fn folder_has_children(&self, aws_account_id: &str, arn: &str) -> bool {
+        self.folders.iter().any(|((account, _), record)| {
+            account == aws_account_id
+                && record
+                    .ancestor_arns
+                    .iter()
+                    .any(|ancestor_arn| ancestor_arn == arn)
+        })
+    }
+
+    /// Removes the folder `(aws_account_id, folder_id)`, answering the record that went —
+    /// `None`, removing nothing, when the account holds no folder under that id.
+    pub fn remove_folder(&mut self, aws_account_id: &str, folder_id: &str) -> Option<FolderRecord> {
+        self.folders
+            .remove(&(aws_account_id.to_string(), folder_id.to_string()))
     }
 
     /// How many folders `aws_account_id` holds — what [`MAX_FOLDERS_PER_ACCOUNT`] is
@@ -629,6 +653,29 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
             namespace.to_string(),
             group_name.to_string(),
         ))
+    }
+
+    /// Removes the group `(aws_account_id, namespace, group_name)`, answering the record
+    /// that went — `None`, removing nothing, when the namespace holds no group of that
+    /// name.
+    ///
+    /// A group's memberships are held inside the group, so they go with it, and so do the
+    /// role memberships naming it: a role's members are groups, so a group that no longer
+    /// exists holds no role.
+    pub fn remove_group(
+        &mut self,
+        aws_account_id: &str,
+        namespace: &str,
+        group_name: &str,
+    ) -> Option<GroupRecord> {
+        let record = self.groups.remove(&(
+            aws_account_id.to_string(),
+            namespace.to_string(),
+            group_name.to_string(),
+        ))?;
+        self.remove_group_members_of(aws_account_id, namespace, group_name);
+        self.remove_role_memberships_of(aws_account_id, namespace, group_name);
+        Some(record)
     }
 
     /// How many groups `(aws_account_id, namespace)` holds — what

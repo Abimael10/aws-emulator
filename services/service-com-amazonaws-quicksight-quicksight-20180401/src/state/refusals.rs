@@ -7,9 +7,11 @@
 //! template, so the wording a client reads does not depend on which operation it
 //! called. These templates cover the resources this crate holds:
 //!
-//! * a resource addressed by an ARN (a folder, a data source, a data set, a theme)
-//!   is named by that ARN — `"<Kind> <arn> already exists"` for a conflict and
-//!   `"<Kind> <arn> is not found"` for a miss, neither ending in a period;
+//! * a resource addressed by an ARN (a data source, a data set, a theme) is named by
+//!   that ARN — `"<Kind> <arn> already exists"` for a conflict and
+//!   `"<Kind> <arn> is not found"` for a miss, neither ending in a period; a folder,
+//!   whose miss the service words differently, is named by its ARN after a colon —
+//!   `"Folder: <arn> not found"`;
 //! * a namespace, whose create is refused by the status the namespace already holding
 //!   the name is in, is named together with that status and the account it belongs to;
 //! * a group or a user, which QuickSight's identity path serves, is named by its name
@@ -65,9 +67,16 @@ pub fn folder_exists_message(region: &str, aws_account_id: &str, folder_id: &str
 }
 
 /// The miss a folder operation reports for a `FolderId` the account holds no folder
-/// under.
+/// under — the same text whether the call reads the folder or deletes it.
+///
+/// The folder path words its miss its own way: the resource kind, a colon, the ARN and
+/// `" not found"` — not the `"<Kind> <arn> is not found"` the other ARN-addressed
+/// resources report.
 pub fn folder_not_found_message(region: &str, aws_account_id: &str, folder_id: &str) -> String {
-    arn_not_found_message(FOLDER, &folder_arn(region, aws_account_id, folder_id))
+    format!(
+        "{FOLDER}: {} not found",
+        folder_arn(region, aws_account_id, folder_id)
+    )
 }
 
 /// The miss a data-source operation reports for a `DataSourceId` the account holds
@@ -163,14 +172,19 @@ pub fn group_exists_message(group_name: &str, aws_account_id: &str) -> String {
 }
 
 /// The miss a group operation reports for a `GroupName` the namespace holds no group
-/// under — the same text whether the call reads the group or addresses one of its
-/// members through it.
+/// under — the same text whether the call reads the group, deletes it or addresses one
+/// of its members through it.
 ///
-/// A group is reached by its name inside a namespace of an account, so the refusal names
-/// those three: the address the call presented, which it can report whether or not a
-/// group was ever held there.
+/// A group is reached by its name inside a namespace of an account, so the refusal states
+/// that no group of that name exists at that address — the three labels the call
+/// presented, which it can report whether or not a group was ever held there — and then
+/// closes with the identity path's labelled fields.
 pub fn group_not_found_message(aws_account_id: &str, namespace: &str, group_name: &str) -> String {
-    format!("Group {group_name} not found in namespace {namespace} in account {aws_account_id}.")
+    format!(
+        "Group {group_name} does not exist in the namespace {namespace} of account \
+         {aws_account_id}. {}",
+        identity_scope_fields(aws_account_id, &[("groupName", group_name)])
+    )
 }
 
 /// The miss a group-membership read reports for a member the group does not hold: the
