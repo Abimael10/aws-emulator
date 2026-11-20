@@ -1018,6 +1018,113 @@ async fn a_propagated_route_cannot_be_modified() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// One call, one route, however many calls
+// ---------------------------------------------------------------------------
+
+/// The target a route sends traffic to is whatever the LAST modify named, so a route walked
+/// through every target the account holds and back to the one it was stored with carries that
+/// target again — the move round-trips rather than accumulating. And each call moves the ONE
+/// route its destination names: every other route of the same table keeps the target it was
+/// stored with, call after call, whichever destination form names the route being moved.
+#[tokio::test]
+async fn repeated_modifies_round_trip_one_route_and_move_no_other() {
+    let (router, engine, fixtures) = emulator();
+    let route_table_id = fixtures.route_tables[0].clone();
+    let seeded = stored_targets(&engine, &route_table_id);
+
+    // Every target an account's route can take, in turn: each group and each network
+    // interface, including the one the route is already pointing at.
+    let walk = [
+        Target::VirtualInterfaceGroup(0),
+        Target::VirtualInterfaceGroup(1),
+        Target::NetworkInterface(0),
+        Target::NetworkInterface(1),
+    ];
+
+    for row in rows() {
+        let destination = row.destination.key().to_string();
+        // The walk, then the target this row was seeded with: the last move takes the route
+        // home, so the table is back where it started before the next row is walked.
+        let moves: Vec<Target> = walk.iter().copied().chain([row.seeded]).collect();
+
+        for target in moves {
+            let case = format!("{destination} -> {target:?}");
+            let target_id = fixtures.target_id(target);
+            let mut params = vec![param("LocalGatewayRouteTableId", &route_table_id)];
+            params.extend(destination_params(&row.destination));
+            params.push(fixtures.target_param(target));
+            let (status, body) = modify(&router, &params).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with body {body}"
+            );
+
+            // The route this call answers is the one the destination names, carrying the one
+            // target this call named and nothing in the member it does not occupy — whatever
+            // target the previous call left there.
+            assert_member(
+                &case,
+                &body,
+                destination_element(&row.destination),
+                &destination,
+            );
+            assert_member(&case, &body, target.element(), &target_id);
+            let vacated = element(&body, target.other_element());
+            assert_eq!(
+                vacated, None,
+                "case {case:?}: a route reports one target, got {vacated:?} in <{}> too",
+                target.other_element()
+            );
+
+            // The store holds exactly the routes it held, with ONLY the named route moved:
+            // every other destination of this table still points where it was stored.
+            let mut expected = seeded.clone();
+            expected.insert(destination.clone(), fixtures.target_members(target));
+            let stored = stored_targets(&engine, &route_table_id);
+            assert_eq!(
+                stored, expected,
+                "case {case:?}: expected the table to hold {expected:?}, got {stored:?}"
+            );
+        }
+
+        // Home again: the route is member-for-member the route it was seeded as, as the
+        // search of the table reports it, so the moves left nothing behind.
+        let case = format!("{destination} back home");
+        let seeded_id = fixtures.target_id(row.seeded);
+        let reported = search(&router, &case, &route_table_id).await;
+        let route = reported
+            .get(&destination)
+            .unwrap_or_else(|| panic!("case {case:?}: {SEARCH} reported {reported:?}"));
+        for (member, value) in [
+            (destination_element(&row.destination), destination.clone()),
+            (row.seeded.element(), seeded_id.clone()),
+            ("type", TYPE_STATIC.to_string()),
+            ("localGatewayRouteTableId", route_table_id.clone()),
+        ] {
+            assert_eq!(
+                route.get(member).map(String::as_str),
+                Some(value.as_str()),
+                "case {case:?}: expected {member} = {value:?} in the searched route, got \
+                 {route:?}"
+            );
+        }
+        assert_eq!(
+            route.get(row.seeded.other_element()),
+            None,
+            "case {case:?}: the searched route must report one target, got {route:?}"
+        );
+    }
+
+    // And the whole table is back to the targets it was seeded with: a round trip of every
+    // route added, removed and moved nothing.
+    let stored = stored_targets(&engine, &route_table_id);
+    assert_eq!(
+        stored, seeded,
+        "expected every route back at its seeded target {seeded:?}, got {stored:?}"
+    );
+}
+
 /// `DryRun` answers whether the caller MAY make the request and moves nothing — and it is
 /// answered only once the request's own form has been read, so a dry run that names a
 /// malformed id, no destination or no target still gets that refusal instead.
