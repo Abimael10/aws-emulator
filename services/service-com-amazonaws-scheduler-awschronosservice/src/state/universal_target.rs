@@ -246,21 +246,26 @@ impl UniversalCall {
     }
 
     /// The error code the invoked service answers a call this invocation's own
-    /// permissions WITHHOLD with, for an operation whose model declares that error;
-    /// `None` for one that declares none.
+    /// permissions WITHHOLD with.
     ///
     /// A withheld call is never made, so what the schedule reports for it is the refusal
-    /// that service WOULD have answered — and where the invoked operation models an
+    /// that service WOULD have answered. Where the invoked operation models an
     /// access-denied error of its own, that error's code is what its answer names the
-    /// class by (Amazon CloudFront's `AccessDenied`, Amazon SNS's `AuthorizationError`)
-    /// rather than the code AWS's authorization layer uses for a service that models
-    /// none. The error is the invoked operation's own fact, read where this tree states
-    /// those facts ([`integration::Denied`]), so no second reading of them lives here.
-    pub(crate) fn withholding_code(&self) -> Option<&'static str> {
+    /// class by (Amazon CloudFront's `AccessDenied`, Amazon SNS's `AuthorizationError`);
+    /// where it models none, the refusal is AWS's authorization layer's, answered in the
+    /// terms the invoked service's own front door words it in (`AccessDenied` for a
+    /// service whose protocol spells it the Query way, `AccessDeniedException` for one
+    /// that spells it the modern way). Both are facts of the INVOKED operation and of its
+    /// service, read where this tree states them ([`integration::Denied`],
+    /// [`integration::Api::access_denied_code`]), so no second reading of them lives here.
+    pub(crate) fn withholding_code(&self) -> &'static str {
         self.call
             .targets
             .and_then(|targets| targets.denied)
-            .map(|denied| denied.code)
+            .map_or_else(
+                || self.call.api.access_denied_code(),
+                |denied| denied.code,
+            )
     }
 
     /// Make the call, and answer what it came to.
@@ -549,21 +554,22 @@ mod tests {
 
     /// A call this invocation's permissions WITHHOLD is reported under the code the
     /// invoked service would have answered it with: the operation's own modelled
-    /// access-denied error where its model declares one, and nothing of the operation's
-    /// where it declares none — which is what leaves the refusing service's own
-    /// authorization-layer code to answer for it. The rows differ along the invoked
-    /// service and along whether that operation models such an error.
+    /// access-denied error where its model declares one, and the code that service's own
+    /// front door words AWS's authorization refusal in where it declares none. The rows
+    /// differ along the invoked service, along whether that operation models such an
+    /// error, and along which of the two spellings of that refusal — the Query one and the
+    /// modern one — the service answering it uses.
     #[test]
-    fn a_withheld_call_is_reported_under_the_operations_own_access_error() {
+    fn a_withheld_call_is_reported_under_the_code_the_invoked_service_answers() {
         // (case, the target ARN, the request, the code the refusal carries)
-        let rows: [(&str, &str, &str, Option<&str>); 4] = [
+        let rows: [(&str, &str, &str, &str); 5] = [
             (
                 // CloudFront's own model declares `AccessDenied` for every one of these
                 // operations.
                 "an invalidation of a distribution",
                 "arn:aws:scheduler:::aws-sdk:cloudfront:createInvalidation",
                 r#"{"DistributionId":"E1EXAMPLE","InvalidationBatch":{}}"#,
-                Some("AccessDenied"),
+                "AccessDenied",
             ),
             (
                 // `Publish` models `AuthorizationErrorException`, whose query code — the
@@ -571,19 +577,31 @@ mod tests {
                 "a publish to a topic",
                 "arn:aws:scheduler:::aws-sdk:sns:publish",
                 r#"{"TopicArn":"arn:aws:sns:eu-west-2:000000000000:orders","Message":"hi"}"#,
-                Some("AuthorizationError"),
+                "AuthorizationError",
             ),
             (
+                // Amazon SQS models no access error on `SendMessage`, and its own front
+                // door answers such a call under the Query code.
                 "a send to a queue, whose operation models no access error",
                 "arn:aws:scheduler:::aws-sdk:sqs:sendMessage",
                 r#"{"QueueUrl":"https://sqs.eu-west-2.amazonaws.com/000000000000/q","MessageBody":"hi"}"#,
-                None,
+                "AccessDenied",
             ),
             (
+                // Step Functions models none either, and its front door answers the
+                // modern AWS-common code.
                 "a state machine execution, whose operation models none either",
                 "arn:aws:scheduler:::aws-sdk:sfn:startExecution",
                 r#"{"StateMachineArn":"arn:aws:states:eu-west-2:000000000000:stateMachine:n"}"#,
-                None,
+                "AccessDeniedException",
+            ),
+            (
+                // Amazon RDS models none either, and its protocol is a query one, so its
+                // front door answers the Query code.
+                "a stop of a DB instance, whose operation models none either",
+                "arn:aws:scheduler:::aws-sdk:rds:stopDBInstance",
+                r#"{"DBInstanceIdentifier":"orders"}"#,
+                "AccessDenied",
             ),
         ];
         for (case, arn, input, expected) in rows {

@@ -211,13 +211,20 @@ pub(crate) async fn given_execution_role(
     given_execution_role_for(router, case, name, &[queue_arn]).await
 }
 
-/// The same role, granted `sqs:SendMessage` on each of `queues` — none of them for a
-/// role whose permissions allow the schedule nothing at all.
-pub(crate) async fn given_execution_role_for(
+/// A role EventBridge Scheduler may assume, granted each `(action, resource)` pair —
+/// the pair AWS documents for an execution role: a trust policy for the scheduler
+/// service principal, and the permissions the schedule's own calls need.
+///
+/// The ONE builder of such a role this test crate keeps: a schedule's target may be a
+/// queue, a function, a state machine or a universal target naming any API operation, and
+/// what differs between those suites is only which `(action, resource)` pairs the role
+/// holds. `grants` empty is a role carrying no permission at all, which is what an
+/// invocation is then refused by.
+pub(crate) async fn given_execution_role_granting(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
-    queues: &[&str],
+    grants: &[(&str, &str)],
 ) -> String {
     let trust = json!({
         "Version": "2012-10-17",
@@ -246,26 +253,24 @@ pub(crate) async fn given_execution_role_for(
         created.contains(&arn),
         "case {case:?}: expected CreateRole to report the ARN {arn:?}, got {created}"
     );
-    let policy = json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Action": "sqs:SendMessage",
-            "Resource": queues,
-        }],
-    })
-    .to_string();
-    if queues.is_empty() {
+    if grants.is_empty() {
         // A role carrying no permissions at all: there is no statement to write, and
         // what such a role withholds is what the invocation is then refused by.
         return arn;
     }
+    let statements: Vec<Value> = grants
+        .iter()
+        .map(|(action, resource)| {
+            json!({ "Effect": "Allow", "Action": action, "Resource": resource })
+        })
+        .collect();
+    let policy = json!({ "Version": "2012-10-17", "Statement": statements }).to_string();
     let (status, written) = iam(
         router,
         "PutRolePolicy",
         &[
             ("RoleName", name),
-            ("PolicyName", "send-to-target"),
+            ("PolicyName", "invoke-the-target"),
             ("PolicyDocument", &policy),
         ],
     )
@@ -275,6 +280,21 @@ pub(crate) async fn given_execution_role_for(
         "case {case:?}: PutRolePolicy answered {status}: {written}"
     );
     arn
+}
+
+/// The same role, granted `sqs:SendMessage` on each of `queues` — none of them for a
+/// role whose permissions allow the schedule nothing at all.
+pub(crate) async fn given_execution_role_for(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    queues: &[&str],
+) -> String {
+    let grants: Vec<(&str, &str)> = queues
+        .iter()
+        .map(|queue| ("sqs:SendMessage", *queue))
+        .collect();
+    given_execution_role_granting(router, case, name, &grants).await
 }
 
 /// Every message waiting on the queue at `url`, left on it: a row that waits for a

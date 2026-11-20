@@ -30,7 +30,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_scheduler_awschronosservice::state::SCHEDULER_SERVICE_PRINCIPAL;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire_harness::{account_id, encode_label, error_code, error_message};
+use crate::wire_harness::{account_id, encode_label, error_code, error_message, xml_text};
 
 /// The Region every call below is signed for.
 const REGION: &str = "eu-west-2";
@@ -157,15 +157,6 @@ async fn query(
         response.status().as_u16(),
         String::from_utf8_lossy(response.body()).to_string(),
     )
-}
-
-/// The text of the first `<tag>` element of an awsQuery answer.
-fn xml_text(body: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = body.find(&open)? + open.len();
-    let end = body[start..].find(&close)? + start;
-    Some(body[start..end].to_string())
 }
 
 /// An identity-based document holding `statements`.

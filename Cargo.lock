@@ -20016,6 +20016,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-lambda-awsgirapiservice",
+ "service-com-amazonaws-rds-amazonrdsv19",
  "service-com-amazonaws-sfn-awsstepfunctions",
  "service-com-amazonaws-sqs-amazonsqs",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",

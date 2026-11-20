@@ -36,7 +36,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::schedule_invocation::{
-    at_expression_body, iam, peek, seconds_from_now, sqs, POLL_INTERVAL, REGION,
+    at_expression_body, given_execution_role_granting, peek, seconds_from_now, sqs, POLL_INTERVAL,
+    REGION,
 };
 use crate::wire_harness::{account_id, call_in, error_code, error_message};
 
@@ -52,9 +53,6 @@ const OCCURRENCE_IN: u64 = 4;
 /// than that row's own occurrence, so its effect proves the clock has already performed
 /// — or declined — the occurrence under test.
 const SENTINEL_IN: u64 = 9;
-
-/// The scheduler service principal a schedule's execution role must trust.
-const SCHEDULER_PRINCIPAL: &str = "scheduler.amazonaws.com";
 
 /// The emulator: EventBridge Scheduler, the services a universal target's call is made
 /// to, and IAM, on ONE engine — the shape `core/router/src/lib.rs` mounts them in.
@@ -190,61 +188,15 @@ async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (St
 }
 
 /// A role EventBridge Scheduler may assume, granted each `(action, resource)` pair —
-/// the pair AWS documents for an execution role: a trust policy for the scheduler
-/// service principal and the permission the schedule's own call needs.
+/// the pair AWS documents for an execution role — through the ONE builder of such a role
+/// this test crate keeps.
 async fn given_execution_role(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
     grants: &[(&str, &str)],
 ) -> String {
-    let trust = json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Principal": { "Service": SCHEDULER_PRINCIPAL },
-            "Action": "sts:AssumeRole",
-        }],
-    })
-    .to_string();
-    let (status, created) = iam(
-        router,
-        "CreateRole",
-        &[("RoleName", name), ("AssumeRolePolicyDocument", &trust)],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: CreateRole answered {status}: {created}"
-    );
-    let arn = format!("arn:aws:iam::{}:role/{name}", account_id());
-    if grants.is_empty() {
-        // A role carrying no permission at all: there is no statement to write, and
-        // what it withholds is what the invocation is then refused by.
-        return arn;
-    }
-    let statements: Vec<Value> = grants
-        .iter()
-        .map(|(action, resource)| {
-            json!({ "Effect": "Allow", "Action": action, "Resource": resource })
-        })
-        .collect();
-    let policy = json!({ "Version": "2012-10-17", "Statement": statements }).to_string();
-    let (status, written) = iam(
-        router,
-        "PutRolePolicy",
-        &[
-            ("RoleName", name),
-            ("PolicyName", "invoke-the-target"),
-            ("PolicyDocument", &policy),
-        ],
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: PutRolePolicy answered {status}: {written}"
-    );
-    arn
+    given_execution_role_granting(router, case, name, grants).await
 }
 
 /// A schedule called `name` whose one occurrence is `in_seconds` ahead, pointed at the

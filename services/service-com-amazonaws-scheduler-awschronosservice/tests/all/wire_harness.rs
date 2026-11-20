@@ -129,6 +129,21 @@ pub fn encode_label(value: &str) -> String {
     encoded
 }
 
+/// The text of the first `<tag>` element of an `awsQuery` answer, or `None` for an answer
+/// carrying no such element.
+///
+/// The ONE reading of a tag's text this test crate keeps: an `awsQuery` answer is XML, and
+/// three suites read a single element out of one (the role a pass was judged on, the action a
+/// refusal named, the status a DB instance reports), so they share this rather than each
+/// hand-rolling the same two `find`s.
+pub fn xml_text(body: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(body[start..end].to_string())
+}
+
 /// The test clock as seconds since the epoch — the unit restJson1 renders a
 /// `timestamp` member in, so a suite can bracket a server-set date with its own
 /// readings taken around the call that set it.

@@ -1900,6 +1900,44 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
         named: cloudfront::CLOUDFRONT_DISTRIBUTION,
         denied: Some(CLOUDFRONT_ACCESS_DENIED),
     },
+    // `arn:aws:states:::aws-sdk:rds:stopDBInstance` — and the start and the reboot of a
+    // DB instance beside it — act on the INSTANCE their `DBInstanceIdentifier` names,
+    // which is the resource `rds:StopDBInstance` and its sibling actions are taken on
+    // ([`rds::RDS_DB_INSTANCE`]). Each publishes its permission under its own operation
+    // name, so the entry states no action of its own. None of these operations models an
+    // access-denied error (`smithy_query(query="operation",operation="StopDBInstance,
+    // StartDBInstance,RebootDBInstance",model_path="services/
+    // service-com-amazonaws-rds-amazonrdsv19/smithy-model/
+    // com-amazonaws-rds-amazonrdsv19.json")` declares only that service's own faults), so
+    // a refusal of one carries the code its front door answers such a call with
+    // ([`Api::access_denied_code`]) and reaches a `Task` state under Amazon RDS's base SDK
+    // exception. The other operations of that service carry no entry: which resource each
+    // of THEM is taken on is not a fact these sources state, and an access request formed
+    // over a guessed one would refuse calls AWS serves.
+    TargetResource {
+        integration: rds::STOP_DB_INSTANCE_INTEGRATION,
+        action: None,
+        member: rds::DB_INSTANCE_IDENTIFIER_MEMBER,
+        default: None,
+        named: rds::RDS_DB_INSTANCE,
+        denied: None,
+    },
+    TargetResource {
+        integration: rds::START_DB_INSTANCE_INTEGRATION,
+        action: None,
+        member: rds::DB_INSTANCE_IDENTIFIER_MEMBER,
+        default: None,
+        named: rds::RDS_DB_INSTANCE,
+        denied: None,
+    },
+    TargetResource {
+        integration: rds::REBOOT_DB_INSTANCE_INTEGRATION,
+        action: None,
+        member: rds::DB_INSTANCE_IDENTIFIER_MEMBER,
+        default: None,
+        named: rds::RDS_DB_INSTANCE,
+        denied: None,
+    },
 ];
 
 /// The refusal every CloudFront operation this emulator calls models for a call its
@@ -2712,6 +2750,12 @@ fn sdk_or_optimized_api(
     // reading below holds every operation of a REST service to ([`read`]).
     if aws_sdk && service == cloudfront::CLOUDFRONT_API.sdk_token() {
         return Ok(&cloudfront::CLOUDFRONT_API);
+    }
+    // Amazon RDS publishes no optimized integration either, and its FORM protocol binds
+    // every operation it models the same way, so the family's own token reaches each of
+    // them ([`rds::RDS_API`]).
+    if aws_sdk && service == rds::RDS_API.sdk_token() {
+        return Ok(&rds::RDS_API);
     }
     APIS.iter()
         .find(|api| match aws_sdk {
@@ -4282,6 +4326,9 @@ pub use apis::*;
 /// Amazon CloudFront's own wire facts, reached through the AWS SDK integration family
 /// alone.
 mod cloudfront;
+
+/// Amazon RDS's own wire facts, reached through the AWS SDK integration family alone.
+mod rds;
 
 /// The BODY of a call to a service whose protocol carries a payload member as an XML
 /// document.

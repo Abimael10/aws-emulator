@@ -984,13 +984,12 @@ async fn perform(
     };
     if let Some((action, resource)) = access {
         // The code the refusal carries is the one the ANSWERING service names such a
-        // refusal by: for a universal target that is the invoked OPERATION's own, where
-        // its model declares one ([`UniversalCall::withholding_code`]), and otherwise the
-        // code the refused service's authorization layer answers with.
+        // refusal by: for a universal target that is the invoked OPERATION's own, or its
+        // service's own front door's where the operation models none
+        // ([`UniversalCall::withholding_code`]), and for a templated target the code the
+        // refused service's authorization layer answers with.
         let code = match &called {
-            Called::Universal(call) => call
-                .withholding_code()
-                .unwrap_or_else(|| authorization_refusal_code(&action)),
+            Called::Universal(call) => call.withholding_code(),
             Called::Templated(_) => authorization_refusal_code(&action),
         };
         if let Some(failure) = withheld_action(callback, pending, code, &action, &resource).await {
