@@ -34,48 +34,31 @@
 //! value, and one carrying no tag at all — may appear in no answer.
 //!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built —
-//! and the requests driven — on a sized thread. The Application Insights wire is
-//! `crate::applicationinsights_wire`, shared with the other suites of this
-//! service pair.
+//! and the requests driven — on a sized thread. The wires below — the Application
+//! Insights operations, Resource Groups, and the Amazon EC2 and Amazon S3 calls
+//! that build the estate — come from `crate::applicationinsights_wire`, shared
+//! with the other suites of these services.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use aws_emulator_router::{build_router, InMemoryEngine};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::applicationinsights_wire::{resource_groups, Answer, BOOT_STACK_SIZE};
-use crate::query_wire::{element, elements, form_encode};
+use crate::applicationinsights_wire as wire;
+use crate::applicationinsights_wire::{Answer, BOOT_STACK_SIZE};
+use crate::query_wire::element;
 
 /// The Region every request below is signed for, and so the Region the resources,
 /// the groups and the application live in. `us-east-1` is the one Region a
 /// `CreateBucket` needs no `CreateBucketConfiguration` for.
 const REGION: &str = "us-east-1";
 
-/// The EC2 API version an ec2Query body carries.
-const EC2_API_VERSION: &str = "2016-11-15";
-
-/// The AMI the launches below run from, in the long form EC2 issues AMI ids in.
-const AMI: &str = "ami-0123456789abcdef0";
-
-/// The one query type a tag-filtered group is defined by
-/// (`smithy_query(query="shape",shape="QueryType")`).
-const TAG_FILTERS: &str = "TAG_FILTERS_1_0";
-
 /// The `ResourceTypeFilters` value that admits every supported type, which is the
 /// value a query naming no type restriction carries.
-const ALL_SUPPORTED: &str = "AWS::AllSupported";
-
-/// How long a poll keeps looking for the state a call owes. Generous by design:
-/// it bounds nothing a row asserts and nothing here measures elapsed time — it
-/// only stops a broken emulator from hanging, so a loaded host cannot fail it.
-const POLL_DEADLINE: Duration = Duration::from_secs(180);
-
-/// How long a poll waits before looking again.
-const LOOK_AGAIN: Duration = Duration::from_millis(25);
+const ALL_SUPPORTED: &str = wire::ALL_SUPPORTED;
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`,
 /// which is what routes the request and tells the handler its Region; the
@@ -124,28 +107,6 @@ fn dispatch(
     )
 }
 
-/// One Amazon S3 call, as its status and the body it answered.
-fn s3(
-    router: &MultiServiceRouter,
-    runtime: &tokio::runtime::Runtime,
-    method: &str,
-    path: &str,
-    body: &str,
-) -> (u16, String) {
-    dispatch(
-        router,
-        runtime,
-        Wire {
-            signing_name: "s3",
-            method,
-            path,
-            content_type: "application/xml",
-            target: None,
-        },
-        Bytes::from(body.to_string()),
-    )
-}
-
 /// One Amazon EC2 action over its ec2Query wire, which must be served, answered
 /// with its XML body.
 fn ec2(
@@ -154,35 +115,12 @@ fn ec2(
     action: &str,
     params: &[(String, String)],
 ) -> String {
-    let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
-    for (name, value) in params {
-        body.push('&');
-        body.push_str(&form_encode(name));
-        body.push('=');
-        body.push_str(&form_encode(value));
-    }
-    let (status, answered) = dispatch(
-        router,
-        runtime,
-        Wire {
-            signing_name: "ec2",
-            method: "POST",
-            path: "/",
-            content_type: "application/x-www-form-urlencoded",
-            target: None,
-        },
-        Bytes::from(body),
-    );
-    assert_eq!(
-        status, 200,
-        "setup: ec2:{action} must be served, got {status} with {answered}"
-    );
-    answered
+    wire::ec2(router, runtime, REGION, action, params)
 }
 
 /// One form field of an ec2Query body.
 fn param(name: &str, value: &str) -> (String, String) {
-    (name.to_string(), value.to_string())
+    wire::param(name, value)
 }
 
 /// One Amazon SQS call over its awsJson1_0 wire, which must be served, answered
@@ -248,7 +186,7 @@ fn application_insights(
     operation: &str,
     body: Value,
 ) -> Answer {
-    crate::applicationinsights_wire::application_insights(router, runtime, REGION, operation, body)
+    wire::application_insights(router, runtime, REGION, operation, body)
 }
 
 /// A bucket created through Amazon S3's own `CreateBucket`, with `tags` written
@@ -260,32 +198,7 @@ fn bucket(
     name: &str,
     tags: &[(&str, &str)],
 ) -> String {
-    let (status, body) = s3(router, runtime, "PUT", &format!("/{name}"), "");
-    assert_eq!(
-        status, 200,
-        "setup: CreateBucket({name:?}) must succeed, got {status} with {body}"
-    );
-    if !tags.is_empty() {
-        let mut document = String::from("<Tagging><TagSet>");
-        for (key, value) in tags {
-            document.push_str(&format!(
-                "<Tag><Key>{key}</Key><Value>{value}</Value></Tag>"
-            ));
-        }
-        document.push_str("</TagSet></Tagging>");
-        let (status, body) = s3(
-            router,
-            runtime,
-            "PUT",
-            &format!("/{name}?tagging"),
-            &document,
-        );
-        assert_eq!(
-            status, 204,
-            "setup: PutBucketTagging({name:?}) must succeed, got {status} with {body}"
-        );
-    }
-    format!("arn:aws:s3:::{name}")
+    wire::tagged_bucket(router, runtime, REGION, name, tags)
 }
 
 /// One instance launched through Amazon EC2's own `RunInstances`, carrying `tags`
@@ -296,28 +209,7 @@ fn instance(
     runtime: &tokio::runtime::Runtime,
     tags: &[(&str, &str)],
 ) -> (String, String) {
-    let mut params = vec![
-        param("ImageId", AMI),
-        param("MinCount", "1"),
-        param("MaxCount", "1"),
-    ];
-    if !tags.is_empty() {
-        params.push(param("TagSpecification.1.ResourceType", "instance"));
-        for (position, (key, value)) in tags.iter().enumerate() {
-            let index = position + 1;
-            params.push(param(&format!("TagSpecification.1.Tag.{index}.Key"), key));
-            params.push(param(&format!("TagSpecification.1.Tag.{index}.Value"), value));
-        }
-    }
-    let launched = ec2(router, runtime, "RunInstances", &params);
-    let instance_id = element(&launched, "instanceId");
-    (
-        instance_id.clone(),
-        format!(
-            "arn:aws:ec2:{REGION}:{}:instance/{instance_id}",
-            engine::emulator_account_id()
-        ),
-    )
+    wire::launch_instance(router, runtime, REGION, tags)
 }
 
 /// One VPC created through Amazon EC2's own `CreateVpc` and tagged afterwards by
@@ -382,33 +274,12 @@ fn queue(
 }
 
 /// The ARNs of the EBS volumes Amazon EC2 reports as attached to `instance_id`.
-///
-/// Read through EC2's own `DescribeVolumes` with the documented
-/// `attachment.instance-id` filter, so what this suite calls "the instance's
-/// volume" is what the service that owns volumes says it is.
 fn attached_volumes(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
     instance_id: &str,
 ) -> BTreeSet<String> {
-    let described = ec2(
-        router,
-        runtime,
-        "DescribeVolumes",
-        &[
-            param("Filter.1.Name", "attachment.instance-id"),
-            param("Filter.1.Value.1", instance_id),
-        ],
-    );
-    elements(&described, "volumeId")
-        .into_iter()
-        .map(|volume_id| {
-            format!(
-                "arn:aws:ec2:{REGION}:{}:volume/{volume_id}",
-                engine::emulator_account_id()
-            )
-        })
-        .collect()
+    wire::attached_volumes(router, runtime, REGION, instance_id)
 }
 
 /// `POST /groups` — Resource Groups' own `CreateGroup`, for a group DEFINED BY a
@@ -420,27 +291,13 @@ fn create_tag_filtered_group(
     resource_type_filters: &[&str],
     tag_filters: Value,
 ) {
-    let query = json!({
-        "ResourceTypeFilters": resource_type_filters,
-        "TagFilters": tag_filters,
-    });
-    let answer = resource_groups(
+    wire::create_tag_filtered_group(
         router,
         runtime,
         REGION,
-        "/groups",
-        json!({
-            "Name": name,
-            "ResourceQuery": {
-                "Type": TAG_FILTERS,
-                "Query": query.to_string(),
-            },
-        }),
-    );
-    assert_eq!(
-        answer.status, 200,
-        "setup: CreateGroup({name:?}) must succeed, got {} / {:?}",
-        answer.status, answer.body
+        name,
+        resource_type_filters,
+        tag_filters,
     );
 }
 
@@ -450,25 +307,7 @@ fn group_members(
     runtime: &tokio::runtime::Runtime,
     name: &str,
 ) -> BTreeSet<String> {
-    let answer = resource_groups(
-        router,
-        runtime,
-        REGION,
-        "/list-group-resources",
-        json!({ "Group": name }),
-    );
-    assert_eq!(
-        answer.status, 200,
-        "ListGroupResources({name:?}) must be served, got {} / {:?}",
-        answer.status, answer.body
-    );
-    answer.body["Resources"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|item| item["Identifier"]["ResourceArn"].as_str().map(str::to_string))
-        .collect()
+    wire::group_members(router, runtime, REGION, name)
 }
 
 /// The components `ListComponents` reports for the application over `group`.
@@ -477,21 +316,7 @@ fn components(
     runtime: &tokio::runtime::Runtime,
     group: &str,
 ) -> Vec<Value> {
-    let listed = application_insights(
-        router,
-        runtime,
-        "ListComponents",
-        json!({ "ResourceGroupName": group }),
-    );
-    assert_eq!(
-        listed.status, 200,
-        "ListComponents({group:?}) must be served, got {} / {:?}",
-        listed.status, listed.body
-    );
-    listed.body["ApplicationComponentList"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    wire::components(router, runtime, REGION, group)
 }
 
 /// The `ComponentName`s of those components.
@@ -500,10 +325,7 @@ fn component_names(
     runtime: &tokio::runtime::Runtime,
     group: &str,
 ) -> BTreeSet<String> {
-    components(router, runtime, group)
-        .iter()
-        .filter_map(|component| component["ComponentName"].as_str().map(str::to_string))
-        .collect()
+    wire::component_names(router, runtime, REGION, group)
 }
 
 /// The `LifeCycle` `DescribeApplication` reports for the application over `group`.
@@ -536,41 +358,13 @@ fn component_resources(
     group: &str,
     component: &str,
 ) -> BTreeSet<String> {
-    let described = application_insights(
-        router,
-        runtime,
-        "DescribeComponent",
-        json!({ "ResourceGroupName": group, "ComponentName": component }),
-    );
-    assert_eq!(
-        described.status, 200,
-        "DescribeComponent({component:?}) must be served, got {} / {:?}",
-        described.status, described.body
-    );
-    described.body["ResourceList"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|arn| arn.as_str().map(str::to_string))
-        .collect()
+    wire::component_resources(router, runtime, REGION, group, component)
 }
 
-/// Look again until `ready` holds, or until [`POLL_DEADLINE`] passes — the
-/// onboarding a create starts is owed by the clock, so a reader waits for the
-/// CONDITION rather than for a duration.
-fn poll_until(case: &str, what: &str, mut ready: impl FnMut() -> bool) {
-    let since = Instant::now();
-    loop {
-        if ready() {
-            return;
-        }
-        assert!(
-            since.elapsed() < POLL_DEADLINE,
-            "case {case:?}: {what} did not hold while polling"
-        );
-        std::thread::sleep(LOOK_AGAIN);
-    }
+/// Look again until `ready` holds — the onboarding a create starts is owed by the
+/// clock, so a reader waits for the CONDITION rather than for a duration.
+fn poll_until(case: &str, what: &str, ready: impl FnMut() -> bool) {
+    wire::poll_until(case, what, ready);
 }
 
 /// One row of the query table: the group to define, the query that defines it,
