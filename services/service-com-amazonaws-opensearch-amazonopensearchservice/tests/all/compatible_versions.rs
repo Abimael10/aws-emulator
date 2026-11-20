@@ -10,17 +10,23 @@
 //! The tests assert the RULE over sets of inputs rather than one recorded call: the
 //! versions a source version can be upgraded to are the published releases of its own
 //! upgrade LINE that are later than it, plus — from the NEWEST release of that line only
-//! — every release of the line that immediately succeeds it. A line is an engine's major
+//! — every release of the line that immediately succeeds it, less the releases the
+//! service offers no upgrade TO. A line is an engine's major
 //! release, except that the Elasticsearch 7 releases and the OpenSearch 1 releases are
-//! one line, OpenSearch 1.0 being the fork of Elasticsearch 7.10. So an upgrade walks the
-//! minors of a line freely and leaves the line only from its end. So:
+//! one line, OpenSearch 1.0 being the fork of Elasticsearch 7.10. So an upgrade walks a
+//! line towards its end and leaves the line only from that end. So:
 //!
 //! * the unfiltered answer is the published upgrade table: a row per release the
 //!   service still offers an upgrade from — those at or after the published floor that
 //!   have somewhere to go — oldest first, each with the targets the rule gives it;
 //! * an upgrade only goes FORWARDS — no version is among its own targets, every
 //!   target ranks above its source, targets are ascending, and a version's
-//!   same-line targets are exactly the later published releases of that line;
+//!   same-line targets are exactly the later published releases of that line an upgrade
+//!   may land on;
+//! * a release below its line's published DESTINATION FLOOR is passed through rather than
+//!   landed on: it is a source row of the table with targets of its own, and a domain can
+//!   be created on it, but no row targets it and `UpgradeDomain` refuses it — over a table
+//!   of releases spanning both sides of two floors and a line that publishes none;
 //! * crossing a line boundary reaches the NEXT line only, and only from the end of a
 //!   line: a source with later releases of its own line ahead of it reaches those and
 //!   stops, and one at the end of its line reaches the whole of the succeeding line and
@@ -37,12 +43,29 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::domain_lifecycle::{
-    error_code, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
+    error_code, poll_until, string_member, Answer, Emulator, PREFIX, RECORDED_NOT_FOUND_STATUS,
 };
+use super::upgrade_history::upgrade;
 
 /// The oldest release the published upgrade table has a row for — the suite's own
 /// expectation of the floor the service offers an upgrade from.
 const UPGRADE_FLOOR: &str = "Elasticsearch_5.1";
+
+/// The oldest release of a line the service offers an upgrade TO, for each line that
+/// publishes such a floor — the suite's OWN statement of the published destination
+/// floors, so moving one in the handler fails this suite instead of being asserted
+/// against itself. A line with no entry here offers an upgrade to every release it
+/// publishes.
+const DESTINATION_FLOORS: [&str; 2] = ["Elasticsearch_5.6", "Elasticsearch_6.3"];
+
+/// Whether an upgrade may LAND on a release: whether its line publishes no destination
+/// floor, or the release is at or after the floor its line publishes.
+fn is_upgrade_destination(version: &str) -> bool {
+    DESTINATION_FLOORS
+        .iter()
+        .find(|floor| line(floor) == line(version))
+        .is_none_or(|floor| rank(floor) <= rank(version))
+}
 
 /// `GetCompatibleVersions`: `GET /2021-01-01/opensearch/compatibleVersions`, with
 /// `DomainName` as its one `@httpQuery` member.
@@ -152,7 +175,8 @@ fn succeeding_line(of: (u8, u32)) -> Option<(u8, u32)> {
 
 /// The rule, applied to one source version: the later published releases of its own
 /// line, plus — from the newest release of that line only — every release of the line
-/// that immediately succeeds it. Oldest first.
+/// that immediately succeeds it, less the releases an upgrade may not land on
+/// ([`is_upgrade_destination`]). Oldest first.
 fn expected_targets(source_version: &str) -> Vec<String> {
     let source = rank(source_version);
     let source_line = line(source_version);
@@ -163,6 +187,7 @@ fn expected_targets(source_version: &str) -> Vec<String> {
     };
     SUPPORTED_ENGINE_VERSIONS
         .iter()
+        .filter(|candidate| is_upgrade_destination(candidate))
         .filter(|candidate| {
             let candidate_line = line(candidate);
             (candidate_line == source_line && rank(candidate) > source)
@@ -186,8 +211,9 @@ fn expected_sources() -> Vec<String> {
         .collect()
 }
 
-/// Create a domain, optionally at a named engine version, and let the provisioning
-/// span fall due so the record is settled before it is read.
+/// Create a domain, optionally at a named engine version, and wait for the CONDITION its
+/// provisioning owes, so the record is settled before it is read however fast the host
+/// runs.
 async fn settled_domain(emulator: &Emulator, name: &str, engine_version: Option<&str>) {
     let mut body = json!({ "DomainName": name });
     if let Some(version) = engine_version {
@@ -199,7 +225,7 @@ async fn settled_domain(emulator: &Emulator, name: &str, engine_version: Option<
         "case {name} / {engine_version:?}: expected the domain to be created, got {} {:?}",
         created.status, created.body
     );
-    tokio::time::sleep(SETTLE_WAIT).await;
+    super::domain_lifecycle::settled_domain(emulator, name).await;
 }
 
 #[tokio::test]
@@ -318,7 +344,8 @@ async fn targets_only_ever_go_forwards() {
         }
 
         // Within one release line, the targets are exactly the published releases of
-        // that line after the source: no hop is missing and none is invented.
+        // that line after the source an upgrade may land on: no hop is missing and none
+        // is invented.
         let same_line: Vec<String> = targets
             .iter()
             .filter(|target| line(target) == line(&source))
@@ -327,7 +354,9 @@ async fn targets_only_ever_go_forwards() {
         let expected_same_line: Vec<String> = published
             .iter()
             .filter(|candidate| {
-                line(candidate) == line(&source) && rank(candidate) > rank(&source)
+                line(candidate) == line(&source)
+                    && rank(candidate) > rank(&source)
+                    && is_upgrade_destination(candidate)
             })
             .cloned()
             .collect();
@@ -348,7 +377,7 @@ async fn targets_only_ever_go_forwards() {
         let expected_crossed: Vec<String> = match succeeding_line(line(&source)) {
             Some(next) if is_newest_of_line(&source) => published
                 .iter()
-                .filter(|candidate| line(candidate) == next)
+                .filter(|candidate| line(candidate) == next && is_upgrade_destination(candidate))
                 .cloned()
                 .collect(),
             _ => Vec::new(),
@@ -359,21 +388,29 @@ async fn targets_only_ever_go_forwards() {
              and no line beyond it, got {crossed:?}"
         );
 
+        // Every target is a release an upgrade may land on: a release below its line's
+        // published destination floor is passed through, never landed on.
+        for target in &targets {
+            assert!(
+                is_upgrade_destination(target),
+                "case {source} -> {target}: expected a release the service offers an \
+                 upgrade to, got {targets:?}"
+            );
+        }
+
         // Within one line, each listed version's targets are the previous one's minus
         // that version itself — the table is one monotone path, not a set of unrelated
         // answers. The release at the END of a line is where the path leaves it, so it
         // is the one source the step does not hold for.
         if let Some((earlier, earlier_targets)) = previous {
             if line(&earlier) == line(&source) && !is_newest_of_line(&source) {
+                let without_source: Vec<String> = earlier_targets
+                    .iter()
+                    .filter(|target| **target != source)
+                    .cloned()
+                    .collect();
                 assert_eq!(
-                    earlier_targets.first().map(String::as_str),
-                    Some(source.as_str()),
-                    "case {earlier}: expected the next published version first among its \
-                     targets, got {earlier_targets:?}"
-                );
-                assert_eq!(
-                    targets,
-                    earlier_targets[1..].to_vec(),
+                    targets, without_source,
                     "case {earlier} -> {source}: expected the later source's targets to be \
                      the earlier one's minus itself, got {targets:?}"
                 );
@@ -515,5 +552,373 @@ async fn reading_the_table_changes_nothing() {
         domain.engine_version, "Elasticsearch_6.8",
         "case stored engine version: reporting compatible versions upgrades nothing, got {}",
         domain.engine_version
+    );
+}
+
+/// One row of the destination table: a release, whether an upgrade may land on it, and
+/// exactly the versions a domain running it may be upgraded to.
+struct DestinationRow {
+    /// The release a domain runs.
+    version: &'static str,
+    /// Whether an upgrade of another domain may land on it.
+    destination: bool,
+    /// The releases a domain running it may be upgraded to, oldest first.
+    targets: &'static [&'static str],
+}
+
+/// The rows the destination rule is asserted over, written out here rather than computed,
+/// so the expectation is the published relation and not whatever the service derives.
+///
+/// Source: the destination floors the service publishes for its Elasticsearch 5 and
+/// Elasticsearch 6 lines — an upgrade inside the 5 line lands only on that line's final
+/// release, and the 6 line is entered at 6.3 — restated as [`DESTINATION_FLOORS`] above.
+/// The rows differ along what the rule generalises over: a release well below its line's
+/// floor, one immediately below it, the floor itself at the end of its line, the first and
+/// the second release of a line whose floor is ahead of them, a release at a floor, a
+/// release above a floor, and a release of a line that publishes no floor at all.
+const DESTINATION_ROWS: [DestinationRow; 8] = [
+    DestinationRow {
+        version: "Elasticsearch_5.1",
+        destination: false,
+        targets: &["Elasticsearch_5.6"],
+    },
+    DestinationRow {
+        version: "Elasticsearch_5.5",
+        destination: false,
+        targets: &["Elasticsearch_5.6"],
+    },
+    DestinationRow {
+        version: "Elasticsearch_5.6",
+        destination: true,
+        targets: &[
+            "Elasticsearch_6.3",
+            "Elasticsearch_6.4",
+            "Elasticsearch_6.5",
+            "Elasticsearch_6.7",
+            "Elasticsearch_6.8",
+        ],
+    },
+    DestinationRow {
+        version: "Elasticsearch_6.0",
+        destination: false,
+        targets: &[
+            "Elasticsearch_6.3",
+            "Elasticsearch_6.4",
+            "Elasticsearch_6.5",
+            "Elasticsearch_6.7",
+            "Elasticsearch_6.8",
+        ],
+    },
+    DestinationRow {
+        version: "Elasticsearch_6.2",
+        destination: false,
+        targets: &[
+            "Elasticsearch_6.3",
+            "Elasticsearch_6.4",
+            "Elasticsearch_6.5",
+            "Elasticsearch_6.7",
+            "Elasticsearch_6.8",
+        ],
+    },
+    DestinationRow {
+        version: "Elasticsearch_6.3",
+        destination: true,
+        targets: &[
+            "Elasticsearch_6.4",
+            "Elasticsearch_6.5",
+            "Elasticsearch_6.7",
+            "Elasticsearch_6.8",
+        ],
+    },
+    DestinationRow {
+        version: "Elasticsearch_6.7",
+        destination: true,
+        targets: &["Elasticsearch_6.8"],
+    },
+    DestinationRow {
+        version: "OpenSearch_2.9",
+        destination: true,
+        targets: &[
+            "OpenSearch_2.11",
+            "OpenSearch_2.13",
+            "OpenSearch_2.15",
+            "OpenSearch_2.17",
+            "OpenSearch_2.19",
+        ],
+    },
+];
+
+/// One upgrade the rule decides: the release the domain runs, the release asked for, and
+/// whether the service offers that upgrade.
+struct UpgradeRow {
+    source: &'static str,
+    target: &'static str,
+    offered: bool,
+}
+
+/// The upgrades the eligibility side of the destination rule is asserted over.
+///
+/// The rows span a target below its line's floor asked from a release below it too, a
+/// target below the floor of the line the source crosses into, the first landable release
+/// of that line, a target at a floor asked from a release below it, a target above a
+/// floor, a line with no floor at all — where the release immediately after the source is
+/// landable — and the version the domain already runs.
+const UPGRADE_ROWS: [UpgradeRow; 9] = [
+    UpgradeRow {
+        source: "Elasticsearch_5.1",
+        target: "Elasticsearch_5.3",
+        offered: false,
+    },
+    UpgradeRow {
+        source: "Elasticsearch_5.1",
+        target: "Elasticsearch_5.6",
+        offered: true,
+    },
+    UpgradeRow {
+        source: "Elasticsearch_5.6",
+        target: "Elasticsearch_6.0",
+        offered: false,
+    },
+    UpgradeRow {
+        source: "Elasticsearch_5.6",
+        target: "Elasticsearch_6.2",
+        offered: false,
+    },
+    UpgradeRow {
+        source: "Elasticsearch_5.6",
+        target: "Elasticsearch_6.3",
+        offered: true,
+    },
+    UpgradeRow {
+        source: "Elasticsearch_6.0",
+        target: "Elasticsearch_6.2",
+        offered: false,
+    },
+    UpgradeRow {
+        source: "Elasticsearch_6.0",
+        target: "Elasticsearch_6.8",
+        offered: true,
+    },
+    UpgradeRow {
+        source: "OpenSearch_2.9",
+        target: "OpenSearch_2.11",
+        offered: true,
+    },
+    UpgradeRow {
+        source: "OpenSearch_2.9",
+        target: "OpenSearch_2.9",
+        offered: false,
+    },
+];
+
+/// The sentence the service refuses an upgrade it does not offer with: the version the
+/// domain runs and the one asked for, the latter in the service's legacy engine-version
+/// form — an Elasticsearch release without the engine name, an OpenSearch one with it.
+/// Written here rather than taken from the crate, so a change to either fails this suite.
+fn not_supported(source: &str, target: &str) -> String {
+    let stated = target.strip_prefix("Elasticsearch_").unwrap_or(target);
+    format!("Failed to submit upgrade. Upgrade from {source} to {stated} not supported.")
+}
+
+/// The one row the domain-scoped answer reports for `name`, as its targets.
+async fn scoped_targets(emulator: &Emulator, name: &str, case: &str) -> Vec<String> {
+    let answer = compatible(emulator, Some(name)).await;
+    let rows = entries(&answer, case);
+    assert_eq!(
+        rows.len(),
+        1,
+        "case {case}: naming a domain limits the answer to its one version, got {rows:?}"
+    );
+    target_versions(&rows[0], case)
+}
+
+/// The `EngineVersion` the domain `name` reports.
+async fn reported_version(emulator: &Emulator, name: &str, case: &str) -> String {
+    string_member(
+        &emulator.describe(name).await.body["DomainStatus"],
+        "EngineVersion",
+        case,
+    )
+}
+
+#[tokio::test]
+async fn no_published_row_targets_a_release_below_its_lines_destination_floor() {
+    let emulator = Emulator::new();
+    let table = entries(&compatible(&emulator, None).await, "published table");
+
+    let mut targeted: Vec<String> = Vec::new();
+    for entry in &table {
+        let source = string_member(entry, "SourceVersion", "published table");
+        for target in target_versions(entry, &source) {
+            assert!(
+                is_upgrade_destination(&target),
+                "case {source} -> {target}: expected no target below its line's published \
+                 destination floor, got {entry:?}"
+            );
+            targeted.push(target);
+        }
+    }
+
+    // The floor narrows the targets rather than emptying them: every published release an
+    // upgrade may land on that is later than the table's own floor — a release at or below
+    // that floor is reached from no row, since the table has no source below it — is the
+    // target of some row.
+    for release in SUPPORTED_ENGINE_VERSIONS
+        .iter()
+        .filter(|release| is_upgrade_destination(release) && rank(release) > rank(UPGRADE_FLOOR))
+    {
+        assert!(
+            targeted.iter().any(|target| target == release),
+            "case {release}: expected a release an upgrade may land on to be the target of \
+             some row, got {} targets over {} rows",
+            targeted.len(),
+            table.len()
+        );
+    }
+
+    // Both sides of the rule are really exercised: the published set carries releases an
+    // upgrade may land on and releases it may not.
+    let landable = SUPPORTED_ENGINE_VERSIONS
+        .iter()
+        .filter(|release| is_upgrade_destination(release))
+        .count();
+    assert!(
+        landable > 0 && landable < SUPPORTED_ENGINE_VERSIONS.len(),
+        "case the published set: expected both landable and passed-through releases, got \
+         {landable} of {}",
+        SUPPORTED_ENGINE_VERSIONS.len()
+    );
+}
+
+#[tokio::test]
+async fn a_release_an_upgrade_cannot_land_on_is_still_offered_to_run() {
+    let emulator = Emulator::new();
+    let table = entries(&compatible(&emulator, None).await, "published table");
+
+    for (index, row) in DESTINATION_ROWS.iter().enumerate() {
+        let case = row.version;
+        let expected: Vec<String> = row.targets.iter().map(|v| (*v).to_string()).collect();
+
+        // The hand-written row and the rule as this suite states it agree, so neither
+        // statement of the relation drifts from the other.
+        assert_eq!(
+            expected,
+            expected_targets(row.version),
+            "case {case}: expected the row to state the published relation"
+        );
+        assert_eq!(
+            row.destination,
+            is_upgrade_destination(row.version),
+            "case {case}: expected the row to state whether an upgrade may land on it"
+        );
+
+        // It is a SOURCE row of the published table whether or not an upgrade may land on
+        // it, with the targets the rule gives it.
+        let published = table
+            .iter()
+            .find(|entry| string_member(entry, "SourceVersion", case) == row.version)
+            .unwrap_or_else(|| panic!("case {case}: expected the table to carry a row for it"));
+        assert_eq!(
+            target_versions(published, case),
+            expected,
+            "case {case}: expected the published targets of this release, got {published:?}"
+        );
+
+        // And it is a release a domain can be created on and read back: "no upgrade lands
+        // here" is not "this release is not offered".
+        let name = format!("destination-row-{index}");
+        settled_domain(&emulator, &name, Some(row.version)).await;
+        assert_eq!(
+            reported_version(&emulator, &name, case).await,
+            row.version,
+            "case {case}: expected the domain to report the release it was created on"
+        );
+        assert_eq!(
+            scoped_targets(&emulator, &name, case).await,
+            expected,
+            "case {case}: expected the domain-scoped row to publish the same targets as the \
+             table"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_upgrade_is_offered_only_to_a_release_it_may_land_on() {
+    let emulator = Emulator::new();
+
+    // One domain per source release, each reused by every row that starts from it, so a
+    // refused upgrade is also shown to leave the domain where it was.
+    let mut sources: Vec<&str> = UPGRADE_ROWS.iter().map(|row| row.source).collect();
+    sources.dedup();
+    for (index, source) in sources.iter().enumerate() {
+        let name = format!("upgrade-destination-{index}");
+        settled_domain(&emulator, &name, Some(source)).await;
+
+        for row in UPGRADE_ROWS.iter().filter(|row| row.source == *source) {
+            let case = format!("{} -> {}", row.source, row.target);
+            // An eligibility check is the question itself — whether that upgrade is
+            // possible — so it is what the offered and refused rows are asked with.
+            let answer = upgrade(&emulator, &name, row.target, true).await;
+            if row.offered {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case}: expected a target the table publishes to be accepted, got \
+                     {} {:?}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    string_member(&answer.body, "TargetVersion", &case),
+                    row.target,
+                    "case {case}: expected the requested TargetVersion echoed, got {:?}",
+                    answer.body
+                );
+            } else {
+                assert_eq!(
+                    (answer.status, error_code(&answer).as_str()),
+                    (400, "BaseException"),
+                    "case {case}: expected the service's refusal of an upgrade it does not \
+                     offer, got {} {:?}",
+                    answer.status,
+                    answer.body
+                );
+                assert_eq!(
+                    answer.body["message"].as_str(),
+                    Some(not_supported(row.source, row.target).as_str()),
+                    "case {case}: expected the service's wording, got {:?}",
+                    answer.body
+                );
+            }
+            // Either way the check performed nothing: the domain still runs its own
+            // release.
+            assert_eq!(
+                reported_version(&emulator, &name, &case).await,
+                row.source,
+                "case {case}: an eligibility check moves no version"
+            );
+        }
+    }
+
+    // The boundary of the same rule, performed rather than checked: an upgrade to the one
+    // release its line offers lands there, so the published relation is the one the
+    // service acts on.
+    let name = "upgrade-landing";
+    let (source, target) = ("Elasticsearch_5.1", "Elasticsearch_5.6");
+    settled_domain(&emulator, name, Some(source)).await;
+    let started = upgrade(&emulator, name, target, false).await;
+    assert_eq!(
+        started.status, 200,
+        "case {source} -> {target}: expected the upgrade to be accepted, got {} {:?}",
+        started.status, started.body
+    );
+    // Wait for the CONDITION the upgrade owes, never for a stretch of time.
+    let landing = format!("{source} -> {target} landing");
+    poll_until(&landing, || async {
+        reported_version(&emulator, name, &landing).await == target
+    })
+    .await;
+    assert_eq!(
+        scoped_targets(&emulator, name, &landing).await,
+        expected_targets(target),
+        "case {landing}: expected the upgraded domain to report its new version's targets"
     );
 }

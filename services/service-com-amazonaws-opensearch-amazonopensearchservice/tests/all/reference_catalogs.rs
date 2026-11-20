@@ -17,7 +17,8 @@
 //! * an upgrade walks the minors of a release LINE and leaves that line only from its
 //!   END: a source's targets are the later releases of its own line, plus — when it is
 //!   the newest release of that line — every release of the line that immediately
-//!   succeeds it, and nothing further. The Elasticsearch 7 releases and the OpenSearch 1
+//!   succeeds it, and nothing further; less, either way, the releases the service offers
+//!   no upgrade TO. The Elasticsearch 7 releases and the OpenSearch 1
 //!   releases are one line, OpenSearch 1.0 being the fork of Elasticsearch 7.10. The
 //!   table is published from the oldest release an in-place upgrade is offered for;
 //! * the storage limits are the REQUESTED instance type's: the sub-types published for
@@ -39,7 +40,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::{
 };
 
 use super::compatible_versions::{compatible, entries, target_versions};
-use super::domain_lifecycle::{string_member, Emulator, SETTLE_WAIT};
+use super::domain_lifecycle::{settled_domain, string_member, Emulator};
 use super::instance_type_limits::{
     describe_limits, limits_by_role, StorageRow, MAXIMUM_STANDARD_VOLUME_SIZE,
     MINIMUM_VOLUME_SIZE, STORAGE_ROWS,
@@ -74,20 +75,16 @@ struct UpgradeRow {
 /// newest line.
 const UPGRADE_ROWS: [UpgradeRow; 7] = [
     UpgradeRow {
-        // The floor of the published table: an in-place upgrade is offered from here on.
+        // The floor of the published table: an in-place upgrade is offered from here on,
+        // and inside this line it is offered only to the line's final release.
         source: "Elasticsearch_5.1",
-        targets: &[
-            "Elasticsearch_5.3",
-            "Elasticsearch_5.5",
-            "Elasticsearch_5.6",
-        ],
+        targets: &["Elasticsearch_5.6"],
     },
     UpgradeRow {
-        // The end of the Elasticsearch 5 line: the whole of the next line is reachable.
+        // The end of the Elasticsearch 5 line: the next line is reachable from here, from
+        // the oldest release of it an upgrade may land on.
         source: "Elasticsearch_5.6",
         targets: &[
-            "Elasticsearch_6.0",
-            "Elasticsearch_6.2",
             "Elasticsearch_6.3",
             "Elasticsearch_6.4",
             "Elasticsearch_6.5",
@@ -313,7 +310,7 @@ async fn the_upgrade_table_leaves_a_release_line_only_from_its_end() {
             "case {}: expected a domain on that release, got {} {:?}",
             row.source, created.status, created.body
         );
-        tokio::time::sleep(SETTLE_WAIT).await;
+        settled_domain(&emulator, &name).await;
         let filtered = entries(&compatible(&emulator, Some(&name)).await, row.source);
         assert_eq!(
             filtered.len(),

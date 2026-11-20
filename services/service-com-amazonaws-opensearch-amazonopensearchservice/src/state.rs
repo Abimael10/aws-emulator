@@ -465,18 +465,57 @@ fn is_newest_of_upgrade_line(source_version: &str) -> bool {
     })
 }
 
+/// The oldest release of an upgrade line the service offers an upgrade TO, for each line
+/// that publishes such a floor.
+///
+/// Running a release and being upgraded TO it are two different things a line publishes: a
+/// release below its line's floor is one [`SUPPORTED_ENGINE_VERSIONS`] still offers — a
+/// domain can be created on it and upgraded FROM it — while an upgrade of another domain
+/// lands on the floor or later, never on it. So the service publishes an upgrade inside
+/// the Elasticsearch 5 line only to that line's final release, and publishes the
+/// Elasticsearch 6 line as entered at 6.3; a line with no row here offers an upgrade to
+/// every release it publishes, which is the ABSENCE of a floor rather than a floor naming
+/// that line's oldest release.
+///
+/// The model carries no record of which releases an upgrade is offered to — `VersionString`
+/// constrains the spelling of a version and nothing else — so this is the set the SERVICE
+/// publishes, stated once here for both readers of the relation: the published upgrade
+/// table and `UpgradeDomain`'s eligibility check.
+const UPGRADE_DESTINATION_FLOORS: [&str; 2] = ["Elasticsearch_5.6", "Elasticsearch_6.3"];
+
+/// Whether the service offers an upgrade TO `engine_version` — whether it is a release an
+/// upgrade may LAND on, which is what makes it a target of the published table.
+///
+/// It is one when its upgrade line publishes no destination floor at all, or when it is at
+/// or after the floor its own line publishes ([`UPGRADE_DESTINATION_FLOORS`]). A value with
+/// no place in the upgrade order names no release, so no upgrade lands on it.
+pub fn offers_upgrade_to(engine_version: &str) -> bool {
+    let Some(rank) = upgrade_rank(engine_version) else {
+        return false;
+    };
+    let Some(line) = upgrade_line(engine_version) else {
+        return false;
+    };
+    UPGRADE_DESTINATION_FLOORS
+        .iter()
+        .find(|floor| upgrade_line(floor) == Some(line))
+        .is_none_or(|floor| upgrade_rank(floor) <= Some(rank))
+}
+
 /// The versions a domain running `source_version` can be upgraded to, oldest first:
 /// every published release of its OWN upgrade line strictly later than it, plus — from
 /// the NEWEST release of that line only — every published release of the line that
-/// immediately succeeds it.
+/// immediately succeeds it, less the releases the service offers no upgrade TO
+/// ([`offers_upgrade_to`]).
 ///
-/// So an upgrade walks the minors of a line freely and leaves the line only from its end:
-/// a domain in the middle of a line reaches the end of that line but not past it, and the
-/// release at the end reaches the whole of the next line and nothing beyond it. It only
-/// ever goes forwards, so a version is never among its own targets and a release at the
-/// end of the newest line has none. The answer is derived from [`upgrade_rank`]'s
-/// comparison rather than from the source being published, so a domain running a version
-/// this emulator does not publish still reports the published versions ahead of it.
+/// So an upgrade walks a line towards its end and leaves the line only from that end: a
+/// domain in the middle of a line reaches the releases of that line an upgrade may land on
+/// but nothing past it, and the release at the end reaches the landable releases of the
+/// next line and nothing beyond those. It only ever goes forwards, so a version is never
+/// among its own targets and a release at the end of the newest line has none. The answer
+/// is derived from [`upgrade_rank`]'s comparison rather than from the source being
+/// published, so a domain running a version this emulator does not publish still reports
+/// the published versions ahead of it.
 pub fn compatible_target_versions(source_version: &str) -> Vec<String> {
     let Some(source) = upgrade_rank(source_version) else {
         return Vec::new();
@@ -495,6 +534,11 @@ pub fn compatible_target_versions(source_version: &str) -> Vec<String> {
             let Some(rank) = upgrade_rank(candidate) else {
                 return false;
             };
+            // A release the service offers no upgrade to is passed THROUGH on the way
+            // along a line, never landed on, so it is a target of no row.
+            if !offers_upgrade_to(candidate) {
+                return false;
+            }
             let candidate_line = upgrade_line(candidate);
             (candidate_line == Some(line) && rank > source)
                 || (next_line.is_some() && candidate_line == next_line)
