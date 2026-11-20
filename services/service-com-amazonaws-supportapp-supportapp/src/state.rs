@@ -431,6 +431,16 @@ const NOTIFICATION_FLAG_PARAMETERS: [&str; 3] = [
     "NotifyOnResolveCase",
 ];
 
+/// The `NotificationSeverityLevel` value that asks for notifications on no case at
+/// all, as the wire spells it (one of
+/// [`crate::ops::types::NOTIFICATION_SEVERITY_LEVEL_VALUES`]).
+///
+/// It is the severity ONE clause of the documented `notifyOnCaseSeverity` rule is
+/// keyed to, so every operation that judges whether that clause applies to its
+/// request names the value from here rather than spelling it again (see
+/// [`notification_rule_violation`]).
+pub const NOTIFICATION_SEVERITY_NONE: &str = "none";
+
 /// A Support App `ValidationException` message: service prose that names the
 /// operation whose request was refused, states the rule the request broke, and asks
 /// the caller to retry.
@@ -748,14 +758,19 @@ impl NotificationFlags {
 ///   will carry once the write lands (create applies its documented default of
 ///   `false` to an absent flag, update keeps the stored value, as that member's note
 ///   states for an unspecified parameter).
-/// * with `none`, the UPDATE request narrows the clause to "any of the following
+/// * with `none`, the UPDATE request words the clause over the REQUEST, both in its
+///   antecedent and in its scope: "If you specify `none`, any of the following
 ///   parameters **that you specify in your request** must be `false`"
 ///   (`smithy_query(query="doc",shape="UpdateSlackChannelConfigurationRequest",member="notifyOnCaseSeverity")`),
-///   so it reads `in_scope_for_none`: only the flags the request itself carried. The
-///   CREATE request words the same clause over the whole configuration ("the
-///   following parameters must be null or false") because a create has no prior
-///   values to keep — and there both scopes are the same set, since an unspecified
-///   flag is created `false`.
+///   so it reads `in_scope_for_none`: `Some` of the flags the request itself carried
+///   when the request itself carried that severity, and `None` when it did not — a
+///   request that specifies no severity keeps the stored one ("If you don't specify
+///   these parameters in your request, the Amazon Web Services Support App uses the
+///   current values by default") and says nothing this clause constrains. The CREATE
+///   request words the same clause over the whole configuration ("the following
+///   parameters must be null or false") because a create has no prior values to keep
+///   — and there both scopes are the same set, since the request always carries the
+///   severity and an unspecified flag is created `false`.
 ///
 /// The message RESTATES that documented rule in service prose through
 /// [`invalid_request_message`], so the operation that was called is named and the
@@ -765,7 +780,7 @@ pub fn notification_rule_violation(
     operation: &str,
     severity: &str,
     will_hold: NotificationFlags,
-    in_scope_for_none: NotificationFlags,
+    in_scope_for_none: Option<NotificationFlags>,
 ) -> Option<String> {
     let [create_or_reopen, add_correspondence, resolve] = NOTIFICATION_FLAG_PARAMETERS;
     let rule = match severity {
@@ -774,10 +789,12 @@ pub fn notification_rule_violation(
              one of the following parameters: {create_or_reopen}, {add_correspondence} \
              or {resolve}."
         ),
-        "none" if in_scope_for_none.any_set() => format!(
-            "If NotifyOnCaseSeverity is none, the following parameters must be null \
-             or false: {create_or_reopen}, {add_correspondence} or {resolve}."
-        ),
+        NOTIFICATION_SEVERITY_NONE if in_scope_for_none.is_some_and(|flags| flags.any_set()) => {
+            format!(
+                "If NotifyOnCaseSeverity is none, the following parameters must be null \
+                 or false: {create_or_reopen}, {add_correspondence} or {resolve}."
+            )
+        }
         _ => return None,
     };
     Some(invalid_request_message(operation, &rule))

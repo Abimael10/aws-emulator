@@ -11,9 +11,11 @@
 //!   over the configuration, which with the member's own note ("If you don't specify
 //!   these parameters in your request, the Amazon Web Services Support App uses the
 //!   current values by default") is the record the update leaves behind.
-//! * `none`: "any of the following parameters **that you specify in your request**
-//!   must be false" — worded over the request, so a flag the request does not carry is
-//!   not constrained by it at all and simply keeps its stored value.
+//! * `none`: "If you specify none, any of the following parameters **that you specify
+//!   in your request** must be false" — worded over the request throughout, so it
+//!   applies only to a request that itself specifies that severity, and then only to
+//!   the flags that same request carries: a member the request does not carry keeps its
+//!   stored value and is not constrained by the clause at all.
 //!
 //! The input space of that rule is FINITE and small, so this suite sweeps it WHOLE
 //! rather than sampling it: every stored fixture below, times every severity an update
@@ -103,8 +105,9 @@ impl Fixture {
 
 /// Whether the documented rule refuses this update, computed from the two clauses the
 /// model words on the UPDATE request — the `all`/`high` clause over the record the
-/// update would leave behind, the `none` clause over only the flags the request
-/// carries.
+/// update would leave behind, the `none` clause over the request itself: only a
+/// request that specifies that severity meets its antecedent ("If you specify none"),
+/// and then only the flags that request carries are in its scope.
 fn refusal_expected(
     stored: &Fixture,
     severity: Option<&str>,
@@ -114,7 +117,7 @@ fn refusal_expected(
     let will_hold = merged_flags(stored, requested);
     match effective_severity {
         "high" | "all" => !will_hold.contains(&true),
-        "none" => requested.contains(&Some(true)),
+        "none" => severity == Some("none") && requested.contains(&Some(true)),
         _ => false,
     }
 }

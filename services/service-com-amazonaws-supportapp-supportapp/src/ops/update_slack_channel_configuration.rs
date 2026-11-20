@@ -9,9 +9,11 @@
 //! The documented `notifyOnCaseSeverity` consistency rule is enforced here with each
 //! of its clauses over the scope THIS request's wording gives it: the `all`/`high`
 //! clause over the configuration the update would leave behind, and the `none` clause
-//! over only the notification flags the request itself specifies — a flag the request
-//! omits keeps its current value and is not something the request says, so it is not
-//! constrained. See `crate::state::notification_rule_violation`.
+//! over the request itself — it applies only to a request that specifies that
+//! severity, and then reads only the notification flags that same request specifies,
+//! because a member the request omits keeps its current value and is not something the
+//! request says, so it is not constrained. See
+//! `crate::state::notification_rule_violation`.
 //!
 //! The `channelName` this request carries declares a `.`-based `@pattern`, which the
 //! request boundary's constraint walk cannot apply in full — see
@@ -311,13 +313,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The flags this request CARRIES, before the merge below consumes them: the
-        // scope the update's own `none` clause is worded over.
-        let requested_flags = crate::state::NotificationFlags::new(
-            input.notify_on_create_or_reopen_case,
-            input.notify_on_add_correspondence_to_case,
-            input.notify_on_resolve_case,
-        );
+        // The flags this request CARRIES, and only when this request also CARRIES the
+        // severity that clause names: the whole scope the update's `none` clause is
+        // worded over is the request itself — "If you specify none, any of the
+        // following parameters that you specify in your request must be false" — so a
+        // request that specifies no severity keeps the stored one and says nothing
+        // that clause constrains. Read before the merge below consumes the members.
+        let requested_flags_for_none_clause = (input.notify_on_case_severity.as_deref()
+            == Some(crate::state::NOTIFICATION_SEVERITY_NONE))
+        .then(|| {
+            crate::state::NotificationFlags::new(
+                input.notify_on_create_or_reopen_case,
+                input.notify_on_add_correspondence_to_case,
+                input.notify_on_resolve_case,
+            )
+        });
 
         // "If you don't specify these parameters in your request, the Amazon Web
         // Services Support App uses the current values by default"
@@ -346,9 +356,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The severity/flag combination rule documented on `notifyOnCaseSeverity`,
         // each clause over the scope the UPDATE request words it with: the `all`/`high`
         // clause over the configuration this update would leave behind, and the `none`
-        // clause over the flags the request itself specifies — a flag the request does
-        // not carry keeps its current value and is not something this request says, so
-        // it is not constrained.
+        // clause over the request itself — it applies only to a request that specifies
+        // that severity, and then reads only the flags that same request specifies,
+        // since a member the request does not carry keeps its current value and is not
+        // something this request says.
         if let Some(message) = crate::state::notification_rule_violation(
             Self::NAME,
             &merged.notify_on_case_severity,
@@ -357,7 +368,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 merged.notify_on_add_correspondence_to_case,
                 merged.notify_on_resolve_case,
             ),
-            requested_flags,
+            requested_flags_for_none_clause,
         ) {
             return Err(UpdateSlackChannelConfigurationErrorModeled::ValidationException(
                 ValidationException {

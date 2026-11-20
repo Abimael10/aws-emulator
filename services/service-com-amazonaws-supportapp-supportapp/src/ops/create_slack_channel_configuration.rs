@@ -272,9 +272,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The same values are what the severity/flag combination rule documented on
         // `notifyOnCaseSeverity` is evaluated over. The model cannot express that rule,
         // so the boundary validator passed it. Both clauses read the same set of values
-        // here: this request carries the WHOLE configuration, and a flag it does not
-        // carry is created `false`, which is what the `none` clause admits as "null or
-        // false".
+        // here: this request carries the WHOLE configuration — the severity among it,
+        // which is why the `none` clause's scope is present (`Some`) on every create —
+        // and a flag it does not carry is created `false`, which is what the `none`
+        // clause admits as "null or false".
         let flags = crate::state::NotificationFlags::new(
             input.notify_on_create_or_reopen_case,
             input.notify_on_add_correspondence_to_case,
@@ -284,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Self::NAME,
             &input.notify_on_case_severity,
             flags,
-            flags,
+            Some(flags),
         ) {
             return Err(CreateSlackChannelConfigurationErrorModeled::ValidationException(
                 ValidationException {
