@@ -141,6 +141,12 @@ pub const MODEL_ARCHIVE_ENTRY: &str = "model.json";
 /// `s3://bucket-name/keynameprefix/model.tar.gz`").
 pub const MODEL_ARCHIVE_OBJECT: &str = "model.tar.gz";
 
+/// The OTHER object a training job's output location holds: the archive of everything the
+/// job's own run wrote beside the model it fitted — what the SageMaker Developer Guide calls
+/// the output data, written to the same `<S3OutputPath>/<TrainingJobName>/output/` prefix as
+/// the model archive. It is the object the recorded service's `TrainingJobOutput` names.
+pub const OUTPUT_ARCHIVE_OBJECT: &str = "output.tar.gz";
+
 /// The `S3DataType` whose `S3Uri` "identifies an object that is a manifest file containing a
 /// list of object keys that you want SageMaker to use for model training"
 /// (`S3DataSource$S3DataType`). Every other value identifies a key name prefix, which is how

@@ -175,6 +175,54 @@ pub fn resolved_image_digest<Eng: Send + Sync + 'static>(
     registry_image_digest(engine, ctx, image).unwrap_or_else(|| derived_image_digest(image))
 }
 
+/// The `DeployedImage` the container image reference `image` is REPORTED as, once the
+/// resource holding it has resolved the image: the path as specified, that path at the
+/// digest it resolves to, and the instant the resolution was made.
+///
+/// `DeployedImage`'s own members state each part: `SpecifiedImage` is "The image path you
+/// specified when you created the model", `ResolvedImage` is "The specific digest path of the
+/// image hosted in this `ProductionVariant`" — the `registry/repository[@digest]` form of the
+/// same reference ([`super::image_at_digest`]) — and `ResolutionTime` is "The date and time
+/// when the image path for the model resolved to the `ResolvedImage`"
+/// (`smithy_query(query="shape",shape="DeployedImage")`).
+///
+/// Resolved on the WRITE path that records the reference, at the instant `at`, so every
+/// reader replays one resolution: an image pushed to the same tag afterwards does not change
+/// what an already-created resource reports, and no read changes what a later caller sees.
+#[must_use]
+pub fn deployed_image<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    image: &str,
+    at: ::std::time::SystemTime,
+) -> crate::ops::types::DeployedImage {
+    let digest = resolved_image_digest(engine, ctx, image);
+    crate::ops::types::DeployedImage {
+        specified_image: Some(image.to_string()),
+        resolved_image: Some(super::image_at_digest(image, &digest)),
+        resolution_time: Some(super::timestamp(at)),
+    }
+}
+
+/// The images a MODEL deploys, as every variant hosting that model reports them: one
+/// [`deployed_image`] per container of the model, the primary container first and then the
+/// additional ones, in the order the model was created with.
+///
+/// A container that names no image path deploys none, so it contributes no entry.
+#[must_use]
+pub fn deployed_model_images<'container, Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    containers: impl IntoIterator<Item = &'container crate::ops::types::ContainerDefinition>,
+    at: ::std::time::SystemTime,
+) -> Vec<crate::ops::types::DeployedImage> {
+    containers
+        .into_iter()
+        .filter_map(|container| container.image.as_deref())
+        .map(|image| deployed_image(engine, ctx, image, at))
+        .collect()
+}
+
 /// Fill in what SageMaker itself resolves for one container of an inference
 /// specification: the digest of the image the container names ([`resolved_image_digest`],
 /// which leaves a digest the request itself carried alone), and whether its model data

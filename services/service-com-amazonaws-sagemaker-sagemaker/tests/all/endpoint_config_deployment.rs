@@ -180,9 +180,16 @@ fn assert_running(case: &str, label: &str, asked: &Value, reported: Option<&Valu
             .and_then(Value::as_str)
             .expect("a variant name");
         let got = summary_of(reported, name);
+        // "The number of instances associated with the variant" (`TaskCount`, `@range min
+        // 0`) is reported for every variant of a created endpoint: the instances it
+        // provisions, and zero for a variant that provisions none.
         assert_eq!(
-            got.get("CurrentInstanceCount"),
-            want.get("InitialInstanceCount"),
+            got.get("CurrentInstanceCount").and_then(Value::as_i64),
+            Some(
+                want.get("InitialInstanceCount")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0)
+            ),
             "case {case:?}: {label}/{name} CurrentInstanceCount, got {got}"
         );
         assert_eq!(

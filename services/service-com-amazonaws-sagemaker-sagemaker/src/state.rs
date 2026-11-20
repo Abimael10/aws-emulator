@@ -183,7 +183,7 @@ pub use s3_access::{
 /// handler names them as `crate::state::…` like every other slice.
 pub mod container_image;
 pub use container_image::{
-    first_image_outside_the_documented_formats, first_malformed_container_image,
+    first_image_outside_the_documented_formats, first_malformed_container_image, image_at_digest,
     image_names_no_registry, malformed_container_image, pinned_image_digest,
     reportable_image_digest, INVALID_IMAGE_PATH,
 };
@@ -194,9 +194,9 @@ pub use container_image::{
 /// `crate::state::…` like every other slice.
 pub mod image_digest;
 pub use image_digest::{
-    derived_image_digest, materialise_additional_inference_specifications,
-    materialise_inference_specification, materialise_training_specification,
-    registry_image_digest, resolved_image_digest,
+    deployed_image, deployed_model_images, derived_image_digest,
+    materialise_additional_inference_specifications, materialise_inference_specification,
+    materialise_training_specification, registry_image_digest, resolved_image_digest,
 };
 
 /// The AWS-PUBLISHED CONTAINER REGISTRY slice: the Amazon ECR registries AWS itself publishes
@@ -1531,12 +1531,20 @@ pub fn version_key(version: &str) -> (u32, u32, u32) {
 }
 
 /// A model created by `CreateModel`, as `DescribeModel` and `ListModels` replay it.
+///
+/// `deployed_images` is the image of each of its containers as the hosting resources report
+/// it — the path specified, that path at the digest it resolved to and the instant of that
+/// resolution ([`deployed_model_images`]). Resolved ONCE, by the create that registered the
+/// model, because `DeployedImage` reports "The image path you specified when you created the
+/// model": an image pushed to the same tag afterwards does not change what an endpoint
+/// already hosting this model is serving.
 #[derive(Debug, Clone)]
 pub struct Model {
     pub name: String,
     pub arn: String,
     pub primary_container: Option<ContainerDefinition>,
     pub containers: Option<Vec<ContainerDefinition>>,
+    pub deployed_images: Vec<crate::ops::types::DeployedImage>,
     pub inference_execution_config: Option<InferenceExecutionConfig>,
     pub execution_role_arn: Option<String>,
     pub vpc_config: Option<VpcConfig>,

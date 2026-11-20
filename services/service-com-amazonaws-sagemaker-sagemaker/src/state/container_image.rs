@@ -110,6 +110,28 @@ pub fn pinned_image_digest(image: &str) -> Option<&str> {
     reportable_image_digest(digest).then_some(digest)
 }
 
+/// The reference `image` names once it is RESOLVED to the content digest `digest`: the
+/// `registry/repository[@digest]` form of the same image.
+///
+/// `DeployedImage` states the rule in so many words: "If you used the
+/// `registry/repository[:tag]` form to specify the image path … the path resolves to a path
+/// of the form `registry/repository[@digest]`"
+/// (`smithy_query(query="shape",shape="DeployedImage")`). So whatever the reference pinned
+/// the image by — a tag, a digest, or nothing at all — the resolved path is the repository
+/// it names at the digest it resolved to.
+///
+/// The tag or digest suffix belongs to the LAST path component, so a registry host carrying
+/// a port (`registry.example.com:5000/inference:1`) keeps its port: only the component after
+/// the final `/` is cut.
+#[must_use]
+pub fn image_at_digest(image: &str, digest: &str) -> String {
+    let component = image.rfind('/').map_or(0, |slash| slash + 1);
+    let repository = image[component..]
+        .find(['@', ':'])
+        .map_or(image.len(), |suffix| component + suffix);
+    format!("{}@{digest}", &image[..repository])
+}
+
 /// Whether `image` is NOT a reference an image registry can resolve: a value outside the
 /// published grammar ([`IMAGE_REFERENCE_PATTERN`]).
 ///
@@ -176,7 +198,60 @@ pub const INVALID_IMAGE_PATH: &str = "Provided image is not a valid ECR image.";
 
 #[cfg(test)]
 mod tests {
-    use super::{malformed_container_image, pinned_image_digest};
+    use super::{image_at_digest, malformed_container_image, pinned_image_digest};
+
+    /// RULE: a reference RESOLVED to a digest is the repository it names at that digest —
+    /// the documented `registry/repository[@digest]` form — whatever the reference pinned
+    /// the image by.
+    ///
+    /// The rows span what that generalises over: a tag, no suffix, a digest already pinned,
+    /// a registry with a port, a namespaced repository and a bare one.
+    #[test]
+    fn a_resolved_reference_names_the_repository_at_its_digest() {
+        let sha = format!("sha256:{}", "8ebddbc1".repeat(8));
+        let other = format!("sha256:{}", "0123abcd".repeat(8));
+        // (case, the reference, the digest it resolved to, the resolved path)
+        let rows: Vec<(&str, String, &String, String)> = vec![
+            (
+                "a tagged ECR path",
+                "000000000000.dkr.ecr.us-east-1.amazonaws.com/xgboost:1".to_string(),
+                &sha,
+                format!("000000000000.dkr.ecr.us-east-1.amazonaws.com/xgboost@{sha}"),
+            ),
+            (
+                "no tag at all",
+                "000000000000.dkr.ecr.us-east-1.amazonaws.com/xgboost".to_string(),
+                &sha,
+                format!("000000000000.dkr.ecr.us-east-1.amazonaws.com/xgboost@{sha}"),
+            ),
+            (
+                "a digest already pinned",
+                format!("000000000000.dkr.ecr.us-east-1.amazonaws.com/xgboost@{other}"),
+                &other,
+                format!("000000000000.dkr.ecr.us-east-1.amazonaws.com/xgboost@{other}"),
+            ),
+            (
+                "a registry with a port",
+                "registry.example.com:5000/team/inference:v1.2".to_string(),
+                &sha,
+                format!("registry.example.com:5000/team/inference@{sha}"),
+            ),
+            (
+                "a bare repository",
+                "inference:latest".to_string(),
+                &sha,
+                format!("inference@{sha}"),
+            ),
+        ];
+
+        for (case, image, digest, expected) in rows {
+            let resolved = image_at_digest(&image, digest);
+            assert_eq!(
+                resolved, expected,
+                "case {case:?}: expected {expected:?} for {image:?}, got {resolved:?}"
+            );
+        }
+    }
 
     /// RULE: a reference in the documented `registry/repository[@digest]` format names the
     /// image by the digest it pins, and one that pins no digest a member can carry names

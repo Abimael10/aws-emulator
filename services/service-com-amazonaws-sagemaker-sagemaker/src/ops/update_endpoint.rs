@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .endpoints
             .get(&input.endpoint_name)
             .ok_or_else(endpoint_missing)?
-            .planned_update(&config, retained, now);
+            .planned_update(&config, retained, now, &store.models);
 
         // The new fleet is stood up while the old one keeps serving, so its instances are
         // taken on top of what the account already hosts. Past a per-instance-type hosting

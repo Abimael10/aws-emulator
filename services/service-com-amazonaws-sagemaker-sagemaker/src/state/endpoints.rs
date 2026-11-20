@@ -82,6 +82,15 @@ pub struct EndpointUpdate {
     pub config_name: String,
     pub production_variants: Vec<ProductionVariant>,
     pub shadow_production_variants: Option<Vec<ProductionVariant>>,
+    /// The images each PRODUCTION variant this deployment stands up deploys, keyed by
+    /// variant name and snapshotted with the variants themselves
+    /// ([`deployed_variant_images`]), so the fleet that starts serving reports the images the
+    /// deployment resolved.
+    pub deployed_images: BTreeMap<String, Vec<crate::ops::types::DeployedImage>>,
+    /// The same for the SHADOW variants, kept apart from the production ones: a variant name
+    /// identifies a variant within ONE fleet, so a shadow variant sharing a name with a
+    /// production variant hosts its own model and deploys its own images.
+    pub shadow_deployed_images: BTreeMap<String, Vec<crate::ops::types::DeployedImage>>,
     pub data_capture_config: Option<DataCaptureConfig>,
     pub async_inference_config: Option<AsyncInferenceConfig>,
     pub explainer_config: Option<ExplainerConfig>,
@@ -173,24 +182,44 @@ pub fn retained_variants(
 }
 
 /// The variant summaries an endpoint reports, derived from the configuration's stored
-/// `ProductionVariant`s.
+/// `ProductionVariant`s and the images each variant's model deploys
+/// ([`deployed_variant_images`], keyed by variant name).
 ///
 /// `CurrentWeight`/`DesiredWeight` come from `InitialVariantWeight`, whose model doc
 /// says "If unspecified, it defaults to 1.0"; the instance counts come from
 /// `InitialInstanceCount`, and a serverless variant reports its serverless config
 /// instead of a count.
 ///
+/// `CurrentInstanceCount` is "The number of instances associated with the variant"
+/// (`TaskCount`, `@range min 0`), which every variant of a created endpoint has a number
+/// for: the instances its configuration provisions, and zero for a variant that provisions
+/// none — a serverless one holds no instances rather than an unknown number of them.
+/// `DesiredInstanceCount` is "The number of instances requested in the
+/// `UpdateEndpointWeightsAndCapacities` request", so it is reported only for a variant a
+/// count was asked for.
+///
+/// `DeployedImages` are the inference images deployed on the variant's instances, which are
+/// the containers of the model it hosts; a variant hosting no model deploys none, so the
+/// member — a `len 1..`-free list that AWS reports per container — stays absent rather than
+/// carrying an empty list.
+///
 /// Stated once here because an endpoint takes its summaries from a configuration both
 /// when it is created from one and when a deployment swaps one in.
-pub fn variant_summaries(variants: &[ProductionVariant]) -> Vec<ProductionVariantSummary> {
+pub fn variant_summaries(
+    variants: &[ProductionVariant],
+    deployed: &BTreeMap<String, Vec<crate::ops::types::DeployedImage>>,
+) -> Vec<ProductionVariantSummary> {
     variants
         .iter()
         .map(|variant| ProductionVariantSummary {
             variant_name: variant.variant_name.clone(),
-            deployed_images: None,
+            deployed_images: deployed
+                .get(&variant.variant_name)
+                .filter(|images| !images.is_empty())
+                .cloned(),
             current_weight: Some(variant.initial_variant_weight.unwrap_or(1.0)),
             desired_weight: Some(variant.initial_variant_weight.unwrap_or(1.0)),
-            current_instance_count: variant.initial_instance_count,
+            current_instance_count: Some(variant.initial_instance_count.unwrap_or(0)),
             desired_instance_count: variant.initial_instance_count,
             instance_pools: None,
             variant_status: None,
@@ -199,6 +228,27 @@ pub fn variant_summaries(variants: &[ProductionVariant]) -> Vec<ProductionVarian
             managed_instance_scaling: variant.managed_instance_scaling.clone(),
             routing_config: variant.routing_config.clone(),
             capacity_reservation_config: None,
+        })
+        .collect()
+}
+
+/// The images each of `variants` deploys, keyed by variant name: the stored images of the
+/// model the variant hosts ([`Model::deployed_images`], resolved by the create that
+/// registered that model).
+///
+/// SNAPSHOTTED by the write that stands the fleet up, like every other property a variant
+/// summary reports: a model deleted or re-registered afterwards does not change what an
+/// endpoint already serving it reports. A variant naming no model, or one naming a model
+/// this account does not hold, deploys no image of its own.
+pub fn deployed_variant_images(
+    variants: &[ProductionVariant],
+    models: &BTreeMap<String, Model>,
+) -> BTreeMap<String, Vec<crate::ops::types::DeployedImage>> {
+    variants
+        .iter()
+        .filter_map(|variant| {
+            let model = models.get(variant.model_name.as_deref()?)?;
+            Some((variant.variant_name.clone(), model.deployed_images.clone()))
         })
         .collect()
 }
@@ -377,17 +427,31 @@ impl Endpoint {
         config: &EndpointConfig,
         retained: RetainedProperties,
         now: SystemTime,
+        models: &BTreeMap<String, Model>,
     ) -> EndpointUpdate {
+        let production_variants = retained_variants(
+            &config.production_variants,
+            &self.production_variants,
+            retained,
+        );
+        let shadow_production_variants = config.shadow_production_variants.as_deref().map(
+            |variants| retained_variants(variants, &self.shadow_production_variants, retained),
+        );
+        // The images the deployment deploys are snapshotted with the variants, from the
+        // models registered NOW: a model re-registered while the deployment is in flight
+        // does not change what this deployment stands up. One map per fleet, because a
+        // variant name identifies a variant inside its own fleet.
+        let deployed_images = deployed_variant_images(&production_variants, models);
+        let shadow_deployed_images = shadow_production_variants
+            .as_deref()
+            .map(|variants| deployed_variant_images(variants, models))
+            .unwrap_or_default();
         EndpointUpdate {
             config_name: config.name.clone(),
-            production_variants: retained_variants(
-                &config.production_variants,
-                &self.production_variants,
-                retained,
-            ),
-            shadow_production_variants: config.shadow_production_variants.as_deref().map(
-                |variants| retained_variants(variants, &self.shadow_production_variants, retained),
-            ),
+            production_variants,
+            shadow_production_variants,
+            deployed_images,
+            shadow_deployed_images,
             data_capture_config: config.data_capture_config.clone(),
             async_inference_config: config.async_inference_config.clone(),
             explainer_config: config.explainer_config.clone(),
@@ -421,11 +485,12 @@ impl Endpoint {
             return false;
         };
         self.instance_usage = update.instance_demand();
-        self.production_variants = variant_summaries(&update.production_variants);
+        self.production_variants =
+            variant_summaries(&update.production_variants, &update.deployed_images);
         self.shadow_production_variants = update
             .shadow_production_variants
             .as_deref()
-            .map(variant_summaries)
+            .map(|variants| variant_summaries(variants, &update.shadow_deployed_images))
             .unwrap_or_default();
         self.config_name = update.config_name;
         self.data_capture_config = update.data_capture_config;
@@ -496,6 +561,10 @@ pub struct InferenceComponent {
     pub variant_name: Option<String>,
     pub specification: Option<crate::ops::types::InferenceComponentSpecification>,
     pub specifications: Option<Vec<crate::ops::types::InferenceComponentSpecification>>,
+    /// The image each container of its specifications deploys, keyed by the path the
+    /// specification named it as and resolved by the create that stored this component
+    /// ([`crate::state::deployed_image`]), so every read replays one resolution.
+    pub deployed_images: BTreeMap<String, crate::ops::types::DeployedImage>,
     pub runtime_config: Option<crate::ops::types::InferenceComponentRuntimeConfig>,
     pub status: String,
     pub failure_reason: Option<String>,

@@ -157,13 +157,13 @@ fn pending_summary(update: &crate::state::EndpointUpdate) -> PendingDeploymentSu
     PendingDeploymentSummary {
         endpoint_config_name: update.config_name.clone(),
         production_variants: (!update.production_variants.is_empty())
-            .then(|| pending_variant_summaries(&update.production_variants)),
+            .then(|| pending_variant_summaries(&update.production_variants, &update.deployed_images)),
         start_time: Some(crate::state::timestamp(update.started_at)),
         shadow_production_variants: update
             .shadow_production_variants
             .as_deref()
             .filter(|variants| !variants.is_empty())
-            .map(pending_variant_summaries),
+            .map(|variants| pending_variant_summaries(variants, &update.shadow_deployed_images)),
     }
 }
 
@@ -173,13 +173,22 @@ fn pending_summary(update: &crate::state::EndpointUpdate) -> PendingDeploymentSu
 /// configuration being deployed, with `DesiredWeight` defaulting the way
 /// `InitialVariantWeight` documents ("If unspecified, it defaults to 1.0"). The
 /// `Current*` members are what of this deployment's fleet is already serving, and while
-/// the deployment is in flight that is nothing, so they are not reported.
-fn pending_variant_summaries(variants: &[ProductionVariant]) -> Vec<PendingProductionVariantSummary> {
+/// the deployment is in flight that is nothing, so they are not reported. `DeployedImages`
+/// are "the inference images deployed on instances of this ProductionVariant", which the
+/// deployment resolved with the variants it stands up — `deployed`, that fleet's own map of
+/// them (`crate::state::deployed_variant_images`).
+fn pending_variant_summaries(
+    variants: &[ProductionVariant],
+    deployed: &::std::collections::BTreeMap<String, Vec<DeployedImage>>,
+) -> Vec<PendingProductionVariantSummary> {
     variants
         .iter()
         .map(|variant| PendingProductionVariantSummary {
             variant_name: variant.variant_name.clone(),
-            deployed_images: None,
+            deployed_images: deployed
+                .get(&variant.variant_name)
+                .filter(|images| !images.is_empty())
+                .cloned(),
             current_weight: None,
             desired_weight: Some(variant.initial_variant_weight.unwrap_or(1.0)),
             current_instance_count: None,

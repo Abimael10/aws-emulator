@@ -830,13 +830,20 @@ async fn endpoint_production_variants_are_derived_from_the_stored_configuration(
                 "case {case}: {member}, got {summary:?}"
             );
         }
-        for member in ["CurrentInstanceCount", "DesiredInstanceCount"] {
-            assert_eq!(
-                summary.get(member).and_then(Value::as_i64),
-                count,
-                "case {case}: {member}, got {summary:?}"
-            );
-        }
+        // `CurrentInstanceCount` is "the number of instances associated with the variant"
+        // (`TaskCount`, `@range min 0`), reported for every variant of a created endpoint —
+        // zero for one that provisions no instances; `DesiredInstanceCount` is the count the
+        // configuration asked for, so a variant that asked for none reports none.
+        assert_eq!(
+            summary.get("CurrentInstanceCount").and_then(Value::as_i64),
+            Some(count.unwrap_or(0)),
+            "case {case}: CurrentInstanceCount, got {summary:?}"
+        );
+        assert_eq!(
+            summary.get("DesiredInstanceCount").and_then(Value::as_i64),
+            count,
+            "case {case}: DesiredInstanceCount, got {summary:?}"
+        );
         for member in ["CurrentServerlessConfig", "DesiredServerlessConfig"] {
             assert_eq!(
                 summary

@@ -139,27 +139,32 @@ impl<Eng> DescribeInferenceComponent<Eng> {
     }
 }
 
-/// The summary form of one stored specification.
+/// A specification summary of one stored specification, with `deployed` the images the
+/// component resolved when it was created, keyed by the path each was specified as.
 ///
 /// Every member is replayed as stored; the two that differ in the summary shape are
 /// `Container` (an `InferenceComponentContainerSpecificationSummary`, whose image is
 /// reported as a `DeployedImage`) and `DataCacheConfig`.
 fn specification_summary(
     specification: &InferenceComponentSpecification,
+    deployed: &::std::collections::BTreeMap<String, DeployedImage>,
 ) -> InferenceComponentSpecificationSummary {
     InferenceComponentSpecificationSummary {
         instance_type: specification.instance_type.clone(),
         model_name: specification.model_name.clone(),
         container: specification.container.as_ref().map(|container| {
             InferenceComponentContainerSpecificationSummary {
-                // `SpecifiedImage` is the image the specification named. This emulator
-                // pulls nothing from a registry, so there is no digest it could report
-                // as `ResolvedImage` and no instant it resolved one at: both members are
-                // optional and stay absent rather than carrying a made-up digest.
-                deployed_image: container.image.as_ref().map(|image| DeployedImage {
-                    specified_image: Some(image.clone()),
-                    resolved_image: None,
-                    resolution_time: None,
+                // The image the container runs, as every reader of a deployed image
+                // reports one: the path specified, that path at the digest it resolved to
+                // and the instant of that resolution — resolved once, by the create that
+                // stored this component (`crate::state::deployed_image`). A path the
+                // stored resolutions do not carry is still the path the specification
+                // named, so that member is reported whatever was resolved for it.
+                deployed_image: container.image.as_deref().map(|image| {
+                    deployed.get(image).cloned().unwrap_or_else(|| DeployedImage {
+                        specified_image: Some(image.to_string()),
+                        ..DeployedImage::default()
+                    })
                 }),
                 artifact_url: container.artifact_url.clone(),
                 environment: container.environment.clone(),
@@ -259,7 +264,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             endpoint_arn: component.endpoint_arn.clone(),
             variant_name: component.variant_name.clone(),
             failure_reason: component.failure_reason.clone(),
-            specification: component.specification.as_ref().map(specification_summary),
+            specification: component
+                .specification
+                .as_ref()
+                .map(|specification| specification_summary(specification, &component.deployed_images)),
             // Set only when the component was created with the plural member, so the
             // singular `Specification` is never reported beside it. The summary list is
             // `len 1..`, so an empty one is omitted rather than serialised.
@@ -267,7 +275,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .specifications
                 .as_ref()
                 .filter(|list| !list.is_empty())
-                .map(|list| list.iter().map(specification_summary).collect()),
+                .map(|list| {
+                    list.iter()
+                        .map(|specification| {
+                            specification_summary(specification, &component.deployed_images)
+                        })
+                        .collect()
+                }),
             runtime_config,
             creation_time: crate::state::timestamp(component.creation_time),
             last_modified_time: crate::state::timestamp(component.last_modified_time),

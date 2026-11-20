@@ -18,11 +18,12 @@
 //! profiler rule evaluations stay absent: no rule container is evaluated against the run.
 //!
 //! Beside the modelled members, the response carries the ones the recorded service answers
-//! that this service's on-disk model does not declare — the job's `DisableEFA`, each input
-//! channel's `EnableFFM`, its output configuration's `DisableModelUpload` and
-//! `RemoveJobNameFromS3OutputPath`, and its resource configuration's
-//! `UseReservedCapacity`. See `super::types::recorded_read_members` for how such a member
-//! reaches the wire, and the block at the end of `handle` for what each one is read off.
+//! that this service's on-disk model does not declare — the job's `DisableEFA` and
+//! `TrainingJobOutput`, each input channel's `EnableFFM`, its output configuration's
+//! `DisableModelUpload` and `RemoveJobNameFromS3OutputPath`, and its resource
+//! configuration's `UseReservedCapacity`. See `super::types::recorded_read_members` for how
+//! such a member reaches the wire, and the block at the end of `handle` for what each one is
+//! read off.
 //!
 //! ## Shape of an operation
 //!
@@ -356,6 +357,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let settled = job.settle_status(now);
 
         let request = job.request.clone();
+        let model_artifacts = job.reported_model_artifacts();
+        let job_output_path = job.job_output_path();
         let output = DescribeTrainingJobOutput {
             training_job_name: job.name.clone(),
             training_job_arn: job.arn.clone(),
@@ -369,7 +372,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             model_artifacts: ModelArtifacts {
                 // The object the job's own RUN wrote, once it wrote one, and otherwise the
                 // location it writes to — which is where a job still running will put it.
-                s3_model_artifacts: job.reported_model_artifacts(),
+                s3_model_artifacts: model_artifacts,
             },
             training_job_status: job.status.clone(),
             // Required, and every stored job carries one; a record seeded without one
@@ -449,6 +452,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "DisableEFA": the Elastic Fabric Adapter is not switched off for the compute this
         // job runs on — nothing here provisions a cluster with it disabled.
         output.disable_efa = Some(false);
+        // "TrainingJobOutput": the job's OTHER output — the archive of everything its run
+        // wrote beside the model it fitted — under the output location the job was
+        // configured with and the job's own name
+        // (`crate::state::TrainingJob::job_output_path`, derived from the stored request the
+        // way `ModelArtifacts` is).
+        output.training_job_output = Some(RecordedTrainingJobOutput::new(job_output_path));
         // The mode the job's algorithm specification reads its data in, which is the mode a
         // channel that overrides it with none runs in.
         let training_input_mode = output

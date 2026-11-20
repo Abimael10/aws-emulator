@@ -645,16 +645,38 @@ impl TrainingJob {
     /// it is DERIVED from the request rather than a report that an object exists, and
     /// stays the same across reads for as long as the job is held.
     pub fn model_artifacts_path(&self) -> String {
+        format!(
+            "{}/{}",
+            self.output_prefix(),
+            crate::state::MODEL_ARCHIVE_OBJECT
+        )
+    }
+
+    /// Where the job's OTHER output — everything its run wrote beside the model it fitted —
+    /// is written: the output-data archive, under the same prefix as the model artifacts
+    /// ([`crate::state::OUTPUT_ARCHIVE_OBJECT`]).
+    ///
+    /// Derived from the output location the request named and the job's own name, exactly as
+    /// [`Self::model_artifacts_path`] is, so it is stable across reads for as long as the job
+    /// is held.
+    pub fn job_output_path(&self) -> String {
+        format!(
+            "{}/{}",
+            self.output_prefix(),
+            crate::state::OUTPUT_ARCHIVE_OBJECT
+        )
+    }
+
+    /// The Amazon S3 prefix a training job's own run writes under:
+    /// `<S3OutputPath>/<TrainingJobName>/output`, the one place both archives the job leaves
+    /// behind are named from.
+    fn output_prefix(&self) -> String {
         let base = self
             .request
             .output_data_config
             .s3_output_path
             .trim_end_matches('/');
-        format!(
-            "{base}/{}/output/{}",
-            self.name,
-            crate::state::MODEL_ARCHIVE_OBJECT
-        )
+        format!("{base}/{}/output", self.name)
     }
 
     /// "Profiling status of a training job" (`ProfilingStatus`), which follows the

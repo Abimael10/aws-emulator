@@ -258,6 +258,37 @@ impl SerializableStruct for RecordedResourceConfig {
     }
 }
 
+/// What a training job's run LEFT BEHIND in Amazon S3, as the recorded service reports it
+/// beside the modelled `ModelArtifacts`: the object the run wrote under the job's output
+/// location.
+#[derive(Debug, Clone)]
+pub struct RecordedTrainingJobOutput {
+    /// The URI of the object the run wrote under `OutputDataConfig.S3OutputPath`.
+    pub s3_training_job_output: Option<String>,
+}
+
+impl RecordedTrainingJobOutput {
+    const M_S3_TRAINING_JOB_OUTPUT: Schema =
+        recorded_member!("TrainingJobOutput", "S3TrainingJobOutput", ShapeType::String, 0);
+
+    /// The output of a job whose run wrote `uri`.
+    #[must_use]
+    pub fn new(uri: String) -> Self {
+        Self {
+            s3_training_job_output: Some(uri),
+        }
+    }
+}
+
+impl SerializableStruct for RecordedTrainingJobOutput {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        if let Some(uri) = self.s3_training_job_output.as_ref() {
+            s.write_string(&Self::M_S3_TRAINING_JOB_OUTPUT, uri.as_str())?;
+        }
+        Ok(())
+    }
+}
+
 /// `DescribeTrainingJob`'s answer: the modelled response, plus the members the recorded
 /// service carries — the job's own `DisableEFA`, and the channels and configurations whose
 /// recorded members live inside them.
@@ -279,6 +310,8 @@ pub struct DescribeTrainingJobRecordedOutput {
     pub resource_config: Option<RecordedResourceConfig>,
     /// Whether the Elastic Fabric Adapter is switched off for the job's compute.
     pub disable_efa: Option<bool>,
+    /// What the job's run left behind in Amazon S3.
+    pub training_job_output: Option<RecordedTrainingJobOutput>,
 }
 
 impl DescribeTrainingJobRecordedOutput {
@@ -306,6 +339,12 @@ impl DescribeTrainingJobRecordedOutput {
     /// modelled ones (0..=49).
     const M_DISABLE_EFA: Schema =
         recorded_member!("DescribeTrainingJobResponse", "DisableEFA", ShapeType::Boolean, 50);
+    const M_TRAINING_JOB_OUTPUT: Schema = recorded_member!(
+        "DescribeTrainingJobResponse",
+        "TrainingJobOutput",
+        ShapeType::Structure,
+        51
+    );
 
     /// Take the channel list and the output and resource configurations OUT of the modelled
     /// response, so each is reported through its own wrapper and never twice.
@@ -328,6 +367,7 @@ impl DescribeTrainingJobRecordedOutput {
             output_data_config,
             resource_config,
             disable_efa: None,
+            training_job_output: None,
         }
     }
 }
@@ -351,6 +391,9 @@ impl SerializableStruct for DescribeTrainingJobRecordedOutput {
         }
         if let Some(disabled) = self.disable_efa {
             s.write_boolean(&Self::M_DISABLE_EFA, disabled)?;
+        }
+        if let Some(output) = self.training_job_output.as_ref() {
+            s.write_struct(&Self::M_TRAINING_JOB_OUTPUT, output)?;
         }
         Ok(())
     }

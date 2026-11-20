@@ -264,6 +264,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If True, no inbound or outbound network calls can be made to or from the model
         // container": a model nothing asked to isolate is not isolated.
         let enable_network_isolation = Some(input.enable_network_isolation.unwrap_or(false));
+        // What the model's containers DEPLOY, resolved once here so every hosting resource
+        // replays one resolution: each container's image path as specified, that path at the
+        // digest the registry holding it reports, and the instant of this resolution (see
+        // `crate::state::image_digest`). Resolved BEFORE this service's store is reached,
+        // because the registry it reads is another service's store on the same engine.
+        let created_at = ::std::time::SystemTime::now();
+        let deployed_images = crate::state::deployed_model_images(
+            &*self.engine,
+            ctx,
+            primary_container.iter().chain(containers.iter().flatten()),
+            created_at,
+        );
 
         let mut store = state.lock();
         // The store is bounded, so a caller varying `ModelName` cannot grow it without
@@ -294,12 +306,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn: arn.clone(),
                 primary_container,
                 containers,
+                deployed_images,
                 inference_execution_config: input.inference_execution_config,
                 execution_role_arn: input.execution_role_arn,
                 vpc_config: input.vpc_config,
                 enable_network_isolation,
                 tags: input.tags.unwrap_or_default(),
-                creation_time: ::std::time::SystemTime::now(),
+                creation_time: created_at,
             },
         );
         drop(store);

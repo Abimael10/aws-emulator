@@ -199,6 +199,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.inference_component_name,
         );
 
+        // What each container of those specifications DEPLOYS: the image path as specified,
+        // that path at the digest the registry holding it reports, and the instant of this
+        // resolution (see `crate::state::image_digest`). Resolved ONCE here, so every read
+        // replays one resolution, and BEFORE this service's store is reached, because the
+        // registry it reads is another service's store on the same engine.
+        let resolved_at = ::std::time::SystemTime::now();
+        let deployed_images: ::std::collections::BTreeMap<String, DeployedImage> = specifications
+            .iter()
+            .filter_map(|specification| specification.container.as_ref()?.image.as_deref())
+            .map(|image| {
+                (
+                    image.to_string(),
+                    crate::state::deployed_image(&*self.engine, ctx, image, resolved_at),
+                )
+            })
+            .collect();
+
         let mut store = state.lock();
         // The store is bounded, so a caller varying `InferenceComponentName` cannot grow
         // it without end. `ResourceLimitExceeded` is the limit failure this operation
@@ -301,6 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 variant_name: input.variant_name.clone(),
                 specification: input.specification.clone(),
                 specifications: input.specifications.clone(),
+                deployed_images,
                 runtime_config: input.runtime_config.clone(),
                 // The copies still have to be placed, so the component reports
                 // `Creating` until the instant below, as the real service does.

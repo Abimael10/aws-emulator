@@ -233,12 +233,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The endpoint snapshots the configuration it was created from, the way the real
-        // service does: a later CreateEndpointConfig does not retroactively change it.
-        let production_variants = crate::state::variant_summaries(&config.production_variants);
+        // service does: a later CreateEndpointConfig does not retroactively change it. The
+        // images each variant deploys are snapshotted with it, from the model the variant
+        // hosts as that model was registered (`crate::state::deployed_variant_images`).
+        let production_images =
+            crate::state::deployed_variant_images(&config.production_variants, &store.models);
+        let shadow_images = config
+            .shadow_production_variants
+            .as_deref()
+            .map(|variants| crate::state::deployed_variant_images(variants, &store.models))
+            .unwrap_or_default();
+        let production_variants =
+            crate::state::variant_summaries(&config.production_variants, &production_images);
         let shadow_production_variants = config
             .shadow_production_variants
             .as_deref()
-            .map(crate::state::variant_summaries)
+            .map(|variants| crate::state::variant_summaries(variants, &shadow_images))
             .unwrap_or_default();
         let data_capture_config = config.data_capture_config.clone();
         let async_inference_config = config.async_inference_config.clone();
