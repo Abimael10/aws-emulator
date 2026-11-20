@@ -1305,7 +1305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is locked for THIS block alone, which is the whole state change: what it
         // answers is owned, so the group the stage publishes is created below with no guard
         // held — a write into CloudWatch Logs is a call into another service.
-        let (body, region, publishes_execution_log_group) = {
+        let (body, region, publishing_role) = {
             let mut store = state.lock();
             // The `(restApiId, stageName)` pair is resolved as ONE lookup for the stage the
             // URI addresses, so an identifier no stored API answers to is reported as the
@@ -1330,6 +1330,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .cloudwatch_role_arn
                 .as_deref()
                 .is_some_and(|arn| !arn.trim().is_empty());
+            // That same role as the PRINCIPAL the group API Gateway publishes is created by,
+            // read here under the one guard this block takes and judged below with none held.
+            let store_account_role = store.account.cloudwatch_role_arn.clone();
             // The account's client certificates, one of which a stage presents to its
             // integration endpoint.
             let client_certificates: BTreeSet<String> =
@@ -1362,11 +1365,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is what API Gateway publishes the stage's own log group for
             // ([`provisioned_execution_log_group`]). Read off the record about to be stored,
             // so it is the configuration now in force rather than what any one patch asked
-            // for.
-            let publishes_execution_log_group =
-                logging_role_configured && stage_logs_executions(&updated);
+            // for — and answered as the ROLE the group would be published as, which is the
+            // principal that create is made by.
+            let publishing_role = if logging_role_configured && stage_logs_executions(&updated) {
+                store_account_role
+            } else {
+                None
+            };
             api.stages.insert(input.stage_name.clone(), updated);
-            (body, region, publishes_execution_log_group)
+            (body, region, publishing_role)
         };
         let output = UpdateStageOutput {
             deployment_id: body.deployment_id,
@@ -1390,9 +1397,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The stage's OWN execution log group, for a stage whose execution logging this
         // configuration leaves on: a group API Gateway publishes rather than one it was
         // pointed at, so it is there before the stage serves anything.
-        if publishes_execution_log_group {
-            provisioned_execution_log_group(ctx, &region, &input.rest_api_id, &input.stage_name)
-                .await;
+        if let Some(role_arn) = &publishing_role {
+            provisioned_execution_log_group(
+                &*self.engine,
+                ctx,
+                &region,
+                &input.rest_api_id,
+                &input.stage_name,
+                role_arn,
+            )
+            .await;
         }
         // "The ARN of the WebAcl associated with the Stage": WAFv2's own record, read
         // with this service's store released, so the update reports the web ACL in front
@@ -1451,17 +1465,24 @@ fn stage_logs_executions(stage: &crate::state::StageEntry) -> bool {
 /// API Gateway writes the account's logs as the account's own CloudWatch role
 /// (`Account$cloudwatchRoleArn`), which is what every patch that turns this logging on
 /// requires ([`ACCOUNT_CLOUDWATCH_ROLE_REQUIRED`]), so an account with no role has nothing for
-/// API Gateway to publish the group as and none is created.
+/// API Gateway to publish the group as and none is created. The create is a call made BY that
+/// role, so a role whose policies say no about creating this group publishes no group either
+/// ([`crate::state::log_delivery_role`]) — and the caller is answered all the same.
 ///
 /// Best effort, and called with no store lock held: the stage has already been updated, and
 /// the caller is answered whatever CloudWatch Logs does with the create.
-async fn provisioned_execution_log_group(
+async fn provisioned_execution_log_group<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     api_id: &str,
     stage_name: &str,
+    role_arn: &str,
 ) {
     let group = crate::service::invoke::stage_logs::execution_log_group(api_id, stage_name);
+    if crate::state::log_delivery_role::group_creation_denied(engine, role_arn, region, &group) {
+        return;
+    }
     ::service_common::cloudwatch_logs::provisioned(ctx, region, &group).await;
 }
 

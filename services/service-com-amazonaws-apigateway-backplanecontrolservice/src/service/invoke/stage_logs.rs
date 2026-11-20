@@ -285,6 +285,10 @@ fn log_stream_name(api_id: &str, stage: &str) -> String {
 struct Planned {
     /// The Region the api's own ARN names, which is where its log groups live.
     region: String,
+    /// The ACCOUNT's CloudWatch role, which is the principal API Gateway makes every one of
+    /// these deliveries as — so what that role's policies say about a write decides whether
+    /// it is made at all ([`crate::state::log_delivery_role`]).
+    role_arn: String,
     /// The stage's access-log destination and the record rendered for this request, when
     /// the stage carries `accessLogSettings` naming a log group and a format.
     access: Option<(String, String)>,
@@ -332,28 +336,65 @@ pub(super) async fn delivered<Eng: Send + Sync + 'static>(
     let Some(planned) = planned.filter(|planned| !planned.is_empty()) else {
         return;
     };
-    if let Some((group, record)) = &planned.access {
-        ::service_common::api_gateway_access_logs::delivered(
-            ctx,
+    // Every write below is made AS the account's CloudWatch role, so a write that role's
+    // policies say no about is one API Gateway does not make: the records are lost and the
+    // destination is left exactly as it was, while the request the stage already answered is
+    // untouched. Decided with no guard of this service's store held (the read above has been
+    // released), which is the lock order the decision is taken under.
+    let withheld = |group: &str| {
+        crate::state::log_delivery_role::record_delivery_denied(
+            engine,
+            &planned.role_arn,
             &planned.region,
             group,
             &planned.stream,
-            std::slice::from_ref(record),
         )
-        .await;
+    };
+    if let Some((group, record)) = &planned.access {
+        if !withheld(group) {
+            ::service_common::api_gateway_access_logs::delivered(
+                ctx,
+                &planned.region,
+                group,
+                &planned.stream,
+                std::slice::from_ref(record),
+            )
+            .await;
+        }
     }
     if let Some((group, trace)) = &planned.execution {
         // The stage's EXECUTION log group is one API Gateway publishes under its own name
-        // ([`execution_log_group`]), so this delivery provisions it; the access-log
-        // destination above is a group of the account's and is never created here.
-        ::service_common::cloudwatch_logs::delivered(
-            ctx,
-            &planned.region,
-            group,
-            &planned.stream,
-            trace,
-        )
-        .await;
+        // ([`execution_log_group`]), so this delivery provisions it — unless the role may not
+        // create that group, where the records go only into a group CloudWatch Logs already
+        // holds. The access-log destination above is a group of the account's and is never
+        // created here.
+        if !withheld(group) {
+            let provisions = !crate::state::log_delivery_role::group_creation_denied(
+                engine,
+                &planned.role_arn,
+                &planned.region,
+                group,
+            );
+            if provisions {
+                ::service_common::cloudwatch_logs::delivered(
+                    ctx,
+                    &planned.region,
+                    group,
+                    &planned.stream,
+                    trace,
+                )
+                .await;
+            } else {
+                ::service_common::cloudwatch_logs::delivered_into_held_group(
+                    ctx,
+                    &planned.region,
+                    group,
+                    &planned.stream,
+                    trace,
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -374,8 +415,9 @@ fn planned<Eng: Send + Sync + 'static>(
 ) -> Option<Planned> {
     let state = crate::state::service_state(engine)?;
     let store = state.lock();
-    // The account's CloudWatch role is what API Gateway writes as; see the module docs.
-    store.account.cloudwatch_role_arn.as_ref()?;
+    // The account's CloudWatch role is what API Gateway writes as; see the module docs. It is
+    // carried through to the deliveries, which are the calls it makes as that role.
+    let role_arn = store.account.cloudwatch_role_arn.clone()?;
     let resolved = super::resolve(&store, &super::Addressed::of_request(req))?;
     let api = resolved.api;
     let (stage_name, resource_path) = super::split_stage(resolved.invoke_path)?;
@@ -484,6 +526,7 @@ fn planned<Eng: Send + Sync + 'static>(
 
     Some(Planned {
         region: api.arn_region().to_string(),
+        role_arn,
         access,
         execution,
         stream: log_stream_name(&api.id, stage_name),

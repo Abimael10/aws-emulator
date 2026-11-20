@@ -4905,3 +4905,8 @@ pub use model_schema::*;
 /// `crate::state::…`.
 mod access_associations;
 pub use access_associations::*;
+
+/// Which CloudWatch Logs call API Gateway may make for a stage's logs, decided over the
+/// policies in force on the account's CloudWatch role — the principal it makes every one of
+/// them as; see that module.
+pub mod log_delivery_role;
