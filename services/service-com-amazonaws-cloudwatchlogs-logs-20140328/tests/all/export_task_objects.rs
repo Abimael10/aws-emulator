@@ -56,6 +56,28 @@ const TERMINAL_STATUSES: [&str; 3] = ["COMPLETED", "CANCELLED", "FAILED"];
 const TERMINAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const TERMINAL_POLL_ATTEMPTS: usize = 600;
 
+/// The bucket policy an export destination carries, as the CloudWatch Logs User Guide writes
+/// it for exporting log data to Amazon S3: the service principal of the Region the export is
+/// made in is granted `s3:GetBucketAcl` on the bucket itself and `s3:PutObject` on everything
+/// in it, each scoped to the account the export is made in.
+///
+/// Shared with the suites whose destination bucket an export runs into, so there is one
+/// statement of "a bucket set up for an export" in this target.
+pub(crate) fn export_destination_policy(bucket: &str, region: &str) -> String {
+    format!(
+        r#"{{"Version":"2012-10-17","Statement":[
+             {{"Sid":"AWSLogDeliveryAclCheck","Effect":"Allow",
+               "Principal":{{"Service":"logs.{region}.amazonaws.com"}},
+               "Action":"s3:GetBucketAcl","Resource":"arn:aws:s3:::{bucket}",
+               "Condition":{{"StringEquals":{{"aws:SourceAccount":"{account}"}}}}}},
+             {{"Sid":"AWSLogDeliveryWrite","Effect":"Allow",
+               "Principal":{{"Service":"logs.{region}.amazonaws.com"}},
+               "Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/*",
+               "Condition":{{"StringEquals":{{"aws:SourceAccount":"{account}"}}}}}}]}}"#,
+        account = engine::emulator_account_id()
+    )
+}
+
 /// CloudWatch Logs and Amazon S3 on one shared engine, reached over the wire.
 ///
 /// Shared with the suites whose subject is also what an export LANDS in the destination
@@ -136,7 +158,15 @@ impl Emulator {
         (status, response.into_body())
     }
 
-    /// `PUT /<bucket>` — S3's `CreateBucket`, naming the Region this suite signs for.
+    /// `PUT /<bucket>` — S3's `CreateBucket`, naming the Region this suite signs for, followed
+    /// by the policy an export destination has to carry
+    /// ([`export_destination_policy`]).
+    ///
+    /// A destination an export runs into is set up the way the service documents it, because
+    /// `CreateExportTask` checks that setup before it mints a task: the permissions the export
+    /// needs live in the destination bucket's OWN policy, so a created bucket alone is a
+    /// destination CloudWatch Logs may not write to. The grant is inert for a suite whose
+    /// subject is not an export.
     pub(crate) async fn create_bucket(&self, case: &str, bucket: &str) {
         let (status, body) = self
             .s3(
@@ -155,6 +185,24 @@ impl Emulator {
             status,
             200,
             "case {case:?}: create bucket {bucket}: got {}",
+            String::from_utf8_lossy(&body)
+        );
+        self.grant_export_delivery(case, bucket).await;
+    }
+
+    /// `PUT /<bucket>?policy` — S3's `PutBucketPolicy`, carrying the export-destination grant
+    /// ([`export_destination_policy`]).
+    pub(crate) async fn grant_export_delivery(&self, case: &str, bucket: &str) {
+        let (status, body) = self
+            .s3(
+                "PUT",
+                &format!("/{bucket}?policy"),
+                export_destination_policy(bucket, REGION).as_bytes(),
+            )
+            .await;
+        assert!(
+            (200..300).contains(&status),
+            "case {case:?}: grant the export delivery on {bucket}: got {status} {}",
             String::from_utf8_lossy(&body)
         );
     }

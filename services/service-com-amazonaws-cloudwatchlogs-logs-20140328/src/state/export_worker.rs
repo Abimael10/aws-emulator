@@ -89,7 +89,7 @@ const FIRST_OBJECT_NAME: &str = "000000.gz";
 /// that you specify as the destination", and the export establishes that by writing — this
 /// object, under the task's own destination prefix, before any exported log data. It is the
 /// name CloudWatch Logs leaves that check under in the destination bucket.
-const WRITE_TEST_OBJECT_NAME: &str = "aws-logs-write-test";
+pub(super) const WRITE_TEST_OBJECT_NAME: &str = "aws-logs-write-test";
 
 /// What that object holds: the outcome of the check it IS, as plain text rather than as
 /// exported log data, so a reader of the destination can tell the check apart from the
@@ -325,7 +325,7 @@ fn object_key(destination_prefix: &str, task_id: &str, stream_name: &str) -> Str
 /// exported", so every key the export writes — the exported data and the permission check
 /// alike — begins with it; a prefix already ending in a separator does not gain a second one,
 /// and an empty prefix contributes none.
-fn prefixed_key(destination_prefix: &str, rest: &str) -> String {
+pub(super) fn prefixed_key(destination_prefix: &str, rest: &str) -> String {
     let prefix = destination_prefix.trim_end_matches('/');
     if prefix.is_empty() {
         rest.to_string()

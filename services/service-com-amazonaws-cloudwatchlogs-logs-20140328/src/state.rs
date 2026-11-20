@@ -3655,6 +3655,31 @@ pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "The specified nextToken is invalid
 pub const EXPORT_DESTINATION_BUCKET_MISSING_MESSAGE: &str =
     "The given bucket does not exist. Please make sure the bucket is valid.";
 
+/// The refusal `CreateExportTask` answers when the destination bucket's own policy does not
+/// let this service read that bucket: the export checks its destination by reading the
+/// bucket's ACL as the CloudWatch Logs service principal before it writes anything, and a
+/// bucket whose policy withholds that read mints no task. Its sentence is fixed for the class:
+/// it names the call that was refused and the permission a client has to grant, and carries
+/// nothing of the request.
+///
+/// The CODE it travels under is the PERMISSION one — recorded CloudWatch Logs answers a
+/// destination whose policy withholds one of the export's own calls with
+/// `AccessDeniedException` ("you don't have sufficient permissions to perform this action"),
+/// not with the incorrectly-stated-parameter code the absent-bucket refusal above carries: the
+/// bucket is named correctly and what is missing is a grant. Both sentences below travel that
+/// way ([`crate::ops::create_export_task`]).
+pub const EXPORT_DESTINATION_ACL_READ_WITHHELD_MESSAGE: &str =
+    "GetBucketAcl call on the given bucket failed. Please check if CloudWatch Logs has been \
+     granted permission to perform this operation.";
+
+/// The refusal `CreateExportTask` answers when the destination bucket's own policy admits the
+/// ACL read but not the export's own write under the destination prefix: the sibling sentence
+/// of [`EXPORT_DESTINATION_ACL_READ_WITHHELD_MESSAGE`], naming the other call the export makes
+/// on the destination, and fixed for the class in the same way.
+pub const EXPORT_DESTINATION_OBJECT_WRITE_WITHHELD_MESSAGE: &str =
+    "PutObject call on the given bucket failed. Please check if CloudWatch Logs has been \
+     granted permission to perform this operation.";
+
 /// The sentence CloudWatch Logs answers when the time range a query is asked over runs
 /// backwards — its end before its start — which includes no instant at all. Fixed text for
 /// the condition: it names the two ends of the range and interpolates neither of their

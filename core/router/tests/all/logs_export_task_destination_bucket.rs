@@ -11,8 +11,8 @@
 //! export task behind. The requirement is the model's own: `CreateExportTask$destination` is
 //! "the name of S3 bucket for the exported log data", and an export to a bucket that is not
 //! there could never write a byte, so a task id for it would be an id a client polls forever.
-//! Only EXISTENCE is resolved: that is the half the object store can answer for and the half
-//! this error channel can express.
+//! EXISTENCE is the half resolved here; what the bucket's own policy says about the export is
+//! the other half, pinned by `logs_export_task_destination_permission.rs` beside this suite.
 //!
 //! This suite needs TWO services on one engine — CloudWatch Logs reaches S3 through the
 //! in-process callback, so a single-service router has no S3 to ask and the bucket a row
@@ -119,10 +119,15 @@ async fn logs(router: &MultiServiceRouter, case: &str, operation: &str, request:
 }
 
 /// `PUT /<bucket>` — S3's `CreateBucket`, naming the Region this suite is signed for as its
-/// location constraint.
+/// location constraint, followed by the policy an export destination has to carry.
 ///
 /// A create sent to a REGIONAL endpoint has to name one: the unspecified constraint means
 /// us-east-1, so S3 refuses a create that leaves it out anywhere else.
+///
+/// The grant is the other half of the destination the create resolves — `CreateExportTask`
+/// also checks that the bucket's own policy lets CloudWatch Logs read it — so a bucket this
+/// suite creates is a bucket an export may run into, and what each row is then judged on is
+/// the EXISTENCE this suite is about.
 async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
     let http_request = http::Request::builder()
         .method("PUT")
@@ -140,6 +145,40 @@ async fn create_bucket(router: &MultiServiceRouter, bucket: &str) {
         response.status().as_u16(),
         200,
         "setup: CreateBucket({bucket:?}) must succeed, got {} with {:?}",
+        response.status(),
+        String::from_utf8_lossy(response.body())
+    );
+    grant_export_delivery(router, bucket).await;
+}
+
+/// `PUT /<bucket>?policy` — S3's `PutBucketPolicy`, carrying the grant the CloudWatch Logs
+/// User Guide documents for an export destination: `s3:GetBucketAcl` on the bucket itself and
+/// `s3:PutObject` on everything in it, to this Region's CloudWatch Logs service principal and
+/// scoped to the account the export is made in.
+async fn grant_export_delivery(router: &MultiServiceRouter, bucket: &str) {
+    let account = engine::emulator_account_id();
+    let document = format!(
+        r#"{{"Version":"2012-10-17","Statement":[
+             {{"Sid":"AWSLogDeliveryAclCheck","Effect":"Allow",
+               "Principal":{{"Service":"logs.{REGION}.amazonaws.com"}},
+               "Action":"s3:GetBucketAcl","Resource":"arn:aws:s3:::{bucket}",
+               "Condition":{{"StringEquals":{{"aws:SourceAccount":"{account}"}}}}}},
+             {{"Sid":"AWSLogDeliveryWrite","Effect":"Allow",
+               "Principal":{{"Service":"logs.{REGION}.amazonaws.com"}},
+               "Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/*",
+               "Condition":{{"StringEquals":{{"aws:SourceAccount":"{account}"}}}}}}]}}"#
+    );
+    let http_request = http::Request::builder()
+        .method("PUT")
+        .uri(format!("/{bucket}?policy"))
+        .header("host", format!("{S3_SIGNING_NAME}.{REGION}.amazonaws.com"))
+        .header("authorization", authorization(S3_SIGNING_NAME))
+        .body(Bytes::from(document))
+        .expect("a well-formed request");
+    let response = router.dispatch(http_request).await;
+    assert!(
+        (200..300).contains(&response.status().as_u16()),
+        "setup: PutBucketPolicy({bucket:?}) must succeed, got {} with {:?}",
         response.status(),
         String::from_utf8_lossy(response.body())
     );

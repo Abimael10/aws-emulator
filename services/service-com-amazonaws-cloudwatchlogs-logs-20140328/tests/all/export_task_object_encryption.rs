@@ -196,7 +196,10 @@ impl Emulator {
         (status, headers, response.into_body())
     }
 
-    /// `PUT /<bucket>` — S3's `CreateBucket`, naming the Region this suite signs for.
+    /// `PUT /<bucket>` — S3's `CreateBucket`, naming the Region this suite signs for, followed
+    /// by the policy an export destination has to carry
+    /// ([`crate::export_task_objects::export_destination_policy`]): `CreateExportTask` checks
+    /// that the destination's own policy lets CloudWatch Logs reach it before it mints a task.
     async fn create_bucket(&self, case: &str, bucket: &str) {
         let (status, _headers, body) = self
             .s3(
@@ -214,6 +217,18 @@ impl Emulator {
             status,
             200,
             "case {case:?}: create bucket {bucket}: got {}",
+            String::from_utf8_lossy(&body)
+        );
+        let (status, _headers, body) = self
+            .s3(
+                "PUT",
+                &format!("/{bucket}?policy"),
+                crate::export_task_objects::export_destination_policy(bucket, REGION).as_bytes(),
+            )
+            .await;
+        assert!(
+            (200..300).contains(&status),
+            "case {case:?}: grant the export delivery on {bucket}: got {status} {}",
             String::from_utf8_lossy(&body)
         );
     }

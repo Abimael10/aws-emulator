@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateExportTask
-//! Implemented: starts an export of one stored log group's events to an S3 bucket,
-//! minting the task `DescribeExportTasks` then reports and handing the export itself to
-//! the task's worker, which writes the window's events to the destination bucket before
-//! the task reaches `COMPLETED` ([`crate::state::export_worker`]). This is the ONLY file
-//! to touch for this operation.
+//! Implemented: starts an export of one stored log group's events to an S3 bucket — once the
+//! destination bucket is resolved against the object store that holds it and its own policy
+//! is shown to let this service make the calls the export makes on it
+//! ([`crate::state::export_destination`]) — minting the task `DescribeExportTasks` then
+//! reports and handing the export itself to the task's worker, which writes the window's
+//! events to the destination bucket before the task reaches `COMPLETED`
+//! ([`crate::state::export_worker`]). This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateExportTask::handle`] with real behaviour and
@@ -108,6 +110,12 @@
 //! * `ResourceAlreadyExistsException` (HTTP 400) — The specified resource already exists.
 //! * `ResourceNotFoundException` (HTTP 400) — The specified resource does not exist.
 //! * `ServiceUnavailableException` (HTTP 500) — The service cannot complete the request.
+//! * `AccessDeniedException` (HTTP 400) — widened in through `extra_errors` (see below): the
+//!   code recorded CloudWatch Logs answers a create whose destination bucket's own policy does
+//!   not let this service make the calls the export makes on that bucket
+//!   (`crate::state::export_destination`). It is the PERMISSION class rather than the
+//!   incorrectly-stated-parameter class an absent bucket takes: the bucket is named correctly
+//!   and what is missing is a grant in its policy.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -123,7 +131,10 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatchlogs-logs-201
 // here — hence the `CreateExportTaskError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatchlogs#CreateExportTask")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatchlogs#CreateExportTask",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum CreateExportTaskErrorModeled {
     InvalidParameterException(InvalidParameterException),
@@ -132,6 +143,13 @@ pub enum CreateExportTaskErrorModeled {
     ResourceAlreadyExistsException(ResourceAlreadyExistsException),
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
+    // Widened in through `extra_errors`: the SERVICE models `AccessDeniedException` ("You
+    // don't have sufficient permissions to perform this action"), which is the code RECORDED
+    // CloudWatch Logs answers a destination whose own policy does not let this service make
+    // the calls an export makes on it — a permission refusal rather than a malformed
+    // parameter, and one this operation's own `errors` list omits. See
+    // `crate::state::export_destination`.
+    AccessDeniedException(AccessDeniedException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -205,6 +223,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
 
+        // The permission refusal: the request is well formed and names a bucket that is there,
+        // and the account has not granted the export what it needs on that bucket. Recorded
+        // CloudWatch Logs answers that class under the permission code rather than the
+        // parameter one, which is why this channel exists beside `invalid` above.
+        let access_denied = |message: String| {
+            CreateExportTaskError::from(CreateExportTaskErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            ))
+        };
+
         // The log group the export reads is resolved FIRST: a group this account does not
         // hold is the more specific client error, and resolution must not mint a task id.
         if !state.lock().log_groups.contains_key(&input.log_group_name) {
@@ -231,20 +261,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The name of S3 bucket for the exported log data" names a resource of the OBJECT
         // STORE, so it is resolved where that service holds it — no lock is held across the
-        // call. An export to a bucket that is not there could never write a byte, so the
-        // service refuses it rather than minting a task id the caller would then poll for
+        // call. An export to a bucket that is not there, or to one whose own policy does not
+        // let this service make the calls the export makes on it, could never write a byte, so
+        // the service refuses it rather than minting a task id the caller would then poll for
         // data nothing will write. `ctx` carries the credential scope the resolution is
         // addressed in; nothing else about the request enters into it.
-        if crate::state::export_destination::bucket_is_absent(
+        let region = crate::state::request_region(ctx.parts());
+        let resolution = crate::state::export_destination::resolve_destination(
             ctx,
-            &crate::state::request_region(ctx.parts()),
+            &region,
             &input.destination,
+            // "The prefix used as the start of the key for every object exported. If you
+            // don't specify a value, the default is exportedlogs" — so it is where the
+            // export's own write lands, and the resource that write is judged against.
+            input
+                .destination_prefix
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_EXPORT_DESTINATION_PREFIX),
+            // The resource the export is made FOR, which is what a destination policy scopes
+            // its grant to this service by.
+            &crate::state::log_group_arn(&region, &input.log_group_name, false),
         )
-        .await
-        {
-            return Err(invalid(
-                crate::state::EXPORT_DESTINATION_BUCKET_MISSING_MESSAGE.to_string(),
-            ));
+        .await;
+        match resolution {
+            crate::state::export_destination::DestinationResolution::BucketAbsent => {
+                return Err(invalid(
+                    crate::state::EXPORT_DESTINATION_BUCKET_MISSING_MESSAGE.to_string(),
+                ));
+            }
+            // A destination whose policy withholds one of those calls is a PERMISSION refusal,
+            // which is the class `AccessDeniedException` carries, rather than a parameter
+            // stated incorrectly: the bucket is named correctly and the account has not granted
+            // the export what it needs on it. The sentence names the call that was withheld,
+            // because that is the grant a client has to go and write.
+            crate::state::export_destination::DestinationResolution::AclReadWithheld => {
+                return Err(access_denied(
+                    crate::state::EXPORT_DESTINATION_ACL_READ_WITHHELD_MESSAGE.to_string(),
+                ));
+            }
+            crate::state::export_destination::DestinationResolution::ObjectWriteWithheld => {
+                return Err(access_denied(
+                    crate::state::EXPORT_DESTINATION_OBJECT_WRITE_WITHHELD_MESSAGE.to_string(),
+                ));
+            }
+            // Either the destination takes the export, or nothing was established about it —
+            // and a refusal has to be grounded in what the object store answered.
+            crate::state::export_destination::DestinationResolution::Admitted
+            | crate::state::export_destination::DestinationResolution::Unresolved => {}
         }
 
         let mut store = state.lock();
@@ -309,7 +372,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::export_worker::start(
             ::std::sync::Arc::clone(&self.engine),
             ctx.callback().clone(),
-            crate::state::request_region(ctx.parts()),
+            region,
             task_id.clone(),
         );
 
