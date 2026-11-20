@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopDBInstanceAutomatedBackupsReplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopDBInstanceAutomatedBackupsReplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopDBInstanceAutomatedBackupsReplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the replication of one DB instance's automated backups INTO the Region this call was
+//! made to, the source instance being named by its ARN (`SourceDBInstanceArn`). The backups
+//! already replicated stay: `retained` is the status
+//! `DescribeDBInstanceAutomatedBackups`'s own `status` filter documents for "automated backups
+//! for deleted instances and after backup replication is stopped", so this Region keeps
+//! reporting them, and the source instance's automated backup stops reporting the replication
+//! ([`crate::state::ReplicatedInstanceBackupRecord`]).
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +142,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopDBInstanceAutomatedBackupsReplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopDBInstanceAutomatedBackupsReplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopDBInstanceAutomatedBackupsReplication"))
+        // The Region this call was made to is the DESTINATION whose replication is stopped:
+        // the replicated backups are that Region's, which is the Region a stop is made from
+        // the endpoint of.
+        let destination = crate::state::request_region(ctx)
+            .map_err(StopDBInstanceAutomatedBackupsReplicationError::validation)?;
+
+        // `SourceDBInstanceArn` is "the Amazon Resource Name (ARN) of the source DB instance
+        // for which to stop replicating automate backups", read through the one reading of
+        // that member this service has, so the start and the stop resolve a source the same
+        // way.
+        let Some(source) = crate::state::source_db_instance_of(&input.source_db_instance_arn)
+        else {
+            return Err(
+                StopDBInstanceAutomatedBackupsReplicationError::invalid_parameter_value(
+                    crate::state::invalid_source_db_instance_arn_message(
+                        &input.source_db_instance_arn,
+                    ),
+                ),
+            );
+        };
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a stop nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due in both Regions this call reads, for the
+        // reason the start settles both: the state this stop is judged against is the current
+        // one.
+        store.settle_due_transitions(&destination);
+        if source.region != destination {
+            store.settle_due_transitions(&source.region);
+        }
+
+        // The source instance is resolved FIRST, in the Region its own ARN names: a resource
+        // that does not exist has no replication to stop, and the operation models
+        // `DBInstanceNotFoundFault` for exactly this.
+        let Some(instance) = store
+            .db_instances
+            .get(&(source.region.clone(), source.identifier.clone()))
+        else {
+            return Err(
+                StopDBInstanceAutomatedBackupsReplicationErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        // The value the REQUEST named the source instance by, as the start's
+                        // own refusal names it: the identifier the source ARN carries.
+                        message: Some(format!(
+                            "DBInstance {} not found.",
+                            crate::state::db_instance_identifier_of(
+                                &input.source_db_instance_arn
+                            )
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let identifier = instance.identifier.clone();
+        let resource_id = instance.dbi_resource_id.clone();
+
+        // A source whose backups are not being replicated into this Region has no replication
+        // to stop — one that was never enabled, and one that has already been stopped alike —
+        // which is the state the modelled `InvalidDBInstanceStateFault` reports.
+        let replicating = store
+            .replicated_instance_backup_of(&destination, &resource_id)
+            .is_some_and(crate::state::ReplicatedInstanceBackupRecord::is_replicating);
+        if !replicating {
+            return Err(
+                StopDBInstanceAutomatedBackupsReplicationErrorModeled::InvalidDBInstanceStateFault(
+                    InvalidDBInstanceStateFault {
+                        message: Some(crate::state::backup_replication_not_enabled_message(
+                            &identifier,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The replication is stopped and the backups it had taken are REPORTED BACK as they
+        // now stand: this Region retains them, so the record stays and reads `retained` from
+        // here on, and the source instance's own automated backup no longer reports a
+        // replication to this Region.
+        let record = store
+            .db_instance_automated_backup_replications
+            .get_mut(&(destination.clone(), resource_id.clone()))
+            .ok_or_else(|| {
+                StopDBInstanceAutomatedBackupsReplicationError::internal_failure(
+                    "the replicated automated backup was read under this lock and is gone",
+                )
+            })?;
+        record.stop();
+        Ok(StopDBInstanceAutomatedBackupsReplicationOutput {
+            db_instance_automated_backup: Some(record.to_wire()),
+        })
     }
 }

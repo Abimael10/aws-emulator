@@ -156,8 +156,10 @@ impl AutomatedBackupReference {
 }
 
 impl RetainedInstanceBackupRecord {
-    /// The backup `instance`'s delete retains: its properties as of now, which is the
-    /// instant the delete was accepted.
+    /// The properties of `instance` as of NOW: the instant a delete that keeps its automated
+    /// backup was accepted, or the instant replication of that backup to another Region was
+    /// enabled ([`ReplicatedInstanceBackupRecord`]) — the two calls that take a copy of an
+    /// instance's backup properties, which is why there is one copy of them.
     pub fn of(instance: &DbInstanceRecord) -> Self {
         Self {
             dbi_resource_id: instance.dbi_resource_id.clone(),
@@ -236,11 +238,13 @@ impl RetainedInstanceBackupRecord {
             backup_target: Some(self.backup_target.clone()),
             dedicated_log_volume: Some(self.dedicated_log_volume),
             tag_list: Some(self.tags.clone()),
-            // The REPLICATED backups of another Region, the key store a Transparent Data
-            // Encryption credential lives in, an Amazon Web Services Backup recovery point
-            // and the time zone only a Microsoft SQL Server instance carries: this service
-            // holds none of them, so none is invented. The list is EMPTY rather than absent,
-            // which is what RDS reports for a backup replicated nowhere.
+            // The REPLICATED backups of another Region: the instance this backup was taken
+            // of is GONE, so the replications of its backup are no longer in force and the
+            // list is EMPTY rather than absent, which is what RDS reports for a backup
+            // replicated nowhere. The key store a Transparent Data Encryption credential
+            // lives in, an Amazon Web Services Backup recovery point and the time zone only a
+            // Microsoft SQL Server instance carries: this service holds none of them, so none
+            // is invented.
             db_instance_automated_backups_replications: Some(Vec::new()),
             tde_credential_arn: None,
             aws_backup_recovery_point_arn: None,
@@ -340,8 +344,11 @@ impl DbInstanceRecord {
             backup_target: Some(self.backup_target.clone()),
             dedicated_log_volume: Some(self.dedicated_log_volume),
             tag_list: Some(self.tags.clone()),
-            // As above: the members this service holds no state for are left out rather
-            // than invented, and the replication list is reported EMPTY.
+            // As above: the members this service holds no state for are left out rather than
+            // invented. The replication list is EMPTY here because the replications of this
+            // backup are records of OTHER Regions, which this projection cannot reach — the
+            // store's own projection fills it
+            // ([`ComAmazonawsRdsAmazonrdsv19State::instance_automated_backup_to_wire`]).
             db_instance_automated_backups_replications: Some(Vec::new()),
             tde_credential_arn: None,
             aws_backup_recovery_point_arn: None,
@@ -372,15 +379,17 @@ pub fn instance_automated_backups_arn(region: &str, dbi_resource_id: &str) -> St
 /// `RestoreWindow`: "the earliest and latest time a DB instance can be restored to".
 ///
 /// The window ends at `latest` — the published point the backup covers to — and reaches
-/// `backup_retention_period` days back from it, never before the instance existed, since
-/// there is no data from before the instance to restore.
-fn restore_window(
+/// `backup_retention_period` days back from it, never before `earliest_possible`: the
+/// earliest instant the backup holds any data from, which for an instance's own backup is
+/// when that instance was created and for one replicated to another Region is when the
+/// replication began ([`ReplicatedInstanceBackupRecord::restore_window`]).
+pub(super) fn restore_window(
     latest: ::aws_smithy_types::DateTime,
-    instance_create_time: ::aws_smithy_types::DateTime,
+    earliest_possible: ::aws_smithy_types::DateTime,
     backup_retention_period: i32,
 ) -> RestoreWindow {
     let retention = f64::from(backup_retention_period) * 24.0 * 60.0 * 60.0;
-    let earliest = (latest.as_secs_f64() - retention).max(instance_create_time.as_secs_f64());
+    let earliest = (latest.as_secs_f64() - retention).max(earliest_possible.as_secs_f64());
     RestoreWindow {
         earliest_time: Some(::aws_smithy_types::DateTime::from_secs_f64(earliest)),
         latest_time: Some(latest),

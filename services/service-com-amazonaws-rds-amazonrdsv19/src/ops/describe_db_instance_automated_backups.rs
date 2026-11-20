@@ -3,10 +3,12 @@
 //! @op DescribeDBInstanceAutomatedBackups
 //!
 //! Reports the automated backups of a region's DB instances: the `active` backup of every
-//! instance that keeps continuous backups, projected from the instance's own record, and
-//! the `retained` backup of every instance a delete kept one for
+//! instance that keeps continuous backups, projected from the instance's own record, the
+//! `retained` backup of every instance a delete kept one for
 //! ([`crate::state::RetainedInstanceBackupRecord`]) — "displays backups for both current
-//! and deleted instances". `DbiResourceId`, `DBInstanceIdentifier` and
+//! and deleted instances" — and the backups replicated INTO this region from an instance of
+//! another one ([`crate::state::ReplicatedInstanceBackupRecord`]). `DbiResourceId`,
+//! `DBInstanceIdentifier` and
 //! `DBInstanceAutomatedBackupsArn` each narrow the report to one backup, and a value that
 //! resolves to none is the modelled `DBInstanceAutomatedBackupNotFoundFault`.
 //!
@@ -191,15 +193,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions(&region);
 
         // "Displays backups for both current and deleted instances": the backups of the
-        // instances this store still holds, projected from their own records, and the
-        // retained backups of instances that have been deleted. RDS is regional, so only
-        // the region the request was signed for is in scope, and only an instance that
-        // KEEPS automated backups has one at all — "current instances with retention
-        // periods greater than zero (0) are returned".
+        // instances this store still holds, projected from their own records, the retained
+        // backups of instances that have been deleted, and the backups REPLICATED INTO this
+        // region from an instance of another one
+        // ([`crate::state::ReplicatedInstanceBackupRecord`]) — "the Amazon Resource Name (ARN)
+        // for the replicated automated backups" is in the region they were replicated to, so
+        // this is the report that lists them. RDS is regional, so only the region the request
+        // was signed for is in scope, and only an instance that KEEPS automated backups has
+        // one at all — "current instances with retention periods greater than zero (0) are
+        // returned".
         //
         // Keyed by the source instance's `DbiResourceId`, which "can't be changed", so a
         // page boundary is a cursor that cannot move when an instance is renamed, and the
-        // two sources interleave in one stable order.
+        // sources interleave in one stable order.
         let mut backups: Vec<(String, DBInstanceAutomatedBackup)> = store
             .instances_in(&region)
             .into_iter()
@@ -207,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|instance| {
                 (
                     instance.dbi_resource_id.clone(),
-                    instance.automated_backup_to_wire(),
+                    store.instance_automated_backup_to_wire(instance),
                 )
             })
             .chain(
@@ -215,6 +221,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .retained_instance_backups_in(&region)
                     .into_iter()
                     .map(|backup| (backup.dbi_resource_id.clone(), backup.to_wire())),
+            )
+            .chain(
+                store
+                    .replicated_instance_backups_in(&region)
+                    .into_iter()
+                    .map(|backup| (backup.source.dbi_resource_id.clone(), backup.to_wire())),
             )
             .collect();
         backups.sort_by(|(left, _), (right, _)| left.cmp(right));

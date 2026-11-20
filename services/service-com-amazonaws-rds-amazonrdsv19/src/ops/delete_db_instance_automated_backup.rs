@@ -4,10 +4,13 @@
 //!
 //! Removes the RETAINED automated backup of a DB instance that has been deleted — the
 //! record `DeleteDBInstance` kept when its `DeleteAutomatedBackups` was turned off
-//! ([`crate::state::RetainedInstanceBackupRecord`]) — named by the source instance's
+//! ([`crate::state::RetainedInstanceBackupRecord`]) — or the backups a STOPPED replication
+//! left this region ([`crate::state::ReplicatedInstanceBackupRecord`]), named by the source
+//! instance's
 //! `DbiResourceId` or by the ARN of the backups themselves, and reports the backup it
-//! removed. The backups of an instance this store still holds go with that instance, so
-//! naming one of those is the modelled `InvalidDBInstanceAutomatedBackupStateFault`, and a
+//! removed. The backups of an instance this store still holds go with that instance, and so
+//! do the backups of a replication still in force, so naming either is the modelled
+//! `InvalidDBInstanceAutomatedBackupStateFault`, and a
 //! reference that resolves to no backup is the modelled
 //! `DBInstanceAutomatedBackupNotFoundFault`.
 //!
@@ -200,9 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // leaves its RETAINED backup as the only one under this id.
         store.settle_due_transitions(&region);
 
-        // WHICH backup the reference names: the retained backup of a deleted instance, or
-        // the `active` backup of an instance this store still holds — those two are all
-        // the backups there are ([`crate::state::DbInstanceRecord::has_automated_backup`]).
+        // WHICH backup the reference names: the retained backup of a deleted instance, the
+        // `active` backup of an instance this store still holds, or the backups replicated
+        // into this region from an instance of another one — those are all the backups there
+        // are ([`crate::state::DbInstanceRecord::has_automated_backup`]).
         // Each candidate is matched against the reference by BOTH of its own values, its
         // source instance's resource id and its own ARN, so neither member of the request is
         // taken apart to resolve it.
@@ -226,6 +230,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+        // The backups REPLICATED INTO this region are automated backups of this region too
+        // ([`crate::state::ReplicatedInstanceBackupRecord`]), so this call deletes one of
+        // them as well — once its replication has been stopped. While the replication is
+        // still in force the backups are being written to, which is the other state the
+        // modelled fault reports: `StopDBInstanceAutomatedBackupsReplication` is what ends
+        // it, and only then is there a `retained` backup to delete.
+        let replicated = store
+            .replicated_instance_backup_named(&region, &reference)
+            .cloned();
+        if let Some(record) = replicated {
+            if record.is_replicating() {
+                let identifier = record.source.db_instance_identifier.clone();
+                return Err(
+                    DeleteDBInstanceAutomatedBackupErrorModeled::InvalidDBInstanceAutomatedBackupStateFault(
+                        InvalidDBInstanceAutomatedBackupStateFault {
+                            message: Some(format!(
+                                "The automated backup is being replicated from the DB instance \
+                                 {identifier} and can't be deleted until the replication is \
+                                 stopped."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let Some(removed) = store
+                .remove_replicated_instance_backup(&region, &record.source.dbi_resource_id)
+            else {
+                return Err(DeleteDBInstanceAutomatedBackupError::internal_failure(
+                    "the replicated automated backup was read under this lock and is gone",
+                ));
+            };
+            return Ok(DeleteDBInstanceAutomatedBackupOutput {
+                db_instance_automated_backup: Some(removed.to_wire()),
+            });
         }
         // The retained backup is REMOVED and reported back as it was: "an automated backup
         // of a DB instance ... the database instance properties that existed at the time

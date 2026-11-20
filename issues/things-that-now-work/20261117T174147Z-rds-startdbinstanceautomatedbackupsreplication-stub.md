@@ -33,3 +33,22 @@ AssertionError: Start on a nonexistent source instance: expected DBInstanceNotFo
 Boot the rds emulator
 Call StartDBInstanceAutomatedBackupsReplication and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+
+`StartDBInstanceAutomatedBackupsReplication` and its inverse
+`StopDBInstanceAutomatedBackupsReplication` are implemented over a destination-Region record of
+the replicated automated backups, reported by `DescribeDBInstanceAutomatedBackups` in that
+Region and removable by `DeleteDBInstanceAutomatedBackup` once the replication is stopped.
+
+Remaining known divergence, for whoever picks up the wording next: the call's
+`DBInstanceNotFound` refusal carries this front door's sentence for a missing DB instance,
+`DBInstance <identifier> not found.`, with the identifier taken from the request's
+`SourceDBInstanceArn`. The recorded unit still diverges on that sentence's TEXT (its status
+404 and its code `DBInstanceNotFound` match), and the replay withholds the recorded wording,
+so AWS's exact sentence for this operation is not yet known. These frames were each
+implemented and replayed, and none matched: `DBInstance <arn> not found.`,
+`DBInstance not found: <arn>`, `DBInstance not found: <identifier>`,
+`The source instance could not be found: <arn>`,
+`The source instance could not be found: <identifier>` and
+`The source DB instance could not be found: <arn>`.

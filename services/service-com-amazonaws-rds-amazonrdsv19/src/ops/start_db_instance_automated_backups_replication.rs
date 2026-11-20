@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartDBInstanceAutomatedBackupsReplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartDBInstanceAutomatedBackupsReplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartDBInstanceAutomatedBackupsReplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enables replication of one DB instance's automated backups into the Region this call was
+//! made to: the source instance is named by its ARN (`SourceDBInstanceArn`) and lives in
+//! another Region, and what this stores is the destination Region's own record of the
+//! replicated backups ([`crate::state::ReplicatedInstanceBackupRecord`]), which
+//! `DescribeDBInstanceAutomatedBackups` reports there from then on — `creating` while it waits
+//! for its first replicated snapshot, then `active`. The SOURCE instance's automated backup
+//! reports the replication on its side (`DBInstanceAutomatedBackupsReplications`), read off
+//! this record rather than stored beside it.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +173,219 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartDBInstanceAutomatedBackupsReplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartDBInstanceAutomatedBackupsReplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartDBInstanceAutomatedBackupsReplication"))
+        // The Region this call was made to is the DESTINATION: this operation "enables
+        // replication of automated backups to a different Amazon Web Services Region", and
+        // the Region a replication is enabled from its endpoint is the one the backups are
+        // replicated into.
+        let destination = crate::state::request_region(ctx)
+            .map_err(StartDBInstanceAutomatedBackupsReplicationError::validation)?;
+
+        // `SourceDBInstanceArn` is "the Amazon Resource Name (ARN) of the source DB instance
+        // for the replicated automated backups", so it names BOTH the instance and the Region
+        // it is in — a value that is not a DB instance ARN names no source at all, which is a
+        // bad parameter rather than a resource that is missing.
+        let Some(source) = crate::state::source_db_instance_of(&input.source_db_instance_arn)
+        else {
+            return Err(
+                StartDBInstanceAutomatedBackupsReplicationError::invalid_parameter_value(
+                    crate::state::invalid_source_db_instance_arn_message(
+                        &input.source_db_instance_arn,
+                    ),
+                ),
+            );
+        };
+        // "The retention period for the replicated automated backups", held to the range a DB
+        // instance's own retention period is held to by the one check this service has for it.
+        if let Some(period) = input.backup_retention_period {
+            crate::state::check_backup_retention_period(
+                period,
+                &crate::state::BACKUP_RETENTION_RANGE,
+            )
+            .map_err(
+                StartDBInstanceAutomatedBackupsReplicationError::invalid_parameter_value,
+            )?;
+        }
+        // "A list of tags to associate with the replicated automated backups": caller-sized
+        // data that reaches the store, so it is bounded where it enters the handler, exactly
+        // as every other create of this service bounds the same member.
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags).map_err(
+            StartDBInstanceAutomatedBackupsReplicationError::invalid_parameter_value,
+        )?;
+        // `PreSignedUrl` carries the signed cross-Region request this call would make on the
+        // caller's behalf and "applies only to Amazon Web Services GovCloud (US) Regions.
+        // It's ignored in other Amazon Web Services Regions" — and this emulator serves every
+        // Region from one process, so the source Region is reached under this one lock rather
+        // than through a second signed call.
+        let _ = &input.pre_signed_url;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a replication nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock already made due — owed at this instant whether or not
+        // anybody called — in BOTH Regions this call reads: the destination's replicated
+        // backups, and the source instance whose state this call is judged against.
+        store.settle_due_transitions(&destination);
+        if source.region != destination {
+            store.settle_due_transitions(&source.region);
+        }
+
+        // The source instance is resolved before every gate over STORED state, in the Region
+        // its own ARN names: a resource that does not exist has no automated backups for the
+        // rest of the request to qualify, and the operation models `DBInstanceNotFoundFault`
+        // for exactly this. The gates over the request's own values ran above it, as they do
+        // in every handler of this service: a value a parameter does not accept is a bad
+        // request whether or not the resource it names exists.
+        let Some(instance) = store
+            .db_instances
+            .get(&(source.region.clone(), source.identifier.clone()))
+        else {
+            return Err(
+                StartDBInstanceAutomatedBackupsReplicationErrorModeled::DBInstanceNotFoundFault(
+                    DBInstanceNotFoundFault {
+                        // The sentence this front door words a missing DB instance with in the
+                        // operations that ADDRESS one — the `StartDBInstance` /
+                        // `StopDBInstance` pair this operation is the backup-replication
+                        // counterpart of word it the same way — and its one variable part is
+                        // the instance the request named: the identifier its source ARN
+                        // carries.
+                        message: Some(format!(
+                            "DBInstance {} not found.",
+                            crate::state::db_instance_identifier_of(
+                                &input.source_db_instance_arn
+                            )
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // Backups are replicated "to a DIFFERENT Amazon Web Services Region", so a source in
+        // the Region of the call has nowhere to be replicated to — the backup it keeps there
+        // is already the one that Region reports.
+        if source.region == destination {
+            return Err(
+                StartDBInstanceAutomatedBackupsReplicationError::invalid_parameter_value(
+                    crate::state::same_region_backup_replication_message(
+                        &input.source_db_instance_arn,
+                    ),
+                ),
+            );
+        }
+        // A source that is not up has no automated backup this call can start replicating:
+        // one still coming up has taken none, and one stopped, rebooting or on its way out is
+        // taking none. ONE fixed sentence, which is this service's wording for a source DB
+        // instance that is not in the available state, so it carries nothing of the request.
+        if instance.status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
+            return Err(
+                StartDBInstanceAutomatedBackupsReplicationErrorModeled::InvalidDBInstanceStateFault(
+                    InvalidDBInstanceStateFault {
+                        message: Some(
+                            crate::state::READ_REPLICA_SOURCE_NOT_AVAILABLE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // And a source that keeps no automated backups at all has none to replicate: that is
+        // what a `BackupRetentionPeriod` of zero means ("to disable automated backups, set
+        // this value to 0"), and a member of a DB cluster keeps none of its own either,
+        // because the cluster holds the data its backups are of
+        // ([`crate::state::DbInstanceRecord::has_automated_backup`]). The sentence is the
+        // service's own fixed one for this condition, naming the operation that turns backups
+        // on.
+        if !instance.has_automated_backup() {
+            return Err(
+                StartDBInstanceAutomatedBackupsReplicationErrorModeled::InvalidDBInstanceStateFault(
+                    InvalidDBInstanceStateFault {
+                        message: Some(
+                            crate::state::AUTOMATED_BACKUPS_NOT_ENABLED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let instance = instance.clone();
+        let resource_id = instance.dbi_resource_id.clone();
+        // The destination Region's allowance for automated backups it holds, read before
+        // anything is stored: "the quota for retained automated backups was exceeded. This
+        // prevents you from retaining any additional automated backups", which is the modelled
+        // fault, and a call it refuses replicates nothing.
+        if !store.has_room_for_replicated_instance_backup(&destination, &resource_id) {
+            return Err(
+                StartDBInstanceAutomatedBackupsReplicationErrorModeled::DBInstanceAutomatedBackupQuotaExceededFault(
+                    DBInstanceAutomatedBackupQuotaExceededFault {
+                        message: Some(format!(
+                            "the request would exceed the allowed number of automated backups \
+                             replicated to one region ({} per region, in at most {} regions)",
+                            crate::state::RETAINED_INSTANCE_BACKUP_QUOTA_PER_REGION,
+                            crate::state::MAX_REGIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A replication that is ALREADY in force into this Region is not taken again: the
+        // backups keep the status and the window they have — "enables replication" is in force
+        // once, and a resource that is up stays up — and this call re-asserts the settings it
+        // carries on them, so nothing it named is dropped. A Region whose replication was
+        // STOPPED begins a new one, from the source as it stands now.
+        let record = match store
+            .replicated_instance_backup_of(&destination, &resource_id)
+            .filter(|record| record.is_replicating())
+            .cloned()
+        {
+            Some(mut record) => {
+                // Tags accumulate across calls, so the bound one resource's tag list is held
+                // to is checked here as well as per request: the one check this service has
+                // for that ([`crate::state::check_tag_capacity`]).
+                crate::state::check_tag_capacity(
+                    record.tags.len(),
+                    crate::state::added_key_count(&record.tags, &tags),
+                )
+                .map_err(
+                    StartDBInstanceAutomatedBackupsReplicationError::invalid_parameter_value,
+                )?;
+                if let Some(period) = input.backup_retention_period {
+                    record.backup_retention_period = period;
+                }
+                if let Some(key) = input.kms_key_id.clone() {
+                    record.kms_key_id = Some(key);
+                }
+                crate::state::merge_tags(&mut record.tags, &tags);
+                record
+            }
+            None => crate::state::ReplicatedInstanceBackupRecord::started(
+                &destination,
+                &instance,
+                input.backup_retention_period,
+                input.kms_key_id.clone(),
+                tags,
+            ),
+        };
+        store.replicate_instance_automated_backup(record);
+
+        // Reported back from the store, so what the caller is told is exactly what a
+        // `DescribeDBInstanceAutomatedBackups` of this Region now reports.
+        let db_instance_automated_backup = store
+            .replicated_instance_backup_of(&destination, &resource_id)
+            .map(crate::state::ReplicatedInstanceBackupRecord::to_wire)
+            .ok_or_else(|| {
+                StartDBInstanceAutomatedBackupsReplicationError::internal_failure(
+                    "the replicated automated backup was stored under this lock and is gone",
+                )
+            })?;
+        Ok(StartDBInstanceAutomatedBackupsReplicationOutput {
+            db_instance_automated_backup: Some(db_instance_automated_backup),
+        })
     }
 }

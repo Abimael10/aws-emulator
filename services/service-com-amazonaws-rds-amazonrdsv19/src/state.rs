@@ -82,7 +82,8 @@ use crate::ops::types::{
     CreateDBClusterEndpointOutput, CreateDBShardGroupOutput,
     DBCluster, DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus,
     DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute,
-    DBClusterSnapshotAttributesResult, DBInstance, DBInstanceAutomatedBackup, DBInstanceRole,
+    DBClusterSnapshotAttributesResult, DBInstance, DBInstanceAutomatedBackup,
+    DBInstanceAutomatedBackupsReplication, DBInstanceRole,
     DBInstanceStatusInfo,
     DBParameterGroup,
     DBParameterGroupStatus,
@@ -316,6 +317,10 @@ mod clusters;
 // backups has, and the record a delete that asked to keep it leaves behind.
 mod instance_automated_backups;
 pub use instance_automated_backups::*;
+// And the REPLICATION of those automated backups to another Amazon Web Services Region: the
+// destination Region's own record of one, which the start enables and the stop ends.
+mod instance_backup_replication;
+pub use instance_backup_replication::*;
 // The weekly maintenance window both resource kinds keep: the form it is STORED in, and
 // when its next occurrence begins.
 pub mod maintenance_window;
@@ -430,6 +435,20 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// ([`DbInstanceRecord::automated_backup_to_wire`]), so an instance and its automated
     /// backup cannot disagree.
     pub db_instance_automated_backups: BTreeMap<RegionalKey, RetainedInstanceBackupRecord>,
+    /// The automated backups REPLICATED INTO a Region from a DB instance of another one, by
+    /// `(destination region, DbiResourceId)` — the id of the source instance, so one source
+    /// instance has one record per destination Region. Ordered, so
+    /// `DescribeDBInstanceAutomatedBackups` pages deterministically within a region.
+    ///
+    /// `StartDBInstanceAutomatedBackupsReplication` inserts here — bounded by
+    /// [`RETAINED_INSTANCE_BACKUP_QUOTA_PER_REGION`] per region and by [`MAX_REGIONS`]
+    /// regions — and `StopDBInstanceAutomatedBackupsReplication` leaves the record behind as
+    /// the `retained` backups the stopped replication had taken. The SOURCE instance's own
+    /// half of the relationship is not stored: its automated backup reports the replications
+    /// read off these records ([`Self::automated_backups_replications_of`]), so the two
+    /// cannot disagree.
+    pub db_instance_automated_backup_replications:
+        BTreeMap<RegionalKey, ReplicatedInstanceBackupRecord>,
     /// DB CLUSTER snapshots by `(region, DBClusterSnapshotIdentifier)` — the identifier
     /// always stored lowercased, as `DBClusterSnapshotIdentifier` documents ("This value
     /// is stored as a lowercase string"). Ordered, so `DescribeDBClusterSnapshots` pages
@@ -898,6 +917,10 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         for key in gone {
             self.custom_db_engine_versions.remove(&key);
         }
+        // The automated backups replicated INTO this region owe the clock the one transition
+        // a backup still waiting for its first replicated snapshot has: `creating` ->
+        // `active`. Nothing removes one, so this walk answers no keys.
+        self.settle_replicated_instance_backups(region, now);
         // An event subscription is in no transient status and owes the clock no
         // transition: it is a notification rule, so a create, a modify and a delete of one
         // are all in force by the time that call answers (see `EventSubscriptionRecord`).
@@ -1988,6 +2011,9 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             // A retained automated backup outlives the instance it was taken of, so its
             // region is counted here too rather than only while that instance is stored.
             .chain(self.db_instance_automated_backups.keys())
+            // And so do the automated backups replicated INTO a region, which outlive both
+            // the source instance and the replication that took them.
+            .chain(self.db_instance_automated_backup_replications.keys())
             .chain(self.db_cluster_snapshots.keys())
             .chain(self.db_clusters.keys())
             .chain(self.db_cluster_endpoints.keys())
