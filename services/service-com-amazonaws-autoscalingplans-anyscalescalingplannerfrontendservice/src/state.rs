@@ -1067,12 +1067,14 @@ pub const MAX_TARGET_TRACKING_CONFIGURATIONS: usize = 10;
 /// states its bound.
 pub const TARGET_TRACKING_ENTRIES: &str = "target tracking configurations";
 
-/// The smallest `MinCapacity` a scaling instruction may ask for.
-///
-/// `ResourceCapacity` carries no `@range` in the model, but the service refuses a
-/// minimum capacity below one unit ("Minimum capacity cannot be less than 1"): a
-/// scaling instruction has to leave the resource at least one unit of capacity.
-pub const MIN_RESOURCE_CAPACITY: i32 = 1;
+// `ScalingInstruction$MinCapacity` and `$MaxCapacity` both target `ResourceCapacity`,
+// declared `{"type": "integer"}` with no `@range`
+// (`smithy_query(query="shape",shape="ResourceCapacity")`), and are documented only as
+// "The minimum capacity of the resource" / "The maximum capacity of the resource", so
+// NEITHER member carries a bound of its own: a resource whose floor is zero asks for a
+// minimum of zero and that is the band the plan registers for it. The one relation the
+// pair has to satisfy is the cross-member one in [`validate_scaling_instruction`], so no
+// constant here states a capacity floor.
 
 /// Lower bound of `ScalingInstruction$PredictiveScalingMaxCapacityBuffer`: "The range
 /// is 1-100."
@@ -1420,13 +1422,9 @@ fn validate_scaling_instruction(
     )?;
 
     // "The minimum capacity of the resource" / "The maximum capacity of the resource":
-    // a capacity is a count of units, and the maximum bounds the minimum. The refusals
-    // name the members in prose, the way the service words them.
-    if instruction.min_capacity < MIN_RESOURCE_CAPACITY {
-        return Err(format!(
-            "Minimum capacity cannot be less than {MIN_RESOURCE_CAPACITY}"
-        ));
-    }
+    // neither member is bounded on its own, and the only relation between the two is
+    // that the band they describe is not inverted. The refusal names the members in
+    // prose, the way the service words them.
     if instruction.max_capacity < instruction.min_capacity {
         return Err("Maximum capacity cannot be less than minimum capacity".to_string());
     }

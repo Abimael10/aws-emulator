@@ -6,7 +6,10 @@
 //!    members contradict each other or the documented relations between them — is
 //!    refused with the modelled `ValidationException` (HTTP 400) and stores nothing.
 //!    The rows below each name a different documented relation; a maximum capacity
-//!    below its minimum is one of them, not the rule.
+//!    below its minimum is one of them, not the rule. A member the model leaves
+//!    unconstrained, and whose documentation states no bound, is NOT one of them:
+//!    [`a_capacity_band_is_applied_as_given_whatever_its_minimum`] drives the capacity
+//!    pair over a table of bands, zero-based ones included.
 //! 2. `DescribeScalingPlanResources` identifies ONE plan by its two required members but
 //!    models no not-found error, so a lookup on a `ScalingPlanName` that finds no stored
 //!    plan reports the empty set of scalable resources (HTTP 200,
@@ -17,14 +20,16 @@
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::ops::types::FORECAST_DATA_TYPE_VALUES;
 use service_com_amazonaws_autoscalingplans_anyscalescalingplannerfrontendservice::state::{
     ALB_LOAD_METRIC_TYPE, ALB_SCALING_METRIC_TYPE, BEHAVIOR_ABOVE_FORECAST_CAPACITY,
     MAX_CAPACITY_BUFFER_MAX, MAX_CAPACITY_BUFFER_MIN, MAX_TARGET_TRACKING_CONFIGURATIONS,
-    MIN_RESOURCE_CAPACITY, TARGET_VALUE_MAX, TARGET_VALUE_MIN,
+    TARGET_VALUE_MAX, TARGET_VALUE_MIN,
 };
 
+use crate::forecast_datapoints::points;
 use crate::scaling_plan_lifecycle::{
-    instruction, simple_instructions, stack_source, Emulator,
+    instruction, now_secs, simple_instructions, stack_source, Emulator,
 };
 
 /// The instruction every row starts from: valid, and the one the sibling suite uses.
@@ -117,12 +122,8 @@ fn refused_instruction_lists() -> Vec<(&'static str, Value)> {
             json!([with(&[("MinCapacity", json!(4)), ("MaxCapacity", json!(3))])]),
         ),
         (
-            "a minimum capacity one below the floor",
-            json!([with(&[("MinCapacity", json!(MIN_RESOURCE_CAPACITY - 1))])]),
-        ),
-        (
-            "a negative minimum capacity",
-            json!([with(&[("MinCapacity", json!(-1))])]),
+            "a maximum capacity below a zero minimum capacity",
+            json!([with(&[("MinCapacity", json!(0)), ("MaxCapacity", json!(-1))])]),
         ),
         (
             "a negative maximum capacity",
@@ -408,8 +409,16 @@ fn accepted_instruction_lists() -> Vec<(&'static str, Value)> {
             json!([with(&[("MinCapacity", json!(7)), ("MaxCapacity", json!(7))])]),
         ),
         (
-            "a minimum capacity at the floor",
-            json!([with(&[("MinCapacity", json!(MIN_RESOURCE_CAPACITY))])]),
+            "a minimum capacity of one unit",
+            json!([with(&[("MinCapacity", json!(1))])]),
+        ),
+        (
+            "a zero minimum capacity — a scale-to-zero resource",
+            json!([with(&[("MinCapacity", json!(0))])]),
+        ),
+        (
+            "a band that is zero wide at zero",
+            json!([with(&[("MinCapacity", json!(0)), ("MaxCapacity", json!(0))])]),
         ),
         (
             "exactly as many target tracking configurations as the bound allows",
@@ -838,4 +847,236 @@ async fn describe_scaling_plan_resources_reports_an_empty_set_for_a_lookup_that_
         Some(1),
         "the stored plan must still report its one resource, got {described}"
     );
+}
+
+/// The capacity band one instruction asks for, over a table of bands.
+///
+/// `ScalingInstruction$MinCapacity` and `$MaxCapacity` both target `ResourceCapacity`, an
+/// integer the model gives no `@range`
+/// (`smithy_query(query="shape",shape="ResourceCapacity,ScalingInstruction")`), and both
+/// are documented only as "The minimum capacity of the resource" / "The maximum capacity
+/// of the resource" — so neither member carries a bound of its own and only the relation
+/// between the two can be broken: a band whose maximum does not sit below its minimum is
+/// applied, and read back exactly as it was written. The rows differ along what that rule
+/// generalises over: the VALUE of the minimum (zero, one unit, several units) and the
+/// WIDTH of the band (nothing, one unit, wide).
+#[tokio::test]
+async fn a_capacity_band_is_applied_as_given_whatever_its_minimum() {
+    for (label, min, max) in [
+        ("a scale-to-zero resource", 0, 1),
+        ("a band of no width at zero", 0, 0),
+        ("a zero minimum under a wide band", 0, 10_000),
+        ("a minimum of one unit", 1, 1),
+        ("a minimum several units up", 5, 25),
+    ] {
+        let emulator = Emulator::new();
+        let instructions = json!([with(&[
+            ("MinCapacity", json!(min)),
+            ("MaxCapacity", json!(max)),
+        ])]);
+        let created = emulator
+            .ok(
+                "CreateScalingPlan",
+                json!({
+                    "ScalingPlanName": "my-plan",
+                    "ApplicationSource": stack_source(1),
+                    "ScalingInstructions": instructions,
+                }),
+            )
+            .await;
+        assert_eq!(
+            created.get("ScalingPlanVersion"),
+            Some(&json!(1)),
+            "case {label:?} ({min}..{max}): expected the plan to be created at version 1, \
+             got {created}"
+        );
+
+        // The band is stored as given, and the plan it belongs to settles once its
+        // creation transition is due.
+        emulator.make_all_due();
+        let described = emulator
+            .ok("DescribeScalingPlans", json!({ "ScalingPlanNames": ["my-plan"] }))
+            .await;
+        let plan = &described["ScalingPlans"][0];
+        assert_eq!(
+            plan.get("StatusCode"),
+            Some(&json!("Active")),
+            "case {label:?} ({min}..{max}): a created plan settles Active, got {plan}"
+        );
+        assert_eq!(
+            plan["ScalingInstructions"][0].get("MinCapacity"),
+            Some(&json!(min)),
+            "case {label:?} ({min}..{max}): the minimum capacity did not round-trip, got \
+             {plan}"
+        );
+        assert_eq!(
+            plan["ScalingInstructions"][0].get("MaxCapacity"),
+            Some(&json!(max)),
+            "case {label:?} ({min}..{max}): the maximum capacity did not round-trip, got \
+             {plan}"
+        );
+
+        // The resource that band was registered for is reported, so the accepted
+        // instruction is applied and not merely stored.
+        let resources = emulator
+            .ok(
+                "DescribeScalingPlanResources",
+                json!({ "ScalingPlanName": "my-plan", "ScalingPlanVersion": 1 }),
+            )
+            .await;
+        assert_eq!(
+            resources["ScalingPlanResources"].as_array().map(Vec::len),
+            Some(1),
+            "case {label:?} ({min}..{max}): one instruction covers one resource, got \
+             {resources}"
+        );
+
+        // The inverted band is the one relation the pair has to satisfy, so one unit
+        // below this minimum is refused however low the minimum itself is.
+        let emulator = Emulator::new();
+        let (status, code) = emulator
+            .err(
+                "CreateScalingPlan",
+                json!({
+                    "ScalingPlanName": "my-plan",
+                    "ApplicationSource": stack_source(1),
+                    "ScalingInstructions": json!([with(&[
+                        ("MinCapacity", json!(min)),
+                        ("MaxCapacity", json!(min - 1)),
+                    ])]),
+                }),
+            )
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {label:?} ({min}..{}): an inverted band is refused, got {status} / \
+             {code:?}",
+            min - 1
+        );
+    }
+}
+
+/// A plan over a scale-to-zero resource reaches the whole predictive-scaling surface.
+///
+/// The members that configure predictive scaling are independent of the capacity band —
+/// `PredictiveScalingMode` "The predictive scaling mode", `DisableDynamicScaling`
+/// "Controls whether dynamic scaling by AWS Auto Scaling is disabled" — so a plan whose
+/// minimum capacity is zero is created, settles, reports those members as written, and
+/// answers every modelled `ForecastDataType`
+/// (`smithy_query(query="shape",shape="ForecastDataType")`, mirrored as
+/// `FORECAST_DATA_TYPE_VALUES`).
+#[tokio::test]
+async fn a_forecast_only_plan_over_a_scale_to_zero_resource_is_reachable() {
+    let emulator = Emulator::new();
+    let instructions = json!([with(&[
+        ("MinCapacity", json!(0)),
+        ("MaxCapacity", json!(1)),
+        (
+            "PredefinedLoadMetricSpecification",
+            json!({ "PredefinedLoadMetricType": "ASGTotalCPUUtilization" })
+        ),
+        ("PredictiveScalingMode", json!("ForecastOnly")),
+        ("DisableDynamicScaling", json!(true)),
+    ])]);
+    let created = emulator
+        .ok(
+            "CreateScalingPlan",
+            json!({
+                "ScalingPlanName": "forecast-only",
+                "ApplicationSource": stack_source(1),
+                "ScalingInstructions": instructions,
+            }),
+        )
+        .await;
+    assert_eq!(
+        created.get("ScalingPlanVersion"),
+        Some(&json!(1)),
+        "a forecast-only plan over a zero minimum is created at version 1, got {created}"
+    );
+
+    emulator.make_all_due();
+    let described = emulator
+        .ok(
+            "DescribeScalingPlans",
+            json!({ "ScalingPlanNames": ["forecast-only"] }),
+        )
+        .await;
+    let plan = &described["ScalingPlans"][0];
+    assert_eq!(
+        plan.get("StatusCode"),
+        Some(&json!("Active")),
+        "the forecast-only plan settles Active, got {plan}"
+    );
+    assert_eq!(
+        plan.get("ScalingInstructions"),
+        Some(&instructions),
+        "the forecast-only instruction did not round-trip, got {plan}"
+    );
+
+    // Every forecast data type is reachable for the resource the plan instructs, over a
+    // window around the current forecast interval. `points` requires each read to answer
+    // 200 with a `Datapoints` list, and each quantity is reported per forecast interval of
+    // the requested window, so the zero-minimum plan is forecast over the same instants as
+    // an otherwise identical plan whose minimum is one unit: the band does not decide
+    // which intervals a resource is forecast over. WHAT each data point carries, and
+    // whether a resource has a forecast at all, are the forecast surface's own rules,
+    // asserted by [`crate::forecast_datapoints`].
+    let issued_at = now_secs();
+    let window = (issued_at - 3_600, issued_at + 4 * 3_600);
+    let twin = Emulator::new();
+    let twin_instructions = json!([with(&[
+        ("MinCapacity", json!(1)),
+        ("MaxCapacity", json!(1)),
+        (
+            "PredefinedLoadMetricSpecification",
+            json!({ "PredefinedLoadMetricType": "ASGTotalCPUUtilization" })
+        ),
+        ("PredictiveScalingMode", json!("ForecastOnly")),
+        ("DisableDynamicScaling", json!(true)),
+    ])]);
+    twin.ok(
+        "CreateScalingPlan",
+        json!({
+            "ScalingPlanName": "forecast-only",
+            "ApplicationSource": stack_source(1),
+            "ScalingInstructions": twin_instructions,
+        }),
+    )
+    .await;
+    twin.make_all_due();
+
+    for data_type in FORECAST_DATA_TYPE_VALUES {
+        let got = points(
+            &emulator,
+            "forecast-only",
+            "autoScalingGroup/my-asg",
+            data_type,
+            window,
+        )
+        .await;
+        for (at, _) in &got {
+            assert!(
+                *at >= window.0 && *at < window.1,
+                "case {data_type}: a data point sits inside the requested window, got {at}"
+            );
+        }
+        let instants: Vec<i64> = got.iter().map(|(at, _)| *at).collect();
+        let twin_instants: Vec<i64> = points(
+            &twin,
+            "forecast-only",
+            "autoScalingGroup/my-asg",
+            data_type,
+            window,
+        )
+        .await
+        .iter()
+        .map(|(at, _)| *at)
+        .collect();
+        assert_eq!(
+            instants, twin_instants,
+            "case {data_type}: the zero-minimum plan is forecast over the same intervals \
+             as its one-unit twin, got {instants:?} against {twin_instants:?}"
+        );
+    }
 }
