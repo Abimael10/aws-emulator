@@ -24,8 +24,24 @@ tracing = { workspace = true }
 # The IAM Identity Center instances of this account, whose access portal is what a
 # device authorization's `startUrl` has to name: the instances are IAM Identity
 # Center's own records, so this service resolves the portal against them rather
-# than keeping a second copy of them.
+# than keeping a second copy of them. Its applications and trusted token issuers are
+# what the JWT-bearer grant of `CreateTokenWithIAM` is authorized by
+# (`src/state/trusted_identity.rs`), read from the same records.
 service-com-amazonaws-ssoadmin-swbexternalservice = { workspace = true }
+# The identity store of an Identity Center instance holds the USERS a JWT-bearer
+# assertion's claims resolve to, so the exchange matches the claim against the stored
+# user where that user lives (`src/state/trusted_identity.rs`).
+service-com-amazonaws-identitystore-awsidentitystore = { workspace = true }
+# A trusted token issuer this emulator serves is an Amazon Cognito user pool, which
+# publishes the key set an assertion's signature is verified against: the set is read
+# from the pool's own state in this process rather than fetched over a network
+# (`src/state/trusted_identity.rs`).
+service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice = { workspace = true }
+# The workspace's one reading of a compact JWS and one signing of it: the assertion is
+# verified with `service_common::jwt` and the identity token this service mints is signed
+# with `service_common::jws_signing`, so what one emulated issuer signs and what another
+# verifies cannot diverge.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

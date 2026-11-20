@@ -20,6 +20,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// them.
 use service_com_amazonaws_ssoadmin_swbexternalservice as identity_center;
 
+/// The JWT-BEARER grant's own reading: whether a presented assertion is one a trusted
+/// token issuer of this account signed, and which Identity Store user its claims name.
+/// It reads three other services' records, so it lives beside this state rather than in
+/// the handler that spends the grant.
+mod trusted_identity;
+pub use trusted_identity::*;
+
 /// The only `clientType` the service accepts: "The service supports only public
 /// as a client type. Anything other than public will be rejected by the
 /// service." (`RegisterClientRequest$clientType` documentation).
@@ -90,6 +97,29 @@ pub const ISSUABLE_TOKEN_TYPE_URIS: &[&str] =
 /// documentation).
 pub const TOKEN_TYPE_BEARER: &str = "Bearer";
 
+/// The scopes every identity-bound exchange is authorized for beside the ones its
+/// application is configured with: "If the value is not specified, IAM Identity Center
+/// authorizes all scopes configured for the application, including the following default
+/// scopes: openid, aws, sts:identity_context" (`CreateTokenWithIAMRequest$scope`).
+pub const DEFAULT_IDENTITY_SCOPES: &[&str] = &["openid", "aws", IDENTITY_CONTEXT_CLAIM];
+
+/// Every scope an identity-bound exchange may be granted for an application configured
+/// with `application_scopes`: the documented defaults, then the application's own, each
+/// named once and in that order, so a response's `scope` does not depend on how either
+/// list was built.
+pub fn granted_identity_scopes(application_scopes: &[String]) -> Vec<String> {
+    let mut granted: Vec<String> = DEFAULT_IDENTITY_SCOPES
+        .iter()
+        .map(|scope| (*scope).to_string())
+        .collect();
+    for scope in application_scopes {
+        if !granted.contains(scope) {
+            granted.push(scope.clone());
+        }
+    }
+    granted
+}
+
 // The `error_description` every refusal of this service carries.
 //
 // Each error shape of this API carries `error` and `error_description`, and the
@@ -144,6 +174,22 @@ pub const DESCRIPTION_INVALID_SUBJECT_TOKEN: &str = "Invalid subject token provi
 
 /// An `assertion` from no token issuer this service trusts (`invalid_grant`).
 pub const DESCRIPTION_INVALID_ASSERTION: &str = "Invalid assertion provided";
+
+/// An `assertion` whose claims name no user of the identity store the application's
+/// instance holds (`invalid_grant`): the identity the assertion names is a resource this
+/// instance does not have, which is the FIXED text of that case.
+///
+/// A separate text from an assertion this exchange may not spend at all: the assertion
+/// itself verified against an issuer the application authorizes, and it identifies nobody
+/// this instance can issue a token for — which RFC 7523 §3.1 refuses as an invalid grant,
+/// with the case named so the two outcomes are distinguishable.
+pub const DESCRIPTION_UNRESOLVED_IDENTITY: &str = "Resource not found";
+
+/// A client that is not authorized for the grant it presents
+/// (`unauthorized_client`). RFC 6749 §5.2 states that class as "the authenticated client
+/// is not authorized to use this authorization grant type".
+pub const DESCRIPTION_UNAUTHORIZED_CLIENT: &str =
+    "Client is not authorized to use this grant type";
 
 /// A grant that resolves to nothing, where no single member carries the failure
 /// (`invalid_grant`).
@@ -253,6 +299,12 @@ pub const MAX_ACCESS_TOKENS: usize = 5_000;
 
 /// See [`MAX_CLIENTS`].
 pub const MAX_REFRESH_TOKENS: usize = 5_000;
+
+/// See [`MAX_CLIENTS`]. A spent-assertion record is dropped at the assertion's own
+/// expiry, so this bounds only how many unexpired assertions one process can have spent;
+/// at the ceiling the record expiring soonest gives way, so the assertions just presented
+/// are the ones that stay single-use.
+pub const MAX_SPENT_ASSERTIONS: usize = 5_000;
 
 /// How many times a fresh user code is drawn before the service gives up, so the
 /// draw cannot spin while the state lock is held.
@@ -408,6 +460,16 @@ pub struct IssuedToken {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub id_token: Option<String>,
+    /// The Identity Center identity this token is BOUND to, for a token minted from a
+    /// grant that authenticated a user of an identity store (the JWT-bearer grant's
+    /// assertion), and `None` for a token of a grant that authenticated only a client.
+    /// It is what [`Self::id_token`] states and what makes the token identity-bound, so
+    /// it is recorded on the token rather than re-derived from whoever presents it.
+    pub identity: Option<BoundIdentity>,
+    /// The trusted context assertion this token was issued with, which the response
+    /// carries as `awsAdditionalDetails.identityContext` and the identity token as its
+    /// [`IDENTITY_CONTEXT_CLAIM`]. Present exactly for an identity-bound token.
+    pub identity_context: Option<String>,
     pub client_id: String,
     /// The sign-in session this token belongs to; see [`SignInSession`].
     pub sign_in_session: String,
@@ -427,6 +489,7 @@ impl std::fmt::Debug for IssuedToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IssuedToken")
             .field("client_id", &self.client_id)
+            .field("identity", &self.identity)
             .field("scopes", &self.scopes)
             .field("token_type", &self.token_type)
             .field("region", &self.region)
@@ -559,6 +622,25 @@ pub struct ComAmazonawsSsooidcAwsssooidcserviceState {
     pub access_tokens: HashMap<String, IssuedToken>,
     /// Issued refresh tokens by `refreshToken`, each with its own lifetime.
     pub refresh_tokens: HashMap<String, RefreshGrant>,
+    /// The `jti` of every JWT-bearer assertion an exchange has already spent, with the
+    /// instant that assertion's own `exp` falls at.
+    ///
+    /// RFC 7523 §3: an authorization server "MAY ensure that JWTs are not replayed by
+    /// maintaining the set of used `jti` values", which is what makes an assertion
+    /// single-use. The record is needed only while the assertion could still be presented
+    /// again, so it is dropped at that expiry
+    /// ([`ComAmazonawsSsooidcAwsssooidcserviceState::purge_spent_assertions`]) and the map
+    /// never grows past [`MAX_SPENT_ASSERTIONS`]. No assertion is stored, only the
+    /// identifier it published of itself.
+    pub spent_assertions: HashMap<String, SystemTime>,
+    /// The key this service signs the identity token of an identity-bound exchange with,
+    /// generated on the first exchange that mints one.
+    ///
+    /// One key for this service, as a token issuer has: every identity token it mints
+    /// names that key, so a holder of two of them can tell they came from one issuer.
+    /// Generating a key pair is CPU-bound work in milliseconds, so it happens once rather
+    /// than per request, and the private half never leaves the signing seam.
+    id_token_key: Option<::service_common::jws_signing::SigningKey>,
 }
 
 /// Prints the shape of the store, never a stored credential.
@@ -569,6 +651,7 @@ impl std::fmt::Debug for ComAmazonawsSsooidcAwsssooidcserviceState {
             .field("device_auths", &self.device_auths.len())
             .field("access_tokens", &self.access_tokens.len())
             .field("refresh_tokens", &self.refresh_tokens.len())
+            .field("spent_assertions", &self.spent_assertions.len())
             .finish_non_exhaustive()
     }
 }
@@ -746,6 +829,10 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
             access_token: access_token.clone(),
             refresh_token: refresh_token.clone(),
             id_token: None,
+            // A grant that authenticated only a client binds no identity; the one grant
+            // that does binds it through `issue_identity_bound_token` below.
+            identity: None,
+            identity_context: None,
             client_id: client_id.to_string(),
             sign_in_session,
             scopes,
@@ -773,6 +860,118 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
         }
         self.access_tokens.insert(access_token, token.clone());
         token
+    }
+
+    /// Mints and persists an IDENTITY-BOUND access token for the application
+    /// `application_arn`, issued by the endpoint in `region`, for the identity an
+    /// exchange resolved: the token records that identity, and the identity token beside
+    /// it ("a JSON Web Token (JWT) that identifies the user associated with the issued
+    /// access token", `CreateTokenWithIAMResponse$idToken`) states it.
+    ///
+    /// The exchange is the user's OWN authentication — the assertion was signed by an
+    /// issuer the application trusts to authenticate them — so this begins a sign-in
+    /// session of its own (see [`SignInSession`]).
+    ///
+    /// No refresh token is minted beside it: the refresh-token grant of this endpoint
+    /// re-issues against a client registration, which an application ARN is not, so a
+    /// refresh token handed out here would name a grant no later call could spend.
+    ///
+    /// The identity token is SIGNED, so an identity-bound token is either signed or
+    /// issued without one: if the signature cannot be computed the access token still
+    /// carries the identity in this store, and the response states no identity token and
+    /// no trusted context assertion rather than an unsigned value.
+    pub fn issue_identity_bound_token(
+        &mut self,
+        application_arn: &str,
+        region: &str,
+        scopes: Vec<String>,
+        identity: BoundIdentity,
+        now: SystemTime,
+    ) -> IssuedToken {
+        let mut token = self.issue_token(
+            application_arn,
+            region,
+            scopes,
+            false,
+            SignInSession::Begun,
+            now,
+        );
+        let identity_context = mint_opaque_value();
+        let claims = identity_token_claims(&token, &identity, &identity_context);
+        match self
+            .id_token_signing_key()
+            .and_then(|key| key.signed_compact_jws(&claims))
+        {
+            Some(id_token) => {
+                token.id_token = Some(id_token);
+                token.identity_context = Some(identity_context);
+            }
+            None => tracing::warn!(
+                target: "sso.oidc",
+                "an identity token could not be signed, so the exchange states none"
+            ),
+        }
+        token.identity = Some(identity);
+        // The record this store holds is what was answered, so a later read of the token
+        // resolves the same identity the caller was handed.
+        self.access_tokens
+            .insert(token.access_token.clone(), token.clone());
+        token
+    }
+
+    /// The key every identity token of this service is signed with, generated on first
+    /// use; `None` only when the signing seam could not produce a key, in which case
+    /// nothing is signed with something that is not one.
+    fn id_token_signing_key(&mut self) -> Option<&::service_common::jws_signing::SigningKey> {
+        if self.id_token_key.is_none() {
+            self.id_token_key = ::service_common::jws_signing::SigningKey::generate(
+                ID_TOKEN_SIGNING_ALGORITHM,
+            );
+        }
+        self.id_token_key.as_ref()
+    }
+
+    /// Whether `assertion_id` names a JWT-bearer assertion an earlier exchange already
+    /// spent. A READ: it reports what is recorded and records nothing.
+    pub fn assertion_already_spent(&self, assertion_id: &str) -> bool {
+        self.spent_assertions.contains_key(assertion_id)
+    }
+
+    /// Records that the assertion `assertion_id` names has been spent, until its own
+    /// `exp` at `expires_at`.
+    ///
+    /// Prunes first — a record the clock has already made pointless is dropped, which is
+    /// owed at this instant whether or not anybody exchanged anything — and at
+    /// [`MAX_SPENT_ASSERTIONS`] the record expiring soonest gives way.
+    pub fn record_spent_assertion(
+        &mut self,
+        assertion_id: String,
+        expires_at: SystemTime,
+        now: SystemTime,
+    ) {
+        self.purge_spent_assertions(now);
+        while self.spent_assertions.len() >= MAX_SPENT_ASSERTIONS {
+            let soonest = self
+                .spent_assertions
+                .iter()
+                .min_by_key(|(_, expires_at)| **expires_at)
+                .map(|(id, _)| id.clone());
+            match soonest {
+                Some(id) => {
+                    self.spent_assertions.remove(&id);
+                }
+                None => break,
+            }
+        }
+        self.spent_assertions.insert(assertion_id, expires_at);
+    }
+
+    /// Drops every spent-assertion record the clock has made pointless: past its own
+    /// `exp` the assertion is refused for being outside its window, so nothing more is
+    /// needed to keep it from being replayed.
+    pub fn purge_spent_assertions(&mut self, now: SystemTime) {
+        self.spent_assertions
+            .retain(|_, expires_at| now < *expires_at);
     }
 
     /// Ends the sign-in session the access token `access_token` belongs to: every

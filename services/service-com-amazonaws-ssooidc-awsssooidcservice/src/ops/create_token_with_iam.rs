@@ -4,8 +4,11 @@
 //! Issues a token to an IAM-authenticated caller from persisted state: the caller is
 //! authenticated by its SigV4 identity rather than a `clientSecret` (the request models
 //! none), so this operation resolves the grant it is handed — a persisted `refreshToken`,
-//! or a persisted access token presented as the subject of a token exchange — against the
-//! store, and mints and persists the token it returns.
+//! a persisted access token presented as the subject of a token exchange, or a JWT a
+//! trusted token issuer signed presented as a JWT-bearer `assertion` — and mints and
+//! persists the token it returns. The JWT-bearer grant is the one that authenticates a
+//! USER, so the token it mints is bound to the Identity Store identity the assertion's
+//! claims resolve to (`crate::state::resolve_jwt_bearer_assertion`).
 //!
 //! ## Shape of an operation
 //!
@@ -296,8 +299,63 @@ fn slow_down() -> CreateTokenWithIAMError {
     .into()
 }
 
+/// `UnauthorizedClientException` (400): the client the request names exists and is not
+/// authorized to make this exchange — RFC 6749 §5.2's `unauthorized_client`, "the
+/// authenticated client is not authorized to use this authorization grant type". The text
+/// is the FIXED one of the class.
+fn unauthorized_client() -> CreateTokenWithIAMError {
+    CreateTokenWithIAMErrorModeled::UnauthorizedClientException(UnauthorizedClientException {
+        error: Some("unauthorized_client".to_string()),
+        error_description: Some(st::DESCRIPTION_UNAUTHORIZED_CLIENT.to_string()),
+    })
+    .into()
+}
+
+/// `InvalidGrantException` (400): the assertion verified against an issuer the application
+/// authorizes, and the claim its configuration names resolves to no user of the
+/// application's identity store — so the assertion identifies nobody this instance can
+/// issue a token for, which RFC 7523 §3.1 refuses as an invalid grant. The text is the
+/// fixed one of that CASE, which is a different statement from an assertion this exchange
+/// may not spend at all, so the two outcomes are told apart by a client.
+fn unresolved_identity() -> CreateTokenWithIAMError {
+    invalid_grant(st::DESCRIPTION_UNRESOLVED_IDENTITY)
+}
+
+/// The modelled refusal one class of assertion failure answers with.
+fn assertion_refusal(refusal: st::AssertionRefusal) -> CreateTokenWithIAMError {
+    match refusal {
+        // An assertion from no issuer this exchange may spend one of, and one already
+        // spent, are the same answer to the caller: an invalid grant naming the member
+        // that carried it.
+        st::AssertionRefusal::InvalidAssertion | st::AssertionRefusal::ReplayedAssertion => {
+            invalid_grant(st::DESCRIPTION_INVALID_ASSERTION)
+        }
+        st::AssertionRefusal::UnknownClient => invalid_client(),
+        st::AssertionRefusal::UnauthorizedClient => unauthorized_client(),
+        st::AssertionRefusal::UnresolvedIdentity => unresolved_identity(),
+        st::AssertionRefusal::StateUnavailable => state_unavailable(),
+    }
+}
+
 /// The persisted record the presented grant names.
 enum PresentedGrant {
+    /// A `refreshToken` that names a stored refresh grant.
+    RefreshToken(String),
+    /// A `subjectToken` that names a stored access token.
+    TokenExchange(String),
+    /// An `assertion` a trusted token issuer of this account may have signed, which the
+    /// JWT-bearer exchange resolves against IAM Identity Center's own records (see
+    /// [`crate::state::resolve_jwt_bearer_assertion`]). Nothing of it is read here: the
+    /// records it is judged against belong to other services, and this service's state
+    /// lock is not held while they are read.
+    JwtBearer(String),
+}
+
+/// The grant this service spends against its OWN records, once the JWT-bearer grant —
+/// which is built on another service's — has been dispatched. Stated as its own type so
+/// the exchange below is exhaustive over exactly the grants it serves, and adding a grant
+/// to [`PresentedGrant`] is a compile error rather than a silent fall-through.
+enum StoredGrant {
     /// A `refreshToken` that names a stored refresh grant.
     RefreshToken(String),
     /// A `subjectToken` that names a stored access token.
@@ -360,15 +418,19 @@ fn presented_grant(
             Err(invalid_grant(st::DESCRIPTION_INVALID_AUTHORIZATION_CODE))
         }
         st::GRANT_TYPE_JWT_BEARER => {
-            if input.assertion.as_deref().is_none_or(str::is_empty) {
+            let Some(assertion) = input
+                .assertion
+                .as_deref()
+                .map(str::trim)
+                .filter(|assertion| !assertion.is_empty())
+            else {
                 return Err(invalid_request(st::DESCRIPTION_ASSERTION_REQUIRED));
-            }
-            // The assertion is "the JSON Web Token (JWT) issued by a trusted
-            // token issuer. To authorize a trusted token issuer, configure the
-            // JWT Bearer GrantOptions for the application" — which is done
-            // outside this API, so this service trusts no issuer and no
-            // assertion presented here resolves to a grant.
-            Err(invalid_grant(st::DESCRIPTION_INVALID_ASSERTION))
+            };
+            // The assertion is "the JSON Web Token (JWT) issued by a trusted token
+            // issuer. To authorize a trusted token issuer, configure the JWT Bearer
+            // GrantOptions for the application" — records of IAM Identity Center, read
+            // where they live once this service's own lock is released.
+            Ok(PresentedGrant::JwtBearer(assertion.to_string()))
         }
         // Any other value names a grant flow this operation does not serve: the
         // device-code grant, which is `CreateToken`'s and whose `deviceCode` this
@@ -437,7 +499,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The grant the request is built on is settled first, against this
         // service's own records; only then is the client the request names
         // resolved.
-        let grant = presented_grant(&store, &input)?;
+        //
+        // The JWT-bearer grant is built on no record of this service at all: the
+        // assertion, the application it names and the identity its claims resolve to are
+        // IAM Identity Center's, the identity store's and the issuer's. So this store's
+        // lock is RELEASED before any of them is read — this service reads other
+        // services' state and none of them reads this one, which is the only lock order
+        // taken — and re-taken to mint.
+        let grant = match presented_grant(&store, &input)? {
+            PresentedGrant::JwtBearer(assertion) => {
+                drop(store);
+                return self.exchange_assertion(&input, &assertion, &region, now, &state);
+            }
+            PresentedGrant::RefreshToken(refresh_token) => StoredGrant::RefreshToken(refresh_token),
+            PresentedGrant::TokenExchange(subject_token) => {
+                StoredGrant::TokenExchange(subject_token)
+            }
+        };
 
         // `clientId` "is an application ARN that has OAuth grants configured", so
         // a token is only ever issued for a client this service knows: one it does
@@ -467,7 +545,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let issued = match &grant {
-            PresentedGrant::RefreshToken(refresh_token) => {
+            StoredGrant::RefreshToken(refresh_token) => {
                 let refresh_token = refresh_token.as_str();
                 // A token is usable only against the endpoint of the region that
                 // issued it, so one issued elsewhere is refused with the region
@@ -508,7 +586,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 }
             }
-            PresentedGrant::TokenExchange(subject_token) => {
+            StoredGrant::TokenExchange(subject_token) => {
                 let subject_token = subject_token.as_str();
                 // `subjectTokenType`: "The following value is supported: * Access
                 // Token - urn:ietf:params:oauth:token-type:access_token".
@@ -601,17 +679,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             refresh_token: issued.token.refresh_token,
             // `idToken` "identifies the user associated with the issued access
             // token", and `awsAdditionalDetails.identityContext` is a context
-            // assertion "signed and encrypted by STS" about that same user. The
-            // grants this service resolves are issued to clients and nothing in it
-            // authenticates an Identity Center user, so there is no identity to
-            // describe: both are left absent rather than filled with a value
-            // nothing computed.
+            // assertion about that same user. The two grants resolved here are
+            // issued to clients and neither authenticates an Identity Center user —
+            // the JWT-bearer grant is the one that does, and it answers from
+            // `exchange_assertion` below — so there is no identity to describe:
+            // both are left absent rather than filled with a value nothing
+            // computed.
             id_token: issued.token.id_token,
             issued_token_type: Some(issued.issued_token_type),
             // "The list of scopes for which authorization is granted" — absent
             // when the grant carried none.
             scope: (!issued.token.scopes.is_empty()).then_some(issued.token.scopes),
             aws_additional_details: None,
+        })
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateTokenWithIAM<Eng> {
+    /// The JWT-BEARER grant: the exchange of an assertion a trusted token issuer signed
+    /// for a token of IAM Identity Center bound to the Identity Store user the
+    /// assertion's claims name.
+    ///
+    /// The assertion is resolved FIRST, with no lock of this service held
+    /// ([`st::resolve_jwt_bearer_assertion`], which states the order the facts are asked
+    /// in and reads each where it lives); this store is then locked once, to record the
+    /// assertion's single use and to mint. So every refusal is settled before anything is
+    /// written, and a refused exchange leaves no token behind and spends no assertion.
+    fn exchange_assertion(
+        &self,
+        input: &CreateTokenWithIAMInput,
+        assertion: &str,
+        region: &str,
+        now: SystemTime,
+        state: &::engine::ServiceState<crate::state::ComAmazonawsSsooidcAwsssooidcserviceState>,
+    ) -> Result<CreateTokenWithIAMOutput, CreateTokenWithIAMError> {
+        let resolved = st::resolve_jwt_bearer_assertion(
+            &*self.engine,
+            &input.client_id,
+            assertion,
+            region,
+            now,
+        )
+        .map_err(assertion_refusal)?;
+
+        // "The list of scopes for which authorization is requested. The access token that
+        // is issued is limited to the scopes that are granted. If the value is not
+        // specified, IAM Identity Center authorizes all scopes configured for the
+        // application, including the following default scopes: openid, aws,
+        // sts:identity_context" — so a request naming none is granted everything the
+        // application carries, and one naming some is granted exactly those, which can
+        // only ever be a subset of them.
+        let authorized = st::granted_identity_scopes(&resolved.application_scopes);
+        let requested = input.scope.clone().unwrap_or_default();
+        let granted = if requested.is_empty() {
+            authorized
+        } else {
+            if requested
+                .iter()
+                .any(|scope| !authorized.contains(scope))
+            {
+                return Err(invalid_scope());
+            }
+            requested
+        };
+
+        let mut store = state.lock();
+        // RFC 7523 §3: an assertion that published an identifier of itself is good for
+        // ONE exchange, so one already spent is refused as the invalid grant it now is.
+        if let Some(assertion_id) = resolved.assertion_id.as_deref() {
+            if store.assertion_already_spent(assertion_id) {
+                return Err(assertion_refusal(st::AssertionRefusal::ReplayedAssertion));
+            }
+        }
+        // This grant adds a token to the store, so reclaim what the clock has already
+        // expired and then refuse rather than grow the store past its bound.
+        store.purge_expired_tokens(now);
+        if !store.has_room_for_token() {
+            return Err(slow_down());
+        }
+        if let Some(assertion_id) = resolved.assertion_id {
+            store.record_spent_assertion(assertion_id, resolved.expires_at, now);
+        }
+        let token = store.issue_identity_bound_token(
+            &input.client_id,
+            region,
+            granted,
+            resolved.identity,
+            now,
+        );
+
+        Ok(CreateTokenWithIAMOutput {
+            access_token: Some(token.access_token),
+            token_type: Some(token.token_type),
+            expires_in: token.expires_in,
+            // No refresh token: see `issue_identity_bound_token`.
+            refresh_token: token.refresh_token,
+            // "A JSON Web Token (JWT) that identifies the user associated with the issued
+            // access token": the identity this exchange resolved.
+            id_token: token.id_token,
+            // The JWT-bearer grant vends an access token; `requestedTokenType` is the
+            // token-exchange grant's member and names nothing here.
+            issued_token_type: Some(st::TOKEN_TYPE_URI_ACCESS_TOKEN.to_string()),
+            scope: (!token.scopes.is_empty()).then_some(token.scopes),
+            // "The trusted context assertion ... provides access to
+            // `sts:identity_context` claim in the `idToken` without JWT parsing": the
+            // same value the identity token carries, so a caller reads it from either.
+            aws_additional_details: token.identity_context.map(|identity_context| {
+                AwsAdditionalDetails {
+                    identity_context: Some(identity_context),
+                }
+            }),
         })
     }
 }
