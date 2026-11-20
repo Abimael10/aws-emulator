@@ -11,6 +11,12 @@
 //! Shared helpers live here rather than in a new top-level module because
 //! `src/lib.rs` is generated and declares the module list.
 
+/// WHICH host an accelerator ANNOUNCES as the one a client reaches it at, which is a
+/// property of the address this emulator is served at rather than of a stored record.
+mod announced_dns;
+
+pub use announced_dns::announced_dns_host;
+
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hasher;
@@ -281,9 +287,11 @@ pub struct StoredAccelerator {
     /// An `IpAddressType` value: [`IP_ADDRESS_TYPE_IPV4`] or [`IP_ADDRESS_TYPE_DUAL_STACK`].
     pub ip_address_type: String,
     pub ip_sets: Vec<StoredIpSet>,
-    pub dns_name: String,
-    /// Present only for a dual-stack accelerator.
-    pub dual_stack_dns_name: Option<String>,
+    /// Whether this accelerator announces a `DualStackDnsName` as well as a `DnsName` —
+    /// true only for a dual-stack one. WHICH host both announce is the address this
+    /// emulator is reached at, read per response rather than stored (see
+    /// [`announced_dns_host`]).
+    pub dual_stack_dns: bool,
     pub enabled: bool,
     pub created_time: SystemTime,
     pub last_modified_time: SystemTime,
@@ -313,14 +321,21 @@ impl StoredAccelerator {
     /// answer with: it carries no `DualStackDnsName` and no `Events`, and its
     /// `Status` is a `CustomRoutingAcceleratorStatus`, whose values are the same
     /// `DEPLOYED`/`IN_PROGRESS` pair [`Self::status`] reports.
-    pub fn to_custom_routing_wire(&self, now: SystemTime) -> CustomRoutingAccelerator {
+    ///
+    /// `announced_host` is the host a client reaches this accelerator at
+    /// ([`announced_dns_host`]).
+    pub fn to_custom_routing_wire(
+        &self,
+        now: SystemTime,
+        announced_host: &str,
+    ) -> CustomRoutingAccelerator {
         CustomRoutingAccelerator {
             accelerator_arn: Some(self.arn.clone()),
             name: Some(self.name.clone()),
             ip_address_type: Some(self.ip_address_type.clone()),
             enabled: Some(self.enabled),
             ip_sets: Some(self.ip_sets.iter().map(StoredIpSet::to_wire).collect()),
-            dns_name: Some(self.dns_name.clone()),
+            dns_name: Some(announced_host.to_string()),
             status: Some(self.status(now).to_string()),
             created_time: Some(to_date_time(self.created_time)),
             last_modified_time: Some(to_date_time(self.last_modified_time)),
@@ -331,18 +346,22 @@ impl StoredAccelerator {
     ///
     /// `Events` is left unset: it is the accelerator's change history, which this
     /// slice does not record.
-    pub fn to_wire(&self, now: SystemTime) -> Accelerator {
+    ///
+    /// Both DNS members carry `announced_host`, the host a client reaches this accelerator
+    /// at ([`announced_dns_host`]): one process answers for both address families, so a
+    /// dual-stack accelerator is reached where every other one is.
+    pub fn to_wire(&self, now: SystemTime, announced_host: &str) -> Accelerator {
         Accelerator {
             accelerator_arn: Some(self.arn.clone()),
             name: Some(self.name.clone()),
             ip_address_type: Some(self.ip_address_type.clone()),
             enabled: Some(self.enabled),
             ip_sets: Some(self.ip_sets.iter().map(StoredIpSet::to_wire).collect()),
-            dns_name: Some(self.dns_name.clone()),
+            dns_name: Some(announced_host.to_string()),
             status: Some(self.status(now).to_string()),
             created_time: Some(to_date_time(self.created_time)),
             last_modified_time: Some(to_date_time(self.last_modified_time)),
-            dual_stack_dns_name: self.dual_stack_dns_name.clone(),
+            dual_stack_dns_name: self.dual_stack_dns.then(|| announced_host.to_string()),
             events: None,
         }
     }
@@ -803,30 +822,16 @@ pub fn endpoint_group_idempotency_key(listener_arn: &str, token: &str) -> String
     format!("endpoint-group:{listener_arn}:{token}")
 }
 
-/// Mint an accelerator ARN and the DNS label that goes with it.
+/// Mint an accelerator ARN: the account-scoped ARN of one accelerator, over the record's
+/// own freshly minted id (see
+/// [`ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State::mint_uuid`]), so it is
+/// unique and stable for the life of the record.
 ///
-/// The DNS naming convention is the model's own (`Accelerator$DnsName`): "A
-/// lowercase letter a, followed by a 16-bit random hex string, followed by
-/// .awsglobalaccelerator.com", with the documented example
-/// `a1234567890abcdef.awsglobalaccelerator.com` showing 16 hex digits. The label
-/// is taken from the accelerator's own freshly minted id (see
-/// [`ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State::mint_uuid`]), so
-/// it is unique and stable for the life of the record.
-pub fn mint_accelerator(uuid: &str) -> (String, String) {
-    let arn = ::engine::emulator_arn("globalaccelerator", "", &format!("accelerator/{uuid}"));
-    let hex: String = uuid.chars().filter(|c| *c != '-').take(16).collect();
-    (arn, format!("a{hex}"))
-}
-
-/// The `DnsName` for a DNS label minted by [`mint_accelerator`].
-pub fn dns_name(label: &str) -> String {
-    format!("{label}.awsglobalaccelerator.com")
-}
-
-/// The `DualStackDnsName` for a DNS label minted by [`mint_accelerator`]:
-/// the same label with `.dualstack` inserted, per `Accelerator$DualStackDnsName`.
-pub fn dual_stack_dns_name(label: &str) -> String {
-    format!("{label}.dualstack.awsglobalaccelerator.com")
+/// It mints no DNS name: what an accelerator announces as its `DnsName` is the host this
+/// emulator is reached at, which is a property of the process rather than of the record
+/// ([`announced_dns_host`]).
+pub fn mint_accelerator(uuid: &str) -> String {
+    ::engine::emulator_arn("globalaccelerator", "", &format!("accelerator/{uuid}"))
 }
 
 /// Hex digits in the id of a listener ARN's final segment, as the service's own ARNs

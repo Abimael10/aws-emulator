@@ -163,8 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation needs none of it.
-        let _ = ctx;
+        // The host an accelerator announces is the one THIS emulator answers on, read off
+        // the request being served.
+        let announced_host = crate::state::announced_dns_host(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateAcceleratorErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -239,14 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .iter()
                 .any(|set| set.ip_address_family == crate::state::IP_FAMILY_IPV6);
             // A dual-stack accelerator carries an IPv6 set and the second DNS name; an
-            // IPv4 one carries neither (`Accelerator$DualStackDnsName`). The DNS label
-            // itself is the accelerator's and does not change.
-            let label = record
-                .dns_name
-                .split('.')
-                .next()
-                .unwrap_or_default()
-                .to_string();
+            // IPv4 one carries neither (`Accelerator$DualStackDnsName`). WHICH host both
+            // DNS members announce is the address this emulator is reached at, so a change
+            // of address family moves no name.
             if dual_stack {
                 if !already_dual_stack {
                     let addresses = vec![store.allocate_ipv6(), store.allocate_ipv6()];
@@ -255,12 +251,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         addresses,
                     ));
                 }
-                record.dual_stack_dns_name = Some(crate::state::dual_stack_dns_name(&label));
+                record.dual_stack_dns = true;
             } else {
                 record
                     .ip_sets
                     .retain(|set| set.ip_address_family != crate::state::IP_FAMILY_IPV6);
-                record.dual_stack_dns_name = None;
+                record.dual_stack_dns = false;
             }
             record.ip_address_type = ip_address_type;
         }
@@ -268,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.last_modified_time = now;
         record.deployed_at = now + crate::state::DEPLOYMENT_SETTLE;
 
-        let accelerator = record.to_wire(now);
+        let accelerator = record.to_wire(now, &announced_host);
         store.accelerators.insert(input.accelerator_arn, record);
 
         Ok(UpdateAcceleratorOutput {

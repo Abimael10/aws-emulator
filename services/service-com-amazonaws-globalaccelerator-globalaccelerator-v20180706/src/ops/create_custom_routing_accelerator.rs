@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomRoutingAccelerator
-//! Mints and PERSISTS a custom routing accelerator in [`crate::state`]: a new ARN, the
-//! DNS name the model's naming convention describes, two allocated static IPv4
-//! addresses, `Enabled` defaulting to true, and a deployment that settles from
-//! `IN_PROGRESS` to `DEPLOYED`. Repeating the call with the same `IdempotencyToken`
-//! returns the accelerator that token already minted.
+//! Mints and PERSISTS a custom routing accelerator in [`crate::state`]: a new ARN, two
+//! allocated static IPv4 addresses, `Enabled` defaulting to true, and a deployment that
+//! settles from `IN_PROGRESS` to `DEPLOYED`. The DNS name it announces is the host this
+//! emulator answers on ([`crate::state::announced_dns_host`]). Repeating the call with the
+//! same `IdempotencyToken` returns the accelerator that token already minted.
 //!
 //! A custom routing accelerator lives apart from a standard one: it is reached only
 //! through the custom-routing operations, so it is held in its own map and
@@ -175,8 +175,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation needs none of it.
-        let _ = ctx;
+        // The host an accelerator announces is the one THIS emulator answers on, read off
+        // the request being served.
+        let announced_host = crate::state::announced_dns_host(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 CreateCustomRoutingAcceleratorErrorModeled::InternalServiceErrorException(
@@ -224,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(minted) = store.idempotency.get(&token_key) {
             if let Some(existing) = store.custom_routing_accelerators.get(minted) {
                 return Ok(CreateCustomRoutingAcceleratorOutput {
-                    accelerator: Some(existing.to_custom_routing_wire(now)),
+                    accelerator: Some(existing.to_custom_routing_wire(now, &announced_host)),
                 });
             }
         }
@@ -246,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let uuid = store.mint_uuid();
-        let (arn, label) = crate::state::mint_accelerator(&uuid);
+        let arn = crate::state::mint_accelerator(&uuid);
         let mut ipv4_addresses = byoip;
         while ipv4_addresses.len() < 2 {
             let allocated = store.allocate_ipv4();
@@ -261,10 +262,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::IP_FAMILY_IPV4,
                 ipv4_addresses,
             )],
-            dns_name: crate::state::dns_name(&label),
             // A custom routing accelerator is IPv4-only, and only a dual-stack
             // accelerator has a second DNS name.
-            dual_stack_dns_name: None,
+            dual_stack_dns: false,
             // "The default value is true" (`CreateCustomRoutingAccelerator$Enabled`).
             enabled: input.enabled.unwrap_or(true),
             created_time: now,
@@ -273,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: crate::state::tags_to_pairs(input.tags),
             listener_arns: Vec::new(),
         };
-        let accelerator = record.to_custom_routing_wire(now);
+        let accelerator = record.to_custom_routing_wire(now, &announced_host);
 
         store.accelerator_attributes.insert(
             arn.clone(),

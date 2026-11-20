@@ -16,7 +16,9 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::accelerator_lifecycle::{arn_of, call, create_accelerator, emulator, error_code, ok};
+use super::accelerator_lifecycle::{
+    arn_of, call, create_accelerator, emulator, error_code, ok, UNSERVED_HOST,
+};
 // The envelope's message, in either spelling, already has one reader in this crate.
 use super::input_refusals::error_message;
 
@@ -62,27 +64,14 @@ async fn describe_custom_routing(router: &MultiServiceRouter, arn: &str) -> (u16
     .await
 }
 
-/// `a` + 16 lowercase hex digits, then `.awsglobalaccelerator.com`: the naming convention
-/// `CustomRoutingAccelerator$DnsName` documents.
+/// The host a custom routing accelerator announces: the one this emulator answers on, as
+/// `CustomRoutingAccelerator$DnsName` has to point at the addresses the same response
+/// advertises — varied over the addresses a client reaches this emulator at in
+/// `tests/all/resource_projection.rs`.
 fn assert_dns_name(case: &str, host: &str) {
-    let label = host
-        .strip_suffix(".awsglobalaccelerator.com")
-        .unwrap_or_else(|| {
-            panic!("case {case}: expected a host under .awsglobalaccelerator.com, got {host:?}")
-        });
-    let digits = label.strip_prefix('a').unwrap_or_else(|| {
-        panic!("case {case}: expected a label starting with 'a', got {label:?}")
-    });
     assert_eq!(
-        digits.len(),
-        16,
-        "case {case}: expected a 16-digit hex label, got {digits:?}"
-    );
-    assert!(
-        digits
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-        "case {case}: expected lowercase hex in the label, got {digits:?}"
+        host, UNSERVED_HOST,
+        "case {case}: expected the host this emulator answers on, got {host:?}"
     );
 }
 

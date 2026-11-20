@@ -140,8 +140,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation needs none of it.
-        let _ = ctx;
+        // The host an accelerator announces is the one THIS emulator answers on, read off
+        // the request being served.
+        let announced_host = crate::state::announced_dns_host(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListAcceleratorsErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -169,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .keys
             .iter()
             .filter_map(|arn| store.accelerators.get(arn))
-            .map(|record| record.to_wire(now))
+            .map(|record| record.to_wire(now, &announced_host))
             .collect();
 
         Ok(ListAcceleratorsOutput {

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccelerator
-//! Mints and PERSISTS an accelerator in [`crate::state`]: a new ARN, the DNS name(s) the
-//! model's naming convention describes, two allocated static IPv4 addresses (plus two
-//! IPv6 addresses for a dual-stack accelerator), `Enabled` defaulting to true, and a
-//! deployment that settles from `IN_PROGRESS` to `DEPLOYED`. Repeating the call with the
-//! same `IdempotencyToken` returns the accelerator that token already minted.
+//! Mints and PERSISTS an accelerator in [`crate::state`]: a new ARN, two allocated static
+//! IPv4 addresses (plus two IPv6 addresses for a dual-stack accelerator), `Enabled`
+//! defaulting to true, and a deployment that settles from `IN_PROGRESS` to `DEPLOYED`. The
+//! DNS name(s) it announces are the host this emulator answers on
+//! ([`crate::state::announced_dns_host`]). Repeating the call with the same
+//! `IdempotencyToken` returns the accelerator that token already minted.
 //!
 //! ## Shape of an operation
 //!
@@ -169,8 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation needs none of it.
-        let _ = ctx;
+        // The host an accelerator announces is the one THIS emulator answers on, read off
+        // the request being served.
+        let announced_host = crate::state::announced_dns_host(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateAcceleratorErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -215,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(minted) = store.idempotency.get(&token_key) {
             if let Some(existing) = store.accelerators.get(minted) {
                 return Ok(CreateAcceleratorOutput {
-                    accelerator: Some(existing.to_wire(now)),
+                    accelerator: Some(existing.to_wire(now, &announced_host)),
                 });
             }
         }
@@ -235,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let uuid = store.mint_uuid();
-        let (arn, label) = crate::state::mint_accelerator(&uuid);
+        let arn = crate::state::mint_accelerator(&uuid);
         let mut ipv4_addresses = byoip;
         while ipv4_addresses.len() < 2 {
             let allocated = store.allocate_ipv4();
@@ -260,8 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             ip_address_type,
             ip_sets,
-            dns_name: crate::state::dns_name(&label),
-            dual_stack_dns_name: dual_stack.then(|| crate::state::dual_stack_dns_name(&label)),
+            dual_stack_dns: dual_stack,
             // "The default value is true" (`CreateAccelerator$Enabled`).
             enabled: input.enabled.unwrap_or(true),
             created_time: now,
@@ -270,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: crate::state::tags_to_pairs(input.tags),
             listener_arns: Vec::new(),
         };
-        let accelerator = record.to_wire(now);
+        let accelerator = record.to_wire(now, &announced_host);
 
         store.accelerator_attributes.insert(
             arn.clone(),

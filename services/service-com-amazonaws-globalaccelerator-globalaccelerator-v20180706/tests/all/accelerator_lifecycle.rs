@@ -30,12 +30,45 @@ pub(crate) fn emulator() -> MultiServiceRouter {
     router
 }
 
+/// The same emulator, told the base URL it is SERVED at — the value
+/// `OperationContext::endpoint` reports once the data port is up, in place of the unserved
+/// base whose host is [`UNSERVED_HOST`].
+pub(crate) fn emulator_served_at(base: &str) -> MultiServiceRouter {
+    let mut router = emulator();
+    router.set_url_base(
+        smithy_server_runtime::EndpointUrl::parse(base)
+            .unwrap_or_else(|| panic!("{base} is not a usable endpoint URL")),
+    );
+    router
+}
+
+/// The host of the base URL an UNSERVED emulator reports
+/// (`smithy_server_runtime::UNSERVED_URL_BASE`), which is what these tests run as: a
+/// router built in-process is served on no port, so a request that addressed one of AWS's
+/// own hosts is announced this host as the one it reaches a resource at.
+pub(crate) const UNSERVED_HOST: &str = "emulator.invalid";
+
+/// The host every call below addresses unless a test names another: the service's own
+/// published AWS endpoint, which is what an SDK client sends to.
+pub(crate) const AWS_ENDPOINT_HOST: &str = "globalaccelerator.us-west-2.amazonaws.com";
+
 /// Call one operation and return `(status, body)`.
 pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+    call_on_host(router, AWS_ENDPOINT_HOST, operation, body).await
+}
+
+/// [`call`], addressed to `host` — the `Host` header the request carries, which is what
+/// says where the client reached this emulator.
+pub(crate) async fn call_on_host(
+    router: &MultiServiceRouter,
+    host: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", "globalaccelerator.us-west-2.amazonaws.com")
+        .header("host", host)
         .header("content-type", "application/x-amz-json-1.1")
         .header(
             "x-amz-target",
@@ -103,22 +136,16 @@ pub(crate) fn arn_of(accelerator: &Value) -> String {
         .to_string()
 }
 
-/// `a` + 16 hex digits, the DNS label `Accelerator$DnsName` describes.
-fn assert_dns_label(case: &str, host: &str, suffix: &str) {
-    let label = host
-        .strip_suffix(suffix)
-        .unwrap_or_else(|| panic!("case {case}: expected a host ending in {suffix}, got {host:?}"));
-    let digits = label
-        .strip_prefix('a')
-        .unwrap_or_else(|| panic!("case {case}: expected a label starting with 'a', got {label:?}"));
+/// The host every operation that projects an accelerator announces as the one a client
+/// reaches it at: the host of the endpoint the request reached. `Accelerator$DnsName` is
+/// "the Domain Name System (DNS) name that Global Accelerator creates that points to an
+/// accelerator's static IPv4 addresses", so it has to lead back to the process serving
+/// those addresses — `tests/all/resource_projection.rs` varies it over the addresses a
+/// client reaches this emulator at.
+fn assert_announced_host(case: &str, announced: &str, expected: &str) {
     assert_eq!(
-        digits.len(),
-        16,
-        "case {case}: expected a 16-digit hex label, got {digits:?}"
-    );
-    assert!(
-        digits.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
-        "case {case}: expected lowercase hex in the label, got {digits:?}"
+        announced, expected,
+        "case {case}: expected the host this emulator answers on, got {announced:?}"
     );
 }
 
@@ -162,10 +189,10 @@ async fn an_accelerator_and_its_listener_round_trip_through_the_store() {
         created["CreatedTime"].is_number() && created["LastModifiedTime"].is_number(),
         "case create: expected both timestamps, got {created}"
     );
-    assert_dns_label(
+    assert_announced_host(
         "create",
         created["DnsName"].as_str().unwrap_or_default(),
-        ".awsglobalaccelerator.com",
+        UNSERVED_HOST,
     );
     let ip_sets = created["IpSets"].as_array().cloned().unwrap_or_default();
     assert_eq!(
@@ -492,16 +519,16 @@ async fn ip_address_type_decides_the_address_families_and_dns_names() {
             );
         }
 
-        assert_dns_label(
+        assert_announced_host(
             case,
             accelerator["DnsName"].as_str().unwrap_or_default(),
-            ".awsglobalaccelerator.com",
+            UNSERVED_HOST,
         );
         if expected_type == "DUAL_STACK" {
-            assert_dns_label(
+            assert_announced_host(
                 case,
                 accelerator["DualStackDnsName"].as_str().unwrap_or_default(),
-                ".dualstack.awsglobalaccelerator.com",
+                UNSERVED_HOST,
             );
         } else {
             assert!(
@@ -1094,20 +1121,13 @@ async fn supplied_ip_addresses_lead_the_ipv4_set() {
 }
 
 /// RULE: changing `IpAddressType` changes which address families the accelerator holds
-/// and whether it carries the dual-stack DNS name, and is idempotent; the accelerator's
-/// own DNS label never changes.
+/// and whether it carries the dual-stack DNS name, and is idempotent; the host the
+/// accelerator is announced at never changes.
 #[tokio::test]
 async fn updating_the_ip_address_type_adds_and_removes_the_ipv6_set() {
     let router = emulator();
     let created = create_accelerator(&router, "families", "families-token").await;
     let arn = arn_of(&created);
-    let label = created["DnsName"]
-        .as_str()
-        .unwrap_or_default()
-        .split('.')
-        .next()
-        .unwrap_or_default()
-        .to_string();
 
     // (case, requested type, expected families, expects a DualStackDnsName). Each type is
     // requested twice, so the transition is tested for idempotence as well.
@@ -1142,10 +1162,10 @@ async fn updating_the_ip_address_type_adds_and_removes_the_ipv6_set() {
             !expects_dual_stack_name,
             "case {case}: DualStackDnsName presence is wrong, got {updated}"
         );
-        assert_eq!(
+        assert_announced_host(
+            case,
             updated["DnsName"].as_str().unwrap_or_default(),
-            format!("{label}.awsglobalaccelerator.com"),
-            "case {case}: the accelerator's DNS label must not change, got {updated}"
+            UNSERVED_HOST,
         );
 
         // The change is what a later caller sees.

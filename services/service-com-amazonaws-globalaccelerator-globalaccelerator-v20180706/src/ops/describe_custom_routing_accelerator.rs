@@ -137,8 +137,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation needs none of it.
-        let _ = ctx;
+        // The host an accelerator announces is the one THIS emulator answers on, read off
+        // the request being served.
+        let announced_host = crate::state::announced_dns_host(ctx);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DescribeCustomRoutingAcceleratorErrorModeled::InternalServiceErrorException(
@@ -174,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(DescribeCustomRoutingAcceleratorOutput {
-            accelerator: Some(record.to_custom_routing_wire(now)),
+            accelerator: Some(record.to_custom_routing_wire(now, &announced_host)),
         })
     }
 }

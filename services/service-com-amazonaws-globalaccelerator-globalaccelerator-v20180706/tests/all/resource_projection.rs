@@ -3,7 +3,7 @@
 //! End-to-end tests for how this service PROJECTS its persisted records, driven over
 //! the wire through the harness in [`super::accelerator_lifecycle`].
 //!
-//! Three rules, each stated once and asserted over a SET of inputs (a recorded request
+//! Four rules, each stated once and asserted over a SET of inputs (a recorded request
 //! is one row):
 //!
 //! 1. Every `IpSet` an accelerator is projected into reports one `IpAddressDetails`
@@ -13,11 +13,16 @@
 //!    persisted for it, through every operation that projects a listener.
 //! 3. A minted ARN's final segment is a lowercase-hex id of the width that resource's
 //!    ARNs carry: 8 for a listener, 12 for an endpoint group.
+//! 4. Every DNS name an accelerator is projected with announces the host THIS emulator
+//!    answers on.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::accelerator_lifecycle::{arn_of, call, create_accelerator, emulator, error_code, ok};
+use super::accelerator_lifecycle::{
+    arn_of, call, call_on_host, create_accelerator, emulator, emulator_served_at, error_code, ok,
+    AWS_ENDPOINT_HOST, UNSERVED_HOST,
+};
 
 /// `NetworkZone`'s modelled constraint: `@length(min: 0, max: 24)` on
 /// `com.amazonaws.globalaccelerator#NetworkZone` (smithy_query query="shape",
@@ -580,4 +585,227 @@ async fn a_minted_arn_segment_has_the_width_that_resources_arns_carry() {
             "case {case}: expected the created endpoint group {group}, got {described}"
         );
     }
+}
+
+/// The zone AWS's own Global Accelerator names live in, from the naming convention
+/// `Accelerator$DnsName` documents ("followed by .awsglobalaccelerator.com"). This emulator
+/// serves no host under it, so no response may announce one.
+const AWS_ACCELERATOR_ZONE: &str = "awsglobalaccelerator.com";
+
+/// Call one operation addressed to `host` and require a 200.
+async fn ok_on_host(
+    router: &MultiServiceRouter,
+    host: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
+    let (status, parsed) = call_on_host(router, host, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "case {host}: expected HTTP 200 from {operation}, got {status} with {parsed}"
+    );
+    parsed
+}
+
+/// Rule 4, for one announced name: it is exactly the host this emulator answers on, carries
+/// no port (a client resolves it and connects on the accelerator's listener port) and is
+/// never a host under the zone AWS serves its own accelerators in.
+fn assert_announced(case: &str, operation: &str, announced: &str, expected_host: &str) {
+    assert!(
+        !announced.contains(AWS_ACCELERATOR_ZONE),
+        "case {case}: {operation} must announce no host under {AWS_ACCELERATOR_ZONE}, \
+         got {announced:?}"
+    );
+    assert_eq!(
+        announced, expected_host,
+        "case {case}: {operation} must announce the host this emulator answers on, \
+         got {announced:?}"
+    );
+}
+
+/// Rule 4, over both accelerator kinds and every operation that projects one.
+///
+/// The rows differ along what the rule generalises over: the form of the address a client
+/// reaches this emulator at (an IPv4 address with a port, the loopback name with a port, a
+/// bracketed IPv6 literal, a routable address) and the cases where the request names no
+/// address of this emulator at all — a client resolving AWS's own hostnames, or a `Host`
+/// that is no address — where the base this process is served at names the host instead
+/// (here the unserved one, since a router built in-process holds no port).
+#[tokio::test]
+async fn an_announced_dns_name_is_the_host_the_emulator_answers_on() {
+    let router = emulator();
+
+    // (case, Host header, expected announced host)
+    let rows: Vec<(&str, &str, &str)> = vec![
+        ("an address with a port", "127.0.0.1:41835", "127.0.0.1"),
+        ("the loopback name with a port", "localhost:9297", "localhost"),
+        ("a bracketed IPv6 literal", "[::1]:9297", "[::1]"),
+        ("a routable address", "10.0.0.7:9297", "10.0.0.7"),
+        // A `Host` carrying userinfo is not an address this emulator can be reached at,
+        // so the base it is served at answers for it, exactly as for an AWS host.
+        (
+            "an address carrying userinfo",
+            "user@localhost:9297",
+            UNSERVED_HOST,
+        ),
+        (
+            "the service's own AWS endpoint",
+            AWS_ENDPOINT_HOST,
+            UNSERVED_HOST,
+        ),
+    ];
+
+    for (index, (case, host, expected_host)) in rows.iter().enumerate() {
+        let created = ok_on_host(
+            &router,
+            host,
+            "CreateAccelerator",
+            json!({
+                "Name": format!("announced-{index}"),
+                "IdempotencyToken": format!("announced-{index}"),
+                "IpAddressType": "DUAL_STACK",
+            }),
+        )
+        .await["Accelerator"]
+            .clone();
+        let arn = arn_of(&created);
+        assert_announced(
+            case,
+            "CreateAccelerator",
+            created["DnsName"].as_str().unwrap_or_default(),
+            expected_host,
+        );
+        // One process answers for both address families, so the dual-stack name is the
+        // same host; it is present because this accelerator is dual-stack.
+        assert_announced(
+            case,
+            "CreateAccelerator (DualStackDnsName)",
+            created["DualStackDnsName"].as_str().unwrap_or_default(),
+            expected_host,
+        );
+
+        // Every other operation that projects this accelerator announces the same host:
+        // the read, the update and the listing.
+        let described = ok_on_host(
+            &router,
+            host,
+            "DescribeAccelerator",
+            json!({ "AcceleratorArn": arn }),
+        )
+        .await["Accelerator"]
+            .clone();
+        let updated = ok_on_host(
+            &router,
+            host,
+            "UpdateAccelerator",
+            json!({ "AcceleratorArn": arn, "Name": format!("announced-{index}-renamed") }),
+        )
+        .await["Accelerator"]
+            .clone();
+        let listed = ok_on_host(&router, host, "ListAccelerators", json!({})).await
+            ["Accelerators"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|entry| entry["AcceleratorArn"] == created["AcceleratorArn"])
+            .unwrap_or_else(|| panic!("case {case}: {arn} is missing from ListAccelerators"));
+        for (operation, projection) in [
+            ("DescribeAccelerator", &described),
+            ("UpdateAccelerator", &updated),
+            ("ListAccelerators", &listed),
+        ] {
+            assert_announced(
+                case,
+                operation,
+                projection["DnsName"].as_str().unwrap_or_default(),
+                expected_host,
+            );
+            assert_announced(
+                case,
+                operation,
+                projection["DualStackDnsName"].as_str().unwrap_or_default(),
+                expected_host,
+            );
+        }
+
+        // A custom routing accelerator is announced the same host, and models no
+        // dual-stack name at all.
+        let custom = ok_on_host(
+            &router,
+            host,
+            "CreateCustomRoutingAccelerator",
+            json!({
+                "Name": format!("announced-cr-{index}"),
+                "IdempotencyToken": format!("announced-cr-{index}"),
+            }),
+        )
+        .await["Accelerator"]
+            .clone();
+        let custom_arn = arn_of(&custom);
+        assert_announced(
+            case,
+            "CreateCustomRoutingAccelerator",
+            custom["DnsName"].as_str().unwrap_or_default(),
+            expected_host,
+        );
+        assert!(
+            custom.get("DualStackDnsName").is_none(),
+            "case {case}: `CustomRoutingAccelerator` models no DualStackDnsName, got {custom}"
+        );
+        let custom_described = ok_on_host(
+            &router,
+            host,
+            "DescribeCustomRoutingAccelerator",
+            json!({ "AcceleratorArn": custom_arn }),
+        )
+        .await["Accelerator"]
+            .clone();
+        assert_announced(
+            case,
+            "DescribeCustomRoutingAccelerator",
+            custom_described["DnsName"].as_str().unwrap_or_default(),
+            expected_host,
+        );
+    }
+
+    // The announced host is a property of where this emulator is REACHED, not of the
+    // record: ONE accelerator read from each address above is announced that address.
+    let subject = create_accelerator(&router, "announced-across-hosts", "across-hosts").await;
+    let subject_arn = arn_of(&subject);
+    for (case, host, expected_host) in &rows {
+        let described = ok_on_host(
+            &router,
+            host,
+            "DescribeAccelerator",
+            json!({ "AcceleratorArn": subject_arn }),
+        )
+        .await["Accelerator"]
+            .clone();
+        assert_announced(
+            case,
+            "DescribeAccelerator (one accelerator, many addresses)",
+            described["DnsName"].as_str().unwrap_or_default(),
+            expected_host,
+        );
+    }
+
+    // A client that resolves AWS's own hostnames reaches none of the addresses above, so
+    // it is announced the host THIS emulator is SERVED at — the one address such a caller
+    // can reach it at.
+    let served = emulator_served_at("https://127.0.0.1:9297");
+    let on_served = ok_on_host(
+        &served,
+        AWS_ENDPOINT_HOST,
+        "CreateAccelerator",
+        json!({ "Name": "announced-served", "IdempotencyToken": "announced-served" }),
+    )
+    .await["Accelerator"]
+        .clone();
+    assert_announced(
+        "a served emulator addressed by an AWS host",
+        "CreateAccelerator",
+        on_served["DnsName"].as_str().unwrap_or_default(),
+        "127.0.0.1",
+    );
 }
