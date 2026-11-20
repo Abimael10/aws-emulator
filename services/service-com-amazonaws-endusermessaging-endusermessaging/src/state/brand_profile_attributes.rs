@@ -141,13 +141,20 @@ pub const BRAND_PROFILE_ATTRIBUTE_RESOURCE_TYPE: &str = "brand-profile-attribute
 pub const RESOURCE_ALREADY_EXISTS_REASON: &str = "RESOURCE_ALREADY_EXISTS";
 
 /// `ResourceNotFoundException` for a `BrandProfileAttributeName` the addressed
-/// profile holds no attribute under. The message is built from the request, so it
-/// names the value given.
+/// profile holds no attribute under.
+///
+/// The name is reported in the `resourceId` member and NOT in the message:
+/// `BrandProfileAttributeName` is `@sensitive`, so the refusal states the value in the
+/// member modelled for it rather than in its own text
+/// ([`super::resource_not_found_of_sensitive_id`]).
 #[must_use]
 pub fn brand_profile_attribute_not_found(
     attribute_name: &str,
 ) -> crate::ops::types::ResourceNotFoundException {
-    super::resource_not_found(BRAND_PROFILE_ATTRIBUTE_RESOURCE_TYPE, attribute_name)
+    super::resource_not_found_of_sensitive_id(
+        BRAND_PROFILE_ATTRIBUTE_RESOURCE_TYPE,
+        attribute_name,
+    )
 }
 
 /// `ConflictException` for a create of an attribute whose name is already taken

@@ -551,6 +551,25 @@ pub fn resource_not_found(
     }
 }
 
+/// `ResourceNotFoundException` for an identifier the service does not restate in the
+/// message: the template of [`resource_not_found`] with its `ResourceId` clause left
+/// off.
+///
+/// This is the form for a resource addressed by a member the model marks
+/// `@sensitive`: such a value is not reproduced in the text a refusal is worded with,
+/// so the identifier is reported in the `resourceId` member modelled for it and
+/// nowhere else.
+pub fn resource_not_found_of_sensitive_id(
+    resource_type: &str,
+    resource_id: &str,
+) -> crate::ops::types::ResourceNotFoundException {
+    crate::ops::types::ResourceNotFoundException {
+        message: format!("Resource not found - ResourceType=\"{resource_type}\""),
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    }
+}
+
 /// `ConflictException` for a request the current state of `resource_id` forbids.
 ///
 /// The message is this error class's fixed template: the quoted `Reason` token

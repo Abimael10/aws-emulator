@@ -26,6 +26,10 @@
 //!   `attributeName` the profile does not hold;
 //! * a repeated `clientToken` reports the attributes the first call created instead of
 //!   creating a second set;
+//! * `DeleteBrandProfileAttribute` removes exactly the attribute named, with the media it
+//!   held, and leaves the profile's other attributes alone; being `@idempotent`, a name the
+//!   profile does not hold is reported as done rather than refused, while the readers of
+//!   that name still answer not found;
 //! * deleting the profile takes its attributes and their media with it.
 
 use std::sync::Arc;
@@ -203,6 +207,22 @@ impl Emulator {
             "GET",
             &format!(
                 "/v1/brand-profiles/{profile_id}/attributes/{}",
+                encode_segment(name)
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// `DeleteBrandProfileAttribute` on one attribute of one profile, addressed by
+    /// either spelling of a `BrandProfileIdOrArn`: the profile reference is sent with
+    /// any `/` it carries percent-encoded, as a client sends a non-greedy `@httpLabel`.
+    async fn delete_attribute(&self, profile_reference: &str, name: &str) -> Reply {
+        self.call(
+            "DELETE",
+            &format!(
+                "/v1/brand-profiles/{}/attributes/{}",
+                crate::brand_profile_default_attributes::path_label(profile_reference),
                 encode_segment(name)
             ),
             None,
@@ -853,7 +873,9 @@ async fn an_identifier_that_names_nothing_is_not_found() {
         );
     }
 
-    // A name the profile holds no attribute under.
+    // A name the profile holds no attribute under. `BrandProfileAttributeName` is
+    // `@sensitive`, so the refusal states the name in the `resourceId` member modelled
+    // for it and not in its own text.
     for unknown in ["Nothing", "Not Stored"] {
         let read = em.get_attribute(&profile, unknown).await;
         assert_eq!(
@@ -865,11 +887,14 @@ async fn an_identifier_that_names_nothing_is_not_found() {
         );
         assert_eq!(
             read.string("message"),
-            format!(
-                "Resource not found - ResourceType=\"brand-profile-attribute\" \
-                 ResourceId=\"{unknown}\""
-            ),
+            attribute_not_found_message(),
             "case {unknown}: unexpected not-found message"
+        );
+        assert_eq!(
+            (read.member("resourceType"), read.member("resourceId")),
+            (&json!("brand-profile-attribute"), &json!(unknown)),
+            "case {unknown}: the refusal must report the resource it could not find, got {:?}",
+            read.body
         );
     }
 }
@@ -1000,4 +1025,417 @@ async fn deleting_the_profile_takes_its_attributes_with_it() {
         404,
         "the media of a deleted profile's attribute is served no more"
     );
+}
+
+/// The attributes kept beside the one each delete case removes: a delete names ONE
+/// attribute, so every case also asserts what it must leave alone — an inline value and
+/// media that is still served afterwards.
+const NEIGHBOUR_TEXT: &str = "Untouched Text";
+const NEIGHBOUR_MEDIA: &str = "Untouched Logo";
+
+/// The message AWS words a not-found of this class with: fixed text and the resource's
+/// hyphenated type. The `attributeName` asked for is NOT part of it —
+/// `BrandProfileAttributeName` is `@sensitive`, so the refusal reports that value in the
+/// `resourceId` member modelled for it rather than in its own text.
+fn attribute_not_found_message() -> String {
+    "Resource not found - ResourceType=\"brand-profile-attribute\"".to_string()
+}
+
+#[tokio::test]
+async fn deleting_an_attribute_removes_it_and_the_media_it_held() {
+    let em = Emulator::new();
+
+    // The rows span what one attribute can be: each `attributeType`, with and without the
+    // content that type takes, with and without the optional members, and each form of
+    // name `BrandProfileAttributeName` admits — an interior space, and the length ceiling.
+    let cases: Vec<(&str, Attribute)> = vec![
+        (
+            "a TEXT attribute with a value",
+            Attribute::text("Company Name", Some("Example Corp")),
+        ),
+        (
+            "a TEXT attribute with no value",
+            Attribute::text("Legal Name", None),
+        ),
+        (
+            "a TEXT attribute carrying every optional member",
+            Attribute::text("Contact Email", Some("ops@example.test"))
+                .described("Where to reach us", "BUSINESS_CONTACT"),
+        ),
+        (
+            "an IMAGE holding media",
+            Attribute::media("Logo", "IMAGE", Some(PNG)),
+        ),
+        (
+            "a DOCUMENT holding media",
+            Attribute::media("Charter", "DOCUMENT", Some(PDF)),
+        ),
+        (
+            "an IMAGE whose media was never supplied",
+            Attribute::media("Banner", "IMAGE", None),
+        ),
+        (
+            "a name with an interior space",
+            Attribute::text("Doing Business As", Some("Example")),
+        ),
+        (
+            "a name at the modelled length ceiling",
+            Attribute::text(LONGEST_NAME, Some("at the length ceiling")),
+        ),
+    ];
+
+    for (case, target) in cases {
+        let profile = em.profile("Delete owner").await;
+        let created = em
+            .create_attributes(
+                &profile,
+                batch(&[
+                    target.clone(),
+                    Attribute::text(NEIGHBOUR_TEXT, Some("stays")),
+                    Attribute::media(NEIGHBOUR_MEDIA, "IMAGE", Some(GIF)),
+                ]),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: the create must succeed, got {} / {:?}",
+            created.status, created.body
+        );
+        let target_media_url = created.attributes()[0]["mediaDownloadUrl"]
+            .as_str()
+            .map(str::to_string);
+        assert_eq!(
+            target_media_url.is_some(),
+            target.holds_media(),
+            "case {case}: the created attribute must report a download URL exactly when it \
+             holds media, got {:?}",
+            created.body
+        );
+        let neighbour_media_url = created.attributes()[2]["mediaDownloadUrl"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case}: the neighbour holding media must report a download URL, got \
+                     {:?}",
+                    created.body
+                )
+            })
+            .to_string();
+
+        let deleted = em.delete_attribute(&profile, target.name).await;
+        assert_eq!(
+            (deleted.status, deleted.error.as_deref()),
+            (200, None),
+            "case {case}: expected 200, got {} / {:?}",
+            deleted.status,
+            deleted.body
+        );
+        assert_eq!(
+            deleted.string("attributeName"),
+            target.name,
+            "case {case}: the delete must report the attribute it removed, got {:?}",
+            deleted.body
+        );
+        assert_eq!(
+            deleted.string("brandProfileId"),
+            profile,
+            "case {case}: the delete must report the profile it removed it from, got {:?}",
+            deleted.body
+        );
+
+        // Gone from the reader of one attribute, and from the profile's own list.
+        let read = em.get_attribute(&profile, target.name).await;
+        assert_eq!(
+            (read.status, read.error.as_deref()),
+            (404, Some("ResourceNotFoundException")),
+            "case {case}: a deleted attribute reads back as missing, got {} / {:?}",
+            read.status,
+            read.body
+        );
+        assert_eq!(
+            read.string("message"),
+            attribute_not_found_message(),
+            "case {case}: unexpected not-found message"
+        );
+        let listed = em.listed_names(&profile).await;
+        assert!(
+            !listed.contains(&target.name.to_string()),
+            "case {case}: {:?} must be gone from the profile's attribute list, got {listed:?}",
+            target.name
+        );
+
+        // The media it held went with it: the address its own URL named serves nothing.
+        if let Some(url) = target_media_url {
+            let fetched = em.fetch(&url).await;
+            assert_eq!(
+                fetched.status, 404,
+                "case {case}: the media of a deleted attribute is served no more, got {} / {}",
+                fetched.status,
+                String::from_utf8_lossy(&fetched.bytes)
+            );
+        }
+
+        // And nothing else went with it: the neighbours still read back, are still listed,
+        // and the media of the one holding media is still served.
+        for neighbour in [NEIGHBOUR_TEXT, NEIGHBOUR_MEDIA] {
+            let kept = em.get_attribute(&profile, neighbour).await;
+            assert_eq!(
+                kept.status, 200,
+                "case {case}: {neighbour:?} must survive the delete, got {} / {:?}",
+                kept.status, kept.body
+            );
+            assert!(
+                listed.contains(&neighbour.to_string()),
+                "case {case}: {neighbour:?} must still be listed, got {listed:?}"
+            );
+        }
+        assert_eq!(
+            em.fetch(&neighbour_media_url).await.status,
+            200,
+            "case {case}: the neighbour's media must still be served"
+        );
+
+        // The name is free again: it takes a fresh attribute, which reads back as its own
+        // rather than as anything the deleted one held.
+        let recreated = em
+            .create_attributes(
+                &profile,
+                batch(&[Attribute::text(target.name, Some("recreated"))]),
+            )
+            .await;
+        assert_eq!(
+            recreated.status, 200,
+            "case {case}: the freed name must take a fresh attribute, got {} / {:?}",
+            recreated.status, recreated.body
+        );
+        let reread = em.get_attribute(&profile, target.name).await;
+        assert_eq!(
+            (reread.status, reread.member("attributeValue")),
+            (200, &json!("recreated")),
+            "case {case}: the fresh attribute must read back as stored, got {} / {:?}",
+            reread.status,
+            reread.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_name_the_profile_does_not_hold_is_reported_as_done() {
+    let em = Emulator::new();
+    let profile = em.profile("Idempotent owner").await;
+    let elsewhere = em.profile("Another owner").await;
+    assert_eq!(
+        em.create_attributes(
+            &elsewhere,
+            batch(&[Attribute::text("Held Elsewhere", Some("v"))])
+        )
+        .await
+        .status,
+        200,
+        "the other profile's attribute must be created"
+    );
+    // A name this profile held until a delete removed it: a second delete of it is the
+    // repeat the rule is about.
+    assert_eq!(
+        em.create_attributes(
+            &profile,
+            batch(&[Attribute::media("Transient", "DOCUMENT", Some(PDF))])
+        )
+        .await
+        .status,
+        200,
+        "the transient attribute must be created"
+    );
+    assert_eq!(
+        em.delete_attribute(&profile, "Transient").await.status,
+        200,
+        "the first delete must be served"
+    );
+
+    // The rows span the ways a name reaches no attribute of THIS profile: one nothing ever
+    // created, one carrying the interior space the model admits, one at the length ceiling,
+    // one a delete already removed, and one only another profile holds.
+    let before = em.listed_names(&profile).await;
+    for name in [
+        "Nothing",
+        "Not Stored At All",
+        LONGEST_NAME,
+        "Transient",
+        "Held Elsewhere",
+    ] {
+        let deleted = em.delete_attribute(&profile, name).await;
+        assert_eq!(
+            (deleted.status, deleted.error.as_deref()),
+            (200, None),
+            "case {name:?}: an idempotent delete reports the state asked for, got {} / {:?}",
+            deleted.status,
+            deleted.body
+        );
+        assert_eq!(
+            deleted.string("attributeName"),
+            name,
+            "case {name:?}: the delete must report the name it was given, got {:?}",
+            deleted.body
+        );
+        assert_eq!(
+            deleted.string("brandProfileId"),
+            profile,
+            "case {name:?}: the delete must report the profile it addressed, got {:?}",
+            deleted.body
+        );
+
+        // Nothing was created to stand in for it: the reader still answers not found, and
+        // the profile's attributes are exactly what they were.
+        let read = em.get_attribute(&profile, name).await;
+        assert_eq!(
+            (read.status, read.error.as_deref()),
+            (404, Some("ResourceNotFoundException")),
+            "case {name:?}: a delete must create nothing, got {} / {:?}",
+            read.status,
+            read.body
+        );
+        assert_eq!(
+            read.string("message"),
+            attribute_not_found_message(),
+            "case {name:?}: unexpected not-found message"
+        );
+        assert_eq!(
+            em.listed_names(&profile).await,
+            before,
+            "case {name:?}: a delete of a name the profile does not hold changes nothing"
+        );
+    }
+
+    // The profile that does hold that name still holds it.
+    let held = em.get_attribute(&elsewhere, "Held Elsewhere").await;
+    assert_eq!(
+        held.status, 200,
+        "another profile's attribute of the same name must be untouched, got {} / {:?}",
+        held.status, held.body
+    );
+}
+
+#[tokio::test]
+async fn a_delete_resolves_the_profile_by_bare_id_and_by_arn() {
+    let em = Emulator::new();
+    let created = em
+        .call(
+            "POST",
+            "/v1/brand-profiles",
+            Some(json!({ "brandProfileName": "Reference owner" })),
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "the profile must be created, got {} / {:?}",
+        created.status, created.body
+    );
+    let id = created.string("brandProfileId");
+    let arn = created.string("brandProfileArn");
+
+    // Both documented spellings of a `BrandProfileIdOrArn` reach the same profile.
+    for reference in [id.clone(), arn.clone()] {
+        let case = format!("reference={reference:?}");
+        let stored = em
+            .create_attributes(&id, batch(&[Attribute::media("Asset", "IMAGE", Some(PNG))]))
+            .await;
+        assert_eq!(
+            stored.status, 200,
+            "case {case}: the create must succeed, got {} / {:?}",
+            stored.status, stored.body
+        );
+        let url = stored.attributes()[0]["mediaDownloadUrl"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: no mediaDownloadUrl in {:?}", stored.body))
+            .to_string();
+
+        let deleted = em.delete_attribute(&reference, "Asset").await;
+        assert_eq!(
+            (deleted.status, deleted.error.as_deref()),
+            (200, None),
+            "case {case}: either spelling must address the profile, got {} / {:?}",
+            deleted.status,
+            deleted.body
+        );
+        // The output names the profile by its own unique identifier, whichever spelling
+        // the request reached it by.
+        assert_eq!(
+            deleted.string("brandProfileId"),
+            id,
+            "case {case}: unexpected reported brandProfileId, got {:?}",
+            deleted.body
+        );
+        assert_eq!(
+            deleted.string("attributeName"),
+            "Asset",
+            "case {case}: unexpected reported attributeName, got {:?}",
+            deleted.body
+        );
+        assert_eq!(
+            em.get_attribute(&id, "Asset").await.status,
+            404,
+            "case {case}: the attribute must be gone whichever spelling removed it"
+        );
+        assert_eq!(
+            em.fetch(&url).await.status,
+            404,
+            "case {case}: its media must be gone with it"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delete_against_a_profile_that_cannot_be_reached_is_refused() {
+    let em = Emulator::new();
+
+    // Identifiers of the documented forms — a bare id, and the ARN of one — that name no
+    // stored profile: the resource is missing, so the refusal names the value given.
+    let unknown = [
+        "bp-00000000000000000".to_string(),
+        "bp-AbCdEfGhIjKlMnOpQ".to_string(),
+        format!(
+            "arn:aws:{SIGNING_NAME}:us-east-1:{}:brand-profile/bp-11111111111111111",
+            engine::EMULATOR_ACCOUNT_ID
+        ),
+    ];
+    for identifier in unknown {
+        let refused = em.delete_attribute(&identifier, "Anything").await;
+        assert_eq!(
+            (refused.status, refused.error.as_deref()),
+            (404, Some("ResourceNotFoundException")),
+            "case {identifier:?}: expected 404, got {} / {:?}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.string("message"),
+            format!("Resource not found - ResourceType=\"brand-profile\" ResourceId=\"{identifier}\""),
+            "case {identifier:?}: unexpected not-found message"
+        );
+    }
+
+    // A value that is no identifier of a brand profile at all can name no profile in any
+    // state, so it is refused as input rather than as a missing resource.
+    for identifier in ["not-a-brand-profile", "bp-tooshort", "ncc-0000000000000000"] {
+        let refused = em.delete_attribute(identifier, "Anything").await;
+        assert_eq!(
+            (refused.status, refused.error.as_deref()),
+            (400, Some("ValidationException")),
+            "case {identifier:?}: expected 400, got {} / {:?}",
+            refused.status,
+            refused.body
+        );
+        let stated = format!("invalid brand profile ID format: {identifier}");
+        assert_eq!(
+            refused.string("message"),
+            stated,
+            "case {identifier:?}: unexpected refusal message"
+        );
+        assert_eq!(
+            refused.body["fieldList"],
+            json!([{ "path": "brandProfileId", "message": stated }]),
+            "case {identifier:?}: the refusal must name the member at fault, got {:?}",
+            refused.body
+        );
+    }
 }

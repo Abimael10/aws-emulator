@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBrandProfileAttribute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBrandProfileAttribute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBrandProfileAttribute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one attribute from one brand profile, with the media that attribute held.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +153,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBrandProfileAttribute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBrandProfileAttributeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Which attribute is removed is read off the input alone: both identifiers are
+        // path labels the deserializer has already bound, so no request metadata takes
+        // part in the decision.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteBrandProfileAttributeErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // An attribute belongs to one profile, so an identifier that is not one of a
+        // brand profile, or that names no stored profile, is refused against the
+        // PROFILE, reported against the value given. The attribute is addressed under
+        // the id this resolves to — a `BrandProfileIdOrArn` may be either spelling,
+        // and only one of them is the stored key.
+        let brand_profile_id = store
+            .resolve_brand_profile_id(&input.brand_profile_id)
+            .map(str::to_string)
+            .map_err(|unreachable| match unreachable {
+                crate::state::UnreachableResource::Invalid(invalid) => {
+                    DeleteBrandProfileAttributeErrorModeled::ValidationException(invalid)
+                }
+                crate::state::UnreachableResource::NotFound(missing) => {
+                    DeleteBrandProfileAttributeErrorModeled::ResourceNotFoundException(missing)
+                }
+            })?;
+        // The resolution and this write share one lock, so the record the identifier
+        // resolved to is still here; a store that lost it in between has failed on the
+        // server's side rather than on the request's.
+        let Some(profile) = store.brand_profiles.get_mut(&brand_profile_id) else {
+            return Err(
+                DeleteBrandProfileAttributeErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::RESOLVED_RESOURCE_VANISHED.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `@idempotent`: what this request asks for is a profile holding no attribute
+        // under this name, which is the state a profile that never held one is already
+        // in — so a name the profile does not hold is reported as done rather than
+        // refused, as the service answers such a request, and a repeat of a delete
+        // already served answers as the first did. A read of that name still answers
+        // not found: only the DELETE treats the absence as the state asked for.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBrandProfileAttribute"))
+        // Dropping the record drops the media it held with it — "if the attribute
+        // stores media, this operation also deletes the associated media" — because
+        // those bytes live on the attribute itself and nowhere beside it, so neither a
+        // read of the attribute nor a download of its media outlives the delete.
+        profile.attributes.remove(&input.attribute_name);
+
+        Ok(DeleteBrandProfileAttributeOutput {
+            brand_profile_id,
+            attribute_name: input.attribute_name,
+        })
     }
 }
