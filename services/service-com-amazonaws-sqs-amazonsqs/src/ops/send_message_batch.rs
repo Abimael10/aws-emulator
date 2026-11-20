@@ -346,7 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store_bytes = state.retained_message_bytes();
         let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
             return Err(SendMessageBatchErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(),
+                sqs::queue_does_not_exist(ctx.parts()),
             )
             .into());
         };
@@ -731,7 +731,7 @@ fn prepare(
 ) -> Result<Prepared, EntryRefusal> {
     let MeasuredEntry {
         mut attributes,
-        system_attributes,
+        mut system_attributes,
         bytes,
         retained,
     } = sized;
@@ -854,13 +854,17 @@ fn prepare(
         return Err(refused(entry, INVALID_PARAMETER_VALUE, reason));
     }
     // "Currently, the only supported message system attribute is AWSTraceHeader", judged
-    // by the same rule `SendMessage` applies to the member.
+    // by the same rule `SendMessage` applies to the member: a name this API does not
+    // publish fails the entry, and a value the service cannot read as that attribute's
+    // content is accepted and dropped from the entry.
     if let Some(reason) = system_attributes
         .iter()
         .find_map(|(name, value)| sqs::message_system_attribute_refusal(name, value))
     {
         return Err(refused(entry, INVALID_PARAMETER_VALUE, reason));
     }
+    system_attributes
+        .retain(|name, value| sqs::propagates_message_system_attribute(name, value));
     // `MD5OfMessageAttributes` is the digest a sender compares against its OWN digest of
     // the attributes it sent, so it covers what this ENTRY carried — taken before the
     // queue puts any value of it into the form it keeps, exactly as `SendMessage` takes it.

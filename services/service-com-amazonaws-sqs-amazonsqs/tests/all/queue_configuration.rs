@@ -758,10 +758,15 @@ async fn re_creating_a_name_is_idempotent_only_for_an_identical_attribute_set() 
             false,
         ),
         (
-            "the second dropping an attribute the first set",
+            // "Amazon SQS returns this error only if the request INCLUDES attributes
+            // whose values differ from those of the existing queue": a request that names
+            // an attribute at all is what states something about it, so one that leaves it
+            // out asks for nothing different about the queue — whatever a create of a NEW
+            // queue would have defaulted it to.
+            "the second naming none of the attributes the first set",
             json!({"SqsManagedSseEnabled": "true"}),
             json!({}),
-            false,
+            true,
         ),
         (
             "the second adding an attribute the first did not set",

@@ -184,7 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
             return Err(PurgeQueueErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(),
+                sqs::queue_does_not_exist(ctx.parts()),
             )
             .into());
         };

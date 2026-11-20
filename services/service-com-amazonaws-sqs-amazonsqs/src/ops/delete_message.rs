@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let origin = state.receipt_handle_origin(&region, &input.queue_url, &input.receipt_handle);
         let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
             return Err(DeleteMessageErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(),
+                sqs::queue_does_not_exist(ctx.parts()),
             )
             .into());
         };
@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             }
             Err(_) => {
-                return Err(match sqs::unresolvable_receipt_handle(origin) {
+                return Err(match sqs::unresolvable_receipt_handle(origin, ctx.parts()) {
                     // The handle names a queue incarnation this store no longer holds, so
                     // the queue it addresses does not exist — whatever queue now carries
                     // that name.

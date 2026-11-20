@@ -19,10 +19,11 @@
 //!   each digest covers the attribute set its own reader has — the send's the ones the
 //!   request carried, a receive's the ones it hands over;
 //! * `MessageSystemAttributes` takes the one name its key shape publishes
-//!   (`AWSTraceHeader`) with a non-empty `String` value, is digested into
-//!   `MD5OfMessageSystemAttributes`, comes back on a receive that selects it, and does
-//!   not count toward the queue's `MaximumMessageSize`; any other name is refused the
-//!   same way;
+//!   (`AWSTraceHeader`), is digested into `MD5OfMessageSystemAttributes`, comes back on a
+//!   receive that selects it, and does not count toward the queue's `MaximumMessageSize`;
+//!   a name this API does not publish and a value supplied in a form other than the one the
+//!   attribute's type names are refused, while a value this service cannot read as the
+//!   header the attribute carries is accepted and not propagated;
 //! * `MessageAttributeNames` selects an attribute by exact name, or by the `prefix.*`
 //!   wildcard, which selects every attribute whose name starts with `prefix`.
 //!
@@ -571,9 +572,11 @@ async fn a_taken_attribute_comes_back_on_the_receive() {
 }
 
 /// `MessageSystemAttributes` takes the one name its key shape publishes, digests it into
-/// `MD5OfMessageSystemAttributes` and hands it back on a receive that selects it; every
-/// other name, and a value that is not a non-empty `String`, is refused with nothing
-/// enqueued.
+/// `MD5OfMessageSystemAttributes` and hands it back on a receive that selects it; a name
+/// this API does not publish and a value the request supplies in a form other than the one
+/// the attribute's type names are refused with nothing enqueued, while a value this service
+/// cannot read as the header the attribute carries leaves the send to succeed and is simply
+/// not propagated.
 #[tokio::test]
 async fn message_system_attributes_take_only_the_trace_header() {
     let router = emulator();
@@ -641,57 +644,124 @@ async fn message_system_attributes_take_only_the_trace_header() {
         );
     }
 
-    // `(case, the system attribute map, taken)`
-    let rows: &[(&str, Value, bool)] = &[
+    // `(case, the system attribute map, taken, propagated)`
+    //
+    // What the request SUPPLIES for the attribute is a requirement on the request: a name
+    // this API does not publish, a declared type other than `String`, a value supplied in
+    // the field another type names, the two list members the shape reserves for future use,
+    // and a value member that is absent altogether are each refused with nothing enqueued.
+    // What the supplied value MEANS is content the service either reads or does not: a
+    // value this service cannot read as a correctly formatted X-Ray trace header is TAKEN
+    // — this operation's model declares no refusal for it — and simply not carried on the
+    // message, which leaves the send to succeed and the message merely untraced.
+    let rows: &[(&str, Value, bool, bool)] = &[
         (
             "a name that is not the published one",
             json!({ "traceparent": { "DataType": "String", "StringValue": TRACE_HEADER } }),
+            false,
             false,
         ),
         (
             "another unpublished name",
             json!({ "XRayTraceHeader": { "DataType": "String", "StringValue": TRACE_HEADER } }),
             false,
+            false,
         ),
         (
             "the published name in the wrong case",
             json!({ "AWSTraceheader": { "DataType": "String", "StringValue": TRACE_HEADER } }),
+            false,
             false,
         ),
         (
             "a message system attribute name that selects, not sends",
             json!({ "SentTimestamp": { "DataType": "String", "StringValue": "0" } }),
             false,
+            false,
         ),
         (
             "the published name with a Number type",
             json!({ "AWSTraceHeader": { "DataType": "Number", "StringValue": "1" } }),
             false,
+            false,
         ),
         (
-            "the published name with a Binary value",
+            "the published name with a Binary type and value",
             json!({ "AWSTraceHeader": { "DataType": "Binary", "BinaryValue": "3q2+7w==" } }),
+            false,
+            false,
+        ),
+        (
+            "the published name with its value in the field another type names",
+            json!({ "AWSTraceHeader": { "DataType": "String", "BinaryValue": "3q2+7w==" } }),
+            false,
+            false,
+        ),
+        (
+            "the published name carrying a reserved list member",
+            json!({
+                "AWSTraceHeader": {
+                    "DataType": "String",
+                    "StringValue": TRACE_HEADER,
+                    "StringListValues": [],
+                },
+            }),
+            false,
+            false,
+        ),
+        (
+            "the published name with no value at all",
+            json!({ "AWSTraceHeader": { "DataType": "String" } }),
+            false,
+            false,
+        ),
+        (
+            "the published name with a custom label on its type",
+            json!({
+                "AWSTraceHeader": { "DataType": "String.xray", "StringValue": TRACE_HEADER },
+            }),
+            false,
+            false,
+        ),
+        (
+            "the published name with a value that is not a trace header",
+            json!({ "AWSTraceHeader": { "DataType": "String", "StringValue": "not-a-trace" } }),
+            true,
+            false,
+        ),
+        (
+            "the published name with a trace id of the wrong width",
+            json!({ "AWSTraceHeader": { "DataType": "String", "StringValue": "Root=1-abc-def" } }),
+            true,
             false,
         ),
         (
             "the published name with an empty value",
             json!({ "AWSTraceHeader": { "DataType": "String", "StringValue": "" } }),
-            false,
-        ),
-        (
-            "the published name with no value",
-            json!({ "AWSTraceHeader": { "DataType": "String" } }),
+            true,
             false,
         ),
         (
             "the published name with a well-formed value",
             json!({ "AWSTraceHeader": { "DataType": "String", "StringValue": TRACE_HEADER } }),
             true,
+            true,
+        ),
+        (
+            "the published name with the trace id alone",
+            json!({
+                "AWSTraceHeader": {
+                    "DataType": "String",
+                    "StringValue": "Root=1-5759e988-bd862e3fe1be46a994272793",
+                },
+            }),
+            true,
+            true,
         ),
     ];
 
     let refusals = create_ok(&router, "system-attribute-rules", &json!({})).await;
-    for (case, system_attributes, taken) in rows {
+    for (case, system_attributes, taken, propagated) in rows {
         let before = held(&router, &refusals).await;
         let (status, answer) = call(
             &router,
@@ -715,6 +785,50 @@ async fn message_system_attributes_take_only_the_trace_header() {
                 "case {case}: an accepted send must enqueue one message, held {before} then \
                  {after}"
             );
+            // A system attribute the service could not read is on neither the digest the
+            // answer reports nor the message a receive hands back.
+            let digested = answer.get("MD5OfMessageSystemAttributes").is_some();
+            assert_eq!(
+                digested, *propagated,
+                "case {case}: expected MD5OfMessageSystemAttributes present={propagated}, got \
+                 {answer}"
+            );
+            let received = messages(
+                &ok(
+                    &router,
+                    "ReceiveMessage",
+                    json!({
+                        "QueueUrl": refusals,
+                        "MessageSystemAttributeNames": ["All"],
+                    }),
+                )
+                .await,
+            );
+            assert_eq!(
+                received.len(),
+                1,
+                "case {case}: expected the one accepted message, got {received:?}"
+            );
+            let reported = received[0]["Attributes"]["AWSTraceHeader"].as_str();
+            // What a propagated attribute reports is the value the request sent for it.
+            let expected = propagated.then(|| {
+                system_attributes["AWSTraceHeader"]["StringValue"]
+                    .as_str()
+                    .unwrap_or_default()
+            });
+            assert_eq!(
+                reported, expected,
+                "case {case}: expected AWSTraceHeader {expected:?}, got {reported:?}"
+            );
+            let _ = ok(
+                &router,
+                "DeleteMessage",
+                json!({
+                    "QueueUrl": refusals,
+                    "ReceiptHandle": received[0]["ReceiptHandle"].as_str().unwrap_or_default(),
+                }),
+            )
+            .await;
         } else {
             assert_eq!(
                 (status, error_code(&answer).as_str()),

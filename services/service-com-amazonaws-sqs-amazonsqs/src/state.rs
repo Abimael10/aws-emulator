@@ -3647,31 +3647,49 @@ pub fn queue_name_from_arn<'a>(arn: &'a str, region: &str) -> Option<&'a str> {
     }
 }
 
-/// The message a `QueueDoesNotExist` refusal carries, whatever addressed the queue that is
-/// not there.
+/// One sentence per wire protocol, because the two surfaces of this one API word this class
+/// differently.
 ///
 /// RECORDED: a request naming a queue this account does not hold — by its `QueueUrl` on every
 /// operation that takes one, and by its `QueueName` on the one operation that resolves a name
-/// — is refused `AWS.SimpleQueueService.NonExistentQueue` with THIS sentence and nothing
-/// further. It is the COMPLETE fixed text of the refusal: the error CODE
-/// (`AWS.SimpleQueueService.NonExistentQueue` / `QueueDoesNotExist`, from the model's
+/// — is refused `AWS.SimpleQueueService.NonExistentQueue` with the sentence of the protocol it
+/// arrived in, and nothing further. It is the COMPLETE fixed text of the refusal: the error
+/// CODE (`AWS.SimpleQueueService.NonExistentQueue` / `QueueDoesNotExist`, from the model's
 /// `awsQueryError`) is what identifies the condition, and the message is a constant a client
-/// can match on. It deliberately does not name the queue, so a caller probing for a queue it
-/// may not address is never handed the url or the name it probed back.
+/// can match on. Neither sentence names the queue, so a caller probing for a queue it may not
+/// address is never handed the url or the name it probed back.
 ///
-/// One sentence for both addressing forms, because the form the caller used is not part of
-/// the condition: the queue is absent either way, and the answer a client reads is the same.
+/// [`QUEUE_DOES_NOT_EXIST_MESSAGE`] is what the `awsJson1_0` surface answers, and
+/// [`QUEUE_DOES_NOT_EXIST_IN_THIS_VERSION`] what the WSDL-versioned AWS Query surface — the
+/// one a query request names its `Version` of — has gone on answering for the clients that
+/// still read it ([`crate::service::query_protocol`]). One sentence per surface for both
+/// addressing forms, because the form the caller used is not part of the condition: the
+/// queue is absent either way.
 pub const QUEUE_DOES_NOT_EXIST_MESSAGE: &str = "The specified queue does not exist.";
+pub const QUEUE_DOES_NOT_EXIST_IN_THIS_VERSION: &str =
+    "The specified queue does not exist for this wsdl version.";
+
+/// The sentence a `QueueDoesNotExist` refusal carries for a request that arrived as `parts`:
+/// the sentence of the wire protocol that request is answered in.
+pub fn queue_does_not_exist_message(parts: &::http::request::Parts) -> &'static str {
+    if crate::service::query_protocol::parts_address_the_query_api(parts) {
+        QUEUE_DOES_NOT_EXIST_IN_THIS_VERSION
+    } else {
+        QUEUE_DOES_NOT_EXIST_MESSAGE
+    }
+}
 
 /// The modelled refusal for a queue this account does not hold — a `QueueUrl` no queue
-/// answers to, or a `QueueName` it holds nothing under — carrying
-/// [`QUEUE_DOES_NOT_EXIST_MESSAGE`] verbatim.
+/// answers to, or a `QueueName` it holds nothing under — carrying the sentence the protocol
+/// the request arrived in words it with ([`queue_does_not_exist_message`]).
 ///
-/// Takes no argument on purpose: nothing of the request may reach this payload, so no
-/// caller can word a message of its own that echoes a url, a name or an owner.
-pub fn queue_does_not_exist() -> QueueDoesNotExist {
+/// Takes the request's PARTS and nothing else on purpose: no value of the request may reach
+/// this payload, so no caller can word a message of its own that echoes a url, a name or an
+/// owner, and the one thing the request decides is which of this service's two surfaces is
+/// answering.
+pub fn queue_does_not_exist(parts: &::http::request::Parts) -> QueueDoesNotExist {
     QueueDoesNotExist {
-        message: Some(QUEUE_DOES_NOT_EXIST_MESSAGE.to_string()),
+        message: Some(queue_does_not_exist_message(parts).to_string()),
     }
 }
 
@@ -3742,10 +3760,13 @@ pub enum UnresolvableReceiptHandle {
 
 /// Which refusal answers a receipt handle the queue addressed cannot resolve, so every
 /// operation that takes one classifies it the same way.
-pub fn unresolvable_receipt_handle(origin: ReceiptHandleOrigin<'_>) -> UnresolvableReceiptHandle {
+pub fn unresolvable_receipt_handle(
+    origin: ReceiptHandleOrigin<'_>,
+    parts: &::http::request::Parts,
+) -> UnresolvableReceiptHandle {
     match origin {
         ReceiptHandleOrigin::PreviousIncarnation => {
-            UnresolvableReceiptHandle::QueueIsGone(queue_does_not_exist())
+            UnresolvableReceiptHandle::QueueIsGone(queue_does_not_exist(parts))
         }
         ReceiptHandleOrigin::Unrecognised | ReceiptHandleOrigin::AnotherQueue(_) => {
             UnresolvableReceiptHandle::HandleIsInvalid(receipt_handle_is_invalid(origin))
@@ -3759,8 +3780,9 @@ pub fn unresolvable_receipt_handle(origin: ReceiptHandleOrigin<'_>) -> Unresolva
 /// `awsQueryError` code for that error shape.
 pub fn unresolvable_receipt_handle_batch_failure(
     origin: ReceiptHandleOrigin<'_>,
+    parts: &::http::request::Parts,
 ) -> (&'static str, Option<String>) {
-    match unresolvable_receipt_handle(origin) {
+    match unresolvable_receipt_handle(origin, parts) {
         UnresolvableReceiptHandle::QueueIsGone(error) => (QUEUE_DOES_NOT_EXIST_CODE, error.message),
         UnresolvableReceiptHandle::HandleIsInvalid(error) => {
             (RECEIPT_HANDLE_IS_INVALID_CODE, error.message)
@@ -4564,17 +4586,21 @@ pub fn tag_refusal(
 /// existing queue instead of creating a new one. If you attempt to create a queue with a
 /// name that already exists but with different attribute names or values, the CreateQueue
 /// action will return an error" — and `QueueNameExists` itself: "Amazon SQS returns this
-/// error only if the request includes attributes whose values differ from those of the
+/// error only if the request INCLUDES attributes whose values differ from those of the
 /// existing queue."
 ///
-/// `requested` is the attribute map the request would leave the queue with (the
-/// documented defaults overlaid with what it supplied), compared attribute by attribute
-/// in name order so a request differing in two is always refused for the same one. EVERY
-/// settable attribute is part of that comparison, including the queue's access policy —
-/// see [`attribute_value_unchanged`] for how each one is compared. `tags` is the tag map
-/// the request supplied, and `None` when it supplied no `tags` member at all: tags carry
-/// no default, so a request that supplies none includes nothing about them, while one
-/// that supplies them has to name the set the queue already holds.
+/// `requested` is the attribute map the request would leave the queue carrying: the
+/// attributes the queue carries NOW with what the request supplied overlaid, compared
+/// attribute by attribute in name order so a request differing in two is always refused
+/// for the same one. So the comparison is against the queue's CURRENT configuration, and an
+/// attribute the request did not name takes no part in it — a re-create naming the value a
+/// `SetQueueAttributes` left in force is idempotent, and one naming no attribute at all
+/// always is. EVERY settable attribute the request names is part of the comparison,
+/// including the queue's access policy — see [`attribute_value_unchanged`] for how each one
+/// is compared. `tags` is the tag map the request supplied, and `None` when it supplied no
+/// `tags` member at all: tags carry no default, so a request that supplies none includes
+/// nothing about them, while one that supplies them has to name the set the queue already
+/// holds.
 ///
 /// The two refusals are worded apart because a tag is not an attribute: an attribute
 /// conflict is repaired with `SetQueueAttributes` and a tag conflict with `TagQueue`, so a

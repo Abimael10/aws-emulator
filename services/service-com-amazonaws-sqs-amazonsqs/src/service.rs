@@ -49,7 +49,11 @@
 /// queue-level call it serves, and the routing table those calls are served through.
 pub mod management_events;
 
+/// The AWS Query protocol this endpoint serves the same API over, beside `awsJson1_0`.
+pub mod query_protocol;
+
 use management_events::AuditedDefinition;
+use query_protocol::{QueryServedApi, QueryServedDefinition};
 use smithy_server_runtime::{
     http, BoxFuture, ErasedOperation, ErasedServiceDefinition, OperationContext, Refusal, Refused,
     Service, Violation, ViolationKind,
@@ -68,15 +72,21 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// onto the account's default event bus while a trail of the Region is logging calls
     /// of its kind (see [`management_events`]). Identity, the protocol and every framework
     /// error renderer stay the generated entry's.
-    entry: AuditedDefinition<crate::ServiceDefinition<Eng>>,
+    entry: QueryServedDefinition<AuditedDefinition<crate::ServiceDefinition<Eng>>>,
     /// The transport's answer to a request body above [`max_request_body_bytes`], held
     /// here because [`Service::override_operation`] hands back a reference borrowed from
     /// `&self`.
     oversized: RequestEntityTooLarge,
+    /// The answer to a request whose declared media type this endpoint reads no document in,
+    /// held here for the same reason.
+    unreadable: MediaTypeNotServed,
     /// Every other request's modelled operation, served through the wrapper that completes
     /// this service's error envelope ([`QueryCompatibleErrors`]), held here for the same
     /// reason.
     query_compatible: QueryCompatibleErrors<Eng>,
+    /// The same operations served in the AWS Query protocol, for a request that arrives in
+    /// it (see [`query_protocol`]), held here for the same reason.
+    query_served: QueryServedApi<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -90,11 +100,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         // filed beside them unrecorded (see [`management_events::audited_table`]).
         let audited = management_events::audited_table(&engine);
         Self {
-            entry: AuditedDefinition::new(
+            entry: QueryServedDefinition::new(AuditedDefinition::new(
                 crate::ServiceDefinition::new(Arc::clone(&engine)),
                 audited,
-            ),
+            )),
             oversized: RequestEntityTooLarge,
+            unreadable: MediaTypeNotServed,
+            query_served: QueryServedApi::new(Arc::clone(&engine)),
             query_compatible: QueryCompatibleErrors { engine },
         }
     }
@@ -107,11 +119,23 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        let key = self.entry.protocol().routing_key(req).ok()?;
+        let key = self.entry.wire_protocol(req).protocol().routing_key(req).ok()?;
         self.entry
             .routing_table()
             .get(key)
             .map(|_| &self.query_compatible as &dyn ErasedOperation)
+    }
+
+    /// The surface that serves `req` in the AWS Query protocol, or `None` when the
+    /// request's `Action` names no operation of this API — which is the framework's routing
+    /// failure, worded in that protocol's own envelope.
+    fn serving_the_query_api(
+        &self,
+        req: &aws_smithy_runtime_api::http::Request,
+    ) -> Option<&dyn ErasedOperation> {
+        self.query_served
+            .names_the_operation(req)
+            .then_some(&self.query_served as &dyn ErasedOperation)
     }
 }
 
@@ -362,7 +386,7 @@ fn modelled_error_id(local: &str) -> Option<&'static str> {
 
 /// The legacy query code this service's model gives the error shape whose local name is
 /// `local`, or `None` when its model declares no error shape of that name.
-fn modelled_query_error_code(local: &str) -> Option<&'static str> {
+pub(crate) fn modelled_query_error_code(local: &str) -> Option<&'static str> {
     modelled_classes()
         .get(local)
         .map(|class| class.query_code.as_str())
@@ -552,6 +576,109 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for QueryCompatibleErrors<Eng> 
     }
 }
 
+/// The error class this endpoint answers a JSON request whose target it cannot resolve to
+/// an operation, named by the shape id of the request framework in front of Amazon SQS —
+/// the same framework the parameter classes in [`crate::scaffolded`] are named by.
+const UNKNOWN_OPERATION_SHAPE_ID: &str = "com.amazon.coral.service#UnknownOperationException";
+
+/// The status that refusal carries: the caller named no operation of this API, which is a
+/// fault in the request.
+const UNKNOWN_OPERATION_STATUS: u16 = 400;
+
+/// The content type the `awsJson1_0` wire carries a document in, which this refusal is
+/// answered as.
+const JSON_CONTENT_TYPE: &str = "application/x-amz-json-1.0";
+
+/// The refusal of a JSON request this endpoint cannot resolve an operation for: the class
+/// alone, which is the whole document — no `message` member, because there is no parameter,
+/// value or header for one to be about.
+fn unknown_operation_response() -> aws_smithy_runtime_api::http::Response {
+    let body = ::serde_json::json!({ TYPE_MEMBER: UNKNOWN_OPERATION_SHAPE_ID }).to_string();
+    let mut resp = aws_smithy_runtime_api::http::Response::new(
+        aws_smithy_runtime_api::http::StatusCode::try_from(UNKNOWN_OPERATION_STATUS)
+            .expect("400 is a status code"),
+        aws_smithy_types::body::SdkBody::from(body),
+    );
+    let _ = resp.headers_mut().try_insert("content-type", JSON_CONTENT_TYPE);
+    resp
+}
+
+/// The media types this endpoint reads a request document in: its `awsJson1_0` wire's own
+/// (`application/x-amz-json-1.0`) and the AWS Query protocol's form encoding
+/// ([`query_protocol`]). A request DECLARING anything else carries no document either
+/// protocol of this endpoint can read ([`MediaTypeNotServed`]).
+///
+/// The JSON entry is the FAMILY and not the one version: `application/x-amz-json-1.1` names
+/// the same JSON document in the next version of the same protocol, which this codec reads
+/// unchanged — the version decides how an error is framed, not what a request document
+/// looks like — so a client of an adjacent version is served rather than refused. A media
+/// type from another protocol family (a plain JSON document, XML, CBOR, text) is a document
+/// neither of this endpoint's protocols carries, and is the refusal's subject.
+const READ_MEDIA_TYPES: &[&str] = &[
+    "application/x-amz-json",
+    ::service_common::query_wire_form::QUERY_CONTENT_TYPE,
+];
+
+/// Whether this endpoint reads a document in the media type `req` DECLARES.
+///
+/// A request that declares none has stated nothing to disagree with and is read in this
+/// service's own protocol, which is the only one its model declares; one that declares a
+/// media type neither of this endpoint's protocols carries a document in names no operation
+/// of this API, whatever its target header says.
+fn reads_the_declared_media_type(req: &aws_smithy_runtime_api::http::Request) -> bool {
+    let Some(declared) = req.headers().get("content-type") else {
+        return true;
+    };
+    let declared = declared.trim().to_ascii_lowercase();
+    READ_MEDIA_TYPES
+        .iter()
+        .any(|read| declared.starts_with(read))
+}
+
+/// The answer to a request whose declared media type carries no document this endpoint
+/// reads: HTTP 404 naming the class an AWS endpoint answers for a request it could resolve
+/// no operation for, as the ONE element that answer carries
+/// ([`UNKNOWN_OPERATION_DOCUMENT`]).
+///
+/// Nothing was read, so there is no operation to name and no parameter to report. It is
+/// shaped as an operation only because the router names one before anything can be
+/// answered; nothing of this service's model reaches it, it deserializes no input and it
+/// writes nothing.
+///
+/// [`ErasedOperation::auth_schemes`] is left at its default `None` for the same reason
+/// [`RequestEntityTooLarge`] leaves it there: routing a request here never weakens what
+/// must sign it.
+#[derive(Debug)]
+struct MediaTypeNotServed;
+
+/// The status that refusal carries.
+const MEDIA_TYPE_NOT_SERVED: u16 = 404;
+
+/// The whole document that refusal carries: the class as its own empty element, which is
+/// what an AWS endpoint answers a request it resolved no operation for in a media type it
+/// reads no document in — not the JSON envelope, because nothing said the caller would read
+/// one.
+const UNKNOWN_OPERATION_DOCUMENT: &str = "<UnknownOperationException/>\n";
+
+impl ErasedOperation for MediaTypeNotServed {
+    fn run<'r>(
+        &'r self,
+        _svc: &'r dyn Service,
+        _req: &'r aws_smithy_runtime_api::http::Request,
+        _ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, aws_smithy_runtime_api::http::Response> {
+        Box::pin(async move {
+            let mut resp = aws_smithy_runtime_api::http::Response::new(
+                aws_smithy_runtime_api::http::StatusCode::try_from(MEDIA_TYPE_NOT_SERVED)
+                    .expect("404 is a status code"),
+                aws_smithy_types::body::SdkBody::from(UNKNOWN_OPERATION_DOCUMENT),
+            );
+            let _ = resp.headers_mut().try_insert("content-type", "text/xml");
+            resp
+        })
+    }
+}
+
 /// The error Amazon SQS names for a value the boundary validator refused, or `None` to
 /// leave the framework's wording in place.
 ///
@@ -633,6 +760,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // failure.
         match req.body().bytes() {
             Some(body) if body.len() > max_request_body_bytes() => Some(&self.oversized),
+            // A request DECLARING a media type neither of this endpoint's protocols reads a
+            // document in names no operation of this API: nothing of it is read, and the
+            // answer is the bare 404 ([`MediaTypeNotServed`]).
+            _ if !reads_the_declared_media_type(req) => Some(&self.unreadable),
+            // A request that arrives in the AWS Query protocol is served in it, out of the
+            // surface that holds this service's operations under that protocol's envelope
+            // ([`query_protocol`]). An `Action` this API does not publish resolves nothing
+            // here, so such a request falls through to the framework's routing failure,
+            // worded in that protocol's own envelope.
+            _ if query_protocol::addresses_the_query_api(req) => self.serving_the_query_api(req),
             Some(_) => self.serving_the_modelled_operation(req),
             // A body that is not in memory has no length to measure, so the ceiling
             // cannot be applied to it and this arm must not guess: it routes on. The
@@ -664,12 +801,27 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it.
+        //
+        // A request in the AWS Query protocol that named no operation of this API is
+        // refused with the class and the sentence that protocol answers for one — the
+        // action it named and the statement that this web service does not have it, or the
+        // statement that it supplied no action at all
+        // ([`query_protocol::no_such_action_response`]). The framework's default renders
+        // the right envelope with a wording of its own.
+        //
+        // On the JSON wire the operation is named by `X-Amz-Target`, and a request whose
+        // target this endpoint cannot resolve to an operation — one that carries no target
+        // at all, or one whose target names nothing this API publishes — is refused with
+        // the class the endpoint answers for an unresolvable target:
+        // `UnknownOperationException`, named by the shape id of the request framework in
+        // front of Amazon SQS ([`UNKNOWN_OPERATION_SHAPE_ID`]). The default rendering
+        // states an emulator-authored sentence about a header instead, which is a class no
+        // client of this API can classify.
+        if query_protocol::addresses_the_query_api(req) {
+            return Some(query_protocol::no_such_action_response(req));
+        }
+        Some(unknown_operation_response())
     }
 
     fn override_framework_error(

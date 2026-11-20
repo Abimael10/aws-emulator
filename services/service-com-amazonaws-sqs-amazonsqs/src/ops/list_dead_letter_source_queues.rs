@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|name| state.holds_queue(&region, name))
             .ok_or_else(|| {
                 ListDeadLetterSourceQueuesErrorModeled::QueueDoesNotExist(
-                    sqs::queue_does_not_exist(),
+                    sqs::queue_does_not_exist(ctx.parts()),
                 )
             })?;
 

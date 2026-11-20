@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let queue = store
             .queue_by_url(&region, &input.queue_url)
             .ok_or_else(|| {
-                ListQueueTagsErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
+                ListQueueTagsErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(ctx.parts()))
             })?;
 
         // Whether this caller may report this queue's tags is decided against the queue's

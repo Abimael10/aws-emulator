@@ -243,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let origin = state.receipt_handle_origin(&region, &input.queue_url, &input.receipt_handle);
         let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
             return Err(ChangeMessageVisibilityErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(),
+                sqs::queue_does_not_exist(ctx.parts()),
             )
             .into());
         };
@@ -290,7 +290,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 sqs::ReceiptHandleOrigin::PreviousIncarnation => {
                     Err(ChangeMessageVisibilityErrorModeled::QueueDoesNotExist(
-                        sqs::queue_does_not_exist(),
+                        sqs::queue_does_not_exist(ctx.parts()),
                     )
                     .into())
                 }

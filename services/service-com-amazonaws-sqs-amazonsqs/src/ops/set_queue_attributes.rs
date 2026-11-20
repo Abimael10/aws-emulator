@@ -241,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|name| store.holds_queue(&region, name))
             .map(str::to_string)
             .ok_or_else(|| {
-                SetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
+                SetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(ctx.parts()))
             })?;
         let fifo = store
             .queue(&region, &name)

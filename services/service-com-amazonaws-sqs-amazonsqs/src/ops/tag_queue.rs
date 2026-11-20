@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|name| store.holds_queue(&region, name))
             .map(str::to_string)
             .ok_or_else(|| {
-                TagQueueErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
+                TagQueueErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(ctx.parts()))
             })?;
 
         // Whether this caller may tag this queue is decided against the queue's own policy

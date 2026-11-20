@@ -327,12 +327,27 @@ pub fn attribute_logical_type(data_type: &str) -> Option<&'static str> {
 
 /// Why this message SYSTEM attribute cannot be accepted, or `None` when it can.
 ///
-/// "Currently, the only supported message system attribute is AWSTraceHeader. Its type
-/// must be String and its value must be a correctly formatted X-Ray trace header string"
+/// "Currently, the only supported message system attribute is AWSTraceHeader. Its type must
+/// be String and its value must be a correctly formatted X-Ray trace header string"
 /// (`SendMessageRequest$MessageSystemAttributes`), and the map's own key shape
-/// ([`MESSAGE_SYSTEM_ATTRIBUTE_NAME_FOR_SENDS_VALUES`]) publishes that one name — so any
-/// other name is refused, and the one name takes a non-empty `StringValue` and nothing
-/// else.
+/// ([`MESSAGE_SYSTEM_ATTRIBUTE_NAME_FOR_SENDS_VALUES`]) publishes that one name. Those two
+/// sentences state two different kinds of thing, and this service answers them differently:
+///
+/// * what the request SUPPLIES for the attribute is a requirement on the request — the
+///   name has to be the published one, the declared type has to be `String`, the value has
+///   to be supplied in the field that type names, and neither of the two list members the
+///   shape reserves for future use may carry it — and a request breaking any of them is
+///   refused with nothing enqueued. A value member that is ABSENT is one of those: the
+///   request did not supply the attribute's value at all;
+/// * what the supplied value MEANS is content the service either reads or does not. This
+///   operation's model declares no error for a value that is not the thing the attribute
+///   carries — "its value must be a correctly formatted X-Ray trace header string" says
+///   what a value MEANS, which the service either reads or does not — and the header
+///   travels BESIDE the message rather than as part of it ("the size of a message system
+///   attribute doesn't count towards the total size of a message"). So a value this service
+///   cannot read as a trace header is accepted and simply not propagated: the message is
+///   sent and merely untraced. See [`propagates_message_system_attribute`], which is what
+///   decides whether the attribute reaches the queue at all.
 pub fn message_system_attribute_refusal(
     name: &str,
     value: &MessageSystemAttributeValue,
@@ -341,17 +356,46 @@ pub fn message_system_attribute_refusal(
         return Some(format!("Message system attribute name '{name}' is invalid."));
     }
     let parts = AttributeParts::from(value);
-    let carries_a_string = parts
-        .string_value
-        .is_some_and(|string_value| !string_value.is_empty());
-    if parts.data_type != "String"
-        || !carries_a_string
+    if parts.data_type != MESSAGE_SYSTEM_ATTRIBUTE_TYPE
+        || parts.string_value.is_none()
         || parts.binary_value.is_some()
         || parts.list_member.is_some()
     {
         return Some(format!(
-            "Message system attribute '{name}' must contain a non-empty value of type 'String'."
+            "Message system attribute '{name}' must contain a non-empty value of type \
+             '{MESSAGE_SYSTEM_ATTRIBUTE_TYPE}'."
         ));
     }
     None
+}
+
+/// The one type a message system attribute's value is declared with: `AWSTraceHeader`
+/// "must be String".
+const MESSAGE_SYSTEM_ATTRIBUTE_TYPE: &str = "String";
+
+/// Whether the value supplied for message system attribute `name` carries content this
+/// service can put ON the message, so that a receive selecting the attribute reports it and
+/// the digest the send answers with covers it.
+///
+/// `AWSTraceHeader`'s content is one thing — "a correctly formatted X-Ray trace header
+/// string" — so a value holding no text, or text this service cannot read as that header,
+/// carries nothing to propagate. Such a value is DROPPED rather than refused (see
+/// [`message_system_attribute_refusal`]): the message is sent carrying everything the
+/// request put on it, and merely untraced.
+///
+/// What a tracing header IS is the shared reading every service in this tree that carries
+/// one applies ([`::service_common::xray_trace::tracing_header`]), so the header this queue
+/// propagates and the header another service reads off a message cannot be judged by two
+/// different rules.
+pub fn propagates_message_system_attribute(
+    name: &str,
+    value: &MessageSystemAttributeValue,
+) -> bool {
+    if !MESSAGE_SYSTEM_ATTRIBUTE_NAME_FOR_SENDS_VALUES.contains(&name) {
+        return false;
+    }
+    AttributeParts::from(value)
+        .string_value
+        .and_then(::service_common::xray_trace::tracing_header)
+        .is_some()
 }

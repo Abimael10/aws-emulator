@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_none()
         {
             return Err(DeleteQueueErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(),
+                sqs::queue_does_not_exist(ctx.parts()),
             )
             .into());
         }

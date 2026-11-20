@@ -332,7 +332,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store_bytes = state.retained_message_bytes();
         let Some(queue) = state.queue_by_url_mut(&region, &input.queue_url) else {
             return Err(SendMessageErrorModeled::QueueDoesNotExist(
-                sqs::queue_does_not_exist(),
+                sqs::queue_does_not_exist(ctx.parts()),
             )
             .into());
         };
@@ -354,9 +354,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The message system attribute to send ... Currently, the only supported message
         // system attribute is AWSTraceHeader": the one name the map's key shape publishes
-        // is taken and carried on the message, and any other name — or a value that is not
-        // a non-empty String — is refused before anything is stored.
-        let message_system_attributes: BTreeMap<String, MessageSystemAttributeValue> = input
+        // is taken and carried on the message, and any other name is refused before
+        // anything is stored. A value this service cannot read as that attribute's content
+        // is accepted and DROPPED rather than refused — the message is sent and merely
+        // untraced (`sqs::propagates_message_system_attribute`).
+        let mut message_system_attributes: BTreeMap<String, MessageSystemAttributeValue> = input
             .message_system_attributes
             .clone()
             .unwrap_or_default()
@@ -370,6 +372,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(Scaffolded::invalid_parameter_value(reason));
         }
+        message_system_attributes
+            .retain(|name, value| sqs::propagates_message_system_attribute(name, value));
 
         // "In FIFO queues, MessageGroupId organizes messages into distinct groups ...
         // If you do not provide a MessageGroupId when sending a message to a FIFO

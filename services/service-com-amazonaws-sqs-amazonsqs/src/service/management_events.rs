@@ -180,7 +180,7 @@ pub fn session_audit_directory<Eng: Send + Sync + 'static>(
 /// The envelope a pre-dispatch failure of one of this service's operations renders in:
 /// this service speaks `awsJson1_0`, which is the same value the generated per-operation
 /// shim passes.
-const JSON_ENVELOPE: PreDispatchProtocol<'static> = PreDispatchProtocol::Json {
+pub const JSON_ENVELOPE: PreDispatchProtocol<'static> = PreDispatchProtocol::Json {
     content_type: "application/x-amz-json-1.0",
     // The awsJson families convey the error type in the body's `__type`, not in a header.
     errortype_header: false,
@@ -255,8 +255,23 @@ pub const DATA_PLANE_OPERATIONS: &[&str] = &[
 /// and change none of it, and `mutates` for every operation that creates, configures,
 /// tags, purges, moves or removes something the account then holds.
 pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> OperationRoutingTable {
+    audited_table_in(engine, JSON_ENVELOPE)
+}
+
+/// The same table, rendering a pre-dispatch failure in `envelope`.
+///
+/// One API, two wire protocols: this service answers the same operations as `awsJson1_0`
+/// and as the AWS Query protocol (`crate::service::query_protocol`), and a request the
+/// framework refuses BEFORE a handler runs is rendered from the envelope the operation was
+/// filed with. So the table is built once per protocol this service serves, from the same
+/// operations and the same recorder — a call is audited identically whichever protocol it
+/// arrived in, and only the envelope its pre-dispatch failures render in differs.
+pub fn audited_table_in<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+    envelope: PreDispatchProtocol<'static>,
+) -> OperationRoutingTable {
     let recorder = Arc::new(SqsAudit::new(Arc::clone(engine)));
-    let mut table = AuditedTable::new(recorder, JSON_ENVELOPE);
+    let mut table = AuditedTable::new(recorder, envelope);
     audited!(
         table, engine,
         add_permission::AddPermission => mutates,

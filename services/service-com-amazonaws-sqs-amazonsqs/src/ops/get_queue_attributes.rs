@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = state::request_region(ctx.parts());
         if store.queue_by_url(&region, &input.queue_url).is_none() {
             return Err(
-                GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
+                GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(ctx.parts()))
                     .into(),
             );
         }
@@ -193,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.advance_message_move_tasks(now);
         let Some(queue) = store.queue_by_url_mut(&region, &input.queue_url) else {
             return Err(
-                GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
+                GetQueueAttributesErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(ctx.parts()))
                     .into(),
             );
         };

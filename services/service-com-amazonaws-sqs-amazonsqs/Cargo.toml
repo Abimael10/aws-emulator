@@ -57,6 +57,11 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `roxmltree`: the suite that drives this endpoint's AWS Query surface
+# (`tests/all/query_compatible_error_envelope.rs`) READS the XML documents that protocol
+# answers with through a real XML parser, so an assertion sees the document a client's
+# parser sees rather than the bytes on the wire.
+roxmltree = "0.20"
 # The encryption suite makes the keys and principals it drives through KMS's, IAM's and
 # STS's own operations, mounted beside this service on one engine, so the key policies and
 # identity policies it asserts on are the ones those services wrote.

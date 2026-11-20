@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|name| store.holds_queue(&region, name))
             .map(str::to_string)
             .ok_or_else(|| {
-                AddPermissionErrorModeled::QueueDoesNotExist(sqs::queue_does_not_exist())
+                AddPermissionErrorModeled::QueueDoesNotExist(sqs::queue_does_not_exist(ctx.parts()))
             })?;
         // "Only you, the owner of the queue, can grant or deny permissions to the queue":
         // whether this caller may is decided against the queue's own policy and the

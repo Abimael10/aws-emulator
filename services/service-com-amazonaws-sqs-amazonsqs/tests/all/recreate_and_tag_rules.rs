@@ -166,7 +166,14 @@ async fn re_creating_a_name_compares_the_policy_on_what_it_grants() {
             ),
             false,
         ),
-        ("no Policy attribute at all", None, false),
+        (
+            // A request that names no `Policy` states nothing about the queue's policy, so
+            // it asks for nothing different: `QueueNameExists` is "only if the request
+            // includes attributes whose values differ from those of the existing queue".
+            "no Policy attribute at all",
+            None,
+            true,
+        ),
     ];
 
     for (index, (case, supplied, idempotent)) in rows.iter().enumerate() {
@@ -204,6 +211,129 @@ async fn re_creating_a_name_compares_the_policy_on_what_it_grants() {
             reported.get(POLICY).map(String::as_str),
             Some(created.as_str()),
             "case {case}: the re-create must leave the stored policy alone, got {reported:?}"
+        );
+    }
+}
+
+/// `CreateQueue` is idempotent against the queue's CURRENT configuration: after a
+/// `SetQueueAttributes` has changed an attribute, a re-create naming the value now in force
+/// — or naming nothing about that attribute at all — is answered with the existing url,
+/// and only a request naming a value that differs from the one the queue carries NOW is
+/// refused `QueueNameExists`. Either way the queue is left exactly as it was.
+///
+/// The rows differ along which attribute was changed (an integer bound, a size bound and
+/// the access policy), along what the re-create names for it (the value in force, the value
+/// the create used, nothing at all, and one attribute beside it that nothing changed) and
+/// along the direction of the change.
+#[tokio::test]
+async fn re_creating_a_name_compares_the_values_the_queue_carries_now() {
+    let router = emulator();
+    let created_policy = policy(granting_statement());
+    let changed_policy = policy(statement_with("Action", Some(json!("sqs:ReceiveMessage"))));
+    // (case, the create's attributes, what SetQueueAttributes puts in force, the
+    //  re-create's attributes, answered with the existing url)
+    let rows: Vec<(&str, Value, Value, Value, bool)> = vec![
+        (
+            "the value a visibility change put in force",
+            json!({"VisibilityTimeout": "30"}),
+            json!({"VisibilityTimeout": "60"}),
+            json!({"VisibilityTimeout": "60"}),
+            true,
+        ),
+        (
+            "no attribute at all, after a visibility change",
+            json!({"VisibilityTimeout": "30"}),
+            json!({"VisibilityTimeout": "60"}),
+            json!({}),
+            true,
+        ),
+        (
+            "the value the create used, which the change replaced",
+            json!({"VisibilityTimeout": "30"}),
+            json!({"VisibilityTimeout": "60"}),
+            json!({"VisibilityTimeout": "30"}),
+            false,
+        ),
+        (
+            "the value a delay change put in force",
+            json!({"DelaySeconds": "0"}),
+            json!({"DelaySeconds": "300"}),
+            json!({"DelaySeconds": "300"}),
+            true,
+        ),
+        (
+            "no attribute at all, after a delay change",
+            json!({}),
+            json!({"DelaySeconds": "300"}),
+            json!({}),
+            true,
+        ),
+        (
+            "a shortened retention period, named back",
+            json!({}),
+            json!({"MessageRetentionPeriod": "60"}),
+            json!({"MessageRetentionPeriod": "60"}),
+            true,
+        ),
+        (
+            "the value in force beside an attribute nothing changed",
+            json!({"VisibilityTimeout": "45"}),
+            json!({"ReceiveMessageWaitTimeSeconds": "20"}),
+            json!({"ReceiveMessageWaitTimeSeconds": "20", "VisibilityTimeout": "45"}),
+            true,
+        ),
+        (
+            "a size bound the change replaced",
+            json!({}),
+            json!({"MaximumMessageSize": "1024"}),
+            json!({"MaximumMessageSize": "262144"}),
+            false,
+        ),
+        (
+            "the policy a change put in force",
+            json!({ POLICY: created_policy.clone() }),
+            json!({ POLICY: changed_policy.clone() }),
+            json!({ POLICY: changed_policy.clone() }),
+            true,
+        ),
+        (
+            "the policy the create stored, which the change replaced",
+            json!({ POLICY: created_policy.clone() }),
+            json!({ POLICY: changed_policy.clone() }),
+            json!({ POLICY: created_policy.clone() }),
+            false,
+        ),
+    ];
+
+    for (index, (case, created_with, changed_to, asked, idempotent)) in rows.iter().enumerate() {
+        let name = format!("recreate-current-{index}");
+        let url = create_ok(&router, &name, created_with).await;
+        let _ = ok(
+            &router,
+            "SetQueueAttributes",
+            json!({"QueueUrl": url, "Attributes": changed_to}),
+        )
+        .await;
+        let in_force = all_attributes(&router, &url).await;
+
+        let (status, parsed) = create(&router, &name, asked).await;
+        if *idempotent {
+            assert_eq!(
+                (status, parsed["QueueUrl"].as_str()),
+                (200, Some(url.as_str())),
+                "case {case}: expected the existing url {url}, got {status} with {parsed}"
+            );
+        } else {
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "QueueNameExists"),
+                "case {case}: expected a 400 QueueNameExists, got {status} with {parsed}"
+            );
+        }
+        assert_eq!(
+            all_attributes(&router, &url).await,
+            in_force,
+            "case {case}: the re-create must leave the queue's attributes as they were"
         );
     }
 }

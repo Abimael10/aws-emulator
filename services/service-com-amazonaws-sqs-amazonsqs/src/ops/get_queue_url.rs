@@ -179,7 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|owner| owner != ::engine::emulator_account_id())
         {
             return Err(GetQueueUrlErrorModeled::QueueDoesNotExist(
-                state::queue_does_not_exist(),
+                state::queue_does_not_exist(ctx.parts()),
             )
             .into());
         }
@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // another region is another queue and is not reported here.
         let region = state::request_region(ctx.parts());
         let queue = store.queue(&region, &input.queue_name).ok_or_else(|| {
-            GetQueueUrlErrorModeled::QueueDoesNotExist(state::queue_does_not_exist())
+            GetQueueUrlErrorModeled::QueueDoesNotExist(state::queue_does_not_exist(ctx.parts()))
         })?;
 
         // Whether this caller may resolve this queue's url is decided against the queue's

@@ -355,8 +355,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // different about it, and is answered with that queue's url, or asks to change it,
         // which is what `QueueNameExists` reports. The same name in another region is
         // another queue and says nothing about this one.
+        //
+        // What the request ASKS FOR is judged against what the queue carries NOW, and over
+        // the attributes the request itself NAMED: the set it would leave the queue
+        // carrying is that queue's own attributes with what this call supplied overlaid, so
+        // an attribute the call did not name stands as the queue holds it — exactly as
+        // `SetQueueAttributes` computes the set it would leave. A documented DEFAULT stands
+        // in for an attribute only when the queue is being created; standing one in here
+        // would compare the request against the value a fresh queue would have had, and
+        // refuse an idempotent create of every queue whose configuration was ever changed.
         if let Some(existing) = store.queue(&region, &input.queue_name) {
-            return match state::recreate_refusal(existing, &attributes, tags.as_ref()) {
+            let mut would_carry = existing.attributes.clone();
+            state::apply_attributes(&mut would_carry, supplied.iter());
+            state::encryption::apply_encryption_choice(&mut would_carry, &supplied);
+            return match state::recreate_refusal(existing, &would_carry, tags.as_ref()) {
                 None => Ok(CreateQueueOutput {
                     queue_url: Some(existing.url.clone()),
                 }),
