@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags stored on the resource the request's `resourceArn` names, whichever
+//! kind of Connect resource that is: the instance itself, a queue, flow or hours of
+//! operation inside it, or a phone number claimed to the account. The lookup from an ARN
+//! to the record that carries it is
+//! [`crate::state::ComAmazonawsConnectAmazonconnectserviceState::tags_of_resource`], so
+//! every ARN-addressed operation of the tagging plane resolves its target the same way.
+//!
+//! A pure read: nothing is written, so what this answers is what every later caller
+//! still sees. An ARN no stored resource carries is this service's single 404.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +150,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServiceException(InternalServiceException {
+                message: Some("the Amazon Connect store is unavailable".to_string()),
+            })
+        })?;
+        let store = state.lock();
+
+        // The ARN is resolved against the stored records and the stored map is READ under
+        // the guard, then projected onto the wire: a read of the tagging plane writes
+        // nothing, so it changes nothing a later caller sees.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // An ARN no stored resource carries is the same refusal every other operation of
+        // this service gives for a resource that is not there
+        // (`crate::state::resource_not_found`), whichever kind of resource the ARN names
+        // and whether it never existed or a delete retired it. The model leaves the ARN's
+        // form unconstrained, and this service states that one sentence for every
+        // resource it cannot resolve, so an ARN that resolves to nothing is answered that
+        // way whatever it looks like.
+        let tags = store.tags_of_resource(&input.resource_arn).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+        })?;
+
+        Ok(ListTagsForResourceOutput {
+            // One tag projection for the whole service: an untagged resource reports no
+            // `tags` member rather than an empty map, which is also the only form the
+            // modelled `TagMap` (length 1..50) can take.
+            tags: crate::state::tags_out(tags),
+        })
     }
 }

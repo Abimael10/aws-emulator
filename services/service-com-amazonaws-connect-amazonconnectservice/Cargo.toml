@@ -38,6 +38,9 @@ service-com-amazonaws-connectparticipant-amazonconnectparticipantservicelambda =
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod::dir!` declares
+# one module per `tests/all/<name>.rs`, so a new suite is just a new file.
+automod = { workspace = true }
 # `time` for `tokio::time::sleep`: the lifecycle test waits past the clock-owed
 # CREATION_IN_PROGRESS -> ACTIVE instant without blocking the test's worker.
 tokio = { workspace = true, features = ["time"] }

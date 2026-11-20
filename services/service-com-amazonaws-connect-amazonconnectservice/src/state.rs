@@ -43,6 +43,11 @@ pub use chat_contacts::{
     MAX_ATTRIBUTES_BYTES, REQUIRED_MESSAGING_CONTENT_TYPE, SUPPORTED_MESSAGING_CONTENT_TYPES,
 };
 
+/// The tagging plane's lookup from a resource ARN to the tag map that resource carries:
+/// one concern of its own, so its own file. It declares no name of its own — it extends
+/// [`ComAmazonawsConnectAmazonconnectserviceState`] — so there is nothing to re-export.
+mod tagging;
+
 /// How this service words a refusal, and the identifier forms a path label may take:
 /// one concern of its own, so its own file, re-exported so a handler reaches it through
 /// `crate::state` like everything else here.
