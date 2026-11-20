@@ -265,7 +265,10 @@ fn refusal_reason(name: &str) -> String {
 
 /// One awsJson call to Amazon Cognito user pools over the same router, signed the way a
 /// client's SDK signs it: the HTTP status and the parsed answer.
-async fn cognito_idp(
+///
+/// `pub(crate)` because `structured_resource_properties.rs` reads the pools that service holds
+/// through the same wire: the calling convention for this service is spelled once.
+pub(crate) async fn cognito_idp(
     router: &MultiServiceRouter,
     operation: &str,
     request: &Value,

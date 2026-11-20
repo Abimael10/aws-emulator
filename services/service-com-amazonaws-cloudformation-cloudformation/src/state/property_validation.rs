@@ -39,6 +39,11 @@
 //!   ([`typed_properties::TYPED_PROPERTIES`]), which is the
 //!   `Property validation failure: [Value of property {/<member>} does not match type
 //!   {<type>}]` the stage reports ([`typed_properties::type_failure_reason`]);
+//! * a property whose contract states a STRUCTURE for its value — a list, an object — carrying
+//!   a value that is not one, over the rows this emulator holds
+//!   ([`structured_properties::STRUCTURED_PROPERTIES`]), which is the
+//!   `Property [<member>] expected type: <expected>, found: <actual>` the stage reports
+//!   ([`structured_properties::type_mismatch_reason`]);
 //! * a property whose contract publishes the values it admits, carrying a value that is not
 //!   one of them, over the rows this emulator holds ([`CONSTRAINED_PROPERTIES`]);
 //! * a property whose type's REGISTRY SCHEMA states the values it admits as an `enum`,
@@ -120,6 +125,10 @@ pub mod patterned_properties;
 /// Which TYPE a property's value has to have, which is the first question its schema makes
 /// decidable about that value.
 pub mod typed_properties;
+
+/// Which STRUCTURE a property's value has to have — a list, an object — which is that same
+/// question for a property whose schema states no scalar type.
+pub mod structured_properties;
 
 /// The values a type's REGISTRY SCHEMA states for a property, and the sentence that schema's
 /// own validator reports a value outside them with — including a LIST-valued property, whose
@@ -427,7 +436,8 @@ const PROPERTIES_SECTION: &str = "Properties";
 /// every property the type REQUIRES (a property that is not there has no value to hold to a
 /// set), then that every member it does carry is one the type HAS
 /// ([`declared_properties`]), then the `oneOf` over those members, and last each value
-/// against what its property states about a value — the TYPE it states
+/// against what its property states about a value — the STRUCTURE it states
+/// ([`structured_properties`]) and the scalar TYPE it states
 /// ([`typed_properties`]), then the set it publishes (the one this emulator knows from the
 /// type's property reference, [`CONSTRAINED_PROPERTIES`], and the one its registry schema
 /// states as an `enum`, [`enum_properties`]), and then the pattern it admits
@@ -438,6 +448,7 @@ pub fn failure(declared: &[StoredResource]) -> Option<PropertyFailure> {
         missing_required_property(resource)
             .or_else(|| declared_properties::undeclared_property(resource))
             .or_else(|| matched_several_subschemas(resource))
+            .or_else(|| structured_properties::value_of_another_structure(resource))
             .or_else(|| typed_properties::value_of_another_type(resource))
             .or_else(|| inadmissible_value(resource))
             .or_else(|| enum_properties::value_outside_its_enum(resource))
