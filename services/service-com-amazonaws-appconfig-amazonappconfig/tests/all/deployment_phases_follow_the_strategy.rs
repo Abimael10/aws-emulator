@@ -49,8 +49,9 @@ use crate::deployment_wire_fidelity::{create_strategy, event_log, host_version, 
 /// | INTERNAL_ERROR`): what the caller's own request initiated, and what AppConfig did on
 /// its own.
 const BY_USER: &str = "USER";
-/// See [`BY_USER`].
-const BY_APPCONFIG: &str = "APPCONFIG";
+/// See [`BY_USER`]. `pub(crate)` because more than one suite asserts that a transition
+/// AppConfig made on its own is logged as AppConfig's.
+pub(crate) const BY_APPCONFIG: &str = "APPCONFIG";
 
 /// One entry of an event log, as this suite compares them: its `EventType`, its
 /// `TriggeredBy` and its `Description`.
@@ -172,7 +173,9 @@ fn entry(event_type: &str, triggered_by: &str, description: &str) -> Entry {
 ///
 /// The share is spelled with its fraction, as the recorded service does: a rollout that has
 /// reached every target reads `100.00%`.
-fn available_to(share: f64) -> String {
+///
+/// `pub(crate)` because more than one suite asserts this sentence.
+pub(crate) fn available_to(share: f64) -> String {
     format!("Configuration available to {share:.2}% of clients")
 }
 
