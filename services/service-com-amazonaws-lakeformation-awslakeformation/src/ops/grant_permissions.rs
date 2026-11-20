@@ -233,7 +233,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(invalid)?;
 
         // Lake Formation grants permissions TO a principal, so a grantee this account's
-        // IAM does not hold is a grant to nobody and is refused with nothing persisted.
+        // IAM does not hold — under no name at all, or under another path than this
+        // identifier names — is a grant to nobody and is refused with nothing persisted.
         // Resolved BEFORE this service's own lock is taken: the question travels over the
         // in-process callback, and holding a store across it is what would make another
         // handler's lookup wait on this one.

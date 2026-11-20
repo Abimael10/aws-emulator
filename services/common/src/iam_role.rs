@@ -59,6 +59,28 @@ pub fn user_name(user_arn: &str) -> Option<&str> {
     entity_name(user_arn, "user")
 }
 
+/// The PATH an IAM role ARN of THIS account names: the segments between the entity type
+/// and the role name, with the leading and trailing `/` IAM writes a path with — `/` for a
+/// role at the account root, `/service-role/` for `:role/service-role/<name>`.
+///
+/// This is the other half of what an IAM entity ARN carries beside [`role_name`]: IAM holds
+/// an entity under a name AND a path, and reports both, so a service that resolves a
+/// caller-supplied ARN can tell an ARN that names the entity IAM holds from one that names
+/// the same name under a path IAM holds nothing under.
+///
+/// `None` for the same reasons [`role_name`] answers it.
+#[must_use]
+pub fn role_path(role_arn: &str) -> Option<&str> {
+    entity_path_and_name(role_arn, "role").map(|(path, _name)| path)
+}
+
+/// The PATH an IAM user ARN of THIS account names, read exactly as [`role_path`] reads a
+/// role's.
+#[must_use]
+pub fn user_path(user_arn: &str) -> Option<&str> {
+    entity_path_and_name(user_arn, "user").map(|(path, _name)| path)
+}
+
 /// The instance profile name an IAM ARN carries, when the ARN names an EC2 instance
 /// profile of THIS account (`arn:<partition>:iam::<account>:instance-profile<path><name>`).
 ///
@@ -148,6 +170,15 @@ pub fn group_name(group_arn: &str) -> Option<&str> {
 /// entity of that type of THIS account: everything after the last `/`, so an entity under
 /// a path resolves to the name IAM holds it under.
 fn entity_name<'a>(value: &'a str, entity_type: &str) -> Option<&'a str> {
+    entity_path_and_name(value, entity_type).map(|(_path, name)| name)
+}
+
+/// The PATH and the NAME an IAM ARN of the entity type `entity_type` carries, when the ARN
+/// names an entity of that type of THIS account — the two halves IAM holds an entity under.
+///
+/// The name is everything after the last `/` and the path is everything before it, kept with
+/// the leading and trailing `/` IAM reports a path with (`/` at the account root).
+fn entity_path_and_name<'a>(value: &'a str, entity_type: &str) -> Option<(&'a str, &'a str)> {
     // The six fields come from the crate's ONE ARN parse (`crate::arn`), which also
     // settles that the value is an ARN of the `iam` vendor at all.
     let arn = crate::arn::parse_of(value, "iam")?;
@@ -159,13 +190,12 @@ fn entity_name<'a>(value: &'a str, entity_type: &str) -> Option<&'a str> {
     if !arn.account.is_empty() && arn.account != ::emulator_server::emulator_account_id() {
         return None;
     }
-    let name = arn
-        .resource
-        .strip_prefix(entity_type)?
-        .strip_prefix('/')?
-        .rsplit('/')
-        .next()?;
-    (!name.is_empty()).then_some(name)
+    // What follows the entity type is the path and the name together, opening with the `/`
+    // every IAM path opens with; the name is the last segment.
+    let path_and_name = arn.resource.strip_prefix(entity_type)?;
+    let last_separator = path_and_name.rfind('/')?;
+    let (path, name) = path_and_name.split_at(last_separator + 1);
+    (path.starts_with('/') && !name.is_empty()).then_some((path, name))
 }
 
 /// Whether IAM ANSWERED that `role_arn` is a role `service_principal` cannot assume: it
@@ -771,8 +801,81 @@ async fn role_answer(
 mod tests {
     use super::{
         assumed_role_session_name, assumed_role_session_role_name, instance_profile_name,
-        role_name, user_name,
+        role_name, role_path, user_name, user_path,
     };
+
+    /// The PATH half of an IAM entity ARN of this account: the segments before the name,
+    /// with the leading and trailing `/` IAM reports a path with, and `/` for an entity at
+    /// the account root. The rows differ along how many segments the path has, which entity
+    /// type the ARN names, and the forms that name no entity of this account at all.
+    #[test]
+    fn an_entity_arn_names_the_path_iam_holds_the_entity_under() {
+        let account = ::emulator_server::emulator_account_id();
+        // (case, value, the path a role ARN names, the path a user ARN names)
+        let rows: Vec<(&str, String, Option<&str>, Option<&str>)> = vec![
+            (
+                "a role at the account root",
+                format!("arn:aws:iam::{account}:role/delivery"),
+                Some("/"),
+                None,
+            ),
+            (
+                "a role under a path",
+                format!("arn:aws:iam::{account}:role/service-role/delivery"),
+                Some("/service-role/"),
+                None,
+            ),
+            (
+                "a role under a nested path",
+                format!("arn:aws:iam::{account}:role/a/b/c/delivery"),
+                Some("/a/b/c/"),
+                None,
+            ),
+            (
+                "a user at the account root",
+                format!("arn:aws:iam::{account}:user/builder"),
+                None,
+                Some("/"),
+            ),
+            (
+                "a user under a path",
+                format!("arn:aws:iam::{account}:user/team/builder"),
+                None,
+                Some("/team/"),
+            ),
+            (
+                "an ARN with no name after its path",
+                format!("arn:aws:iam::{account}:role/team/"),
+                None,
+                None,
+            ),
+            (
+                "another account's role",
+                "arn:aws:iam::210987654321:role/delivery".to_string(),
+                None,
+                None,
+            ),
+            (
+                "a bare role name",
+                "delivery".to_string(),
+                None,
+                None,
+            ),
+        ];
+
+        for (case, value, expected_role, expected_user) in &rows {
+            let read_role = role_path(value);
+            assert_eq!(
+                read_role, *expected_role,
+                "case {case:?}: expected the role path {expected_role:?}, got {read_role:?}"
+            );
+            let read_user = user_path(value);
+            assert_eq!(
+                read_user, *expected_user,
+                "case {case:?}: expected the user path {expected_user:?}, got {read_user:?}"
+            );
+        }
+    }
 
     /// The role an STS assumed-role SESSION ARN names: the first segment after
     /// `assumed-role/`, whatever the session name after it, and nothing from any other

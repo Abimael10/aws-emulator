@@ -9,7 +9,7 @@
 //! `Message` member — and compares the message against the sentence the service words that
 //! error class with, spelled out here rather than read back out of the crate.
 //!
-//! Three rules, one table each:
+//! Four rules, one table each:
 //!
 //! * a value the `Permission` enum does not carry is refused, on BOTH write paths, with
 //!   the `InvalidInputException` those operations model, whose message is the service's
@@ -18,7 +18,10 @@
 //!   service's ARN-shape sentence, whose one variable part is the rejected identifier as
 //!   the request wrote it;
 //! * a refusal about the entity a request ADDRESSED — absent, or already there — carries
-//!   wholly fixed text, naming neither the entity nor the catalog.
+//!   wholly fixed text, naming neither the entity nor the catalog;
+//! * the BODY of any refusal carries the error shape's own modelled members and nothing
+//!   else, because this service speaks `restJson1`, which names the error SHAPE in the
+//!   `x-amzn-errortype` header.
 //!
 //! The rows of each table differ along what its rule generalises over: which list the
 //! offending value sits in and what form it takes, which administrator member names the
@@ -33,6 +36,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // error-code extractor.
 use crate::glue_catalog::{
     account_catalog, emulator, emulator_with_catalog, error_code, lake_formation_response,
+    lake_formation_wire,
 };
 
 /// The invalid-permissions refusal as Lake Formation words it: two fixed sentences with
@@ -450,6 +454,163 @@ async fn an_entity_state_refusal_carries_the_services_fixed_sentence() {
             Some(row.message),
             "case {:?}: expected {operation} to answer Message {:?}, got {actual:?}",
             row.case, row.message
+        );
+    }
+}
+
+/// The member a JSON error envelope of the AWS JSON protocol FAMILY names its error shape
+/// in, which a `restJson1` body does not carry: that protocol names the shape in the
+/// `x-amzn-errortype` header instead.
+const SHAPE_DISCRIMINATOR: &str = "__type";
+
+/// One row of the error-body table: the case, the call that is refused, and the status, the
+/// error shape and the one modelled member its body must carry.
+struct ErrorBodyCase {
+    case: &'static str,
+    refused: (&'static str, Value),
+    status: u16,
+    shape: &'static str,
+    message: String,
+}
+
+#[tokio::test]
+async fn a_refusals_body_carries_the_error_shapes_modelled_members_and_nothing_else() {
+    // RULE: this service speaks `restJson1`, which resolves a failure's error SHAPE from
+    // the `x-amzn-errortype` response header, so the BODY of a refusal carries the error
+    // shape's own modelled members and nothing else. Every error shape of this model
+    // declares the single member `Message`, so a refusal's body is exactly that one key —
+    // never the AWS JSON families' `__type` discriminator beside it.
+    //
+    // The rows differ along what the rule generalises over: the error shape answered, the
+    // operation and entity class that answers it, and whether the message is wholly fixed
+    // text or carries a value from the request.
+    let catalog = account_catalog();
+    let cases = vec![
+        ErrorBodyCase {
+            // The grant surface's own refusal, which carries a request value.
+            case: "a permission the model does not carry",
+            refused: (
+                "GrantPermissions",
+                json!({
+                    "Principal": principal(&format!("arn:aws:iam::{catalog}:role/analyst")),
+                    "Resource": { "Database": { "Name": "sales" } },
+                    "Permissions": ["SUPER"],
+                }),
+            ),
+            status: 400,
+            shape: "InvalidInputException",
+            message: invalid_permissions_message(&["SUPER"]),
+        },
+        ErrorBodyCase {
+            case: "an administrator that is not an ARN",
+            refused: (
+                "PutDataLakeSettings",
+                json!({
+                    "DataLakeSettings": { "DataLakeAdmins": [principal("lake-admin")] },
+                }),
+            ),
+            status: 400,
+            shape: "InvalidInputException",
+            message: invalid_arn_message("lake-admin"),
+        },
+        ErrorBodyCase {
+            // Wholly fixed text, and the recorded shape of this service's settings refusal.
+            case: "a principal designated in both administrator lists",
+            refused: (
+                "PutDataLakeSettings",
+                json!({
+                    "DataLakeSettings": {
+                        "DataLakeAdmins": [
+                            principal(&format!("arn:aws:iam::{catalog}:role/lake-admin")),
+                        ],
+                        "ReadOnlyAdmins": [
+                            principal(&format!("arn:aws:iam::{catalog}:role/lake-admin")),
+                        ],
+                    },
+                }),
+            ),
+            status: 400,
+            shape: "InvalidInputException",
+            message: "Principal cannot be both readOnly and LF admin.".to_string(),
+        },
+        ErrorBodyCase {
+            // A different error SHAPE, on a different entity class.
+            case: "a tag key that was never created",
+            refused: ("GetLFTag", json!({ "TagKey": "absent" })),
+            status: 400,
+            shape: "EntityNotFoundException",
+            message: "Tag key does not exist".to_string(),
+        },
+        ErrorBodyCase {
+            case: "a data cells filter that was never created",
+            refused: (
+                "GetDataCellsFilter",
+                json!({
+                    "TableCatalogId": catalog,
+                    "DatabaseName": "sales",
+                    "TableName": "orders",
+                    "Name": "absent",
+                }),
+            ),
+            status: 400,
+            shape: "EntityNotFoundException",
+            message: "Entity Not Found".to_string(),
+        },
+    ];
+
+    let router = emulator();
+    for row in &cases {
+        let (operation, body) = &row.refused;
+        // The response BYTES, with nothing folded into them: this rule is about what the
+        // wire body carries, key set included.
+        let (status, error_type, raw) = lake_formation_wire(&router, operation, body).await;
+        let rendered = String::from_utf8_lossy(&raw).to_string();
+        assert_eq!(
+            status, row.status,
+            "case {:?}: expected {operation} to answer {}, got {status} {rendered}",
+            row.case, row.status
+        );
+        assert_eq!(
+            error_type, row.shape,
+            "case {:?}: expected {} in x-amzn-errortype, got {error_type:?}",
+            row.case, row.shape
+        );
+        let document: Value = serde_json::from_slice(&raw)
+            .unwrap_or_else(|e| panic!("case {:?}: the body must be JSON ({e})", row.case));
+        assert_eq!(
+            document,
+            json!({ "Message": row.message }),
+            "case {:?}: expected the body to carry the shape's Message alone, got {document}",
+            row.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_request_naming_no_modelled_operation_carries_no_shape_in_its_body_either() {
+    // The same rule at the other seam this service owns: a request it claimed that names no
+    // modelled operation is answered by the framework's routing failure, whose body is
+    // corrected the same way — the shape travels in `x-amzn-errortype` alone.
+    //
+    // The rows differ along the form the unknown operation takes.
+    let router = emulator();
+    for case in ["NoSuchOperation", "grantpermissions", "Grant%20Permissions"] {
+        let (status, error_type, raw) = lake_formation_wire(&router, case, &json!({})).await;
+        let rendered = String::from_utf8_lossy(&raw).to_string();
+        assert_eq!(
+            status, 501,
+            "case {case:?}: expected the routing failure to answer 501, got {status} {rendered}"
+        );
+        assert!(
+            !error_type.is_empty(),
+            "case {case:?}: expected the failure to name its shape in x-amzn-errortype, got \
+             {error_type:?}"
+        );
+        let document: Value = serde_json::from_slice(&raw)
+            .unwrap_or_else(|e| panic!("case {case:?}: the body must be JSON ({e})"));
+        assert!(
+            document.get(SHAPE_DISCRIMINATOR).is_none(),
+            "case {case:?}: the body must carry no {SHAPE_DISCRIMINATOR} member, got {document}"
         );
     }
 }

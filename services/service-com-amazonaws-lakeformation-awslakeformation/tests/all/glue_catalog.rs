@@ -122,16 +122,17 @@ pub async fn lake_formation(
     (status, payload)
 }
 
-/// As [`lake_formation`], also answering the `x-amzn-errortype` header (`""` when the
-/// response carries none).
+/// `POST /<operation>` against Lake Formation (`restJson1`), answering the status, the
+/// `x-amzn-errortype` header (`""` when the response carries none) and the response body
+/// BYTES exactly as the service wrote them.
 ///
-/// restJson1 resolves an error SHAPE from that header, so a suite that asserts WHICH
-/// modelled error a refusal is reads it rather than inferring the shape from the body.
-pub async fn lake_formation_response(
+/// The one place a suite reads a response before anything is folded into it, for an
+/// assertion about what the WIRE body carries — its key set included.
+pub async fn lake_formation_wire(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,
-) -> (u16, String, Value) {
+) -> (u16, String, Vec<u8>) {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!(
@@ -157,15 +158,45 @@ pub async fn lake_formation_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_string();
-    let payload = if response.body().is_empty() {
+    (status, error_type, response.body().to_vec())
+}
+
+/// As [`lake_formation`], also answering the `x-amzn-errortype` header (`""` when the
+/// response carries none).
+///
+/// restJson1 resolves an error SHAPE from that header, so a suite that asserts WHICH
+/// modelled error a refusal is reads it rather than inferring the shape from the body: the
+/// BODY of a failure carries the error shape's own modelled members and nothing else (the
+/// service's `rest_json_error_body` rule). The shape is also folded into the parsed body
+/// under the key the AWS JSON families name it in, so one accessor ([`error_code`]) reads
+/// either protocol's answer; a body that already names a shape keeps the name it carried. A
+/// suite about what the BODY itself carries reads [`lake_formation_wire`] instead.
+pub async fn lake_formation_response(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+) -> (u16, String, Value) {
+    let (status, error_type, raw) = lake_formation_wire(router, operation, body).await;
+    let mut payload = if raw.is_empty() {
         Value::Null
     } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        serde_json::from_slice(&raw).unwrap_or(Value::Null)
     };
+    if let Value::Object(members) = &mut payload {
+        if !error_type.is_empty() {
+            members
+                .entry("__type")
+                .or_insert_with(|| Value::String(error_type.clone()));
+        }
+    }
     (status, error_type, payload)
 }
 
-/// The wire error code (`__type`) of an error envelope, or `""` for a success body.
+/// The wire error code of an error envelope, or `""` for a success body.
+///
+/// The shape a failure names: the `x-amzn-errortype` header restJson1 carries it in, which
+/// [`lake_formation_response`] folds into the payload, or the member the AWS JSON families
+/// carry it in for a response rendered by one of those.
 pub fn error_code(payload: &Value) -> String {
     payload
         .get("__type")

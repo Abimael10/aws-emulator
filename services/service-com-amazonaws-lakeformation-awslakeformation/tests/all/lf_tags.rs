@@ -43,6 +43,10 @@ fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 /// The `Authorization` credential scope names `lakeformation`, which is the routing
 /// signal `resolve_route_key` reads first; no authenticator is registered, so the
 /// signature itself is not checked.
+///
+/// A restJson1 failure names its error SHAPE in `x-amzn-errortype` and its body carries the
+/// error shape's own modelled members alone, so the shape is folded into the parsed body
+/// under the key the AWS JSON families name it in and [`error_code`] reads it there.
 async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
@@ -63,15 +67,26 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
-    let payload = if response.body().is_empty() {
+    let named_shape = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut payload = if response.body().is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(response.body()).unwrap_or(Value::Null)
     };
+    if let (Some(shape), Value::Object(members)) = (named_shape, &mut payload) {
+        members
+            .entry("__type")
+            .or_insert_with(|| Value::String(shape));
+    }
     (status, payload)
 }
 
-/// The wire error code (`__type`) of an error envelope, or `""` for a success body.
+/// The wire error code of an error envelope, or `""` for a success body: the shape
+/// `x-amzn-errortype` names, which [`call`] folds into the payload.
 fn error_code(payload: &Value) -> String {
     payload
         .get("__type")

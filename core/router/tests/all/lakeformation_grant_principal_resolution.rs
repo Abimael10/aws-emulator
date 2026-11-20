@@ -66,6 +66,10 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// Send one buffered request and answer its status with the body, parsed when it is JSON.
+///
+/// A `restJson1` failure names its error SHAPE in `x-amzn-errortype` and its body carries the
+/// error shape's own modelled members alone, so the shape is handed back beside the body for
+/// [`lakeformation`] to fold in under the key the AWS JSON families name it in.
 fn send(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
@@ -73,7 +77,7 @@ fn send(
     path: &str,
     content_type: &str,
     body: String,
-) -> (u16, String) {
+) -> (u16, Option<String>, String) {
     let request = http::Request::builder()
         .method("POST")
         .uri(format!(
@@ -86,7 +90,16 @@ fn send(
         .expect("a well-formed request");
     let response = runtime.block_on(router.dispatch(request));
     let status = response.status().as_u16();
-    (status, String::from_utf8_lossy(response.body()).to_string())
+    let named_shape = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    (
+        status,
+        named_shape,
+        String::from_utf8_lossy(response.body()).to_string(),
+    )
 }
 
 /// Drive one IAM operation (`awsQuery`: the action and its parameters go in the form body).
@@ -103,14 +116,15 @@ fn iam(
         body.push('=');
         body.push_str(&form_encode(value));
     }
-    send(
+    let (status, _shape, text) = send(
         router,
         runtime,
         "iam",
         "/",
         "application/x-www-form-urlencoded",
         body,
-    )
+    );
+    (status, text)
 }
 
 /// Drive one Lake Formation operation (`restJson1`: the operation names the path).
@@ -120,7 +134,7 @@ fn lakeformation(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
-    let (status, text) = send(
+    let (status, named_shape, text) = send(
         router,
         runtime,
         "lakeformation",
@@ -128,15 +142,21 @@ fn lakeformation(
         "application/json",
         body.to_string(),
     );
-    let parsed = if text.is_empty() {
+    let mut parsed = if text.is_empty() {
         Value::Null
     } else {
         serde_json::from_str(&text).unwrap_or(Value::Null)
     };
+    if let (Some(shape), Value::Object(members)) = (named_shape, &mut parsed) {
+        members
+            .entry("__type")
+            .or_insert_with(|| Value::String(shape));
+    }
     (status, parsed)
 }
 
-/// The wire error code, without its namespace.
+/// The wire error code, without its namespace: the shape `x-amzn-errortype` names, which
+/// [`lakeformation`] folds into the parsed body.
 fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)

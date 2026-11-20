@@ -35,6 +35,10 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is one this service DOES take, for the one thing the
+//! generic renderer cannot express: what a FAILURE's body carries. See
+//! [`rest_json_error_body`].
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -45,6 +49,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod rest_json_error_body;
+
 /// The `com-amazonaws-lakeformation-awslakeformation` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -52,6 +58,10 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire codec: the model's own `restJson1` with the error body this
+    /// service is recorded answering ([`rest_json_error_body`]). Built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it, and never per request.
+    protocol: rest_json_error_body::LakeFormationRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -61,6 +71,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: rest_json_error_body::LakeFormationRestJson::new(),
         }
     }
 }
@@ -115,12 +126,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // routing table resolved it. The default IS this service's answer; what it
+        // renders is handed back with the ERROR BODY this service is recorded answering,
+        // because the shared renderer writes the AWS JSON family's shape discriminator
+        // into every body it renders and a `restJson1` body carries the error shape's own
+        // modelled members alone. See [`rest_json_error_body`] for the rule and for the
+        // one class no seam can reach.
+        Some(rest_json_error_body::with_served_error_body(
+            self.entry.routing_error_response(req),
+        ))
     }
 
     fn override_framework_error(
@@ -135,5 +149,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own `restJson1`, with the ERROR BODY this service is recorded
+        // answering: a failure's body carries the error shape's own modelled members and
+        // nothing else, so the shape travels in `x-amzn-errortype` alone. The shared
+        // framework renderer writes the AWS JSON family's `__type` discriminator into every
+        // body it renders, and it is not this crate's to change; see
+        // [`rest_json_error_body`] for the rule, why it matters and where else it is
+        // applied.
+        Some(&self.protocol)
     }
 }

@@ -87,6 +87,10 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// Send one buffered request and answer its status with the parsed body.
+///
+/// A `restJson1` failure names its error SHAPE in `x-amzn-errortype` and its body carries the
+/// error shape's own modelled members alone, so the shape is folded into the parsed body
+/// under the key the AWS JSON families name it in and [`error_code`] reads it there.
 fn send(
     router: &MultiServiceRouter,
     runtime: &tokio::runtime::Runtime,
@@ -112,11 +116,21 @@ fn send(
         .expect("a well-formed request");
     let response = runtime.block_on(router.dispatch(request));
     let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
+    let named_shape = response
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let mut parsed = if response.body().is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(response.body()).unwrap_or(Value::Null)
     };
+    if let (Some(shape), Value::Object(members)) = (named_shape, &mut parsed) {
+        members
+            .entry("__type")
+            .or_insert_with(|| Value::String(shape));
+    }
     (status, parsed)
 }
 
@@ -156,7 +170,8 @@ fn lakeformation(
     )
 }
 
-/// The wire error code, without its namespace.
+/// The wire error code, without its namespace: the shape `x-amzn-errortype` names, which
+/// [`send`] folds into the parsed body, or the member the AWS JSON families name it in.
 fn error_code(body: &Value) -> String {
     body.get("__type")
         .and_then(Value::as_str)

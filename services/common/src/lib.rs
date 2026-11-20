@@ -719,6 +719,9 @@ pub mod response_media_type;
 /// The ONE plumbing for a service that answers a framework-rendered refusal in an envelope
 /// only the request and the whole rendered response can decide.
 pub mod restated_refusal;
+/// The ONE `restJson1` codec whose failures carry the error shape's own modelled members and
+/// nothing else, for every service whose protocol names the shape in `x-amzn-errortype`.
+pub mod rest_json_error_body;
 pub mod rfc3339;
 pub mod rpc_target;
 /// The ONE reading of what an Amazon S3 BUCKET NAME has to be, for every service that

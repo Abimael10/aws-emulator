@@ -2084,20 +2084,27 @@ pub const DATABASE_NOT_FOUND: &str = "Database not found.";
 /// [`DATABASE_NOT_FOUND`].
 pub const TABLE_NOT_FOUND: &str = "Table not found.";
 
-/// The refusal for a grant whose `Principal` names an identity this account's IAM does not
-/// hold — `None` when nothing shows the principal is absent.
+/// The refusal for a grant whose `Principal` does not name an identity this account's IAM
+/// holds — `None` when nothing shows it does not.
 ///
 /// Lake Formation grants permissions TO a principal, so a grant to an identity that does
 /// not exist is a grant to nobody: the grantee is resolved against this account's IAM
-/// before anything is written, and the refusal names the identifier the request carried
-/// ([`invalid_principal`]).
+/// before anything is written. IAM holds an identity under a name AND a path and reports
+/// both, so an identifier can fail to name one in two ways, and the refusal says which:
 ///
-/// The resolution is [`::service_common::iam_principal::identity_is_absent`], the tree's
+/// * IAM holds nothing of that entity type under that name, so the ARN names no identity at
+///   all ([`invalid_principal`]);
+/// * IAM holds that name under ANOTHER path than the ARN's path portion names, so the ARN
+///   names the path rather than the identity ([`invalid_principal_path`]).
+///
+/// Either way the refusal names the identifier the request carried, and nothing is written.
+///
+/// The resolution is [`::service_common::iam_principal::resolve_identity`], the tree's
 /// one reading of a principal against IAM, so a refusal is grounded in what IAM ANSWERED.
 /// Everything else refuses nothing, because nothing about it is known: a value that names
 /// no IAM role or user of this account (the [`IAM_ALLOWED_PRINCIPALS`] group, an account id,
 /// an identity of ANOTHER account whose IAM this emulator is not the one to ask, a
-/// principal of another identity system), an answer that is not "the entity is absent", and
+/// principal of another identity system), an answer this emulator could not read, and
 /// an emulator with no IAM mounted at all.
 ///
 /// Called BEFORE this service's own lock is taken: the question travels over the operation
@@ -2106,16 +2113,27 @@ pub async fn unresolved_grant_principal(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     principal: &str,
 ) -> Option<String> {
+    use ::service_common::iam_principal::IdentityAnswer;
+
     let region = request_region(ctx.parts());
-    ::service_common::iam_principal::identity_is_absent(ctx, &region, principal)
-        .await
-        .then(|| invalid_principal(principal))
+    match ::service_common::iam_principal::resolve_identity(ctx, &region, principal).await {
+        IdentityAnswer::Resolved => None,
+        IdentityAnswer::Absent => Some(invalid_principal(principal)),
+        IdentityAnswer::AtAnotherPath => Some(invalid_principal_path(principal)),
+    }
 }
 
 /// The refusal text for a principal IAM does not hold: fixed text, and the one variable
 /// part is the `DataLakePrincipalIdentifier` the request named.
 pub fn invalid_principal(identifier: &str) -> String {
     format!("Invalid principal, arn: {identifier}")
+}
+
+/// The refusal text for a principal whose name IAM holds under another path than the
+/// identifier's path portion names: fixed text, and the one variable part is the
+/// `DataLakePrincipalIdentifier` the request named.
+pub fn invalid_principal_path(identifier: &str) -> String {
+    format!("Invalid path for user, arn: {identifier}")
 }
 
 /// The region this request was signed for, which the IAM lookup above is addressed to.
