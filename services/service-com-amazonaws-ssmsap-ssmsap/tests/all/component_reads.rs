@@ -777,20 +777,8 @@ async fn a_component_is_gone_when_its_application_is_deregistered() {
         "expected 200 from DeregisterApplication, got {deregistered:?}"
     );
 
-    // While the deregistration runs the application still exists, so its components do
-    // too — and nothing has established what they are running.
-    let during = get_component(&emulator, case.application_id, id).await;
-    assert_eq!(
-        during.status, 200,
-        "a deregistration under way leaves the component readable, got {during:?}"
-    );
-    assert_eq!(
-        component_str(&during, "Status"),
-        "UNDEFINED",
-        "a component of an application being deregistered has no established status, got {during:?}"
-    );
-
-    settle().await;
+    // The registration ended when the call was accepted, so its components went with it
+    // at that instant: nothing waits for the clock here.
     let after = get_component(&emulator, case.application_id, id).await;
     assert_eq!(
         after.status, 400,

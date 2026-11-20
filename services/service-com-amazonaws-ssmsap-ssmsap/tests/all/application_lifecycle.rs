@@ -1741,10 +1741,8 @@ async fn deregistering_removes_the_application_from_every_reader() {
             removed.status, 200,
             "case {id:?}: expected 200 from DeregisterApplication, got {removed:?}"
         );
-        // The deregistration is asynchronous: the application reports DELETING until the
-        // removal the clock owes it falls due (`tests/all/deregistration_window.rs` pins
-        // that window), so this waits the clock out before reading it back.
-        settle().await;
+        // The deregistration ended the registration as it was accepted, so this reads it
+        // back straight away.
 
         let fetched = emulator.get_application(json!({"ApplicationId": id})).await;
         assert_eq!(

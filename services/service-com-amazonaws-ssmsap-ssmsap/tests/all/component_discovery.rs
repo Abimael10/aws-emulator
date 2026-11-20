@@ -414,16 +414,8 @@ async fn discovered_components_end_with_their_application() {
         "case {:?}: expected 200 from DeregisterApplication, got {deregistered:?}",
         case.name
     );
-    // While the deregistration runs the application still exists, so its discovered
-    // components do too.
-    assert_eq!(
-        listed(&list(&emulator, case.application_id).await),
-        case.expected(),
-        "case {:?}: a deregistration under way leaves the components listed",
-        case.name
-    );
-
-    settle().await;
+    // The deregistration ends that registration as it is accepted, so its discovered
+    // components resolve to nothing from that instant.
     let gone = list(&emulator, case.application_id).await;
     assert_eq!(
         gone.status, 404,

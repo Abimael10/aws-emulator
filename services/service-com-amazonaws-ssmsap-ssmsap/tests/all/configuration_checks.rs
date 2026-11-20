@@ -756,19 +756,8 @@ async fn deregistering_an_application_forgets_its_configuration_checks() {
         "expected 200 from DeregisterApplication, got {deregistered:?}"
     );
 
-    // While the deregistration is still running the application exists, so its check
-    // runs still resolve: they are forgotten when the removal the clock owes falls due.
-    for (application, id) in &ids {
-        let reply = emulator.get_check(id).await;
-        assert_eq!(
-            reply.status, 200,
-            "case {application:?}/{id:?}: a run still resolves while the application is \
-             DELETING, got {}: {:?}",
-            reply.status, reply.body
-        );
-    }
-    settle().await;
-
+    // The registration ended when the call was accepted, so the runs that inspected it
+    // are gone at that instant; the other application's run is untouched.
     for (application, id) in &ids {
         let reply = emulator.get_check(id).await;
         let expected = if *application == "HDB-TEST" { 400 } else { 200 };

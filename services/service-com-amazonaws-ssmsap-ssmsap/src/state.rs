@@ -15,12 +15,17 @@
 //! and an `OperationId` handed to a caller always names a record that exists.
 //!
 //! Those calls are ASYNCHRONOUS, so what they start is a change the CLOCK owes the
-//! application ([`PendingTransition`]): the next status it takes, the settings an update
-//! asked for ([`PendingSettings`]), or — for a
-//! deregistration — the removal that ends it. Until that change falls due the
+//! application ([`PendingTransition`]): the next status it takes, or the settings an
+//! update asked for ([`PendingSettings`]). Until that change falls due the
 //! application resolves in the transient status the call gave it (`REGISTERING`,
-//! `STARTING`, `STOPPING`, `DELETING`), and [`RegionState::settle`] materialises the
-//! change for every reader at the same instant without anything ever sleeping.
+//! `STARTING`, `STOPPING`), and [`RegionState::settle`] materialises the change for
+//! every reader at the same instant without anything ever sleeping.
+//!
+//! A DEREGISTRATION is NOT one of them: it ends the registration at the instant the call
+//! is accepted, so the application — and everything held for it — stops resolving before
+//! the response is written ([`RegionState::deregister_application`]) and every later call
+//! naming that id answers the condition that the account has no such registered
+//! application ([`no_registered_application`], [`application_not_found_message`]).
 //!
 //! WHICH change a registration owes is the outcome of the DISCOVERY it runs on the Amazon
 //! EC2 instances it named ([`discovery::run_document`]): a discovery that can be carried
@@ -209,10 +214,6 @@ pub const APPLICATION_STATUS_STOPPING: &str = "STOPPING";
 /// `ApplicationStatus` for an application that has been stopped.
 pub const APPLICATION_STATUS_STOPPED: &str = "STOPPED";
 
-/// `ApplicationStatus` between `DeregisterApplication` and the application being gone:
-/// the status a deregistration that is still running reports.
-pub const APPLICATION_STATUS_DELETING: &str = "DELETING";
-
 /// `ApplicationStatus` of an application whose registration did not complete: the
 /// registration ran and its discovery could not be carried out, so the service manages
 /// nothing for it ([`StoredApplication::registration_failed`]).
@@ -229,9 +230,6 @@ pub const DISCOVERY_STATUS_SUCCESS: &str = "SUCCESS";
 /// `ApplicationDiscoveryStatus` of an application whose registration's discovery could
 /// not be carried out: the discovery result a failed registration converges to.
 pub const DISCOVERY_STATUS_REGISTRATION_FAILED: &str = "REGISTRATION_FAILED";
-
-/// `ApplicationDiscoveryStatus` while the application's deregistration is running.
-pub const DISCOVERY_STATUS_DELETING: &str = "DELETING";
 
 /// `OperationStatus` for an operation that has not reached its terminal status yet.
 /// One of the model's `OperationStatus` values (see
@@ -622,17 +620,10 @@ pub struct PendingTransition {
     pub change: PendingChange,
 }
 
-impl PendingTransition {
-    /// Whether the change this application is under is its removal — which is what a
-    /// deregistration still running owes it.
-    pub fn removes(&self) -> bool {
-        matches!(self.change, PendingChange::Removal)
-    }
-}
-
 /// What the clock owes an application: the asynchronous calls of this service either
-/// move the application to another status, settle the settings an update asked for, or,
-/// for a deregistration, end it.
+/// move the application to another status or settle the settings an update asked for.
+/// A deregistration owes nothing, because it ends the registration as it is accepted
+/// ([`RegionState::deregister_application`]).
 #[derive(Debug, Clone)]
 pub enum PendingChange {
     /// The application takes these settings — what an `UpdateApplicationSettings` call
@@ -646,9 +637,6 @@ pub enum PendingChange {
         /// The `ApplicationDiscoveryStatus` it takes then.
         discovery_status: String,
     },
-    /// The application stops existing: what a deregistration owes it, materialised by
-    /// [`RegionState::settle`].
-    Removal,
 }
 
 /// The settings an `UpdateApplicationSettings` call owes an application: what the
@@ -759,9 +747,9 @@ impl StoredDbms {
     ///
     /// A database lives in the connected DBMS, so the status it reports is that DBMS's —
     /// but only from a status in which the service has established what the application
-    /// runs at all. For any other application status (its registration or its
-    /// deregistration is still under way, or discovery never succeeded) nothing is known
-    /// about its databases, which is what the model's `UNKNOWN` states.
+    /// runs at all. For any other application status (its registration is still under way,
+    /// or discovery never succeeded) nothing is known about its databases, which is what
+    /// the model's `UNKNOWN` states.
     pub fn status_for(&self, application_status: &str) -> &str {
         match application_status {
             APPLICATION_STATUS_ACTIVATED
@@ -852,10 +840,6 @@ impl StoredApplication {
     /// called, so applying it on a read reports what the resource already is rather
     /// than changing it — and `LastUpdated` is stamped with the due instant, not with
     /// the time of the call that happened to observe it.
-    ///
-    /// A removal that has fallen due is left in place here, because a record cannot drop
-    /// itself: [`RegionState::settle`] is what forgets it, and until it does this
-    /// application still reports the `DELETING` status its deregistration gave it.
     pub fn settle(&mut self, now: SystemTime) {
         // The connected DBMS runs on its own clock: a stop that named it as the connected
         // entity, or a start that brought it back up, is due whether or not the
@@ -866,9 +850,7 @@ impl StoredApplication {
         let Some(pending) = self.pending.as_ref() else {
             return;
         };
-        // A removal is left in place whether or not it has fallen due: a record cannot
-        // drop itself.
-        if now < pending.due_at || pending.removes() {
+        if now < pending.due_at {
             return;
         }
         let pending = self.pending.take().expect("checked present just above");
@@ -901,8 +883,6 @@ impl StoredApplication {
                     self.database_arn = Some(database_arn);
                 }
             }
-            // Returned above: a record cannot drop itself.
-            PendingChange::Removal => {}
         }
         self.last_updated = pending.due_at.max(self.last_updated);
     }
@@ -1018,20 +998,6 @@ impl StoredApplication {
             }) => discovery_status.as_str(),
             _ => self.discovery_status.as_str(),
         }
-    }
-
-    /// Whether a deregistration is running against this application: it reports
-    /// `DELETING` and its removal is the change the clock owes it.
-    pub fn is_deregistering(&self) -> bool {
-        self.pending.as_ref().is_some_and(PendingTransition::removes)
-    }
-
-    /// Whether the deregistration running against this application has completed by
-    /// `now`, so the application no longer exists at that instant.
-    pub fn removal_due(&self, now: SystemTime) -> bool {
-        self.pending
-            .as_ref()
-            .is_some_and(|pending| pending.removes() && now >= pending.due_at)
     }
 
     /// Whether the change the clock owes this application can leave it deriving a
@@ -1320,8 +1286,9 @@ impl StoredApplication {
     ///
     /// This is the ONE enumeration of a registration's resources, so the resolver that
     /// decides whether an ARN names something ([`RegionState::holds_resource`]) and the
-    /// cleanup that drops what was held per resource when the registration goes
-    /// ([`RegionState::settle`]) cannot disagree about which resources a registration has.
+    /// cleanup that drops what was held per resource when that resource goes
+    /// ([`RegionState::forget_destroyed`]) cannot disagree about which resources a
+    /// registration has.
     ///
     /// `region` is the Region the application is registered in, which is the Region the
     /// ARNs listed here carry.
@@ -1930,7 +1897,7 @@ pub struct RegionState {
 impl RegionState {
     /// Materialise every change the clock already owes, on applications and on
     /// operations alike — the status an asynchronous call moves an application to, and
-    /// the removal a deregistration ends one with.
+    /// the resources a settling change stops deriving.
     ///
     /// Every handler calls this first, so each one reports the same thing about a
     /// resource at the same instant.
@@ -1944,10 +1911,10 @@ impl RegionState {
     /// resources each registration gives rise to, and never their product, however many
     /// changes fall due in the same instant.
     pub fn settle(&mut self, now: SystemTime) {
-        // The ARNs of resources that have STOPPED existing at `now`, gathered by both
-        // passes below and resolved ONCE at the end: what is held on each of them is
-        // forgotten there, so neither pass pays to re-resolve an ARN and the whole
-        // cleanup costs one enumeration of this partition's resources, and only when
+        // The ARNs of resources that have STOPPED existing at `now`, gathered by the pass
+        // below and resolved ONCE at the end ([`Self::forget_destroyed`]): what is held on
+        // each of them is forgotten there, so the pass pays to re-resolve no ARN and the
+        // whole cleanup costs one enumeration of this partition's resources, and only when
         // something was destroyed at all.
         let mut destroyed: Vec<String> = Vec::new();
 
@@ -1971,61 +1938,7 @@ impl RegionState {
                 destroyed.extend(before.into_iter().filter(|arn| !after.contains(arn)));
             }
         }
-        // A deregistration whose removal has fallen due is COMPLETE: from that instant
-        // the application stops resolving, whether or not anybody called, and what was
-        // held FOR it goes with it — its tags and the resource permissions granted on
-        // it, both keyed by its ARN, and the configuration
-        // check runs that inspected it, which describe a configuration that no longer
-        // exists. Its `Operation` records stay: they are the history of calls already
-        // made, which `GetOperation` resolves by id, and [`MAX_RETAINED_OPERATIONS`] is
-        // what bounds them — and they stay the records of the registration they were filed
-        // against, which has ended, so no later registration made under the same id
-        // reports them as its own ([`Self::operations_for`]).
-        //
-        // What is held PER RESOURCE goes with it for every resource of that
-        // registration — the application's own ARN and the ARNs of the resources
-        // DERIVED from it ([`StoredApplication::resource_arns`]), since a database or a
-        // component cannot outlive the registration it came from and neither can what
-        // was tagged on it or granted on it.
-        let completed: Vec<(String, Vec<String>)> = self
-            .applications
-            .values()
-            .filter(|application| application.removal_due(now))
-            .map(|application| {
-                let region = arn_region(&application.arn);
-                (
-                    application.id.clone(),
-                    application.resource_arns(region),
-                )
-            })
-            .collect();
-        for (id, arns) in completed {
-            self.applications.remove(&id);
-            destroyed.extend(arns);
-            self.forget_configuration_checks_for(&id);
-        }
-        if !destroyed.is_empty() {
-            // The ARNs this partition STILL holds, enumerated once: the same enumeration
-            // [`Self::holds_resource`] resolves an ARN through, so a destroyed ARN is one
-            // no call that takes an ARN resolves any more. It is asked of the set rather
-            // than of the resolver per ARN because one DATABASE can be named by more than
-            // one registration (`RegisterApplication$DatabaseArn` and
-            // `UpdateApplicationSettings$DatabaseArn` name a database that need not be a
-            // resource of the registration naming it, [`arn_names_a_database`]), so a
-            // database another registration still names must keep what is held on it —
-            // and one pass over this partition answers that for every destroyed ARN at
-            // once.
-            let live: BTreeSet<String> = self
-                .applications
-                .values()
-                .flat_map(|application| application.resource_arns(arn_region(&application.arn)))
-                .collect();
-            for arn in &destroyed {
-                if !live.contains(arn) {
-                    self.forget_resource(arn);
-                }
-            }
-        }
+        self.forget_destroyed(destroyed);
         for operation in self.operations.values_mut() {
             operation.settle(now);
         }
@@ -2055,6 +1968,72 @@ impl RegionState {
             };
             if let Some(run) = self.configuration_check_operations.get_mut(&id) {
                 run.settle(now, evaluated);
+            }
+        }
+    }
+
+    /// End the registration of `application_id` in this Region, and answer the record it
+    /// held — `None` when this Region holds no application of that id.
+    ///
+    /// The deregistration is COMPLETE when it is accepted: from that instant the
+    /// application resolves for nobody ([`Self::resolve_application_id`]), so every later
+    /// read and every later mutation of that id answers the condition that the account has
+    /// no such registered application, each in its own error family
+    /// ([`no_registered_application`], [`application_not_found_message`]). The call does
+    /// not report a status for an application that no longer exists, and there is no window
+    /// in which one caller sees it gone and another still sees it.
+    ///
+    /// What was held FOR that registration goes with it: its tags and the resource
+    /// permissions granted on it, both keyed by its ARN, and the configuration check runs
+    /// that inspected it, which describe a configuration that no longer exists. What is
+    /// held PER RESOURCE goes for every resource of the registration — the application's
+    /// own ARN and the ARNs of the resources DERIVED from it
+    /// ([`StoredApplication::resource_arns`]) — since a database or a component cannot
+    /// outlive the registration it came from and neither can what was tagged or granted on
+    /// it.
+    ///
+    /// Its `Operation` records STAY: they are the history of calls already made, which
+    /// `GetOperation` resolves by id and [`MAX_RETAINED_OPERATIONS`] bounds — and they stay
+    /// the records of the registration they were filed against, which has ended, so no
+    /// later registration made under the same id reports them as its own
+    /// ([`Self::operations_for`]).
+    pub fn deregister_application(&mut self, application_id: &str) -> Option<StoredApplication> {
+        let application = self.applications.remove(application_id)?;
+        let destroyed = application.resource_arns(arn_region(&application.arn));
+        self.forget_configuration_checks_for(application_id);
+        self.forget_destroyed(destroyed);
+        Some(application)
+    }
+
+    /// Forget what this Region holds on each ARN in `destroyed` that no longer names a
+    /// resource of it.
+    ///
+    /// The ONE place the ARNs of resources that stopped existing are resolved, so the two
+    /// ways a resource goes away — a registration that ends
+    /// ([`Self::deregister_application`]) and a settling change that stops deriving one of
+    /// its resources ([`Self::settle`]) — cost the same single pass and cannot disagree.
+    ///
+    /// The ARNs this partition STILL holds are enumerated once: the same enumeration
+    /// [`Self::holds_resource`] resolves an ARN through, so a destroyed ARN is one no call
+    /// that takes an ARN resolves any more. It is asked of the set rather than of the
+    /// resolver per ARN because one DATABASE can be named by more than one registration
+    /// (`RegisterApplication$DatabaseArn` and `UpdateApplicationSettings$DatabaseArn` name
+    /// a database that need not be a resource of the registration naming it,
+    /// [`arn_names_a_database`]), so a database another registration still names must keep
+    /// what is held on it — and one pass over this partition answers that for every
+    /// destroyed ARN at once.
+    fn forget_destroyed(&mut self, destroyed: Vec<String>) {
+        if destroyed.is_empty() {
+            return;
+        }
+        let live: BTreeSet<String> = self
+            .applications
+            .values()
+            .flat_map(|application| application.resource_arns(arn_region(&application.arn)))
+            .collect();
+        for arn in &destroyed {
+            if !live.contains(arn) {
+                self.forget_resource(arn);
             }
         }
     }
@@ -2979,9 +2958,9 @@ pub fn component_arn(region: &str, application_id: &str, component_id: &str) -> 
 /// application is what starts and stops its components, so a component is up exactly
 /// while the application is up and is in the same transition while the application is in
 /// one. For any other application status — one where the service has not established what
-/// the application is running (its registration or its deregistration is still under way,
-/// or discovery never succeeded) — no component status follows from it, which is what the
-/// model's `UNDEFINED` states.
+/// the application is running (its registration is still under way, or discovery never
+/// succeeded) — no component status follows from it, which is what the model's
+/// `UNDEFINED` states.
 pub fn component_status_for(application_status: &str) -> &'static str {
     match application_status {
         APPLICATION_STATUS_ACTIVATED => COMPONENT_STATUS_RUNNING,

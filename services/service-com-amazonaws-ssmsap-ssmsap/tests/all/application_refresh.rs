@@ -29,10 +29,10 @@ use service_com_amazonaws_ssmsap_ssmsap::ops::types::{
     APPLICATION_DISCOVERY_STATUS_VALUES, APPLICATION_STATUS_VALUES,
 };
 use service_com_amazonaws_ssmsap_ssmsap::state::{
-    APPLICATION_STATUS_ACTIVATED, APPLICATION_STATUS_DELETING, APPLICATION_STATUS_REGISTERING,
-    APPLICATION_STATUS_STARTING, APPLICATION_STATUS_STOPPED, APPLICATION_STATUS_STOPPING,
-    DISCOVERY_STATUS_DELETING, DISCOVERY_STATUS_REGISTERING, DISCOVERY_STATUS_SUCCESS,
-    OPERATION_TYPE_START_APPLICATION_REFRESH, PendingChange, PendingTransition, TRANSITION_SPAN,
+    APPLICATION_STATUS_ACTIVATED, APPLICATION_STATUS_REGISTERING, APPLICATION_STATUS_STARTING,
+    APPLICATION_STATUS_STOPPED, APPLICATION_STATUS_STOPPING, DISCOVERY_STATUS_REGISTERING,
+    DISCOVERY_STATUS_SUCCESS, OPERATION_TYPE_START_APPLICATION_REFRESH, PendingChange,
+    PendingTransition, TRANSITION_SPAN,
 };
 
 use crate::application_lifecycle::{
@@ -529,7 +529,9 @@ struct Owed {
 }
 
 /// The rows: every change this service's asynchronous calls leave outstanding — the next
-/// status a registration, a start and a stop owe, and the removal a deregistration owes.
+/// status a registration, a start and a stop owe. A deregistration leaves none: it ends
+/// the registration as it is accepted, so there is no application left to refuse a
+/// refresh for.
 fn owed_changes() -> Vec<Owed> {
     vec![
         Owed {
@@ -558,12 +560,6 @@ fn owed_changes() -> Vec<Owed> {
                 status: APPLICATION_STATUS_STOPPED.to_string(),
                 discovery_status: DISCOVERY_STATUS_SUCCESS.to_string(),
             },
-        },
-        Owed {
-            label: "a deregistration still running",
-            status: APPLICATION_STATUS_DELETING,
-            discovery_status: DISCOVERY_STATUS_DELETING,
-            change: || PendingChange::Removal,
         },
     ]
 }

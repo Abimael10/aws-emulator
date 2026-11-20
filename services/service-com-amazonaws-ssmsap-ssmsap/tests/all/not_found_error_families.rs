@@ -38,7 +38,7 @@ use service_com_amazonaws_ssmsap_ssmsap::state::{
     duplicate_application_id_message, no_operation_message, RESOURCE_NOT_FOUND_MESSAGE,
 };
 
-use crate::application_lifecycle::{settle, valid_registration, Emulator, Reply};
+use crate::application_lifecycle::{valid_registration, Emulator, Reply};
 use crate::resource_tags::{
     application_arn, database_arn, list_tags_in_region, register, registration,
 };
@@ -273,9 +273,8 @@ async fn the_tagging_routes_refuse_an_unresolvable_arn_on_their_own_not_found_cl
         reply.status, 200,
         "expected 200 from DeregisterApplication, got {reply:?}"
     );
-    // Deregistration is asynchronous: the application stops resolving when the removal
-    // the clock owes it falls due.
-    settle().await;
+    // The deregistration ended that registration as it was accepted, so its ARN names
+    // nothing from that instant.
 
     // (label, the region the call is made at, the ARN it names): the ways an ARN can name
     // nothing, including both branches of the modelled `SsmSapArn` pattern

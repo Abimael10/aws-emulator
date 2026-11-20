@@ -161,12 +161,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceError::internal_failure(crate::state::STORE_UNAVAILABLE_MESSAGE)
         })?;
-        // A tag is not something the clock changes, but the RESOURCE it is held for is:
-        // a deregistration the clock has completed takes the application with its tags,
-        // so the change already due is materialised before this read answers, exactly as
-        // every other read of this service does. It is the only write a reporting
-        // operation makes. Reading a Region that holds nothing mints no partition for it
-        // (`region`, not `region_entry`).
+        // A tag is not something the clock changes, but the RESOURCE it is held for is: a
+        // settings change the clock has settled stops deriving a database and takes its
+        // tags with it, so the change already due is materialised before this read
+        // answers, exactly as every other read of this service does. It is the only write
+        // a reporting operation makes. Reading a Region that holds nothing mints no
+        // partition for it (`region`, not `region_entry`).
         let mut state = state.lock();
         state.settle(::std::time::SystemTime::now());
         let region_state = state.region(&region);

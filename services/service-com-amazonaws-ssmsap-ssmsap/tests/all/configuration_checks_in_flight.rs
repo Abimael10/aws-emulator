@@ -16,9 +16,9 @@
 //! under an application whose own state is still moving.
 //!
 //! The rows span what that rule generalises over: WHICH call left the change owed (a
-//! registration still settling, a start, a stop, a refresh, a settings update, a
-//! deregistration), the application type, the form of the `ApplicationId`, and how many
-//! checks the refused request names.
+//! registration still settling, a start, a stop, a refresh, a settings update), the
+//! application type, the form of the `ApplicationId`, and how many checks the refused
+//! request names.
 
 use std::collections::BTreeSet;
 use std::time::Instant;
@@ -36,10 +36,6 @@ use crate::validation_message_rendering::message;
 /// `ConflictException` @httpError 409).
 const CONFLICT_EXCEPTION: &str = "ConflictException";
 
-/// The modelled error code a start against an application this Region has not registered
-/// is answered with (same query: `ResourceNotFoundException` @httpError 404).
-const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
-
 /// `ConfigurationCheckOperationListingMode$ALL_OPERATIONS`, as the model spells it — the
 /// mode that reports EVERY run of an application, which is how a row proves a refused
 /// start filed none.
@@ -56,6 +52,10 @@ const NOT_REGISTERED_SUCCESSFULLY: &str =
     "The specified application has not been registered successfully";
 
 /// The call that leaves a change the clock owes the application outstanding.
+///
+/// `DeregisterApplication` is not one of them: it ends the registration as it is
+/// accepted, so it leaves no application a start could be refused against —
+/// `tests/all/deregistration_window.rs` pins what a start answers then.
 #[derive(Debug, Clone, Copy)]
 enum InFlight {
     /// The registration itself has not settled yet.
@@ -68,8 +68,6 @@ enum InFlight {
     Refresh,
     /// `UpdateApplicationSettings`.
     SettingsUpdate,
-    /// `DeregisterApplication`, after which the application stops existing altogether.
-    Deregistration,
 }
 
 /// One row: an application with one call's work under way on it, and the
@@ -123,13 +121,6 @@ const CASES: &[Case] = &[
         app_type: "HANA",
         in_flight: InFlight::SettingsUpdate,
         requested: Some(1),
-    },
-    Case {
-        label: "a deregistration still running",
-        id: "HDB.TEST-9",
-        app_type: "HANA",
-        in_flight: InFlight::Deregistration,
-        requested: None,
     },
 ];
 
@@ -217,10 +208,6 @@ async fn leave_work_in_flight(emulator: &Emulator, case: &Case) {
                 }],
             }),
         ),
-        InFlight::Deregistration => (
-            "/deregister-application",
-            json!({"ApplicationId": case.id}),
-        ),
     };
     let reply = emulator.send(path, body).await;
     assert_eq!(
@@ -234,8 +221,7 @@ async fn leave_work_in_flight(emulator: &Emulator, case: &Case) {
 /// RULE: a change the clock still owes an application is work already under way on it, so
 /// `StartConfigurationChecks` is refused with the modelled `ConflictException` (HTTP 409)
 /// until that work completes, files nothing while it refuses, and is served once the owed
-/// change has fallen due — or answers the modelled 404 when the owed change was the
-/// application's removal.
+/// change has fallen due.
 #[tokio::test]
 async fn a_start_is_refused_while_the_application_owes_a_change() {
     for case in CASES {
@@ -335,23 +321,9 @@ async fn a_start_is_refused_while_the_application_owes_a_change() {
             );
         }
 
-        // Once the owed change has fallen due the call is served — unless what fell due
-        // was the application's removal, which leaves nothing to start checks against.
+        // Once the owed change has fallen due the call is served.
         settle().await;
         let after = emulator.start_checks(start_request(case, case.id)).await;
-        if matches!(case.in_flight, InFlight::Deregistration) {
-            assert_eq!(
-                (after.status, after.code()),
-                (404, RESOURCE_NOT_FOUND),
-                "case {label:?}: a removed application is not found, got {after:?}"
-            );
-            let (gone, _) = emulator.every_run(case.id).await;
-            assert_eq!(
-                gone.status, 404,
-                "case {label:?}: nothing is listed under a removed application, got {gone:?}"
-            );
-            continue;
-        }
 
         assert_eq!(
             after.status, 200,

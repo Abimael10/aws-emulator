@@ -2,12 +2,13 @@
 
 //! @op DeregisterApplication
 //!
-//! Starts the asynchronous deregistration of an application: the call returns at once
-//! and the application reports `DELETING` — resolvable by `GetApplication` and listed by
-//! `ListApplications` — until the removal the clock owes it falls due, when the record,
-//! the tags held for its ARN and the configuration check runs that inspected it stop
-//! resolving. The operation records of calls already made survive, since they are the
-//! history `GetOperation` resolves by id.
+//! Ends the registration of an application: the call is accepted only for an application
+//! this account has registered in this Region, and that registration stops existing at the
+//! instant it is accepted — the record, the tags held for its ARN, the resource
+//! permissions granted on it and the configuration check runs that inspected it all stop
+//! resolving before the response is written, so every later read or mutation of that id is
+//! refused as naming no registered application. The operation records of calls already
+//! made survive, since they are the history `GetOperation` resolves by id.
 //!
 //! ## Shape of an operation
 //!
@@ -147,7 +148,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         state.settle(now);
 
-        let Some(mut application) = state
+        let Some(application) = state
             .region(&region)
             .applications
             .get(&input.application_id)
@@ -157,37 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // application registered in this account and Region is refused as a
             // validation failure — the same construction `GetApplication` answers that
             // condition with, since the two refuse the same thing at the same status and
-            // error shape.
+            // error shape. A second deregistration of the same id is refused here too:
+            // the first one already ended that registration.
             return Err(DeregisterApplicationErrorModeled::ValidationException(
                 crate::state::no_registered_application(&input.application_id),
             )
             .into());
         };
-
-        // A deregistration already running against this application needs no second
-        // one: the application is already DELETING with its removal due, so asking
-        // again neither restarts the deletion, moves its due instant nor files another
-        // record for the same work — and the call is still served, since the state the
-        // caller asked for is the state the application is in.
-        if application.is_deregistering() {
-            return Ok(DeregisterApplicationOutput {});
-        }
-
-        // Deregistration is ASYNCHRONOUS: the call returns at once and the application
-        // reports DELETING, resolvable by every reader, until the removal the clock owes
-        // it falls due one `TRANSITION_SPAN` from now — materialised by the first
-        // request at or after that instant
-        // (`crate::state::RegionState::settle`). Nothing sleeps, and a caller polling
-        // straight after this call still observes the transient status.
-        application.status = crate::state::APPLICATION_STATUS_DELETING.to_string();
-        // The deregistration undoes the discovery the registration made, so the
-        // application's latest discovery result is the deletion that is running.
-        application.discovery_status = crate::state::DISCOVERY_STATUS_DELETING.to_string();
-        application.last_updated = now;
-        application.pending = Some(crate::state::PendingTransition {
-            due_at: now + crate::state::TRANSITION_SPAN,
-            change: crate::state::PendingChange::Removal,
-        });
 
         // The application was just found in this Region, so reaching for the partition
         // to write mints nothing.
@@ -196,7 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it started, so the deregistration is recorded like the registration, start and
         // stop before it. `DeregisterApplicationOutput` carries no `OperationId`, so the
         // id is not handed back to the caller — the record is what `ListOperations`
-        // reports and what `GetOperation` resolves.
+        // reports and what `GetOperation` resolves. Filed BEFORE the removal, so it
+        // records the registration it was filed against
+        // ([`crate::state::StoredOperation::registration`]).
         region_state.record_operation(
             crate::state::OPERATION_TYPE_DEREGISTER_APPLICATION,
             &application,
@@ -205,9 +184,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::collections::HashMap::new(),
             now,
         );
-        region_state
-            .applications
-            .insert(input.application_id, application);
+
+        // The deregistration takes effect NOW rather than at a later instant the clock
+        // owes: the registration this call ends resolves for nobody from here on, so a
+        // caller reading or mutating the id straight afterwards is told the account has no
+        // such registered application, and no caller ever observes a registration this
+        // call has already accepted the end of.
+        region_state.deregister_application(&input.application_id);
 
         Ok(DeregisterApplicationOutput {})
     }

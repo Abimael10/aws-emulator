@@ -170,9 +170,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut state = state.lock();
         // Every handler materialises what the clock already owes first, so this call
-        // acts on the same resources as any other call at this instant — a
-        // deregistration whose removal has fallen due has already taken its application
-        // and that application's tags by the time this write resolves the ARN.
+        // acts on the same resources as any other call at this instant — a settling
+        // change that stopped deriving a resource has already taken that resource's tags
+        // by the time this write resolves the ARN.
         state.settle(::std::time::SystemTime::now());
 
         // `ResourceArn` is modelled `@required` with a `@pattern` and every `TagValue`

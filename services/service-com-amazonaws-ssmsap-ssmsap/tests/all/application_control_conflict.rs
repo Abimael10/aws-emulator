@@ -26,15 +26,14 @@
 //!
 //! The rows span what the rule generalises over: WHICH control call runs into the gate,
 //! which call left the change owed (a registration still settling, a start, a stop, a
-//! refresh, a settings update, a deregistration), the application type and the form of
-//! the `ApplicationId`.
+//! refresh, a settings update), the application type and the form of the `ApplicationId`.
 
 use std::time::Instant;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ssmsap_ssmsap::state::{
-    APPLICATION_STATUS_ACTIVATED, APPLICATION_STATUS_DELETING, APPLICATION_STATUS_REGISTERING,
-    APPLICATION_STATUS_STARTING, APPLICATION_STATUS_STOPPING, TRANSITION_SPAN,
+    APPLICATION_STATUS_ACTIVATED, APPLICATION_STATUS_REGISTERING, APPLICATION_STATUS_STARTING,
+    APPLICATION_STATUS_STOPPING, TRANSITION_SPAN,
 };
 
 use crate::application_lifecycle::{settle, valid_registration, Emulator, Reply};
@@ -160,6 +159,10 @@ enum Expected {
 }
 
 /// The call that leaves a change the clock owes the application outstanding.
+///
+/// `DeregisterApplication` is not one of them: it ends the registration as it is
+/// accepted, so it leaves no application for a control call to be refused against —
+/// `tests/all/deregistration_window.rs` pins what every such call answers then.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InFlight {
     /// The registration itself has not settled yet.
@@ -168,8 +171,6 @@ enum InFlight {
     Stop,
     Refresh,
     SettingsUpdate,
-    /// `DeregisterApplication`, after which the application stops existing altogether.
-    Deregistration,
 }
 
 impl InFlight {
@@ -188,10 +189,6 @@ impl InFlight {
                 Control::SettingsUpdate.path(),
                 Control::SettingsUpdate.request(application),
             )),
-            Self::Deregistration => Some((
-                "/deregister-application",
-                json!({"ApplicationId": application}),
-            )),
         }
     }
 
@@ -204,7 +201,6 @@ impl InFlight {
             Self::Start => APPLICATION_STATUS_STARTING,
             Self::Stop => APPLICATION_STATUS_STOPPING,
             Self::Refresh | Self::SettingsUpdate => APPLICATION_STATUS_ACTIVATED,
-            Self::Deregistration => APPLICATION_STATUS_DELETING,
         }
     }
 
@@ -266,12 +262,6 @@ const CASES: &[Case] = &[
         id: "hana-1",
         app_type: "HANA",
         in_flight: InFlight::SettingsUpdate,
-    },
-    Case {
-        label: "a deregistration still running",
-        id: "HDB.TEST-9",
-        app_type: "HANA",
-        in_flight: InFlight::Deregistration,
     },
 ];
 

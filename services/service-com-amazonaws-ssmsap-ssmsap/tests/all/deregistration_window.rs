@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The window an asynchronous deregistration leaves open, driven over the wire.
+//! What a deregistration leaves behind — nothing, and no window — driven over the wire.
 //!
 //! Every case goes through the real router (the harness `tests/all/application_lifecycle.rs`
 //! owns), so the restJson1 routing, the boundary constraint walk, the handler and the
@@ -9,49 +9,198 @@
 //! the id of the record the deregistration files, which no response hands back, and every
 //! assertion about that record is then made over the wire through `GetOperation`.
 //!
-//! RULE under test: a call that starts asynchronous work returns at once and the resource
-//! it acts on keeps resolving in the transient status that work gave it until the change
-//! the clock owes falls due — so a deregistration leaves the application reporting
-//! `DELETING` to every reader, refuses another operation on it meanwhile, and the
-//! application stops resolving only once the removal falls due, while the record of the
-//! work itself is filed like any other operation's.
+//! RULE under test: a `DeregisterApplication` that is accepted ends the registration at
+//! that instant — the application resolves for no later call, and what was held FOR it
+//! (its tags, the configuration check runs that inspected it) stops resolving with it — so
+//! the very next call naming that id answers the condition that the account has no such
+//! registered application, each operation on the error family its own model declares
+//! (HTTP 400 `ValidationException` where no not-found error is modelled, HTTP 404
+//! `ResourceNotFoundException` where one is), and the id is free to register again. The
+//! operation RECORDS of calls already made survive, since they are the history
+//! `GetOperation` resolves by id.
+//!
+//! No assertion here waits for the clock: there is no instant between the deregistration
+//! being accepted and the application being gone, which is exactly what the rows pin.
 //!
 //! The rows span what that rule generalises over: the `ApplicationId` forms the modelled
 //! pattern admits, the application type, whether the registration carried tags, and the
-//! state the application is in when the deregistration starts — still registering (a
-//! change already owed), activated, started, and stopped.
+//! state the application is in when it is deregistered — still registering (a change
+//! owed), activated, started, and stopped.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_ssmsap_ssmsap::ops::types::{
-    APPLICATION_DISCOVERY_STATUS_VALUES, APPLICATION_STATUS_VALUES,
-};
-use service_com_amazonaws_ssmsap_ssmsap::state::{
-    APPLICATION_STATUS_DELETING, DISCOVERY_STATUS_DELETING, OPERATION_TYPE_DEREGISTER_APPLICATION,
-    TRANSITION_SPAN,
-};
+use service_com_amazonaws_ssmsap_ssmsap::state::OPERATION_TYPE_DEREGISTER_APPLICATION;
 
-use crate::application_lifecycle::{settle, tag_pairs, valid_registration, Emulator, Reply, REGION};
+use crate::application_lifecycle::{tag_pairs, valid_registration, Emulator, Reply, REGION};
+use crate::configuration_checks::{started, string_field};
+use crate::resource_tags::list_tags_in_region;
 use crate::validation_message_rendering::{message, VALIDATION_EXCEPTION};
 
-/// The account every emulated ARN carries, from the core's single source of truth.
+/// The account every emulated ARN carries, and the account a lookup runs in, from the
+/// core's single source of truth.
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
-/// The modelled error code an operation already under way on an application is refused
-/// with (`smithy_query(query="operation", operation="StartApplication")`:
-/// `ConflictException` `@httpError 409`).
-const CONFLICT_EXCEPTION: &str = "ConflictException";
+/// The modelled error code the calls that DO declare a not-found error answer an
+/// application that is not registered with (`smithy_query(query="operation",
+/// operation="StartApplication")`: `ResourceNotFoundException` `@httpError 404`).
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 
-/// `OperationStatus$SUCCESS`, as the model spells it.
-const OPERATION_STATUS_SUCCESS: &str = "SUCCESS";
+/// The fixed sentence the ARN-addressed tagging routes refuse an ARN that names no
+/// resource of this account and Region with, on their own not-found class.
+const NOT_FOUND_CODE: &str = service_com_amazonaws_ssmsap_ssmsap::scaffolded::NOT_FOUND_CODE;
+
+/// `ApplicationStatus` values the rows drive the application through
+/// (`smithy_query(query="shape", shape="ApplicationStatus")`).
+const ACTIVATED: &str = "ACTIVATED";
+const STOPPED: &str = "STOPPED";
+
+/// How long a poll for a status the clock owes may go on before the case fails. Generous
+/// by design: the loop waits for the CONDITION, and only a store that never settles can
+/// run it out.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long the poll loop pauses between looks.
+const POLL_PAUSE: Duration = Duration::from_millis(50);
+
+/// How this service states that the account holds no such registered application: the
+/// wording the calls that model NO not-found error answer the condition with, fixed text
+/// around the account the lookup ran in and the id the request carried.
+///
+/// Spelled out here rather than taken from the crate, so the wording is pinned
+/// independently of the one place the handlers build it in.
+fn no_registered_application(id: &str) -> String {
+    format!("No registered application found for account: {ACCOUNT}, and application: {id}")
+}
+
+/// How the calls that DO model a not-found error state the same condition: fixed text
+/// around the id the request carried. Spelled out here for the same reason.
+fn application_does_not_exist(id: &str) -> String {
+    format!("Application {id} doesn't exist.")
+}
+
+/// How the application-scoped listing of operation records states it. Spelled out here
+/// for the same reason.
+fn the_application_does_not_exist(id: &str) -> String {
+    format!("The application '{id}' does not exist")
+}
+
+/// One call that names an application by its `ApplicationId`, and the refusal it answers
+/// for an id that names no registered application.
+///
+/// Which error family each call carries is its MODEL's: a call that declares a
+/// `ResourceNotFoundException` reports the condition as that 404, and one that declares
+/// none reports it as the 400 `ValidationException` it does declare
+/// (`smithy_query(query="operation", operation="GetApplication,GetComponent,ListOperations,DeregisterApplication")`
+/// list no 404).
+struct Refusal {
+    /// The restJson1 path the model binds the operation to.
+    path: &'static str,
+    /// The smallest body the call accepts for the application the case names.
+    body: fn(&str) -> Value,
+    status: u16,
+    code: &'static str,
+    /// How this service words the condition for the id the request carried.
+    message: fn(&str) -> String,
+}
+
+/// Every call this suite asks for the deregistered id: the read the recording shows
+/// refused, the mutating calls on the other error family, and the application-scoped
+/// listings.
+const REFUSALS: &[Refusal] = &[
+    Refusal {
+        path: "/get-application",
+        body: |id| json!({"ApplicationId": id}),
+        status: 400,
+        code: VALIDATION_EXCEPTION,
+        message: no_registered_application,
+    },
+    Refusal {
+        // Deregistering a deregistered id is refused: the first call already ended that
+        // registration, so the second one names no registered application.
+        path: "/deregister-application",
+        body: |id| json!({"ApplicationId": id}),
+        status: 400,
+        code: VALIDATION_EXCEPTION,
+        message: no_registered_application,
+    },
+    Refusal {
+        // `ComponentId` is modelled `^[\w\d-]+$`; the application is what fails to
+        // resolve here, before any component is looked for.
+        path: "/get-component",
+        body: |id| json!({"ApplicationId": id, "ComponentId": "HDB-HANA"}),
+        status: 400,
+        code: VALIDATION_EXCEPTION,
+        message: no_registered_application,
+    },
+    Refusal {
+        path: "/list-operations",
+        body: |id| json!({"ApplicationId": id}),
+        status: 400,
+        code: VALIDATION_EXCEPTION,
+        message: the_application_does_not_exist,
+    },
+    Refusal {
+        path: "/start-application",
+        body: |id| json!({"ApplicationId": id}),
+        status: 404,
+        code: RESOURCE_NOT_FOUND_EXCEPTION,
+        message: application_does_not_exist,
+    },
+    Refusal {
+        path: "/stop-application",
+        body: |id| json!({"ApplicationId": id}),
+        status: 404,
+        code: RESOURCE_NOT_FOUND_EXCEPTION,
+        message: application_does_not_exist,
+    },
+    Refusal {
+        path: "/start-application-refresh",
+        body: |id| json!({"ApplicationId": id}),
+        status: 404,
+        code: RESOURCE_NOT_FOUND_EXCEPTION,
+        message: application_does_not_exist,
+    },
+    Refusal {
+        // `UpdateApplicationSettings` needs a setting to change, or it refuses the empty
+        // request before it resolves anything.
+        path: "/update-application-settings",
+        body: |id| {
+            json!({
+                "ApplicationId": id,
+                "CredentialsToAddOrUpdate": [{
+                    "DatabaseName": "TNT1",
+                    "CredentialType": "ADMIN",
+                    "SecretId": "sap/tnt1/admin",
+                }],
+            })
+        },
+        status: 404,
+        code: RESOURCE_NOT_FOUND_EXCEPTION,
+        message: application_does_not_exist,
+    },
+    Refusal {
+        path: "/start-configuration-checks",
+        body: |id| json!({"ApplicationId": id}),
+        status: 404,
+        code: RESOURCE_NOT_FOUND_EXCEPTION,
+        message: application_does_not_exist,
+    },
+    Refusal {
+        path: "/list-configuration-check-operations",
+        body: |id| json!({"ApplicationId": id}),
+        status: 404,
+        code: RESOURCE_NOT_FOUND_EXCEPTION,
+        message: application_does_not_exist,
+    },
+];
 
 /// What the application has been through by the time it is deregistered.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Before {
     /// Nothing: the registration is still settling, so a change was already owed when
-    /// the deregistration started.
+    /// the deregistration was made.
     StillRegistering,
     /// The registration has settled, so the application is activated and no change is
     /// owed.
@@ -75,7 +224,7 @@ struct Case {
     before: Before,
 }
 
-/// The rows: the state the application is in when the deregistration starts, across both
+/// The rows: the state the application is in when it is deregistered, across both
 /// application types, tagged and untagged, with ids of different forms.
 const CASES: &[Case] = &[
     Case {
@@ -162,6 +311,28 @@ impl Emulator {
         });
         ids
     }
+
+    /// Look at `GetApplication` until the application reports `wanted`.
+    ///
+    /// The emulator never sleeps: a change the clock owes is materialised by the first
+    /// request at or after its due instant, so this looks AGAIN rather than waiting a
+    /// fixed time, and fails only if the status never arrives.
+    async fn await_status(&self, label: &str, id: &str, wanted: &str) {
+        let started_at = Instant::now();
+        loop {
+            let reply = self
+                .send("/get-application", json!({"ApplicationId": id}))
+                .await;
+            if reply.status == 200 && reply.app_str("Status") == wanted {
+                return;
+            }
+            assert!(
+                started_at.elapsed() < POLL_DEADLINE,
+                "case {label:?}: expected {id:?} to report Status {wanted}, got {reply:?}"
+            );
+            tokio::time::sleep(POLL_PAUSE).await;
+        }
+    }
 }
 
 /// The `OperationId` a reply handed out.
@@ -173,8 +344,8 @@ fn operation_id(label: &str, reply: &Reply) -> String {
         .to_string()
 }
 
-/// Every `ApplicationSummary` a listing reported, as id -> `DiscoveryStatus`.
-fn listed(reply: &Reply) -> BTreeMap<String, String> {
+/// Every `ApplicationSummary` id a listing reported.
+fn listed(reply: &Reply) -> Vec<String> {
     reply
         .member("Applications")
         .and_then(Value::as_array)
@@ -182,16 +353,10 @@ fn listed(reply: &Reply) -> BTreeMap<String, String> {
             items
                 .iter()
                 .map(|item| {
-                    (
-                        item.get("Id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        item.get("DiscoveryStatus")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                    )
+                    item.get("Id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
                 })
                 .collect()
         })
@@ -204,22 +369,12 @@ fn expected_arn(id: &str) -> String {
 }
 
 #[tokio::test]
-async fn a_deregistration_reports_deleting_until_the_removal_falls_due() {
-    // The two statuses a deregistration reports are the model's own
-    // (`smithy_query(query="shape", shape="ApplicationStatus,ApplicationDiscoveryStatus")`),
-    // so no case can pass on a value the API does not define.
-    assert!(
-        APPLICATION_STATUS_VALUES.contains(&APPLICATION_STATUS_DELETING)
-            && APPLICATION_DISCOVERY_STATUS_VALUES.contains(&DISCOVERY_STATUS_DELETING),
-        "the deleting statuses must be modelled values, got {APPLICATION_STATUS_DELETING:?} \
-         and {DISCOVERY_STATUS_DELETING:?}"
-    );
-
+async fn a_deregistration_takes_the_application_out_of_every_path_at_once() {
     for case in CASES {
         let label = case.label;
         let emulator = Emulator::new();
-        // A second application, deregistered by nothing, proves the work is scoped to the
-        // application the call names.
+        // A second application, deregistered by nothing, proves the removal is scoped to
+        // the application the call names.
         let survivor = format!("{}-keep", case.id);
         let mut earlier_operations = vec![emulator.register_case(case).await];
         emulator
@@ -228,9 +383,9 @@ async fn a_deregistration_reports_deleting_until_the_removal_falls_due() {
 
         match case.before {
             Before::StillRegistering => {}
-            Before::Activated => settle().await,
+            Before::Activated => emulator.await_status(label, case.id, ACTIVATED).await,
             Before::Started => {
-                settle().await;
+                emulator.await_status(label, case.id, ACTIVATED).await;
                 let started = emulator
                     .send("/start-application", json!({"ApplicationId": case.id}))
                     .await;
@@ -239,10 +394,10 @@ async fn a_deregistration_reports_deleting_until_the_removal_falls_due() {
                     "case {label:?}: expected 200 from StartApplication, got {started:?}"
                 );
                 earlier_operations.push(operation_id(label, &started));
-                settle().await;
+                emulator.await_status(label, case.id, ACTIVATED).await;
             }
             Before::Stopped => {
-                settle().await;
+                emulator.await_status(label, case.id, ACTIVATED).await;
                 let stopped = emulator
                     .send("/stop-application", json!({"ApplicationId": case.id}))
                     .await;
@@ -251,14 +406,54 @@ async fn a_deregistration_reports_deleting_until_the_removal_falls_due() {
                     "case {label:?}: expected 200 from StopApplication, got {stopped:?}"
                 );
                 earlier_operations.push(operation_id(label, &stopped));
-                settle().await;
+                emulator.await_status(label, case.id, STOPPED).await;
             }
+        }
+
+        // What is held FOR the registration while it exists: its tags, and a
+        // configuration check run that inspected it. A run can only be started against an
+        // application whose registration has completed, so the row that deregisters one
+        // still registering starts none.
+        let tags_before = list_tags_in_region(&emulator, REGION, &expected_arn(case.id)).await;
+        assert_eq!(
+            tags_before.status, 200,
+            "case {label:?}: a registered application's tags resolve, got {tags_before:?}"
+        );
+        let expected_tags: BTreeMap<String, String> = case
+            .tags
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        // `ListTagsForResource` reports its map in the member the model names it with
+        // (`smithy_query(query="shape", shape="ListTagsForResourceOutput")`: `tags`).
+        assert_eq!(
+            tag_pairs(tags_before.member("tags")),
+            expected_tags,
+            "case {label:?}: the tags its registration carried are the ones held, got \
+             {tags_before:?}"
+        );
+        let mut check_runs: Vec<String> = Vec::new();
+        if case.before != Before::StillRegistering {
+            let checks = emulator
+                .start_checks(json!({"ApplicationId": case.id}))
+                .await;
+            assert_eq!(
+                checks.status, 200,
+                "case {label:?}: expected 200 from StartConfigurationChecks, got {checks:?}"
+            );
+            check_runs = started(&checks)
+                .iter()
+                .map(|operation| string_field(operation, "Id"))
+                .collect();
+            assert!(
+                !check_runs.is_empty(),
+                "case {label:?}: a start files at least one run, got {checks:?}"
+            );
         }
 
         let deregistered = emulator
             .send("/deregister-application", json!({"ApplicationId": case.id}))
             .await;
-        let started_at = Instant::now();
         assert_eq!(
             deregistered.status, 200,
             "case {label:?}: expected 200 from DeregisterApplication, got {deregistered:?}"
@@ -269,154 +464,64 @@ async fn a_deregistration_reports_deleting_until_the_removal_falls_due() {
             "case {label:?}: DeregisterApplicationOutput models no member, got {deregistered:?}"
         );
 
-        // Everything a client can do while the deregistration runs, before any assertion
-        // gates on the clock.
-        let during = emulator
-            .send("/get-application", json!({"ApplicationId": case.id}))
-            .await;
-        let listing = emulator.send("/list-applications", json!({})).await;
-        let filtered = emulator
-            .send(
-                "/list-applications",
-                json!({"Filters": [{
-                    "Name": "DiscoveryStatus",
-                    "Value": DISCOVERY_STATUS_DELETING,
-                    "Operator": "Equals",
-                }]}),
-            )
-            .await;
-        let restarted = emulator
-            .send("/start-application", json!({"ApplicationId": case.id}))
-            .await;
-        let again = emulator
-            .send("/deregister-application", json!({"ApplicationId": case.id}))
-            .await;
-        let still = emulator
-            .send("/get-application", json!({"ApplicationId": case.id})).await;
-        let records_during = emulator.deregister_record_ids(case.id);
-
-        // The transient assertions hold only while the clock still owes the removal: past
-        // that instant the application was due to go whether or not anybody called.
-        if started_at.elapsed() < TRANSITION_SPAN {
+        // From here on NOTHING waits for the clock: the registration ended when the call
+        // was accepted, so the next call already sees it gone.
+        for refusal in REFUSALS {
+            let path = refusal.path;
+            let reply = emulator.send(path, (refusal.body)(case.id)).await;
             assert_eq!(
-                during.status, 200,
-                "case {label:?}: a deregistering application still resolves, got {during:?}"
+                (reply.status, reply.code()),
+                (refusal.status, refusal.code),
+                "case {label:?}: expected {} {} from {path} for a deregistered id, got \
+                 {reply:?}",
+                refusal.status,
+                refusal.code
             );
+            let expected = (refusal.message)(case.id);
             assert_eq!(
-                during.app_str("Status"),
-                APPLICATION_STATUS_DELETING,
-                "case {label:?}: expected Status {APPLICATION_STATUS_DELETING}, got {during:?}"
-            );
-            assert_eq!(
-                during.app_str("DiscoveryStatus"),
-                DISCOVERY_STATUS_DELETING,
-                "case {label:?}: expected DiscoveryStatus {DISCOVERY_STATUS_DELETING}, got \
-                 {during:?}"
-            );
-            assert_eq!(
-                during.app_str("Arn"),
-                expected_arn(case.id),
-                "case {label:?}: the deregistering application keeps its ARN, got {during:?}"
-            );
-            let expected_tags: BTreeMap<String, String> = case
-                .tags
-                .iter()
-                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-                .collect();
-            assert_eq!(
-                tag_pairs(during.member("Tags")),
-                expected_tags,
-                "case {label:?}: its tags are still held while it is deleting, got {during:?}"
-            );
-
-            let reported = listed(&listing);
-            assert_eq!(
-                reported.keys().cloned().collect::<Vec<String>>(),
-                {
-                    let mut expected = vec![case.id.to_string(), survivor.clone()];
-                    expected.sort();
-                    expected
-                },
-                "case {label:?}: a deregistering application is still listed, got {listing:?}"
-            );
-            assert_eq!(
-                reported.get(case.id).map(String::as_str),
-                Some(DISCOVERY_STATUS_DELETING),
-                "case {label:?}: it is listed as deleting, got {listing:?}"
-            );
-            assert_eq!(
-                listed(&filtered).keys().cloned().collect::<Vec<String>>(),
-                vec![case.id.to_string()],
-                "case {label:?}: the deleting application is the one that filter matches, got \
-                 {filtered:?}"
-            );
-
-            assert_eq!(
-                restarted.status, 409,
-                "case {label:?}: a deregistering application cannot be started, got {restarted:?}"
-            );
-            assert_eq!(
-                restarted.code(),
-                CONFLICT_EXCEPTION,
-                "case {label:?}: expected {CONFLICT_EXCEPTION}, got {restarted:?}"
+                message(&reply),
+                expected,
+                "case {label:?}: expected {path} to state {expected:?}, got {:?}",
+                message(&reply)
             );
             assert!(
-                message(&restarted).contains(case.id),
-                "case {label:?}: the refusal must name the application, got {:?}",
-                message(&restarted)
-            );
-
-            assert_eq!(
-                again.status, 200,
-                "case {label:?}: deregistering a deregistering application is served, got \
-                 {again:?}"
-            );
-            assert_eq!(
-                still.app_str("Status"),
-                APPLICATION_STATUS_DELETING,
-                "case {label:?}: a second deregistration leaves it deleting, got {still:?}"
-            );
-            assert_eq!(
-                records_during.len(),
-                1,
-                "case {label:?}: one deregistration files one record, got {records_during:?}"
+                reply.member("Application").is_none() && reply.member("OperationId").is_none(),
+                "case {label:?}: a refusal from {path} reports nothing for the application, \
+                 got {reply:?}"
             );
         }
 
-        // Past the due instant the application is gone, without any further call having
-        // been needed to make it so.
-        settle().await;
-
-        let after = emulator
-            .send("/get-application", json!({"ApplicationId": case.id}))
-            .await;
+        let listing = emulator.send("/list-applications", json!({})).await;
         assert_eq!(
-            after.status, 400,
-            "case {label:?}: a completed deregistration stops resolving, got {after:?}"
-        );
-        assert_eq!(
-            after.code(),
-            VALIDATION_EXCEPTION,
-            "case {label:?}: expected {VALIDATION_EXCEPTION}, got {after:?}"
-        );
-        assert!(
-            after.member("Application").is_none(),
-            "case {label:?}: nothing may be reported for it, got {after:?}"
-        );
-
-        let listing_after = emulator.send("/list-applications", json!({})).await;
-        assert_eq!(
-            listed(&listing_after).keys().cloned().collect::<Vec<String>>(),
+            listed(&listing),
             vec![survivor.clone()],
-            "case {label:?}: only the other application remains listed, got {listing_after:?}"
+            "case {label:?}: only the other application remains listed, got {listing:?}"
         );
 
-        let restart_after = emulator
-            .send("/start-application", json!({"ApplicationId": case.id}))
+        // What was held FOR the registration went with it, at the same instant.
+        let tags_after = list_tags_in_region(&emulator, REGION, &expected_arn(case.id)).await;
+        assert_eq!(
+            (tags_after.status, tags_after.code()),
+            (404, NOT_FOUND_CODE),
+            "case {label:?}: its ARN names nothing once it is deregistered, got {tags_after:?}"
+        );
+        for run in &check_runs {
+            let reply = emulator.get_check(run).await;
+            assert_eq!(
+                (reply.status, reply.code()),
+                (400, VALIDATION_EXCEPTION),
+                "case {label:?}: the run {run:?} that inspected it stops resolving, got \
+                 {reply:?}"
+            );
+        }
+
+        // The other application is untouched by any of it.
+        let other = emulator
+            .send("/get-application", json!({"ApplicationId": survivor}))
             .await;
         assert_eq!(
-            restart_after.status, 404,
-            "case {label:?}: expected 404 once the removal completed, got {restart_after:?}"
+            other.status, 200,
+            "case {label:?}: the application nobody deregistered still resolves, got {other:?}"
         );
 
         // The record of the deregistration is filed like every other operation's, and the
@@ -437,22 +542,16 @@ async fn a_deregistration_reports_deleting_until_the_removal_falls_due() {
         assert_eq!(
             (
                 record.op_str("Type"),
-                record.op_str("Status"),
                 record.op_str("ResourceId"),
                 record.op_str("ResourceArn"),
             ),
             (
                 OPERATION_TYPE_DEREGISTER_APPLICATION,
-                OPERATION_STATUS_SUCCESS,
                 case.id,
                 expected_arn(case.id).as_str(),
             ),
             "case {label:?}: the record must describe the deregistration it was filed for, \
              got {record:?}"
-        );
-        assert!(
-            record.op("EndTime").is_some(),
-            "case {label:?}: a completed operation reports when it ended, got {record:?}"
         );
         for earlier in &earlier_operations {
             let reply = emulator
@@ -470,5 +569,14 @@ async fn a_deregistration_reports_deleting_until_the_removal_falls_due() {
                  got {reply:?}"
             );
         }
+
+        // The id is free again at once, and the re-registration is a new record.
+        let reregistered = emulator
+            .register_application(label, case.id, case.app_type, &[])
+            .await;
+        assert!(
+            !reregistered.is_empty() && !earlier_operations.contains(&reregistered),
+            "case {label:?}: the re-registration files its own record, got {reregistered:?}"
+        );
     }
 }

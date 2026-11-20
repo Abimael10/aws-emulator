@@ -458,12 +458,8 @@ async fn the_association_ends_with_the_other_registration() {
         reply.status, 200,
         "expected 200 from DeregisterApplication, got {reply:?}"
     );
-    // The removal is asynchronous: until it falls due the application is still registered,
-    // so it is still the application the other one shares its database with.
-    assert_associated(&emulator, "the deregistration is outstanding", "left-abap", &["gone-hdb"])
-        .await;
-
-    settle().await;
+    // The deregistration ends that registration as it is accepted, so the database it
+    // shared is gone with it and the association ended at the same instant.
     assert_associated(&emulator, case, "left-abap", &[]).await;
     let gone = get(&emulator, "gone-hdb").await;
     assert!(

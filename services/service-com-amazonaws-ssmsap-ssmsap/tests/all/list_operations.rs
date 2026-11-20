@@ -36,7 +36,7 @@ use service_com_amazonaws_ssmsap_ssmsap::ops::types::FILTER_OPERATOR_VALUES;
 use service_com_amazonaws_ssmsap_ssmsap::state::{
     APPLICATION_RESOURCE_TYPE, MAX_PAGE_SIZE, OPERATION_FILTER_NAMES,
     OPERATION_STATUS_ERROR, OPERATION_STATUS_INPROGRESS, OPERATION_STATUS_SUCCESS,
-    OPERATION_TYPE_DEREGISTER_APPLICATION, OPERATION_TYPE_REGISTER_APPLICATION,
+    OPERATION_TYPE_REGISTER_APPLICATION,
     OPERATION_TYPE_START_APPLICATION, OPERATION_TYPE_START_APPLICATION_REFRESH,
     OPERATION_TYPE_STOP_APPLICATION, TRANSITION_SPAN,
 };
@@ -303,8 +303,9 @@ async fn reports_every_record_filed_against_the_application() {
 }
 
 /// RULE: a record the clock has not yet brought to its terminal status is reported as the
-/// running record it is, and the deregistration that ends an application is a record like
-/// every other while that application still resolves.
+/// running record it is, and the deregistration that ends an application leaves that
+/// application's own listing unresolvable while the records of its calls are still read by
+/// id.
 #[tokio::test]
 async fn reports_a_running_record_and_the_deregistration_that_ends_the_application() {
     let emulator = Emulator::new();
@@ -341,8 +342,9 @@ async fn reports_a_running_record_and_the_deregistration_that_ends_the_applicati
     }
     settle().await;
 
-    // A deregistration files a record like every other call, and the application still
-    // resolves until the removal the clock owes it falls due.
+    // A deregistration ends the registration as it is accepted, so the listing that is
+    // scoped to that application resolves no more from that instant — the refusal an
+    // unresolvable reference always is.
     let reply = emulator
         .send("/deregister-application", json!({"ApplicationId": APPLICATION}))
         .await;
@@ -350,35 +352,20 @@ async fn reports_a_running_record_and_the_deregistration_that_ends_the_applicati
         reply.status, 200,
         "expected 200 from DeregisterApplication, got {reply:?}"
     );
-    let deregistered_at = Instant::now();
-    let reply = list_operations(&emulator, json!({"ApplicationId": APPLICATION})).await;
-    if deregistered_at.elapsed() < TRANSITION_SPAN {
-        assert_eq!(
-            reply.status, 200,
-            "an application whose removal is still owed resolves, got {reply:?}"
-        );
-        let types: BTreeSet<String> = listed(&reply)
-            .iter()
-            .map(|row| string_field(row, "Type"))
-            .collect();
-        assert_eq!(
-            types,
-            BTreeSet::from([
-                OPERATION_TYPE_REGISTER_APPLICATION.to_string(),
-                OPERATION_TYPE_DEREGISTER_APPLICATION.to_string(),
-            ]),
-            "the deregistration is a record like every other, got {reply:?}"
-        );
-    }
-
-    // Once the removal has fallen due the application resolves no more, so the listing
-    // for it is the refusal an unresolvable reference always is.
-    settle().await;
     let reply = list_operations(&emulator, json!({"ApplicationId": APPLICATION})).await;
     assert_refused(
         &reply,
         APPLICATION,
         &unresolvable_reference_message(APPLICATION),
+    );
+
+    // The records of the calls already made are history the removal does not destroy, so
+    // the id the registration handed out still resolves.
+    let kept = read_operation(&emulator, &registration).await;
+    assert_eq!(
+        string_field(&read_record(&kept), "ResourceId"),
+        APPLICATION,
+        "a record filed before the deregistration still names its application, got {kept:?}"
     );
 }
 

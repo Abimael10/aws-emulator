@@ -195,9 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A change the clock still owes this application is an operation already under
         // way on it, which is what `ConflictException` reports — decided and worded in
         // the one place every control call of this service refuses that condition from —
-        // so no run is filed against an application whose own state is still moving, and
-        // in particular none against one whose deregistration is in flight, whose records
-        // would stop existing the instant the removal falls due.
+        // so no run is filed against an application whose own state is still moving.
         crate::state::application_control_available(
             &application,
             crate::state::ApplicationControl::ConfigurationChecks,
