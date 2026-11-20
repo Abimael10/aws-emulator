@@ -20,7 +20,9 @@
 //! * `ListNetworks` / `ListUsers` are `@paginated(items=networks|users)`, so a page
 //!   plus its `nextToken` must walk every stored item exactly once.
 //! * A network, user, bot or security group "that doesn't exist or has been deleted"
-//!   answers `ResourceNotFoundError` (HTTP 404).
+//!   answers `ResourceNotFoundError` (HTTP 404) — for every network-scoped operation
+//!   but `GetNetwork`, which resolves ownership of the `networkId` label first and
+//!   denies it (`get_network_ownership_refusals.rs`).
 //! * `UpdateNetworkSettings` "can modify settings such as client metrics, data
 //!   retention, and other network-wide options", and every `NetworkSettings` member
 //!   is optional, so a member the request leaves out keeps its stored value;
@@ -437,8 +439,10 @@ async fn the_network_and_user_lifecycle_round_trips_through_stored_state() {
         "DeleteNetwork: expected a message, got {deleted}"
     );
 
+    // Every network-scoped operation but `GetNetwork` reports a deleted network as
+    // not found; `GetNetwork` resolves ownership of the label first and denies it,
+    // which `get_network_ownership_refusals.rs` is the suite for.
     for (operation, method, uri) in [
-        ("GetNetwork", "GET", format!("/networks/{network_id}")),
         (
             "ListUsers",
             "GET",
@@ -1054,9 +1058,10 @@ async fn users_sort_by_the_requested_member_and_by_id_numerically() {
 async fn an_unknown_but_well_formed_network_id_is_not_found() {
     let router = emulator();
     // Well formed per `NetworkId` (`^[0-9]{8}$`) and never minted by this store.
+    // `GetNetwork` is not here: it denies an id it cannot own instead of reporting
+    // whether a network holds it (see `get_network_ownership_refusals.rs`).
     let unknown = "99999999";
     let cases: &[(&str, &str, &str, Option<Value>)] = &[
-        ("GetNetwork", "GET", "/networks/99999999", None),
         ("ListUsers", "GET", "/networks/99999999/users", None),
         ("DeleteNetwork", "DELETE", "/networks/99999999", None),
     ];
@@ -1504,10 +1509,11 @@ async fn settings_of_a_network_that_does_not_exist_are_not_found() {
 async fn a_network_id_outside_the_modelled_pattern_is_refused() {
     let router = emulator();
     // `NetworkId` is `^[0-9]{8}$`: one past each end of the length, and a value of
-    // the right length that is not digits.
+    // the right length that is not digits. `GetNetwork` is not here: it denies a
+    // label it cannot own before the model's constraints are reached (see
+    // `get_network_ownership_refusals.rs`).
     for case in ["1234567", "123", "123456789", "abcdefgh", "1234567a"] {
         for (operation, method, uri) in [
-            ("GetNetwork", "GET", format!("/networks/{case}")),
             ("ListUsers", "GET", format!("/networks/{case}/users")),
             ("DeleteNetwork", "DELETE", format!("/networks/{case}")),
         ] {
@@ -1756,10 +1762,12 @@ async fn delete_network_states_the_initiated_deletion_and_echoes_the_network_id(
         answered.push(deleted["message"].as_str().unwrap_or_default().to_string());
 
         // The network really went: the delete's sentence is about state that changed.
+        // Reading it back is answered by the ownership-first denial this API gives for a
+        // network of this account that is gone (`get_network_ownership_refusals.rs`).
         let (status, gone) = call(&router, "GET", &format!("/networks/{network_id}"), None).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: GetNetwork after the delete expected 404, got {status} with {gone}"
+            status, 403,
+            "case {case:?}: GetNetwork after the delete expected 403, got {status} with {gone}"
         );
     }
 
@@ -1778,8 +1786,10 @@ async fn delete_network_states_the_initiated_deletion_and_echoes_the_network_id(
 ///
 /// The rows span the response classes a client can receive: a create (201), a read (200), a
 /// listing (200), an update (200), a delete (200), a refusal a handler raises (422), a
-/// refusal the model's own constraints produce before any handler runs (400) and an error
-/// about stored state (404).
+/// refusal the model's own constraints produce before any handler runs (400), an error
+/// about stored state (404), and the two denials `GetNetwork` answers for a `networkId` it
+/// cannot own (403 before the model's constraints are reached, 401 for an id this store
+/// cannot place).
 #[tokio::test]
 async fn every_response_announces_the_charset_and_carries_an_entity_tag() {
     let router = emulator();
@@ -1818,16 +1828,30 @@ async fn every_response_announces_the_charset_and_carries_an_entity_tag() {
         (
             "a refusal the model's constraints produce",
             "GET",
-            "/networks/123".to_string(),
+            "/networks/123/users".to_string(),
             None,
             400,
         ),
         (
             "an error about stored state",
             "GET",
-            "/networks/99999999".to_string(),
+            "/networks/99999999/users".to_string(),
             None,
             404,
+        ),
+        (
+            "a denial decided before the model's constraints",
+            "GET",
+            "/networks/123".to_string(),
+            None,
+            403,
+        ),
+        (
+            "a denial of an id this store cannot place",
+            "GET",
+            "/networks/99999999".to_string(),
+            None,
+            401,
         ),
         (
             "a delete",

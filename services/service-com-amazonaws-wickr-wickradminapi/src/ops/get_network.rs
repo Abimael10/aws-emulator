@@ -3,6 +3,22 @@
 //! @op GetNetwork
 //! Reports one stored network by id. Reporting only: it never writes.
 //!
+//! ## How this operation refuses
+//!
+//! This API resolves ownership of the `networkId` path label before it validates the
+//! label or reports anything about the network behind it, so a request it cannot serve
+//! from a network of this account is refused in the authorization class with a fixed
+//! sentence that names neither the member nor the id — never as a validation failure or
+//! as a statement that the resource was not found:
+//!
+//! * an id that is not a `NetworkId` at all (`@length` 8, `@pattern ^[0-9]{8}$`) is
+//!   denied before the model's own constraints are reached, which is why the boundary
+//!   check is taken in front of this operation
+//!   (`crate::service::network_ownership`) rather than here;
+//! * an id this account owned and deleted is `ForbiddenError` (403);
+//! * an id this store cannot place at all is `UnauthorizedError` (401), which discloses
+//!   nothing about whether such a network exists.
+//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".
 //!
@@ -181,11 +197,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
-        let network = store.networks.get(&input.network_id).ok_or_else(|| {
-            GetNetworkErrorModeled::ResourceNotFoundError(ResourceNotFoundError {
-                message: Some(format!("network {} does not exist", input.network_id)),
-            })
-        })?;
+        // Ownership of the `networkId` is resolved before anything about the network
+        // behind it is reported: an id this account cannot be shown to own is denied,
+        // and the refusal discloses neither the id nor whether a network holds it.
+        let network = match store.network_access(&input.network_id) {
+            crate::state::NetworkAccess::Owned(record) => record,
+            crate::state::NetworkAccess::Deleted => {
+                return Err(GetNetworkErrorModeled::ForbiddenError(ForbiddenError {
+                    message: Some(crate::state::NETWORK_GONE_MESSAGE.to_string()),
+                })
+                .into())
+            }
+            crate::state::NetworkAccess::Unplaceable => {
+                return Err(GetNetworkErrorModeled::UnauthorizedError(UnauthorizedError {
+                    message: Some(crate::state::ACCESS_DENIED_MESSAGE.to_string()),
+                })
+                .into())
+            }
+        };
 
         Ok(GetNetworkOutput {
             network_id: network.network_id.clone(),

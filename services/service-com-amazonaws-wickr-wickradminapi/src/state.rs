@@ -11,7 +11,7 @@
 //! and the two content-derived user identifiers — so the per-operation files in
 //! `ops/` share one implementation instead of three copies.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The first `networkId` a store mints.
 ///
@@ -88,6 +88,35 @@ const SECONDS_PER_DAY: i64 = 86_400;
 
 /// The region an ARN carries when the request is unsigned and so names none.
 const DEFAULT_REGION: &str = "us-east-1";
+
+/// The fixed text this API denies a `networkId` the caller cannot be shown to
+/// own with.
+///
+/// It carries no variable part: the refusal names neither the member nor the
+/// value, so it says nothing about whether a network with that id exists.
+pub const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The fixed text this API answers for a `networkId` it can place as a network
+/// of this account that is gone — the deletion `DeleteNetwork` initiated has
+/// happened. It names no id either.
+pub const NETWORK_GONE_MESSAGE: &str = "Network not found";
+
+/// How a `networkId` a request named resolves for the caller, which is what the
+/// admin API decides before it reports anything about the network behind it.
+///
+/// A read of one network is answered from this three-way answer rather than from
+/// a bare map lookup, so an id the caller cannot be shown to own is never
+/// answered with a statement about whether a network holds it.
+#[derive(Debug)]
+pub enum NetworkAccess<'a> {
+    /// A network this account owns, which the caller may read.
+    Owned(&'a NetworkRecord),
+    /// A network this account owned and has deleted: the id can still be placed,
+    /// and there is no network left behind it.
+    Deleted,
+    /// An id this store cannot place as a network of this account at all.
+    Unplaceable,
+}
 
 /// One stored network — every member of the modelled `Network` shape, so
 /// `GetNetwork` and `ListNetworks` read the same record rather than each
@@ -350,6 +379,14 @@ pub struct ComAmazonawsWickrWickradminapiState {
     /// Maintained only by [`Self::insert_user`] and [`Self::remove_network`], which
     /// are the only writers of `users`, so it cannot drift from it.
     username_index: BTreeMap<String, BTreeMap<String, String>>,
+    /// The ids of the networks this store has deleted, so a later read can tell
+    /// an id whose network is gone from one that never named a network here.
+    ///
+    /// Written only by [`Self::remove_network`], and bounded twice over: an entry
+    /// exists only for an id [`Self::mint_network_id`] handed out, which stops at
+    /// [`LAST_NETWORK_ID`], and each entry REPLACES the [`NetworkRecord`] it was
+    /// taken from — several times larger — so a deletion never grows the store.
+    deleted_networks: BTreeSet<String>,
     /// How many network ids this store has minted. Monotonic and never reset, so
     /// a deleted network's id is never handed out again.
     minted_networks: u32,
@@ -377,6 +414,18 @@ impl ComAmazonawsWickrWickradminapiState {
         }
         self.minted_users = next;
         Some(next.to_string())
+    }
+
+    /// How `network_id` resolves for the caller: a network this account owns,
+    /// one it owned and deleted, or an id this store cannot place at all.
+    ///
+    /// Reporting only — a lookup, never a write.
+    pub fn network_access(&self, network_id: &str) -> NetworkAccess<'_> {
+        match self.networks.get(network_id) {
+            Some(record) => NetworkAccess::Owned(record),
+            None if self.deleted_networks.contains(network_id) => NetworkAccess::Deleted,
+            None => NetworkAccess::Unplaceable,
+        }
     }
 
     /// The network-level settings of `network_id` — what has been set on it, or
@@ -429,6 +478,10 @@ impl ComAmazonawsWickrWickradminapiState {
     /// gone.
     pub fn remove_network(&mut self, network_id: &str) -> Option<usize> {
         self.networks.remove(network_id)?;
+        // The id outlives the network it named: a read of it afterwards is
+        // answered as a network of this account that is gone, not as an id this
+        // store knows nothing about.
+        self.deleted_networks.insert(network_id.to_string());
         let removed_users = self.users.remove(network_id).unwrap_or_default();
         self.security_groups.remove(network_id);
         self.network_settings.remove(network_id);

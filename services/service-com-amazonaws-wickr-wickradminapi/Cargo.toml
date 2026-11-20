@@ -31,6 +31,10 @@ sha2 = { workspace = true }
 # Hex codec for those digests, for that entity tag and for the opaque pagination tokens.
 hex = { workspace = true }
 
+[dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a new suite needs no edit here.
+automod = { workspace = true }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

@@ -20,9 +20,11 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//! - `override_operation` — EDITED HERE. The routing key, the handler and the store
+//!   stay the generated table's; `GetNetwork` alone is served through
+//!   [`network_ownership::OwnershipFirst`], because this API resolves ownership of a
+//!   `networkId` path label before it validates the label's shape. See "Why this file
+//!   denies a network id" below.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -40,19 +42,38 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 //!
-//! FOUR seams are taken here, three of them for one reason: every response of this service
-//! carries the envelope stated in [`response_envelope`] — the charset-qualified media type
-//! and an entity tag over the body — which is a property of the channel rather than of any
-//! one operation, so it is applied at every seam that can answer: the centralized walk
-//! (`override_operation`), an unroutable request (`override_routing_error`) and a
-//! transport-level failure (`override_framework_error`). Routing, status, codes, messages
-//! and every body byte stay with the framework.
+//! FOUR seams are taken here. Three of them are for one reason: every response of this
+//! service carries the envelope stated in [`response_envelope`] — the charset-qualified
+//! media type and an entity tag over the body — which is a property of the channel rather
+//! than of any one operation, so it is applied at every seam that can answer: the
+//! centralized walk (`override_operation`), an unroutable request
+//! (`override_routing_error`) and a transport-level failure (`override_framework_error`).
+//! Routing, status, codes, messages and every body byte stay with the framework.
+//!
+//! ## Why this file denies a network id
+//!
+//! The fourth is `override_operation`'s other half. Reading one network is an ownership
+//! question before it is anything else: this API resolves ownership of the `networkId`
+//! path label before it validates the label's shape, so a label it cannot own is denied
+//! rather than reported back as a malformed value. The framework's request walk runs the
+//! other way round — the model's constraint traits are checked before any handler runs —
+//! so without a seam a label outside `NetworkId` is answered with the boundary's refusal
+//! and the denial is never reached.
+//!
+//! [`network_ownership::OwnershipFirst`] restores that order for `GetNetwork`, and only
+//! for it: the rest of the ownership question (a network of this account that is gone, an
+//! id this store cannot place) is decided in the handler, from the store where that answer
+//! lives. Every other operation keeps the framework's order and its own refusals. The
+//! denial it answers, and everything it delegates, carry the same response envelope as
+//! every other response.
+
+pub mod network_ownership;
 
 pub mod response_envelope;
 
 use response_envelope::ResponseEnvelopeOperation;
 use smithy_server_runtime::{
-    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Operation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -68,6 +89,14 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// Held in a field, built once, because `override_operation` hands back a reference to
     /// it.
     envelope: ResponseEnvelopeOperation,
+    /// The ownership-first answer for `GetNetwork`, built once here and never per request.
+    /// It holds the operation's TYPE only — no second operation instance and no second
+    /// store — and fronts the same [`ResponseEnvelopeOperation`] every other request is
+    /// served through, so a denial and a served read carry one envelope.
+    get_network: network_ownership::OwnershipFirst<
+        crate::ops::get_network::GetNetwork<Eng>,
+        ResponseEnvelopeOperation,
+    >,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -78,6 +107,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             envelope: ResponseEnvelopeOperation::new(),
+            get_network: network_ownership::OwnershipFirst::new(ResponseEnvelopeOperation::new()),
         }
     }
 }
@@ -111,7 +141,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // serve is declined here, so the framework answers it as the unroutable request it
         // is — through `override_routing_error` below, which puts the same envelope on it.
         let definition: &dyn ErasedServiceDefinition = &self.entry;
-        service_common::response_media_type::routes(definition, req).then_some(&self.envelope as _)
+        if !service_common::response_media_type::routes(definition, req) {
+            return None;
+        }
+        // `GetNetwork` is served through the ownership-first answer in front of that
+        // wrapper: this API denies a `networkId` it cannot own before it judges the label's
+        // shape, which is the reverse of the framework's own order (validate, then
+        // dispatch). Every other operation reaches the wrapper directly, so their refusals
+        // are each their own operation's contract.
+        let key = self.entry.protocol().routing_key(req).ok()?;
+        if key == <crate::ops::get_network::GetNetwork<Eng> as Operation>::NAME {
+            return Some(&self.get_network as _);
+        }
+        Some(&self.envelope as _)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -124,6 +166,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // longer than the 20 characters the model documents). The HTTP status of a
         // boundary refusal stays with the protocol (400); only a handler-returned
         // `ValidationError` carries the modelled 422.
+        //
+        // `GetNetwork` never reaches this seam for its path label: that operation
+        // resolves ownership of the label first and denies it, which is why it is
+        // served through `network_ownership::OwnershipFirst` above.
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: "ValidationError".to_string(),
