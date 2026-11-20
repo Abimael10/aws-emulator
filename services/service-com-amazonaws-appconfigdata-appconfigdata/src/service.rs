@@ -36,11 +36,15 @@
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
+//! - `override_protocol` — the codec the modelled walk is driven through. This service
+//!   takes it for the ERROR BODY it is recorded answering: see [`rest_json_error_body`].
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+
+mod rest_json_error_body;
 
 use aws_smithy_schema_server::{constraints::path, ProtocolError, Violation, ViolationKind};
 use smithy_server_runtime::{
@@ -296,6 +300,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The same check for `GetLatestConfiguration`.
     get_latest_configuration_check:
         ModeledInputCheck<crate::ops::get_latest_configuration::GetLatestConfiguration<Eng>>,
+    /// The model's `restJson1` with the error body this service is recorded answering; see
+    /// [`rest_json_error_body`]. Built once, here, because [`Service::override_protocol`]
+    /// hands back a borrow of it.
+    protocol: rest_json_error_body::AppConfigDataRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -307,6 +315,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
             start_configuration_session_check: ModeledInputCheck::new(),
             get_latest_configuration_check: ModeledInputCheck::new(),
+            protocol: rest_json_error_body::AppConfigDataRestJson::new(),
         }
     }
 }
@@ -378,10 +387,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501).
+        //
+        // The default IS this service's answer; what it renders is handed back with the
+        // ERROR BODY this service is recorded answering, because the shared renderer writes
+        // the AWS JSON family's shape discriminator into every body it renders and a
+        // `restJson1` body carries the error shape's own modelled members alone. See
+        // [`rest_json_error_body`] for the rule and for the one class no seam can reach.
+        Some(rest_json_error_body::with_served_error_body(
+            self.entry.routing_error_response(req),
+        ))
     }
 
     fn override_framework_error(
@@ -396,5 +411,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn ServerHttpProtocol> {
+        // The model's own `restJson1`, with the ERROR BODY this service is recorded
+        // answering: a failure's body carries the error shape's own modelled members and
+        // nothing else, so a refusal this service attributes nothing to is the empty JSON
+        // document and the shape travels in `x-amzn-errortype` alone. The shared framework
+        // renderer writes the AWS JSON family's `__type` discriminator into every body it
+        // renders, and it is not this crate's to change; see [`rest_json_error_body`] for the
+        // rule, why it matters and where else it is applied.
+        Some(&self.protocol)
     }
 }

@@ -576,11 +576,6 @@ fn assert_withdrawn(
         reply.status
     );
     assert_eq!(
-        reply.json()["__type"].as_str(),
-        Some("ResourceNotFoundException"),
-        "case {case_name}: {poll} expected ResourceNotFoundException, got {text}"
-    );
-    assert_eq!(
         reply.header("x-amzn-errortype"),
         Some("ResourceNotFoundException"),
         "case {case_name}: {poll} expected the error type header, got {:?}",

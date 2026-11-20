@@ -136,16 +136,6 @@ impl From<StartConfigurationSessionErrorModeled> for StartConfigurationSessionEr
     }
 }
 
-/// The modelled `InvalidParameterProblem` reported for an identifier this service cannot
-/// read as the id or the name of its level.
-///
-/// `Corrupted` is documented as "the parameter was corrupted and could not be understood
-/// by the service", which is what a value in another form is; the other two modelled
-/// values (`Expired`, `PollIntervalNotSatisfied`) describe WHEN a parameter was
-/// presented, not what it says. See `INVALID_PARAMETER_PROBLEM_VALUES` in
-/// `crate::ops::types`.
-const PROBLEM_CORRUPTED: &str = "Corrupted";
-
 /// This operation's input members documented as "the ID or the name" of a level of the
 /// AppConfig hierarchy, in the order the model declares them, each with the identifier
 /// the request carried.
@@ -184,8 +174,19 @@ fn is_arn_form(identifier: &str) -> bool {
 /// written as an ARN is neither an id nor a name, and is therefore input that fails the
 /// service's constraints — the modelled `BadRequestException` (HTTP 400) — rather than an
 /// identifier that resolves to nothing. The refusal is the same whichever member carried
-/// it, and `Details.InvalidParameters` names EVERY member at fault, so a caller that got
-/// more than one wrong learns them all in one answer.
+/// it, and however many did.
+///
+/// What the refusal COMMITS TO is the status and the error shape, and nothing else: every
+/// member of `BadRequestException` is optional, and this service asserts nothing in the
+/// payload about WHICH parameter it judged unreadable, so the document is empty and the
+/// shape travels in the response's error-type header alone (see
+/// [`crate::service`]'s `rest_json_error_body`). Filling `Message` from the shape's
+/// `@documentation` sentence, or `Reason`/`Details` from this handler's own per-member
+/// attribution, would tell a client that branches on `BadRequestDetails` something the
+/// service never decided — `Details.InvalidParameters` is how a parameter the service
+/// could not USE at the moment it was presented is reported (a token that is expired, a
+/// poll made sooner than the session's interval: see
+/// [`crate::ops::get_latest_configuration`]), not an attribution of request syntax.
 ///
 /// It is decided on the REQUEST alone, before anything is resolved against the control
 /// plane, so a malformed identifier can never become a `ResourceNotFoundException`: the
@@ -202,34 +203,21 @@ fn malformed_identifier_refusal(
     if malformed.is_empty() {
         return None;
     }
-    debug_assert!(
-        INVALID_PARAMETER_PROBLEM_VALUES.contains(&PROBLEM_CORRUPTED),
-        "the reported problem must be a modelled InvalidParameterProblem value"
-    );
-    // An attribution record for the refusal: WHICH members were malformed. The values
-    // are not recorded — a caller-supplied ARN carries an account id.
+    // An attribution record for the refusal: WHICH members were malformed. It is this
+    // emulator's own log and not part of the answer — the response asserts nothing about
+    // which member was at fault. The values are not recorded either: a caller-supplied
+    // ARN carries an account id.
     tracing::debug!(
         operation = "StartConfigurationSession",
         outcome = "BadRequestException",
         members = malformed.join(","),
         "refused identifiers that are neither an id nor a name"
     );
-    let invalid_parameters: std::collections::HashMap<String, InvalidParameterDetail> = malformed
-        .into_iter()
-        .map(|member| {
-            (
-                member.to_string(),
-                InvalidParameterDetail {
-                    problem: Some(PROBLEM_CORRUPTED.to_string()),
-                },
-            )
-        })
-        .collect();
     Some(
         StartConfigurationSessionErrorModeled::BadRequestException(BadRequestException {
-            message: Some(INPUT_FAILS_CONSTRAINTS_MESSAGE.to_string()),
-            reason: Some(REASON_INVALID_PARAMETERS.to_string()),
-            details: Some(BadRequestDetails::InvalidParameters(invalid_parameters)),
+            message: None,
+            reason: None,
+            details: None,
         })
         .into(),
     )

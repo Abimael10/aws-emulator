@@ -254,8 +254,8 @@ fn assert_too_early(reply: &Reply, name: &str, attempt: &str) {
     );
     let body = reply.json();
     assert_eq!(
-        body["__type"].as_str(),
-        Some("BadRequestException"),
+        reply.error_code(),
+        "BadRequestException",
         "case {name}: {attempt} expected BadRequestException, got {}",
         reply.text()
     );

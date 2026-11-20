@@ -599,9 +599,24 @@ impl Reply {
             .to_string()
     }
 
-    /// The error code a restJson1 error response carries.
+    /// The error code a restJson1 error response carries: that protocol names the error
+    /// SHAPE in `x-amzn-errortype`, not in the body (see
+    /// `src/service/rest_json_error_body.rs`), so this reads the header. A value may arrive
+    /// namespaced, and the namespace is not part of the shape's name.
     pub(crate) fn error_code(&self) -> String {
-        self.string("__type")
+        let named = self.header("x-amzn-errortype").unwrap_or_else(|| {
+            panic!(
+                "no x-amzn-errortype header; headers {:?} body {}",
+                self.headers,
+                self.text()
+            )
+        });
+        named
+            .rsplit('#')
+            .next()
+            .unwrap_or(named)
+            .trim()
+            .to_string()
     }
 
     /// `Details.InvalidParameters.ConfigurationToken.Problem`, as the modelled

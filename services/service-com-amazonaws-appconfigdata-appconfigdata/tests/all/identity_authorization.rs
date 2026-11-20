@@ -167,7 +167,7 @@ impl Emulator {
         path: &str,
         content_type: &str,
         body: &[u8],
-    ) -> (u16, Vec<u8>, Value) {
+    ) -> (u16, Vec<u8>, Value, String) {
         let host = format!("{signing_name}.{REGION}.amazonaws.com");
         let request = http::Request::builder()
             .method(method)
@@ -186,13 +186,22 @@ impl Emulator {
             .expect("a valid test request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        // `restJson1` names a failure's error SHAPE in this header, not in the body (see
+        // `src/service/rest_json_error_body.rs`), so it is read off the response here and
+        // carried beside the document every assertion below reads.
+        let error_type = response
+            .headers()
+            .get("x-amzn-errortype")
+            .and_then(|named| named.to_str().ok())
+            .map(|named| named.rsplit('#').next().unwrap_or(named).trim().to_string())
+            .unwrap_or_default();
         let payload = response.into_body().to_vec();
         let parsed = if payload.is_empty() {
             Value::Null
         } else {
             serde_json::from_slice(&payload).unwrap_or(Value::Null)
         };
-        (status, payload, parsed)
+        (status, payload, parsed, error_type)
     }
 
     /// `StartConfigurationSession` over one triple, as `principal`.
@@ -202,8 +211,8 @@ impl Emulator {
         application: &str,
         environment: &str,
         profile: &str,
-    ) -> (u16, Value) {
-        let (status, _bytes, parsed) = self
+    ) -> (u16, Value, String) {
+        let (status, _bytes, parsed, error_type) = self
             .call_as(
                 access_key_id,
                 "appconfig",
@@ -218,11 +227,11 @@ impl Emulator {
                 .expect("the request body serializes"),
             )
             .await;
-        (status, parsed)
+        (status, parsed, error_type)
     }
 
     /// `GetLatestConfiguration` with one token, as `principal`.
-    async fn poll(&self, access_key_id: &str, token: &str) -> (u16, Vec<u8>, Value) {
+    async fn poll(&self, access_key_id: &str, token: &str) -> (u16, Vec<u8>, Value, String) {
         self.call_as(
             access_key_id,
             "appconfig",
@@ -237,7 +246,7 @@ impl Emulator {
     /// One AppConfig control-plane call, made with the account's own credential, that must be
     /// served.
     async fn appconfig(&self, what: &str, path: &str, content_type: &str, body: &[u8]) -> Value {
-        let (status, _bytes, parsed) = self
+        let (status, _bytes, parsed, _error_type) = self
             .call_as(ACCOUNT_KEY, "appconfig", "POST", path, content_type, body)
             .await;
         assert_eq!(
@@ -565,21 +574,24 @@ fn denial(principal: &str, action: &str, resource: &str, explicit_deny: bool) ->
     )
 }
 
-/// What a refusal of this service carries on the wire: the code in the header and in the
-/// document, and the `Message` its own error shapes spell.
-fn refusal(status: u16, parsed: &Value, case: &str, expected_code: &str, expected_status: u16) {
+/// What a refusal of this service carries on the wire: the status, the error SHAPE (which
+/// `restJson1` names in `x-amzn-errortype` rather than in the document), and the `Message` its
+/// own error shapes spell.
+fn refusal(
+    status: u16,
+    parsed: &Value,
+    error_type: &str,
+    case: &str,
+    expected_code: &str,
+    expected_status: u16,
+) {
     assert_eq!(
         status, expected_status,
         "case {case:?}: expected HTTP {expected_status}, got {status} with {parsed}"
     );
     assert_eq!(
-        parsed["__type"].as_str().map(|named| named
-            .split('#')
-            .next_back()
-            .unwrap_or(named)
-            .to_string()),
-        Some(expected_code.to_string()),
-        "case {case:?}: expected the {expected_code} code, got {parsed}"
+        error_type, expected_code,
+        "case {case:?}: expected the {expected_code} code, got {error_type:?} with {parsed}"
     );
 }
 
@@ -609,7 +621,7 @@ async fn both_operations_are_decided_against_the_callers_identity_policies() {
             .await;
 
         let minted_before = aws.sessions();
-        let (status, parsed) = aws
+        let (status, parsed, error_type) = aws
             .start_session(
                 &caller.access_key_id,
                 &deployed.application,
@@ -619,7 +631,14 @@ async fn both_operations_are_decided_against_the_callers_identity_policies() {
             .await;
         let token = match row.session_refused {
             Some(action) => {
-                refusal(status, &parsed, case, ACCESS_DENIED, ACCESS_DENIED_STATUS);
+                refusal(
+                    status,
+                    &parsed,
+                    &error_type,
+                    case,
+                    ACCESS_DENIED,
+                    ACCESS_DENIED_STATUS,
+                );
                 assert_eq!(
                     parsed["Message"].as_str(),
                     Some(denial(&caller.arn, action, &arn, row.explicit_deny).as_str()),
@@ -632,7 +651,7 @@ async fn both_operations_are_decided_against_the_callers_identity_policies() {
                 );
                 // The poll leg still needs a live token, which only an authorized caller can
                 // mint.
-                let (status, minted) = aws
+                let (status, minted, _error_type) = aws
                     .start_session(
                         &permitted.access_key_id,
                         &deployed.application,
@@ -661,10 +680,17 @@ async fn both_operations_are_decided_against_the_callers_identity_policies() {
             }
         };
 
-        let (status, body, parsed) = aws.poll(&caller.access_key_id, &token).await;
+        let (status, body, parsed, error_type) = aws.poll(&caller.access_key_id, &token).await;
         match row.poll_refused {
             Some(action) => {
-                refusal(status, &parsed, case, ACCESS_DENIED, ACCESS_DENIED_STATUS);
+                refusal(
+                    status,
+                    &parsed,
+                    &error_type,
+                    case,
+                    ACCESS_DENIED,
+                    ACCESS_DENIED_STATUS,
+                );
                 assert_eq!(
                     parsed["Message"].as_str(),
                     Some(denial(&caller.arn, action, &arn, row.explicit_deny).as_str()),
@@ -672,7 +698,8 @@ async fn both_operations_are_decided_against_the_callers_identity_policies() {
                 );
                 // The refusal consumed nothing: the same token still polls for a caller that
                 // may.
-                let (status, served, _parsed) = aws.poll(&permitted.access_key_id, &token).await;
+                let (status, served, _parsed, _error_type) =
+                    aws.poll(&permitted.access_key_id, &token).await;
                 assert_eq!(
                     status, 200,
                     "case {case:?}: a refused poll must consume no token, got {status}"
@@ -712,7 +739,7 @@ async fn a_poll_whose_token_resolves_to_nothing_is_decided_on_the_action_alone()
     )
     .await;
     let denied = assumed_role(&aws, "appconfig-token-denied", &[]).await;
-    let (status, minted) = aws
+    let (status, minted, _error_type) = aws
         .start_session(
             &permitted.access_key_id,
             &deployed.application,
@@ -739,8 +766,15 @@ async fn a_poll_whose_token_resolves_to_nothing_is_decided_on_the_action_alone()
         ),
     ];
     for (case, token, resource) in rows {
-        let (status, _body, parsed) = aws.poll(&denied.access_key_id, token).await;
-        refusal(status, &parsed, case, ACCESS_DENIED, ACCESS_DENIED_STATUS);
+        let (status, _body, parsed, error_type) = aws.poll(&denied.access_key_id, token).await;
+        refusal(
+            status,
+            &parsed,
+            &error_type,
+            case,
+            ACCESS_DENIED,
+            ACCESS_DENIED_STATUS,
+        );
         assert_eq!(
             parsed["Message"].as_str(),
             Some(denial(&denied.arn, GET_CONFIGURATION, resource, false).as_str()),
@@ -749,10 +783,12 @@ async fn a_poll_whose_token_resolves_to_nothing_is_decided_on_the_action_alone()
     }
     // The authorized caller reaches the token verdict instead, which is a different claim from
     // the refusal above.
-    let (status, _body, parsed) = aws.poll(&permitted.access_key_id, &"0".repeat(64)).await;
+    let (status, _body, parsed, error_type) =
+        aws.poll(&permitted.access_key_id, &"0".repeat(64)).await;
     refusal(
         status,
         &parsed,
+        &error_type,
         "an authorized caller presenting a token no session answers to",
         "BadRequestException",
         400,
@@ -770,7 +806,7 @@ async fn an_unresolvable_identifier_and_a_missing_grant_are_different_refusals()
     let denied = assumed_role(&aws, "appconfig-unresolvable", &[]).await;
 
     // The account's own credential: no IAM policies, so the triple decides the answer.
-    let (status, parsed) = aws
+    let (status, parsed, _error_type) = aws
         .start_session(
             ACCOUNT_KEY,
             &deployed.application,
@@ -782,7 +818,7 @@ async fn an_unresolvable_identifier_and_a_missing_grant_are_different_refusals()
         status, 201,
         "case \"the account's own credential\": expected a session, got {status} {parsed}"
     );
-    let (status, parsed) = aws
+    let (status, parsed, error_type) = aws
         .start_session(
             ACCOUNT_KEY,
             &deployed.application,
@@ -793,6 +829,7 @@ async fn an_unresolvable_identifier_and_a_missing_grant_are_different_refusals()
     refusal(
         status,
         &parsed,
+        &error_type,
         "an identifier that resolves to nothing",
         NOT_FOUND,
         NOT_FOUND_STATUS,
@@ -800,7 +837,7 @@ async fn an_unresolvable_identifier_and_a_missing_grant_are_different_refusals()
 
     // The same unresolvable triple, for a caller holding no grant: the authorization refusal
     // comes first and says nothing about the identifiers.
-    let (status, parsed) = aws
+    let (status, parsed, error_type) = aws
         .start_session(
             &denied.access_key_id,
             &deployed.application,
@@ -809,7 +846,14 @@ async fn an_unresolvable_identifier_and_a_missing_grant_are_different_refusals()
         )
         .await;
     let case = "an unresolvable triple for a caller holding no grant";
-    refusal(status, &parsed, case, ACCESS_DENIED, ACCESS_DENIED_STATUS);
+    refusal(
+        status,
+        &parsed,
+        &error_type,
+        case,
+        ACCESS_DENIED,
+        ACCESS_DENIED_STATUS,
+    );
     assert!(
         parsed["ResourceType"].is_null() && parsed["ReferencedBy"].is_null(),
         "case {case:?}: an authorization refusal must report no resource, got {parsed}"

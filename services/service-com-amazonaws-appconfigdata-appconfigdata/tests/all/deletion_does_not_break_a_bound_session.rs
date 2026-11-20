@@ -567,12 +567,6 @@ impl Withdrawal {
             self.status, self.text
         );
         assert_eq!(
-            self.body["__type"].as_str(),
-            Some("ResourceNotFoundException"),
-            "case {case}: {poll} expected ResourceNotFoundException, got {}",
-            self.text
-        );
-        assert_eq!(
             self.error_type_header.as_deref(),
             Some("ResourceNotFoundException"),
             "case {case}: {poll} expected the error type header, got {:?}",

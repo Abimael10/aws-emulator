@@ -7,11 +7,11 @@
 //! member, one vendor or one recorded value: each of `ApplicationIdentifier`,
 //! `EnvironmentIdentifier` and `ConfigurationProfileIdentifier` is documented as "the ID
 //! or the name" of its level, so a value written as an Amazon Resource Name is neither
-//! and is refused on the REQUEST — the modelled `BadRequestException` (HTTP 400) with
-//! `Reason` `InvalidParameters` and `Details.InvalidParameters` keyed by every member at
-//! fault — before any identifier is resolved against the control plane, so a malformed
-//! identifier never becomes a `ResourceNotFoundException`. A value that is NOT in that
-//! form keeps taking the resolution path: it resolves, or it is the 404 it always was.
+//! and is refused on the REQUEST — the modelled `BadRequestException`, HTTP 400, naming
+//! that shape in `x-amzn-errortype` and committing to NOTHING in the payload — before any
+//! identifier is resolved against the control plane, so a malformed identifier never
+//! becomes a `ResourceNotFoundException`. A value that is NOT in that form keeps taking
+//! the resolution path: it resolves, or it is the 404 it always was.
 //!
 //! Every case drives real requests through the router harness the polling suite sets up
 //! ([`super::configuration_session_poll::Emulator`]), which mounts AppConfigData and the
@@ -34,22 +34,8 @@ const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
 /// See [`RESOURCE_NOT_FOUND_EXCEPTION`].
 const NOT_FOUND_STATUS: u16 = 404;
 
-/// `BadRequestReason`'s one modelled value (`BAD_REQUEST_REASON_VALUES` in
-/// `src/ops/types/shared_types.rs`).
-const REASON_INVALID_PARAMETERS: &str = "InvalidParameters";
-
-/// The modelled `InvalidParameterProblem` value for a parameter the service "could not
-/// understand" — one of the three the enum declares
-/// (`INVALID_PARAMETER_PROBLEM_VALUES` in `src/ops/types/shared_types.rs`).
-const PROBLEM_CORRUPTED: &str = "Corrupted";
-
-/// The whole `Message` of `BadRequestException`, which is the shape's own fixed text and
-/// interpolates nothing: which parameters are at fault travels in `Details`.
-const INPUT_FAILS_CONSTRAINTS: &str =
-    "The input fails to satisfy the constraints specified by the service.";
-
-/// The three input member names, which `Details.InvalidParameters` and `ReferencedBy` are
-/// both keyed by.
+/// The three input member names, which `ReferencedBy` is keyed by — and which a refusal of
+/// an identifier's FORM must name nowhere in its payload.
 const APPLICATION_MEMBER: &str = "ApplicationIdentifier";
 /// See [`APPLICATION_MEMBER`].
 const ENVIRONMENT_MEMBER: &str = "EnvironmentIdentifier";
@@ -75,8 +61,9 @@ enum Spelling {
 enum Expect {
     /// 201 and a minted token.
     Session,
-    /// 400 `BadRequestException` naming exactly these members in
-    /// `Details.InvalidParameters`.
+    /// 400 `BadRequestException` with an empty payload. The members listed are the ones
+    /// this request got wrong — which the answer must name NOWHERE, since the refusal
+    /// asserts nothing about which parameter the service judged unreadable.
     BadRequest(&'static [&'static str]),
     /// 404 `ResourceNotFoundException` reporting this `ResourceType`.
     NotFound(&'static str),
@@ -190,9 +177,9 @@ const CASES: &[Case] = &[
 ];
 
 /// An identifier written as an ARN is refused as input the service cannot use, with the
-/// modelled 400 error naming every member at fault, and nothing is minted — while a value
-/// that is not in that form still takes the resolution path, serving the session or
-/// answering the 404 for the level that resolves to nothing.
+/// modelled 400 error whose payload asserts nothing about which member was at fault, and
+/// nothing is minted — while a value that is not in that form still takes the resolution
+/// path, serving the session or answering the 404 for the level that resolves to nothing.
 #[tokio::test]
 async fn an_identifier_in_arn_form_is_refused_as_input_rather_than_looked_up() {
     for case in CASES {
@@ -260,47 +247,31 @@ async fn an_identifier_in_arn_form_is_refused_as_input_rather_than_looked_up() {
                     "case {name}: expected the modelled error type header, got {:?}",
                     reply.header("x-amzn-errortype")
                 );
-                let body = reply.json();
+                // The whole payload: the refusal commits to the status and the shape, and
+                // asserts nothing about which parameter it could not read — so the
+                // document is empty, whichever member carried the malformed value and
+                // however many did.
                 assert_eq!(
-                    body["Message"].as_str(),
-                    Some(INPUT_FAILS_CONSTRAINTS),
-                    "case {name}: expected the whole fixed message, got {}",
+                    reply.json(),
+                    serde_json::json!({}),
+                    "case {name}: expected an empty refusal document, got {}",
                     reply.text()
                 );
-                assert_eq!(
-                    body["Reason"].as_str(),
-                    Some(REASON_INVALID_PARAMETERS),
-                    "case {name}: expected the modelled reason, got {}",
-                    reply.text()
-                );
-                let invalid = &body["Details"]["InvalidParameters"];
-                let reported = invalid
-                    .as_object()
-                    .unwrap_or_else(|| panic!("case {name}: no InvalidParameters in {}", reply.text()));
-                let mut reported_members: Vec<&str> =
-                    reported.keys().map(String::as_str).collect();
-                reported_members.sort_unstable();
-                let mut wanted: Vec<&str> = members.to_vec();
-                wanted.sort_unstable();
-                assert_eq!(
-                    reported_members, wanted,
-                    "case {name}: expected exactly {wanted:?} reported invalid, got {}",
-                    reply.text()
-                );
+                // Named explicitly, because these are the members a per-member
+                // attribution would have reported: no payload names any of them, and a
+                // refusal of the INPUT reports no resource either — a client must not read
+                // it as a resource that is merely absent.
+                let text = reply.text();
                 for member in members {
-                    assert_eq!(
-                        invalid[*member]["Problem"].as_str(),
-                        Some(PROBLEM_CORRUPTED),
-                        "case {name}: expected the {member} problem, got {}",
-                        reply.text()
+                    assert!(
+                        !text.contains(member),
+                        "case {name}: the refusal must not name {member}, got {text}"
                     );
                 }
-                // A refusal of the INPUT reports no resource: a client must not read it
-                // as a resource that is merely absent.
+                let body = reply.json();
                 assert!(
                     body["ResourceType"].is_null() && body["ReferencedBy"].is_null(),
-                    "case {name}: an input refusal must report no missing resource, got {}",
-                    reply.text()
+                    "case {name}: an input refusal must report no missing resource, got {text}"
                 );
             }
             Expect::NotFound(resource_type) => {
@@ -388,5 +359,188 @@ fn spell(spelling: Spelling, hierarchy: &Hierarchy, level: Level) -> String {
             engine::emulator_arn("appconfig", "us-west-2", &resource)
         }
         Spelling::Literal(literal) => literal.to_string(),
+    }
+}
+
+/// The members each modelled error shape of this service declares, as
+/// `smithy_query(query="shape",shape="BadRequestException,ResourceNotFoundException",
+/// model_path="services/service-com-amazonaws-appconfigdata-appconfigdata/smithy-model/com-amazonaws-appconfigdata-appconfigdata.json")`
+/// reports them. A failure's document may carry any subset of its shape's members, and
+/// nothing outside it.
+const BAD_REQUEST_MEMBERS: &[&str] = &["Message", "Reason", "Details"];
+/// See [`BAD_REQUEST_MEMBERS`].
+const RESOURCE_NOT_FOUND_MEMBERS: &[&str] = &["Message", "ResourceType", "ReferencedBy"];
+
+/// Which operation a case calls, and with what.
+enum Earn {
+    /// `StartConfigurationSession` with this request document.
+    Session(&'static str),
+    /// `GetLatestConfiguration` with this configuration token.
+    Poll(&'static str),
+}
+
+/// One failure this service answers: the call that earns it, the shape and status it must
+/// be answered in, the members that shape declares, and whether the document must be
+/// empty.
+struct WireCase {
+    name: &'static str,
+    earn: Earn,
+    code: &'static str,
+    status: u16,
+    members: &'static [&'static str],
+    empty: bool,
+}
+
+/// An ARN of another vendor: a value in a form no identifier member accepts, written
+/// without any id this hierarchy minted, so the row is a static document.
+const AN_ARN: &str = "arn:aws:s3:::my-configuration-bucket";
+
+/// An identifier past `Identifier`'s modelled `@length` 1..128 upper bound.
+const TOO_LONG: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                        aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
+                        aaaaaaaa";
+
+/// RULE: this service speaks `restJson1`, which names a failure's error SHAPE in the
+/// `x-amzn-errortype` response header, so a failure's DOCUMENT carries that shape's own
+/// modelled members and nothing else — never an in-body discriminator — and a refusal this
+/// service attributes to nothing is the empty document exactly.
+///
+/// The rows differ along what the rule generalises over: which operation answered, which
+/// error shape and status, how many members the shape declares, how many the answer fills,
+/// and whether the refusal was decided by the handler, by the input schema or by a missing
+/// member.
+#[tokio::test]
+async fn a_failure_names_its_shape_in_the_header_and_its_body_carries_only_modelled_members() {
+    let cases: &[WireCase] = &[
+        WireCase {
+            name: "an identifier whose form is neither an id nor a name",
+            earn: Earn::Session(
+                r#"{"ApplicationIdentifier":"ARN_HERE",
+                     "EnvironmentIdentifier":"Prod",
+                     "ConfigurationProfileIdentifier":"Weights"}"#,
+            ),
+            code: BAD_REQUEST_EXCEPTION,
+            status: BAD_REQUEST_STATUS,
+            members: BAD_REQUEST_MEMBERS,
+            empty: true,
+        },
+        WireCase {
+            name: "an application that resolves to nothing",
+            earn: Earn::Session(
+                r#"{"ApplicationIdentifier":"NoSuchApplication",
+                     "EnvironmentIdentifier":"Prod",
+                     "ConfigurationProfileIdentifier":"Weights"}"#,
+            ),
+            code: RESOURCE_NOT_FOUND_EXCEPTION,
+            status: NOT_FOUND_STATUS,
+            members: RESOURCE_NOT_FOUND_MEMBERS,
+            empty: false,
+        },
+        WireCase {
+            name: "an identifier past the modelled length bound",
+            earn: Earn::Session(
+                r#"{"ApplicationIdentifier":"TOO_LONG_HERE",
+                     "EnvironmentIdentifier":"Prod",
+                     "ConfigurationProfileIdentifier":"Weights"}"#,
+            ),
+            code: BAD_REQUEST_EXCEPTION,
+            status: BAD_REQUEST_STATUS,
+            members: BAD_REQUEST_MEMBERS,
+            empty: false,
+        },
+        WireCase {
+            name: "a request that omits a required identifier",
+            earn: Earn::Session(
+                r#"{"ApplicationIdentifier":"MyApp","EnvironmentIdentifier":"Prod"}"#,
+            ),
+            code: BAD_REQUEST_EXCEPTION,
+            status: BAD_REQUEST_STATUS,
+            members: BAD_REQUEST_MEMBERS,
+            empty: false,
+        },
+        WireCase {
+            name: "a poll presenting a token no session answers to",
+            earn: Earn::Poll("0000000000000000000000000000000000000000000000000000000000000000"),
+            code: BAD_REQUEST_EXCEPTION,
+            status: BAD_REQUEST_STATUS,
+            members: BAD_REQUEST_MEMBERS,
+            empty: false,
+        },
+    ];
+
+    let emulator = Emulator::new();
+    let hierarchy = emulator.create_hierarchy("MyApp", "Prod", "Weights").await;
+    emulator
+        .deploy(
+            &hierarchy,
+            &hierarchy.profile_id,
+            br#"{"limit":10}"#,
+            "application/json",
+            None,
+        )
+        .await;
+
+    for case in cases {
+        let name = case.name;
+        let reply = match &case.earn {
+            Earn::Session(document) => {
+                let document = document
+                    .replace("ARN_HERE", AN_ARN)
+                    .replace("TOO_LONG_HERE", TOO_LONG);
+                emulator.post_json("/configurationsessions", &document).await
+            }
+            Earn::Poll(token) => emulator.get_latest_configuration(token).await,
+        };
+
+        assert_eq!(
+            reply.status,
+            case.status,
+            "case {name}: expected {}, got {} body {}",
+            case.status,
+            reply.status,
+            reply.text()
+        );
+        assert_eq!(
+            reply.header("x-amzn-errortype").map(|named| named
+                .rsplit('#')
+                .next()
+                .unwrap_or(named)
+                .to_string()),
+            Some(case.code.to_string()),
+            "case {name}: expected {} in the error type header, got {:?}",
+            case.code,
+            reply.header("x-amzn-errortype")
+        );
+        let document = reply.json();
+        let object = document.as_object().unwrap_or_else(|| {
+            panic!(
+                "case {name}: expected a JSON object document, got {}",
+                reply.text()
+            )
+        });
+        let unmodelled: Vec<&str> = object
+            .keys()
+            .map(String::as_str)
+            .filter(|member| !case.members.contains(member))
+            .collect();
+        assert!(
+            unmodelled.is_empty(),
+            "case {name}: the document carries {unmodelled:?}, which {} does not declare, in {}",
+            case.code,
+            reply.text()
+        );
+        if case.empty {
+            assert!(
+                object.is_empty(),
+                "case {name}: expected an empty document, got {}",
+                reply.text()
+            );
+        } else {
+            assert!(
+                !object.is_empty(),
+                "case {name}: expected the shape's own members, got {}",
+                reply.text()
+            );
+        }
     }
 }
