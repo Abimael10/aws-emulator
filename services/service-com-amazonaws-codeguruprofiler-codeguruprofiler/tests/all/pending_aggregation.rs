@@ -21,11 +21,22 @@
 //! bound with the window's length), the payload's size and bytes, the media type it was
 //! posted under, and how many profiles the group holds.
 //!
-//! The harness is the one [`crate::profiling_group_lifecycle`] already builds, and the
-//! aggregation is let fall due through the one shared helper every suite uses.
+//! The second half of that rule is the one the cases from
+//! [`a_submission_covering_a_closed_window_is_retrievable_at_once`] on assert, with the
+//! clock alone deciding it: a submission whose data covers a window that had ALREADY
+//! closed when it was posted is owed its aggregated profile right away, so `GetProfile`
+//! for the matching period answers 200 with that window's aggregated document without
+//! anything writing to the store in between — and whatever it answers, it answers: the
+//! 200 payload or one of the operation's modelled errors, never a request left hanging.
+//!
+//! The harness is the one [`crate::profiling_group_lifecycle`] already builds, the
+//! aggregation is let fall due through the one shared helper every suite uses, and the
+//! clock is read clear of every window boundary through
+//! [`crate::profile_times::now_clear_of_window_boundaries`].
 
+use crate::profile_times::now_clear_of_window_boundaries;
 use crate::profiling_group_lifecycle::{
-    Answer, Harness, aggregation_of, element_of, ion_profile, json_profile,
+    Answer, Harness, aggregation_of, data_of, element_of, ion_profile, iso_millis, json_profile,
     pending_profile_start_millis, profile_data, servable_window, servable_window_from_start,
     servable_window_to_end,
 };
@@ -400,5 +411,402 @@ async fn reading_a_pending_aggregation_changes_nothing_a_later_caller_sees() {
         profile_data(&bytes),
         "the aggregated profile must hold the posted data, got {}",
         element_of(&first.body)
+    );
+}
+
+/// The two media types the model's `GetProfile$contentType` doc names ("either
+/// application/json or the default application/x-amzn-ion"): the ones a submission is
+/// posted under and the ones a request accepts.
+const JSON: &str = "application/json";
+const ION: &str = "application/x-amzn-ion";
+
+/// The length in whole seconds of the modelled `AggregationPeriod` value `period`, read
+/// off the service's own table ([`AGGREGATION_PERIODS`]) so no case can name a period this
+/// service does not aggregate at.
+fn period_length(period: &str) -> i64 {
+    AGGREGATION_PERIODS
+        .iter()
+        .find(|(name, _)| *name == period)
+        .map(|(_, seconds)| *seconds)
+        .unwrap_or_else(|| panic!("{period} is no aggregation period this service offers"))
+}
+
+/// One case about a window that had already CLOSED when the submission covering it was
+/// posted: the aggregation period asked about, how many of that period's windows back the
+/// submitted data sits, the media type it is posted under and how many submissions the
+/// window holds.
+struct ClosedWindow {
+    label: &'static str,
+    /// The modelled `AggregationPeriod` the request names as `period`, and nothing else —
+    /// which is what asks for the group's latest aggregated profile of that length.
+    period: &'static str,
+    /// How many windows of that period before the one the clock is in the data sits in: 1
+    /// is the LAST window to have closed, which is the window an agent that has just
+    /// finished collecting submits for.
+    windows_back: i64,
+    content_type: &'static str,
+    /// How many submissions the window holds, each with its own `profileToken` and its own
+    /// frame.
+    posts: usize,
+}
+
+impl ClosedWindow {
+    /// The start of the window this case's data covers, in epoch seconds, worked out from
+    /// the clock and the period's length alone — so the expectation is not the handler's
+    /// own arithmetic read back.
+    fn window_start(&self, now: i64) -> i64 {
+        let length = period_length(self.period);
+        now.div_euclid(length)
+            .saturating_sub(self.windows_back)
+            .saturating_mul(length)
+    }
+
+    /// The bytes submission `post` of this case is posted as, in the representation it is
+    /// posted under: a profile stating the start of the period its data covers and one
+    /// frame of its own, so which submissions an answer holds is readable off the answer.
+    ///
+    /// Each submission states one millisecond more than the last, which keeps the bytes of
+    /// a window's submissions distinct without moving any of them out of the window.
+    fn posted_bytes(&self, window_start: i64, post: usize) -> Vec<u8> {
+        const MILLIS_PER_SECOND: i64 = 1_000;
+        let counted = i64::try_from(post).unwrap_or(0);
+        let start = window_start.saturating_mul(MILLIS_PER_SECOND) + counted;
+        let frame = format!("F{post}");
+        if self.content_type == ION {
+            ion_rs::Element::from(ion_rs::Struct::from_iter([
+                (
+                    ion_rs::Symbol::from("start"),
+                    ion_rs::Element::from(start),
+                ),
+                (
+                    ion_rs::Symbol::from("callgraph"),
+                    ion_rs::Element::from(ion_rs::Struct::from_iter([(
+                        ion_rs::Symbol::from(frame.as_str()),
+                        ion_rs::Element::from(counted + 1),
+                    )])),
+                ),
+            ]))
+            .encode_as(ion_rs::v1_0::Binary)
+            .expect("an encodable Ion document")
+        } else {
+            serde_json::to_vec(&serde_json::json!({
+                "start": start,
+                "callgraph": { frame: counted + 1 },
+            }))
+            .expect("a serializable document")
+        }
+    }
+
+    /// The profiling DATA the aggregated profile of this case's window holds: the frame
+    /// each of its submissions contributed. What the document states about the AGGREGATION
+    /// itself — the window it covers, the agents that reported into it — is the service's
+    /// own and is asserted on its own ([`aggregation_of`]).
+    fn expected_data(&self) -> ion_rs::Element {
+        let mut callgraph = serde_json::Map::new();
+        for post in 0..self.posts {
+            callgraph.insert(
+                format!("F{post}"),
+                serde_json::json!(i64::try_from(post).unwrap_or(0) + 1),
+            );
+        }
+        data_of(&element_of(
+            &serde_json::to_vec(&serde_json::json!({ "callgraph": callgraph }))
+                .expect("a serializable document"),
+        ))
+    }
+}
+
+/// The table: rows differ in the period the window belongs to (every one the model
+/// declares), how far back that window closed, the representation the data was posted in,
+/// and how many agents reported into the window.
+fn closed_window_rows() -> Vec<ClosedWindow> {
+    vec![
+        ClosedWindow {
+            label: "the last closed five-minute window",
+            period: "PT5M",
+            windows_back: 1,
+            content_type: JSON,
+            posts: 1,
+        },
+        ClosedWindow {
+            label: "the last closed five-minute window, posted as Ion",
+            period: "PT5M",
+            windows_back: 1,
+            content_type: ION,
+            posts: 1,
+        },
+        ClosedWindow {
+            label: "two agents reporting into the last closed five-minute window",
+            period: "PT5M",
+            windows_back: 1,
+            content_type: JSON,
+            posts: 2,
+        },
+        ClosedWindow {
+            label: "a five-minute window twelve windows back",
+            period: "PT5M",
+            windows_back: 12,
+            content_type: JSON,
+            posts: 1,
+        },
+        ClosedWindow {
+            label: "the last closed hour",
+            period: "PT1H",
+            windows_back: 1,
+            content_type: JSON,
+            posts: 1,
+        },
+        ClosedWindow {
+            label: "the hour before the last closed one, two agents, posted as Ion",
+            period: "PT1H",
+            windows_back: 2,
+            content_type: ION,
+            posts: 2,
+        },
+        ClosedWindow {
+            label: "the last closed day",
+            period: "P1D",
+            windows_back: 1,
+            content_type: JSON,
+            posts: 1,
+        },
+        ClosedWindow {
+            label: "the day before the last closed one, three agents",
+            period: "P1D",
+            windows_back: 2,
+            content_type: JSON,
+            posts: 3,
+        },
+    ]
+}
+
+/// A submission whose data covers a window that has ALREADY closed is owed its aggregated
+/// profile at once: nothing has to write to the store in between, so the first
+/// `GetProfile` naming that period answers 200 with the aggregated document of that
+/// window.
+///
+/// The clock is read clear of every window boundary, so each row's window closed well
+/// before the submission was posted and the aggregation pass over it is through by the
+/// time the request is answered — which is why this needs no poll at all.
+#[tokio::test]
+async fn a_submission_covering_a_closed_window_is_retrievable_at_once() {
+    let harness = Harness::new();
+    let now = now_clear_of_window_boundaries().await;
+
+    for (index, row) in closed_window_rows().iter().enumerate() {
+        let name = format!("closed-{index}");
+        let case = row.label;
+        assert_eq!(
+            create_group(&harness, &name).await.status,
+            201,
+            "case {case:?}: create must succeed"
+        );
+
+        let window_start = row.window_start(now);
+        let length = period_length(row.period);
+        for post in 0..row.posts {
+            let answer = harness
+                .post_agent_profile(
+                    &name,
+                    row.content_type,
+                    Some(&format!("ptok-closed-{index}-{post}")),
+                    row.posted_bytes(window_start, post),
+                )
+                .await;
+            assert_eq!(
+                answer.status,
+                204,
+                "case {case:?}: post {post} must answer 204, got {} {}",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+        }
+
+        let query = format!("?period={}", row.period);
+        let answer = harness
+            .get_profile_accepting(&name, &query, Some(JSON))
+            .await;
+        assert_eq!(
+            answer.status,
+            200,
+            "case {case:?}: the aggregated profile of a window that closed before the post \
+             must be served at once, got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.content_type.as_deref(),
+            Some(JSON),
+            "case {case:?}: expected the accepted representation to be announced, got {:?}",
+            answer.content_type
+        );
+        assert_eq!(
+            profile_data(&answer.body),
+            row.expected_data(),
+            "case {case:?}: expected the window's submitted frames, got {}",
+            element_of(&answer.body)
+        );
+
+        // The document states the window it covers — the aligned window the data sits in,
+        // not any instant the uploads stated — and how many agents reported into it.
+        let (start, end, reported_agents) = aggregation_of(case, &answer.body);
+        assert_eq!(
+            start,
+            iso_millis(window_start),
+            "case {case:?}: expected the window's start, got {}",
+            element_of(&answer.body)
+        );
+        assert_eq!(
+            end,
+            iso_millis(window_start + length),
+            "case {case:?}: expected the window's end, got {}",
+            element_of(&answer.body)
+        );
+        assert_eq!(
+            reported_agents,
+            i64::try_from(row.posts).unwrap_or(0),
+            "case {case:?}: expected the window's {} submissions to be reported, got {}",
+            row.posts,
+            element_of(&answer.body)
+        );
+    }
+}
+
+/// How long the poll below waits for a closed window's aggregated profile before failing
+/// the case.
+///
+/// The service's pass over a closed window takes a fraction of a second
+/// (`state::AGGREGATION_PASS_MILLIS`), and the window these cases name closed before the
+/// submission was even posted, so the answer is expected on the FIRST attempt; this
+/// deadline exists only so a window whose aggregate never arrives fails here instead of
+/// spinning, which is the defect this suite's poll is about.
+const AGGREGATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often that poll looks again.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The whole agent round trip a client written against the real service drives:
+/// `ConfigureAgent`, `PostAgentProfile` for the window that has just closed,
+/// `DescribeProfilingGroup`, then `GetProfile` polled until the aggregated profile is
+/// there — tolerating only the modelled 404 `ResourceNotFoundException`, the way such a
+/// client does.
+///
+/// The poll ENDS: every attempt answers either the 200 payload or that one modelled
+/// refusal, and the payload arrives inside the deadline, so a caller never waits on a
+/// window the service will not aggregate.
+#[tokio::test]
+async fn polling_get_profile_after_a_post_for_a_closed_window_completes() {
+    let harness = Harness::new();
+    let name = "closed-round-trip";
+    assert_eq!(
+        create_group(&harness, name).await.status,
+        201,
+        "create must succeed"
+    );
+    assert_eq!(
+        harness.configure_agent(name).await.status,
+        200,
+        "configuring the agent must succeed"
+    );
+
+    let period = "PT5M";
+    let length = period_length(period);
+    let row = ClosedWindow {
+        label: "the agent round trip",
+        period,
+        windows_back: 1,
+        content_type: JSON,
+        posts: 1,
+    };
+    let window_start = row.window_start(now_clear_of_window_boundaries().await);
+    assert_eq!(
+        harness
+            .post_agent_profile(
+                name,
+                JSON,
+                Some("ptok-round-trip"),
+                row.posted_bytes(window_start, 0),
+            )
+            .await
+            .status,
+        204,
+        "the post must succeed"
+    );
+    assert!(
+        harness
+            .describe(name)
+            .await
+            .json()
+            .pointer("/profilingStatus/latestAgentProfileReportedAt")
+            .is_some(),
+        "the post must be recorded as received"
+    );
+
+    let query = format!("?period={period}");
+    let deadline = std::time::Instant::now() + AGGREGATION_DEADLINE;
+    let mut attempts = 0usize;
+    let served = loop {
+        let answer = harness
+            .get_profile_accepting(name, &query, Some(JSON))
+            .await;
+        if answer.status == 200 {
+            break answer;
+        }
+        // A client polling for an aggregation tolerates exactly one answer besides the
+        // payload, so anything else — another status, another code, no answer at all —
+        // ends the poll here.
+        assert_eq!(
+            answer.status,
+            404,
+            "attempt {attempts}: GetProfile must answer the payload or its modelled 404, \
+             got {} {}",
+            answer.status,
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.error_code(),
+            "ResourceNotFoundException",
+            "attempt {attempts}: expected ResourceNotFoundException, got {}",
+            String::from_utf8_lossy(&answer.body)
+        );
+        assert_eq!(
+            answer.error_message(),
+            NO_PROFILES_IN_TIME_RANGE,
+            "attempt {attempts}: expected the fixed no-data text, got {:?}",
+            answer.error_message()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the aggregated profile of a closed window never became retrievable: \
+             {attempts} attempts answered 404"
+        );
+        attempts += 1;
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
+
+    let case = row.label;
+    let (start, end, reported_agents) = aggregation_of(case, &served.body);
+    assert_eq!(
+        start,
+        iso_millis(window_start),
+        "expected the window's start, got {}",
+        element_of(&served.body)
+    );
+    assert_eq!(
+        end,
+        iso_millis(window_start + length),
+        "expected the window's end, got {}",
+        element_of(&served.body)
+    );
+    assert_eq!(
+        reported_agents, 1,
+        "expected the one submission to be reported, got {}",
+        element_of(&served.body)
+    );
+    assert_eq!(
+        profile_data(&served.body),
+        row.expected_data(),
+        "expected the submitted frame, got {}",
+        element_of(&served.body)
     );
 }

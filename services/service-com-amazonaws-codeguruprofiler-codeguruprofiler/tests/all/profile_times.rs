@@ -1137,7 +1137,11 @@ const BOUNDARY_MARGIN_SECONDS: i64 = 10;
 /// This POLLS the clock for that condition rather than waiting a fixed span: it answers
 /// immediately unless the call lands within the margin of a five-minute boundary, and then
 /// as soon as the clock is clear of it.
-async fn now_clear_of_window_boundaries() -> i64 {
+///
+/// `pub(crate)` so every suite that states which windows have CLOSED relative to the
+/// clock reads the clock the same way — [`crate::pending_aggregation`] states it about the
+/// aggregated profile `GetProfile` serves for such a window.
+pub(crate) async fn now_clear_of_window_boundaries() -> i64 {
     let finest = service_com_amazonaws_codeguruprofiler_codeguruprofiler::state::finest_aggregation_period_seconds();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
     loop {
