@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
     cannot_find_output_message, NOT_FOUND_MESSAGE,
 };
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EndpointUrl, MultiServiceRouter, UNSERVED_URL_BASE};
 
 /// The error code the service's 404 refusal carries
 /// (`smithy_query(query="shape",shape="ResourceNotFoundException")`: client error, HTTP
@@ -110,6 +110,179 @@ fn query(output_name: &str, start_pts: i64, end_pts: i64, timescale: i64) -> Val
 /// timescale.
 fn default_query(output_name: &str) -> Value {
     query(output_name, 0, 1001, 1000)
+}
+
+/// RULE: the endpoint a feed advertises is DERIVED from the base this responder is reached
+/// on, so whatever address this emulator answers on is the authority the create, the read
+/// and the update all publish — and the media path a client concatenates onto it is served
+/// under every one of them.
+///
+/// The rows differ along what the rule generalises over: the FORM the base takes (a named
+/// host with and without a port, a loopback address and port as a served data port reports
+/// it, an IPv6 literal, and the base an unserved router reports), which is the only thing
+/// the advertised value may depend on. A host written into this crate would answer every
+/// row alike, which is what the final assertion refuses.
+#[tokio::test]
+async fn the_advertised_endpoint_follows_the_base_this_emulator_is_reached_on() {
+    // Each base is a bare `https` origin, the only form an endpoint base takes
+    // (`smithy_server_runtime::EndpointUrl::parse`).
+    let bases: [(&str, &str); 5] = [
+        ("the base an unserved router reports", UNSERVED_URL_BASE),
+        ("a loopback address and a data port", "https://127.0.0.1:9297"),
+        ("an IPv6 loopback literal and a port", "https://[::1]:9297"),
+        ("a named host with no port", "https://emulator.test"),
+        (
+            "a named host and a non-default port",
+            "https://my-emulator.example:8443",
+        ),
+    ];
+
+    let mut advertised: Vec<String> = Vec::new();
+    for (label, base) in bases {
+        let mut router = router();
+        router.set_url_base(
+            EndpointUrl::parse(base)
+                .unwrap_or_else(|| panic!("case {label:?}: {base:?} is an endpoint base")),
+        );
+        let name = "endpoint-base-feed";
+        let (id, endpoint) = feed_with_endpoint(&router, name).await;
+        // The root path of THIS responder, ending in the slash a client concatenates a
+        // media path onto.
+        let expected = format!("{base}/");
+        assert_eq!(
+            endpoint, expected,
+            "case {label:?}: CreateFeed advertises the base this emulator is reached on, \
+             expected {expected:?}, got {endpoint:?}"
+        );
+        assert!(
+            !endpoint.contains("amazonaws.com") && !endpoint.contains("api.aws"),
+            "case {label:?}: the endpoint names no host of AWS's own, got {endpoint:?}"
+        );
+
+        let (status, fetched) = call(&router, "GET", &format!("/v1/feed/{id}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: GetFeed answers 200, got {status} with {fetched}"
+        );
+        assert_eq!(
+            fetched["dataEndpoints"],
+            json!([expected]),
+            "case {label:?}: GetFeed reports the same endpoint, got {:?}",
+            fetched["dataEndpoints"]
+        );
+
+        let (status, updated) = call(
+            &router,
+            "PUT",
+            &format!("/v1/feed/{id}"),
+            Some(feed_body(name)),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: UpdateFeed answers 200, got {status} with {updated}"
+        );
+        assert_eq!(
+            updated["dataEndpoints"],
+            json!([expected]),
+            "case {label:?}: UpdateFeed echoes the same endpoint, got {:?}",
+            updated["dataEndpoints"]
+        );
+
+        // Reachable, not merely well-formed: the path a client builds from the value it was
+        // just handed is served by this very responder under this base too.
+        let target = concatenated_target(&endpoint, &metadata_path(&id, FIRST_INPUT));
+        let (status, answered) = call(&router, "POST", &target, Some(default_query("sub1"))).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: the advertised endpoint serves the query at {target:?}, got \
+             {status} with {answered}"
+        );
+        assert!(
+            answered["items"].is_array(),
+            "case {label:?}: the metadata document carries an items list, got {answered}"
+        );
+
+        advertised.push(endpoint);
+    }
+
+    // Derived from where this process answers, not written into the crate: no two bases
+    // are advertised as the same endpoint.
+    let distinct: std::collections::BTreeSet<&String> = advertised.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        advertised.len(),
+        "each base is advertised as its own endpoint, got {advertised:?}"
+    );
+}
+
+/// RULE: the endpoint is reported from the base in force WHEN the feed is read, not
+/// remembered from the create — the address a feed's media plane answers at is a property of
+/// where this process serves, which is why a feed created while this emulator was reached on
+/// one base is read back on the base it is reached on now.
+///
+/// The rows differ along the move the base makes while the feed stands: from the unserved base
+/// to a served one, from a served one to another, and back again.
+#[tokio::test]
+async fn a_read_reports_the_base_in_force_when_it_is_read() {
+    let mut router = router();
+    let name = "endpoint-base-moves";
+    let (id, created) = {
+        let (status, created) = call(&router, "POST", "/v1/feed", Some(feed_body(name))).await;
+        assert_eq!(
+            status, 202,
+            "CreateFeed is accepted, got {status} with {created}"
+        );
+        let id = created["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the created feed carries an id, got {created}"))
+            .to_string();
+        (id, created)
+    };
+    assert_eq!(
+        created["dataEndpoints"],
+        json!([format!("{UNSERVED_URL_BASE}/")]),
+        "the create advertises the base in force at the create, got {:?}",
+        created["dataEndpoints"]
+    );
+
+    for (label, base) in [
+        ("served on a data port", "https://127.0.0.1:9297"),
+        ("served on another address", "https://emulator.test:8443"),
+        ("not served again", UNSERVED_URL_BASE),
+    ] {
+        router.set_url_base(
+            EndpointUrl::parse(base)
+                .unwrap_or_else(|| panic!("case {label:?}: {base:?} is an endpoint base")),
+        );
+        let expected = json!([format!("{base}/")]);
+        let (status, fetched) = call(&router, "GET", &format!("/v1/feed/{id}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: GetFeed answers 200, got {status} with {fetched}"
+        );
+        assert_eq!(
+            fetched["dataEndpoints"], expected,
+            "case {label:?}: GetFeed reports the base in force now ({base}), got {:?}",
+            fetched["dataEndpoints"]
+        );
+        let (status, updated) = call(
+            &router,
+            "PUT",
+            &format!("/v1/feed/{id}"),
+            Some(feed_body(name)),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: UpdateFeed answers 200, got {status} with {updated}"
+        );
+        assert_eq!(
+            updated["dataEndpoints"], expected,
+            "case {label:?}: UpdateFeed reports the base in force now ({base}), got {:?}",
+            updated["dataEndpoints"]
+        );
+    }
 }
 
 /// RULE: the endpoint the feed advertises is SERVED — a metadata query sent to the path a
