@@ -23,7 +23,10 @@
 //! parent may still arrive.
 //!
 //! Assembly is a READ: nothing here is stored, and a document that adopted
-//! nothing is answered with the bytes it was submitted as.
+//! nothing is answered with the bytes it was submitted as. One that DID adopt is
+//! read and written again through [`super::segment_document`], which is where
+//! what that round trip keeps is written down — every member of every entity,
+//! its value and the order its own document named it in.
 //!
 //! The work is bounded by what the store already bounds — a trace holds at most
 //! [`MAX_SEGMENTS_PER_TRACE`] documents — and the nesting it builds by
@@ -188,9 +191,7 @@ pub fn assembled_documents(trace: &TraceRecord) -> Vec<AssembledSegment> {
         if holders[index].children.is_empty() {
             continue;
         }
-        let Ok(mut value) =
-            serde_json::from_str::<serde_json::Value>(&holders[index].record.document)
-        else {
+        let Some(mut value) = read_document(&holders[index].record.document) else {
             // A stored document always parsed at ingest, so this is unreachable;
             // one that somehow did not adopts nothing, and its children stay at
             // the top of the trace.
@@ -204,7 +205,7 @@ pub fn assembled_documents(trace: &TraceRecord) -> Vec<AssembledSegment> {
                 .assembled
                 .clone()
                 .unwrap_or_else(|| holders[child].record.document.clone());
-            let mut nested = serde_json::from_str::<serde_json::Value>(&text).ok();
+            let mut nested = read_document(&text);
             let at = holders[child]
                 .attach
                 .clone()
@@ -218,7 +219,18 @@ pub fn assembled_documents(trace: &TraceRecord) -> Vec<AssembledSegment> {
                 holders[child].attach = None;
             }
         }
-        holders[index].assembled = Some(value.to_string());
+        match written_document(&value) {
+            Some(document) => holders[index].assembled = Some(document),
+            // A document read from JSON is always written again, so this is
+            // unreachable; one that somehow was not keeps the bytes it was
+            // submitted as, and the children it took in are answered for at the
+            // top of the trace rather than lost inside it.
+            None => {
+                for child in holders[index].children.clone() {
+                    holders[child].attach = None;
+                }
+            }
+        }
     }
 
     holders
@@ -260,6 +272,10 @@ fn nest(
         let Some(taken) = child.take() else {
             return false;
         };
+        let named = taken
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let Some(object) = host.as_object_mut() else {
             return false;
         };
@@ -269,10 +285,6 @@ fn nest(
         let Some(entities) = carried.as_array_mut() else {
             return false;
         };
-        let named = taken
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string);
         match entities.iter().position(|entity| {
             entity.get("id").and_then(serde_json::Value::as_str) == named.as_deref()
         }) {

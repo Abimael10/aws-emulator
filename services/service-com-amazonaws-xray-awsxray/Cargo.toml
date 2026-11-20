@@ -19,7 +19,13 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
-serde_json = { workspace = true }
+# `preserve_order`: every reader that reports a stored segment document answers
+# it with its members in the order the document named them (`src/state/
+# segment_document.rs`); with the feature off a JSON object is held as a sorted
+# map and an assembled document would name them in an order no client sent, so
+# this crate declares the feature its own answers depend on rather than
+# inheriting it from another crate's manifest.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = { workspace = true }
 # `stable_hex_id`: the one deterministic mixing function a service derives a
 # wire-visible id with, rather than a copy per crate.

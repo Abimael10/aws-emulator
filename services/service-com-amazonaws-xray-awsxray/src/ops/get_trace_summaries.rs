@@ -673,6 +673,14 @@ fn budget_spent() -> GetTraceSummariesError {
 }
 
 /// Build one `TraceSummary` from a stored trace's segments.
+///
+/// Every COLLECTION a summary reports is reported PRESENT: a trace whose
+/// documents named no user, no resource, no instance, no zone and no annotation
+/// is answered the empty collection for each, because "metadata generated from
+/// the segment documents in a trace" (`TraceSummary`) is a complete answer about
+/// that trace either way — a client that iterates `ResourceARNs` iterates
+/// nothing rather than finding the member missing. The same holds for the root
+/// cause lists and `ServiceIds` this projection already reports.
 fn summary_of(trace: &crate::state::TraceRecord) -> TraceSummary {
     let root = trace.root();
     TraceSummary {
@@ -685,11 +693,26 @@ fn summary_of(trace: &crate::state::TraceRecord) -> TraceSummary {
         has_throttle: Some(trace.has_throttle()),
         is_partial: Some(trace.is_partial()),
         http: root.and_then(http_of),
-        annotations: annotations_of(trace),
-        users: users_of(trace),
+        annotations: Some(annotations_of(trace)),
+        users: Some(users_of(trace)),
         service_ids: Some(service_ids_of(trace)),
-        resource_ar_ns: resource_arns_of(trace),
+        resource_ar_ns: Some(resource_arns_of(trace)),
+        instance_ids: Some(instance_ids_of(trace)),
+        availability_zones: Some(availability_zones_of(trace)),
         entry_point: root.map(service_id_of),
+        // "The revision number of a trace": the updates this trace has taken
+        // in, counted at ingest ([`crate::state::TraceRecord::revision`]), so a
+        // trace a client has submitted a document for is never reported at the
+        // shape's default and a client watching the number sees it move as the
+        // trace is added to.
+        revision: trace.revision,
+        // "The matched time stamp of a defined event": the instant of the last
+        // event this trace recorded, which is the latest instant its segments
+        // reached — the same instant the `Service` time range selects a trace
+        // by. It is read off the documents rather than off the clock, so the
+        // time reported is when the trace's work happened and not when it was
+        // read.
+        matched_event_time: Some(crate::state::timestamp_of(trace.last_end)),
         fault_root_causes: Some(
             trace
                 .root_causes(crate::state::RootCauseKind::Fault)
@@ -711,7 +734,6 @@ fn summary_of(trace: &crate::state::TraceRecord) -> TraceSummary {
                 .map(response_time_root_cause_of)
                 .collect(),
         ),
-        ..TraceSummary::default()
     }
 }
 
@@ -827,8 +849,8 @@ fn exceptions_of(exceptions: &[crate::state::CauseException]) -> Vec<RootCauseEx
 }
 
 /// "Users from the trace's segment documents" — one per distinct `user`, with
-/// the services that recorded it. `None` when no segment names one.
-fn users_of(trace: &crate::state::TraceRecord) -> Option<Vec<TraceUser>> {
+/// the services that recorded it.
+fn users_of(trace: &crate::state::TraceRecord) -> Vec<TraceUser> {
     let mut users: Vec<TraceUser> = Vec::new();
     for segment in &trace.segments {
         let Some(name) = segment.user.clone() else {
@@ -848,26 +870,83 @@ fn users_of(trace: &crate::state::TraceRecord) -> Option<Vec<TraceUser>> {
             }),
         }
     }
-    (!users.is_empty()).then_some(users)
+    users
 }
 
 /// "A list of resource ARNs for any resource corresponding to the trace
-/// segments" — one per distinct `resource_arn`. `None` when no segment names
-/// one.
-fn resource_arns_of(trace: &crate::state::TraceRecord) -> Option<Vec<ResourceARNDetail>> {
-    let mut arns: Vec<String> = Vec::new();
+/// segments" — one per distinct `resource_arn`.
+fn resource_arns_of(trace: &crate::state::TraceRecord) -> Vec<ResourceARNDetail> {
+    distinct_values(trace, |segment| segment.resource_arn.clone())
+        .into_iter()
+        .map(|arn| ResourceARNDetail { arn: Some(arn) })
+        .collect()
+}
+
+/// "A list of EC2 instance IDs for any instance corresponding to the trace
+/// segments" — one per distinct instance a segment's `aws` block reported
+/// itself as running on.
+fn instance_ids_of(trace: &crate::state::TraceRecord) -> Vec<InstanceIdDetail> {
+    distinct_values(trace, |segment| ec2_field(segment, EC2_INSTANCE_ID))
+        .into_iter()
+        .map(|id| InstanceIdDetail { id: Some(id) })
+        .collect()
+}
+
+/// "A list of Availability Zones for any zone corresponding to the trace
+/// segments" — one per distinct zone a segment's `aws` block reported itself as
+/// running in.
+fn availability_zones_of(trace: &crate::state::TraceRecord) -> Vec<AvailabilityZoneDetail> {
+    distinct_values(trace, |segment| ec2_field(segment, EC2_AVAILABILITY_ZONE))
+        .into_iter()
+        .map(|name| AvailabilityZoneDetail { name: Some(name) })
+        .collect()
+}
+
+/// The `aws.ec2` member `member` of `segment`, where the document reported one.
+///
+/// Source: the `aws` block of the X-Ray segment documents reference, whose
+/// `ec2` plugin block records "information about an EC2 instance" — the
+/// `instance_id` of the instance the segment ran on and the
+/// `availability_zone` it ran in. A member set to anything but a non-empty
+/// string names nothing, exactly as the resource members of the same block do.
+fn ec2_field(segment: &crate::state::SegmentRecord, member: &str) -> Option<String> {
+    segment
+        .aws
+        .as_ref()?
+        .get(EC2_BLOCK)?
+        .as_object()?
+        .get(member)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// The `aws` block that records the EC2 instance a segment ran on.
+const EC2_BLOCK: &str = "ec2";
+
+/// The `aws.ec2` member naming that instance.
+const EC2_INSTANCE_ID: &str = "instance_id";
+
+/// The `aws.ec2` member naming the Availability Zone it ran in.
+const EC2_AVAILABILITY_ZONE: &str = "availability_zone";
+
+/// The distinct values `named` reads off the trace's segments, in the order the
+/// segments were submitted — the one walk every per-trace value list of a
+/// summary is derived by, so none of them can report a duplicate or a different
+/// order.
+fn distinct_values(
+    trace: &crate::state::TraceRecord,
+    named: impl Fn(&crate::state::SegmentRecord) -> Option<String>,
+) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
     for segment in &trace.segments {
-        if let Some(arn) = segment.resource_arn.clone() {
-            if !arns.contains(&arn) {
-                arns.push(arn);
+        if let Some(value) = named(segment) {
+            if !values.contains(&value) {
+                values.push(value);
             }
         }
     }
-    (!arns.is_empty()).then(|| {
-        arns.into_iter()
-            .map(|arn| ResourceARNDetail { arn: Some(arn) })
-            .collect()
-    })
+    values
 }
 
 /// The root segment's `http` block, as the modelled `Http`.
@@ -924,11 +1003,22 @@ fn service_ids_of(trace: &crate::state::TraceRecord) -> Vec<ServiceId> {
         .collect()
 }
 
-/// "Annotations from the trace's segment documents", each value carrying the
-/// services that annotated it. `None` when no segment carries any.
+/// "Annotations from the trace's segment documents", each key carrying the
+/// values the documents annotated it with.
+///
+/// `ValueWithServiceIds$ServiceIds` — "services to which the annotation
+/// applies" — is NOT derived here, even though the segment that carried the
+/// annotation is known at this point: X-Ray's own answer for a trace assembled
+/// from submitted segment documents leaves that member unset (recorded
+/// behaviour; the model documents the member without saying when it is
+/// reported), so an annotation read out of a trace's documents is reported as
+/// the value it was annotated with, and the services of a trace are what that
+/// summary's `ServiceIds` answers for. A client reading an annotation is
+/// therefore never handed a service attribution the service itself does not
+/// publish for it.
 fn annotations_of(
     trace: &crate::state::TraceRecord,
-) -> Option<std::collections::HashMap<String, Vec<ValueWithServiceIds>>> {
+) -> std::collections::HashMap<String, Vec<ValueWithServiceIds>> {
     let mut annotations: std::collections::HashMap<String, Vec<ValueWithServiceIds>> =
         std::collections::HashMap::new();
     for segment in &trace.segments {
@@ -941,11 +1031,11 @@ fn annotations_of(
                 .or_default()
                 .push(ValueWithServiceIds {
                     annotation_value: Some(annotation_value),
-                    service_ids: Some(vec![service_id_of(segment)]),
+                    service_ids: None,
                 });
         }
     }
-    (!annotations.is_empty()).then_some(annotations)
+    annotations
 }
 
 /// A submitted annotation as the modelled union. `AnnotationValue` has exactly

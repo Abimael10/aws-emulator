@@ -97,6 +97,7 @@ pub mod query_window;
 pub mod retrievals;
 pub mod sampling_rules;
 pub mod sampling_statistics;
+pub mod segment_document;
 pub mod span_delivery;
 pub mod trace_id_reads;
 pub mod trace_pages;
@@ -119,6 +120,7 @@ pub use query_window::*;
 pub use retrievals::*;
 pub use sampling_rules::*;
 pub use sampling_statistics::*;
+pub use segment_document::*;
 pub use trace_id_reads::*;
 pub use trace_pages::*;
 
@@ -1101,6 +1103,17 @@ pub struct TraceRecord {
     /// ingest, so it is the service's own clock rather than anything a document
     /// carried.
     pub last_updated_at: f64,
+    /// How many submitted documents this trace has taken in: its
+    /// `TraceSummary$Revision`, "the revision number of a trace".
+    ///
+    /// A trace is REVISED as it is assembled, so the revision counts the
+    /// updates the trace has had — one for the document that created it, and one
+    /// more for every further document accepted under it, including one that
+    /// replaces a segment already held. The segments this service INFERS for the
+    /// calls a document made are part of the same update, so they revise
+    /// nothing of their own, and a document the trace had no room for revises
+    /// nothing either.
+    pub revision: i32,
 }
 
 /// One segment document, with the fields a reader needs lifted out of it and the
@@ -2810,6 +2823,10 @@ impl TraceRecord {
             limit_exceeded: self.limit_exceeded,
             ingest_seq: self.ingest_seq,
             last_updated_at: self.last_updated_at,
+            // The trace's revision is the trace's, not the window's: trimming
+            // selects which segments a windowed read answers for and revises
+            // nothing.
+            revision: self.revision,
         };
         trimmed.recompute_bounds();
         trimmed
@@ -2971,6 +2988,11 @@ impl ComAmazonawsXrayAwsxrayState {
         // The trace's update time: when THIS service accepted a document for
         // it, which is what the `Event` time range windows a trace by.
         trace.last_updated_at = now_epoch_seconds();
+        // And the trace's REVISION, which counts the updates a submitted
+        // document made to it: taken before the record moves into the trace,
+        // and only for a document a client submitted, because the segments this
+        // service infers from that document are part of the same update.
+        let revises = !segment.inferred;
         match trace.segment_index.get(&segment.id).copied() {
             Some(at) => {
                 trace.segments[at] = segment;
@@ -2987,6 +3009,9 @@ impl ComAmazonawsXrayAwsxrayState {
                 trace.extend_bounds(&segment);
                 trace.segments.push(segment);
             }
+        }
+        if revises {
+            trace.revision = trace.revision.saturating_add(1);
         }
         Ok(())
     }

@@ -287,6 +287,28 @@ impl Xray {
         self.query_summaries(start, end, None, token).await
     }
 
+    /// The ONE `TraceSummary` the window `[start, end)` holds for the trace
+    /// `trace`, as `GetTraceSummaries` answers it — the shape every suite that
+    /// asserts on a summary's members reads it through, so none of them rebuilds
+    /// the query or the lookup.
+    ///
+    /// Panics when the window holds no summary for that trace, which is the
+    /// answer a case asking about its members cannot go on from.
+    pub async fn summary_of(&self, case: &str, start: f64, end: f64, trace: &str) -> Value {
+        let got = self.summaries(start, end, None).await;
+        assert_eq!(
+            got.status, 200,
+            "case {case:?}: the summaries must be readable, got {got:?}"
+        );
+        array(&got.body, "TraceSummaries")
+            .iter()
+            .find(|summary| summary.get("Id").and_then(Value::as_str) == Some(trace))
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the trace {trace:?} must be summarised, got {got:?}")
+            })
+    }
+
     /// `GetTraceSummaries` over `[start, end)` with a filter expression.
     pub async fn filtered(&self, start: f64, end: f64, filter: &str) -> Answer {
         self.query_summaries(start, end, Some(filter), None).await

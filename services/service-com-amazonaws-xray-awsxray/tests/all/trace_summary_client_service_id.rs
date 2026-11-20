@@ -103,16 +103,7 @@ async fn graph_types_named_for(xray: &Xray, name: &str) -> Vec<String> {
 
 /// The one summary of the trace `trace`, from a query over the window.
 async fn summary_of(xray: &Xray, case: &str, trace: &str) -> Value {
-    let got = xray.summaries(WINDOW.0, WINDOW.1, None).await;
-    assert_eq!(
-        got.status, 200,
-        "case {case:?}: the summaries must be readable, got {got:?}"
-    );
-    array(&got.body, "TraceSummaries")
-        .iter()
-        .find(|summary| summary.get("Id").and_then(Value::as_str) == Some(trace))
-        .cloned()
-        .unwrap_or_else(|| panic!("case {case:?}: the trace {trace:?} must be summarised, got {got:?}"))
+    xray.summary_of(case, WINDOW.0, WINDOW.1, trace).await
 }
 
 #[tokio::test]

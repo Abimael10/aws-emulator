@@ -35,7 +35,17 @@
 //! * an expression the language cannot read is refused with
 //!   `InvalidRequestException` by BOTH surfaces that take one
 //!   (`GetTraceSummaries` and `CreateGroup`);
-//! * an `EndTime` that precedes `StartTime` is refused.
+//! * an `EndTime` that precedes `StartTime` is refused;
+//! * a `TraceSummary` reports every COLLECTION it derives from the trace's
+//!   documents — its users, resource ARNs, EC2 instances, Availability Zones and
+//!   annotations — present, and empty where those documents named nothing of the
+//!   kind, with the trace's `Revision` counting the documents it took in, its
+//!   `MatchedEventTime` the latest instant they reached, and each annotation
+//!   reported as the value it was annotated with;
+//! * a reader answers with the DOCUMENT that was submitted: its members, with
+//!   their values, in the order it named them — the one document written again
+//!   is a document that adopted another, and each entity of it still carries its
+//!   own members in its own order.
 
 use std::collections::BTreeSet;
 
@@ -1988,4 +1998,577 @@ async fn an_inferred_segment_does_not_move_the_traces_own_times() {
         BTreeSet::from(["client", "quartz"]),
         "the inferred service is one of the trace's services, got {service_names:?}"
     );
+}
+
+// =============================================================================
+// 9. What a TraceSummary reports about the trace's documents
+// =============================================================================
+
+/// The summary of `trace` in the seeded window, as `GetTraceSummaries` answers
+/// it — read through the harness's one summary lookup
+/// ([`Xray::summary_of`]).
+async fn summary_of(xray: &Xray, case: &str, trace: &str) -> Value {
+    xray.summary_of(case, WINDOW.0, WINDOW.1, trace).await
+}
+
+/// The member `member` of each entry of the summary's list `list`.
+fn entries(summary: &Value, list: &str, member: &str) -> Vec<String> {
+    array(summary, list)
+        .iter()
+        .filter_map(|entry| entry.get(member).and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_trace_summary_reports_every_collection_it_derives_present() {
+    // A summary describes the trace's documents, so each collection it derives
+    // is REPORTED — empty where those documents named nothing of the kind. The
+    // rows differ along what the rule generalises over: which of the kinds the
+    // documents name, how many documents name one, whether two documents name
+    // the SAME one, and whether the member a kind is read from carries nothing
+    // usable. The instance and the zone come from the `aws.ec2` block of the
+    // segment documents reference ("information about an EC2 instance": its
+    // `instance_id` and the `availability_zone` it ran in).
+    struct Case {
+        case: &'static str,
+        documents: Vec<Value>,
+        users: Vec<&'static str>,
+        arns: Vec<&'static str>,
+        instances: Vec<&'static str>,
+        zones: Vec<&'static str>,
+        annotations: Vec<&'static str>,
+    }
+
+    let trace = trace_id(40);
+    let plain = root_document("0000000000000001", &trace, "svc", 1_000.0, Some(1_000.5));
+    let mut named = plain.clone();
+    named["user"] = json!("sam");
+    named["resource_arn"] = json!("arn:aws:elasticbeanstalk:us-east-1:123456789012:environment/app");
+    named["aws"] = json!({"ec2": {"instance_id": "i-0b5a4678fc325bg98", "availability_zone": "us-east-1a"}});
+    named["annotations"] = json!({"order_id": "o-1001"});
+
+    let mut second = root_document("0000000000000002", &trace, "svc", 1_000.1, Some(1_000.4));
+    second["user"] = json!("sam");
+    second["aws"] = json!({"ec2": {"instance_id": "i-0b5a4678fc325bg98", "availability_zone": "us-east-1a"}});
+
+    let mut elsewhere = root_document("0000000000000003", &trace, "svc", 1_000.2, Some(1_000.3));
+    elsewhere["user"] = json!("ada");
+    elsewhere["resource_arn"] = json!("arn:aws:ecs:us-east-1:123456789012:cluster/orders");
+    elsewhere["aws"] = json!({"ec2": {"instance_id": "i-1111111111111111", "availability_zone": "us-east-1b"}});
+    elsewhere["annotations"] = json!({"attempt": 2});
+
+    let mut blank = root_document("0000000000000004", &trace, "svc", 1_000.0, Some(1_000.5));
+    blank["aws"] = json!({"ec2": {"instance_id": "", "availability_zone": 7}});
+
+    let mut other_block = root_document("0000000000000005", &trace, "svc", 1_000.0, Some(1_000.5));
+    other_block["aws"] = json!({"operation": "GetItem", "region": "us-east-1"});
+
+    let rows: Vec<Case> = vec![
+        Case {
+            case: "a document naming none of them",
+            documents: vec![plain.clone()],
+            users: vec![],
+            arns: vec![],
+            instances: vec![],
+            zones: vec![],
+            annotations: vec![],
+        },
+        Case {
+            case: "one document naming each of them",
+            documents: vec![named.clone()],
+            users: vec!["sam"],
+            arns: vec!["arn:aws:elasticbeanstalk:us-east-1:123456789012:environment/app"],
+            instances: vec!["i-0b5a4678fc325bg98"],
+            zones: vec!["us-east-1a"],
+            annotations: vec!["order_id"],
+        },
+        Case {
+            case: "two documents naming the same instance, zone and user",
+            documents: vec![named.clone(), second.clone()],
+            users: vec!["sam"],
+            arns: vec!["arn:aws:elasticbeanstalk:us-east-1:123456789012:environment/app"],
+            instances: vec!["i-0b5a4678fc325bg98"],
+            zones: vec!["us-east-1a"],
+            annotations: vec!["order_id"],
+        },
+        Case {
+            case: "two documents naming different instances, zones and users",
+            documents: vec![named.clone(), elsewhere.clone()],
+            users: vec!["sam", "ada"],
+            arns: vec![
+                "arn:aws:elasticbeanstalk:us-east-1:123456789012:environment/app",
+                "arn:aws:ecs:us-east-1:123456789012:cluster/orders",
+            ],
+            instances: vec!["i-0b5a4678fc325bg98", "i-1111111111111111"],
+            zones: vec!["us-east-1a", "us-east-1b"],
+            annotations: vec!["order_id", "attempt"],
+        },
+        Case {
+            case: "an ec2 block whose members name nothing usable",
+            documents: vec![blank],
+            users: vec![],
+            arns: vec![],
+            instances: vec![],
+            zones: vec![],
+            annotations: vec![],
+        },
+        Case {
+            case: "an aws block that is not an ec2 block",
+            documents: vec![other_block],
+            users: vec![],
+            arns: vec![],
+            instances: vec![],
+            zones: vec![],
+            annotations: vec![],
+        },
+    ];
+
+    for row in rows {
+        let xray = Xray::new();
+        let documents: Vec<String> = row.documents.iter().map(Value::to_string).collect();
+        let put = xray.put_segments(&documents).await;
+        assert_eq!(
+            put.status, 200,
+            "case {:?}: seeding must succeed, got {put:?}",
+            row.case
+        );
+
+        let summary = summary_of(&xray, row.case, &trace).await;
+        for list in [
+            "Users",
+            "ResourceARNs",
+            "InstanceIds",
+            "AvailabilityZones",
+        ] {
+            assert!(
+                summary.get(list).is_some_and(Value::is_array),
+                "case {:?}: {list} must be reported as a list, got {:?}",
+                row.case,
+                summary.get(list)
+            );
+        }
+        assert!(
+            summary.get("Annotations").is_some_and(Value::is_object),
+            "case {:?}: Annotations must be reported as a map, got {:?}",
+            row.case,
+            summary.get("Annotations")
+        );
+        let got_users = entries(&summary, "Users", "UserName");
+        assert_eq!(
+            got_users, row.users,
+            "case {:?}: expected Users {:?}, got {got_users:?}",
+            row.case, row.users
+        );
+        let got_arns = entries(&summary, "ResourceARNs", "ARN");
+        assert_eq!(
+            got_arns, row.arns,
+            "case {:?}: expected ResourceARNs {:?}, got {got_arns:?}",
+            row.case, row.arns
+        );
+        let got_instances = entries(&summary, "InstanceIds", "Id");
+        assert_eq!(
+            got_instances, row.instances,
+            "case {:?}: expected InstanceIds {:?}, got {got_instances:?}",
+            row.case, row.instances
+        );
+        let got_zones = entries(&summary, "AvailabilityZones", "Name");
+        assert_eq!(
+            got_zones, row.zones,
+            "case {:?}: expected AvailabilityZones {:?}, got {got_zones:?}",
+            row.case, row.zones
+        );
+        let got_keys: BTreeSet<&str> = summary
+            .get("Annotations")
+            .and_then(Value::as_object)
+            .map(|map| map.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        let expected_keys: BTreeSet<&str> = row.annotations.iter().copied().collect();
+        assert_eq!(
+            got_keys, expected_keys,
+            "case {:?}: expected Annotations keys {expected_keys:?}, got {got_keys:?}",
+            row.case
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_trace_summarys_revision_counts_the_documents_the_trace_took_in() {
+    // A trace is REVISED as it is assembled, so its revision is the number of
+    // submitted documents it has taken in — one for the document that created
+    // it, one more for each further document, including one that replaces a
+    // segment the trace already held. The rows differ along how many documents
+    // arrive, how many CALLS they arrive in, whether one replaces another, and
+    // whether the service infers further segments from them (which are part of
+    // the same update and so revise nothing).
+    let trace = trace_id(41);
+    let first = root_document("1111111111111111", &trace, "svc", 1_000.0, None);
+    let completed = root_document("1111111111111111", &trace, "svc", 1_000.0, Some(1_000.5));
+    let child = json!({
+        "trace_id": trace,
+        "id": "2222222222222222",
+        "parent_id": "1111111111111111",
+        "type": "subsegment",
+        "name": "inner",
+        "start_time": 1_000.1_f64,
+        "end_time": 1_000.2_f64,
+    });
+    let mut calls_out = root_document("3333333333333333", &trace, "client", 1_000.0, Some(1_000.6));
+    calls_out["subsegments"] = json!([{
+        "id": "4444444444444444",
+        "name": "quartz",
+        "namespace": "remote",
+        "start_time": 1_000.1_f64,
+        "end_time": 1_000.5_f64,
+    }]);
+
+    let rows: Vec<(&str, Vec<Vec<Value>>, i64)> = vec![
+        ("one document", vec![vec![first.clone()]], 1),
+        (
+            "two documents in one call",
+            vec![vec![first.clone(), child.clone()]],
+            2,
+        ),
+        (
+            "two documents in two calls",
+            vec![vec![first.clone()], vec![child.clone()]],
+            2,
+        ),
+        (
+            "a document that completes a segment already held",
+            vec![vec![first.clone()], vec![completed.clone()]],
+            2,
+        ),
+        (
+            "three documents, the last completing the first",
+            vec![
+                vec![first.clone(), child.clone()],
+                vec![completed.clone()],
+            ],
+            3,
+        ),
+        (
+            "one document the service infers a downstream segment from",
+            vec![vec![calls_out.clone()]],
+            1,
+        ),
+    ];
+
+    for (case, calls, expected) in rows {
+        let xray = Xray::new();
+        for documents in &calls {
+            let put = xray
+                .put_segments(&documents.iter().map(Value::to_string).collect::<Vec<String>>())
+                .await;
+            assert_eq!(put.status, 200, "case {case:?}: seeding must succeed, got {put:?}");
+            assert!(
+                array(&put.body, "UnprocessedTraceSegments").is_empty(),
+                "case {case:?}: every document is well formed, got {put:?}"
+            );
+        }
+        let summary = summary_of(&xray, case, &trace).await;
+        let revision = summary.get("Revision").and_then(Value::as_i64);
+        assert_eq!(
+            revision,
+            Some(expected),
+            "case {case:?}: expected Revision {expected}, got {revision:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_trace_summarys_times_are_the_instants_its_documents_recorded() {
+    // `StartTime` is the earliest instant the trace's documents started at and
+    // `MatchedEventTime` the latest instant they reached — both read off the
+    // documents rather than off the clock, so a backdated or replayed segment
+    // reports the times it recorded. The rows differ along how many documents
+    // there are, which one holds each bound, whether a document is still in
+    // progress (so its latest known instant is its own start) and the order
+    // they arrive in.
+    let trace = trace_id(42);
+    let rows: Vec<(&str, Vec<Value>, f64, f64)> = vec![
+        (
+            "one complete segment",
+            vec![root_document("1111111111111111", &trace, "svc", 1_000.0, Some(1_002.0))],
+            1_000.0,
+            1_002.0,
+        ),
+        (
+            "a second segment reaching further",
+            vec![
+                root_document("1111111111111111", &trace, "svc", 1_000.0, Some(1_000.5)),
+                root_document("2222222222222222", &trace, "svc", 1_000.25, Some(1_001.25)),
+            ],
+            1_000.0,
+            1_001.25,
+        ),
+        (
+            "the later segment submitted first",
+            vec![
+                root_document("2222222222222222", &trace, "svc", 1_000.25, Some(1_001.25)),
+                root_document("1111111111111111", &trace, "svc", 1_000.0, Some(1_000.5)),
+            ],
+            1_000.0,
+            1_001.25,
+        ),
+        (
+            "a segment still in progress",
+            vec![root_document("1111111111111111", &trace, "svc", 1_000.75, None)],
+            1_000.75,
+            1_000.75,
+        ),
+        (
+            "a whole second, which a client may write without a fraction",
+            vec![root_document("1111111111111111", &trace, "svc", 1_001.0, Some(1_001.0))],
+            1_001.0,
+            1_001.0,
+        ),
+    ];
+
+    for (case, documents, started, matched) in rows {
+        let xray = Xray::new();
+        let put = xray
+            .put_segments(&documents.iter().map(Value::to_string).collect::<Vec<String>>())
+            .await;
+        assert_eq!(put.status, 200, "case {case:?}: seeding must succeed, got {put:?}");
+
+        let summary = summary_of(&xray, case, &trace).await;
+        let start_time = summary.get("StartTime").and_then(Value::as_f64);
+        assert!(
+            start_time.is_some_and(|actual| close(actual, started)),
+            "case {case:?}: expected StartTime {started}, got {start_time:?}"
+        );
+        let event = summary.get("MatchedEventTime").and_then(Value::as_f64);
+        assert!(
+            event.is_some_and(|actual| close(actual, matched)),
+            "case {case:?}: expected MatchedEventTime {matched}, got {event:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_annotation_is_reported_as_the_value_it_was_annotated_with() {
+    // An annotation read out of a trace's segment documents is reported as the
+    // VALUE it was annotated with, in the value type the document wrote; the
+    // services a trace touched are what the summary's own `ServiceIds` answers
+    // for, so no annotation entry carries a service attribution of its own. The
+    // rows differ along the value type and along how many documents, of how
+    // many services, annotated the key.
+    let trace = trace_id(43);
+    let mut first = root_document("1111111111111111", &trace, "frontend", 1_000.0, Some(1_000.5));
+    first["annotations"] = json!({"order_id": "o-1001", "attempt": 2, "cached": false});
+    let mut second = root_document("2222222222222222", &trace, "backend", 1_000.1, Some(1_000.4));
+    second["annotations"] = json!({"order_id": "o-1002"});
+
+    let xray = Xray::new();
+    let put = xray
+        .put_segments(&[first.to_string(), second.to_string()])
+        .await;
+    assert_eq!(put.status, 200, "seeding must succeed, got {put:?}");
+
+    let summary = summary_of(&xray, "two services annotating one trace", &trace).await;
+    let annotations = summary
+        .get("Annotations")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    // Each row is a key of the map and the values the documents annotated it
+    // with, in the value type each was written as.
+    let rows: Vec<(&str, Vec<Value>)> = vec![
+        (
+            "order_id",
+            vec![
+                json!({"StringValue": "o-1001"}),
+                json!({"StringValue": "o-1002"}),
+            ],
+        ),
+        ("attempt", vec![json!({"NumberValue": 2.0})]),
+        ("cached", vec![json!({"BooleanValue": false})]),
+    ];
+    for (key, expected) in rows {
+        let entries = annotations
+            .get(key)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let values: Vec<Value> = entries
+            .iter()
+            .map(|entry| entry.get("AnnotationValue").cloned().unwrap_or(Value::Null))
+            .collect();
+        assert_eq!(
+            values, expected,
+            "case {key:?}: expected the annotated values {expected:?}, got {values:?}"
+        );
+        for entry in &entries {
+            assert!(
+                entry.get("ServiceIds").is_none_or(Value::is_null),
+                "case {key:?}: an annotation entry carries no service attribution, got {entry:?}"
+            );
+        }
+    }
+    let service_names: BTreeSet<&str> = array(&summary, "ServiceIds")
+        .iter()
+        .filter_map(|id| id.get("Name").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        service_names,
+        BTreeSet::from(["backend", "frontend"]),
+        "the services of the trace are what ServiceIds answers for, got {service_names:?}"
+    );
+}
+
+// =============================================================================
+// 10. A reader answers with the document that was submitted
+// =============================================================================
+
+/// The `Segment$Document` texts `BatchGetTraces` answers for `trace`, as the
+/// bytes they travel as.
+async fn documents_of(xray: &Xray, case: &str, trace: &str) -> Vec<String> {
+    let read = xray.batch_get(&[trace.to_string()], None).await;
+    assert_eq!(
+        read.status, 200,
+        "case {case:?}: BatchGetTraces must answer, got {read:?}"
+    );
+    array(&read.body, "Traces")
+        .iter()
+        .flat_map(|held| array(held, "Segments").to_vec())
+        .filter_map(|segment| {
+            segment
+                .get("Document")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_document_that_adopted_nothing_is_answered_as_it_was_submitted() {
+    // A reader answers with the document that was submitted: every member it
+    // carried, with the value it carried, in the order it carried them — never
+    // a document rebuilt from the members the service parsed out, and never the
+    // service's own clock in place of a time the caller recorded. The rows
+    // differ along what a client is free to choose and the service is not: the
+    // order the members are named in, how a number is spelled, which optional
+    // members are there, and how deep the document nests.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "the member order the segment documentation shows",
+            format!(
+                r#"{{"trace_id":"{trace}","id":"1111111111111111","start_time":1000.0,"end_time":1002.0,"name":"svc"}}"#,
+                trace = trace_id(50)
+            ),
+        ),
+        (
+            "the same members, named in another order",
+            format!(
+                r#"{{"name":"svc","id":"1111111111111111","trace_id":"{trace}","start_time":1000.0,"end_time":1002.0}}"#,
+                trace = trace_id(51)
+            ),
+        ),
+        (
+            "a whole second written without a fraction",
+            format!(
+                r#"{{"id":"1111111111111111","name":"svc","start_time":1000,"trace_id":"{trace}","end_time":1002}}"#,
+                trace = trace_id(52)
+            ),
+        ),
+        (
+            "an instant written as a power of ten",
+            format!(
+                r#"{{"id":"1111111111111111","name":"svc","start_time":1.0E3,"trace_id":"{trace}","end_time":1.002E3}}"#,
+                trace = trace_id(53)
+            ),
+        ),
+        (
+            "an http block, an annotation and a user",
+            format!(
+                r#"{{"id":"1111111111111111","name":"svc","start_time":1000.0,"trace_id":"{trace}","end_time":1002.0,"http":{{"request":{{"method":"GET","url":"http://localhost/orders"}},"response":{{"status":200}}}},"annotations":{{"order_id":"o-1001"}},"user":"sam"}}"#,
+                trace = trace_id(54)
+            ),
+        ),
+        (
+            "subsegments carried inline, with their own member order",
+            format!(
+                r#"{{"id":"1111111111111111","name":"svc","start_time":1000.0,"trace_id":"{trace}","end_time":1002.0,"subsegments":[{{"name":"inner","id":"2222222222222222","start_time":1000.1,"end_time":1000.2}}]}}"#,
+                trace = trace_id(55)
+            ),
+        ),
+        (
+            "the spaces a client framed its document with",
+            format!(
+                r#"{{ "id": "1111111111111111", "name": "svc", "start_time": 1000.0, "trace_id": "{trace}", "end_time": 1002.0 }}"#,
+                trace = trace_id(56)
+            ),
+        ),
+    ];
+
+    for (case, submitted) in rows {
+        let xray = Xray::new();
+        let trace = serde_json::from_str::<Value>(&submitted)
+            .ok()
+            .and_then(|document| {
+                document
+                    .get("trace_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .expect("each row names the trace it belongs to");
+        let put = xray.put_segments(std::slice::from_ref(&submitted)).await;
+        assert_eq!(put.status, 200, "case {case:?}: seeding must succeed, got {put:?}");
+        assert!(
+            array(&put.body, "UnprocessedTraceSegments").is_empty(),
+            "case {case:?}: the document is well formed, got {put:?}"
+        );
+
+        let answered = documents_of(&xray, case, &trace).await;
+        assert_eq!(
+            answered,
+            vec![submitted.clone()],
+            "case {case:?}: the document must come back as it was submitted, got {answered:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_adopted_document_keeps_each_entitys_members_where_its_document_put_them() {
+    // The one document a reader WRITES is a document that adopted another: a
+    // trace is one tree, so a subsegment submitted on its own is answered for
+    // inside the entity it named. Written again, each entity still carries its
+    // own members in its own order, with its own values — the parent's first
+    // and the adopted child inside the parent's `subsegments`.
+    let trace = trace_id(57);
+    let parent = format!(
+        r#"{{"trace_id":"{trace}","id":"1111111111111111","name":"frontend","start_time":1000.0,"end_time":1002.0,"http":{{"request":{{"method":"GET","url":"http://localhost/orders"}}}}}}"#
+    );
+    let child = format!(
+        r#"{{"name":"backend","id":"2222222222222222","trace_id":"{trace}","type":"subsegment","parent_id":"1111111111111111","start_time":1000.1,"end_time":1000.2}}"#
+    );
+
+    // Rows differ in the order the two documents arrive in: the child may reach
+    // the service before the parent that holds it.
+    for (case, documents) in [
+        ("the parent first", vec![parent.clone(), child.clone()]),
+        ("the child first", vec![child.clone(), parent.clone()]),
+    ] {
+        let xray = Xray::new();
+        for document in &documents {
+            let put = xray.put_segments(std::slice::from_ref(document)).await;
+            assert_eq!(put.status, 200, "case {case:?}: seeding must succeed, got {put:?}");
+        }
+
+        let expected = format!(
+            "{},\"subsegments\":[{}]}}",
+            parent
+                .strip_suffix('}')
+                .expect("the parent document is an object"),
+            child
+        );
+        let answered = documents_of(&xray, case, &trace).await;
+        assert_eq!(
+            answered,
+            vec![expected.clone()],
+            "case {case:?}: expected the parent carrying the adopted child, got {answered:?}"
+        );
+    }
 }
