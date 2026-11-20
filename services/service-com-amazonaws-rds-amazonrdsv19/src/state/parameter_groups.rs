@@ -440,8 +440,10 @@ impl DbParameterGroupRecord {
 /// family has ONE published parameter list, whichever operation is asked — so the two can
 /// never disagree about what a parameter admits. It is a SAMPLE of that list rather than the
 /// whole of it (an engine publishes hundreds of parameters per family), which is why
-/// [`validate_db_parameter_setting`] checks the value of a parameter the catalog carries and
-/// admits any name it does not.
+/// [`validate_db_parameter_setting`] checks the VALUE of a parameter the catalog carries and
+/// admits any value of a name it does not: there is no published domain to hold such a value
+/// to. WHETHER a name may be carried at all is a different question, answered by the engine's
+/// own settings namespace ([`validate_db_parameter_name`]).
 ///
 /// A family the catalog is empty for, and a string that names no family at all, publish
 /// nothing.
@@ -459,16 +461,19 @@ pub fn published_db_parameter(family: &str, name: &str) -> Option<&'static Clust
     spec_in_catalog(published_db_parameters(family), name)
 }
 
-/// Refuse a setting a DB (instance) parameter group of `family` cannot carry: a parameter of
-/// another engine, a parameter the family publishes that the engine does not let a caller
-/// modify, or a value outside the ones that parameter admits.
+/// Refuse a setting a DB (instance) parameter group of `family` cannot carry: a name the
+/// family's engine has no setting for, a parameter of another engine, a parameter the family
+/// publishes that the engine does not let a caller modify, or a value outside the ones that
+/// parameter admits.
 ///
-/// A name the published catalog does not carry is ADMITTED unless it is another engine's
-/// ([`validate_db_parameter_name`]), because that catalog is a sample of the family's
-/// published list rather than the whole of it: see [`published_db_parameters`] and
-/// [`validate_known_setting`], which carries the value rule. The cluster-level rule is
-/// [`validate_cluster_parameter_setting`], whose name half refuses more because a family
-/// whose vocabulary IS its whole list has nothing outside it.
+/// The name half is [`validate_db_parameter_name`]: a name the published catalog does not
+/// carry is admitted where the engine HAS a setting of that name
+/// ([`family_engine_has_no_setting_named`]) and it is no other engine's, because that catalog
+/// is a sample of the family's published list rather than the whole of it (see
+/// [`published_db_parameters`]). The value half is [`validate_known_setting`], which holds a
+/// value to the published domain of the parameter where the catalog publishes one. The
+/// cluster-level rule is [`validate_cluster_parameter_setting`], whose name half refuses more
+/// for a family whose vocabulary IS its whole list, since nothing lies outside it.
 pub fn validate_db_parameter_setting(
     family: &str,
     name: &str,
@@ -522,9 +527,7 @@ pub fn published_cluster_parameter_at_any_level(
 }
 
 /// Whether the vocabulary this emulator publishes for `family` is the WHOLE of what a group of
-/// that family carries, rather than a SAMPLE of it. Stated once here, and one of the two
-/// things that decide whether an unpublished name can be refused
-/// ([`validate_cluster_parameter_name`]; the other is [`published_for_another_engine`]).
+/// that family carries, rather than a SAMPLE of it.
 ///
 /// It is complete where the SERVICE defines the vocabulary and this emulator carries that
 /// definition: Amazon DocumentDB publishes a closed, service-managed cluster parameter list
@@ -533,18 +536,29 @@ pub fn published_cluster_parameter_at_any_level(
 /// states it IS its families' complete list — and Amazon Neptune publishes its own such list,
 /// which is this crate's Neptune cluster catalog.
 ///
-/// It is a SAMPLE for every family whose parameters are the open-source ENGINE's own system
-/// variables: the MySQL- and PostgreSQL-compatible families carry hundreds of them per
-/// release, and both catalogs here say so in their own module headers — the cluster tables are
-/// "not AWS's whole list" and the DB-parameter tables are drawn from the head of it. A name
-/// outside a sample is therefore no evidence that the engine lacks the parameter, so nothing is
-/// refused for it: the engine parameters such a group really carries reach past this sample —
-/// `aws_default_s3_role`, which an Aurora MySQL cluster's own S3 import reads off its cluster
-/// parameter group, is one of them.
+/// It is a SAMPLE for every family whose parameters are the open-source ENGINE's own
+/// configuration settings: the MySQL- and PostgreSQL-compatible families carry hundreds of
+/// them per release, and both catalogs here say so in their own module headers. For those
+/// families it is the engine's settings NAMESPACE that says which parameters a group has
+/// ([`crate::state::engine_has_no_setting_named`]) — the names, without the published record
+/// a catalog entry carries — so a name outside the sampled catalog is still carried where the
+/// engine has a setting by that name.
 pub fn publishes_a_complete_vocabulary(family: &str) -> bool {
     published_parameters(family).is_some()
         || crate::ops::describe_engine_default_parameters::family_engine(family)
             .is_some_and(|engine| engine == NEPTUNE_ENGINE)
+}
+
+/// Whether the engine of `family` has NO setting named `name`: the positive evidence that a
+/// parameter group of the family does not have the parameter, read from that engine's own
+/// configuration namespace ([`crate::state::engine_has_no_setting_named`]).
+///
+/// A family that names no engine, and one whose engine's namespace this front door does not
+/// carry, answers `false`: the refusal rests on the namespace of the group's own engine, never
+/// on its absence.
+fn family_engine_has_no_setting_named(family: &str, name: &str) -> bool {
+    crate::ops::describe_engine_default_parameters::family_engine(family)
+        .is_some_and(|engine| engine_has_no_setting_named(engine, name))
 }
 
 /// Whether this front door publishes `name` as a parameter of an engine it serves OTHER than
@@ -553,10 +567,11 @@ pub fn publishes_a_complete_vocabulary(family: &str) -> bool {
 /// A parameter belongs to an ENGINE: `mysql8.0` publishes MySQL's server variables and
 /// `neptune1.3` publishes the graph engine's own parameters, so a name one engine's published
 /// vocabulary carries and the other's does not names a parameter of the first engine and no
-/// parameter of the second. That is evidence this front door HAS, whether or not the
-/// vocabulary it publishes for the family is the whole of that family's list
-/// ([`publishes_a_complete_vocabulary`]): the sample is incomplete about the engine's own
-/// variables, never about another engine's.
+/// parameter of the second. That is evidence this front door HAS whichever level of either
+/// engine publishes the name, and it is what the INSTANCE-level name rule rests on
+/// ([`validate_db_parameter_name`]): a family's published DB-parameter table is a sample drawn
+/// from the head of AWS's list, so it is incomplete about the engine's own variables, but
+/// never about another engine's.
 ///
 /// Both sides are read from published data, and both have to be there for the answer to be
 /// yes:
@@ -625,24 +640,31 @@ fn publishes_a_vocabulary(engine: &str) -> bool {
 }
 
 /// Refuse the NAME of a parameter a DB CLUSTER parameter group of `family` cannot carry: one
-/// the family publishes no record for at either level, where this front door has published
-/// evidence that the family does not have it.
+/// no parameter list of that family's engine has.
 ///
-/// A group carries only parameters its family publishes, so a name the family publishes
-/// nothing for ([`published_cluster_parameter_at_any_level`], both levels of it) names no
-/// parameter of the group and is refused with
-/// [`service_common::rds_cluster_parameters::parameter_not_found_message`] — whether the
+/// A parameter group's MEMBERSHIP is its family's engine parameter list: the group is
+/// "initially created with the default parameters for the database engine used by instances in
+/// the DB cluster", and a caller's modify changes the value of one of THOSE parameters rather
+/// than adding a parameter of its own. So a name the family publishes no record for at either
+/// level ([`published_cluster_parameter_at_any_level`], the family's cluster-level table and
+/// the instance-level table of the same engine) and that the engine has no setting for
+/// ([`family_engine_has_no_setting_named`]) names no parameter of the group, and is refused
+/// with [`service_common::rds_cluster_parameters::parameter_not_found_message`] — whether the
 /// request would SET it (where the value rule follows, see
 /// [`validate_cluster_parameter_setting`]) or RESET it, since there is no such parameter to put
 /// back to its default either. The two operations read this one resolution, so they cannot
-/// disagree about which parameters a group has.
+/// disagree about which parameters a group has, and no read can report a member the write was
+/// refused for.
 ///
-/// There are two ways this front door knows the family does not have the parameter, and an
-/// unpublished name is carried where NEITHER holds, because against a sample of AWS's
-/// published list a refusal would reject parameters the engine really has:
+/// There are three ways this front door knows the family does not have the parameter, and an
+/// unpublished name is carried where NONE holds, because against a SAMPLE of AWS's published
+/// list alone a refusal would reject parameters the engine really has:
 ///
 /// * the family's published vocabulary is the whole of what a group of it carries
 ///   ([`publishes_a_complete_vocabulary`]), so there is nothing outside it; or
+/// * the engine's own configuration namespace has no setting of that name
+///   ([`family_engine_has_no_setting_named`]) — the engine decides which parameters exist, and
+///   that namespace is carried by NAME for the engines whose published records are sampled; or
 /// * the name is a parameter of ANOTHER engine this door serves
 ///   ([`published_for_another_engine`]) — one engine's parameter is no parameter of another
 ///   engine's family, however incompletely that family's own list is sampled.
@@ -650,29 +672,39 @@ pub fn validate_cluster_parameter_name(family: &str, name: &str) -> Result<(), S
     if published_cluster_parameter_at_any_level(family, name).is_some() {
         return Ok(());
     }
-    if publishes_a_complete_vocabulary(family) || published_for_another_engine(family, name) {
+    if publishes_a_complete_vocabulary(family)
+        || family_engine_has_no_setting_named(family, name)
+        || published_for_another_engine(family, name)
+    {
         return Err(parameter_not_found_message(name));
     }
     Ok(())
 }
 
 /// Refuse the NAME of a parameter a DB (instance) parameter group of `family` cannot carry:
-/// one that is a parameter of ANOTHER engine this front door serves
-/// ([`published_for_another_engine`]).
+/// one the engine of that family has no setting for
+/// ([`family_engine_has_no_setting_named`]), and one that is a parameter of ANOTHER engine this
+/// front door serves ([`published_for_another_engine`]).
 ///
-/// The instance-level half of [`validate_cluster_parameter_name`], read by the modify that
-/// would SET such a parameter ([`validate_db_parameter_setting`]) and by the reset that would
-/// clear it, so the two cannot disagree about which parameters a group has. A name this door
-/// publishes for no engine at all is carried: the DB-parameter catalogs are samples of AWS's
-/// published lists ([`published_db_parameters`]), so a name outside one is no evidence that
-/// the engine lacks the parameter.
+/// The instance-level half of [`validate_cluster_parameter_name`], over the same membership
+/// rule — a group carries its family's engine's parameters and no others — read by the modify
+/// that would SET such a parameter ([`validate_db_parameter_setting`]) and by the reset that
+/// would clear it, so the two cannot disagree about which parameters a group has.
+///
+/// A name the family's published DB-parameter table does not carry is still carried where the
+/// engine has a setting by that name: those tables are samples of AWS's published lists
+/// ([`published_db_parameters`]), so a name outside one is no evidence that the engine lacks
+/// the parameter — the engine's namespace is.
 pub fn validate_db_parameter_name(family: &str, name: &str) -> Result<(), String> {
-    if published_db_parameter(family, name).is_some()
-        || !published_for_another_engine(family, name)
-    {
+    if published_db_parameter(family, name).is_some() {
         return Ok(());
     }
-    Err(parameter_not_found_message(name))
+    if family_engine_has_no_setting_named(family, name)
+        || published_for_another_engine(family, name)
+    {
+        return Err(parameter_not_found_message(name));
+    }
+    Ok(())
 }
 
 /// Refuse a setting a DB CLUSTER parameter group of `family` cannot carry: a parameter the

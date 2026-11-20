@@ -428,11 +428,20 @@ fn admitted_and_refused(spec: &ClusterParameterSpec) -> (Vec<String>, Vec<String
         Some((low, high)) => {
             let low: f64 = low.parse().expect("a float range bound");
             let high: f64 = high.parse().expect("a float range bound");
+            // One step outside each published bound. A bound at the largest double the
+            // service parses has no representable next value — `high + 1.0` IS `high` — so
+            // the value past it is the next order of magnitude, written as the decimal the
+            // request carries.
+            let past_high = if high + 1.0 > high {
+                (high + 1.0).to_string()
+            } else {
+                format!("{high}0")
+            };
             (
                 vec![low.to_string(), high.to_string()],
                 vec![
                     (low - 1.0).to_string(),
-                    (high + 1.0).to_string(),
+                    past_high,
                     "not-a-number".to_string(),
                 ],
             )
@@ -449,6 +458,21 @@ fn admitted_and_refused(spec: &ClusterParameterSpec) -> (Vec<String>, Vec<String
 /// vocabularies are driven by the suites that own them (`engine_default_parameters` for the
 /// published catalog, `cluster_parameter_groups` for the value rule over it).
 const CATALOG_FAMILIES: [&str; 4] = ["mysql8.0", "postgres16", "oracle-ee-19", "neptune1.3"];
+
+/// A setting the engine of `family` HAS and this front door publishes no catalog entry for:
+/// what the unpublished-name row of the value rule is driven with.
+///
+/// Source: each engine's own configuration reference — a MySQL system variable, a PostgreSQL
+/// server setting, an Oracle initialization parameter and one of the graph engine's own
+/// parameters, each outside the sample this front door publishes for its family.
+fn unpublished_setting_of(family: &str) -> &'static str {
+    match family {
+        "postgres16" => "effective_cache_size",
+        "oracle-ee-19" => "session_cached_cursors",
+        "neptune1.3" => "neptune_lab_mode",
+        _ => "innodb_old_blocks_time",
+    }
+}
 
 /// Every parameter a DB parameter group family publishes admits exactly the values its
 /// `AllowedValues` names, and refuses anything else with `InvalidParameterValue` — a message
@@ -538,9 +562,11 @@ async fn a_parameter_value_outside_the_published_set_is_refused() {
 
         // A parameter name the published catalog does not carry is admitted and stored as
         // sent: an engine publishes hundreds of parameters per family and this catalog is a
-        // sample of that list, so refusing an unpublished name would reject a parameter the
-        // engine has. It is reported without the metadata only a published parameter has.
-        let unpublished = "innodb_old_blocks_time";
+        // sample of that list, so refusing a name the ENGINE has would reject a parameter the
+        // family really carries. It is reported without the metadata only a published
+        // parameter has. The name is the family's OWN engine's, because a parameter belongs to
+        // an engine: another engine's name is no parameter of this family at all.
+        let unpublished = unpublished_setting_of(family);
         let case = format!("{family}: a parameter the catalog does not carry");
         assert!(
             catalog.iter().all(|spec| spec.name != unpublished),

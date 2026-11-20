@@ -622,7 +622,11 @@ impl ParameterVocabulary {
     /// Whether `engine` is one of the engines that share this vocabulary — the same reading
     /// [`engine_default_parameters`] selects its catalog by, so the two cannot disagree
     /// about which engines a published column is about.
-    fn is_spoken_by(self, engine: &str) -> bool {
+    ///
+    /// `pub(crate)` because the engine SETTINGS namespace is grouped by the same reading
+    /// (`crate::state::engine_has_no_setting_named`): one engine's namespace and one engine's
+    /// catalog must belong to the same server.
+    pub(crate) fn is_spoken_by(self, engine: &str) -> bool {
         match self {
             Self::MysqlCompatible => engine.ends_with("mysql") || engine == "mariadb",
             Self::PostgresCompatible => is_postgres_engine(engine),
@@ -1748,6 +1752,20 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         true,
         "",
         "Sets the maximum number of parallel processes per executor node.",
+    ),
+    parameter(
+        "random_page_cost",
+        crate::state::APPLY_TYPE_DYNAMIC,
+        "float",
+        // The engine bounds a planner cost factor by nothing but the floating-point domain
+        // itself, and RDS publishes that domain as the range below — the largest finite
+        // double, written the way the published catalog writes it.
+        "0-1.79769e+308",
+        "4",
+        true,
+        "",
+        // The engine's own settings-catalog text for the parameter, as RDS publishes it.
+        "Sets the planners estimate of the cost of a nonsequentially fetched disk page.",
     ),
     // The parameters Amazon RDS ADDS to the PostgreSQL engine carry its own `rds.`
     // namespace, and a DB parameter group of an RDS for PostgreSQL family publishes them

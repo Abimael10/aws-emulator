@@ -593,7 +593,10 @@ async fn a_parameter_the_family_publishes_carries_its_metadata() {
             "a parameter no catalog of an aurora family carries",
             "aurora-postgresql15",
             false,
-            "not_a_published_parameter",
+            // A setting the engine HAS and this front door publishes no record for: the
+            // family's catalog is a sample of AWS's list, so the name is carried and
+            // reported with none of the columns a published entry would add.
+            "wal_buffers",
             "4096",
         ),
         (

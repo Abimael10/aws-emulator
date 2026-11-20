@@ -369,7 +369,9 @@ const GROUPS: &[(&str, &str, &str, &str, &str, &str, bool)] = &[
     (
         "a family that publishes the parameter at neither level",
         "mariadb10.11",
-        "not_a_published_parameter",
+        // A system variable the engine HAS that neither catalog of its family publishes a
+        // record for: carried, and reported without the published columns.
+        "innodb_old_blocks_time",
         "1",
         "",
         "",

@@ -614,30 +614,31 @@ async fn a_reset_refuses_what_it_cannot_serve_and_changes_nothing() {
 }
 
 /// Names for the rows that are about HOW MANY parameters a request carries rather than
-/// about which: a name the published catalog does not carry is taken as sent, so these
-/// occupy a position without naming a setting the group holds.
+/// about which: each is a system variable the engine of [`PUBLISHED_FAMILY`] HAS and that the
+/// group under test holds no setting under, so it occupies a position in the request without
+/// naming a setting to drop.
 const PADDING_NAMES: [&str; 21] = [
-    "emu_pad_01",
-    "emu_pad_02",
-    "emu_pad_03",
-    "emu_pad_04",
-    "emu_pad_05",
-    "emu_pad_06",
-    "emu_pad_07",
-    "emu_pad_08",
-    "emu_pad_09",
-    "emu_pad_10",
-    "emu_pad_11",
-    "emu_pad_12",
-    "emu_pad_13",
-    "emu_pad_14",
-    "emu_pad_15",
-    "emu_pad_16",
-    "emu_pad_17",
-    "emu_pad_18",
-    "emu_pad_19",
-    "emu_pad_20",
-    "emu_pad_21",
+    "innodb_io_capacity",
+    "innodb_io_capacity_max",
+    "innodb_lock_wait_timeout",
+    "innodb_old_blocks_pct",
+    "innodb_old_blocks_time",
+    "innodb_open_files",
+    "innodb_page_cleaners",
+    "innodb_purge_threads",
+    "innodb_read_io_threads",
+    "innodb_write_io_threads",
+    "join_buffer_size",
+    "key_buffer_size",
+    "long_query_time",
+    "max_allowed_packet",
+    "max_connect_errors",
+    "max_heap_table_size",
+    "net_read_timeout",
+    "net_write_timeout",
+    "sort_buffer_size",
+    "table_open_cache",
+    "thread_cache_size",
 ];
 
 // ---------------------------------------------------------------------------

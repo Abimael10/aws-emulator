@@ -174,6 +174,11 @@ mod recommendations;
 mod event_subscriptions;
 mod option_groups;
 mod parameter_groups;
+// WHICH names an engine has a setting for at all — the engine's configuration namespace,
+// which is what decides whether a parameter group of one of its families HAS the parameter a
+// request names. Its own file beside the parameter-group records, because it is reference
+// data about the ENGINE rather than about any group.
+mod engine_settings;
 mod shard_groups;
 mod snapshots;
 // The tenant databases a DB snapshot CAPTURED, beside the snapshot records themselves:
@@ -190,6 +195,7 @@ pub use default_catalog::*;
 pub use event_catalog::*;
 pub use recommendations::*;
 pub use event_subscriptions::*;
+pub use engine_settings::*;
 pub use option_groups::*;
 pub use parameter_groups::*;
 pub use shard_groups::*;
