@@ -388,16 +388,24 @@ fn authorization_redirect(provider: &Provider, request: &DataPlaneRequest) -> Se
 }
 
 /// The callback the IdP sends the authorization answer back to: the load balancer's own
-/// authentication endpoint on the name the CLIENT addressed, which is the URL an IdP's
+/// authentication endpoint on the ADDRESS the CLIENT addressed, which is the URL an IdP's
 /// client registers as its callback.
 ///
 /// An authentication action is an HTTPS listener's — "[HTTPS listeners] Information for
 /// using Amazon Cognito to authenticate users" (`Action$AuthenticateCognitoConfig`) — so
 /// the callback is an `https` URL, carrying the port the client addressed where that is not
 /// the one `https` implies.
+///
+/// The whole authority is the one the client DIALLED — its host and its own port
+/// ([`DataPlaneRequest::client_port`]) — because this URL is the one the client comes back
+/// to: an authority assembled out of two different addresses, the client's host on the port
+/// of the listener the connection reached, names an address nothing need answer on, and the
+/// address a load balancer of this emulator is reached at is the `host:port` it published
+/// ([`crate::state::open_load_balancer_endpoint`]) rather than the port its listener
+/// declares.
 fn callback_url(request: &DataPlaneRequest) -> String {
     let port = request
-        .port
+        .client_port
         .filter(|port| *port != HTTPS_PORT)
         .map(|port| format!(":{port}"))
         .unwrap_or_default();
@@ -461,13 +469,16 @@ mod tests {
         }
     }
 
-    /// The request every row is answered for: a client that addressed one host.
+    /// The request every row is answered for: a client that addressed one host, on one port.
+    /// A client's own address is ONE authority, so the port it dialled is both the port that
+    /// decides which listener took the request and the port of the address it came from.
     fn addressed(host: &str, port: Option<i32>, cookie: Option<&str>) -> DataPlaneRequest {
         DataPlaneRequest {
             method: "GET".to_string(),
             path: "/".to_string(),
             host: host.to_string(),
             port,
+            client_port: port,
             headers: cookie
                 .map(|carried| vec![("cookie".to_string(), carried.to_string())])
                 .unwrap_or_default(),

@@ -687,8 +687,18 @@ pub(super) struct DataPlaneRequest {
     /// Every header, with its name lower-cased: a header condition names its header
     /// case-insensitively.
     pub(super) headers: Vec<(String, String)>,
-    /// The port the client addressed, when it named one.
+    /// The port that decides WHICH listener of the load balancer took the request, when the
+    /// request named one: the port of the authority it was ADDRESSED to. For a request a load
+    /// balancer's own socket forwarded, that authority is the one the leg was re-addressed to,
+    /// which carries the port of the listener the connection reached
+    /// ([`super::listener_socket`]) rather than the port the client dialled.
     pub(super) port: Option<i32>,
+    /// The port of the authority the CLIENT addressed — the one it dialled — when that
+    /// authority named one. Read off the same authority [`Self::host`] is, so the two together
+    /// are ONE address: the one a URL this plane announces for the client to come back to has
+    /// to lead to, because that is where the client is already talking. `None` for a client
+    /// that named no port, which is the port its scheme implies.
+    pub(super) client_port: Option<i32>,
     /// What the TLS connection this request arrived over negotiated, for one that arrived
     /// over TLS at all ([`ConnectionTls`]).
     pub(super) tls: ConnectionTls,
@@ -791,6 +801,10 @@ impl DataPlaneRequest {
             host: client_host.map(host_only).unwrap_or_default().to_string(),
             headers,
             port: addressed_port(addressed),
+            // The port of the authority the CLIENT addressed, read off the same authority its
+            // host is: what the client dialled, which is not what a leg this plane was
+            // re-addressed on carries.
+            client_port: addressed_port(client_host),
             tls,
             // The address the connection came from where this emulator knows one, and the
             // address a client reaches its sockets from where it does not.
@@ -838,6 +852,14 @@ impl DataPlaneRequest {
     /// addressing — the published name, the emulator's own endpoint, or any name a client
     /// resolves to the load balancer, which is what a `host-header` condition is written
     /// for — and is left exactly as it arrived.
+    ///
+    /// The published name is taken WHOLE: the port it carries becomes
+    /// [`Self::client_port`] too, because host and port are one address — the address that
+    /// name is reached at — and a URL announced for the client to come back to is built from
+    /// the pair ([`super::user_authentication`]). Reading the host off the published name and
+    /// the port off the endpoint the request arrived at would announce the published host on a
+    /// port the load balancer does not answer on. A published name carrying no port of its own
+    /// leaves none, which is the port its scheme implies.
     fn addressed_the_published_name(&mut self, dns_name: &str) {
         let this_api =
             service_named_by_host(&self.host).is_some_and(|named| named == super::ROUTE_KEY);
@@ -845,6 +867,7 @@ impl DataPlaneRequest {
             return;
         }
         self.host = host_only(dns_name).to_string();
+        self.client_port = addressed_port(Some(dns_name));
     }
 }
 
