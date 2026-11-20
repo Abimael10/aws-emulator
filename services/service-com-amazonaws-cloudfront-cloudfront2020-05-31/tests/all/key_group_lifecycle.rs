@@ -37,8 +37,8 @@
 use std::collections::BTreeSet;
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    id_format_invalid_message, KEY_GROUP_ALREADY_EXISTS_MESSAGE,
-    KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE, MAX_KEY_GROUPS, MAX_KEY_GROUP_COMMENT,
+    id_format_invalid_message, key_group_without_a_public_key_message,
+    KEY_GROUP_ALREADY_EXISTS_MESSAGE, MAX_KEY_GROUPS, MAX_KEY_GROUP_COMMENT,
     MAX_PUBLIC_KEYS_IN_KEY_GROUP, NO_SUCH_KEY_GROUP_MESSAGE, TOO_MANY_KEY_GROUPS_MESSAGE,
     TOO_MANY_PUBLIC_KEYS_IN_KEY_GROUP_MESSAGE,
 };
@@ -468,6 +468,9 @@ async fn a_name_identifies_one_key_group() {
 async fn a_configuration_outside_the_documented_bounds_is_refused() {
     let router = emulator();
     let minted = mint_public_keys(&router, "key-group-bounds", 3).await;
+    // The sentence a configuration naming no public key is refused with: the service's own,
+    // read off the refusal rather than written out here.
+    let no_public_key = key_group_without_a_public_key_message();
 
     // Each row is a configuration past one documented bound, with the code and the
     // sentence the operation models for it.
@@ -480,7 +483,7 @@ async fn a_configuration_outside_the_documented_bounds_is_refused() {
                 comment: None,
             },
             "InvalidArgument",
-            KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE,
+            no_public_key.as_str(),
         ),
         (
             Group {
@@ -490,7 +493,7 @@ async fn a_configuration_outside_the_documented_bounds_is_refused() {
                 comment: Some("a group that names nothing".to_string()),
             },
             "InvalidArgument",
-            KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE,
+            no_public_key.as_str(),
         ),
         (
             Group {

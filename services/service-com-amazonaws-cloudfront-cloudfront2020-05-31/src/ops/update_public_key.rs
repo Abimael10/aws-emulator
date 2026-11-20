@@ -227,7 +227,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let comment_length = config.comment.as_deref().unwrap_or_default().chars().count();
         if comment_length > crate::state::MAX_PUBLIC_KEY_COMMENT {
             return Err(UpdatePublicKeyErrorModeled::InvalidArgument(
-                crate::state::comment_too_long(comment_length),
+                crate::state::comment_too_long(),
             )
             .into());
         }

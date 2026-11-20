@@ -10,6 +10,10 @@
 //! checked against. Reports the record as it then stands, read from the store rather than
 //! from the request.
 //!
+//! What is stored is the submitted configuration RESOLVED, exactly as the create stores one
+//! ([`crate::state::resolve_key_group_config`]): `Items` is the group's membership, so a
+//! public key id the payload repeats is held — and reported — once.
+//!
 //! The refusals, in the order they are checked — each one BEFORE anything is written, so a
 //! refused update leaves the stored group, its version token and its `LastModifiedTime`
 //! exactly as they were:
@@ -23,8 +27,9 @@
 //!   ([`crate::state::PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE`]) — so an update only
 //!   lands on the configuration its caller actually read
 //!   ([`crate::state::check_if_match`]);
-//! * a configuration that names no public key at all, whose `Comment` is past the
-//!   documented 128 characters, or that names a public key this account holds none of —
+//! * a configuration whose `Name` is longer than the service admits, that names no public key
+//!   at all, whose `Comment` is past the documented 128 characters, or that names a public key
+//!   this account holds none of —
 //!   `InvalidArgument` (HTTP 400), the SAME judgement the create path makes
 //!   ([`crate::state::key_group_config_refusal`]), because each rule is about the
 //!   CONFIGURATION rather than about the call that submits it, so an update cannot store one
@@ -191,7 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
         let _ = ctx;
-        let config = input.key_group_config;
+        // The configuration as the service will HOLD it, resolved exactly as the create
+        // resolves one ([`crate::state::resolve_key_group_config`]): `Items` is the group's
+        // membership, so a public key id the payload repeats names one member. Resolved before
+        // the judgement below, so what is judged — and what then replaces the stored
+        // configuration — is the one configuration this group runs under.
+        let config = crate::state::resolve_key_group_config(input.key_group_config);
         let now = SystemTime::now();
         let mut store = state.lock();
         // Materialise whatever the clock owes the rest of the store before this call reads

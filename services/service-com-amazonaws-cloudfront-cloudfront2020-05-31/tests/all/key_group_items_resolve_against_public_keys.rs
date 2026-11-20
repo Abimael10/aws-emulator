@@ -549,8 +549,10 @@ async fn an_id_whose_public_key_was_deleted_cannot_be_named_again() {
     third.assert_matches(config, "GetKeyGroup", &read.raw);
 }
 
-/// Every configuration whose entries ALL resolve is stored as submitted, whatever the count
-/// and the order: the rule refuses an unresolvable entry and nothing else.
+/// Every configuration whose entries ALL resolve is stored, whatever the count and the order:
+/// the rule refuses an unresolvable entry and nothing else. What the group then HOLDS is its
+/// membership, so a list naming one held key twice holds it once
+/// (`key_group_items_are_a_set.rs` owns that rule).
 #[tokio::test]
 async fn a_configuration_naming_only_keys_the_account_holds_is_accepted() {
     let router = emulator();
@@ -567,8 +569,8 @@ async fn a_configuration_naming_only_keys_the_account_holds_is_accepted() {
             items: keys[..count].iter().rev().cloned().collect(),
         });
     }
-    // One list naming the same held key twice: the rule is about each entry resolving, and
-    // the model puts no uniqueness constraint on the list.
+    // One list naming the same held key twice: the rule here is about each entry resolving,
+    // and a held key named twice resolves as surely as one named once.
     rows.push(Row {
         case: "one held key named twice".to_string(),
         items: vec![keys[0].clone(), keys[0].clone()],
@@ -587,12 +589,24 @@ async fn a_configuration_naming_only_keys_the_account_holds_is_accepted() {
             "case {:?}: expected HTTP 201 from CreateKeyGroup, got {} with {}",
             row.case, answer.status, answer.raw
         );
+        // The group holds each public key its configuration names ONCE, at the place of that
+        // id's first mention, so the readback of a row naming a key twice reports it once.
+        let mut held: Vec<String> = Vec::new();
+        for item in &row.items {
+            if !held.contains(item) {
+                held.push(item.clone());
+            }
+        }
+        let stored = Group {
+            items: held,
+            ..submitted.clone()
+        };
         let id = answer.root().text_at("Id").unwrap_or_default().to_string();
         let read = get_group(&router, &id).await;
         let config = read
             .root()
             .at("KeyGroupConfig")
             .unwrap_or_else(|| panic!("case {:?}: no configuration in {}", row.case, read.raw));
-        submitted.assert_matches(config, "GetKeyGroup", &read.raw);
+        stored.assert_matches(config, "GetKeyGroup", &read.raw);
     }
 }

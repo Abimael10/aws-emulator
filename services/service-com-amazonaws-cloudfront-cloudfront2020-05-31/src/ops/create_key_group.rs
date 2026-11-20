@@ -12,10 +12,15 @@
 //! store.
 //!
 //! The configuration itself is judged by the rules both key group writes make
-//! ([`crate::state::key_group_config_refusal`]) — it names at least one public key, its
-//! comment is within the documented bound, it names no more keys than the published quota,
-//! and every id it names resolves to a public key this account holds — each checked BEFORE
+//! ([`crate::state::key_group_config_refusal`]) — its name is within the length the service
+//! admits, it names at least one public key, its comment is within the documented bound, it
+//! names no more keys than the published quota, and every id it names resolves to a public key
+//! this account holds — each checked BEFORE
 //! the id and the version token are minted, so a refused create stores nothing.
+//!
+//! What is then STORED is that configuration resolved
+//! ([`crate::state::resolve_key_group_config`]): `Items` is the group's membership, so a
+//! public key id the payload repeats is held — and reported — once.
 //!
 //! ## Shape of an operation
 //!
@@ -165,7 +170,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
         let _ = ctx;
-        let config = input.key_group_config;
+        // The configuration as the service will HOLD it: `Items` is the group's membership, so
+        // a public key id the payload repeats names one member
+        // ([`crate::state::resolve_key_group_config`]). Resolved before the judgement below,
+        // so what is judged — and what is then stored — is the one configuration this group
+        // runs under rather than the document that was submitted.
+        let config = crate::state::resolve_key_group_config(input.key_group_config);
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // Materialise whatever the clock owes the rest of the store before this call reads
@@ -218,8 +228,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let etag = store.next_etag();
         let stored = crate::state::StoredKeyGroup {
             id: id.clone(),
-            // Stored whole: a later read answers from this record, never from the request
-            // that was served — down to the members this create left out.
+            // Stored whole, as resolved above: a later read answers from this record, never
+            // from the request that was served — down to the members this create left out.
             config,
             // "The date and time when the key group was last modified": the instant this
             // call stored it, written once so every later read reports the same one until

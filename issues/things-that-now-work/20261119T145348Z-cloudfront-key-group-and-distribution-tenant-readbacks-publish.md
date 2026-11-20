@@ -47,3 +47,34 @@ Cause 2 — ListDistributionTenants 200->200, key $.ListDistributionTenantsResul
 1. git clone the repo, boot the emulator built from that checkout, and replay the wire corpus (trace set simparity-wire-aws-v1).
 2. Representative step: fixture cloudfront-key-group-config-bounds-and-member-dedup, step task#11 — PUT /2020-05-31/key-group/<Id> whose KeyGroupConfig.Items names the same public key id twice, with the current If-Match. Inspect KeyGroup.KeyGroupConfig.Items in the 200 body: AWS serializes one PublicKey element, the emulator serializes two.
 3. Fixture cloudfront-distribution-tenant-lifecycle, step task#4 — POST /2020-05-31/distribution-tenants and read DistributionTenantList/DistributionTenantSummary/ETag. Compare it with the ETag the tenant's preceding create/update step in the same fixture published, and then re-use the listed ETag as If-Match on an update of that tenant: it must be accepted as the tenant's current version.
+
+## Resolution
+
+Cause 1 FIXED, cause 2 DECLINED as a per-run value (and pinned by a suite instead).
+
+- Cause 1 FIXED: a key group's `Items` is the group's MEMBERSHIP, so a public key id a payload
+  repeats names one member. The submitted configuration is now RESOLVED before it is judged and
+  stored (`state::key_group_config::resolve_key_group_config`, reached by `CreateKeyGroup`,
+  `UpdateKeyGroup` and `apply_key_group_config`), collapsing repeated ids and keeping the place of
+  each id's first mention, so every readback of a group — the create's and the update's own body,
+  `GetKeyGroup`, `GetKeyGroupConfig`, `ListKeyGroups` and a distribution's
+  `ActiveTrustedKeyGroups` — reports each of its keys once, and a read-modify-write round trip is
+  stable. `tests/all/key_group_items_are_a_set.rs` pins it over a table of repetition shapes on
+  both writes and every readback.
+- Along the way, so the replayed fixture gets past the causes it then failed on (all of them the
+  property of a key group CONFIGURATION, judged in the one place both writes judge one), the
+  refusals of that configuration now carry CloudFront's own wording and the two rules about its
+  `Name`: a name past the length the service admits ("too big"), a name carrying a character it
+  does not admit ("contains illegal characters"), a key list naming no public key (an invalid
+  `publicKeyIdsList`), and a `Comment` past its member's documented bound ("too big", one sentence
+  for every surface of this service that carries a `Comment`).
+  `tests/all/key_group_configuration_members.rs` pins each sentence as a literal, at and past each
+  bound, on the create and the update.
+- Cause 2 DECLINED: a version token is a per-run, server-generated value. The summary a listing
+  reports already carries the tenant's own stored current version — `state.rs`'s
+  `StoredDistributionTenant::to_summary` reads `self.etag`, the token the create, the update, the
+  web ACL association and `GetDistributionTenant` publish — so a client can take it out of a
+  listing and modify or delete the tenant with it; nothing on a read path mints or re-derives one.
+  `tests/all/tenant_listing_version_token.rs` pins that across the create, an
+  `UpdateDistributionTenant` and an `AssociateDistributionTenantWebACL`, including the
+  list-then-modify path and the refusal of the superseded token.

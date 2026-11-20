@@ -1434,7 +1434,7 @@ pub fn cache_policy_config_invalid(config: &CachePolicyConfig) -> Option<String>
     if let Some(comment) = &config.comment {
         let length = comment.chars().count();
         if length > MAX_CACHE_POLICY_COMMENT {
-            return comment_too_long(length).message;
+            return comment_too_long().message;
         }
     }
 
@@ -2788,18 +2788,26 @@ pub fn streaming_distribution_already_exists_message(existing_id: &str) -> Strin
 /// create path checks it itself.
 pub const MAX_ORIGIN_ACCESS_IDENTITY_COMMENT: usize = 128;
 
-/// The modelled `InvalidArgument` for an origin access identity comment past
-/// [`MAX_ORIGIN_ACCESS_IDENTITY_COMMENT`].
+/// The modelled `InvalidArgument` for a `Comment` longer than the member admits — the ONE
+/// refusal every comment bound in this service is served with.
 ///
-/// The message states the CONSTRAINT the request broke and the length it submitted, which
-/// is the rule the refusal is built from rather than text echoed out of the request.
-pub fn comment_too_long(length: usize) -> crate::ops::types::InvalidArgument {
+/// Recorded behaviour: CloudFront refuses the condition as the PARAMETER the value arrived in
+/// ([`parameter_too_big_message`]), named as the model names the member
+/// ([`COMMENT_MEMBER`]). The whole sentence is fixed text: neither the bound nor the length
+/// submitted is echoed, so one comment past the bound and another far past it read alike, and
+/// every surface that carries a `Comment` refuses it with this one sentence.
+pub fn comment_too_long() -> crate::ops::types::InvalidArgument {
     crate::ops::types::InvalidArgument {
-        message: Some(format!(
-            "An argument is invalid: the comment cannot be longer than \
-             {MAX_ORIGIN_ACCESS_IDENTITY_COMMENT} characters but the request submits {length}"
-        )),
+        message: Some(comment_too_long_message()),
     }
+}
+
+/// The member a comment arrives in, as every configuration of this service names it.
+pub const COMMENT_MEMBER: &str = "Comment";
+
+/// The message a comment past its member's bound is refused with.
+pub fn comment_too_long_message() -> String {
+    parameter_too_big_message(COMMENT_MEMBER)
 }
 
 /// The modelled `NoSuchResponseHeadersPolicy` (HTTP 404) for an id neither source of
@@ -4091,20 +4099,123 @@ pub const TOO_MANY_PUBLIC_KEYS_IN_KEY_GROUP_MESSAGE: &str =
 ///
 /// `CreateKeyGroup` documents the requirement — "To create a key group, you must specify
 /// at least one public key for the key group" — and the model's `PublicKeyIdList` carries
-/// no length constraint, so the bound is not refused before a handler runs and the create
-/// path checks it itself. The sentence states the CONSTRAINT rather than echoing the
-/// request, as [`comment_too_long`] does for the other documented bound on a
-/// configuration.
+/// no length constraint, so the bound is not refused before a handler runs and the key group
+/// path checks it itself. CloudFront reports the condition against the PARAMETER the list
+/// arrived in ([`invalid_parameter_message`]), named as the wire reports that member
+/// ([`PUBLIC_KEY_IDS_LIST_PARAMETER`]): recorded behaviour, and the form this service's other
+/// refusals of an unusable parameter already take. Nothing of the request or of the store is
+/// echoed — the parameter is what the caller has to fix — and the sentence is about the
+/// CONFIGURATION rather than about the call carrying it, so the create and the update read
+/// alike.
 pub fn key_group_without_a_public_key() -> crate::ops::types::InvalidArgument {
     crate::ops::types::InvalidArgument {
-        message: Some(KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE.to_string()),
+        message: Some(key_group_without_a_public_key_message()),
     }
 }
 
-/// The message a key group create naming no public key is refused with.
-pub const KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE: &str =
-    "An argument is invalid: to create a key group, you must specify at least one public \
-     key for the key group";
+/// The name the WIRE reports `KeyGroupConfig$Items` under, which is the name CloudFront's
+/// refusal of that member carries.
+pub const PUBLIC_KEY_IDS_LIST_PARAMETER: &str = "publicKeyIdsList";
+
+/// The message a key group write naming no public key is refused with.
+pub fn key_group_without_a_public_key_message() -> String {
+    invalid_parameter_message(PUBLIC_KEY_IDS_LIST_PARAMETER)
+}
+
+/// The sentence CloudFront refuses a PARAMETER it cannot use the value of with: fixed text
+/// around the name of the member, and nothing of the value it carried.
+///
+/// ONE template for every such refusal this service serves, so no two of them can word the
+/// same condition differently.
+pub fn invalid_parameter_message(parameter: &str) -> String {
+    format!("The parameter {parameter} is invalid.")
+}
+
+/// The sentence CloudFront refuses a PARAMETER whose value is longer than it admits with:
+/// fixed text around the name of the member, and nothing of the value or of the bound.
+///
+/// The companion of [`invalid_parameter_message`] for the one condition CloudFront words
+/// differently — a value that is too big rather than one it cannot read — stated once for
+/// every member refused that way.
+pub fn parameter_too_big_message(parameter: &str) -> String {
+    format!("The parameter {parameter} is too big.")
+}
+
+/// The longest name a key group carries.
+///
+/// `KeyGroupConfig$Name` is "a name to identify the key group" and carries no `@length` in the
+/// model, so the bound is not refused before a handler runs and the key group path checks it
+/// itself. Recorded behaviour on both sides of it: CloudFront refuses a longer name as the
+/// parameter it arrived in ([`key_group_name_too_long`]), and the names a recorded create is
+/// SERVED for are inside this bound — so the value held to is the 128 characters the key group
+/// surface states for the other free-text member of the same configuration
+/// ([`MAX_KEY_GROUP_COMMENT`]), one bound for the configuration's text rather than a second
+/// literal. A longer limit would admit a name the recording has the service refuse; a shorter
+/// one would refuse a name it has the service store.
+pub const MAX_KEY_GROUP_NAME: usize = MAX_KEY_GROUP_COMMENT;
+
+/// The name the WIRE reports `KeyGroupConfig$Name` under, which is the name CloudFront's
+/// refusal of that member carries.
+pub const KEY_GROUP_NAME_PARAMETER: &str = "KeyGroupName";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a key group name longer than
+/// [`MAX_KEY_GROUP_NAME`].
+///
+/// Recorded behaviour: the whole sentence is fixed text naming the PARAMETER the name arrived
+/// in ([`parameter_too_big_message`]) — neither the submitted name nor the bound is echoed, so
+/// the refusal reads the same for every name past it.
+pub fn key_group_name_too_long() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(key_group_name_too_long_message()),
+    }
+}
+
+/// The message a key group write naming a name past [`MAX_KEY_GROUP_NAME`] is refused with.
+pub fn key_group_name_too_long_message() -> String {
+    parameter_too_big_message(KEY_GROUP_NAME_PARAMETER)
+}
+
+/// Whether `name` is a name a key group of this account can be identified by: a name built
+/// from the characters CloudFront admits in one.
+///
+/// `KeyGroupConfig$Name` is "a name to identify the key group" and carries no `@pattern` in the
+/// model, so the alphabet is not enforced before a handler runs. Recorded behaviour on both
+/// sides of it: CloudFront refuses a name carrying a character outside the alphabet
+/// ([`key_group_name_illegal_characters`]), and every name a recorded create or update is SERVED
+/// for is written from ASCII letters, digits, `-` and `_` — which is also the alphabet this
+/// service's model states for the other name it constrains, `KeyValueStoreName`'s
+/// `^[a-zA-Z0-9-_]{1,64}$`, read through [`is_key_value_store_name`], so one alphabet serves
+/// both rather than a second reading of its own.
+///
+/// The rule is about the CHARACTERS a name carries, so the empty name is not refused here: the
+/// member is `@required`, which is what refuses a name that is absent, and this service has no
+/// recorded refusal of an empty one to word — a name no group is identified by is left to the
+/// uniqueness rule, which the group holding it then owns.
+pub fn is_key_group_name(name: &str) -> bool {
+    name.bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+/// The name the WIRE reports the offending member under when a key group name carries a
+/// character CloudFront does not admit: the member's own name, as the recorded refusal of that
+/// condition carries it.
+pub const KEY_GROUP_NAME_MEMBER: &str = "Name";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a key group name carrying a character
+/// CloudFront does not admit in one ([`is_key_group_name`]).
+///
+/// Recorded behaviour: the whole sentence is fixed text naming the member the value arrived in
+/// and nothing of the value itself, so the refusal reads the same for every such name.
+pub fn key_group_name_illegal_characters() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(key_group_name_illegal_characters_message()),
+    }
+}
+
+/// The message a key group write naming a name outside [`is_key_group_name`] is refused with.
+pub fn key_group_name_illegal_characters_message() -> String {
+    format!("The parameter {KEY_GROUP_NAME_MEMBER} contains illegal characters.")
+}
 
 /// The modelled `InvalidArgument` (HTTP 400) for a key group configuration whose `Items`
 /// name a public key this account holds none of.
@@ -4115,8 +4226,8 @@ pub const KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE: &str =
 /// configuration as unusable rather than storing a reference to a key that is not there. The
 /// sentence states the CONDITION — the configuration names a public key that does not exist
 /// — so nothing from the request or from the store belongs in it, as
-/// [`KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE`] carries nothing for the other rule about the
-/// same member.
+/// [`key_group_without_a_public_key_message`] carries nothing of the value for the other rule
+/// about the same member.
 pub fn absent_public_key_in_key_group() -> crate::ops::types::InvalidArgument {
     crate::ops::types::InvalidArgument {
         message: Some(ABSENT_PUBLIC_KEY_IN_KEY_GROUP_MESSAGE.to_string()),

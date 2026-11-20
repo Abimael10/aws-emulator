@@ -283,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if comment_length > crate::state::MAX_FIELD_LEVEL_ENCRYPTION_PROFILE_COMMENT {
             return Err(
                 UpdateFieldLevelEncryptionProfileErrorModeled::InvalidArgument(
-                    crate::state::comment_too_long(comment_length),
+                    crate::state::comment_too_long(),
                 )
                 .into(),
             );

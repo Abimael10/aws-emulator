@@ -2805,7 +2805,10 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         let etag = self.next_etag();
         let stored = self.key_groups.get_mut(id)?;
-        stored.config = config;
+        // Stored RESOLVED, exactly as the create stores it
+        // ([`resolve_key_group_config`]): the group holds each public key the configuration
+        // names once.
+        stored.config = resolve_key_group_config(config);
         stored.last_modified_time = now;
         stored.etag = etag;
         Some(stored)

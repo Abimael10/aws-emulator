@@ -181,8 +181,7 @@ const ROWS: &[Row] = &[
         entries: &[Entry::Create, Entry::Update],
         status: 400,
         code: "InvalidArgument",
-        served: "An argument is invalid: to create a key group, you must specify at least one \
-                 public key for the key group",
+        served: "The parameter publicKeyIdsList is invalid.",
         documented: "An argument is invalid.",
     },
     Row {

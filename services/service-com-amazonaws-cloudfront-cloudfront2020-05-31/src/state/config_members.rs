@@ -109,7 +109,7 @@ pub enum ConfigMemberRefusal {
 /// named for the member.
 pub fn invalid_parameter(parameter: &str) -> ConfigMemberRefusal {
     ConfigMemberRefusal::InvalidArgument(crate::ops::types::InvalidArgument {
-        message: Some(format!("The parameter {parameter} is invalid.")),
+        message: Some(invalid_parameter_message(parameter)),
     })
 }
 

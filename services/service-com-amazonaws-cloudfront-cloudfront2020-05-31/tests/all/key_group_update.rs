@@ -37,8 +37,8 @@
 //! lifecycle and distribution lifecycle suites', reused rather than copied.
 
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    comment_too_long, INVALID_IF_MATCH_VERSION_MESSAGE, KEY_GROUP_ALREADY_EXISTS_MESSAGE,
-    KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE, MAX_KEY_GROUP_COMMENT, MAX_PUBLIC_KEYS_IN_KEY_GROUP,
+    comment_too_long, key_group_without_a_public_key_message, INVALID_IF_MATCH_VERSION_MESSAGE,
+    KEY_GROUP_ALREADY_EXISTS_MESSAGE, MAX_KEY_GROUP_COMMENT, MAX_PUBLIC_KEYS_IN_KEY_GROUP,
     NO_SUCH_KEY_GROUP_MESSAGE, PRECONDITION_FAILED_FOR_THIS_OPERATION_MESSAGE,
     TOO_MANY_PUBLIC_KEYS_IN_KEY_GROUP_MESSAGE,
 };
@@ -728,11 +728,10 @@ struct Bound {
     refusal: Option<(&'static str, String)>,
 }
 
-/// The sentence an over-long comment is refused with, for a comment of `length`
-/// characters: the service's own, which states the constraint and the length submitted, so
-/// a row expecting it pins the variable part without restating the text.
-fn over_long_comment(length: usize) -> String {
-    comment_too_long(length).message.unwrap_or_default()
+/// The sentence an over-long comment is refused with: the service's own, which names the
+/// member and echoes nothing of the value, so a row expecting it restates no text.
+fn over_long_comment() -> String {
+    comment_too_long().message.unwrap_or_default()
 }
 
 /// The documented bounds on a key group CONFIGURATION hold on an update exactly as they
@@ -785,7 +784,7 @@ async fn a_configuration_outside_the_documented_bounds_is_refused() {
             comment: None,
             refusal: Some((
                 "InvalidArgument",
-                KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE.to_string(),
+                key_group_without_a_public_key_message(),
             )),
         },
         Bound {
@@ -794,7 +793,7 @@ async fn a_configuration_outside_the_documented_bounds_is_refused() {
             comment: Some("a group that names nothing".to_string()),
             refusal: Some((
                 "InvalidArgument",
-                KEY_GROUP_WITHOUT_A_PUBLIC_KEY_MESSAGE.to_string(),
+                key_group_without_a_public_key_message(),
             )),
         },
         Bound {
@@ -813,16 +812,16 @@ async fn a_configuration_outside_the_documented_bounds_is_refused() {
             case: "a comment one character past the published bound".to_string(),
             items: keys[..1].to_vec(),
             comment: Some("c".repeat(MAX_KEY_GROUP_COMMENT + 1)),
-            // The refusal states the constraint and the length submitted, so the sentence
-            // The refusal states the constraint and the LENGTH submitted, so the sentence
-            // this row expects is read off that length rather than written out here.
-            refusal: Some(("InvalidArgument", over_long_comment(MAX_KEY_GROUP_COMMENT + 1))),
+            // The refusal names the MEMBER and echoes nothing of the value, so the sentence
+            // this row expects is read off the service's own refusal rather than written out
+            // here.
+            refusal: Some(("InvalidArgument", over_long_comment())),
         },
         Bound {
             case: "a comment far past the published bound".to_string(),
             items: keys[..1].to_vec(),
             comment: Some("c".repeat(MAX_KEY_GROUP_COMMENT * 4)),
-            refusal: Some(("InvalidArgument", over_long_comment(MAX_KEY_GROUP_COMMENT * 4))),
+            refusal: Some(("InvalidArgument", over_long_comment())),
         },
         Bound {
             // The bound counts CHARACTERS, so a comment of that many multi-byte characters
@@ -836,9 +835,9 @@ async fn a_configuration_outside_the_documented_bounds_is_refused() {
             case: "a multi-byte comment one character past the published bound".to_string(),
             items: keys[..1].to_vec(),
             comment: Some("é".repeat(MAX_KEY_GROUP_COMMENT + 1)),
-            // The length the refusal states is a CHARACTER count, so a multi-byte comment
-            // one character past the bound draws the same sentence as a single-byte one.
-            refusal: Some(("InvalidArgument", over_long_comment(MAX_KEY_GROUP_COMMENT + 1))),
+            // The bound the refusal is about counts CHARACTERS, so a multi-byte comment one
+            // character past it draws the same sentence as a single-byte one.
+            refusal: Some(("InvalidArgument", over_long_comment())),
         },
     ];
 
