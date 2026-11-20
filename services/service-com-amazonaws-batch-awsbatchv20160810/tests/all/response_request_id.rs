@@ -134,12 +134,14 @@ async fn answers(batch: &Batch) -> Vec<Answer> {
             stated: Stated::Nothing,
         },
         Answer {
-            // The scaffold's 501: an answer a still-stubbed operation produced.
-            label: "TerminateServiceJobs, a scaffolded operation".to_string(),
+            // A bulk answer, whose outcome is reported per job inside a 200 rather than as
+            // the call's status. (The 501 an answer NO operation produced carries is the
+            // last row below: this service has no scaffolded operation left.)
+            label: "TerminateServiceJobs, reporting per job".to_string(),
             method: "POST",
             uri: "/v1/terminateservicejobs".to_string(),
             payload: Some(json!({"jobs": ["sj-reported"], "reason": "because"})),
-            status: 501,
+            status: 200,
             stated: Stated::Nothing,
         },
         Answer {

@@ -316,7 +316,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.queue_divides_capacity_by_quota_share(&queue_arn) {
             let Some(share_name) = input.quota_share_name.as_deref() else {
                 return Err(SubmitServiceJobErrorModeled::ClientException(
-                    batch::client_exception(batch::quota_share_name_required_message(&queue_arn)),
+                    batch::client_exception(batch::QUOTA_SHARE_NAME_REQUIRED),
                 )
                 .into());
             };

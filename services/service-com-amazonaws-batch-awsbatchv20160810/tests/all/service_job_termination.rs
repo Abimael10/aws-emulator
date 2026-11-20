@@ -16,6 +16,11 @@
 //! * `DescribeServiceJob` ("The details of a service job") reports the stored record
 //!   member for member, and answers the modelled `ClientException` (HTTP 400) for a
 //!   `jobId` the service holds no service job for.
+//! * `TerminateServiceJobs` ("a bulk version of `TerminateServiceJob`") ends every id it
+//!   lists through that same machinery and reports the outcome PER JOB — 200 with every id
+//!   given back in `successful`, an empty `errors`, and an id no service job answers to
+//!   "treated as successfully processed" — while a request past the documented maximum of
+//!   ids is refused whole and ends nothing.
 //!
 //! Each test asserts its rule over a SET of inputs: every non-terminal and every
 //! terminal `ServiceJobStatus` the model declares, reasons differing in size and
@@ -195,6 +200,16 @@ pub(crate) async fn terminate(batch: &Batch, case: &str, job_id: &str, reason: &
         json!({}),
         "case {case}: TerminateServiceJob models no output members, got {body}"
     );
+}
+
+/// `TerminateServiceJobs` (the BULK form) over the wire: the status and the decoded body.
+async fn terminate_many(batch: &Batch, jobs: &[String], reason: &str) -> (u16, Value) {
+    batch
+        .call(
+            "/v1/terminateservicejobs",
+            json!({"jobs": jobs, "reason": reason}),
+        )
+        .await
 }
 
 /// `detail` with the members a termination is allowed to change removed, so two of these
@@ -602,6 +617,197 @@ async fn describe_service_job_reports_the_stored_record_member_for_member() {
                      {detail}"
                 );
             }
+        }
+    }
+}
+
+/// RULE: `TerminateServiceJobs` is the bulk `TerminateServiceJob` — every id it lists is
+/// ended exactly as one call per id would end it, and the outcome is reported PER JOB
+/// rather than as the call's status: the call answers 200 with every id it was given in
+/// `successful` ("Service jobs that can't be found are treated as successfully processed")
+/// and an empty `errors`, a job already in a terminal status is left exactly as it is, an
+/// unknown id changes nothing, and a service job the request does NOT list is untouched.
+///
+/// The one request spans what the rule generalises over: a live job in every non-terminal
+/// `ServiceJobStatus` the model declares, a job in each terminal status, two forms of
+/// unknown id, and the same id listed twice.
+#[tokio::test]
+async fn terminating_service_jobs_in_bulk_ends_each_listed_job_as_the_singular_call_does() {
+    const REASON: &str = "end them all";
+    let batch = Batch::new();
+
+    let live: Vec<ServiceJob> = live_statuses()
+        .iter()
+        .map(|status| seed(&batch, status, Filled::Everything))
+        .collect();
+    let already_ended: Vec<ServiceJob> = TERMINAL_STATUSES
+        .iter()
+        .map(|status| seed(&batch, status, Filled::Everything))
+        .collect();
+    // A live service job the request never names: nothing may happen to it.
+    let unlisted = seed(&batch, state::SERVICE_JOB_SUBMITTED, Filled::Required);
+    let unknown: Vec<String> = vec![
+        "does-not-exist".to_string(),
+        "00000000-0000-4000-8000-000000000000".to_string(),
+    ];
+
+    let mut ended_before: Vec<Value> = Vec::new();
+    for job in &already_ended {
+        ended_before.push(described(&batch, "already ended", &job.job_id).await);
+    }
+
+    let mut listed: Vec<String> = live.iter().map(|job| job.job_id.clone()).collect();
+    listed.extend(already_ended.iter().map(|job| job.job_id.clone()));
+    listed.extend(unknown.iter().cloned());
+    // Every id named so far is a distinct job, and `successful` names the JOBS whose
+    // termination the call accepted — so this is the answer expected, whatever the request
+    // repeats after it.
+    let expected: Vec<String> = listed.clone();
+    // The same id once more: one request naming one job twice.
+    listed.push(live[0].job_id.clone());
+
+    let (status, body) = terminate_many(&batch, &listed, REASON).await;
+    assert_eq!(
+        status, 200,
+        "case the bulk termination: expected 200, got {status} {body}"
+    );
+    assert_eq!(
+        body["successful"],
+        json!(expected),
+        "case the bulk termination: every job the request named is successful, and the job it \
+         named twice once, got {body}"
+    );
+    assert_eq!(
+        body["errors"],
+        json!([]),
+        "case the bulk termination: no id this service could address failed, got {body}"
+    );
+
+    for job in &live {
+        let case = format!("the {} job the bulk call listed", job.status);
+        let after = described(&batch, &case, &job.job_id).await;
+        assert_eq!(
+            after["status"].as_str(),
+            Some(state::SERVICE_JOB_FAILED),
+            "case {case}: a bulk-terminated service job ends FAILED, got {after}"
+        );
+        assert_eq!(
+            after["statusReason"].as_str(),
+            Some(REASON),
+            "case {case}: the caller's reason is what DescribeServiceJob reports, got {after}"
+        );
+        assert_eq!(
+            after["isTerminated"].as_bool(),
+            Some(true),
+            "case {case}: a bulk-terminated service job reports isTerminated, got {after}"
+        );
+        assert!(
+            after["stoppedAt"]
+                .as_i64()
+                .is_some_and(|stopped| stopped >= job.created_at),
+            "case {case}: expected stoppedAt at or after createdAt {}, got {after}",
+            job.created_at
+        );
+    }
+
+    for (job, before) in already_ended.iter().zip(&ended_before) {
+        let case = format!("the {} job the bulk call listed", job.status);
+        let after = described(&batch, &case, &job.job_id).await;
+        assert_eq!(
+            &after, before,
+            "case {case}: a job that already ended is left exactly as it is, got {after}"
+        );
+    }
+
+    for id in &unknown {
+        let (status, body) = describe(&batch, id).await;
+        assert_eq!(
+            status, 400,
+            "case {id:?}: an id the bulk call could not resolve stays unresolvable, got \
+             {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ClientException",
+            "case {id:?}: expected the modelled ClientException, got {body}"
+        );
+    }
+
+    let after = described(&batch, "the unlisted job", &unlisted.job_id).await;
+    assert_eq!(
+        after["status"].as_str(),
+        Some(state::SERVICE_JOB_SUBMITTED),
+        "case the unlisted job: a bulk call ends only what it listed, got {after}"
+    );
+    assert_eq!(
+        after["isTerminated"].as_bool(),
+        Some(false),
+        "case the unlisted job: it was never terminated, got {after}"
+    );
+    assert_eq!(
+        after["statusReason"],
+        Value::Null,
+        "case the unlisted job: no reason was recorded on it, got {after}"
+    );
+}
+
+/// RULE: a bulk termination naming more service jobs than the documented maximum ("up to 50
+/// service job IDs", `state::limits::MAX_BULK_JOBS`) is refused WHOLE with the modelled
+/// `ClientException` (HTTP 400) and ends nothing, while a request naming exactly the maximum
+/// is served.
+///
+/// The rows are the bound itself and one past it, each carrying the same live service job,
+/// so what decides the answer is the number of ids and nothing else.
+#[tokio::test]
+async fn a_bulk_service_job_termination_holds_the_documented_maximum() {
+    let maximum = state::limits::MAX_BULK_JOBS;
+    // (case, how many ids the request lists, the status expected)
+    let rows: Vec<(&str, usize, u16)> = vec![
+        ("one past the documented maximum", maximum + 1, 400),
+        ("exactly the documented maximum", maximum, 200),
+    ];
+
+    let batch = Batch::new();
+    let live = seed(&batch, "RUNNING", Filled::Required);
+    for (case, count, expected) in rows {
+        // The live job first, then as many ids this service never minted as the row needs.
+        let mut jobs: Vec<String> = vec![live.job_id.clone()];
+        jobs.extend((1..count).map(|index| format!("00000000-0000-4000-8000-{index:012}")));
+        assert_eq!(
+            jobs.len(),
+            count,
+            "case {case:?}: the row must list {count} ids, got {}",
+            jobs.len()
+        );
+
+        let (status, body) = terminate_many(&batch, &jobs, "over the bound").await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected HTTP {expected}, got {status} {body}"
+        );
+        let detail = described(&batch, case, &live.job_id).await;
+        if expected == 400 {
+            assert_eq!(
+                error_code(&body),
+                "ClientException",
+                "case {case:?}: expected the modelled ClientException, got {body}"
+            );
+            assert_eq!(
+                detail["status"].as_str(),
+                Some("RUNNING"),
+                "case {case:?}: a refused bulk call ends nothing it named, got {detail}"
+            );
+            assert_eq!(
+                detail["isTerminated"].as_bool(),
+                Some(false),
+                "case {case:?}: a refused bulk call terminates nothing, got {detail}"
+            );
+        } else {
+            assert_eq!(
+                detail["status"].as_str(),
+                Some(state::SERVICE_JOB_FAILED),
+                "case {case:?}: a served bulk call ends the job it named, got {detail}"
+            );
         }
     }
 }

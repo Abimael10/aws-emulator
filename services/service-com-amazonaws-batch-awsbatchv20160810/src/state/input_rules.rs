@@ -188,16 +188,16 @@ pub fn job_queue_not_enabled_message(job_queue_arn: &str) -> String {
 /// scheduling policy, then this parameter must be specified." The member is an optional
 /// unconstrained `String`, so the requirement is CONDITIONAL on the queue the request names
 /// and is decided by the service layer rather than at the boundary — which is why the
-/// sentence is stated BARE, as this plane's other state-derived refusals are, and why it
-/// names the QUEUE it is about the way they name it ([`job_queue_not_enabled_message`],
-/// [`super::not_found_exception`]): the kind, then the ARN the request's reference resolved
-/// to.
+/// sentence is stated BARE, as this plane's other state-derived refusals are.
 ///
-/// The requirement itself is the model's own, restated as the service states a rule: the
-/// member that must be given, and the queue that requires it.
-pub fn quota_share_name_required_message(job_queue_arn: &str) -> String {
-    format!("quotaShareName must be specified for JobQueue {job_queue_arn}.")
-}
+/// The sentence is WHOLLY FIXED: it states the precondition that was broken — a job naming
+/// no share, onto a queue whose scheduling policy divides its capacity into shares — and
+/// names neither the queue, nor its ARN, nor the job, so no value of the request or of the
+/// store appears in it. Recorded behaviour of this refusal class; the model states no
+/// message text for it.
+pub const QUOTA_SHARE_NAME_REQUIRED: &str = "Job without quotaShareName cannot be submitted \
+                                             to a job queue with quota share scheduling \
+                                             policy.";
 
 /// The smallest capacity a `capacityLimits` entry may allocate.
 ///

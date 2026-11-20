@@ -42,7 +42,14 @@
 //! here, so one statement scoped to this service's actions covers every operation of it and
 //! nothing outside it.
 //!
-//! The resource is the one the REQUEST addresses ([`judged_resource`]): the ARN of this
+//! An operation that is the BULK version of a per-item one is the exception, and the model
+//! states it: such an operation authorizes the SINGULAR action for each item its list names,
+//! and no action named after the bulk API exists at all ([`BULK_OPERATIONS`]). So a bulk
+//! request is decided item by item ([`decide`]) — the per-item action against that item's own
+//! ARN — and is allowed only when every item it lists is, which is what makes a policy
+//! granting the per-item action serve the singular and the bulk call alike.
+//!
+//! The resource is the one the REQUEST addresses ([`addressed_arn_of`]): the ARN of this
 //! service it names — the whole ARN the tagging surface binds as its one path label
 //! (`/v1/tags/{resourceArn}`), else the ARN of what an input member the model binds a
 //! resource identifier to names ([`ARN_MEMBERS`]), built by this service's OWN ARN builders
@@ -178,6 +185,31 @@ const SERVICE_JOB_OPERATIONS: &[&str] = &[
     "UpdateServiceJob",
 ];
 
+/// The BULK operations of this model: each is "a bulk version of" one per-item operation,
+/// and IAM evaluates that SINGULAR action against every item the request lists rather than an
+/// action named after the bulk API.
+///
+/// Source: this model's own documentation of each of them
+/// (`smithy_query(query="doc",shape="CancelJobs")`, and the same for `TerminateJobs` and
+/// `TerminateServiceJobs`), which states the rule for all three alike — "This operation
+/// requires `batch:<SingularOperation>` permission for each job in the request. There is no
+/// separate `batch:<BulkOperation>` IAM action."
+///
+/// Each row is the bulk operation, the per-item operation whose action IAM evaluates, the
+/// list-valued input member naming the items, and how one item's ARN is built — the per-item
+/// operation also being what decides which plane's job an id names
+/// ([`SERVICE_JOB_OPERATIONS`]).
+const BULK_OPERATIONS: &[(&str, &str, &str, Addressed)] = &[
+    ("CancelJobs", "CancelJob", "jobs", Addressed::JobId),
+    ("TerminateJobs", "TerminateJob", "jobs", Addressed::JobId),
+    (
+        "TerminateServiceJobs",
+        "TerminateServiceJob",
+        "jobs",
+        Addressed::JobId,
+    ),
+];
+
 /// One refused request: the sentence IAM states the refusal with, and nothing else — the
 /// status and the error shape are this module's constants.
 #[derive(Debug, Clone)]
@@ -194,42 +226,16 @@ pub fn action_prefix<'ctx>(ctx: &'ctx OperationContext<'_>) -> &'ctx str {
     ctx.identity().signing_name()
 }
 
-/// The resource this request is judged against: the ARN of what it addresses, else
-/// [`ANY_RESOURCE`].
-///
-/// `operation` is the operation's own name, which is what decides which plane's job a
-/// `jobId` names ([`SERVICE_JOB_OPERATIONS`]).
-#[must_use]
-pub fn judged_resource(ctx: &OperationContext<'_>, operation: &str, req: &RtRequest) -> String {
-    addressed_arn(ctx, operation, req).unwrap_or_else(|| ANY_RESOURCE.to_string())
-}
-
-/// The ARN of the resource this request addresses, or `None` for one that addresses none.
+/// The ARN of the resource a request to `operation` addresses, read off its `path` and its
+/// `body` alone, and `None` for one that addresses no single resource.
 ///
 /// The tagging surface carries it as its one path label, decoded the way the codec that
 /// deserializes the request decodes it ([`::service_common::percent_decode_path_label`]), so
 /// the gate reads the same ARN the handler reads; every other operation of this model carries
 /// its identifiers in the body.
-fn addressed_arn(
-    ctx: &OperationContext<'_>,
-    operation: &str,
-    req: &RtRequest,
-) -> Option<String> {
-    addressed_arn_of(
-        action_prefix(ctx),
-        &crate::state::request_region(ctx),
-        operation,
-        ::service_common::request_path(req.uri()),
-        req.body().bytes().unwrap_or_default(),
-    )
-}
-
-/// The ARN of `vendor` in `region` a request to `operation` addresses, read off its `path`
-/// and its `body` alone.
 ///
-/// Split from [`addressed_arn`] so the rule is decided from values rather than from a live
-/// request: the request is where the vendor, the Region, the path and the body come from, and
-/// nothing else about it matters here.
+/// Decided from values rather than from a live request: the request is where the vendor, the
+/// Region, the path and the body come from, and nothing else about it matters here.
 fn addressed_arn_of(
     vendor: &str,
     region: &str,
@@ -245,49 +251,155 @@ fn addressed_arn_of(
     let members = document.as_object()?;
     ARN_MEMBERS.iter().find_map(|(member, addressed)| {
         let value = members.get(*member).and_then(::serde_json::Value::as_str)?;
-        if ::service_common::arn::is_resource_arn_of(value, vendor) {
-            return Some(value.to_string());
-        }
-        let minted = match addressed {
-            Addressed::ArnOnly => return None,
-            Addressed::JobQueue => crate::state::job_queue_arn(region, value),
-            Addressed::ComputeEnvironment => crate::state::compute_environment_arn(region, value),
-            Addressed::ServiceEnvironment => crate::state::service_environment_arn(region, value),
-            Addressed::ConsumableResource => crate::state::consumable_resource_arn(region, value),
-            Addressed::SchedulingPolicy => crate::state::scheduling_policy_arn(region, value),
-            Addressed::JobId if SERVICE_JOB_OPERATIONS.contains(&operation) => {
-                crate::state::service_job_arn(region, value)
-            }
-            Addressed::JobId => crate::state::job_arn(region, value),
-        };
-        Some(minted)
+        arn_of_value(vendor, region, operation, *addressed, value)
     })
 }
 
-/// Authorize this request, where `operation` is the operation's own name
-/// ([`smithy_server_runtime::Operation::NAME`]) and `resource` the ARN the request ADDRESSES
-/// ([`judged_resource`]).
+/// The ARN of the resource `value` names at a member that addresses `addressed`: the value
+/// itself when it already IS an ARN of this service, else the ARN this service's own builder
+/// for that family mints for the name or job id — and `None` for a value that addresses no
+/// single resource.
 ///
-/// `Ok(())` for a request IAM permits (and for every caller this gate does not bound, see the
-/// module docs); the refusal otherwise. Taken BEFORE the operation runs, so a refused request
-/// reads and writes nothing.
+/// `operation` is the operation whose ACTION is being judged, which is what decides which
+/// plane's job an id names ([`SERVICE_JOB_OPERATIONS`]); for a bulk request that is the
+/// per-item operation rather than the bulk API ([`BULK_OPERATIONS`]).
+fn arn_of_value(
+    vendor: &str,
+    region: &str,
+    operation: &str,
+    addressed: Addressed,
+    value: &str,
+) -> Option<String> {
+    if ::service_common::arn::is_resource_arn_of(value, vendor) {
+        return Some(value.to_string());
+    }
+    let minted = match addressed {
+        Addressed::ArnOnly => return None,
+        Addressed::JobQueue => crate::state::job_queue_arn(region, value),
+        Addressed::ComputeEnvironment => crate::state::compute_environment_arn(region, value),
+        Addressed::ServiceEnvironment => crate::state::service_environment_arn(region, value),
+        Addressed::ConsumableResource => crate::state::consumable_resource_arn(region, value),
+        Addressed::SchedulingPolicy => crate::state::scheduling_policy_arn(region, value),
+        Addressed::JobId if SERVICE_JOB_OPERATIONS.contains(&operation) => {
+            crate::state::service_job_arn(region, value)
+        }
+        Addressed::JobId => crate::state::job_arn(region, value),
+    };
+    Some(minted)
+}
+
+/// Every `(operation, resource)` this request has to be authorized for, in the order the
+/// request states them: ONE pair for an ordinary operation — its own action against the
+/// resource it addresses ([`addressed_arn_of`]) — and one pair PER ITEM for a bulk operation,
+/// each carrying the per-item action and that item's own ARN ([`BULK_OPERATIONS`]).
+fn judged_actions(
+    ctx: &OperationContext<'_>,
+    operation: &str,
+    req: &RtRequest,
+) -> Vec<(String, String)> {
+    judged_actions_of(
+        action_prefix(ctx),
+        &crate::state::request_region(ctx),
+        operation,
+        ::service_common::request_path(req.uri()),
+        req.body().bytes().unwrap_or_default(),
+    )
+}
+
+/// What [`judged_actions`] decides, from the request's vendor, Region, operation, `path` and
+/// `body` alone — split out for the same reason [`addressed_arn_of`] is.
+fn judged_actions_of(
+    vendor: &str,
+    region: &str,
+    operation: &str,
+    path: &str,
+    body: &[u8],
+) -> Vec<(String, String)> {
+    let Some((_, item_operation, member, addressed)) =
+        BULK_OPERATIONS.iter().find(|(bulk, ..)| *bulk == operation)
+    else {
+        return vec![(
+            operation.to_string(),
+            addressed_arn_of(vendor, region, operation, path, body)
+                .unwrap_or_else(|| ANY_RESOURCE.to_string()),
+        )];
+    };
+    let items: Vec<(String, String)> = listed_items(body, member)
+        .into_iter()
+        // What one request can make this gate decide is bounded by the bound the bulk
+        // operations themselves hold their list to (`state::limits::MAX_BULK_JOBS`): a
+        // request naming more items than that is refused whole by the operation, so no item
+        // past the bound can be acted on whatever the decision about it would have been.
+        .take(crate::state::limits::MAX_BULK_JOBS)
+        .map(|value| {
+            let resource = arn_of_value(vendor, region, item_operation, *addressed, &value)
+                .unwrap_or_else(|| ANY_RESOURCE.to_string());
+            ((*item_operation).to_string(), resource)
+        })
+        .collect();
+    if items.is_empty() {
+        // A bulk request that lists no item still asks for the per-item action, and there is
+        // no resource of this service to judge it against.
+        return vec![((*item_operation).to_string(), ANY_RESOURCE.to_string())];
+    }
+    items
+}
+
+/// The values a request's list-valued `member` names, in the order it lists them, and none
+/// for a body that carries no such list.
+fn listed_items(body: &[u8], member: &str) -> Vec<String> {
+    let Ok(document) = ::serde_json::from_slice::<::serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    document
+        .get(member)
+        .and_then(::serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(::serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// IAM's decision about this whole request: `None` for one it permits, and the FIRST refusal
+/// otherwise — for a bulk request the refusal of the first item it names that the caller may
+/// not act on, so such a call is allowed only when every item it lists is.
 ///
-/// Resolving the caller goes through STS's own `resolve_caller`, which first materialises the
-/// session expiries the clock has already made due; that write is owed at the same instant
-/// whether or not anybody called, which is why a REPORTING operation of this service takes
-/// this decision too.
-pub fn authorize<Eng: Send + Sync + 'static>(
+/// This is the ONE entry point the gate in front of the handlers takes
+/// ([`crate::service::request_id_header`]), and it is taken BEFORE the operation runs, so a
+/// refused request reads and writes nothing. The caller's identity and the policies in force
+/// on it are read once for the whole request; resolving the caller goes through STS's own
+/// `resolve_caller`, which first materialises the session expiries the clock has already made
+/// due — a write owed at the same instant whether or not anybody called, which is why a
+/// REPORTING operation of this service takes this decision too.
+pub fn decide<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &OperationContext<'_>,
     operation: &str,
-    resource: &str,
-) -> Result<(), Denial> {
-    let action = format!("{}:{operation}", action_prefix(ctx));
+    req: &RtRequest,
+) -> Option<Denial> {
     let caller = caller(engine, ctx);
+    let prefix = action_prefix(ctx);
+    judged_actions(ctx, operation, req)
+        .into_iter()
+        .find_map(|(action_operation, resource)| {
+            authorize_caller(&caller, &format!("{prefix}:{action_operation}"), &resource).err()
+        })
+}
+
+/// Whether the policies in force on `caller` let it perform `action` on `resource`.
+///
+/// The one decision [`decide`] takes, once per action a request asks for: a bulk request asks
+/// for the per-item action once per item, and the principal, its documents and its boundary
+/// are the same for all of them, so the caller is resolved once and handed here.
+fn authorize_caller(caller: &Caller, action: &str, resource: &str) -> Result<(), Denial> {
     // The principal spellings travel with the request because that is what a statement's
     // `Principal` element would be matched against; an identity-based document states no such
     // element, so the decision below rests on the action and the resource.
-    let request = iam::Request::new(&action, resource, &caller.principals);
+    let request = iam::Request::new(action, resource, &caller.principals);
     let documents = iam::prepare_documents(&caller.documents);
     let identity_said = iam::identity_decision_prepared(&documents, &request);
     // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be read
@@ -297,20 +409,20 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     if identity_said == Decision::Denied {
         return Err(not_authorized(
             &caller.arn,
-            &action,
+            action,
             resource,
             iam::IDENTITY_POLICY_EXPLICIT_DENY,
         ));
     }
     let granted = iam::is_allowed(identity_said, Decision::NotStated)
-        || may_allow(&documents, &action, resource)
+        || may_allow(&documents, action, resource)
         || caller.identity_is_unbounded();
     if !granted {
         return Err(not_authorized(
             &caller.arn,
-            &action,
+            action,
             resource,
-            &iam::no_identity_policy_allows(&action),
+            &iam::no_identity_policy_allows(action),
         ));
     }
     // "A permissions boundary sets the maximum permissions that an identity-based policy can
@@ -325,13 +437,13 @@ pub fn authorize<Eng: Send + Sync + 'static>(
             // policies gave.
             Decision::Denied => iam::PERMISSIONS_BOUNDARY_EXPLICIT_DENY.to_string(),
             Decision::NotStated => {
-                if may_allow(&boundary, &action, resource) {
+                if may_allow(&boundary, action, resource) {
                     return Ok(());
                 }
-                iam::no_permissions_boundary_allows(&action)
+                iam::no_permissions_boundary_allows(action)
             }
         };
-        return Err(not_authorized(&caller.arn, &action, resource, &reason));
+        return Err(not_authorized(&caller.arn, action, resource, &reason));
     }
     Ok(())
 }
@@ -519,6 +631,15 @@ mod tests {
     /// This service's ARN namespace, which is the vendor every ARN it mints carries.
     const VENDOR: &str = "batch";
 
+    /// One row of the bulk-action table: the case, the operation asked for, the body it
+    /// carries, and the `(operation, resource)` pairs the request has to be judged by.
+    type JudgedRow = (
+        &'static str,
+        &'static str,
+        String,
+        Vec<(&'static str, String)>,
+    );
+
     /// RULE: the refusal names the principal, the action, the resource the request addressed
     /// and which of IAM's rules refused — every part taken from the request and the stored
     /// policies — and it names no resource for a request that addresses none.
@@ -702,5 +823,117 @@ mod tests {
                 "case {case:?}: expected the judged resource {expected:?}, got {actual:?}"
             );
         }
+    }
+
+    /// RULE: a BULK operation is judged action by action, one per item its list names — the
+    /// SINGULAR per-item action against that item's own ARN, whether the item is given as an
+    /// id or already as an ARN — while every other operation is judged once, as its own
+    /// action against the resource it addresses.
+    #[test]
+    fn a_bulk_request_is_judged_per_item_against_the_singular_action() {
+        let account = ::engine::emulator_account_id();
+        let region = "us-east-1";
+        let first = "7f1d2c3b-4a59-4e6f-8a0b-1c2d3e4f5a6b";
+        let second = "1b2c3d4e-5f60-4712-8899-aabbccddeeff";
+        // An item named by its ARN rather than by its id: it addresses the resource it
+        // already spells.
+        let arn_item = format!("arn:aws:batch:{region}:{account}:service-job/{second}");
+        // (case, the operation, its body, the pairs the request is judged by)
+        let rows: Vec<JudgedRow> = vec![
+            (
+                "a bulk service-job termination of two jobs",
+                "TerminateServiceJobs",
+                ::serde_json::json!({"jobs": [first, second], "reason": "r"}).to_string(),
+                vec![
+                    (
+                        "TerminateServiceJob",
+                        crate::state::service_job_arn(region, first),
+                    ),
+                    (
+                        "TerminateServiceJob",
+                        crate::state::service_job_arn(region, second),
+                    ),
+                ],
+            ),
+            (
+                "a bulk service-job termination naming one job by ARN",
+                "TerminateServiceJobs",
+                ::serde_json::json!({"jobs": [arn_item], "reason": "r"}).to_string(),
+                vec![("TerminateServiceJob", arn_item.clone())],
+            ),
+            (
+                "a bulk container-job termination, whose items are container jobs",
+                "TerminateJobs",
+                ::serde_json::json!({"jobs": [first], "reason": "r"}).to_string(),
+                vec![("TerminateJob", crate::state::job_arn(region, first))],
+            ),
+            (
+                "a bulk cancel",
+                "CancelJobs",
+                ::serde_json::json!({"jobs": [first, second], "reason": "r"}).to_string(),
+                vec![
+                    ("CancelJob", crate::state::job_arn(region, first)),
+                    ("CancelJob", crate::state::job_arn(region, second)),
+                ],
+            ),
+            (
+                "a bulk request listing nothing",
+                "CancelJobs",
+                ::serde_json::json!({"jobs": [], "reason": "r"}).to_string(),
+                vec![("CancelJob", ANY_RESOURCE.to_string())],
+            ),
+            (
+                "a bulk request carrying no list at all",
+                "TerminateServiceJobs",
+                ::serde_json::json!({"reason": "r"}).to_string(),
+                vec![("TerminateServiceJob", ANY_RESOURCE.to_string())],
+            ),
+            (
+                "the SINGULAR operation, judged once as its own action",
+                "TerminateServiceJob",
+                ::serde_json::json!({"jobId": first, "reason": "r"}).to_string(),
+                vec![(
+                    "TerminateServiceJob",
+                    crate::state::service_job_arn(region, first),
+                )],
+            ),
+            (
+                "an operation that is no bulk version of anything",
+                "DescribeJobQueues",
+                ::serde_json::json!({"jobQueues": ["probed"]}).to_string(),
+                vec![("DescribeJobQueues", ANY_RESOURCE.to_string())],
+            ),
+        ];
+        for (case, operation, body, expected) in rows {
+            let path = format!("/v1/{}", operation.to_lowercase());
+            let actual = judged_actions_of(VENDOR, region, operation, &path, body.as_bytes());
+            let expected: Vec<(String, String)> = expected
+                .into_iter()
+                .map(|(operation, resource)| (operation.to_string(), resource))
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the judged actions {expected:?}, got {actual:?}"
+            );
+        }
+
+        // What one request can make this gate decide is bounded by the maximum the bulk
+        // operations hold their own list to, past which the request is refused whole.
+        let maximum = crate::state::limits::MAX_BULK_JOBS;
+        let overlong: Vec<String> = (0..=maximum).map(|index| format!("job-{index}")).collect();
+        let body = ::serde_json::json!({"jobs": overlong, "reason": "r"}).to_string();
+        let judged = judged_actions_of(
+            VENDOR,
+            region,
+            "TerminateServiceJobs",
+            "/v1/terminateservicejobs",
+            body.as_bytes(),
+        );
+        assert_eq!(
+            judged.len(),
+            maximum,
+            "case a list past the maximum: expected at most {maximum} judged actions, got {}",
+            judged.len()
+        );
     }
 }

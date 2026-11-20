@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TerminateServiceJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TerminateServiceJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TerminateServiceJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The bulk `TerminateServiceJob`: every service job id the request names is ended through
+//! the SAME state machinery the singular operation uses
+//! ([`crate::state::ComAmazonawsBatchAwsbatchv20160810State::terminate_service_job`]), so a
+//! bulk request cannot end a service job differently from one call per job, and the
+//! capacity each ended job was holding is given back exactly as it is for the singular call.
+//!
+//! The result is reported PER JOB rather than as the call's status: "The response returns an
+//! HTTP status code of 200 even when some service jobs encountered errors, so check the
+//! errors list", and "Service jobs that can't be found are treated as successfully
+//! processed" — so an id the store holds no service job for is `successful` too. A request
+//! naming more jobs than the documented maximum ([`crate::state::limits::MAX_BULK_JOBS`]) is
+//! refused whole, with the modelled `ClientException` (HTTP 400): nothing in it is
+//! processed.
+//!
+//! Whether the caller may make the call at all is IAM's decision, taken in front of this
+//! handler against the per-item action this operation documents
+//! ([`crate::service::authorization`]): "This operation requires
+//! `batch:TerminateServiceJob` permission for each service job in the request. There is no
+//! separate `batch:TerminateServiceJobs` IAM action."
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +170,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TerminateServiceJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TerminateServiceJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TerminateServiceJobs"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(TerminateServiceJobsErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        // "An array of up to 50 service job IDs of the service jobs to terminate" (`jobs`):
+        // a request past the bound is refused whole, so one call can never end an unbounded
+        // number of service jobs — the same bound the job plane's bulk calls hold
+        // (`state::limits::MAX_BULK_JOBS`).
+        if input.jobs.len() > batch::limits::MAX_BULK_JOBS {
+            return Err(TerminateServiceJobsErrorModeled::ClientException(
+                batch::client_exception(batch::quota_message(
+                    "service job IDs for one TerminateServiceJobs request",
+                    batch::limits::MAX_BULK_JOBS,
+                )),
+            )
+            .into());
+        }
+        let now = batch::now_millis();
+        // The dispatch steps the service-job plane already owed, driven before the
+        // terminations, so a job whose work the downstream service already reported finished
+        // is not dragged out of the status it reached (`state::service_job_dispatch`).
+        batch::advance_service_job_dispatch(&*self.engine, ctx, now).await;
+        // The store's lock lives in THIS block and no longer, so nothing holds it while the
+        // stop each ended job owes the downstream service is driven below.
+        let successful = {
+            let mut state = state.lock();
+            // Materialise what the clock owed BEFORE terminating, so each job is judged on
+            // the status it has at `now`, exactly as the singular operation judges it.
+            state.materialize_due(now);
+            let mut successful: Vec<String> = Vec::new();
+            for job in &input.jobs {
+                // "Service jobs that can't be found are treated as successfully processed",
+                // so the answer is the same whether or not the store held the job: what
+                // differs is only whether anything changed.
+                state.terminate_service_job(job, &input.reason, now);
+                // `successful` is "a list of the service job IDs whose termination request
+                // was accepted", so it names the JOBS the call accepted one for: an id the
+                // request happens to repeat names ONE job and is reported once, which is the
+                // rule the job plane's bulk calls hold their own list to as well
+                // (`ops::terminate_jobs`, `ops::cancel_jobs`).
+                if !successful.iter().any(|seen| seen == job) {
+                    successful.push(job.clone());
+                }
+            }
+            // A terminated job gives back the capacity it was holding, and this call is what
+            // freed it: a job RESTING on that capacity is placeable again one dispatch span
+            // from here.
+            state.rearm_resting_service_jobs(now);
+            successful
+        };
+        // The work each ended job was dispatched as ends with it: the stop the terminations
+        // owe the downstream service is the next step this drives.
+        batch::advance_service_job_dispatch(&*self.engine, ctx, now).await;
+
+        Ok(TerminateServiceJobsOutput {
+            successful,
+            // Every id this service could address was processed, so there is nothing to
+            // report here: the list is present and empty, as the member is modelled
+            // required.
+            errors: Vec::new(),
+        })
     }
 }

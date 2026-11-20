@@ -39,34 +39,34 @@ use crate::query_wire::{element, form_encode};
 
 /// The Region every call below is signed for, so the ARNs the decisions are made about are
 /// the ones this Region's resources carry.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// The access-key id standing for the account's own published credential: neither STS nor
 /// IAM holds a record for it, so it resolves to the account's ambient identity, which holds
 /// no IAM policies — the position AWS account root credentials are in.
-const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
+pub(crate) const ACCOUNT_KEY: &str = "EMULATORTESTKEY12345";
 
 /// The wire name and status of the refusal the authorization layer answers with.
-const ACCESS_DENIED: &str = "AccessDeniedException";
-const ACCESS_DENIED_STATUS: u16 = 403;
+pub(crate) const ACCESS_DENIED: &str = "AccessDeniedException";
+pub(crate) const ACCESS_DENIED_STATUS: u16 = 403;
 
 /// Batch's own IAM action prefix, which is its signing name and `arnNamespace` alike.
-const ACTION_PREFIX: &str = "batch";
+pub(crate) const ACTION_PREFIX: &str = "batch";
 
 /// The only `ServiceJobType` and `ServiceEnvironmentType` the model declares.
-const SAGEMAKER_TRAINING: &str = "SAGEMAKER_TRAINING";
+pub(crate) const SAGEMAKER_TRAINING: &str = "SAGEMAKER_TRAINING";
 
 /// One answer, reduced to what a client branches on.
 #[derive(Debug)]
-struct Reply {
-    status: u16,
-    error_code: Option<String>,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: Option<String>,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The `message` the error document carries.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         self.body["message"]
             .as_str()
             .unwrap_or_default()
@@ -77,9 +77,9 @@ impl Reply {
 /// A principal a call is signed as: the access key id it presents, and the ARN a refusal
 /// must blame it by — what `sts:GetCallerIdentity` reports for that key.
 #[derive(Debug)]
-struct Principal {
-    access_key_id: String,
-    arn: String,
+pub(crate) struct Principal {
+    pub(crate) access_key_id: String,
+    pub(crate) arn: String,
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `service`. The signature is
@@ -94,7 +94,7 @@ fn authorization(access_key_id: &str, service: &str) -> String {
 
 /// The emulator these rows drive: Batch beside the IAM and STS services the principals and
 /// their policies are made with, on ONE engine, as `core/router/src/lib.rs` mounts them.
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -114,7 +114,7 @@ fn build_router() -> MultiServiceRouter {
 
 /// One Batch call: `restJson1` under the `batch` credential scope, in Batch's own `/v1/…`
 /// path space, signed with `access_key_id`.
-async fn batch(
+pub(crate) async fn batch(
     router: &MultiServiceRouter,
     access_key_id: &str,
     path: &str,
@@ -151,7 +151,12 @@ async fn batch(
 
 /// One Batch call signed as the account itself, which must succeed: the suite's setup and
 /// read-back legs.
-async fn served(router: &MultiServiceRouter, case: &str, path: &str, body: &Value) -> Value {
+pub(crate) async fn served(
+    router: &MultiServiceRouter,
+    case: &str,
+    path: &str,
+    body: &Value,
+) -> Value {
     let reply = batch(router, ACCOUNT_KEY, path, body).await;
     assert_eq!(
         reply.status, 200,
@@ -196,7 +201,11 @@ async fn query(
 
 /// Create an IAM user carrying `policy` as its inline policy, mint a long-term access key
 /// for it, and answer that key id with the user's own ARN.
-async fn user(router: &MultiServiceRouter, user_name: &str, policy: &str) -> Principal {
+pub(crate) async fn user(
+    router: &MultiServiceRouter,
+    user_name: &str,
+    policy: &str,
+) -> Principal {
     let created = query(
         router,
         "iam",
@@ -289,7 +298,7 @@ async fn assumed_role(router: &MultiServiceRouter, role_name: &str, policy: &str
 }
 
 /// A policy document allowing `action` on `resource`.
-fn allow(action: &str, resource: &str) -> String {
+pub(crate) fn allow(action: &str, resource: &str) -> String {
     json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": action, "Resource": resource }],

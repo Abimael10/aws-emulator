@@ -124,13 +124,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for RequestIdHeaderOperation<En
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
-            // IAM's decision, taken before the operation reads or writes anything: the
-            // action is the operation's own name under this service's prefix, and the
-            // resource is the one the REQUEST addresses.
-            let denial = routing_key(svc, req).and_then(|operation| {
-                let resource = authorization::judged_resource(ctx, operation, req);
-                authorization::authorize(&*self.engine, ctx, operation, &resource).err()
-            });
+            // IAM's decision, taken before the operation reads or writes anything: for an
+            // ordinary operation the action is its own name under this service's prefix,
+            // judged against the resource the REQUEST addresses; for a bulk operation it is
+            // the per-item action, judged against each item the request lists.
+            let denial = routing_key(svc, req)
+                .and_then(|operation| authorization::decide(&*self.engine, ctx, operation, req));
             if let Some(denial) = denial {
                 return with_request_id_header(authorization::refusal_response(&denial));
             }

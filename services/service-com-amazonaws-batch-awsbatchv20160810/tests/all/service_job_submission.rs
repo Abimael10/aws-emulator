@@ -1331,10 +1331,10 @@ async fn a_quota_managed_queue_admits_only_a_submit_naming_one_of_its_shares() {
                 // A name no share of the queue answers to is the service's own lookup
                 // missing, worded as this plane words a miss.
                 Some(share) => format!("QuotaShare {share} not found."),
-                // A member the queue's policy requires and the request did not give: the
-                // rule the member documents, stated bare and naming the queue that
-                // requires it, as this plane's state-derived refusals do.
-                None => state::quota_share_name_required_message(queue),
+                // A member the queue's policy requires and the request did not give: one
+                // FIXED sentence stating the precondition, naming neither the queue nor the
+                // job (asserted as a rule in its own test below).
+                None => state::QUOTA_SHARE_NAME_REQUIRED.to_string(),
             };
             let message = error_message(&body);
             assert_eq!(
@@ -1354,5 +1354,109 @@ async fn a_quota_managed_queue_admits_only_a_submit_naming_one_of_its_shares() {
                  {body}"
             );
         }
+    }
+}
+
+/// RULE: the refusal of a submit that names no `quotaShareName` onto a queue whose
+/// scheduling policy divides its capacity into quota shares is ONE FIXED sentence
+/// (`state::QUOTA_SHARE_NAME_REQUIRED`): it states the precondition that was broken and
+/// carries no variable part at all — not the queue's name, not the ARN the request's
+/// reference resolved to, not the job's name, and no other value of the request or of the
+/// store.
+///
+/// The rows differ along everything the sentence would interpolate if it had a variable
+/// part: the queue (two queues built from ONE shared quota-share policy, and a third built
+/// on a policy of its own, each with its own name and ARN), how the request names that
+/// queue (by name and by ARN), the job name's length and alphabet, and which other optional
+/// members the request carries. Every row must answer the same sentence.
+#[tokio::test]
+async fn the_missing_quota_share_name_refusal_is_one_fixed_sentence() {
+    let batch = Batch::new();
+    let environment = service_environment(&batch, "se-fixed-sentence").await;
+    // `QuotaSharePolicy$idleResourceAssignmentStrategy`'s only documented value.
+    let quota_policy = json!({"quotaSharePolicy": {"idleResourceAssignmentStrategy": "FIFO"}});
+    let shared_policy = scheduling_policy(&batch, "sp-shared", quota_policy.clone()).await;
+    let own_policy = scheduling_policy(&batch, "sp-own", quota_policy).await;
+
+    // Two queues on ONE policy and one on a policy of its own: queue construction is what
+    // the two recorded examples of this refusal differ in, and the sentence may not notice
+    // it.
+    let first = queue_with_policy(&batch, "q-shared-a", &environment, &shared_policy).await;
+    let second = queue_with_policy(&batch, "q-shared-b", &environment, &shared_policy).await;
+    let third = queue_with_policy(&batch, "q-own-policy", &environment, &own_policy).await;
+    quota_share(&batch, "qs-a", &first).await;
+    quota_share(&batch, "qs-b", &second).await;
+    quota_share(&batch, "qs-c", &third).await;
+
+    // (case, how the request names the queue, the job name, the other members it carries)
+    let rows: Vec<(&str, String, &str, Value)> = vec![
+        (
+            "the first queue of the shared policy, named by ARN",
+            first.clone(),
+            "sj-a",
+            json!({}),
+        ),
+        (
+            "the same queue, named by name",
+            "q-shared-a".to_string(),
+            "a-much-longer_service-job-NAME-0123456789",
+            json!({}),
+        ),
+        (
+            "the second queue of the SAME policy",
+            second.clone(),
+            "sj-b",
+            json!({"schedulingPriority": 9999}),
+        ),
+        (
+            "a queue carrying a quota-share policy of its own, named by name",
+            "q-own-policy".to_string(),
+            "sj-c",
+            json!({"shareIdentifier": "share-x", "tags": {"env": "test"}}),
+        ),
+        (
+            "the same queue by ARN, with a retry strategy and a timeout",
+            third.clone(),
+            "sj-d",
+            json!({
+                "retryStrategy": {"attempts": 10},
+                "timeoutConfig": {"attemptDurationSeconds": 600},
+            }),
+        ),
+    ];
+
+    for (case, queue, job_name, extra) in &rows {
+        let before = stored_service_jobs(&batch);
+        let (status, body) = submit(&batch, submit_body(job_name, queue, extra.clone())).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ClientException",
+            "case {case:?}: expected the modelled ClientException, got {body}"
+        );
+        let message = error_message(&body);
+        assert_eq!(
+            message,
+            state::QUOTA_SHARE_NAME_REQUIRED,
+            "case {case:?}: expected the fixed sentence {:?}, got {message:?}",
+            state::QUOTA_SHARE_NAME_REQUIRED
+        );
+        // No value of the request or of the store is interpolated: neither the queue
+        // reference the caller gave, nor the ARN it resolved to, nor the job's name.
+        for value in [queue.as_str(), first.as_str(), *job_name] {
+            assert!(
+                !message.contains(value),
+                "case {case:?}: the sentence names no value of the request, got {message:?} \
+                 carrying {value:?}"
+            );
+        }
+        assert_eq!(
+            stored_service_jobs(&batch),
+            before,
+            "case {case:?}: a refused submit persists no service job"
+        );
     }
 }
