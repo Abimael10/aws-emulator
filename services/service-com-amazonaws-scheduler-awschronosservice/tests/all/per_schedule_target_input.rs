@@ -366,7 +366,7 @@ async fn create_schedule(
 
 /// A schedule group of `name`, which a row that states one needs before its schedule
 /// can live there.
-async fn given_group(router: &MultiServiceRouter, case: &str, name: &str) {
+pub(crate) async fn given_group(router: &MultiServiceRouter, case: &str, name: &str) {
     let (status, created) = scheduler(
         router,
         "POST",

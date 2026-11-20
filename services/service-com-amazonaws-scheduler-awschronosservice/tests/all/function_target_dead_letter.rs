@@ -355,7 +355,7 @@ async fn a_function_target_is_invoked_as_the_reported_invocation_type_says() {
 ///
 /// `DeleteFunction` is bound to `DELETE /2015-03-31/functions/{FunctionName}` and
 /// answers 204 No Content.
-async fn delete_function(router: &MultiServiceRouter, case: &str, name: &str) {
+pub(crate) async fn delete_function(router: &MultiServiceRouter, case: &str, name: &str) {
     let request = http::Request::builder()
         .method("DELETE")
         .uri(format!("{FUNCTIONS_URI}/{name}"))
