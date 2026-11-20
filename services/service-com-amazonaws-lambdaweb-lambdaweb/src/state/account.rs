@@ -36,8 +36,9 @@ pub const MAX_TOTAL_RATE_LIMIT: i32 = 10_000;
 ///
 /// CHOSEN, not cited: the model bounds
 /// `AccountQuotas$maxEndpointsPerFunction` at `@range(min: 0)` and publishes no
-/// value for it, so this emulator reports a fixed, non-zero allowance — far
-/// above the one endpoint a create can add today.
+/// value for it, so this emulator reports a fixed, non-zero allowance — and it
+/// is the very bound `CreateWebFunctionEndpoint` refuses at, so a caller that
+/// reads this quota and a caller that trips it see the same number.
 pub const MAX_ENDPOINTS_PER_FUNCTION: i32 = 10;
 
 /// An `i32` member's value for a stored count, saturating rather than wrapping:

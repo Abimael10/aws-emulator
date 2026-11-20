@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end tests for the initial endpoint `CreateWebFunction` creates from
-//! `endpointConfig`, and for the `GetWebFunctionEndpoint` read that reports it.
+//! End-to-end tests for a web function's endpoints: the initial one
+//! `CreateWebFunction` creates from `endpointConfig`, the ones
+//! `CreateWebFunctionEndpoint` adds to a stored function, and the
+//! `GetWebFunctionEndpoint` read that reports either.
 //!
 //! Every assertion goes over the wire through the same [`Emulator`] harness the
 //! `web_function_lifecycle` suite uses: a request is built, dispatched through the
@@ -19,7 +21,10 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_lambdaweb_lambdaweb::state::PROVISIONING_DELAY;
+use service_com_amazonaws_lambdaweb_lambdaweb::state::endpoint_plane::serve_request;
+use service_com_amazonaws_lambdaweb_lambdaweb::state::{
+    service_state, MAX_ENDPOINTS_PER_FUNCTION, PROVISIONING_DELAY,
+};
 
 use super::web_function_lifecycle::{
     build_config, expected_arn, percent_encoded, role_arn, Emulator, Reply,
@@ -779,3 +784,944 @@ async fn a_deleted_function_takes_its_endpoint_with_it() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// `CreateWebFunctionEndpoint`: an endpoint added to a web function that already
+// exists. It is stored in the SAME endpoint slice `CreateWebFunction`'s initial
+// endpoint is stored in, so every rule asserted above holds of it too, and the
+// endpoint readers of this service report one copy of either.
+// ---------------------------------------------------------------------------
+
+/// `PUT /web-functions/{functionName}/endpoints` — `CreateWebFunctionEndpoint`
+/// (model: `smithy_query(query="operation", operation="CreateWebFunctionEndpoint")`).
+async fn create_endpoint(emulator: &Emulator, function_name: &str, body: Value) -> Reply {
+    emulator
+        .send(
+            "PUT",
+            &format!("/web-functions/{function_name}/endpoints"),
+            REGION,
+            Some(body),
+        )
+        .await
+}
+
+/// `POST /web-functions/{functionName}/revisions`, for a row that needs a second
+/// revision to split traffic across.
+async fn create_revision(emulator: &Emulator, function_name: &str) -> String {
+    let created = emulator
+        .send(
+            "POST",
+            &format!("/web-functions/{function_name}/revisions"),
+            REGION,
+            Some(initial_revision(function_name)),
+        )
+        .await;
+    assert_eq!(
+        created.status, 202,
+        "CreateWebFunctionRevision {function_name}: expected 202, got {} with {:?}",
+        created.status, created.body
+    );
+    created
+        .string("revisionId")
+        .unwrap_or_else(|| panic!("the revision create reports a revisionId, got {:?}", created.body))
+}
+
+/// A web function with one revision and NO endpoint — what
+/// `CreateWebFunctionEndpoint` adds one to — and that revision's `revisionId`.
+async fn function_with_a_revision(emulator: &Emulator, function_name: &str) -> String {
+    let created = emulator
+        .send(
+            "PUT",
+            "/web-functions",
+            REGION,
+            Some(json!({
+                "functionName": function_name,
+                "revisionConfig": initial_revision(function_name),
+            })),
+        )
+        .await;
+    assert_eq!(
+        created.status, 202,
+        "CreateWebFunction {function_name}: expected 202, got {} with {:?}",
+        created.status, created.body
+    );
+    created
+        .field("revision")
+        .and_then(|revision| revision.get("revisionId"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("the create reports its initial revision, got {:?}", created.body))
+        .to_string()
+}
+
+/// Poll `GetWebFunctionEndpoint` until the endpoint reports `Active`, and report that
+/// read.
+///
+/// The `Pending -> Active` transition is owed to the CLOCK, so the test waits for the
+/// condition to hold rather than for a duration: it looks again until it does, or
+/// until a deadline far longer than the service's own span has passed.
+async fn poll_until_active(emulator: &Emulator, function_name: &str, endpoint_name: &str) -> Value {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let read = get_endpoint(emulator, function_name, endpoint_name).await;
+        if member(&read.body, "state") == json!("Active") {
+            return read.body;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {function_name}/{endpoint_name}: the endpoint never reached Active, last \
+             read {:?}",
+            read.body
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// One row of the `CreateWebFunctionEndpoint` table: the request's own members, and
+/// what the stored endpoint has to report.
+struct CreateCase {
+    case: &'static str,
+    endpoint_name: &'static str,
+    endpoint_type: &'static str,
+    auth_type: &'static str,
+    /// The `regions` member the request carries, or `None` when it omits it.
+    requested_regions: Option<&'static [&'static str]>,
+    /// The optional members the request carries, merged into it as sent.
+    extra: fn() -> Value,
+    /// The Regions the endpoint must report, the home one included.
+    expected_regions: &'static [&'static str],
+    /// The `autoDeploymentMode` the endpoint must report.
+    expected_auto_deployment_mode: &'static str,
+    /// Whether the request names the function by its ARN rather than by its name.
+    by_function_arn: bool,
+}
+
+/// The table: the rule generalises over the endpoint type, the Regions asked for,
+/// which optional members the request carries, the form of the name and how the
+/// function is identified, so the rows differ along all five. The published bounds of
+/// `scalingConfig.maxEnvironments` (`@range(2..10000)`) and `throttleConfig.rateLimit`
+/// (`@range(0..)`) carry the rows that set them.
+fn create_cases() -> Vec<CreateCase> {
+    vec![
+        CreateCase {
+            case: "home-region-minimal",
+            endpoint_name: "second",
+            endpoint_type: "HomeRegion",
+            auth_type: "IamAuth",
+            requested_regions: None,
+            extra: || json!({}),
+            expected_regions: &[REGION],
+            expected_auto_deployment_mode: "Disabled",
+            by_function_arn: false,
+        },
+        CreateCase {
+            case: "home-region-every-optional-member",
+            endpoint_name: "canary_1",
+            endpoint_type: "HomeRegion",
+            auth_type: "ApplicationManaged",
+            requested_regions: Some(&[REGION]),
+            extra: || {
+                json!({
+                    "description": "an endpoint added later",
+                    "autoDeploymentMode": "LatestRevision",
+                    "scalingConfig": { "maxEnvironments": 2 },
+                    "throttleConfig": { "rateLimit": 0 },
+                })
+            },
+            expected_regions: &[REGION],
+            expected_auto_deployment_mode: "LatestRevision",
+            by_function_arn: false,
+        },
+        CreateCase {
+            case: "multi-region-by-function-arn",
+            endpoint_name: "edge",
+            endpoint_type: "MultiRegion",
+            auth_type: "ApplicationManaged",
+            requested_regions: Some(&["eu-west-1", "ap-south-1"]),
+            extra: || {
+                json!({
+                    "scalingConfig": { "maxEnvironments": 10000 },
+                    "throttleConfig": { "rateLimit": 10000 },
+                })
+            },
+            // "The home Region is added automatically if you don't include it."
+            expected_regions: &["ap-south-1", "eu-west-1", REGION],
+            expected_auto_deployment_mode: "Disabled",
+            by_function_arn: true,
+        },
+        CreateCase {
+            case: "per-region",
+            endpoint_name: "regional-endpoint",
+            endpoint_type: "PerRegion",
+            auth_type: "IamAuth",
+            requested_regions: Some(&["us-west-2", REGION]),
+            extra: || json!({ "description": "" }),
+            expected_regions: &["us-west-2", REGION],
+            expected_auto_deployment_mode: "Disabled",
+            by_function_arn: false,
+        },
+        CreateCase {
+            // The longest name the member documents: exactly 64 characters.
+            case: "longest-endpoint-name",
+            endpoint_name: "e0123456789012345678901234567890123456789012345678901234567890ab",
+            endpoint_type: "HomeRegion",
+            auth_type: "IamAuth",
+            requested_regions: None,
+            extra: || json!({}),
+            expected_regions: &[REGION],
+            expected_auto_deployment_mode: "Disabled",
+            by_function_arn: false,
+        },
+    ]
+}
+
+/// The request body a row sends.
+fn create_body(row: &CreateCase) -> Value {
+    let mut body = json!({
+        "endpointName": row.endpoint_name,
+        "endpointType": row.endpoint_type,
+        "authType": row.auth_type,
+    });
+    if let Some(regions) = row.requested_regions {
+        body["regions"] = json!(regions);
+    }
+    for (name, value) in (row.extra)().as_object().expect("extra is an object") {
+        body[name] = value.clone();
+    }
+    body
+}
+
+/// RULE: a create of an endpoint on a stored web function persists that endpoint in
+/// the function's own endpoint slice and reports it from there — its ARN derived from
+/// the function's, its Regions and configuration as the documented rules settle them,
+/// `Pending` until the clock owes it `Active`, and a `domainName` this emulator
+/// answers on — so the endpoint readers of this service report the same record.
+#[tokio::test]
+async fn an_endpoint_created_on_a_stored_function_is_persisted_and_read_back() {
+    for row in create_cases() {
+        let case = row.case;
+        let emulator = Emulator::new();
+        let function_name = format!("added-{case}");
+        let revision_id = function_with_a_revision(&emulator, &function_name).await;
+        let function_arn = expected_arn(REGION, &function_name);
+        let identifier = if row.by_function_arn {
+            percent_encoded(&function_arn)
+        } else {
+            function_name.clone()
+        };
+
+        let created = create_endpoint(&emulator, &identifier, create_body(&row)).await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: CreateWebFunctionEndpoint expected 202, got {} with {:?}",
+            created.status, created.body
+        );
+        assert_eq!(
+            created.string("functionArn"),
+            Some(function_arn.clone()),
+            "case {case:?}: the endpoint belongs to the named function, got {:?}",
+            created.body
+        );
+        assert_eq!(
+            created.string("endpointArn"),
+            Some(format!("{function_arn}/endpoint/{}", row.endpoint_name)),
+            "case {case:?}: the endpoint ARN is derived from the function's, got {:?}",
+            created.body
+        );
+        assert_eq!(
+            member(&created.body, "endpointName"),
+            json!(row.endpoint_name),
+            "case {case:?}: expected the stored endpoint name, got {:?}",
+            created.body
+        );
+        assert_eq!(
+            member(&created.body, "endpointType"),
+            json!(row.endpoint_type),
+            "case {case:?}: expected the stored endpoint type, got {:?}",
+            created.body
+        );
+        assert_eq!(
+            member(&created.body, "authType"),
+            json!(row.auth_type),
+            "case {case:?}: expected the stored auth type, got {:?}",
+            created.body
+        );
+        assert_eq!(
+            member(&created.body, "autoDeploymentMode"),
+            json!(row.expected_auto_deployment_mode),
+            "case {case:?}: expected autoDeploymentMode {:?}, got {:?}",
+            row.expected_auto_deployment_mode,
+            created.body
+        );
+        assert_eq!(
+            region_set(&created.body),
+            row.expected_regions
+                .iter()
+                .map(|region| (*region).to_string())
+                .collect::<BTreeSet<String>>(),
+            "case {case:?}: expected the Regions {:?}, got {:?}",
+            row.expected_regions,
+            created.body
+        );
+        // A request that names no `revisionWeights` serves the function's newest
+        // revision with all of the traffic: every endpoint this service reports serves
+        // at least one revision.
+        assert_eq!(
+            member(&created.body, "revisionWeights"),
+            json!([{ "revisionId": revision_id, "weight": 100 }]),
+            "case {case:?}: expected the newest revision to carry all the traffic, got {:?}",
+            created.body
+        );
+        assert_eq!(
+            member(&created.body, "state"),
+            json!("Pending"),
+            "case {case:?}: a just-created endpoint is still Pending, got {:?}",
+            created.body
+        );
+        assert!(
+            member(&created.body, "stateReason")
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "case {case:?}: expected a non-empty stateReason, got {:?}",
+            created.body
+        );
+        assert!(
+            created.field("updateStatus").is_none() && created.field("updateStatusReason").is_none(),
+            "case {case:?}: an endpoint nobody updated reports no update status, got {:?}",
+            created.body
+        );
+        let domain_name = created.string("domainName").unwrap_or_default();
+        assert!(
+            is_an_address_the_emulator_answers_on(&domain_name),
+            "case {case:?}: expected a domainName the emulator answers on, got {domain_name:?}"
+        );
+
+        // The read-back: the endpoint readers of this service report the record the
+        // create stored, member for member.
+        let fetched = get_endpoint(&emulator, &function_name, row.endpoint_name).await;
+        assert_eq!(
+            fetched.status, 200,
+            "case {case:?}: GetWebFunctionEndpoint expected 200, got {} with {:?}",
+            fetched.status, fetched.body
+        );
+        for name in [
+            "functionArn",
+            "endpointArn",
+            "endpointName",
+            "description",
+            "endpointType",
+            "domainName",
+            "authType",
+            "autoDeploymentMode",
+            "revisionWeights",
+            "regions",
+            "scalingConfig",
+            "throttleConfig",
+            "regionalEndpoints",
+            "createdAt",
+        ] {
+            assert_eq!(
+                member(&fetched.body, name),
+                member(&created.body, name),
+                "case {case:?}: GetWebFunctionEndpoint reports a different {name} than the \
+                 create did, got {:?}",
+                fetched.body
+            );
+        }
+
+        // One regional entry per configured Region, each reporting the endpoint's own
+        // configuration; `MultiRegion` routes one domain to the nearest Region, so its
+        // regional entries declare none of their own.
+        let regional = member(&created.body, "regionalEndpoints");
+        let regional = regional
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case:?}: expected regionalEndpoints, got {regional:?}"));
+        assert_eq!(
+            regional.keys().cloned().collect::<BTreeSet<String>>(),
+            region_set(&created.body),
+            "case {case:?}: expected one regional entry per Region, got {regional:?}"
+        );
+        for (region, entry) in regional {
+            assert_eq!(
+                member(entry, "authType"),
+                json!(row.auth_type),
+                "case {case:?}: regional entry {region} reports another auth type, got {entry:?}"
+            );
+            assert_eq!(
+                member(entry, "revisionWeights"),
+                member(&created.body, "revisionWeights"),
+                "case {case:?}: regional entry {region} serves another revision, got {entry:?}"
+            );
+            match member(entry, "domainName").as_str() {
+                None => assert_eq!(
+                    row.endpoint_type, "MultiRegion",
+                    "case {case:?}: regional entry {region} must carry its own domain, got \
+                     {entry:?}"
+                ),
+                Some(regional_domain) => assert_eq!(
+                    regional_domain, domain_name,
+                    "case {case:?}: regional entry {region} must report the address the \
+                     endpoint is served at, got {regional_domain:?}"
+                ),
+            }
+        }
+
+        // The initial-endpoint path and this one write ONE slice: a function created
+        // with an endpoint keeps it when another is added beside it.
+        let second = create_endpoint(
+            &emulator,
+            &function_name,
+            json!({
+                "endpointName": "beside-it",
+                "endpointType": "HomeRegion",
+                "authType": "IamAuth",
+            }),
+        )
+        .await;
+        assert_eq!(
+            second.status, 202,
+            "case {case:?}: a second endpoint expected 202, got {} with {:?}",
+            second.status, second.body
+        );
+        assert_ne!(
+            second.string("domainName"),
+            Some(domain_name.clone()),
+            "case {case:?}: two endpoints must not publish one address, got {:?}",
+            second.body
+        );
+        let still_there = get_endpoint(&emulator, &function_name, row.endpoint_name).await;
+        assert_eq!(
+            still_there.status, 200,
+            "case {case:?}: the first endpoint survived the second, got {} with {:?}",
+            still_there.status, still_there.body
+        );
+    }
+}
+
+/// RULE: an endpoint serves the revisions its `revisionWeights` name, and those have
+/// to be the function's own revisions — "each entry maps a revision to a weight from 1
+/// to 100", for up to two revisions.
+#[tokio::test]
+async fn revision_weights_name_the_functions_own_revisions() {
+    let emulator = Emulator::new();
+    let function_name = "weighted";
+    let first = function_with_a_revision(&emulator, function_name).await;
+    let second = create_revision(&emulator, function_name).await;
+    assert_ne!(
+        first, second,
+        "two revisions of one function must not share an id, got {first:?}"
+    );
+
+    // The rows span one revision at full weight, two revisions split, and a split that
+    // is not an even one.
+    let accepted: Vec<(&str, Value)> = vec![
+        (
+            "one-revision",
+            json!([{ "revisionId": first, "weight": 100 }]),
+        ),
+        (
+            "two-revisions-even",
+            json!([
+                { "revisionId": first, "weight": 50 },
+                { "revisionId": second, "weight": 50 },
+            ]),
+        ),
+        (
+            "two-revisions-canary",
+            json!([
+                { "revisionId": first, "weight": 99 },
+                { "revisionId": second, "weight": 1 },
+            ]),
+        ),
+    ];
+    for (case, weights) in accepted {
+        let endpoint_name = format!("weights-{case}");
+        let created = create_endpoint(
+            &emulator,
+            function_name,
+            json!({
+                "endpointName": endpoint_name,
+                "endpointType": "HomeRegion",
+                "authType": "IamAuth",
+                "revisionWeights": weights,
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: expected 202, got {} with {:?}",
+            created.status, created.body
+        );
+        assert_eq!(
+            member(&created.body, "revisionWeights"),
+            weights,
+            "case {case:?}: expected the weights the request named, got {:?}",
+            created.body
+        );
+        let fetched = get_endpoint(&emulator, function_name, &endpoint_name).await;
+        assert_eq!(
+            member(&fetched.body, "revisionWeights"),
+            weights,
+            "case {case:?}: the read reports other weights, got {:?}",
+            fetched.body
+        );
+    }
+
+    // (case, the request body, the status and error shape the refusal carries)
+    let unknown_revision = "00000000-0000-0000-0000-000000000000";
+    let refused: Vec<(&str, Value, u16, &str)> = vec![
+        (
+            "revision-nobody-created",
+            json!({
+                "endpointName": "refused-unknown",
+                "endpointType": "HomeRegion",
+                "authType": "IamAuth",
+                "revisionWeights": [{ "revisionId": unknown_revision, "weight": 100 }],
+            }),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "one-known-one-unknown-revision",
+            json!({
+                "endpointName": "refused-half-unknown",
+                "endpointType": "HomeRegion",
+                "authType": "IamAuth",
+                "revisionWeights": [
+                    { "revisionId": first, "weight": 90 },
+                    { "revisionId": unknown_revision, "weight": 10 },
+                ],
+            }),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "one-revision-named-twice",
+            json!({
+                "endpointName": "refused-twice",
+                "endpointType": "HomeRegion",
+                "authType": "IamAuth",
+                "revisionWeights": [
+                    { "revisionId": first, "weight": 60 },
+                    { "revisionId": first, "weight": 40 },
+                ],
+            }),
+            400,
+            "ValidationException",
+        ),
+    ];
+    for (case, body, status, error) in refused {
+        let endpoint_name = body
+            .get("endpointName")
+            .and_then(Value::as_str)
+            .expect("the row names its endpoint")
+            .to_string();
+        let reply = create_endpoint(&emulator, function_name, body).await;
+        assert_eq!(
+            reply.status, status,
+            "case {case:?}: expected {status}, got {} with {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error(),
+            error,
+            "case {case:?}: expected {error}, got {:?}",
+            reply.body
+        );
+        let fetched = get_endpoint(&emulator, function_name, &endpoint_name).await;
+        assert_eq!(
+            fetched.status, 404,
+            "case {case:?}: a refused create stores nothing, got {} with {:?}",
+            fetched.status, fetched.body
+        );
+    }
+
+    // A function with no revisions has nothing for an endpoint to route to, and the
+    // request cannot name a weight either.
+    let bare = "no-revisions";
+    let created = emulator
+        .send(
+            "PUT",
+            "/web-functions",
+            REGION,
+            Some(json!({ "functionName": bare })),
+        )
+        .await;
+    assert_eq!(
+        created.status, 202,
+        "case no-revisions: CreateWebFunction expected 202, got {} with {:?}",
+        created.status, created.body
+    );
+    let reply = create_endpoint(
+        &emulator,
+        bare,
+        json!({
+            "endpointName": "nothing-to-serve",
+            "endpointType": "HomeRegion",
+            "authType": "IamAuth",
+        }),
+    )
+    .await;
+    assert_eq!(
+        reply.status, 400,
+        "case no-revisions: expected 400, got {} with {:?}",
+        reply.status, reply.body
+    );
+    assert_eq!(
+        reply.error(),
+        "ValidationException",
+        "case no-revisions: expected ValidationException, got {:?}",
+        reply.body
+    );
+}
+
+/// RULE: an endpoint's name is its identity on its function, and the endpoint belongs
+/// to a function that exists — so a create under a name the function already carries
+/// conflicts with the stored endpoint, and a create on a function nobody created finds
+/// nothing. Neither changes what is stored.
+#[tokio::test]
+async fn a_create_that_cannot_own_its_name_is_refused_and_changes_nothing() {
+    let emulator = Emulator::new();
+    let function_name = "owned-names";
+    function_with_a_revision(&emulator, function_name).await;
+    let body = json!({
+        "endpointName": "prod",
+        "endpointType": "HomeRegion",
+        "authType": "IamAuth",
+        "description": "the first one",
+    });
+    let created = create_endpoint(&emulator, function_name, body.clone()).await;
+    assert_eq!(
+        created.status, 202,
+        "the first create expected 202, got {} with {:?}",
+        created.status, created.body
+    );
+
+    // The rows differ in what the second request asks for: the same configuration, and
+    // a different one. Either way the name is taken.
+    for (case, second) in [
+        ("identical", body.clone()),
+        (
+            "different-configuration",
+            json!({
+                "endpointName": "prod",
+                "endpointType": "MultiRegion",
+                "authType": "ApplicationManaged",
+                "regions": ["eu-west-1"],
+            }),
+        ),
+    ] {
+        let conflict = create_endpoint(&emulator, function_name, second).await;
+        assert_eq!(
+            conflict.status, 409,
+            "case {case:?}: expected 409, got {} with {:?}",
+            conflict.status, conflict.body
+        );
+        assert_eq!(
+            conflict.error(),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {:?}",
+            conflict.body
+        );
+    }
+    // The stored endpoint is the one the first create stored, untouched.
+    let fetched = get_endpoint(&emulator, function_name, "prod").await;
+    assert_eq!(
+        member(&fetched.body, "description"),
+        json!("the first one"),
+        "a refused create must not overwrite the stored endpoint, got {:?}",
+        fetched.body
+    );
+    assert_eq!(
+        member(&fetched.body, "endpointType"),
+        json!("HomeRegion"),
+        "a refused create must not overwrite the stored endpoint, got {:?}",
+        fetched.body
+    );
+
+    // A function nobody created: 404, by either spelling of the identifier.
+    for identifier in [
+        "no-such-function".to_string(),
+        percent_encoded(&expected_arn(REGION, "no-such-function")),
+    ] {
+        let missing = create_endpoint(
+            &emulator,
+            &identifier,
+            json!({
+                "endpointName": "prod",
+                "endpointType": "HomeRegion",
+                "authType": "IamAuth",
+            }),
+        )
+        .await;
+        assert_eq!(
+            missing.status, 404,
+            "case {identifier:?}: expected 404, got {} with {:?}",
+            missing.status, missing.body
+        );
+        assert_eq!(
+            missing.error(),
+            "ResourceNotFoundException",
+            "case {identifier:?}: expected ResourceNotFoundException, got {:?}",
+            missing.body
+        );
+    }
+}
+
+/// RULE: the documented `endpointName` and `regions` rules hold of every endpoint this
+/// service creates, whichever operation creates it — and a refused create stores
+/// nothing.
+#[tokio::test]
+async fn a_configuration_outside_the_documented_rules_is_refused_on_this_path_too() {
+    let emulator = Emulator::new();
+    let function_name = "rules-apply";
+    function_with_a_revision(&emulator, function_name).await;
+
+    let long_name = "e".repeat(65);
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "name-leading-underscore",
+            json!({ "endpointName": "_prod", "endpointType": "HomeRegion", "authType": "IamAuth" }),
+        ),
+        (
+            "name-trailing-hyphen",
+            json!({ "endpointName": "prod-", "endpointType": "HomeRegion", "authType": "IamAuth" }),
+        ),
+        (
+            "name-illegal-character",
+            json!({ "endpointName": "pro/d", "endpointType": "HomeRegion", "authType": "IamAuth" }),
+        ),
+        (
+            "name-one-past-the-bound",
+            json!({ "endpointName": long_name, "endpointType": "HomeRegion", "authType": "IamAuth" }),
+        ),
+        (
+            "home-region-with-another-region",
+            json!({
+                "endpointName": "prod",
+                "endpointType": "HomeRegion",
+                "authType": "IamAuth",
+                "regions": ["eu-west-1"],
+            }),
+        ),
+        (
+            "multi-region-without-regions",
+            json!({ "endpointName": "edge", "endpointType": "MultiRegion", "authType": "IamAuth" }),
+        ),
+        (
+            "per-region-with-only-the-home-region",
+            json!({
+                "endpointName": "edge",
+                "endpointType": "PerRegion",
+                "authType": "IamAuth",
+                "regions": [REGION],
+            }),
+        ),
+    ];
+    for (case, body) in cases {
+        let reply = create_endpoint(&emulator, function_name, body).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {case:?}: expected 400, got {} with {:?}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error(),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {:?}",
+            reply.body
+        );
+    }
+    // Nothing above was stored: the function still carries no endpoint at all.
+    for endpoint_name in ["prod", "edge", "_prod", &long_name] {
+        let fetched = get_endpoint(&emulator, function_name, endpoint_name).await;
+        assert_eq!(
+            fetched.status, 404,
+            "case {endpoint_name:?}: a refused create stores nothing, got {} with {:?}",
+            fetched.status, fetched.body
+        );
+    }
+}
+
+/// RULE: a function carries at most the endpoints the account's
+/// `maxEndpointsPerFunction` quota allows, and a create past it is refused with the
+/// modelled quota error rather than stored.
+#[tokio::test]
+async fn a_create_past_the_endpoint_quota_is_refused() {
+    let emulator = Emulator::new();
+    let function_name = "at-the-quota";
+    function_with_a_revision(&emulator, function_name).await;
+    let quota = usize::try_from(MAX_ENDPOINTS_PER_FUNCTION).expect("a positive quota");
+    for index in 0..quota {
+        let reply = create_endpoint(
+            &emulator,
+            function_name,
+            json!({
+                "endpointName": format!("ep-{index}"),
+                "endpointType": "HomeRegion",
+                "authType": "IamAuth",
+            }),
+        )
+        .await;
+        assert_eq!(
+            reply.status, 202,
+            "case ep-{index}: expected 202 below the quota, got {} with {:?}",
+            reply.status, reply.body
+        );
+    }
+    let refused = create_endpoint(
+        &emulator,
+        function_name,
+        json!({
+            "endpointName": "one-too-many",
+            "endpointType": "HomeRegion",
+            "authType": "IamAuth",
+        }),
+    )
+    .await;
+    assert_eq!(
+        refused.status, 402,
+        "case one-too-many: expected 402, got {} with {:?}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error(),
+        "ServiceQuotaExceededException",
+        "case one-too-many: expected ServiceQuotaExceededException, got {:?}",
+        refused.body
+    );
+    let fetched = get_endpoint(&emulator, function_name, "one-too-many").await;
+    assert_eq!(
+        fetched.status, 404,
+        "case one-too-many: a refused create stores nothing, got {} with {:?}",
+        fetched.status, fetched.body
+    );
+}
+
+/// RULE: an endpoint created on a stored function publishes a data plane of its own —
+/// it reaches `Active` on the clock, and at its published address its `authType`
+/// decides: `IamAuth` ("requests ... must be signed with Signature Version 4") refuses
+/// a request presenting no SigV4 credential with Lambda's `403 Forbidden` document,
+/// while `ApplicationManaged` ("your application handles authorization") refuses
+/// nothing of its own.
+///
+/// What an authorized request is answered with is the web function's own handler
+/// response, and this emulator runs no web function code, so it answers `501` and
+/// synthesises nothing in the handler's name.
+#[tokio::test]
+async fn an_endpoint_created_on_a_stored_function_serves_its_own_address() {
+    let emulator = Emulator::new();
+    let function_name = "auth-types";
+    function_with_a_revision(&emulator, function_name).await;
+
+    for (case, auth_type) in [
+        ("iam-authorized", "IamAuth"),
+        ("application-managed", "ApplicationManaged"),
+    ] {
+        let endpoint_name = format!("ep-{case}");
+        let created = create_endpoint(
+            &emulator,
+            function_name,
+            json!({
+                "endpointName": endpoint_name,
+                "endpointType": "HomeRegion",
+                "authType": auth_type,
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: expected 202, got {} with {:?}",
+            created.status, created.body
+        );
+        let domain_name = created.string("domainName").unwrap_or_default();
+        assert!(
+            is_an_address_the_emulator_answers_on(&domain_name),
+            "case {case:?}: expected a domainName the emulator answers on, got {domain_name:?}"
+        );
+
+        // Nothing is published at the address until the endpoint is serving traffic.
+        let pending = request_endpoint(
+            &emulator,
+            function_name,
+            &endpoint_name,
+            "/",
+            &[("authorization", SIGNED_AUTHORIZATION)],
+        );
+        assert_eq!(
+            pending.status().as_u16(),
+            404,
+            "case {case:?}: an endpoint that is not serving traffic publishes nothing, got {}",
+            pending.status()
+        );
+
+        let active = poll_until_active(&emulator, function_name, &endpoint_name).await;
+        assert_eq!(
+            member(&active, "domainName"),
+            json!(domain_name),
+            "case {case:?}: the serving endpoint reports another address, got {active:?}"
+        );
+
+        // (request case, the request's URI, its headers, the status the address answers)
+        let unsigned = if auth_type == "IamAuth" { 403 } else { 501 };
+        let rows: &[AddressRow<'_>] = &[
+            (
+                "a signed GET",
+                "/",
+                &[("authorization", SIGNED_AUTHORIZATION)],
+                501,
+            ),
+            (
+                "a presigned GET",
+                "/?X-Amz-Credential=AKIDEXAMPLE&X-Amz-Signature=deadbeef",
+                &[],
+                501,
+            ),
+            ("an unsigned GET", "/", &[], unsigned),
+            ("an unsigned GET deeper in the path", "/items/42", &[], unsigned),
+        ];
+        for (request_case, uri, headers, expected) in rows {
+            let answered = request_endpoint(&emulator, function_name, &endpoint_name, uri, headers);
+            assert_eq!(
+                answered.status().as_u16(),
+                *expected,
+                "case {case:?}/{request_case:?}: expected {expected}, got {} with {:?}",
+                answered.status(),
+                String::from_utf8_lossy(answered.body())
+            );
+            if *expected == 403 {
+                assert_eq!(
+                    String::from_utf8_lossy(answered.body()),
+                    "{\"Message\":\"Forbidden\"}",
+                    "case {case:?}/{request_case:?}: expected Lambda's Forbidden document"
+                );
+            }
+        }
+    }
+}
+
+/// One row of the published-address table: the case, the request URI, the headers it
+/// carries, and the status the address answers it with.
+type AddressRow<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], u16);
+
+/// A SigV4 `Authorization` header, as a signed client sends one.
+const SIGNED_AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/\
+                                    lambda/aws4_request, SignedHeaders=host, Signature=deadbeef";
+
+/// One request to a published endpoint's address, answered by the decision the core's
+/// listener serves there — read out of the ONE store this service's handlers write.
+fn request_endpoint(
+    emulator: &Emulator,
+    function_name: &str,
+    endpoint_name: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> ::http::Response<Vec<u8>> {
+    let mut builder = ::http::Request::builder().method("GET").uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder.body(Vec::new()).expect("a well-formed request");
+    let state = service_state(&**emulator.engine()).expect("this service's store");
+    serve_request(&state, function_name, endpoint_name, &request)
+}
+

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWebFunctionEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWebFunctionEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWebFunctionEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds an endpoint to a web function the store already holds, in the endpoint slice
+//! of this service's state ([`crate::state::endpoints`]) — the same slice
+//! `CreateWebFunction`'s initial endpoint is stored in, so the endpoint readers of
+//! this service report ONE copy of every endpoint however it was created.
+//!
+//! The endpoint's published `domainName` is the ADDRESS this emulator answers that
+//! endpoint's own HTTP requests on ([`crate::state::endpoint_plane`]), opened before
+//! anything is stored so no endpoint is ever stored announcing a domain nothing
+//! serves. Every member of the response is read back out of the stored record.
 //!
 //! ## Shape of an operation
 //!
@@ -204,6 +205,156 @@ impl From<CreateWebFunctionEndpointErrorModeled> for CreateWebFunctionEndpointEr
     }
 }
 
+/// One refusal of a request this operation models no other error for: a 400
+/// `ValidationException` carrying `message`.
+fn validation(message: String) -> CreateWebFunctionEndpointError {
+    CreateWebFunctionEndpointErrorModeled::ValidationException(ValidationException { message })
+        .into()
+}
+
+/// The stored web function `function_name` names, or the modelled 404 for a function
+/// this store does not hold. `identifier` is what the request named it by, which is
+/// what the refusal quotes back.
+fn require_function<'store>(
+    state: &'store crate::state::ComAmazonawsLambdawebLambdawebState,
+    function_name: &str,
+    identifier: &str,
+) -> Result<&'store crate::state::WebFunction, CreateWebFunctionEndpointError> {
+    state.functions.get(function_name).ok_or_else(|| {
+        CreateWebFunctionEndpointErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::function_not_found_message(identifier),
+                resource_id: None,
+                resource_type: None,
+            },
+        )
+        .into()
+    })
+}
+
+/// Refuse a create under an `endpointName` this function already carries: an
+/// endpoint's name is its identity on the function (the store is keyed by it), so a
+/// second create under that name conflicts with the stored endpoint rather than
+/// replacing it.
+fn refuse_if_taken(
+    function: &crate::state::WebFunction,
+    endpoint_name: &str,
+) -> Result<(), CreateWebFunctionEndpointError> {
+    let Some(existing) = function.endpoints.get(endpoint_name) else {
+        return Ok(());
+    };
+    Err(
+        CreateWebFunctionEndpointErrorModeled::ConflictException(ConflictException {
+            message: format!(
+                "The endpoint {} already exists on web function {}.",
+                existing.endpoint_name, function.function_name
+            ),
+            resource_id: None,
+            resource_type: None,
+        })
+        .into(),
+    )
+}
+
+/// Refuse a create that would take the function past the endpoints it may carry —
+/// the very allowance `GetWebAccountSettings` reports as
+/// `maxEndpointsPerFunction`, so a caller that reads that quota and a caller that
+/// trips it see the same number.
+fn refuse_if_at_the_quota(
+    function: &crate::state::WebFunction,
+) -> Result<(), CreateWebFunctionEndpointError> {
+    let stored = i64::try_from(function.endpoints.len()).unwrap_or(i64::MAX);
+    if stored < i64::from(crate::state::MAX_ENDPOINTS_PER_FUNCTION) {
+        return Ok(());
+    }
+    Err(
+        CreateWebFunctionEndpointErrorModeled::ServiceQuotaExceededException(
+            ServiceQuotaExceededException {
+                message: format!(
+                    "The request would exceed the maximum number of endpoints ({}) for web function {}",
+                    crate::state::MAX_ENDPOINTS_PER_FUNCTION, function.function_name
+                ),
+                resource_id: None,
+                resource_type: None,
+                service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                quota_code: None,
+            },
+        )
+        .into(),
+    )
+}
+
+/// Which revisions the new endpoint serves, and with how much of the traffic.
+///
+/// `revisionWeights` is optional on the request and `@required` with at least one
+/// entry on every endpoint this service reports, so an endpoint created without one
+/// serves the function's newest revision with all of the traffic — the same revision
+/// `CreateWebFunction`'s initial endpoint is pointed at, and the one an
+/// `autoDeploymentMode` of `LatestRevision` would move it onto anyway. A function
+/// with no revisions at all has nothing for an endpoint to route to, so the request
+/// has to name the weights and cannot.
+///
+/// A named revision has to be one of the function's own: an endpoint "maps a
+/// revision to a weight", so a weight naming no stored revision names nothing. The
+/// list is `@uniqueItems`, which refuses two identical ENTRIES at the boundary but
+/// not two weights for one revision, and "you can assign weights to up to two
+/// revisions" (`RevisionWeight`) — one revision twice is not two revisions.
+fn revision_weights_for(
+    function: &crate::state::WebFunction,
+    requested: Option<&[RevisionWeight]>,
+) -> Result<Vec<RevisionWeight>, CreateWebFunctionEndpointError> {
+    let Some(requested) = requested else {
+        let Some(latest) = function.latest_revision() else {
+            return Err(validation(format!(
+                "The revisionWeights parameter is required because web function {} has no \
+                 revisions: an endpoint serves at least one revision.",
+                function.function_name
+            )));
+        };
+        return Ok(vec![RevisionWeight {
+            revision_id: latest.revision_id.clone(),
+            weight: crate::state::FULL_WEIGHT,
+        }]);
+    };
+    let mut named: Vec<&str> = Vec::with_capacity(requested.len());
+    for weight in requested {
+        if !function.revisions.contains_key(&weight.revision_id) {
+            return Err(
+                CreateWebFunctionEndpointErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "The revision {} of web function {} doesn't exist.",
+                            weight.revision_id, function.function_name
+                        ),
+                        resource_id: None,
+                        resource_type: None,
+                    },
+                )
+                .into(),
+            );
+        }
+        if named.contains(&weight.revision_id.as_str()) {
+            return Err(validation(format!(
+                "The revisionWeights parameter names revision {} more than once: each entry \
+                 must name a different revision.",
+                weight.revision_id
+            )));
+        }
+        named.push(&weight.revision_id);
+    }
+    Ok(requested.to_vec())
+}
+
+/// The HOME Region of `function`: "the Region where you created the web function",
+/// which is the Region its stored ARN names — the one the `endpointType` and
+/// `regions` rules are stated against. A stored ARN whose Region field is not a
+/// Region label leaves the Region the call was signed for.
+fn home_region(function: &crate::state::WebFunction, signed_for: &str) -> String {
+    ::service_common::arn::region_of(&function.function_arn, crate::state::ARN_NAMESPACE)
+        .unwrap_or(signed_for)
+        .to_string()
+}
+
 /// The `CreateWebFunctionEndpoint` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -240,18 +391,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWebFunctionEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWebFunctionEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWebFunctionEndpoint"))
+        let akid = ::engine::extract_akid(&ctx.parts().headers);
+        // The Region the call was signed for, which is the one a function's own ARN
+        // names when the endpoint is created in the Region the function was.
+        let signed_for = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateWebFunctionEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the web function store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The caller may name the function by name or by ARN; both resolve to the one
+        // stored record.
+        let function_name = crate::state::resolve_function_name(&input.function_name).to_string();
+
+        // Every refusal, taken under a guard of its own and BEFORE the address below is
+        // opened: a request that is going to be refused should not bind a port. They are
+        // all checked again under the guard that does the writing, which is the one that
+        // decides, because the store may have moved in between.
+        {
+            let mut store = state.lock();
+            store.materialise_due_transitions(::std::time::SystemTime::now());
+            let function = require_function(&store, &function_name, &input.function_name)?;
+            refuse_if_taken(function, &input.endpoint_name)?;
+            refuse_if_at_the_quota(function)?;
+            revision_weights_for(function, input.revision_weights.as_deref())?;
+            // The two rules the model cannot express — the `endpointName` naming rule and
+            // the `regions` rule — are stated against the endpoint's HOME Region, so they
+            // are checked once the function that fixes that Region is in hand.
+            if let Some(message) = crate::state::endpoint_config_violation(
+                &input.endpoint_name,
+                &input.endpoint_type,
+                input.regions.as_deref(),
+                &home_region(function, &signed_for),
+            ) {
+                return Err(validation(message));
+            }
+        }
+
+        // The ADDRESS this endpoint is published on, opened before anything is stored:
+        // the endpoint reports it as its `domainName`, and this emulator answers the
+        // endpoint's own HTTP requests there. An emulator that vends no listener answers a
+        // modelled server error rather than publishing a domain nothing serves.
+        let plane = crate::state::open_endpoint_plane(
+            &*self.engine,
+            &state,
+            &function_name,
+            &input.endpoint_name,
+        )
+        .await
+        .ok_or_else(|| {
+            CreateWebFunctionEndpointErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the web function endpoint's address could not be opened".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.materialise_due_transitions(now);
+
+        let (revision_weights, region) = {
+            let function = require_function(&store, &function_name, &input.function_name)?;
+            refuse_if_taken(function, &input.endpoint_name)?;
+            refuse_if_at_the_quota(function)?;
+            let weights = revision_weights_for(function, input.revision_weights.as_deref())?;
+            let region = home_region(function, &signed_for);
+            if let Some(message) = crate::state::endpoint_config_violation(
+                &input.endpoint_name,
+                &input.endpoint_type,
+                input.regions.as_deref(),
+                &region,
+            ) {
+                return Err(validation(message));
+            }
+            (weights, region)
+        };
+
+        let endpoint_name = store
+            .add_endpoint(
+                &function_name,
+                crate::state::NewEndpoint {
+                    endpoint_name: input.endpoint_name.clone(),
+                    description: input.description,
+                    endpoint_type: input.endpoint_type,
+                    auth_type: input.auth_type,
+                    auto_deployment_mode: input.auto_deployment_mode,
+                    regions: input.regions,
+                    scaling_config: input.scaling_config,
+                    throttle_config: input.throttle_config,
+                    revision_weights,
+                },
+                &region,
+                plane.authority(),
+                now,
+            )
+            .expect("the function found above is in the store");
+
+        // The listener's handle lives in the store beside the endpoint record, under that
+        // endpoint's ARN: holding it is what keeps the published address answering, and a
+        // delete of the endpoint (or of its function) closes it.
+        let endpoint_arn = store
+            .functions
+            .get(&function_name)
+            .and_then(|function| function.endpoints.get(&endpoint_name))
+            .map(|endpoint| endpoint.endpoint_arn.clone())
+            .expect("the endpoint stored above is under that function");
+        store.endpoint_planes.insert(endpoint_arn, plane);
+
+        // Every member below comes out of the stored record, so what this create reports
+        // is what the endpoint readers of this service report for the same endpoint.
+        let function = store
+            .functions
+            .get(&function_name)
+            .expect("the function found above is in the store");
+        let endpoint = function
+            .endpoints
+            .get(&endpoint_name)
+            .expect("the endpoint stored above is under that function");
+        // The audit record for a state change: who, what, outcome. No secret and no
+        // credential material — the access key id identifies the caller the way the
+        // real service's trail does.
+        ::tracing::info!(
+            operation = "CreateWebFunctionEndpoint",
+            akid = %akid,
+            function_name = %function.function_name,
+            endpoint_arn = %endpoint.endpoint_arn,
+            outcome = "created",
+            "web function endpoint created"
+        );
+        Ok(CreateWebFunctionEndpointOutput {
+            function_arn: function.function_arn.clone(),
+            endpoint_arn: endpoint.endpoint_arn.clone(),
+            endpoint_name: endpoint.endpoint_name.clone(),
+            description: endpoint.description.clone(),
+            endpoint_type: endpoint.endpoint_type.clone(),
+            domain_name: endpoint.domain_name.clone(),
+            auth_type: endpoint.auth_type.clone(),
+            auto_deployment_mode: endpoint.auto_deployment_mode.clone(),
+            revision_weights: endpoint.revision_weights.clone(),
+            regions: endpoint.region_list(),
+            scaling_config: endpoint.scaling_config.clone(),
+            throttle_config: endpoint.throttle_config.clone(),
+            state: endpoint.state.wire().to_string(),
+            state_reason: endpoint.state_reason.clone(),
+            update_status: endpoint.update_status.clone(),
+            update_status_reason: endpoint.update_status_reason.clone(),
+            regional_endpoints: endpoint.regional_endpoints(),
+            created_at: ::aws_smithy_types::DateTime::from(endpoint.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(endpoint.updated_at),
+        })
     }
 }

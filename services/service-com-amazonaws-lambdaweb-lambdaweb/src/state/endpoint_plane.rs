@@ -19,9 +19,11 @@
 //! ARN, beside the records that say which endpoints exist: dropping it closes the port, so
 //! a deleted endpoint stops answering ([`super::ComAmazonawsLambdawebLambdawebState::
 //! prune_endpoint_planes`]). How many addresses one store can hold open is bounded by the
-//! resources a caller may create: the one create path that opens an address creates at most
-//! one endpoint per web function, and the store holds at most
-//! [`super::MAX_WEB_FUNCTIONS`] of those.
+//! resources a caller may create: a web function carries at most
+//! [`super::MAX_ENDPOINTS_PER_FUNCTION`] endpoints, each with one address, and the store
+//! holds at most [`super::MAX_WEB_FUNCTIONS`] web functions. An address the host will not
+//! lend a socket for is not opened, and the create answers a modelled server error rather
+//! than storing an endpoint that announces a domain nothing serves.
 //!
 //! The socket, the bind interface and the TLS are the CORE's: the listener is opened
 //! through `engine.listeners()`, so this plane binds the interface the operator chose
