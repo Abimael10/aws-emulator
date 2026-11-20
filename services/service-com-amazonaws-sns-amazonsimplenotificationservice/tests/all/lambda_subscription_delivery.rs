@@ -227,6 +227,25 @@ pub(crate) async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> V
     parsed
 }
 
+/// FETCH `url` through THIS harness's router, as a client that was handed it would.
+///
+/// The request a client makes of a URL it was handed is built by the one definition of it
+/// this target has (`sqs_subscription_delivery::anonymous_get`); what differs here is only
+/// which router answers it, because this harness mounts Lambda beside SNS and the `Emulator`
+/// of that harness is a different one. Answers the status and the body as text: a URL a
+/// delivered record carries is only a URL if following it reaches a document, which is what
+/// the signing certificate a function's event record names is read with below.
+async fn fetch(emulator: &Emulator, url: &str) -> (u16, String) {
+    let response = emulator
+        .router
+        .dispatch(crate::sqs_subscription_delivery::anonymous_get(url))
+        .await;
+    (
+        response.status().as_u16(),
+        String::from_utf8_lossy(response.body()).to_string(),
+    )
+}
+
 /// A function called `name`, brought to `Active` — the state an invocation needs — by moving
 /// the activation instant the store holds into the past, which is what waiting would do. Its
 /// ARN, which is what a subscription names it by.
@@ -1058,4 +1077,277 @@ async fn one_publish_reaches_every_subscribed_endpoint_of_the_topic() {
         "case \"the queue subscribed to the same topic\": expected the published body, got \
          {envelope}"
     );
+}
+
+/// One row of the record-signature table: the `SignatureVersion` the topic is set to (`None`
+/// leaves the topic as created), what is published, and the version the delivered record must
+/// then declare.
+struct SignedRecord {
+    case: &'static str,
+    asked_for: Option<&'static str>,
+    body: &'static str,
+    subject: Option<&'static str>,
+    /// The message attributes the publish carries, as `(name, data type, value)`.
+    attributes: &'static [(&'static str, &'static str, &'static str)],
+    version: &'static str,
+}
+
+/// The rows: the version the topic signs under (the default, each published value, and back
+/// again), whether the publish carried a subject, and whether it carried attributes — what the
+/// rule generalises over, since the signature is over the members the record carries.
+const SIGNED_RECORDS: &[SignedRecord] = &[
+    SignedRecord {
+        case: "the topic default, a bare publish",
+        asked_for: None,
+        body: "a bare event",
+        subject: None,
+        attributes: &[],
+        version: "1",
+    },
+    SignedRecord {
+        case: "the default, with a subject",
+        asked_for: None,
+        body: "an event with a subject",
+        subject: Some("an order"),
+        attributes: &[],
+        version: "1",
+    },
+    SignedRecord {
+        case: "version 1 asked for explicitly, with attributes",
+        asked_for: Some("1"),
+        body: "an attributed event",
+        subject: None,
+        attributes: &[("tier", "String", "gold")],
+        version: "1",
+    },
+    SignedRecord {
+        case: "version 2, which switches the digest to SHA-256",
+        asked_for: Some("2"),
+        body: "an event signed under the other digest",
+        subject: Some("an order"),
+        attributes: &[("tier", "String", "gold"), ("count", "Number", "7")],
+        version: "2",
+    },
+    SignedRecord {
+        case: "back to version 1 on the same topic",
+        asked_for: Some("1"),
+        body: "an event signed under the default digest again",
+        subject: None,
+        attributes: &[],
+        version: "1",
+    },
+];
+
+/// The two URL members a FUNCTION's event record spells with `Url`, the signing certificate's
+/// among them.
+const RECORD_URL_MEMBERS: &[&str] = &["SigningCertUrl", "UnsubscribeUrl"];
+
+/// The `...URL` spelling of those same two members: the JSON envelope's, which a function's
+/// event record never carries.
+const ENVELOPE_URL_MEMBERS: &[&str] = &["SigningCertURL", "UnsubscribeURL"];
+
+/// The part of `url` that names the document, which is its path: what follows the `?` is the
+/// signature that gets a fetch back to this emulator and is minted per URL.
+fn document_path(url: &str) -> &str {
+    url.split_once('?').map_or(url, |(path, _)| path)
+}
+
+/// RULE: every notification SNS delivers inside an envelope carries the material its
+/// subscriber verifies it with — the `SignatureVersion` the topic signs under (its own
+/// `SignatureVersion` attribute, "By default SignatureVersion is set to 1",
+/// `SetTopicAttributesInput$AttributeName`), the RSA `Signature` of the canonical string built
+/// from the members that arrived, over the digest that version selects, and the URL of the
+/// certificate that verifies it (Amazon SNS Developer Guide, "Verifying the signatures of
+/// Amazon SNS messages") — whichever endpoint kind receives it. A subscribed FUNCTION's event
+/// record is such an envelope, so it carries those three members too, with the certificate's
+/// URL under the `Url` spelling a Lambda event names its URL members by.
+///
+/// Asserted the way a verifying handler asserts it, which is the point of the members: the
+/// certificate is FETCHED from the URL the record handed it, the canonical string is rebuilt
+/// from what arrived, and the signature is checked against that certificate's public key with
+/// the digest the declared version selects — through the one definition of those two steps the
+/// envelope suite uses, because the material a function verifies is the same material.
+///
+/// And it is the SAME seal: the queue subscribed to the same topic receives the JSON envelope
+/// of each of these publishes, and the version, the signature and the certificate it names are
+/// the record's own — one message is signed once, however many subscribers receive it.
+#[tokio::test]
+async fn the_record_a_subscribed_function_receives_carries_a_verifiable_signature() {
+    use crate::lambda_subscription_dead_letter::{given_queue, held};
+    use crate::notification_signature::{canonical_string, verifies};
+
+    let emulator = emulator();
+    let topic = element(
+        &sns(&emulator, "CreateTopic", &[("Name", "signed-record")]).await,
+        "TopicArn",
+    );
+    let function = "signed-record-probe";
+    let function_arn = given_function(&emulator, function).await;
+    grant(
+        &emulator,
+        function,
+        "sns-invoke",
+        INVOKE_ACTION,
+        SNS_PRINCIPAL,
+        Some(&topic),
+    )
+    .await;
+    subscribe(&emulator, &topic, LAMBDA_PROTOCOL, &function_arn).await;
+    // A QUEUE subscribed to the same topic receives the JSON envelope of every publish below,
+    // so the two renderings of ONE message can be held against each other. A message this test
+    // has already read stays invisible for the rest of the run, and every row looks for the
+    // envelope of its OWN publish by message id, so no row can be answered by another's.
+    let (queue_url, queue_arn) = given_queue(&emulator, "signed-record-queue").await;
+    sqs(
+        &emulator,
+        "SetQueueAttributes",
+        &json!({
+            "QueueUrl": queue_url,
+            "Attributes": {"VisibilityTimeout": "43200"},
+        }),
+    )
+    .await;
+    subscribe(&emulator, &topic, "sqs", &queue_arn).await;
+
+    for (index, row) in SIGNED_RECORDS.iter().enumerate() {
+        let case = row.case;
+        if let Some(asked_for) = row.asked_for {
+            sns(
+                &emulator,
+                "SetTopicAttributes",
+                &[
+                    ("TopicArn", &topic),
+                    ("AttributeName", "SignatureVersion"),
+                    ("AttributeValue", asked_for),
+                ],
+            )
+            .await;
+        }
+        let mut params: Vec<(String, String)> = vec![("Message".to_string(), row.body.to_string())];
+        if let Some(subject) = row.subject {
+            params.push(("Subject".to_string(), subject.to_string()));
+        }
+        for (at, (name, data_type, value)) in row.attributes.iter().enumerate() {
+            let entry = at + 1;
+            params.push((
+                format!("MessageAttributes.entry.{entry}.Name"),
+                (*name).to_string(),
+            ));
+            params.push((
+                format!("MessageAttributes.entry.{entry}.Value.DataType"),
+                (*data_type).to_string(),
+            ));
+            params.push((
+                format!("MessageAttributes.entry.{entry}.Value.StringValue"),
+                (*value).to_string(),
+            ));
+        }
+        let borrowed: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let message_id = publish(&emulator, &topic, &borrowed).await;
+
+        let events = invoked(&emulator, function, index + 1).await;
+        let record = events
+            .iter()
+            .map(|event| &event["Records"][0]["Sns"])
+            .find(|record| record["MessageId"].as_str() == Some(message_id.as_str()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected a record of the publish {message_id:?}, got {events:?}"
+                )
+            });
+
+        assert_eq!(
+            record["SignatureVersion"].as_str(),
+            Some(row.version),
+            "case {case:?}: expected the record to declare SignatureVersion {:?}, got {record}",
+            row.version
+        );
+        for member in RECORD_URL_MEMBERS {
+            assert!(
+                record[*member].as_str().is_some_and(|url| !url.is_empty()),
+                "case {case:?}: expected the record to carry {member}, got {record}"
+            );
+        }
+        for member in ENVELOPE_URL_MEMBERS {
+            assert!(
+                record.get(*member).is_none(),
+                "case {case:?}: a function's event record never carries the {member} spelling, \
+                 got {record}"
+            );
+        }
+
+        let certificate_url = record["SigningCertUrl"].as_str().unwrap_or_default();
+        let (status, certificate) = fetch(&emulator, certificate_url).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: following {certificate_url:?} must reach the certificate, got \
+             {status} / {certificate}"
+        );
+        assert!(
+            certificate.starts_with("-----BEGIN CERTIFICATE-----"),
+            "case {case:?}: {certificate_url:?} must serve a PEM certificate, got {certificate}"
+        );
+        let declared = record["Signature"].as_str().unwrap_or_default();
+        let signature = ::aws_smithy_types::base64::decode(declared).unwrap_or_else(|error| {
+            panic!("case {case:?}: the record's Signature must be base64 ({error}): {record}")
+        });
+        let signed = canonical_string(record);
+        assert!(
+            verifies(&certificate, row.version, &signed, &signature),
+            "case {case:?}: the record's signature must verify against the certificate it \
+             named, over the canonical string {signed:?}, got {record}"
+        );
+        // The signature is of THIS record: one byte more and it does not verify, so the member
+        // is a signature rather than a constant that happens to decode.
+        assert!(
+            !verifies(
+                &certificate,
+                row.version,
+                &format!("{signed}tampered\n"),
+                &signature
+            ),
+            "case {case:?}: a signature of another string must not verify, got {record}"
+        );
+
+        let delivered: Vec<Value> = held(&emulator, &queue_url, 1)
+            .await
+            .iter()
+            .map(|body| {
+                serde_json::from_str(body).unwrap_or_else(|error| {
+                    panic!("case {case:?}: the delivered body must be the envelope ({error}): \
+                            {body}")
+                })
+            })
+            .collect();
+        let envelope = delivered
+            .iter()
+            .find(|envelope| envelope["MessageId"].as_str() == Some(message_id.as_str()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected the queue to receive the envelope of \
+                     {message_id:?}, got {delivered:?}"
+                )
+            });
+        assert_eq!(
+            (
+                envelope["SignatureVersion"].as_str(),
+                envelope["Signature"].as_str(),
+            ),
+            (
+                record["SignatureVersion"].as_str(),
+                record["Signature"].as_str(),
+            ),
+            "case {case:?}: one message is sealed once, so the envelope's version and \
+             signature are the record's, got {envelope} against {record}"
+        );
+        assert_eq!(
+            document_path(envelope["SigningCertURL"].as_str().unwrap_or_default()),
+            document_path(certificate_url),
+            "case {case:?}: both renderings must name the same signing certificate, got \
+             {envelope} against {record}"
+        );
+    }
 }

@@ -200,26 +200,37 @@ pub(crate) fn element(body: &str, tag: &str) -> String {
     body[start..start + end].to_string()
 }
 
-/// FETCH `url` through this same router, as a client that was handed it would: the host and
-/// the path (with its query) are taken from the URL itself, so a URL this emulator minted is
-/// followed exactly as it was handed out.
+/// A GET of `url` as a client that was handed it would make it: the host and the path (with
+/// its query) are taken from the URL itself and no credential of its own is carried, so a URL
+/// this emulator minted is followed exactly as it was handed out.
 ///
-/// Answers the status and the body as text. `pub(crate)` because a URL a notification
-/// carries is only a URL if following it reaches a document
-/// (`notification_signature.rs`).
-pub(crate) async fn fetch(emulator: &Emulator, url: &str) -> (u16, String) {
+/// `pub(crate)`: the harnesses of this target differ in which services they mount, and so in
+/// the `Emulator` they dispatch on, but following a URL is the same REQUEST whichever router
+/// answers it — so it is built once here, and a suite over another harness dispatches it on
+/// its own router (`lambda_subscription_delivery.rs` follows the signing certificate a
+/// function's event record names with it).
+pub(crate) fn anonymous_get(url: &str) -> http::Request<bytes::Bytes> {
     let addressed = url.split_once("://").map_or(url, |(_, rest)| rest);
     let (host, path) = match addressed.find('/') {
         Some(at) => (&addressed[..at], &addressed[at..]),
         None => (addressed, "/"),
     };
-    let request = http::Request::builder()
+    http::Request::builder()
         .method("GET")
         .uri(path)
         .header("host", host)
         .body(bytes::Bytes::new())
-        .expect("the test request is well formed");
-    let response = emulator.router.dispatch(request).await;
+        .expect("the test request is well formed")
+}
+
+/// FETCH `url` through this same router, as a client that was handed it would
+/// ([`anonymous_get`]).
+///
+/// Answers the status and the body as text. `pub(crate)` because a URL a notification
+/// carries is only a URL if following it reaches a document
+/// (`notification_signature.rs`).
+pub(crate) async fn fetch(emulator: &Emulator, url: &str) -> (u16, String) {
+    let response = emulator.router.dispatch(anonymous_get(url)).await;
     let status = response.status().as_u16();
     let text = String::from_utf8_lossy(response.body()).to_string();
     (status, text)
