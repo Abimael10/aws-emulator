@@ -58,7 +58,10 @@ const PRECONDITION_FAILED: &str = "Your request is missing requirements for this
 
 /// One `DisassociateDistributionWebACL` call: the distribution in the path and the version
 /// (when the row states one) in the `If-Match` header. The operation carries no body.
-async fn disassociate_web_acl(
+///
+/// `pub(crate)` so the suite about what an association DOES at the edge takes it off the way
+/// a client does rather than carrying a second copy of the route.
+pub(crate) async fn disassociate_web_acl(
     router: &MultiServiceRouter,
     id: &str,
     if_match: Option<&str>,

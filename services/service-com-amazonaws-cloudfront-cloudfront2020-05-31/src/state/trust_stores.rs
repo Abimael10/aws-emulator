@@ -282,6 +282,27 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|trust_store| trust_store.arn == identifier || trust_store.name == identifier)
     }
 
+    /// The id of the distribution whose viewer mTLS configuration validates client
+    /// certificates against the trust store `id` names, or `None` when nothing stored does.
+    ///
+    /// What makes a trust store IN USE, and so what a delete of one is refused for: a
+    /// distribution names a trust store in exactly one place
+    /// ([`references_trust_store`]), the same place the listing of the distributions a
+    /// trust store serves reads, so the two can never disagree about which trust stores are
+    /// still referenced. A scan over the STORED configurations rather than a second index
+    /// beside them, for the reason
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_origin_access_control`]
+    /// scans, and over a collection bounded by [`MAX_DISTRIBUTIONS`].
+    ///
+    /// The holder's id rather than its record, because what the refusal needs to know is
+    /// that there is one.
+    pub fn distribution_using_trust_store(&self, id: &str) -> Option<&str> {
+        self.distributions
+            .values()
+            .find(|stored| references_trust_store(&stored.config, id))
+            .map(|stored| stored.id.as_str())
+    }
+
     /// Whether the account already holds a trust store called `name` — what makes a
     /// repeated name a [`trust_store_already_exists`] rather than a second trust store.
     ///

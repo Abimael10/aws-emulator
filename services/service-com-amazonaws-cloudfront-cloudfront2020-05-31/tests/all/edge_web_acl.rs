@@ -35,12 +35,12 @@ use crate::waf_control_plane::SCOPE_CLOUDFRONT;
 /// The viewer path the blocking rule matches. The `SearchString` that matches it is the
 /// base64 of `blockme` in [`BLOCKING_RULE`] — `ByteMatchStatement$SearchString` is a blob,
 /// so the JSON carries it encoded.
-const BLOCKED_PATH: &str = "/blockme.html";
+pub(crate) const BLOCKED_PATH: &str = "/blockme.html";
 
 /// One router carrying BOTH services over one shared engine: the distribution's edge asks
 /// the WAFv2 service about every viewer request, so the two have to be mounted together for
 /// that question to have an answer.
-fn emulator_with_waf() -> MultiServiceRouter {
+pub(crate) fn emulator_with_waf() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -70,7 +70,7 @@ async fn create_web_acl(
 }
 
 /// A rule that BLOCKS a viewer request whose URI path contains `blockme`.
-const BLOCKING_RULE: &str = "{\"Name\":\"block-the-path\",\"Priority\":0,\
+pub(crate) const BLOCKING_RULE: &str = "{\"Name\":\"block-the-path\",\"Priority\":0,\
      \"Statement\":{\"ByteMatchStatement\":{\"SearchString\":\"YmxvY2ttZQ==\",\
      \"FieldToMatch\":{\"UriPath\":{}},\
      \"TextTransformations\":[{\"Priority\":0,\"Type\":\"NONE\"}],\
@@ -133,7 +133,7 @@ async fn distribution(router: &MultiServiceRouter, reference: &str, web_acl_id: 
 
 /// One VIEWER request, addressed HOST-STYLE at the name the distribution published and
 /// carrying no credential — which is what a viewer is.
-async fn view(router: &MultiServiceRouter, domain: &str, path: &str) -> Viewed {
+pub(crate) async fn view(router: &MultiServiceRouter, domain: &str, path: &str) -> Viewed {
     let request = ::http::Request::builder()
         .method("GET")
         .uri(path)
@@ -157,10 +157,10 @@ async fn view(router: &MultiServiceRouter, domain: &str, path: &str) -> Viewed {
 }
 
 /// What the edge answered one viewer request with.
-struct Viewed {
-    status: u16,
-    x_cache: String,
-    body: String,
+pub(crate) struct Viewed {
+    pub(crate) status: u16,
+    pub(crate) x_cache: String,
+    pub(crate) body: String,
 }
 
 /// What a row expects of the web ACL in front of its distribution.

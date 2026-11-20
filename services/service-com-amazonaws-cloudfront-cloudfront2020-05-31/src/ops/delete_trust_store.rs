@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTrustStore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTrustStore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTrustStore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes a trust store": the one stored record the create persisted is REMOVED, under the
+//! optimistic-concurrency precondition every conditional write of this service runs under —
+//! so the identifier answers no later read, and the name it held is free again.
+//!
+//! The order the refusals are decided in is the order the request can be judged in: the `Id`
+//! has to name a stored trust store at all (`EntityNotFound`, 404), the `If-Match` the
+//! request carried has to be that record's current version token — a value that is no
+//! version token at all is `InvalidIfMatchVersion` (400) and a well-formed token that is not
+//! the current one is `PreconditionFailed` (412) — and a trust store a stored distribution
+//! still validates viewer certificates against cannot be deleted at all
+//! (`CannotDeleteEntityWhileInUse`, 409). NO refusal writes anything: the record and the
+//! version token an `If-Match` is checked against stand exactly as they were, so a caller
+//! that re-reads the trust store and retries with the version it reports lands.
 //!
 //! ## Shape of an operation
 //!
@@ -70,6 +75,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -168,18 +177,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTrustStore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTrustStoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTrustStore"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes this service's state before the call
+        // reads it, so the version this precondition is evaluated against is the one a read
+        // at this instant reports.
+        store.settle(SystemTime::now());
+
+        // `Id` is "the trust store's ID", the token the create minted and the key the record
+        // is held under — not the `Identifier` the reads of this resource kind resolve — so
+        // the delete removes the one record that id addresses. An id no stored trust store
+        // answers to names nothing to delete: `EntityNotFound` is what this operation models
+        // for an entity it cannot find, and it is decided before anything else is spent on
+        // the request.
+        let Some(stored) = store.trust_stores.get(&input.id) else {
+            return Err(DeleteTrustStoreErrorModeled::EntityNotFound(
+                crate::state::trust_store_not_found(),
+            )
+            .into());
+        };
+        let current_etag = stored.etag.clone();
+
+        // "The current version (ETag value) of the trust store you are deleting": the
+        // precondition is evaluated next, the way HTTP evaluates one, so a caller holding a
+        // version that is no longer current is told that before anything about what the trust
+        // store is attached to. A value that is no version token at all is "the If-Match
+        // version is missing or not valid", and a well-formed token that is not the stored
+        // one is a failed precondition — worded as the resource DOCUMENTS a caller
+        // conditionally rewrites word it, which is the family a trust store belongs to. The
+        // member is `@required`, so a request stating no `If-Match` is refused at the request
+        // boundary.
+        match crate::state::check_if_match(&current_etag, Some(input.if_match.as_str())) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(DeleteTrustStoreErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(DeleteTrustStoreErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed(),
+                )
+                .into());
+            }
+        }
+
+        // A trust store a stored distribution still validates viewer certificates against is
+        // IN USE, so the delete is refused and the trust store stays readable: the reference
+        // is the one place a configuration names a trust store, read from the stored
+        // configurations, so this answers exactly when the listing of the distributions that
+        // trust store serves lists one.
+        if store.distribution_using_trust_store(&input.id).is_some() {
+            return Err(DeleteTrustStoreErrorModeled::CannotDeleteEntityWhileInUse(
+                crate::state::entity_in_use(),
+            )
+            .into());
+        }
+
+        // Gone means gone: the record every read of this trust store answered from is removed
+        // — with the tags it carried, which were held on it — so neither the id, nor the ARN,
+        // nor the name answers a later read, and that name is free for a later create.
+        store.trust_stores.remove(&input.id);
+
+        Ok(DeleteTrustStoreOutput)
     }
 }

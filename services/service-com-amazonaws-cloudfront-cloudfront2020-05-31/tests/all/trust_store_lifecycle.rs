@@ -280,7 +280,7 @@ pub(crate) async fn create_trust_store(router: &MultiServiceRouter, body: &str) 
 }
 
 /// `GET /2020-05-31/trust-store/{Identifier}`.
-async fn get_trust_store(router: &MultiServiceRouter, identifier: &str) -> Answer {
+pub(crate) async fn get_trust_store(router: &MultiServiceRouter, identifier: &str) -> Answer {
     call(
         router,
         "GET",
