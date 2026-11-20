@@ -416,6 +416,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation keeps is the walk, the locking and the refusals it answers with.
         let mut resolution = crate::state::metric_query::Resolution::default();
         for (index, query) in input.metric_data_queries.iter().enumerate() {
+            // A Metrics Insights query reads the store the way a query naming a metric does —
+            // it SELECTS series rather than computing over the values of other queries — so it
+            // is resolved in this pass, before any expression is evaluated: a math expression
+            // may then refer to its result ("you can reference results from a Metrics Insights
+            // query", `GetMetricData`).
+            if query
+                .expression
+                .as_deref()
+                .is_some_and(crate::state::metric_math::is_metrics_insights_query)
+            {
+                let (value, datapoints) = {
+                    let store = state.lock();
+                    crate::state::metric_query::insights_series(
+                        &store,
+                        query,
+                        slice.start,
+                        slice.end,
+                        now,
+                    )
+                }
+                .map_err(refusal)?;
+                resolution
+                    .resolve_query(query, value, datapoints)
+                    .map_err(refusal)?;
+                if index > 0 && index.is_multiple_of(QUERY_YIELD_INTERVAL) {
+                    ::tokio::task::yield_now().await;
+                }
+                continue;
+            }
             let Some(stat) = query.metric_stat.as_ref() else {
                 continue;
             };

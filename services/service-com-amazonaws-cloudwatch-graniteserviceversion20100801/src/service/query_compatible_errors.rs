@@ -153,6 +153,13 @@ const NOT_A_SERVICE_CLASS: &[&str] = &["NotImplemented", "AccessDenied"];
 /// The body member the JSON error renderers name the error shape in.
 const TYPE_MEMBER: &str = "__type";
 
+/// The root element of the `awsQuery` error envelope.
+const QUERY_ERROR_ROOT: &str = "<ErrorResponse";
+
+/// The element of that envelope that names the class, as the renderer writes it.
+const CODE_OPEN: &str = "<Code>";
+const CODE_CLOSE: &str = "</Code>";
+
 /// The response header the legacy query error code and fault side are reported in.
 const QUERY_ERROR_HEADER: &str = "x-amzn-query-error";
 
@@ -189,6 +196,38 @@ fn class_of(named: &str) -> Option<&'static ErrorClass> {
         .iter()
         .copied()
         .find(|class| class.answers_to(named))
+}
+
+/// `body` with the class its `<Code>` names restated as that class's QUERY code, or `None` when
+/// the body is not an `awsQuery` error envelope or already names the class the way that wire
+/// does.
+///
+/// The envelope of the query protocol states the class in the body rather than in a header, and
+/// what it states there is the LEGACY code a query client branches on — so the
+/// request-validation class is `ValidationError` on this wire, where a JSON body of the same
+/// refusal names the shape `ValidationException` ([`VALIDATION`]). A modelled fault is left
+/// alone: the framework writes its own `awsQueryError` code, the class's one source for a fault
+/// the model declares.
+///
+/// Only the `<Code>` element is touched: the status, the `<Type>`, the `<Message>` and the
+/// `<RequestId>` belong to the layers that wrote them.
+fn with_query_code(body: &str) -> Option<String> {
+    if !body.contains(QUERY_ERROR_ROOT) {
+        return None;
+    }
+    let opens = body.find(CODE_OPEN)?.checked_add(CODE_OPEN.len())?;
+    let closes = body.get(opens..)?.find(CODE_CLOSE)?.checked_add(opens)?;
+    let named = body.get(opens..closes)?;
+    let class = class_of(local_name(named))?;
+    if named == class.query_code {
+        return None;
+    }
+    Some(format!(
+        "{}{}{}",
+        body.get(..opens)?,
+        class.query_code,
+        body.get(closes..)?
+    ))
 }
 
 /// The fully qualified shape id a body naming `named` states, or `None` when this service
@@ -235,6 +274,18 @@ fn with_qualified_type(mut document: Value, shape_id: &str) -> Option<Vec<u8>> {
     serde_json::to_vec(&document).ok()
 }
 
+/// `resp` answered with `body` instead of the bytes its renderer wrote.
+///
+/// Only a renderer that advertised a length needs it corrected; the framework's error renderers
+/// set `content-type` alone and leave framing to the transport.
+fn restated_body(resp: &mut RtResponse, body: Vec<u8>) {
+    if resp.headers().get("content-length").is_some() {
+        let length = body.len().to_string();
+        let _ = resp.headers_mut().try_insert("content-length", length);
+    }
+    *resp.body_mut() = SdkBody::from(body);
+}
+
 /// `resp` as this `awsQueryCompatible` service answers it: the class named in full in the
 /// body, and its legacy query code reported in the header for a client that asked for one.
 ///
@@ -249,19 +300,23 @@ pub fn completing_the_envelope(req: &RtRequest, mut resp: RtResponse) -> RtRespo
     // An error body is built in memory by its renderer, so the bytes are readable here; a
     // streamed body is not an error body and is left alone.
     let Some((document, named)) = resp.body().bytes().and_then(error_document) else {
+        // A failure answered in the QUERY protocol is no JSON document: it names its class in
+        // the `<Code>` of the envelope, under that class's legacy code ([`with_query_code`]).
+        if let Some(rewritten) = resp
+            .body()
+            .bytes()
+            .and_then(|bytes| ::std::str::from_utf8(bytes).ok())
+            .and_then(with_query_code)
+        {
+            restated_body(&mut resp, rewritten.into_bytes());
+        }
         return resp;
     };
     let class = class_of(&named);
     if let Some(rewritten) = shape_id_of(&named, class)
         .and_then(|shape_id| with_qualified_type(document, &shape_id))
     {
-        // Only a renderer that advertised a length needs it corrected; the framework's error
-        // renderers set `content-type` alone and leave framing to the transport.
-        if resp.headers().get("content-length").is_some() {
-            let length = rewritten.len().to_string();
-            let _ = resp.headers_mut().try_insert("content-length", length);
-        }
-        *resp.body_mut() = SdkBody::from(rewritten);
+        restated_body(&mut resp, rewritten);
     }
     if let Some(class) = class {
         if resp.headers().get(QUERY_ERROR_HEADER).is_none() && asked_for_the_query_error(req) {
@@ -503,5 +558,70 @@ mod tests {
             VALIDATION.shape_id,
             "the framework's refusal names the request-validation class in full"
         );
+    }
+
+    /// The envelope of the QUERY protocol names the class in its `<Code>`, under that class's
+    /// legacy code — and leaves every other element, and a class whose code the framework
+    /// already wrote, exactly as the renderer wrote it.
+    #[test]
+    fn the_query_envelope_names_the_class_by_its_legacy_code() {
+        // (case, the `<Code>` the renderer wrote, the one the answer carries)
+        let rows: [(&str, &str, &str); 5] = [
+            (
+                "the constraint walk's own refusal",
+                "ValidationException",
+                "ValidationError",
+            ),
+            (
+                "this service's own wording of the same class",
+                "ValidationError",
+                "ValidationError",
+            ),
+            (
+                "the modelled parameter-value fault",
+                "InvalidParameterValueException",
+                "InvalidParameterValue",
+            ),
+            (
+                "a modelled fault the framework already coded",
+                "ResourceNotFound",
+                "ResourceNotFound",
+            ),
+            (
+                "a routing failure of the protocol itself",
+                "InvalidAction",
+                "InvalidAction",
+            ),
+        ];
+        for (case, rendered, expected) in rows {
+            let body = format!(
+                "<?xml version=\"1.0\"?><ErrorResponse><Error><Type>Sender</Type>\
+                 <Code>{rendered}</Code><Message>Value &apos;x&apos; at &apos;Code&apos; is \
+                 no good</Message></Error><RequestId>an-id</RequestId></ErrorResponse>"
+            );
+            let completed = completing_the_envelope(&asked(false), answered(400, &body));
+            let answered_body = completed
+                .body()
+                .bytes()
+                .map(|bytes| String::from_utf8_lossy(bytes).to_string())
+                .unwrap_or_default();
+            assert!(
+                answered_body.contains(&format!("<Code>{expected}</Code>")),
+                "case {case:?}: expected the class {expected:?} in the envelope, got \
+                 {answered_body}"
+            );
+            // Every other element is the renderer's: the message quoting a value, the fault
+            // side and the request the envelope names.
+            for kept in [
+                "<Type>Sender</Type>",
+                "<Message>Value &apos;x&apos; at &apos;Code&apos; is no good</Message>",
+                "<RequestId>an-id</RequestId>",
+            ] {
+                assert!(
+                    answered_body.contains(kept),
+                    "case {case:?}: expected {kept:?} to be kept, got {answered_body}"
+                );
+            }
+        }
     }
 }

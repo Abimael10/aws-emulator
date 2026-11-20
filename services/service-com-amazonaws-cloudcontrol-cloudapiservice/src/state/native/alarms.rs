@@ -560,6 +560,10 @@ fn write(
             // Nothing a caller FORCED is standing: a configuration write hands the alarm
             // back to its own evaluation.
             forced_state_until_secs: 0.0,
+            // Nothing is recorded per contributor by a write: the entries of a query that
+            // returns a vector of series are what the alarm's own evaluation grades
+            // (`cw::StoredAlarmContributor`).
+            contributors: Vec::new(),
         },
     );
     store.record_history(

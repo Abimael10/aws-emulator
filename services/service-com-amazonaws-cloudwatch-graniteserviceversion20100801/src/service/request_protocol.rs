@@ -36,12 +36,13 @@
 //!
 //! The second half is the request id: AWS answers a failed `awsQuery` call with
 //! `<ErrorResponse><Error>…</Error><RequestId>…</RequestId></ErrorResponse>`, the failure's
-//! counterpart of the `ResponseMetadata/RequestId` a success carries. The element belongs to
-//! the envelope rather than to any modelled error shape, so it is written by the shared
-//! writer every `awsQuery` service in this workspace reports it with
-//! (`service_common::query_error_envelope`), wrapped around this definition for the failures
-//! no operation produced and around each operation ([`ReportingTheRequestId`]) for the ones a
-//! handler or the constraint walk did.
+//! counterpart of the `ResponseMetadata/RequestId` a success carries, and it names the request of
+//! EVERY answer in the `x-amzn-requestid` header — which is where an SDK reads a failed call's
+//! `ResponseMetadata.RequestId` from when the call was made in either of the two binary
+//! protocols, whose error bodies have no element for it. Both reports are the shared writer's
+//! ([`naming_the_request`], `service_common::query_error_envelope::named_request`), under ONE id
+//! per answer, wrapped around this definition for the failures no operation produced and around
+//! each operation ([`ReportingTheRequestId`]) for the ones a handler or the constraint walk did.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_types::body::SdkBody;
@@ -204,6 +205,20 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for TheProtocolOfTheReq
     }
 }
 
+/// One answer, naming the request it answers wherever its protocol states that id: the
+/// `<RequestId>` element of an `awsQuery` error envelope, and the `x-amzn-requestid` header of
+/// every answer in any of the three protocols this service declares.
+///
+/// One id per answer, so a client correlating on the header and one reading the envelope see the
+/// same value, and an answer a layer already named its request in keeps the id it has
+/// (`service_common::query_error_envelope::named_request`). This is the report BOTH seams of this
+/// service use — the definition wrapper for the failures no operation produced, and
+/// [`ReportingTheRequestId`] for the ones a handler or the constraint walk did — so which layer
+/// refused a request never decides whether its answer names it.
+pub fn naming_the_request(answered: RtResponse) -> RtResponse {
+    service_common::query_error_envelope::named_request(answered).0
+}
+
 /// One operation, served so that whatever failure it answers names the request it answered —
 /// the `<RequestId>` of the `awsQuery` error envelope and the header AWS reports the same id
 /// in (`service_common::query_error_envelope::with_request_id`).
@@ -237,7 +252,7 @@ where
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
             let answered = self.operation.run(svc, req, ctx).await;
-            service_common::query_error_envelope::with_request_id(answered)
+            naming_the_request(answered)
         })
     }
 

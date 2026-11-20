@@ -781,6 +781,19 @@ pub fn plotted_series(
         }
     }
 
+    // A Metrics Insights query is resolved over the store like a query that names a metric
+    // ([`metric_query::insights_series`]) rather than parsed as a metric math expression, and
+    // the graph this renderer DRAWS has no plot of such a query's result: a widget carrying one
+    // is reported as a widget whose image this service does not render yet.
+    if widget
+        .queries
+        .iter()
+        .filter_map(|query| query.expression.as_deref())
+        .any(super::metric_math::is_metrics_insights_query)
+    {
+        return Err(QueryRefusal::MetricsInsights);
+    }
+
     let parsed = metric_query::parse_queries(&widget.queries)?;
     let order = metric_query::evaluation_order(&widget.queries, &parsed)?;
     for id in order {

@@ -19,10 +19,10 @@
 //! (far above it, far below it, inside it) and in the state the verdict therefore reaches.
 //!
 //! The second and third tests assert the two halves of the same rule that are about the MODEL
-//! rather than one verdict: a model a live alarm's threshold is drawn from is re-created when it
-//! is deleted under that alarm (while a model no alarm references stays deleted), and the same
-//! alarm rides its band from `OK` into `ALARM` when the series leaves it, recording the
-//! transition it made.
+//! rather than one verdict: a model is gone once it is deleted — whether or not a live alarm's
+//! threshold is drawn from it, so the alarm over it is then evaluated with no band to compare
+//! against and keeps the state it has — and an alarm whose model the account holds rides its band
+//! from `OK` into `ALARM` when the series leaves it, recording the transition it made.
 //!
 //! The last test asserts what a decision record reports PER DATAPOINT under either kind of
 //! threshold: an entry of `StateReasonData.evaluatedDatapoints` names what was measured over the
@@ -581,7 +581,7 @@ async fn a_band_alarm_is_decided_by_the_bound_of_the_band_at_each_graded_period(
 }
 
 #[tokio::test]
-async fn a_live_band_alarm_re_creates_the_model_its_threshold_is_drawn_from() {
+async fn a_deleted_model_stays_deleted_under_a_live_band_alarm() {
     let router = build_router();
     // Two identical detectors, on two series: one a live alarm's threshold is drawn from, and
     // one no alarm references at all.
@@ -611,9 +611,10 @@ async fn a_live_band_alarm_re_creates_the_model_its_threshold_is_drawn_from() {
         "an in-band value must drive the band alarm to OK, got {alarm}"
     );
 
-    // Both models are deleted. The one the live alarm's threshold is drawn from is created
-    // again for it — by the evaluation the clock owes that alarm, so a span later, as a NEW
-    // model under a newly minted identifier — and the one no alarm references stays gone.
+    // Both models are deleted, and both stay deleted: "Deletes the specified anomaly detection
+    // model from your account" (`DeleteAnomalyDetector`) is about the account's models, so what
+    // still REFERENCES one — a live alarm whose threshold is drawn from its band — does not bring
+    // it back.
     for dimensions in [&watched, &unwatched] {
         delete_detector(&router, dimensions).await;
     }
@@ -625,47 +626,39 @@ async fn a_live_band_alarm_re_creates_the_model_its_threshold_is_drawn_from() {
             .find(|detector| detector.get("Dimensions") == Some(series))
             .cloned()
     };
-    let restored = reported(&watched).unwrap_or_else(|| {
-        panic!("the model the live alarm's threshold is drawn from must be created again, got {listed:?}")
-    });
-    let restored_id = restored
-        .get("AnomalyDetectorId")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    assert_ne!(
-        restored_id, watched_id,
-        "a model created again after a delete is a new model under a new identifier, got \
-         {restored}"
-    );
-    let state = restored
-        .get("StateValue")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    assert!(
-        ["PENDING_TRAINING", "TRAINED", "TRAINED_INSUFFICIENT_DATA"].contains(&state.as_str()),
-        "a model created again reports a modelled AnomalyDetectorStateValue, got {state:?}"
-    );
-    assert!(
-        reported(&unwatched).is_none(),
-        "a model no alarm's threshold is drawn from must stay deleted, got {listed:?}"
-    );
+    for (case, series) in [
+        ("the model a live alarm's threshold is drawn from", &watched),
+        ("a model no alarm references", &unwatched),
+    ] {
+        assert!(
+            reported(series).is_none(),
+            "case {case:?}: a deleted model must stay deleted, got {listed:?}"
+        );
+    }
     assert_ne!(
         unwatched_id, watched_id,
         "two models over two series carry two identifiers"
     );
+    // The alarm itself SURVIVES the delete, and is evaluated with no band to compare its windows
+    // against: nothing computes a state for it, so it keeps the one it has.
     let still_ok = described_alarm(&router, AlarmKind::Metric, name)
         .await
         .unwrap_or_else(|| panic!("DescribeAlarms reports no alarm {name}"));
     assert_eq!(
         still_ok.get("StateValue").and_then(Value::as_str),
         Some("OK"),
-        "an alarm whose model is being re-trained keeps the state it has, got {still_ok}"
+        "an alarm whose model was deleted under it keeps the state it has, got {still_ok}"
     );
 
-    // The series then leaves the band, and the same alarm crosses — recording the transition it
-    // made out of the state it was in.
+    // A model created again by a CALLER is a new model under a newly minted identifier, and the
+    // alarm's band is drawn from it again: the series then leaves the band, and the same alarm
+    // crosses — recording the transition it made out of the state it was in.
+    let created_again = put_detector(&router, &watched).await;
+    assert_ne!(
+        created_again, watched_id,
+        "a model created again after a delete is a new model under a new identifier"
+    );
+    wait_for_evaluation();
     publish(&router, &watched, ABOVE_BAND, stamp).await;
     wait_for_evaluation();
     let crossed = described_alarm(&router, AlarmKind::Metric, name)

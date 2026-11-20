@@ -6,7 +6,8 @@
 //! names that are themselves in `ALARM`, derived from the alarm this store holds rather than
 //! recorded beside it. Only an alarm whose configuration evaluates a query over SEVERAL series
 //! has contributors at all; a name no alarm carries and an alarm of any other kind are two
-//! distinct refusals.
+//! distinct refusals. The entries are reported in the order the alarm's own query RANKED them
+//! (`crate::state::metrics_insights`), which is the ranking the caller asked the service to make.
 //!
 //!
 //! ## Shape of an operation
@@ -211,7 +212,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(DescribeAlarmContributorsOutput {
-            alarm_contributors: contributors_of(&stored.alarm),
+            alarm_contributors: contributors_of(stored),
             // Every contributor of the alarm is in this page, so there is no more data available
             // and no token is owed (`DescribeAlarmContributorsOutput$NextToken`).
             next_token: None,
@@ -252,22 +253,51 @@ fn no_alarm_for_name(alarm_name: &str) -> String {
 ///
 /// Such an alarm's contributors are the entries of its query's result vector
 /// ([`multi_time_series`]), and a contributor is reported exactly while it is in `ALARM` — an
-/// alarm in `OK` or `INSUFFICIENT_DATA` has no contributor in `ALARM` state, which is what this
-/// read reports from. Nothing is recorded per contributor: every member below is read off the
-/// alarm this store holds.
-fn contributors_of(alarm: &MetricAlarm) -> Vec<AlarmContributor> {
+/// entry in `OK` or `INSUFFICIENT_DATA` is not a contributor to the alarm's state, which is what
+/// this read reports from. Nothing is recorded per contributor by a caller: every member below is
+/// what the evaluation that graded that entry left
+/// ([`crate::state::StoredAlarmContributor`]), reported in the order the query RANKED its
+/// entries — the ranking the query asked the service to make.
+///
+/// An alarm whose query returns a vector this engine resolves no entries of — the query language
+/// of its `EvaluationCriteria` is resolved by no engine of this emulator — still has the one
+/// contributor its own `ALARM` state accounts for, described by the identity this store can name
+/// for it, which is the alarm's own.
+fn contributors_of(stored: &crate::state::StoredAlarm) -> Vec<AlarmContributor> {
+    let alarm = &stored.alarm;
     if alarm.state_value.as_deref() != Some(crate::state::ALARM_STATE_ALARM) {
         return Vec::new();
     }
+    if !stored.contributors.is_empty() {
+        return stored
+            .contributors
+            .iter()
+            .filter(|contributor| {
+                contributor.state_value == crate::state::ALARM_STATE_ALARM
+            })
+            .map(|contributor| AlarmContributor {
+                contributor_id: contributor.contributor_id.clone(),
+                contributor_attributes: contributor
+                    .attributes
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+                state_reason: contributor.state_reason.clone(),
+                state_transitioned_timestamp: Some(crate::state::to_timestamp(
+                    contributor.state_transitioned_secs,
+                )),
+            })
+            .collect();
+    }
     // WHICH series the alarm evaluates is read from the same resolution the evaluation itself
     // reads it by, so a contributor describes the series the configuration identified, whichever
-    // form identified it. An alarm whose query names no series of this store — the query language
-    // of its `EvaluationCriteria` is resolved by no engine of this emulator — still has the one
-    // contributor its own `ALARM` state accounts for, described by the identity this store can
-    // name for it, which is the alarm's own.
+    // form identified it.
     let series = crate::state::alarm_evaluation::graded_series_key(alarm);
     vec![AlarmContributor {
-        contributor_id: contributor_id(alarm, series.as_ref()),
+        contributor_id: crate::state::alarm_evaluation::contributor_id(
+            alarm.alarm_name.as_deref().unwrap_or_default(),
+            series.as_ref(),
+        ),
         // "A map of attributes that describe the contributor, such as metric dimensions and other
         // identifying characteristics." (`AlarmContributor$ContributorAttributes`) — the
         // dimensions of that series, as the write that configured the alarm named them, and
@@ -290,43 +320,3 @@ fn contributors_of(alarm: &MetricAlarm) -> Vec<AlarmContributor> {
     }]
 }
 
-/// How many characters a contributor's identifier carries: the whole of `ContributorId`'s
-/// modelled 1..16 length.
-const CONTRIBUTOR_ID_LEN: usize = 16;
-
-/// The identifier of the contributor that is one alarm's watched series.
-///
-/// "Represents an individual contributor to a multi-timeseries alarm, containing information
-/// about a specific time series" (`AlarmContributor`) — so the identifier names a series OF an
-/// alarm: it is a digest of the alarm and the series identity (the metric, its namespace and its
-/// normalised dimension set), cut to the modelled length. Derived, so it is stable across reads
-/// and the same contributor keeps the same id for the life of the alarm, and distinct, so two
-/// series are two contributors.
-///
-/// Each part is digested under its own LENGTH rather than under a separator, because a dimension
-/// name or value may carry any character a separator could be: two series whose parts differ can
-/// never be digested from the same bytes.
-fn contributor_id(alarm: &MetricAlarm, series: Option<&crate::state::MetricKey>) -> String {
-    let mut identity = String::new();
-    let mut part = |text: &str| {
-        identity.push_str(&text.len().to_string());
-        identity.push(':');
-        identity.push_str(text);
-    };
-    part(alarm.alarm_name.as_deref().unwrap_or_default());
-    if let Some(series) = series {
-        part(&series.namespace);
-        part(&series.metric_name);
-        for (name, value) in &series.dimensions {
-            part(name);
-            part(value);
-        }
-    }
-    let digest = ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(
-        identity.as_bytes(),
-    ));
-    digest
-        .get(..CONTRIBUTOR_ID_LEN)
-        .unwrap_or(digest.as_str())
-        .to_string()
-}

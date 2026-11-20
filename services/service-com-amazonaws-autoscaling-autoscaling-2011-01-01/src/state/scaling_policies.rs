@@ -854,6 +854,10 @@ pub fn sync_policy_alarms<Eng: Send + Sync + 'static>(
                 // Nothing has forced this alarm's state, so no forced span is standing
                 // that its evaluation must not cut short.
                 forced_state_until_secs: 0.0,
+                // The alarm this write mints watches ONE metric, so it has no contributors
+                // at all: contributors are the entries of a query that returns a vector of
+                // series (`cloudwatch::state::StoredAlarmContributor`).
+                contributors: Vec::new(),
             },
         );
         minted.push(Alarm {

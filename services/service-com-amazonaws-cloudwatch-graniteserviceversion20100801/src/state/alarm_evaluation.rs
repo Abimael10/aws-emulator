@@ -856,6 +856,7 @@ struct Verdict {
 }
 
 /// The state one evaluation computed for one alarm, with the explanation it reports.
+#[derive(Debug, Clone)]
 struct Evaluation {
     /// The computed `StateValue`.
     state: &'static str,
@@ -864,6 +865,109 @@ struct Evaluation {
     reason: String,
     /// `StateReasonData`: "An explanation for the alarm state, in JSON format."
     reason_data: String,
+}
+
+/// The Metrics Insights query one alarm's evaluation reads the store by: the query the alarm
+/// WATCHES, when that query is one, and `None` for every other configuration.
+///
+/// Read through the ONE parser of that language ([`super::metrics_insights::parse`]), so which
+/// series an alarm reads, when its evaluation is due and what its contributors are all follow
+/// from the same reading of the statement.
+pub(super) fn watched_insights_query(
+    alarm: &MetricAlarm,
+) -> Option<super::metrics_insights::Query> {
+    let expression = watched_query(
+        alarm.metrics.as_deref()?,
+        alarm.threshold_metric_id.as_deref(),
+    )?
+    .expression
+    .as_deref()?;
+    if !super::metric_math::is_metrics_insights_query(expression) {
+        return None;
+    }
+    super::metrics_insights::parse(expression).ok()
+}
+
+/// How many characters a contributor's identifier carries: the whole of `ContributorId`'s
+/// modelled 1..16 length.
+const CONTRIBUTOR_ID_LEN: usize = 16;
+
+/// The identifier of the contributor that is ONE series of the alarm `alarm_name`.
+///
+/// "Represents an individual contributor to a multi-timeseries alarm, containing information
+/// about a specific time series" (`AlarmContributor`) — so the identifier names a series OF an
+/// alarm: it is a digest of the alarm and the series identity (the metric, its namespace and its
+/// normalised label set), cut to the modelled length. Derived, so it is stable across reads and
+/// the same contributor keeps the same id for the life of the alarm, and distinct, so two series
+/// are two contributors.
+///
+/// Each part is digested under its own LENGTH rather than under a separator, because a label name
+/// or value may carry any character a separator could be: two series whose parts differ can never
+/// be digested from the same bytes.
+#[must_use]
+pub fn contributor_id(alarm_name: &str, series: Option<&MetricKey>) -> String {
+    let mut identity = String::new();
+    let mut part = |text: &str| {
+        identity.push_str(&text.len().to_string());
+        identity.push(':');
+        identity.push_str(text);
+    };
+    part(alarm_name);
+    if let Some(series) = series {
+        part(&series.namespace);
+        part(&series.metric_name);
+        for (name, value) in &series.dimensions {
+            part(name);
+            part(value);
+        }
+    }
+    let digest = ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(
+        identity.as_bytes(),
+    ));
+    digest
+        .get(..CONTRIBUTOR_ID_LEN)
+        .unwrap_or(digest.as_str())
+        .to_string()
+}
+
+/// One contributor of a multi-time-series alarm, as one evaluation graded it.
+///
+/// "Each entry in the vector result represents an alarm contributor" — so a contributor is one
+/// entry of the vector the alarm's query returns, graded by the alarm's own predicate exactly as
+/// a single series would be.
+#[derive(Debug, Clone)]
+struct GradedContributor {
+    /// The labels that identify the entry: the keys the query grouped by and this entry's values
+    /// for them.
+    labels: ::std::collections::BTreeMap<String, String>,
+    /// The identity of the series this entry is, which its identifier is digested from.
+    series: MetricKey,
+    /// The state this entry's own grading put it in, with the explanation it reports.
+    evaluation: Evaluation,
+}
+
+/// The state the CONTRIBUTORS of a multi-time-series alarm put the alarm itself in, with the
+/// explanation that entry reports.
+///
+/// "Returns the information of the current alarm contributors that are in ALARM state."
+/// (`DescribeAlarmContributors`) — an alarm whose query returns a vector of series is in `ALARM`
+/// while any entry of that vector is, so the alarm's state is the state of the entry that
+/// decides it: the first entry in `ALARM` in the order the query ranked them, else the first
+/// entry with a decided state, and the explanation is that entry's own.
+///
+/// `None` for a query whose result has no entry at all — nothing graded anything, so the alarm
+/// keeps the state it has.
+fn contributor_verdict(graded: &[GradedContributor]) -> Option<Evaluation> {
+    let deciding = graded
+        .iter()
+        .find(|contributor| contributor.evaluation.state == ALARM_STATE_ALARM)
+        .or_else(|| {
+            graded
+                .iter()
+                .find(|contributor| contributor.evaluation.state == ALARM_STATE_OK)
+        })
+        .or_else(|| graded.first())?;
+    Some(deciding.evaluation.clone())
 }
 
 impl State {
@@ -959,9 +1063,6 @@ impl State {
         // Everything the evaluation reads is read before anything is written.
         let alarm = stored.alarm.clone();
         budget.charge_alarm();
-        // An alarm whose threshold is a MODEL keeps that model: the evaluation that is now due
-        // creates the detector its band is drawn from if the store no longer holds it.
-        self.create_band_models(&alarm, now_secs);
         // This alarm is being evaluated now, so its NEXT evaluation is owed a span from here
         // rather than being due again at once: it is re-armed before the fold runs, so the
         // fold is charged to this request only and a following request pays for the alarms
@@ -969,7 +1070,23 @@ impl State {
         if let Some(stored) = self.alarms.get_mut(name) {
             stored.evaluation_due_secs = now_secs + EVALUATION_DELAY_SECS;
         }
-        let Some(evaluation) = self.metric_alarm_evaluation(&alarm, now_secs, budget) else {
+        // An alarm whose query returns a VECTOR of series is decided by its CONTRIBUTORS: each
+        // entry of that vector is graded on its own ([`Self::graded_contributors`]) and the
+        // alarm's own state is the state those entries put it in
+        // ([`contributor_verdict`]). `None` for every other configuration, which is graded as
+        // the one series it watches.
+        let contributors = self.graded_contributors(&alarm, now_secs, budget);
+        let evaluation = match contributors.as_deref() {
+            Some(graded) => contributor_verdict(graded),
+            None => self.metric_alarm_evaluation(&alarm, now_secs, budget),
+        };
+        // What the contributors stand at NOW is what a read of them reports, whether or not the
+        // alarm itself moved: the entries of the vector are the alarm's own current reading of
+        // its query.
+        if let Some(graded) = contributors.as_deref() {
+            self.record_contributors(name, graded, now_secs);
+        }
+        let Some(evaluation) = evaluation else {
             // This pass has paid for one alarm's evaluation, so what remains of the budget
             // bounds it again — whether the evaluation computed a state or this is an alarm
             // this engine computes nothing for.
@@ -1039,49 +1156,170 @@ impl State {
         self.make_parents_due(name, now_secs);
     }
 
-    /// Create the anomaly detection models every LIVE alarm's threshold is drawn from that this
-    /// store no longer holds, for the alarms whose evaluation the clock has already made due.
+    /// Every CONTRIBUTOR of an alarm whose query returns a vector of series, graded by the
+    /// alarm's own predicate — and `None` for an alarm that is graded on ONE series, whatever
+    /// identifies it.
     ///
-    /// The detector store's side of the same rule [`Self::create_band_models`] states for one
-    /// alarm, for the reader that reports the models: an alarm's due evaluation needs the model
-    /// its band is drawn from, and that evaluation was owed at this instant whether or not
-    /// anybody called — so a model deleted under such an alarm is back a span later, while one
-    /// no alarm's threshold is drawn from stays deleted. Bounded by
-    /// [`MAX_ALARMS_EVALUATED_PER_REQUEST`], like every other pass one request pays for.
-    pub fn restore_alarm_referenced_models(&mut self, now_secs: f64) {
-        let needed: Vec<MetricAlarm> = self
-            .alarms
-            .values()
-            .filter(|stored| {
-                stored.alarm.threshold_metric_id.is_some()
-                    && stored.evaluation_due_secs <= now_secs
-            })
-            .take(MAX_ALARMS_EVALUATED_PER_REQUEST)
-            .map(|stored| stored.alarm.clone())
-            .collect();
-        for alarm in &needed {
-            self.create_band_models(alarm, now_secs);
+    /// "The query must return a result of vector type. Each entry in the vector result represents
+    /// an alarm contributor." (`AlarmPromQLCriteria$Query`) — so the entries of the vector are
+    /// what such an alarm is decided from: each one is a time series, graded window by window
+    /// against the alarm's threshold by exactly the predicate a single-series alarm is graded by
+    /// ([`Self::verdict_over`]), and the order they come back in is the order the query ranked
+    /// them ([`super::metrics_insights`]).
+    ///
+    /// The vector comes from the Metrics Insights query the alarm watches, which is the one query
+    /// language of this model whose result this engine resolves; an alarm whose
+    /// `EvaluationCriteria` states a query in another language has contributors this engine
+    /// resolves no entries for, so it is left to the state the write that configured it left.
+    fn graded_contributors(
+        &self,
+        alarm: &MetricAlarm,
+        now_secs: f64,
+        budget: &mut EvaluationBudget,
+    ) -> Option<Vec<GradedContributor>> {
+        let queries = alarm.metrics.as_deref()?;
+        let watched = watched_query(queries, alarm.threshold_metric_id.as_deref())?;
+        let query = watched_insights_query(alarm).filter(super::metrics_insights::Query::groups_its_result)?;
+        // Every entry of the vector is graded against the alarm's own threshold and comparison,
+        // over the alarm's own periods: a contributor is a series of this alarm, not an alarm of
+        // its own.
+        let operator = alarm.comparison_operator.as_deref()?;
+        let comparison = comparison_of(operator)?;
+        let threshold = alarm.threshold?;
+        let predicate = Predicate::Static {
+            threshold,
+            comparison,
+        };
+        let evaluation_periods = evaluated_periods(alarm)?;
+        let grid = EvaluationGrid::of(alarm, now_secs);
+        let period = graded_period(queries, watched);
+        let read = self.watched_data(alarm, now_secs, budget);
+        let range_periods = evaluation_range_periods(
+            evaluation_periods,
+            graded_window_secs(alarm),
+            read.storage_span,
+            grid,
+            now_secs,
+        );
+        if budget.spent() {
+            return None;
         }
+        // The range the query is evaluated over is exactly the windows the evaluation grades,
+        // laid on the alarm's own grid — the same range a `Metrics` array of this alarm would be
+        // resolved over ([`Self::resolved_query_array`]).
+        let start = grid.window_start(now_secs, range_periods.saturating_sub(1), period);
+        let end = grid.range_end(now_secs, period);
+        #[allow(clippy::cast_possible_truncation)]
+        let period_secs = period.trunc() as i32;
+        let answered = query.evaluate(self, start, end, period_secs, now_secs);
+        budget.charge_datapoints(answered.datapoints);
+        let mut graded: Vec<GradedContributor> = Vec::with_capacity(answered.groups.len());
+        for group in answered.groups {
+            let series = GradedSeries {
+                // No single statistic describes a series a query folded, so its decision record
+                // names none.
+                statistic: None,
+                grid,
+                period,
+                windows: graded_windows(
+                    &group.series.points,
+                    grid,
+                    period,
+                    range_periods,
+                    now_secs,
+                ),
+            };
+            let Some(evaluation) = self.verdict_over(
+                alarm,
+                &series,
+                &predicate,
+                evaluation_periods,
+                &read,
+                now_secs,
+            ) else {
+                continue;
+            };
+            graded.push(GradedContributor {
+                series: MetricKey {
+                    namespace: group
+                        .series
+                        .metric
+                        .as_ref()
+                        .map(|metric| metric.namespace.clone())
+                        .unwrap_or_default(),
+                    metric_name: group
+                        .series
+                        .metric
+                        .as_ref()
+                        .map(|metric| metric.metric_name.clone())
+                        .unwrap_or_default(),
+                    dimensions: group.labels.clone(),
+                },
+                labels: group.labels,
+                evaluation,
+            });
+        }
+        Some(graded)
+    }
+
+    /// Keep what this evaluation graded each of the alarm's contributors at, so a read of them
+    /// reports the entries of the vector as they stand now.
+    ///
+    /// An entry that is in the state it was already in keeps the instant it reached that state:
+    /// "The timestamp when the contributor last transitioned to its current state."
+    /// (`AlarmContributor$StateTransitionedTimestamp`) — so the instant moves only where the
+    /// entry's own state did.
+    fn record_contributors(
+        &mut self,
+        name: &str,
+        graded: &[GradedContributor],
+        now_secs: f64,
+    ) {
+        let Some(stored) = self.alarms.get_mut(name) else {
+            return;
+        };
+        let held = ::std::mem::take(&mut stored.contributors);
+        stored.contributors = graded
+            .iter()
+            .map(|contributor| {
+                let id = contributor_id(name, Some(&contributor.series));
+                let since = held
+                    .iter()
+                    .find(|previous| {
+                        previous.contributor_id == id
+                            && previous.state_value == contributor.evaluation.state
+                    })
+                    .map_or(now_secs, |previous| previous.state_transitioned_secs);
+                super::StoredAlarmContributor {
+                    contributor_id: id,
+                    attributes: contributor.labels.clone(),
+                    state_value: contributor.evaluation.state.to_string(),
+                    state_reason: contributor.evaluation.reason.clone(),
+                    state_transitioned_secs: since,
+                }
+            })
+            .collect();
     }
 
     /// Create the anomaly detection model `alarm`'s threshold is drawn from, when the store
     /// holds none for the metric that band is drawn from.
     ///
-    /// An alarm whose threshold is a model OWNS that model: the alarm names the band as its
-    /// threshold ("the ID of the ANOMALY_DETECTION_BAND function used as the threshold for the
-    /// alarm", `MetricAlarm$ThresholdMetricId`) and a band is a model's ("You can use the model
-    /// to display a band of expected normal values when the metric is graphed.",
+    /// An alarm whose threshold is a model names a band as that threshold ("the ID of the
+    /// ANOMALY_DETECTION_BAND function used as the threshold for the alarm",
+    /// `MetricAlarm$ThresholdMetricId`) and a band is a model's ("You can use the model to
+    /// display a band of expected normal values when the metric is graphed.",
     /// `PutAnomalyDetector`), so the write that configures such an alarm creates the model for
     /// each metric its band is drawn from where the account holds none — pending training,
-    /// exactly as a model a caller created directly is — and the evaluation that is later due for
-    /// that alarm creates one again if the model was deleted under it. A model no live alarm's
-    /// threshold is drawn from is not created again: deleting it removes it for good.
+    /// exactly as a model a caller created directly is.
+    ///
+    /// Nothing creates one again afterwards: `DeleteAnomalyDetector` "Deletes the specified
+    /// anomaly detection model from your account" (`DeleteAnomalyDetector`), so a model a caller
+    /// deleted is gone whatever still references it, and the alarm whose threshold was drawn from
+    /// it is evaluated with no model to draw a band from.
     ///
     /// The model this creates carries no training configuration and no metric characteristics:
-    /// the alarm names only the metric and statistic its band is drawn from, and a model created
-    /// again after a delete cannot carry what the deleted model was configured with. Its
-    /// identifier is minted for it like any other model's, so a model created again after a
-    /// delete is a DIFFERENT model with a different identifier.
+    /// the alarm names only the metric and statistic its band is drawn from. Its identifier is
+    /// minted for it like any other model's.
     pub fn create_band_models(&mut self, alarm: &MetricAlarm, now_secs: f64) {
         for metric in band_model_metrics(alarm) {
             let form = super::AnomalyDetectorForm::of_series_metric(&metric);
@@ -1174,6 +1412,33 @@ impl State {
             }
         };
 
+        self.verdict_over(
+            alarm,
+            &graded,
+            &predicate,
+            evaluation_periods,
+            &watched,
+            now_secs,
+        )
+    }
+
+    /// The state ONE graded series puts an alarm in, with the explanation it reports — the
+    /// verdict every metric alarm is decided by, whatever identified the series it grades.
+    ///
+    /// `None` where this evaluation decided nothing: an evaluation whose every real datapoint was
+    /// withheld, and one that graded no datapoint at all while the series it reads hold one its
+    /// range has not reached yet. Such an alarm keeps the state it has rather than being given
+    /// one nothing computed.
+    fn verdict_over(
+        &self,
+        alarm: &MetricAlarm,
+        graded: &GradedSeries<'_>,
+        predicate: &Predicate,
+        evaluation_periods: usize,
+        watched: &WatchedData,
+        now_secs: f64,
+    ) -> Option<Evaluation> {
+        let grid = graded.grid;
         let treat_missing = alarm.treat_missing_data.as_deref().unwrap_or(MISSING_MISSING);
         // How many observations a window has to hold before this alarm grades the percentile
         // over it at all, for an alarm configured to withhold its state while a period is too
@@ -1260,9 +1525,9 @@ impl State {
         }
         self.graded_evaluation(
             alarm,
-            &graded,
+            graded,
             GradedAgainst {
-                predicate: &predicate,
+                predicate,
                 // How many of the alarm's periods held a datapoint it withheld: those slots are
                 // not ones the missing-data treatment may stand in for either, because
                 // substituting a datapoint for a period the metric really was published into
@@ -1281,7 +1546,8 @@ impl State {
     /// datapoints it visits are charged to `budget`, as every fold over a series is.
     ///
     /// The series are every one the alarm reads — the one its own members name, or each metric a
-    /// `Metrics` array's queries read ([`watched_series_set`]) — because the value an expression
+    /// `Metrics` array's queries read ([`watched_series_set`]), plus every series the Metrics
+    /// Insights query it watches SELECTS ([`watched_insights_query`]) — because the value a query
     /// yields is only as dense, and only as fresh, as the series it is computed from.
     ///
     /// What a datapoint's granularity is, is the datapoint's own: "Setting this to 1 specifies
@@ -1304,14 +1570,10 @@ impl State {
         budget: &mut EvaluationBudget,
     ) -> WatchedData {
         let mut found = WatchedData::default();
-        for (key, unit) in watched_series_set(alarm) {
-            let Some(series) = self.metrics.get(&key) else {
-                continue;
-            };
-            budget.charge_datapoints(series.len());
+        let read = |found: &mut WatchedData, series: &[StoredDatum], unit: Option<&str>| {
             for datum in series {
                 found.storage_span = found.storage_span.max(datum.aggregated_span());
-                if !grades_unit(unit.as_deref(), datum.unit()) {
+                if !grades_unit(unit, datum.unit()) {
                     continue;
                 }
                 let at = datum.aggregated_instant();
@@ -1321,6 +1583,25 @@ impl State {
                 if found.newest_instant.is_none_or(|newest| at > newest) {
                     found.newest_instant = Some(at);
                 }
+            }
+        };
+        for (key, unit) in watched_series_set(alarm) {
+            let Some(series) = self.metrics.get(&key) else {
+                continue;
+            };
+            budget.charge_datapoints(series.len());
+            read(&mut found, series, unit.as_deref());
+        }
+        // A Metrics Insights query names no series of its own: it SELECTS them out of the store
+        // by namespace, metric name and labels, so what the alarm reads is every series its
+        // query selects — and it names no unit, so every datapoint of each of them.
+        if let Some(query) = watched_insights_query(alarm) {
+            for (key, series) in &self.metrics {
+                if !query.selects(key) {
+                    continue;
+                }
+                budget.charge_datapoints(series.len());
+                read(&mut found, series, None);
             }
         }
         found
@@ -1567,6 +1848,20 @@ impl State {
             // alarm due for the next call rather than being graded from a part of itself.
             if budget.spent() {
                 return None;
+            }
+            // A Metrics Insights query SELECTS series out of the store rather than computing
+            // over the values of other queries, so it is resolved in this pass, exactly as a
+            // `GetMetricData` request over the same array resolves it.
+            if query
+                .expression
+                .as_deref()
+                .is_some_and(super::metric_math::is_metrics_insights_query)
+            {
+                let (value, datapoints) =
+                    super::metric_query::insights_series(self, query, start, end, now_secs).ok()?;
+                budget.charge_datapoints(datapoints);
+                resolution.resolve_query(query, value, datapoints).ok()?;
+                continue;
             }
             let Some(stat) = query.metric_stat.as_ref() else {
                 continue;

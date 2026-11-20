@@ -1316,6 +1316,10 @@ fn write_alarm(
             // a caller FORCED: a configuration write hands the alarm back to its own
             // evaluation, so nothing is standing that the evaluation must not cut short.
             forced_state_until_secs: 0.0,
+            // The entries of the query this alarm watches are what its own evaluation grades,
+            // so this write records none of them: the first evaluation that is due for the
+            // alarm reads them out of the series the store holds.
+            contributors: Vec::new(),
         },
     );
     store.record_history(

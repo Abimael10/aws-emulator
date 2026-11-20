@@ -122,6 +122,10 @@ pub use resource_insight_rules::*;
 /// evaluated over the series this store holds.
 pub mod metric_math;
 
+/// The CloudWatch Metrics Insights query a `MetricDataQuery$Expression` may carry instead,
+/// evaluated over the series this store holds.
+pub mod metrics_insights;
+
 /// A `MetricDataQuery` array — what `GetMetricData` answers from and what a metric-math
 /// alarm's configuration is — resolved over the series this store holds.
 pub mod metric_query;
@@ -1366,6 +1370,40 @@ pub struct StoredAlarm {
     /// takes it back FORWARD of that instant — not an arriving datapoint of the series the
     /// alarm watches, which would otherwise leave the forced state visible to nobody at all.
     pub forced_state_until_secs: f64,
+    /// What this alarm's CONTRIBUTORS stood at when its evaluation last graded them, in the
+    /// order the query that returns them ranked them; empty for an alarm that is graded on one
+    /// series and so has no contributors at all.
+    ///
+    /// "Represents an individual contributor to a multi-timeseries alarm, containing information
+    /// about a specific time series and its contribution to the alarm's state."
+    /// (`AlarmContributor`) — an entry of the vector the alarm's query returns
+    /// ([`alarm_evaluation::grades_a_vector_of_series`]). Kept rather than recomputed by the
+    /// read, because an entry's own transition instant is a fact about when its state last
+    /// changed, which only the evaluation that changed it knows.
+    pub contributors: Vec<StoredAlarmContributor>,
+}
+
+/// One CONTRIBUTOR of a multi-time-series alarm, as the evaluation that graded it left it: the
+/// members `DescribeAlarmContributors` reports for one entry of the alarm's query result.
+#[derive(Debug, Clone, Default)]
+pub struct StoredAlarmContributor {
+    /// "The unique identifier for this alarm contributor." (`AlarmContributor$ContributorId`) —
+    /// derived from the alarm and the series this entry is
+    /// ([`alarm_evaluation::contributor_id`]), so it is stable across reads.
+    pub contributor_id: String,
+    /// "A map of attributes that describe the contributor, such as metric dimensions and other
+    /// identifying characteristics." (`AlarmContributor$ContributorAttributes`) — the labels
+    /// that identify this entry among the result's entries.
+    pub attributes: std::collections::BTreeMap<String, String>,
+    /// The state this entry's own grading put it in, one of the alarm state values.
+    pub state_value: String,
+    /// "An explanation for the contributor's current state, providing context about why it is in
+    /// its current condition." (`AlarmContributor$StateReason`) — the decision record of the
+    /// grading of THIS entry.
+    pub state_reason: String,
+    /// "The timestamp when the contributor last transitioned to its current state."
+    /// (`AlarmContributor$StateTransitionedTimestamp`), in epoch seconds.
+    pub state_transitioned_secs: f64,
 }
 
 /// A stored composite alarm: the modelled shape `DescribeAlarms` returns, plus what the
@@ -3707,7 +3745,15 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
                         })
                 })
             });
-            if grades {
+            // A Metrics Insights query names no series: it SELECTS them out of the store, so a
+            // datapoint of any series its query selects is a datapoint such an alarm would grade
+            // — and it names no unit, so every unit of that series counts.
+            let selects = || {
+                alarm_evaluation::watched_insights_query(&stored.alarm).is_some_and(|query| {
+                    written.iter().any(|series| query.selects(&series.key))
+                })
+            };
+            if grades || selects() {
                 stored.evaluation_due_secs = stored
                     .evaluation_due_secs
                     .min(due)

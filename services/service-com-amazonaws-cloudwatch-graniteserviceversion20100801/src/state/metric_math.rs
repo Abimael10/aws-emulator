@@ -396,59 +396,29 @@ pub fn returns_many_series(expression: &Expression) -> bool {
     }
 }
 
-/// The keyword a Metrics Insights query opens with ("Metrics Insights query components and
-/// syntax", `MetricDataQuery$Expression`).
-const SELECT_KEYWORD: &str = "SELECT";
-
 /// Whether `expression` is a Metrics Insights query rather than a metric math expression: an
 /// Insights query is a SELECT statement in a language of its own, so none of the metric math
 /// above speaks about it.
+///
+/// The ONE reading of that keyword lives with the language it opens
+/// ([`super::metrics_insights::opens_a_query`]), so the reader that tells the two languages apart
+/// and the one that evaluates the query cannot disagree about which is which.
 pub fn is_metrics_insights_query(expression: &str) -> bool {
-    expression
-        .trim_start()
-        .get(..SELECT_KEYWORD.len())
-        .is_some_and(|start| start.eq_ignore_ascii_case(SELECT_KEYWORD))
+    super::metrics_insights::opens_a_query(expression)
 }
 
 /// Whether `expression` is a Metrics Insights query whose result is a VECTOR of time series
 /// rather than one: a `SELECT` statement ([`is_metrics_insights_query`]) carrying a `GROUP BY`
 /// clause, which returns one series per group of the values it groups by.
 ///
-/// The clause is read off the statement by the maintained SQL grammar, so it is recognised only
-/// where the language puts a clause — a metric name, a dimension value or a string literal
-/// carrying those words is part of a projection or a predicate, not a grouping. A statement that
-/// grammar cannot read states no grouping this service can see, so the alarm watching it is
-/// graded as the one series an alarm's result otherwise is.
+/// Read off the statement by the ONE parser of that language
+/// ([`super::metrics_insights::parse`]), so whether a query groups its result is decided by the
+/// same reading that evaluates it: a metric name, a dimension value or a string literal carrying
+/// the words of a clause is part of a projection or a predicate, not a grouping. A statement that
+/// parser cannot read states no grouping this service can see, so the alarm watching it is graded
+/// as the one series an alarm's result otherwise is.
 pub fn groups_a_metrics_insights_query(expression: &str) -> bool {
-    if !is_metrics_insights_query(expression) {
-        return false;
-    }
-    let Ok(statements) = ::sqlparser::parser::Parser::parse_sql(
-        &::sqlparser::dialect::GenericDialect {},
-        expression,
-    ) else {
-        return false;
-    };
-    statements.iter().any(groups_its_result)
-}
-
-/// Whether `statement` is a query whose result is split into one row group per combination of
-/// the values a `GROUP BY` names — and so, for the series a Metrics Insights query returns, one
-/// series per group.
-fn groups_its_result(statement: &::sqlparser::ast::Statement) -> bool {
-    let ::sqlparser::ast::Statement::Query(query) = statement else {
-        return false;
-    };
-    let ::sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
-        return false;
-    };
-    match &select.group_by {
-        // `GROUP BY ALL` groups by every value the projection selects, so it groups too.
-        ::sqlparser::ast::GroupByExpr::All(_) => true,
-        ::sqlparser::ast::GroupByExpr::Expressions(expressions, modifiers) => {
-            !expressions.is_empty() || !modifiers.is_empty()
-        }
-    }
+    super::metrics_insights::parse(expression).is_ok_and(|query| query.groups_its_result())
 }
 
 /// Append the ids `expression` refers to that `found` does not already carry.

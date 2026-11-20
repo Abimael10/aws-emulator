@@ -369,6 +369,26 @@ impl Resolution {
         Ok(())
     }
 
+    /// Record what one Metrics Insights query resolved to ([`insights_series`]), refusing a
+    /// resolution that reads more data points than one may.
+    ///
+    /// The query reads the store exactly as a `MetricStat` query does, so what it read is
+    /// charged the same way — but its value is not one series this resolution RETRIEVED: it is
+    /// the result of a query over several of them, so `METRICS()` does not match it.
+    pub fn resolve_query(
+        &mut self,
+        query: &MetricDataQuery,
+        value: MathValue,
+        datapoints: usize,
+    ) -> Result<(), QueryRefusal> {
+        self.points = self.points.saturating_add(datapoints);
+        if self.points > MAX_RETRIEVED_POINTS {
+            return Err(too_many_points());
+        }
+        self.values.insert(query.id.clone(), value);
+        Ok(())
+    }
+
     /// Evaluate the expression of the query `id` over what this resolution holds, at the
     /// granularity `period` and over the range `window`.
     pub fn evaluate(
@@ -444,10 +464,12 @@ pub fn parse_queries(
             continue;
         };
         // "This field can contain either a Metrics Insights query, or a metric math
-        // expression": an Insights query is a SELECT statement in its own language, which
-        // this service does not run.
+        // expression": an Insights query is a SELECT statement in a language of its own, and
+        // none of the metric math grammar speaks about it — it is resolved against the store
+        // instead ([`insights_series`]), like a query that names a metric, so this walk leaves
+        // it to that reader rather than parsing it as an expression.
         if super::metric_math::is_metrics_insights_query(expression) {
-            return Err(QueryRefusal::MetricsInsights);
+            continue;
         }
         let tree =
             super::metric_math::parse(expression).map_err(|error| QueryRefusal::Expression {
@@ -457,6 +479,53 @@ pub fn parse_queries(
         parsed.insert(query.id.as_str(), tree);
     }
     Ok(parsed)
+}
+
+/// Answer one Metrics Insights query of an array from the store: the series its `SELECT`
+/// returns over `[requested_start, end)`, folded into `Period`-wide windows by the function it
+/// states ([`super::metrics_insights`]).
+///
+/// The value a grouped query takes is the ARRAY of those series — "one series per group" — and
+/// the value an ungrouped one takes is the single series it folded everything it selected into,
+/// which is what lets an alarm watch an ungrouped query and a math expression refer to either.
+///
+/// An expression that is no query this service evaluates is reported as the expression refusal
+/// of the query carrying it, exactly as a malformed metric math expression is.
+pub fn insights_series(
+    store: &State,
+    query: &MetricDataQuery,
+    requested_start: f64,
+    end: f64,
+    now: f64,
+) -> Result<(MathValue, usize), QueryRefusal> {
+    let expression = query.expression.as_deref().unwrap_or_default();
+    let parsed = super::metrics_insights::parse(expression).map_err(|error| {
+        QueryRefusal::Expression {
+            id: query.id.clone(),
+            detail: error.message,
+        }
+    })?;
+    // "When used in GetMetricData, [Period] is the granularity, in seconds, of the returned
+    // data points" — the query's own `Period`, and the granularity an expression's constructed
+    // series takes where it names none ([`query_period`]).
+    let period = query_period(query);
+    #[allow(clippy::cast_possible_truncation)]
+    let period_secs = period.trunc() as i32;
+    if let Some(message) = super::period_error(period_secs) {
+        return Err(QueryRefusal::InvalidValue(message));
+    }
+    let answered = parsed.evaluate(store, requested_start, end, period_secs, now);
+    let series: Vec<MathSeries> = answered
+        .groups
+        .into_iter()
+        .map(|group| group.series)
+        .collect();
+    let value = if parsed.groups_its_result() {
+        MathValue::Array(series)
+    } else {
+        MathValue::Series(series.into_iter().next().unwrap_or_default())
+    };
+    Ok((value, answered.datapoints))
 }
 
 /// The refusal for an array carrying more queries than one resolution resolves, in the words

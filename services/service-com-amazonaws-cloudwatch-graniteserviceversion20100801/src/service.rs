@@ -442,8 +442,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         );
         Self {
             metered: the_way_every_operation_is_served(Arc::clone(&engine), TheModelledOperation),
-            entry: service_common::query_error_envelope::RequestIdEnvelopeDefinition::new(
+            entry: service_common::query_error_envelope::RequestIdEnvelopeDefinition::reporting(
                 TheProtocolOfTheRequest::new(crate::ServiceDefinition::new(engine)),
+                request_protocol::naming_the_request,
             ),
             overridden,
         }
@@ -454,8 +455,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// calling principal's own IAM policies before anything is read or written
 /// ([`authorization`]), counted into the usage telemetry this service publishes about its own
 /// API ([`Metering`]), naming the class of whatever failure it answers in full
-/// ([`QueryCompatibleErrors`]), and naming the request it answered in the `awsQuery` error
-/// envelope ([`ReportingTheRequestId`]).
+/// ([`QueryCompatibleErrors`]), and naming the request it answered — in the `awsQuery` error
+/// envelope and in the header every protocol reports it in ([`ReportingTheRequestId`]).
 ///
 /// All four are owed by every answer, whichever layer built it, so the chain is stated here
 /// once rather than at each of the operations whose answer this file owns a part of. The
