@@ -190,7 +190,13 @@ impl Emulator {
                     "firewallType": "WAF",
                     "policyConfiguration": {
                         "remediationEnabled": false,
-                        "resourcesCleanUp": false,
+                        "resourcesCleanUp": true,
+                        // A WAF policy carries the `wafConfig` members the model declares
+                        // `@required` ("Required for AWS WAF policies").
+                        "wafConfig": {
+                            "existingCustomerWebACLResolution": "RETROFIT",
+                            "conflictResolution": "MERGE_WHERE_APPLICABLE",
+                        },
                     },
                 })),
             )

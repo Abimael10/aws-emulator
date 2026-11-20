@@ -48,6 +48,9 @@ pub mod list_scopes_types;
 pub mod list_tags_for_resource_types;
 pub mod list_template_snapshots_types;
 pub mod list_templates_types;
+/// The scope shapes the scaffold declined (see `src/ops/SKIPPED_STUBS.md`), reached by
+/// every scope operation. HAND-AUTHORED.
+pub mod scope_types;
 pub mod shared_types;
 pub mod tag_resource_types;
 pub mod untag_resource_types;
@@ -55,6 +58,9 @@ pub mod update_deployment_types;
 pub mod update_policy_types;
 pub mod update_rule_types;
 pub mod update_template_types;
+/// `WafConfig`, whose required members the SERVICE refuses rather than the boundary.
+/// HAND-AUTHORED; see that module's docs.
+pub mod waf_config_types;
 
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_deployment_snapshot_types::*;
@@ -125,6 +131,8 @@ pub use list_template_snapshots_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use list_templates_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use scope_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use tag_resource_types::*;
@@ -138,4 +146,6 @@ pub use update_policy_types::*;
 pub use update_rule_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use update_template_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use waf_config_types::*;
 

@@ -35,6 +35,12 @@
 //!   body). The default returns `None`, keeping the entry's protocol-correct
 //!   rendering. Return `Some(resp)` to reword it if desired.
 //!
+//! A sixth seam, `override_protocol`, is the one this service also takes: every timestamp
+//! member of this model targets `DateTimestamp`, which declares the `date-time` form, so
+//! the codec that reads and writes one is the workspace's shared
+//! [`service_common::date_time_json::DateTimeRestJson`] — the model's own `restJson1` in
+//! every other respect.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
@@ -47,11 +53,6 @@ use std::sync::Arc;
 
 mod enum_value_sets;
 
-/// The error code this service answers a boundary constraint refusal with — the one the
-/// framework's own restJson1 default picks, named here so a reworded MESSAGE always
-/// travels with the code a client already branches on.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
-
 /// The `com-amazonaws-networksecuritymanager-piccolocustomerapiservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -59,6 +60,9 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// This service's wire protocol, built ONCE here because
+    /// [`Service::override_protocol`] hands back a borrow of it.
+    protocol: ::service_common::date_time_json::DateTimeRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -68,6 +72,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            protocol: ::service_common::date_time_json::DateTimeRestJson::new(),
         }
     }
 }
@@ -107,29 +112,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // required member, or a value outside a declared bound) to let this service
         // reword it.
         //
-        // One thing about such a refusal is this service's own rather than the model's:
-        // the ORDER an enumerated type's admissible values are listed in
-        // ([`enum_value_sets`]), which follows the front door's own table of those values
-        // and not the order the model declares them in. That order is restated on the
-        // VIOLATION, so the counted envelope, the clause, the member path and the echoed
-        // value stay with the one place that writes them, and every other constraint
-        // class keeps the framework's wording exactly.
+        // Two things about such a refusal are AWS's rather than the framework's, and both
+        // live in the fleet's shared home for refusal wording, which [`enum_value_sets`]
+        // delegates to: a `@pattern` requirement is quoted without the whole-value anchors
+        // the model wraps it in, and a collection that broke its `@length` is stated with
+        // no value. A third is this service's own: the ORDER an enumerated type's
+        // admissible values are listed in, which follows the front door's own table of
+        // those values and not the order the model declares them in.
         //
-        // `None` whenever nothing moved — a refusal with no enum clause, and anything
-        // that is not a constraint refusal (an unauthenticated caller keeps the
-        // framework's 403 and its wording) — so this seam can only change the order and
-        // never the rest of the sentence.
-        let Refusal::Invalid(violations) = refusal else {
-            return None;
-        };
-        let stated = enum_value_sets::as_this_service_states(violations);
-        if stated == *violations {
-            return None;
-        }
-        Some(Refused {
-            code: VALIDATION_EXCEPTION.to_string(),
-            message: aws_smithy_schema_server::envelope(&stated)?,
-        })
+        // The envelope, the clause, the member path, the echoed value and every other
+        // requirement stay the framework's, so this seam cannot word a constraint
+        // differently from the services that state the same sentence. `None` for anything
+        // that is not a constraint refusal — an unauthenticated caller keeps the
+        // framework's 403 and its wording.
+        enum_value_sets::refused(refusal)
     }
 
     fn override_routing_error(
@@ -158,5 +154,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every timestamp member of this model targets ONE shape,
+        // `com.amazonaws.networksecuritymanager#DateTimestamp`, and it carries
+        // `@timestampFormat("date-time")`
+        // (`smithy_query(query="shape",shape="DateTimestamp")`), so every timestamp this
+        // service answers — every entity's `updatedAt`, and a synchronization status's
+        // `evaluatedAt` — is an RFC 3339 string rather than the protocol's default
+        // epoch-seconds number, in both directions. The generated member schemas drop that
+        // format, and the shared codec supplies it; it never overrides a member that
+        // declares one.
+        Some(&self.protocol)
     }
 }

@@ -10,15 +10,18 @@
 //! of each.
 //!
 //! One entity per module: the Rule record and its lookups live in [`rules`], the
-//! Deployment record in [`deployments`] and the Template record in [`templates`],
-//! re-exported here so `crate::state::<name>` keeps naming every one of them.
+//! Deployment record in [`deployments`], the Template record in [`templates`] and the
+//! Scope record in [`scopes`], re-exported here so `crate::state::<name>` keeps naming
+//! every one of them.
 
 mod deployments;
 mod rules;
+mod scopes;
 mod templates;
 
 pub use deployments::*;
 pub use rules::*;
+pub use scopes::*;
 pub use templates::*;
 
 use std::collections::BTreeMap;
@@ -26,6 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
     AssociatedTemplateOrRule, PolicyConfiguration, PolicySummary, TemplateOrRuleReference,
+    ValidationExceptionField,
 };
 
 /// This service's ARN namespace (`awsService.arnNamespace` / `aws.auth#sigv4` name in
@@ -44,6 +48,14 @@ pub const STATUS_DRAFT: &str = "DRAFT";
 
 /// `PolicyFirewallType` value whose policies carry no template/rule associations.
 pub const FIREWALL_TYPE_SHIELD_ADVANCED: &str = "SHIELD_ADVANCED";
+
+/// `PolicyFirewallType` value whose policies carry the AWS WAF settings block (see
+/// [`waf_config_violation`]).
+pub const FIREWALL_TYPE_WAF: &str = "WAF";
+
+/// The `policyConfiguration` member of a policy create/update, as the model names it:
+/// the root of the dotted path a refusal of one of its nested members reports.
+pub const POLICY_CONFIGURATION_MEMBER: &str = "policyConfiguration";
 
 /// `ServiceResourceType` naming a policy, for the `resourceType` member the modelled
 /// `ConflictException` / `ResourceNotFoundException` shapes carry.
@@ -365,6 +377,133 @@ pub fn association_list_violation(
 /// The `ValidationExceptionReason` a refused member carries.
 pub const VALIDATION_REASON_FIELD: &str = "FIELD_VALIDATION_FAILED";
 
+/// The `wafConfig` member of `PolicyConfiguration`, as the model names it: "AWS WAF-specific
+/// policy settings. This is populated only for AWS WAF policies."
+const WAF_CONFIG_MEMBER: &str = "wafConfig";
+
+/// `ExistingCustomerWebACLResolution`'s admissible values in the order the MODEL declares
+/// them (`smithy_query(query="shape", shape="ExistingCustomerWebACLResolution")`) — the
+/// order [`waf_config_violation`] lists them in, because the list it states is the modelled
+/// enum rather than anything one request carries.
+const EXISTING_CUSTOMER_WEB_ACL_RESOLUTION_DECLARED: &[&str] =
+    &["RETROFIT", "OVERRIDE_ASSOCIATION", "NO_REMEDIATION"];
+
+/// `WAFConflictResolutionOptions`' admissible values, declared as
+/// [`EXISTING_CUSTOMER_WEB_ACL_RESOLUTION_DECLARED`] is
+/// (`smithy_query(query="shape", shape="WAFConflictResolutionOptions")`).
+const WAF_CONFLICT_RESOLUTION_DECLARED: &[&str] = &["MERGE_WHERE_APPLICABLE"];
+
+/// Refuse a policy configuration the service does not accept, returning the `message` and
+/// the `fieldList` the refusal states — `None` when the configuration is one it accepts.
+///
+/// Two rules the model states in prose but no constraint trait expresses, checked in the
+/// order the recordings show them reported:
+///
+/// * the members `WafConfig` declares `@required` ([`waf_config_violation`]);
+/// * the resource cleanup the service requires ([`resources_clean_up_violation`]).
+///
+/// One home for the pair, so `CreatePolicy` and `UpdatePolicy` refuse alike.
+pub fn policy_configuration_violation(
+    firewall_type: &str,
+    configuration: &PolicyConfiguration,
+) -> Option<(String, Vec<ValidationExceptionField>)> {
+    waf_config_violation(firewall_type, configuration)
+        .or_else(|| resources_clean_up_violation(configuration))
+}
+
+/// Refuse a policy configuration that leaves the resources the service creates behind,
+/// returning the `message` and the `fieldList` the refusal states.
+///
+/// The model: `resourcesCleanUp` — "Specifies whether AWS Network Security Manager
+/// automatically removes the resources it created when they are no longer needed." The
+/// service only takes a policy it can clean up after, so a configuration that turns that
+/// off is refused whatever else it carries: unlike the WAF rule above, the refusal names no
+/// condition because the recorded one states none — it holds for every firewall type and
+/// whether or not remediation is enabled, the modelled `@default` of `false` included.
+///
+/// The `fieldList` entry carries the member's dotted path and the sentence the service
+/// states for the violation; nothing is invented for it, because the one thing recorded
+/// about this refusal is that sentence.
+fn resources_clean_up_violation(
+    configuration: &PolicyConfiguration,
+) -> Option<(String, Vec<ValidationExceptionField>)> {
+    if configuration.resources_clean_up {
+        return None;
+    }
+    let message = format!("{RESOURCES_CLEAN_UP_MEMBER} must be true");
+    Some((
+        message.clone(),
+        vec![ValidationExceptionField {
+            name: format!("{POLICY_CONFIGURATION_MEMBER}.{RESOURCES_CLEAN_UP_MEMBER}"),
+            message,
+        }],
+    ))
+}
+
+/// The `resourcesCleanUp` member of `PolicyConfiguration`, as the model names it.
+const RESOURCES_CLEAN_UP_MEMBER: &str = "resourcesCleanUp";
+
+/// Refuse a policy configuration that does not carry a member its firewall type requires,
+/// returning the `message` and the `fieldList` the refusal states — `None` when nothing is
+/// missing.
+///
+/// `WafConfig`'s two members are `@required`, and the model says of each: "Required for AWS
+/// WAF policies"; of the block that holds them it says "This is populated only for AWS WAF
+/// policies". So a WAF policy has to supply both, whether or not it sends the block at all,
+/// and a policy of any firewall type that DOES send the block has to complete it.
+///
+/// The SERVICE, not the protocol boundary, is what reports an omitted one: the refusal is
+/// this operation's modelled `ValidationException`, whose `reason`
+/// (`FIELD_VALIDATION_FAILED`) and `fieldList` only a handler can fill, so the shape is read
+/// with both members optional (`crate::ops::types::waf_config_types`) and checked here. The
+/// dotted `name` is the path to the member from the operation's input, built from the
+/// members the model names — the same path whether the block was sent or not; the firewall
+/// type is the one the request is for; and the valid-value list is the member's target enum
+/// as the model declares it.
+///
+/// One member is named, the first the model declares of those missing, so a request missing
+/// several states what a request missing one states.
+fn waf_config_violation(
+    firewall_type: &str,
+    configuration: &PolicyConfiguration,
+) -> Option<(String, Vec<ValidationExceptionField>)> {
+    let waf_config = configuration.waf_config.as_ref();
+    if waf_config.is_none() && firewall_type != FIREWALL_TYPE_WAF {
+        return None;
+    }
+    // Each of `WafConfig`'s `@required` members, in the model's member order: the member
+    // name, what the request supplied for it, and the values its target enum admits — for
+    // the refusal's wording only. A value PRESENT but outside that enum is refused before
+    // this runs, by the `EnumTrait` the member schema carries
+    // (`crate::ops::types::waf_config_types`), so what is left to check here is presence.
+    let members: [(&str, Option<&String>, &[&str]); 2] = [
+        (
+            "existingCustomerWebACLResolution",
+            waf_config.and_then(|config| config.existing_customer_web_acl_resolution.as_ref()),
+            EXISTING_CUSTOMER_WEB_ACL_RESOLUTION_DECLARED,
+        ),
+        (
+            "conflictResolution",
+            waf_config.and_then(|config| config.conflict_resolution.as_ref()),
+            WAF_CONFLICT_RESOLUTION_DECLARED,
+        ),
+    ];
+    let (member, _, values) = members
+        .iter()
+        .find(|(_, supplied, _)| supplied.is_none())?;
+    Some((
+        format!("{member} is required for {firewall_type} policies"),
+        vec![ValidationExceptionField {
+            name: format!("{POLICY_CONFIGURATION_MEMBER}.{WAF_CONFIG_MEMBER}.{member}"),
+            message: format!(
+                "{member} must be specified when firewallType is {firewall_type}. \
+                 Valid values: {}",
+                values.join(", ")
+            ),
+        }],
+    ))
+}
+
 /// Refuse a create's reference member whose identifier is not an ARN, returning the
 /// offending LIST member and the message naming what is wrong — `None` when every
 /// identifier is usable.
@@ -432,9 +571,9 @@ pub struct IdempotentCall {
 ///
 /// Every map here is bounded: `policies` (and with it `policy_name_index`, one entry per
 /// policy) by [`MAX_POLICIES`], `rules` by [`MAX_RULES`], `deployments` by
-/// [`MAX_DEPLOYMENTS`], `templates` by [`MAX_TEMPLATES`], and `idempotency` by
-/// [`MAX_IDEMPOTENCY_RECORDS`], so no sequence of requests can grow this process without
-/// limit.
+/// [`MAX_DEPLOYMENTS`], `templates` by [`MAX_TEMPLATES`], `scopes` by [`MAX_SCOPES`], and
+/// `idempotency` by [`MAX_IDEMPOTENCY_RECORDS`], so no sequence of requests can grow this
+/// process without limit.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {
     /// Every persisted policy, keyed by its `policyId` and so iterated in a stable
@@ -483,6 +622,15 @@ pub struct ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {
     pub templates: BTreeMap<String, Template>,
     /// Monotonic counter feeding [`Self::mint_template_id`].
     pub next_template_seq: u64,
+    /// Every persisted scope, keyed by its `scopeId` and so iterated in a stable order —
+    /// which is what makes `ListScopes`' `nextToken` resume exactly where the previous
+    /// page stopped. At most [`MAX_SCOPES`] entries.
+    ///
+    /// Scopes are NOT indexed by name, for the same reason rules are not: no modelled
+    /// trait and no documented rule makes `scopeName` unique.
+    pub scopes: BTreeMap<String, Scope>,
+    /// Monotonic counter feeding [`Self::mint_scope_id`].
+    pub next_scope_seq: u64,
 }
 
 impl ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {

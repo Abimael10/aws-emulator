@@ -229,12 +229,9 @@ pub struct PolicyConfiguration {
     pub waf_config: Option<WafConfig>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.networksecuritymanager#WafConfig")]
-#[derive(Debug, Clone, Default)]
-pub struct WafConfig {
-    pub existing_customer_web_acl_resolution: String,
-    pub conflict_resolution: String,
-}
+// `WafConfig` is declared in `waf_config_types`, not here: its schema and codec are
+// hand-written so an omitted `@required` member reaches the handler, which is what refuses
+// it. See that module's docs.
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.networksecuritymanager#AssociatedTemplateOrRule")]
 #[allow(clippy::large_enum_variant)]

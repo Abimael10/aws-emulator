@@ -235,6 +235,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        if let Some((message, field_list)) = crate::state::policy_configuration_violation(
+            &input.firewall_type,
+            &input.policy_configuration,
+        ) {
+            return Err(
+                CreatePolicyErrorModeled::ValidationException(ValidationException {
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                    field_list: Some(field_list),
+                    message,
+                })
+                .into(),
+            );
+        }
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();

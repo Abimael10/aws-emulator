@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The ORDER this service lists an enumerated type's admissible values in when the
-//! boundary refuses a value outside that type.
+//! boundary refuses a value outside that type, and the RENDERING of a `@pattern` it quotes.
 //!
 //! RULE: a refusal of a value outside an enumerated type lists that type's admissible set
 //! in the order the front door's own TABLE of those values is walked — the table's
@@ -15,18 +15,32 @@
 //! listed alike, in any operation, in whatever binding carried the value, at any depth,
 //! and a type the model gains needs nothing added here.
 //!
-//! Only the ORDER moves. The counted envelope, the clause, the member path, the value the
-//! clause echoes and every other constraint class's requirement stay where
-//! [`super::EmulatedService::override_refusal`] takes them from
-//! (`aws_smithy_schema_server::envelope`), so this service cannot word a constraint
-//! differently from the services that state the same sentence; a refusal carrying no enum
-//! clause comes back untouched.
+//! Only the ORDER is this service's own. Everything else — the counted envelope, the
+//! clause, the member path, the value the clause echoes and every other constraint class's
+//! requirement — comes from
+//! [`::service_common::validation_message::aws_validation_refusal`], the fleet's one home
+//! for how AWS states a boundary refusal, so this service cannot word a constraint
+//! differently from the services that state the same sentence. Two renderings are that
+//! home's rather than the framework's, and both now reach this service: a `@pattern`
+//! requirement is quoted WITHOUT the whole-value anchors the model wraps it in
+//! (`::service_common::validation::unanchored`), and a COLLECTION that broke its `@length`
+//! is stated with no value at all. The CHECK is always the model's pattern as written;
+//! only the quoting changes.
 
-use ::service_common::validation_message::in_hashed_enum_order;
-use ::smithy_server_runtime::Violation;
+use ::service_common::validation_message::{aws_validation_refusal, in_hashed_enum_order};
+use ::smithy_server_runtime::{Refusal, Refused};
 
-/// Every violation as THIS SERVICE states it: an enum value set listed in the order the
-/// table of the admissible values is walked, and every other violation kind unchanged.
-pub(super) fn as_this_service_states(violations: &[Violation]) -> Vec<Violation> {
-    violations.iter().map(in_hashed_enum_order).collect()
+/// How this service states `refusal`, or `None` to keep the framework's wording.
+///
+/// `None` for anything that is not an input-constraint refusal: an authentication failure
+/// is a different fault, with its own code and status, and nothing about it is this
+/// service's to word.
+pub(super) fn refused(refusal: &Refusal) -> Option<Refused> {
+    let Refusal::Invalid(violations) = refusal else {
+        return None;
+    };
+    // Each violation is re-ordered BEFORE the envelope words it: only the values of an
+    // enum clause move, and every other violation class comes back untouched.
+    let stated = Refusal::Invalid(violations.iter().map(in_hashed_enum_order).collect());
+    aws_validation_refusal(&stated)
 }

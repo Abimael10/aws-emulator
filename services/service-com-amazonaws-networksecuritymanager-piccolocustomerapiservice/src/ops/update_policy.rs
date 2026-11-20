@@ -280,6 +280,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         }
+        // An update REPLACES the whole configuration, so one that supplies a
+        // `policyConfiguration` has to carry everything the policy's firewall type
+        // requires; an update that supplies none leaves the stored configuration alone and
+        // is not checked.
+        if let Some(configuration) = input.policy_configuration.as_ref() {
+            if let Some((message, field_list)) =
+                crate::state::policy_configuration_violation(&stored_firewall_type, configuration)
+            {
+                return Err(
+                    UpdatePolicyErrorModeled::ValidationException(ValidationException {
+                        reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                        field_list: Some(field_list),
+                        message,
+                    })
+                    .into(),
+                );
+            }
+        }
 
         let Some(policy) = store.policies.get_mut(&policy_id) else {
             return Err(UpdatePolicyErrorModeled::InternalServerException(

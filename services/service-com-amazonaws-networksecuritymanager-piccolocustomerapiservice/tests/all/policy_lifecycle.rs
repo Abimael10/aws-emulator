@@ -227,7 +227,9 @@ fn expected_policy_arn(policy_id: &str) -> String {
     )
 }
 
-/// A `policyConfiguration` with no AWS WAF section.
+/// A `policyConfiguration` with no AWS WAF section. For a `SHIELD_ADVANCED` policy: the
+/// model says `wafConfig` "is populated only for AWS WAF policies", and a WAF policy has
+/// to carry it (see [`waf_configuration_with`]).
 fn plain_configuration(remediation: bool, clean_up: bool) -> serde_json::Value {
     serde_json::json!({
         "remediationEnabled": remediation,
@@ -235,17 +237,27 @@ fn plain_configuration(remediation: bool, clean_up: bool) -> serde_json::Value {
     })
 }
 
-/// A `policyConfiguration` carrying `wafConfig`. The two enum values come from
-/// `ExistingCustomerWebACLResolution` / `WAFConflictResolutionOptions` in the model.
-fn waf_configuration(resolution: &str) -> serde_json::Value {
+/// A `policyConfiguration` carrying `wafConfig`, with the remediation flags a row varies.
+/// Every member `WafConfig` declares is supplied, which is what a WAF policy requires.
+fn waf_configuration_with(
+    remediation: bool,
+    clean_up: bool,
+    resolution: &str,
+) -> serde_json::Value {
     serde_json::json!({
-        "remediationEnabled": true,
-        "resourcesCleanUp": true,
+        "remediationEnabled": remediation,
+        "resourcesCleanUp": clean_up,
         "wafConfig": {
             "existingCustomerWebACLResolution": resolution,
             "conflictResolution": "MERGE_WHERE_APPLICABLE",
         },
     })
+}
+
+/// A `policyConfiguration` carrying `wafConfig`. The two enum values come from
+/// `ExistingCustomerWebACLResolution` / `WAFConflictResolutionOptions` in the model.
+fn waf_configuration(resolution: &str) -> serde_json::Value {
+    waf_configuration_with(true, true, resolution)
 }
 
 /// An ARN of one of this service's other resource types, for an association reference.
@@ -317,7 +329,7 @@ fn create_cases() -> Vec<CreateCase> {
             description: None,
             is_published: None,
             associations: Vec::new(),
-            configuration: plain_configuration(false, false),
+            configuration: waf_configuration_with(false, true, "RETROFIT"),
             tags: None,
         },
         CreateCase {
@@ -327,7 +339,7 @@ fn create_cases() -> Vec<CreateCase> {
             description: Some("a draft policy"),
             is_published: Some(false),
             associations: Vec::new(),
-            configuration: plain_configuration(true, false),
+            configuration: waf_configuration_with(true, true, "NO_REMEDIATION"),
             tags: None,
         },
         CreateCase {
@@ -620,7 +632,7 @@ async fn update_applies_only_the_members_it_carries() {
             associations: Some(vec![serde_json::json!({
                 "ruleIdentifier": reference_arn("rule", "r7"),
             })]),
-            configuration: Some(plain_configuration(true, true)),
+            configuration: Some(waf_configuration_with(true, true, "OVERRIDE_ASSOCIATION")),
         },
     ];
 
@@ -834,7 +846,7 @@ async fn paging_returns_every_policy_exactly_once_for_any_page_size() {
                     "policyName": format!("policy-{index}"),
                     "priority": index + 1,
                     "firewallType": "WAF",
-                    "policyConfiguration": plain_configuration(false, false),
+                    "policyConfiguration": waf_configuration_with(false, true, "RETROFIT"),
                 }))
                 .await;
             assert_eq!(
@@ -877,7 +889,7 @@ async fn listing_filters_by_status() {
                 "priority": index + 1,
                 "firewallType": "WAF",
                 "isPublished": published,
-                "policyConfiguration": plain_configuration(false, false),
+                "policyConfiguration": waf_configuration_with(false, true, "RETROFIT"),
             }))
             .await;
         assert_eq!(reply.status, 201, "setup create failed: {:?}", reply.json);
@@ -942,7 +954,7 @@ async fn delete_removes_the_record_and_is_idempotent() {
                 "policyName": format!("doomed-{index}"),
                 "priority": index + 1,
                 "firewallType": "WAF",
-                "policyConfiguration": plain_configuration(false, false),
+                "policyConfiguration": waf_configuration_with(false, true, "RETROFIT"),
             }))
             .await;
         assert_eq!(reply.status, 201, "setup create failed: {:?}", reply.json);
@@ -1003,7 +1015,7 @@ async fn a_replayed_client_token_returns_the_same_policy() {
             "policyName": name,
             "priority": 1,
             "firewallType": "WAF",
-            "policyConfiguration": plain_configuration(false, false),
+            "policyConfiguration": waf_configuration_with(false, true, "RETROFIT"),
         })
     };
 
@@ -1048,7 +1060,7 @@ async fn a_duplicate_policy_name_is_a_conflict() {
         "policyName": "only-one-of-these",
         "priority": 1,
         "firewallType": "WAF",
-        "policyConfiguration": plain_configuration(false, false),
+        "policyConfiguration": waf_configuration_with(false, true, "RETROFIT"),
     });
     let first = emulator.create(body.clone()).await;
     assert_eq!(first.status, 201, "setup create failed: {:?}", first.json);
@@ -1182,7 +1194,7 @@ async fn creating_past_the_store_bound_is_refused() {
             "policyName": name,
             "priority": 1,
             "firewallType": "WAF",
-            "policyConfiguration": plain_configuration(false, false),
+            "policyConfiguration": waf_configuration_with(false, true, "RETROFIT"),
         })
     };
 
@@ -1208,7 +1220,7 @@ async fn creating_past_the_store_bound_is_refused() {
                 "policyName": "over-token",
                 "priority": 7,
                 "firewallType": "WAF",
-                "policyConfiguration": plain_configuration(true, true),
+                "policyConfiguration": waf_configuration_with(true, true, "RETROFIT"),
             }),
         ),
         (
@@ -1380,7 +1392,7 @@ async fn deleting_a_policy_releases_its_idempotency_records() {
         "policyName": "released-with-the-policy",
         "priority": 3,
         "firewallType": "WAF",
-        "policyConfiguration": plain_configuration(false, false),
+        "policyConfiguration": waf_configuration_with(false, true, "RETROFIT"),
     });
     let created = emulator.create(body.clone()).await;
     assert_eq!(
@@ -1453,7 +1465,7 @@ async fn a_replayed_update_token_returns_the_update_it_applied() {
             "policyName": "replayed-update",
             "priority": 1,
             "firewallType": "WAF",
-            "policyConfiguration": plain_configuration(false, false),
+            "policyConfiguration": waf_configuration_with(false, true, "RETROFIT"),
         }))
         .await;
     assert_eq!(
