@@ -23,9 +23,11 @@
 //! - `override_operation` — serve a request the model's routing key cannot name
 //!   correctly. The default returns `None`, so every request resolves through the
 //!   generated routing table. Return `Some(op)` to route one yourself.
-//! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//! - `override_refusal` — EDITED HERE: how this service words a request the
+//!   framework refused before any handler ran. It no longer returns the default
+//!   `None` for every refusal — a refusal that blames the bot identifier of a
+//!   session address is worded as the Lex V2 runtime words it. See the inline
+//!   note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -44,6 +46,32 @@ use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The dotted path the validating walk gives the bot identifier every operation
+/// of this service addresses a session by: the one `@httpLabel` member targeting
+/// `BotIdentifier` (`@length(min: 10, max: 10)`, `@pattern("^[0-9a-zA-Z]+$")`),
+/// which `GetSession`, `PutSession`, `DeleteSession`, `RecognizeText` and
+/// `RecognizeUtterance` all bind under this name — as does the model's sixth
+/// operation, `StartConversation`, whose event-stream input leaves it unwired
+/// (see `ops/SKIPPED_STUBS.md`), so no request of it reaches this seam at all.
+///
+/// It is the ONLY label of a session address this rule can be reached through:
+/// the bot ALIAS label targets `BotAliasIdentifier`, which declares neither a
+/// length nor a pattern, so no violation of it is ever raised.
+const BOT_ID_PATH: &str = "botId";
+
+/// What the Amazon Lex V2 runtime answers a request whose bot identifier is not
+/// a well-formed bot identifier.
+///
+/// The sentence is entirely FIXED: it names neither the member nor the value the
+/// caller sent, and states no bound — the frontend reports that it could not
+/// address a bot, not which rule of the identifier shape the value broke.
+const INVALID_BOT_OR_ALIAS_MESSAGE: &str = "INVALID_REQUEST - Invalid bot name or alias";
+
+/// The error every operation of this model declares for a request it refuses at
+/// HTTP 400, and the code the framework already names for a refused value — so
+/// rewording such a refusal keeps it.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
 
 /// The `com-amazonaws-lexruntimev2-awsdeepsenseruntimeserviceapi2-0` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -108,15 +136,34 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // service reword it.
+        //
+        // The Lex V2 runtime resolves the bot a request addresses BEFORE it reads
+        // anything else, and it states a bot identifier that is not a
+        // well-formed one in its own fixed words
+        // ([`INVALID_BOT_OR_ALIAS_MESSAGE`]) rather than reporting which rule the
+        // value broke: a bot address is either one the frontend can look a bot up
+        // by or it is not. So any refusal that blames the bot identifier is
+        // worded that way, whichever operation it was reached through, and every
+        // other refusal keeps the framework's wording (`None`), which is what
+        // this service's remaining bounded labels and body members are stated by.
+        //
+        // The error CODE is the one the framework already names for a refused
+        // value, `ValidationException`, which is the error every operation of this
+        // model declares at HTTP 400 — so only the message changes.
+        match refusal {
+            Refusal::Invalid(violations)
+                if violations
+                    .iter()
+                    .any(|violation| violation.path == BOT_ID_PATH) =>
+            {
+                Some(Refused {
+                    code: VALIDATION_EXCEPTION.to_string(),
+                    message: INVALID_BOT_OR_ALIAS_MESSAGE.to_string(),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn override_routing_error(

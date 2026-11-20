@@ -24,6 +24,10 @@
 //! 3. The `messages` a `PutSession` reports are the ones the BOT authors for
 //!    the dialog state it seeds when the request carries none of its own, and
 //!    the caller's own messages when it does.
+//! 4. A `botId` that is not a well-formed bot identifier is refused, whichever
+//!    session operation it is addressed through, with the runtime's own fixed
+//!    sentence for a bot address it cannot look a bot up by — while a refusal
+//!    that blames another label keeps that label's own report.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -44,11 +48,14 @@ const FALLBACK_INTENT: &str = "FallbackIntent";
 const LOCALE_NOT_VALID: &str = "The provided BotId/BotLocale combination is not valid. \
      Please update the BotId/BotLocale combination and retry your request.";
 
-/// The three calls that need the bot's runtime model: `PutSession`, which seeds
-/// a session's dialog state, and the two encodings of one turn. Each row of a
-/// table below is applied to all three, so what is asserted is the addressing
-/// rule they share rather than one operation's spelling of it.
+/// One operation addressed to a session: `PutSession`, which seeds a session's
+/// dialog state, the two encodings of one turn, and the two operations that read
+/// and delete the session. Each row of a table below is applied to a whole set of
+/// them, so what is asserted is the addressing rule they share rather than one
+/// operation's spelling of it.
 enum Call {
+    GetSession,
+    DeleteSession,
     PutSession,
     RecognizeText,
     RecognizeUtterance,
@@ -57,16 +64,32 @@ enum Call {
 impl Call {
     fn name(&self) -> &'static str {
         match self {
+            Self::GetSession => "GetSession",
+            Self::DeleteSession => "DeleteSession",
             Self::PutSession => "PutSession",
             Self::RecognizeText => "RecognizeText",
             Self::RecognizeUtterance => "RecognizeUtterance",
         }
     }
 
-    /// Send this call against `path`, with a dialog state the fixture bot's
-    /// locale defines, so nothing but the addressing can refuse it.
+    /// Is this call served AGAINST the bot's runtime model? `PutSession` seeds a
+    /// dialog state the locale has to define, and the two encodings of a turn are
+    /// interpreted by that locale's model; the read and the delete address the
+    /// stored session alone.
+    fn needs_the_runtime_model(&self) -> bool {
+        match self {
+            Self::GetSession | Self::DeleteSession => false,
+            Self::PutSession | Self::RecognizeText | Self::RecognizeUtterance => true,
+        }
+    }
+
+    /// Send this call against `path`, with a body this operation's own model
+    /// accepts and a dialog state the fixture bot's locale defines, so nothing
+    /// but the addressing can refuse it.
     async fn send(&self, emulator: &Emulator, path: &str) -> crate::harness::Reply {
         match self {
+            Self::GetSession => emulator.send("GET", path, None).await,
+            Self::DeleteSession => emulator.send("DELETE", path, None).await,
             Self::PutSession => {
                 emulator
                     .send(
@@ -100,9 +123,26 @@ impl Call {
     }
 }
 
-/// Every call that needs the runtime model.
-fn calls() -> [Call; 3] {
-    [Call::PutSession, Call::RecognizeText, Call::RecognizeUtterance]
+/// Every call that needs the runtime model: the subset of [`session_calls`] that
+/// is served AGAINST the bot's built locale — stated as that subset so the two
+/// tables cannot drift when another operation is wired.
+fn calls() -> Vec<Call> {
+    session_calls()
+        .into_iter()
+        .filter(Call::needs_the_runtime_model)
+        .collect()
+}
+
+/// EVERY operation this service binds to a session address — the five that bind
+/// the same four `@httpLabel` values, model-needing or not.
+fn session_calls() -> [Call; 5] {
+    [
+        Call::GetSession,
+        Call::DeleteSession,
+        Call::PutSession,
+        Call::RecognizeText,
+        Call::RecognizeUtterance,
+    ]
 }
 
 /// The sentence AWS states for a `botId`/`botAliasId` pair that is not one of
@@ -609,4 +649,205 @@ fn contents(messages: Option<&Value>) -> Vec<&str> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// --- Rule 4: an identifier the bot address cannot be read from ---------------
+
+/// The sentence the Lex V2 runtime answers a request whose bot identifier is not
+/// a well-formed one with. Entirely FIXED text: no member name, no echoed value
+/// and no bound appear in it.
+const INVALID_BOT_OR_ALIAS: &str = "INVALID_REQUEST - Invalid bot name or alias";
+
+/// Rule 4: the bot identifier is the first thing a session address is read from,
+/// so one that is not a well-formed `BotIdentifier` — whatever it fails, and
+/// whatever else the request also gets wrong — is HTTP 400 `ValidationException`
+/// in the runtime's own fixed words, from every operation. A well-formed one is
+/// never refused that way, whether or not a bot was created under it.
+#[tokio::test]
+async fn a_malformed_bot_identifier_is_refused_in_the_runtimes_own_fixed_words() {
+    let (emulator, bot) = Emulator::with_bot().await;
+
+    // (case, botId, sessionId, the botId is well formed)
+    //
+    // The rows differ along what a value can fail in the modelled identifier
+    // (`BotIdentifier`: length exactly 10, pattern `^[0-9a-zA-Z]+$`) — too long,
+    // too short, each published bound met exactly, and a character the pattern
+    // excludes at either end — plus a row whose session id is malformed too, so
+    // which of two refused labels is reported is pinned as well.
+    let rows: Vec<(&str, String, String, bool)> = vec![
+        (
+            "the bot's own identifier: ten alphanumeric characters",
+            bot.bot_id.clone(),
+            "well-formed-bot".to_string(),
+            true,
+        ),
+        (
+            "ten alphanumeric characters no bot was created under",
+            "0123456789".to_string(),
+            "unknown-bot".to_string(),
+            true,
+        ),
+        (
+            "eleven alphanumeric characters: one past the maximum",
+            "AAAAAAAAAAA".to_string(),
+            "too-long".to_string(),
+            false,
+        ),
+        (
+            "nine alphanumeric characters: one below the minimum",
+            "AAAAAAAAA".to_string(),
+            "too-short".to_string(),
+            false,
+        ),
+        (
+            "four alphanumeric characters",
+            "ABCD".to_string(),
+            "far-too-short".to_string(),
+            false,
+        ),
+        (
+            "ten characters, one of them a hyphen",
+            "ABCD-56789".to_string(),
+            "hyphenated".to_string(),
+            false,
+        ),
+        (
+            "ten characters, the last an underscore",
+            "ABCD56789_".to_string(),
+            "underscored".to_string(),
+            false,
+        ),
+        (
+            "ten characters, the first a dot",
+            ".ABCD56789".to_string(),
+            "dotted".to_string(),
+            false,
+        ),
+        (
+            "a malformed bot identifier and a malformed session id",
+            "AAAAAAAAAAA".to_string(),
+            "a".to_string(),
+            false,
+        ),
+    ];
+
+    for (case, bot_id, session_id, well_formed) in &rows {
+        for call in session_calls() {
+            let path = format!(
+                "/bots/{bot_id}/botAliases/{}/botLocales/{}/sessions/{session_id}",
+                bot.alias_id,
+                bot.locale()
+            );
+            let reply = call.send(&emulator, &path).await;
+            if *well_formed {
+                // A well-formed identifier is read as one: the call is served, or
+                // refused for what it addresses, never for how it is spelled.
+                assert!(
+                    reply.status == 200 || reply.status == 404,
+                    "case {case:?} on {}: a well-formed botId is not a refused value, so the \
+                     call is served or its resource absent, got {} {:?}",
+                    call.name(),
+                    reply.status,
+                    String::from_utf8_lossy(&reply.body)
+                );
+                if reply.status == 404 {
+                    // What is absent is the resource the labels address — the
+                    // session, or the bot the pair names — which is rule 1's
+                    // refusal, not a refused value.
+                    assert!(
+                        reply.error_type().ends_with("ResourceNotFoundException"),
+                        "case {case:?} on {}: an absent resource is the modelled 404, got {:?}",
+                        call.name(),
+                        reply.error_type()
+                    );
+                }
+                continue;
+            }
+            assert_eq!(
+                reply.status,
+                400,
+                "case {case:?} on {}: expected HTTP 400, got {} {:?}",
+                call.name(),
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+            assert!(
+                reply.error_type().ends_with("ValidationException"),
+                "case {case:?} on {}: expected ValidationException, got {:?}",
+                call.name(),
+                reply.error_type()
+            );
+            let message = reply.error_message();
+            assert_eq!(
+                message, INVALID_BOT_OR_ALIAS,
+                "case {case:?} on {}: expected the runtime's fixed sentence, got {message:?}",
+                call.name()
+            );
+            // The sentence is fixed, so nothing of the request is in it: neither
+            // the value the caller sent nor the member it was bound to.
+            assert!(
+                !message.contains(bot_id.as_str()) && !message.contains("botId"),
+                "case {case:?} on {}: the sentence interpolates nothing, got {message:?}",
+                call.name()
+            );
+        }
+    }
+}
+
+/// Rule 4, the other side: the reword is confined to the bot identifier, so a
+/// refusal that blames another label still reports THAT label — a client fixing
+/// a session id is told which value it was.
+#[tokio::test]
+async fn a_refusal_that_blames_another_label_keeps_its_own_report() {
+    let (emulator, bot) = Emulator::with_bot().await;
+
+    // (case, sessionId) — the rows span what the modelled `SessionId`
+    // (length 2..100, pattern `^[0-9a-zA-Z._:-]+$`) can fail, with the bot
+    // identifier well formed in every one.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "one character: one below the minimum of 2",
+            "a".to_string(),
+        ),
+        (
+            "101 characters: one past the maximum of 100",
+            "a".repeat(101),
+        ),
+        (
+            "a character the pattern excludes",
+            "session~id".to_string(),
+        ),
+    ];
+
+    for (case, session_id) in &rows {
+        for call in session_calls() {
+            let path = format!(
+                "/bots/{}/botAliases/{}/botLocales/{}/sessions/{session_id}",
+                bot.bot_id,
+                bot.alias_id,
+                bot.locale()
+            );
+            let reply = call.send(&emulator, &path).await;
+            assert_eq!(
+                reply.status,
+                400,
+                "case {case:?} on {}: expected HTTP 400, got {} {:?}",
+                call.name(),
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            );
+            let message = reply.error_message();
+            assert_ne!(
+                message, INVALID_BOT_OR_ALIAS,
+                "case {case:?} on {}: the bot address is well formed, so this is not its \
+                 refusal, got {message:?}",
+                call.name()
+            );
+            assert!(
+                message.contains("sessionId"),
+                "case {case:?} on {}: expected the refused label to be named, got {message:?}",
+                call.name()
+            );
+        }
+    }
 }
