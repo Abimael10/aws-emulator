@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTransitGatewayPeeringAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTransitGatewayPeeringAttachment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTransitGatewayPeeringAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the stored transit gateway peering attachment the request names into
+//! the transient state of a deletion, with the clock owing it the terminal one, and answers the
+//! record as the store then holds it. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -135,18 +129,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTransitGatewayPeeringAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTransitGatewayPeeringAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it — an attachment
+        // is named by id, which is unique across Regions in this store. The store is reached
+        // through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        let attachment_id = input.transit_gateway_attachment_id.as_str();
+        // The request's own FORM first, before anything is resolved: "not an id of this kind"
+        // is a malformed request rather than a missing attachment, and it is not answered by
+        // the DryRun arm below. Through the ONE place this resource's malformed refusal is
+        // worded, which every other reader of a `TransitGatewayAttachmentId` answers.
+        state::require_well_formed_transit_gateway_attachment_id(attachment_id)?;
+
+        // "Checks whether you have the required permissions for the action, WITHOUT ACTUALLY
+        // MAKING THE REQUEST, and provides an error response. If you have the required
+        // permissions, the error response is DryRunOperation. Otherwise, it is
+        // UnauthorizedOperation" (`DryRun`): the flag asks about PERMISSION, not about the
+        // attachment the request names, so it is answered once the request's own form has been
+        // checked and before anything is resolved or written — the order every other delete of
+        // this family answers it in — and every caller of this emulator is permitted.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // The clock first: an attachment whose owed move has fallen due is already in the state
+        // it was owed, so whether this delete is admissible is asked of the state the store is
+        // ACTUALLY in rather than of the one its last writer left it in.
+        store.materialize_due_transitions();
+
+        // "Deletes a transit gateway peering attachment": an id this account holds no peering
+        // attachment under is a refusal, not a no-op — a caller that deletes twice has to be
+        // able to tell the deletion it performed from one it did not. Every attachment kind
+        // shares one id space, so an id naming an attachment of ANOTHER kind names no
+        // attachment THIS operation can delete and is refused as unknown, in the wording the
+        // transit gateway family answers for an attachment of its own that is not there, which
+        // names the ATTACHMENT — the resource this action, like the acceptances and rejections
+        // that take an attachment of any kind, has as its subject.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTransitGatewayPeeringAttachment"))
+        // Resolved ONCE, mutably, so the check below and the write that follows it are made of
+        // the very record this call then answers with.
+        let Some(record) = store
+            .transit_gateway_attachments
+            .get_mut(attachment_id)
+            .filter(|record| {
+                record.view.resource_type()
+                    == state::TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_PEERING
+            })
+        else {
+            return Err(state::transit_gateway_attachment_deleted_or_absent(attachment_id));
+        };
+        // A delete whose work this attachment is already doing or has already done asks for a
+        // state it is in or on its way to, so it is ANSWERED with the record rather than
+        // refused: a caller that repeats the delete of an attachment that is leaving or gone is
+        // told what it asked for is so, and the clock is not restarted on it. Which states those
+        // are is the attachment family's own definition, in `crate::state` beside the predicate
+        // that says whether there is anything left to delete at all.
+        let deletion_already_under_way =
+            state::transit_gateway_attachment_deletion_already_under_way(record.view.state());
+        if !deletion_already_under_way {
+            // A delete takes the attachment away from the gateways it joins, so there has to be
+            // an attachment still joining them: one the lifecycle finished some OTHER way —
+            // refused by the owner of the attached resource, or failed — joins nothing and was
+            // never deleted either, and is refused with the attachment family's own
+            // `IncorrectState`, as is one on its way to such an end.
+            if !state::transit_gateway_attachment_state_admits_deletion(record.view.state()) {
+                return Err(state::transit_gateway_attachment_invalid_state(
+                    attachment_id,
+                ));
+            }
+
+            // The transient state of a deletion now, with the terminal one owed one span later
+            // — the span is never zero, so a caller reading straight after this call still sees
+            // the deletion under way, and nothing is slept for. A peering attachment's `Status`
+            // is the status OF the state it is in, so the one writer of that state moves both
+            // together.
+            record.begin_move(
+                state::TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETING,
+                state::TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETED,
+            );
+        }
+
+        // "The transit gateway peering attachment" (`$TransitGatewayPeeringAttachment`) as the
+        // STORE now holds it, so this answer and the describes of this attachment cannot drift
+        // apart.
+        let state::TransitGatewayAttachmentView::Peering(attachment) = record.view.clone() else {
+            return Err(state::unexpected_attachment_kind(attachment_id));
+        };
+        Ok(DeleteTransitGatewayPeeringAttachmentOutput {
+            transit_gateway_peering_attachment: Some(attachment),
+        })
     }
 }

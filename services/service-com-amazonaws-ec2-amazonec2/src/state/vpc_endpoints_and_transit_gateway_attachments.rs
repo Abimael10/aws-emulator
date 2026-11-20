@@ -1014,8 +1014,13 @@ pub fn transit_gateway_attachment_is_finished(attachment_state: Option<&str>) ->
 /// them, which an earlier call has already started and which a second call cannot start again.
 ///
 /// The ONE definition of it, for every delete of an attachment of any kind
-/// (`DeleteTransitGatewayVpcAttachment`, `DeleteTransitGatewayConnect`), so a state added to
-/// `TransitGatewayAttachmentState` cannot be admitted by one of them and refused by another.
+/// (`DeleteTransitGatewayVpcAttachment`, `DeleteTransitGatewayConnect`,
+/// `DeleteTransitGatewayPeeringAttachment`), so a state added to
+/// `TransitGatewayAttachmentState` cannot be admitted by one of them and refused by another. A
+/// delete whose work is already under way or done is a question of its own
+/// ([`transit_gateway_attachment_deletion_already_under_way`]) and is asked FIRST by the kind
+/// whose delete answers it idempotently, so this predicate stays the single definition of "there
+/// is something left to delete".
 pub fn transit_gateway_attachment_state_admits_deletion(attachment_state: Option<&str>) -> bool {
     !transit_gateway_attachment_is_finished(attachment_state)
         && !matches!(
@@ -1026,6 +1031,30 @@ pub fn transit_gateway_attachment_state_admits_deletion(attachment_state: Option
                     | TRANSIT_GATEWAY_ATTACHMENT_STATE_FAILING
             )
         )
+}
+
+/// Whether the deletion of an attachment in `attachment_state` is already under way or already
+/// done — the two states a delete of its own puts an attachment into
+/// ([`TransitGatewayAttachmentRecord::begin_move`] from a delete), and no others: an attachment
+/// the lifecycle ended some other way (refused by the owner of the attached resource, or failed)
+/// was never deleted, so it is not one of these.
+///
+/// Beside [`transit_gateway_attachment_state_admits_deletion`] rather than inside it, because the
+/// two answer different questions: this one says the caller's deletion ALREADY HAPPENED, which is
+/// what lets a repeated delete be answered with the record instead of refused for the state. Which
+/// of the attachment kinds answers a repeat that way is a fact of the kind's own delete:
+/// `DeleteTransitGatewayPeeringAttachment` does, where the VPC attachment's and the Connect
+/// attachment's deletes refuse a repeat with the family's `IncorrectState`.
+pub fn transit_gateway_attachment_deletion_already_under_way(
+    attachment_state: Option<&str>,
+) -> bool {
+    matches!(
+        attachment_state,
+        Some(
+            TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETING
+                | TRANSIT_GATEWAY_ATTACHMENT_STATE_DELETED
+        )
+    )
 }
 
 /// `pendingAcceptance` as the OTHER state enum spells it:
