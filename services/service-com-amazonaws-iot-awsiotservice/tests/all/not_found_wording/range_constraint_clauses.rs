@@ -8,14 +8,13 @@
 //! request signed for the `iot` signing name — so what is asserted is what an AWS SDK
 //! client would see, not an internal function's return value.
 //!
-//! The rule under test: a clause about a member's `@range` names the member and the bound
-//! it broke and states NO value — `Value at '<member>' failed to satisfy constraint: Member
-//! must have value {less,greater} than or equal to <bound>` — so the number that fell
-//! outside the bound is not reflected back to the caller. It is the same decision the
-//! `@length` and `@pattern` classes already take: the clause states the REQUIREMENT the
-//! value broke, and a bound and the value it rejected say the same thing twice. The one
-//! class whose requirement is a SET of admissible values is still stated beside the value it
-//! rejected, which is what keeps this about the range class rather than about the envelope.
+//! The rule under test: a clause about a member's `@range` names the member, the bound it
+//! broke and the NUMBER the request submitted for it — `Value '<n>' at '<member>' failed to
+//! satisfy constraint: Member must have value {less,greater} than or equal to <bound>` —
+//! because a numeric bound states the interval a value had to lie in rather than the value
+//! that fell outside it. It is the same decision the enumerated class already takes, and the
+//! opposite of the `@length` and `@pattern` classes, whose requirement is itself a statement
+//! about the value's own text.
 //!
 //! The envelope itself is the parent suite's: 400, `InvalidRequestException` qualified with
 //! the service's API doc namespace in `x-amzn-errortype`, `N validation error(s) detected: `
@@ -140,19 +139,19 @@ impl Emulator {
     }
 }
 
-/// The clause a refusal states for a member past its `@range` maximum.
-fn past_the_maximum(member: &str, maximum: i64) -> String {
+/// The clause a refusal states for `submitted` at a member past its `@range` maximum.
+fn past_the_maximum(member: &str, maximum: i64, submitted: i64) -> String {
     format!(
-        "Value at '{member}' failed to satisfy constraint: Member must have value less than \
-         or equal to {maximum}"
+        "Value '{submitted}' at '{member}' failed to satisfy constraint: Member must have \
+         value less than or equal to {maximum}"
     )
 }
 
-/// The clause a refusal states for a member short of its `@range` minimum.
-fn short_of_the_minimum(member: &str, minimum: i64) -> String {
+/// The clause a refusal states for `submitted` at a member short of its `@range` minimum.
+fn short_of_the_minimum(member: &str, minimum: i64, submitted: i64) -> String {
     format!(
-        "Value at '{member}' failed to satisfy constraint: Member must have value greater \
-         than or equal to {minimum}"
+        "Value '{submitted}' at '{member}' failed to satisfy constraint: Member must have \
+         value greater than or equal to {minimum}"
     )
 }
 
@@ -166,8 +165,7 @@ struct RefusedRequest {
     /// A body for the rows that carry one.
     body: Option<Value>,
     clauses: Vec<String>,
-    /// What the request sent for the member the range clause is about: no clause may quote
-    /// it.
+    /// What the request sent for the member the range clause is about: the clause quotes it.
     rejected: i64,
 }
 
@@ -194,22 +192,30 @@ fn refused_requests() -> Vec<RefusedRequest> {
             (
                 "the first second past the maximum",
                 MAX_CREDENTIAL_DURATION_SECONDS + 1,
-                past_the_maximum(duration, MAX_CREDENTIAL_DURATION_SECONDS),
+                past_the_maximum(
+                    duration,
+                    MAX_CREDENTIAL_DURATION_SECONDS,
+                    MAX_CREDENTIAL_DURATION_SECONDS + 1,
+                ),
             ),
             (
                 "a duration well past the maximum",
                 46_800,
-                past_the_maximum(duration, MAX_CREDENTIAL_DURATION_SECONDS),
+                past_the_maximum(duration, MAX_CREDENTIAL_DURATION_SECONDS, 46_800),
             ),
             (
                 "the last second short of the minimum",
                 MIN_CREDENTIAL_DURATION_SECONDS - 1,
-                short_of_the_minimum(duration, MIN_CREDENTIAL_DURATION_SECONDS),
+                short_of_the_minimum(
+                    duration,
+                    MIN_CREDENTIAL_DURATION_SECONDS,
+                    MIN_CREDENTIAL_DURATION_SECONDS - 1,
+                ),
             ),
             (
                 "a duration of no seconds at all",
                 0,
-                short_of_the_minimum(duration, MIN_CREDENTIAL_DURATION_SECONDS),
+                short_of_the_minimum(duration, MIN_CREDENTIAL_DURATION_SECONDS, 0),
             ),
         ] {
             rows.push(RefusedRequest {
@@ -235,12 +241,12 @@ fn refused_requests() -> Vec<RefusedRequest> {
             (
                 "one page past the maximum",
                 MAX_PAGE_SIZE + 1,
-                past_the_maximum(member, MAX_PAGE_SIZE),
+                past_the_maximum(member, MAX_PAGE_SIZE, MAX_PAGE_SIZE + 1),
             ),
             (
                 "a page of none",
                 MIN_PAGE_SIZE - 1,
-                short_of_the_minimum(member, MIN_PAGE_SIZE),
+                short_of_the_minimum(member, MIN_PAGE_SIZE, MIN_PAGE_SIZE - 1),
             ),
         ] {
             rows.push(RefusedRequest {
@@ -257,11 +263,12 @@ fn refused_requests() -> Vec<RefusedRequest> {
     rows
 }
 
-/// RULE: a clause about a `@range` bound names the member and the bound and states no
-/// value, at either end of the bound, for a member bound anywhere in the request, on every
-/// operation — and the envelope counts the clauses as it does for any other class.
+/// RULE: a clause about a `@range` bound names the member, the bound and the number the
+/// request submitted, at either end of the bound, for a member bound anywhere in the
+/// request, on every operation — and the envelope counts the clauses as it does for any
+/// other class.
 #[tokio::test]
-async fn a_range_clause_states_the_bound_and_not_the_value_that_broke_it() {
+async fn a_range_clause_states_the_bound_and_the_value_that_broke_it() {
     for case in refused_requests() {
         // A fresh emulator per row: a validation refusal is decided by the REQUEST, so it
         // must not depend on what another row left behind.
@@ -295,17 +302,17 @@ async fn a_range_clause_states_the_bound_and_not_the_value_that_broke_it() {
         );
         let quoted = format!("Value '{}'", case.rejected);
         assert!(
-            !reply.message().contains(&quoted),
-            "case {:?}: expected the clause to state no value, got {:?}",
+            reply.message().contains(&quoted),
+            "case {:?}: expected the clause to quote {quoted:?}, got {:?}",
             case.case,
             reply.message()
         );
     }
 }
 
-/// RULE: the class that states a SET of admissible values still quotes the value it
-/// rejected — the change is keyed to the range class and not to the envelope — including in
-/// a message that states a range clause beside it.
+/// RULE: the class that states a SET of admissible values quotes the value it rejected just
+/// as the range class does — the envelope states one clause per broken constraint and each
+/// clause its own value — including in a message that states a range clause beside it.
 #[tokio::test]
 async fn a_class_that_quotes_the_submitted_value_still_quotes_it() {
     // `ListAuditTasks` binds both `maxResults` (`range 1..250`) and `taskStatus` (the
@@ -318,7 +325,11 @@ async fn a_class_that_quotes_the_submitted_value_still_quotes_it() {
         ("an unmodelled task status alone", None, 1),
         (
             "an unmodelled task status beside a page size past its maximum",
-            Some(past_the_maximum("maxResults", MAX_PAGE_SIZE)),
+            Some(past_the_maximum(
+                "maxResults",
+                MAX_PAGE_SIZE,
+                MAX_PAGE_SIZE + 1,
+            )),
             2,
         ),
     ];
@@ -362,11 +373,6 @@ async fn a_class_that_quotes_the_submitted_value_still_quotes_it() {
             assert!(
                 reply.message().contains(&range_clause),
                 "case {case:?}: expected the clause {range_clause:?}, got {:?}",
-                reply.message()
-            );
-            assert!(
-                !reply.message().contains(&format!("Value '{rejected_max_results}'")),
-                "case {case:?}: expected the range clause to state no value, got {:?}",
                 reply.message()
             );
         }

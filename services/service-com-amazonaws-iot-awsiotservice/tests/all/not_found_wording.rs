@@ -51,10 +51,10 @@
 //!   while a COLLECTION outside its `@length` is stated WITH the collection, which the
 //!   child suite [`modelled_refusal_shape`] pins beside the error SHAPE each plane's
 //!   operations model;
-//! * a member outside either end of its `@range` is stated with no value for the same
-//!   reason — the clause names the numeric bound it broke, not the number that broke it —
-//!   which the child suite [`range_constraint_clauses`] pins over the operations, the
-//!   bindings and both ends of the bounds that rule covers;
+//! * a member outside either end of its `@range` is stated WITH the number that broke it,
+//!   quoted beside the numeric bound — a bound states the interval a value had to lie in
+//!   rather than the value — which the child suite [`range_constraint_clauses`] pins over
+//!   the operations, the bindings and both ends of the bounds that rule covers;
 //! * a value outside an enumerated set is quoted beside that set, whose members are listed
 //!   in the order of the hash table the front door holds them in rather than in the model's
 //!   declaration order.
@@ -99,7 +99,7 @@ mod modelled_refusal_shape;
 mod clause_value_classes;
 
 /// The `@range` class of that same envelope: a clause about a NUMERIC bound states the
-/// bound and not the value that broke it, over the operations, the bindings and both ends
+/// bound and the number that broke it, over the operations, the bindings and both ends
 /// of the bounds the rule covers. Declared the same way, and for the same reason, as the
 /// length suite above.
 #[path = "not_found_wording/range_constraint_clauses.rs"]

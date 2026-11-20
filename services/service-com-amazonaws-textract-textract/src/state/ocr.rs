@@ -2056,8 +2056,27 @@ fn cut_apart(
     Ok(())
 }
 
-/// Join the neighbouring pieces of `marks` that are named better as one mark than as two:
-/// what a stroke that broke apart leaves.
+/// Join the neighbouring pieces of `marks` that are one character's ink: what a stroke that
+/// broke apart leaves.
+///
+/// Two marks closer than a letter's own side bearing, at least one of them too narrow to be
+/// a character of this line, can be one character whose stroke broke. Where BOTH are too
+/// narrow to be characters the pieces are joined wherever the whole accounts for their ink
+/// better than either does; where only one is, the narrow one may be a narrow CHARACTER set
+/// tight against its neighbour instead, and what tells the two apart is whether the joined
+/// ink NAMES a character at least as well as the worse of the two is named ([`joined`]).
+///
+/// A piece belongs to the character it broke off, and that character stands on EITHER side of
+/// it: the upper arc a `3` leaves when its waist falls under the floor that tells ink from
+/// ground stands before the rest of that figure, and the arm of a `Y` whose apex thinned out
+/// stands after the rest of that letter. So the pairs are weighed against each other rather
+/// than read left to right: the pair whose joined ink accounts for most of itself is joined,
+/// then the pairs its join changed are weighed again, until no pair is left to join. A pass
+/// that only ever joined a piece to the mark BEFORE it would report the piece of a letter
+/// that broke on its left as the mark of punctuation that piece is shaped like.
+///
+/// Each pair is named once and re-named only when a join changes it, so the naming this
+/// costs grows with the marks of the line rather than with their square.
 fn join(
     ink: &Ink,
     band: &InkLine,
@@ -2065,40 +2084,119 @@ fn join(
     line: glyphs::Line,
     budget: &mut Budget,
 ) -> Result<Vec<Settled>, Unreadable> {
-    let mut out: Vec<Settled> = Vec::with_capacity(marks.len());
-    for mark in marks {
-        let mut mark = mark;
-        while let Some(before) = out.last() {
-            // Only PIECES are joined: a mark as wide as a character of this line is one,
-            // and two marks a letter's own side bearing apart are two.
-            let piece = (mark.glyph.width() as f32) <= MAX_PIECE_WIDTH * line.cap;
-            let close = (mark.glyph.x0.saturating_sub(before.glyph.x1 + 1) as f32)
-                <= MAX_PIECE_GAP * line.cap;
-            let fits = ((mark.glyph.x1 + 1 - before.glyph.x0) as f32)
-                <= glyphs::widest_glyph() * line.cap;
-            if !(piece && close && fits) {
-                break;
-            }
-            let Some(together) = ink.mark_in(before.glyph.x0, mark.glyph.x1, band) else {
-                break;
-            };
-            let together = name(ink, together, line, budget)?;
-            // Against the better of the two pieces, not against both of them together: a
-            // simple shape agrees with the template it is a copy of more closely than a
-            // letter of several strokes does with its own, so two pieces that are each a
-            // clean mark of their own — the two diagonals a `V` falls into when its apex
-            // thins out, the bar and the stem of a broken `T` — would otherwise stand as
-            // the characters they are not. What the join asks is whether the letter they
-            // make up is a better reading of the ink than either of them is.
-            if together.value() <= before.value().max(mark.value()) {
-                break;
-            }
-            out.pop();
-            mark = together;
-        }
-        out.push(mark);
+    let mut marks = marks;
+    // What each neighbouring pair is worth joined, `pairs[at]` being the pair of `marks[at]`
+    // and the mark after it: `None` where that pair is not one character's ink.
+    let mut pairs: Vec<Option<Joined>> = Vec::with_capacity(marks.len());
+    for at in 0..marks.len().saturating_sub(1) {
+        pairs.push(joined(ink, band, &marks[at], &marks[at + 1], line, budget)?);
     }
-    Ok(out)
+    while let Some(at) = best_join(&pairs) {
+        // The pair stands as one mark, and the pairs either side of it are pairs of that
+        // mark now, so they are weighed again.
+        let Some(found) = pairs[at].take() else {
+            break;
+        };
+        marks[at] = found.mark;
+        marks.remove(at + 1);
+        pairs.remove(at);
+        if at > 0 {
+            pairs[at - 1] = joined(ink, band, &marks[at - 1], &marks[at], line, budget)?;
+        }
+        if at < pairs.len() {
+            pairs[at] = joined(ink, band, &marks[at], &marks[at + 1], line, budget)?;
+        }
+    }
+    Ok(marks)
+}
+
+/// Two neighbouring marks read as ONE mark, and how much of itself that reading accounts
+/// for beside the better of the two.
+#[derive(Debug, Clone, Copy)]
+struct Joined {
+    mark: Settled,
+    gain: f32,
+}
+
+/// Which pair of [`join`]'s accounts for most of its own ink, or `None` where no pair is to
+/// be joined at all.
+fn best_join(pairs: &[Option<Joined>]) -> Option<usize> {
+    pairs
+        .iter()
+        .enumerate()
+        .filter_map(|(at, found)| found.map(|found| (at, found.gain)))
+        .fold(None, |held: Option<(usize, f32)>, (at, gain)| {
+            match held {
+                Some((_, best)) if best >= gain => held,
+                _ => Some((at, gain)),
+            }
+        })
+        .map(|(at, _)| at)
+}
+
+/// `before` and `after` named as one mark, where their ink is one character's.
+fn joined(
+    ink: &Ink,
+    band: &InkLine,
+    before: &Settled,
+    after: &Settled,
+    line: glyphs::Line,
+    budget: &mut Budget,
+) -> Result<Option<Joined>, Unreadable> {
+    // Only PIECES are joined: two marks each as wide as a character of this line are two
+    // characters, and two marks a letter's own side bearing apart are two marks. Which of
+    // the two is the piece is not asked — a stroke breaks off either side of a letter.
+    let narrow = |mark: &Settled| (mark.glyph.width() as f32) <= MAX_PIECE_WIDTH * line.cap;
+    let piece = narrow(before) || narrow(after);
+    let close = (after.glyph.x0.saturating_sub(before.glyph.x1 + 1) as f32)
+        <= MAX_PIECE_GAP * line.cap;
+    let fits = ((after.glyph.x1 + 1).saturating_sub(before.glyph.x0) as f32)
+        <= glyphs::widest_glyph() * line.cap;
+    if !(piece && close && fits) {
+        return Ok(None);
+    }
+    let Some(together) = ink.mark_in(before.glyph.x0, after.glyph.x1, band) else {
+        return Ok(None);
+    };
+    let together = name(ink, together, line, budget)?;
+    // How much of the joined ink the one mark accounts for, beside the better of the two
+    // marks it is made of: the same ink either way, so what the two readings are compared on
+    // is how well it is named ([`Settled::value`]).
+    let gain = together.value() - before.value().max(after.value());
+    // Where BOTH marks are too narrow to be characters of this line, neither is one: the ink
+    // is one character's, broken in two — the diagonals a `V` falls into when its apex thins
+    // out, the bar and the stem of a broken `T` — and the pieces are joined wherever the
+    // whole accounts for that ink better than either piece does.
+    if narrow(before) && narrow(after) && gain > 0.0 {
+        return Ok(Some(Joined {
+            mark: together,
+            gain,
+        }));
+    }
+    // Where only ONE of them is narrow, that one is either a narrow CHARACTER the face set
+    // tight against its neighbour — an `I`, a `1` — or a piece that broke off it. What tells
+    // the two apart is how well the joined ink is named: the pieces of a letter whose stroke
+    // broke name that letter at least as well as the worse of them names what IT is shaped
+    // like, while two characters the face set tight are each named well and their joined ink
+    // is named worse than both, since one character's ink is not read as well as either of
+    // two characters' is. Going by the score of the pieces alone would report a mark the page
+    // never drew: what a thin stroke falling under the floor that tells ink from ground
+    // leaves is the ends of the strokes it joined, and those agree closely with the
+    // punctuation they are shaped like.
+    //
+    // A part that names nothing counts as named at nothing, so ink that matched no glyph is
+    // joined into the character beside it wherever the joined ink names one.
+    let scored = |mark: &Settled| mark.named.map_or(0.0, |found| found.score);
+    let whole = together
+        .named
+        .is_some_and(|found| found.score >= scored(before).min(scored(after)));
+    if !whole {
+        return Ok(None);
+    }
+    Ok(Some(Joined {
+        mark: together,
+        gain,
+    }))
 }
 
 /// One line's recognised text, and the scores it was recognised with.

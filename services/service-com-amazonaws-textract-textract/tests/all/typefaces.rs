@@ -61,10 +61,10 @@ const NUMBERS: &[&str] = &["48213", "1250.00"];
 /// both rather than each suite growing its own" — so the levels come from there and only the
 /// blending an ANTI-ALIASED stroke needs is added here: a bitmap face turns a pixel on or
 /// off, while an outline rasteriser hands out how much of a stroke each pixel carries.
-type Polarity = crate::raster_documents::Paper;
+pub(crate) type Polarity = crate::raster_documents::Paper;
 
 /// A page of dark ink on a light ground.
-const fn dark_on_light() -> Polarity {
+pub(crate) const fn dark_on_light() -> Polarity {
     Polarity {
         background: 245,
         ink: 0,
@@ -174,7 +174,12 @@ fn pixel_page(lines: &[&str], font: &MonoFont<'static>, polarity: Polarity) -> G
 /// box, with the metrics that place that box against the line's baseline and advance the
 /// pen by the glyph's own width — so the page carries anti-aliased strokes set
 /// proportionally, which is what a document rendered from an outline face looks like.
-fn outline_page(lines: &[&str], face: &'static [u8], size: f32, polarity: Polarity) -> GrayImage {
+pub(crate) fn outline_page(
+    lines: &[&str],
+    face: &'static [u8],
+    size: f32,
+    polarity: Polarity,
+) -> GrayImage {
     let font = fontdue::Font::from_bytes(face, fontdue::FontSettings::default())
         .expect("the embedded outline face parses");
     let metrics = font

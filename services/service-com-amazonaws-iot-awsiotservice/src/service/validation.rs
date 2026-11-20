@@ -41,9 +41,11 @@
 //!   ([`::service_common::validation_message::quoting_an_empty_submitted_collection`], where
 //!   the rendering lives); a summary of any other size needs the request's own elements,
 //!   which this seam is not handed, and keeps the framework's valueless clause;
-//! * a member outside either end of its `@range` is stated with no value for the same
-//!   reason: the clause names the member and the numeric bound it broke, and the number that
-//!   broke it is not echoed back;
+//! * a member outside either end of its `@range` is stated WITH the number the request
+//!   submitted, quoted, beside the numeric bound it broke — `Value '<n>' at '<member path>'
+//!   failed to satisfy constraint: Member must have value less than or equal to <bound>` —
+//!   because a numeric bound names the admissible INTERVAL rather than the one value that
+//!   fell outside it, so the number says something the requirement does not;
 //! * every other class keeps the value the request submitted — a value outside an
 //!   enumerated set is quoted beside the set it had to be in — which is what the framework
 //!   already states.
@@ -172,17 +174,18 @@ const REGISTRY_NAME_EXPRESSION: &str = "[a-zA-Z0-9:_-]+";
 
 /// Whether the clause for `violation` states no value: the member was ABSENT, so there is
 /// no value to quote; it fell outside a `@pattern` that is not one of the registry's names,
-/// whose clause names the expression alone; it fell outside its `@length` or its `@range`,
-/// whose clause names the bound rather than the value that broke it; or it is one this
-/// service never discloses.
+/// whose clause names the expression alone; it fell outside its `@length`, whose clause
+/// names the bound rather than the text that broke it; or it is one this service never
+/// discloses.
 ///
 /// What those classes have in common is that the clause already states the REQUIREMENT the
-/// value broke — an expression, a length bound, a numeric bound — so quoting the value says
-/// the same thing twice. The two classes stated WITH a value are the one whose requirement is
-/// a SET of admissible values, which the framework already writes that way, and a THING-
-/// REGISTRY name outside its expression, which the registry names when it refuses it. That
-/// second one is why this is asked about the violation rather than about its member path: the
-/// same member path states its value for this requirement and withholds it for the `@length`
+/// value broke — an expression, a length bound — so quoting the value says the same thing
+/// twice. The classes stated WITH a value are the one whose requirement is a SET of
+/// admissible values, which the framework already writes that way, a NUMERIC bound, which
+/// states the interval a value had to lie in rather than the value, and a THING-REGISTRY
+/// name outside its expression, which the registry names when it refuses it. That last one
+/// is why this is asked about the violation rather than about its member path: the same
+/// member path states its value for this requirement and withholds it for the `@length`
 /// bound of the very same type.
 ///
 /// A `@length` broken by a COLLECTION is the third class stated WITH a value: the clause
@@ -194,9 +197,10 @@ const REGISTRY_NAME_EXPRESSION: &str = "[a-zA-Z0-9:_-]+";
 fn states_no_value(violation: &Violation, quoting_a_collection: &HashSet<String>) -> bool {
     let withheld_by_class = match &violation.kind {
         ViolationKind::Pattern(expression) => expression != REGISTRY_NAME_EXPRESSION,
-        ViolationKind::MissingRequiredMember
-        | ViolationKind::MinValue(_)
-        | ViolationKind::MaxValue(_) => true,
+        ViolationKind::MissingRequiredMember => true,
+        // A numeric bound states the INTERVAL the value had to lie in, so the number that
+        // fell outside it is stated beside it.
+        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_) => false,
         // The text that broke a length bound says the bound twice; the COLLECTION that
         // broke one is the value the clause states.
         ViolationKind::MinLength(_) | ViolationKind::MaxLength(_) => {
@@ -228,12 +232,12 @@ mod tests {
     }
 
     /// RULE: a member the request did not carry, a member outside a `@pattern` that is not
-    /// a registry name's, and a member whose own TEXT is outside its `@length` or its
-    /// `@range` are each stated with NO value; a REGISTRY NAME outside its expression, a
-    /// COLLECTION outside its `@length` (stated with the collection itself where the walk's
-    /// summary determines it) and every other constraint class state the value the request
-    /// submitted; and a `@pattern` is quoted without the anchors a whole-value pattern wraps
-    /// it in.
+    /// a registry name's, and a member whose own TEXT is outside its `@length` are each
+    /// stated with NO value; a REGISTRY NAME outside its expression, a member outside its
+    /// `@range`, a COLLECTION outside its `@length` (stated with the collection itself where
+    /// the walk's summary determines it) and every other constraint class state the value the
+    /// request submitted; and a `@pattern` is quoted without the anchors a whole-value
+    /// pattern wraps it in.
     #[test]
     fn an_absent_member_states_no_value_and_every_other_class_states_one() {
         // The rows span the classes the framework reports: an absent member, a value
@@ -291,8 +295,9 @@ mod tests {
                     ViolationKind::MaxValue("43200".to_owned()),
                     Some("46800"),
                 ),
-                "1 validation error detected: Value at 'credentialDurationSeconds' failed to \
-                 satisfy constraint: Member must have value less than or equal to 43200",
+                "1 validation error detected: Value '46800' at 'credentialDurationSeconds' \
+                 failed to satisfy constraint: Member must have value less than or equal to \
+                 43200",
             ),
             (
                 "a member short of its range minimum",
@@ -301,8 +306,9 @@ mod tests {
                     ViolationKind::MinValue("900".to_owned()),
                     Some("899"),
                 ),
-                "1 validation error detected: Value at 'credentialDurationSeconds' failed to \
-                 satisfy constraint: Member must have value greater than or equal to 900",
+                "1 validation error detected: Value '899' at 'credentialDurationSeconds' \
+                 failed to satisfy constraint: Member must have value greater than or equal \
+                 to 900",
             ),
             (
                 "a member outside its value set",

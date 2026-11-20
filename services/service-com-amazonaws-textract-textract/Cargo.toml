@@ -77,6 +77,8 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` for the single integration-test target.
+automod = { workspace = true }
 # The Amazon S3 service, mounted beside textract on one engine so a document staged with
 # `PutObject` is the one the S3-sourced read paths resolve.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
