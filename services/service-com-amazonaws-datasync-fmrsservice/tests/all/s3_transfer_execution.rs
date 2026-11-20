@@ -2139,3 +2139,378 @@ async fn destination_fingerprints(
     }
     held
 }
+
+/// The bytes of each object a subdirectory case stages, named once so a source object and
+/// the destination copy a case calls identical to it cannot drift apart.
+const FIRST_BODY: &[u8] = b"the first object under the location's own subdirectory";
+
+/// An object of no bytes at all, so a skip decision cannot rest on a size being non-zero.
+const EMPTY_BODY: &[u8] = b"";
+
+/// The bytes of the object under a prefix of its own.
+const SECOND_BODY: &[u8] = b"the second object, under a prefix of its own";
+
+/// The shortest body of the set.
+const THIRD_BODY: &[u8] = b"third";
+
+/// The objects a subdirectory case stages under a location's own `Subdirectory`, by key
+/// RELATIVE to it: four distinct sizes, one of them empty, and two under a prefix of
+/// their own, so neither a byte total nor a flat key can stand in for the file count.
+const RELATIVE_OBJECTS: &[(&str, &[u8])] = &[
+    ("alpha.txt", FIRST_BODY),
+    ("empty.bin", EMPTY_BODY),
+    ("nested/second.txt", SECOND_BODY),
+    ("nested/third.log", THIRD_BODY),
+];
+
+/// The two of those that lie under the `nested` prefix, by key relative to THAT prefix:
+/// what a source location pointed one level deeper admits.
+const DEEPER_OBJECTS: &[(&str, &[u8])] = &[
+    ("second.txt", SECOND_BODY),
+    ("third.log", THIRD_BODY),
+];
+
+/// The one relative key a partly synchronised destination already holds identically.
+const RELATIVE_SYNCED: &[(&str, &[u8])] = &[("alpha.txt", FIRST_BODY)];
+
+/// The same four relative keys holding DIFFERENT content, for a destination out of step
+/// with its source — and for the objects staged outside every location's subdirectory.
+const RELATIVE_STALE: &[(&str, &[u8])] = &[
+    ("alpha.txt", b"a stale first object"),
+    ("empty.bin", b"no longer empty"),
+    ("nested/second.txt", b"a stale second object"),
+    ("nested/third.log", b"stale third"),
+];
+
+/// A prefix of the destination bucket that NO location of these cases names: a transfer
+/// compares and writes under its own location's subdirectory, so what lies outside it is
+/// neither admitted, nor skipped, nor written over.
+const DECOY_PREFIX: &str = "/outside-every-location";
+
+/// One row of the subdirectory accounting table.
+struct SubdirectoryRow {
+    case: &'static str,
+    /// The prefix of the source bucket the source objects are staged under.
+    source_prefix: &'static str,
+    /// The `Subdirectory` the source LOCATION is created with — the prefix those objects
+    /// are staged under, except in the rows that point the location one level deeper.
+    source_subdirectory: &'static str,
+    /// The source objects, by key relative to `source_prefix`.
+    source: &'static [(&'static str, &'static [u8])],
+    /// The `Subdirectory` the destination location reads and writes under.
+    destination_subdirectory: &'static str,
+    /// What the destination bucket already holds under that subdirectory, staged by the
+    /// object store itself rather than by a transfer, by key relative to it.
+    destination: &'static [(&'static str, &'static [u8])],
+    options: Value,
+    /// How many source objects this task admits: the set that has to partition into the
+    /// files the run transferred and the files it skipped.
+    admitted: i64,
+    files_transferred: i64,
+    files_skipped: i64,
+    files_verified: i64,
+    bytes_moved: i64,
+    /// What the destination must hold under its own subdirectory once the run is over, by
+    /// key relative to it.
+    expected_destination: &'static [(&'static str, &'static [u8])],
+}
+
+/// RULE: the source files a task admits partition into the ones its execution transferred
+/// and the ones it skipped, and the two sides are compared by key RELATIVE to each
+/// location's own subdirectory — so a source file the destination already holds
+/// identically under its own subdirectory counts in `FilesSkipped`, whatever prefix either
+/// side keeps its objects under, and an object outside a location's subdirectory takes no
+/// part in the accounting at all.
+///
+/// The rows differ along what the rule generalises over: how much of the destination is
+/// already in step under its own prefix (all of it, one key, none of it), the two
+/// `TransferMode` values, the `OverwriteMode` that protects what is there, the subdirectory
+/// form (nested, with and without a trailing slash), and a source location pointed one
+/// level deeper than where its objects are staged. Every case stages objects the two
+/// locations' subdirectories exclude, which must come out untouched.
+#[tokio::test]
+async fn skip_accounting_holds_under_each_location_subdirectory() {
+    let rows = vec![
+        SubdirectoryRow {
+            case: "both sides under their own subdirectory, already in step",
+            source_prefix: "/incoming",
+            source_subdirectory: "/incoming",
+            source: RELATIVE_OBJECTS,
+            destination_subdirectory: "/archive/2026",
+            destination: RELATIVE_OBJECTS,
+            options: json!({
+                "TransferMode": "CHANGED",
+                "VerifyMode": "POINT_IN_TIME_CONSISTENT",
+                "LogLevel": "OFF",
+            }),
+            admitted: 4,
+            files_transferred: 0,
+            files_skipped: 4,
+            files_verified: 4,
+            bytes_moved: 0,
+            expected_destination: RELATIVE_OBJECTS,
+        },
+        SubdirectoryRow {
+            case: "one relative key in step, the rest still to move",
+            source_prefix: "/incoming",
+            source_subdirectory: "/incoming",
+            source: RELATIVE_OBJECTS,
+            destination_subdirectory: "/archive/2026/",
+            destination: RELATIVE_SYNCED,
+            options: json!({ "TransferMode": "CHANGED" }),
+            admitted: 4,
+            files_transferred: 3,
+            files_skipped: 1,
+            files_verified: 4,
+            bytes_moved: total_bytes(RELATIVE_OBJECTS) - total_bytes(RELATIVE_SYNCED),
+            expected_destination: RELATIVE_OBJECTS,
+        },
+        SubdirectoryRow {
+            case: "a destination subdirectory holding nothing skips nothing",
+            source_prefix: "/incoming",
+            source_subdirectory: "/incoming",
+            source: RELATIVE_OBJECTS,
+            destination_subdirectory: "/archive",
+            destination: &[],
+            options: json!({ "TransferMode": "CHANGED" }),
+            admitted: 4,
+            files_transferred: 4,
+            files_skipped: 0,
+            files_verified: 4,
+            bytes_moved: total_bytes(RELATIVE_OBJECTS),
+            expected_destination: RELATIVE_OBJECTS,
+        },
+        SubdirectoryRow {
+            case: "transfer all moves what is already in step under both subdirectories",
+            source_prefix: "/incoming",
+            source_subdirectory: "/incoming",
+            source: RELATIVE_OBJECTS,
+            destination_subdirectory: "/archive",
+            destination: RELATIVE_OBJECTS,
+            options: json!({ "TransferMode": "ALL" }),
+            admitted: 4,
+            files_transferred: 4,
+            files_skipped: 0,
+            files_verified: 4,
+            bytes_moved: total_bytes(RELATIVE_OBJECTS),
+            expected_destination: RELATIVE_OBJECTS,
+        },
+        SubdirectoryRow {
+            case: "the copies the overwrite mode protects under the destination subdirectory",
+            source_prefix: "/incoming",
+            source_subdirectory: "/incoming",
+            source: RELATIVE_OBJECTS,
+            destination_subdirectory: "/archive",
+            destination: RELATIVE_STALE,
+            options: json!({
+                "TransferMode": "CHANGED",
+                "OverwriteMode": "NEVER",
+                "VerifyMode": "NONE",
+            }),
+            admitted: 4,
+            files_transferred: 0,
+            files_skipped: 4,
+            files_verified: 0,
+            bytes_moved: 0,
+            expected_destination: RELATIVE_STALE,
+        },
+        SubdirectoryRow {
+            case: "a source location one level deeper, already in step",
+            source_prefix: "/incoming",
+            source_subdirectory: "/incoming/nested",
+            source: RELATIVE_OBJECTS,
+            destination_subdirectory: "/archive",
+            destination: DEEPER_OBJECTS,
+            options: json!({ "TransferMode": "CHANGED" }),
+            admitted: 2,
+            files_transferred: 0,
+            files_skipped: 2,
+            files_verified: 2,
+            bytes_moved: 0,
+            expected_destination: DEEPER_OBJECTS,
+        },
+        SubdirectoryRow {
+            case: "a source location one level deeper, with nothing at the destination",
+            source_prefix: "/incoming",
+            source_subdirectory: "/incoming/nested/",
+            source: RELATIVE_OBJECTS,
+            destination_subdirectory: "/archive",
+            destination: &[],
+            options: json!({ "TransferMode": "CHANGED" }),
+            admitted: 2,
+            files_transferred: 2,
+            files_skipped: 0,
+            files_verified: 2,
+            bytes_moved: total_bytes(DEEPER_OBJECTS),
+            expected_destination: DEEPER_OBJECTS,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let aws = Aws::new();
+        let (source_bucket, destination_bucket) =
+            ("subdirectory-source", "subdirectory-destination");
+        aws.seed_bucket(source_bucket, &[], case).await;
+        aws.seed_bucket(destination_bucket, &[], case).await;
+        stage_under(&aws, source_bucket, row.source_prefix, row.source, case).await;
+        stage_under(
+            &aws,
+            destination_bucket,
+            row.destination_subdirectory,
+            row.destination,
+            case,
+        )
+        .await;
+        // What neither location's subdirectory covers, on both sides.
+        stage_under(&aws, source_bucket, DECOY_PREFIX, RELATIVE_STALE, case).await;
+        stage_under(&aws, destination_bucket, DECOY_PREFIX, RELATIVE_STALE, case).await;
+
+        let role_arn = aws.create_role(&[source_bucket, destination_bucket]).await;
+        let source = aws
+            .create_location(
+                source_bucket,
+                Some(row.source_subdirectory),
+                &role_arn,
+                case,
+            )
+            .await;
+        let destination = aws
+            .create_location(
+                destination_bucket,
+                Some(row.destination_subdirectory),
+                &role_arn,
+                case,
+            )
+            .await;
+        let created = aws
+            .ok(
+                "CreateTask",
+                json!({
+                    "SourceLocationArn": source,
+                    "DestinationLocationArn": destination,
+                    "Name": "subdirectory-accounting-task",
+                    "Options": row.options,
+                }),
+                case,
+            )
+            .await;
+        let task_arn = created["TaskArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a TaskArn, got {created}"))
+            .to_string();
+
+        let execution_arn = aws.start_execution(&task_arn, case).await;
+        let finished = aws.await_terminal(&execution_arn, case).await;
+        let status = finished["Status"].as_str().unwrap_or_default();
+        assert_eq!(
+            status, "SUCCESS",
+            "case {case:?}: expected the execution to end \"SUCCESS\", got {status:?} in \
+             {finished}"
+        );
+
+        for (counter, expected) in [
+            ("FilesTransferred", row.files_transferred),
+            ("FilesSkipped", row.files_skipped),
+            ("FilesVerified", row.files_verified),
+            ("BytesTransferred", row.bytes_moved),
+            ("BytesWritten", row.bytes_moved),
+            ("FilesDeleted", 0),
+        ] {
+            let actual = finished[counter].as_i64();
+            assert_eq!(
+                actual,
+                Some(expected),
+                "case {case:?}: expected {counter} {expected}, got {actual:?} in {finished}"
+            );
+        }
+
+        // The partition itself: every admitted source file is accounted for exactly once,
+        // as a file this run moved or as one it skipped.
+        let transferred = finished["FilesTransferred"].as_i64().unwrap_or_default();
+        let skipped = finished["FilesSkipped"].as_i64().unwrap_or_default();
+        assert_eq!(
+            transferred + skipped,
+            row.admitted,
+            "case {case:?}: expected the {admitted} admitted files to partition into \
+             transferred and skipped, got {transferred} + {skipped} in {finished}",
+            admitted = row.admitted
+        );
+
+        // What the destination bucket holds: the keys its OWN subdirectory covers, and the
+        // objects outside it exactly as the object store wrote them.
+        let held = aws.bucket_contents(destination_bucket).await;
+        let mut expected: Vec<(String, Vec<u8>)> = row
+            .expected_destination
+            .iter()
+            .map(|(relative, body)| {
+                (
+                    absolute_key(row.destination_subdirectory, relative),
+                    body.to_vec(),
+                )
+            })
+            .chain(RELATIVE_STALE.iter().map(|(relative, body)| {
+                (absolute_key(DECOY_PREFIX, relative), body.to_vec())
+            }))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            held.len(),
+            expected.len(),
+            "case {case:?}: expected {count} destination objects, got {keys:?}",
+            count = expected.len(),
+            keys = held.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>()
+        );
+        for ((actual_key, actual_body), (expected_key, expected_body)) in
+            held.iter().zip(expected.iter())
+        {
+            assert_eq!(
+                actual_key, expected_key,
+                "case {case:?}: expected the destination to hold {expected_key:?}, got \
+                 {actual_key:?}"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(actual_body),
+                String::from_utf8_lossy(expected_body),
+                "case {case:?}: wrong bytes at {actual_key:?}"
+            );
+        }
+    }
+}
+
+/// The key `relative` is held under in a bucket when a location's `Subdirectory` is
+/// `subdirectory`, however that request stated it: a subdirectory names a key prefix, so
+/// the slashes around it are not part of the key.
+fn absolute_key(subdirectory: &str, relative: &str) -> String {
+    let prefix = subdirectory.trim_matches('/');
+    if prefix.is_empty() {
+        relative.to_string()
+    } else {
+        format!("{prefix}/{relative}")
+    }
+}
+
+/// Put every object of `objects` into `bucket` under the prefix `subdirectory` names.
+async fn stage_under(
+    aws: &Aws,
+    bucket: &str,
+    subdirectory: &str,
+    objects: &[(&str, &[u8])],
+    case: &str,
+) {
+    for (relative, body) in objects {
+        let key = absolute_key(subdirectory, relative);
+        let stored = aws
+            .s3()
+            .put_object()
+            .bucket(bucket)
+            .key(&key)
+            .body(::aws_sdk_s3::primitives::ByteStream::from(body.to_vec()))
+            .send()
+            .await;
+        assert!(
+            stored.is_ok(),
+            "case {case:?}: Amazon S3 must store {key:?} in {bucket:?}, got {stored:?}"
+        );
+    }
+}
