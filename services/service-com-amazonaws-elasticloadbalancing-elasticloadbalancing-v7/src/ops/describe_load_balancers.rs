@@ -297,8 +297,14 @@ fn policies(record: &crate::state::LoadBalancer) -> Policies {
 fn describe(record: &crate::state::LoadBalancer) -> LoadBalancerDescription {
     LoadBalancerDescription {
         load_balancer_name: Some(record.name.clone()),
+        // The address the load balancer publishes, and the alias target a Route 53 record
+        // points at to reach it — the same address, reported only for a load balancer that
+        // HAS such a target, so a client is never handed an alias target for a load
+        // balancer AWS gives none.
         dns_name: Some(record.dns_name.clone()),
-        canonical_hosted_zone_name: Some(record.canonical_hosted_zone_name.clone()),
+        canonical_hosted_zone_name: record
+            .canonical_hosted_zone_name()
+            .map(::std::string::ToString::to_string),
         canonical_hosted_zone_name_id: Some(record.canonical_hosted_zone_name_id.clone()),
         listener_descriptions: Some(
             record

@@ -750,9 +750,10 @@ impl Default for AttributeConfig {
 #[derive(Debug, Clone)]
 pub struct LoadBalancer {
     pub name: String,
-    /// Generated once at create and kept for the record's lifetime.
+    /// The address this load balancer PUBLISHES, generated once at create and kept for the
+    /// record's lifetime: the `host:port` of the socket this emulator answers that load
+    /// balancer's traffic on ([`LoadBalancerEndpoint`]).
     pub dns_name: String,
-    pub canonical_hosted_zone_name: String,
     pub canonical_hosted_zone_name_id: String,
     pub scheme: String,
     pub created_time: SystemTime,
@@ -799,6 +800,20 @@ pub struct LoadBalancer {
 }
 
 impl LoadBalancer {
+    /// The name a Route 53 alias record points at to reach this load balancer, which is
+    /// what `CanonicalHostedZoneName` reports — or `None` for a load balancer that has no
+    /// such alias target.
+    ///
+    /// It is "the DNS name of the load balancer", the same address `DNSName` publishes, so
+    /// an alias pointed at it reaches the load balancer exactly as a client that dials the
+    /// published name does. Only a load balancer whose scheme gives it a public alias target
+    /// — an internet-facing one — reports the member at all: for an `internal` load balancer
+    /// Elastic Load Balancing reports no `CanonicalHostedZoneName`, and the member is left
+    /// out rather than filled with a name no alias may be pointed at.
+    pub fn canonical_hosted_zone_name(&self) -> Option<&str> {
+        (self.scheme != SCHEME_INTERNAL).then_some(self.dns_name.as_str())
+    }
+
     /// Every Availability Zone this load balancer is in, deduplicated: the zones a request
     /// named directly, then the zone of each attached subnet in attachment order.
     ///
@@ -1290,9 +1305,10 @@ fn dns_suffix(region: &str, name: &str) -> u64 {
 /// DIALS, and a host in AWS's own zone resolves to nothing on the machine this emulator
 /// runs on, so what is published is the `host:port` of the socket this emulator answers
 /// the load balancer's traffic on ([`LoadBalancerEndpoint`]). This is the fallback behind
-/// it, for an engine that vends no listener at all — and it is what
-/// `CanonicalHostedZoneName` reports, the name under which the load balancer's record
-/// lives in the Route 53 hosted zone a client points an alias at.
+/// it, for an engine that vends no listener at all: the only address such an emulator has
+/// to give. Every member that reports "the DNS name of the load balancer" — `DNSName` and
+/// `CanonicalHostedZoneName` alike ([`LoadBalancer::canonical_hosted_zone_name`]) —
+/// reports the published address, never a second name beside it.
 pub fn dns_name(region: &str, name: &str, scheme: &str) -> String {
     let suffix = dns_suffix(region, name);
     if scheme == SCHEME_INTERNAL {

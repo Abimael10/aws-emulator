@@ -9,8 +9,9 @@
 //!    answers on, and the load balancer answers there.** `DNSName` is the address a client
 //!    dials, so a host in Elastic Load Balancing's own DNS zone — which resolves to nothing
 //!    on the machine this emulator runs on — is no address at all; what is published is the
-//!    `host:port` of the socket this emulator serves that load balancer's traffic on, while
-//!    `CanonicalHostedZoneName` stays the name that zone carries.
+//!    `host:port` of the socket this emulator serves that load balancer's traffic on, which
+//!    is the address `CanonicalHostedZoneName` reports too wherever that member is reported
+//!    at all.
 //! 2. **a request is answered only by a registered instance the load balancer may send it
 //!    to**: one its own health checks report `InService` and — while
 //!    `CrossZoneLoadBalancing` is off — one in the zone of the node that took the request.
@@ -418,8 +419,8 @@ async fn fixture(name: &'static str, cross_zone: bool) -> (Fixture, Arc<engine::
 }
 
 /// RULE 1: the address a load balancer publishes is one this emulator answers on, the load
-/// balancer answers there, and `CanonicalHostedZoneName` keeps the name Elastic Load
-/// Balancing's own zone carries.
+/// balancer answers there, and `CanonicalHostedZoneName` — where it is reported — carries
+/// that same address.
 #[tokio::test]
 async fn the_published_address_is_one_the_emulator_answers_on() {
     let (router, _engine) = emulator_with_ec2();
@@ -476,10 +477,14 @@ async fn the_published_address_is_one_the_emulator_answers_on() {
             "case {case:?}: a describe must report the address the create published, got {}",
             described.body
         );
-        let hosted_zone_name = kid_text(description, "CanonicalHostedZoneName").unwrap_or_default();
-        assert!(
-            hosted_zone_name.ends_with(&format!(".{region}.elb.amazonaws.com")),
-            "case {case:?}: CanonicalHostedZoneName is the name the hosted zone carries, got \
+        // The alias target a Route 53 record points at is the same address, and is reported
+        // only for a load balancer that HAS one: an `internal` load balancer reports none.
+        let hosted_zone_name = kid_text(description, "CanonicalHostedZoneName");
+        let expected = (*scheme != Some("internal")).then(|| dns.clone());
+        assert_eq!(
+            hosted_zone_name, expected,
+            "case {case:?}: CanonicalHostedZoneName must carry the published address of an \
+             internet-facing load balancer and nothing for an internal one, got \
              {hosted_zone_name:?}"
         );
 

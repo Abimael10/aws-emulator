@@ -355,22 +355,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The name Elastic Load Balancing's own zone would give this load balancer, which
-        // is what `CanonicalHostedZoneName` reports — "the DNS name of the load balancer"
-        // as the Route 53 hosted zone a client points an alias at carries it.
-        let zone_name = crate::state::dns_name(&region, &input.load_balancer_name, &scheme);
-        // And what it PUBLISHES as its `DNSName`: the address of the socket this create
-        // opened, so a client that dials what this load balancer published reaches this
-        // load balancer. What is published is the authority the store KEPT — the socket
-        // already open under this (region, name) is the one every published name points at
-        // — so a caller is never told a port that was closed again. An engine that vends no
-        // listener at all publishes the zone name behind it, which is the only address such
-        // an emulator has to give.
+        // What this load balancer PUBLISHES as its `DNSName`: the address of the socket
+        // this create opened, so a client that dials what this load balancer published
+        // reaches this load balancer. What is published is the authority the store KEPT —
+        // the socket already open under this (region, name) is the one every published name
+        // points at — so a caller is never told a port that was closed again. An engine
+        // that vends no listener at all publishes the name Elastic Load Balancing's own
+        // zone would carry, which is the only address such an emulator has to give.
         let dns_name = match endpoint {
             Some(endpoint) => {
                 guard.remember_endpoint(&region, &input.load_balancer_name, endpoint)
             }
-            None => zone_name.clone(),
+            None => crate::state::dns_name(&region, &input.load_balancer_name, &scheme),
         };
         // The default health check targets the instance port of the first listener.
         let health_check = crate::state::HealthCheckConfig::default_for_instance_port(
@@ -380,9 +376,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let record = crate::state::LoadBalancer {
             name: input.load_balancer_name.clone(),
-            // `CanonicalHostedZoneName` is documented as "The DNS name of the load
-            // balancer", which is the name its record carries in that hosted zone.
-            canonical_hosted_zone_name: zone_name,
             canonical_hosted_zone_name_id: crate::state::hosted_zone_id(&region),
             dns_name: dns_name.clone(),
             scheme,
