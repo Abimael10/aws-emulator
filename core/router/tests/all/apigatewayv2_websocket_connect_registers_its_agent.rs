@@ -64,9 +64,13 @@ const FORBIDDEN: u16 = 403;
 /// whole range of keys is pinned by the API Gateway V2 crate's
 /// `tests/all/websocket_stage_upgrade_counts.rs`; here the published pair is what says the
 /// answer is derived from the client's key rather than constant.
-const ACCEPT_FIELD: &str = "sec-websocket-accept";
-const RFC_EXAMPLE_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
-const RFC_EXAMPLE_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+///
+/// `pub(crate)` because the specification publishes ONE such pair, and a sibling suite that
+/// writes its own handshake has to offer the same key to check the same derived answer
+/// ([`super::apigatewayv2_announced_address_traffic_is_metered`] reads them from here).
+pub(crate) const ACCEPT_FIELD: &str = "sec-websocket-accept";
+pub(crate) const RFC_EXAMPLE_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+pub(crate) const RFC_EXAMPLE_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
 
 /// How long one invocation of this handler is given, as the function's own `Timeout`.
 const FUNCTION_TIMEOUT: u64 = 30;
@@ -395,17 +399,21 @@ fn template() -> String {
 }
 
 /// The head the socket answered one handshake with, as the client read it off the wire.
-struct Head {
-    status: u16,
+///
+/// `pub(crate)` with its fields, because it is what [`answered_handshake_at`] answers, and a
+/// sibling suite that writes its handshakes through that reads this head
+/// ([`super::apigatewayv2_announced_address_traffic_is_metered`]).
+pub(crate) struct Head {
+    pub(crate) status: u16,
     /// The status line as written.
-    line: String,
+    pub(crate) line: String,
     /// Every field, under its lower-cased name.
-    fields: BTreeMap<String, String>,
+    pub(crate) fields: BTreeMap<String, String>,
 }
 
 impl Head {
     /// The value the answer carries for `name`, read case-insensitively as a field name is.
-    fn field(&self, name: &str) -> Option<&str> {
+    pub(crate) fn field(&self, name: &str) -> Option<&str> {
         self.fields
             .get(&name.to_ascii_lowercase())
             .map(String::as_str)
@@ -416,7 +424,11 @@ impl Head {
 /// is the loopback one — so the dial below reaches this machine's own listener and nothing
 /// else. Nothing about the address is spelled out here beyond that check: the scheme, the host
 /// and the port all come from the value the control plane reported.
-fn announced_loopback(case: &str, announced: &str) -> (String, u16) {
+///
+/// `pub(crate)` for the same reason [`Head`] is: it is part of what [`answered_handshake_at`]
+/// does for every suite that writes a handshake through it, so there is one reading of what a
+/// WEBSOCKET api announced.
+pub(crate) fn announced_loopback(case: &str, announced: &str) -> (String, u16) {
     let (scheme, rest) = announced.split_once("://").unwrap_or_else(|| {
         panic!("case {case:?}: an announced endpoint is an absolute URI, got {announced:?}")
     });
@@ -454,6 +466,22 @@ async fn answered_handshake(
     agent: &str,
     key: &str,
 ) -> Head {
+    answered_handshake_at(case, announced, &format!("/{stage}?agent={agent}"), key).await
+}
+
+/// [`answered_handshake`] against any `path` of the announced socket: the stage a client
+/// addresses, and whatever query string it carries.
+///
+/// `pub(crate)` because the bytes a client writes are RFC 6455's rather than this suite's, and a
+/// second copy of them is a second statement of what a client sends
+/// ([`super::apigatewayv2_announced_address_traffic_is_metered`] writes its own handshakes
+/// through this).
+pub(crate) async fn answered_handshake_at(
+    case: &str,
+    announced: &str,
+    path: &str,
+    key: &str,
+) -> Head {
     let (authority, port) = announced_loopback(case, announced);
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .await
@@ -463,7 +491,7 @@ async fn answered_handshake(
                  got {error}"
             )
         });
-    let mut request = format!("GET /{stage}?agent={agent} HTTP/1.1\r\n");
+    let mut request = format!("GET {path} HTTP/1.1\r\n");
     for (name, value) in [
         ("Host", authority.as_str()),
         ("Connection", "Upgrade"),
@@ -506,7 +534,11 @@ async fn answered_handshake(
 
 /// The bytes of the response head, up to and including the blank line that ends it (RFC 9112
 /// §2.1), or `None` for a socket that answered none within [`MAX_HEAD_BYTES`].
-async fn read_head(stream: &mut TcpStream) -> Option<String> {
+///
+/// `pub(crate)` for the same reason [`Head`] is: it is where [`answered_handshake_at`] stops
+/// reading an answer — a completed handshake is followed by frames rather than by a body — so
+/// every suite that writes a handshake through it stops at the same place.
+pub(crate) async fn read_head(stream: &mut TcpStream) -> Option<String> {
     let mut head: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
     while head.len() < MAX_HEAD_BYTES {
