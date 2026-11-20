@@ -9,24 +9,30 @@
 //!
 //! The rule under test: a delete of a certificate takes effect only when nothing in the
 //! account's state holds it back — the store holds one under the requested id, its status
-//! is not `ACTIVE`, and no policy is attached to it — and otherwise refuses with the
-//! modelled class for what held it back ("A certificate cannot be deleted if it has a
-//! policy or IoT thing attached to it or if its status is set to ACTIVE",
+//! is not `ACTIVE`, no IoT thing has it attached as a principal, and no policy is attached
+//! to it — and otherwise refuses with the modelled class for what held it back ("A
+//! certificate cannot be deleted if it has a policy or IoT thing attached to it or if its
+//! status is set to ACTIVE",
 //! `smithy_query(query="operation",operation="DeleteCertificate")`): an unheld id is
 //! `ResourceNotFoundException` (404), an `ACTIVE` certificate is
-//! `CertificateStateException` (406), and attached policies are `DeleteConflictException`
-//! (409). `forceDelete` — "Forces the deletion of a certificate if it is inactive and is
-//! not attached to an IoT thing" — relaxes that last refusal and detaches those policies,
-//! and relaxes neither of the other two. A delete that takes effect is observable: the
+//! `CertificateStateException` (406), and an attached thing or an attached policy is
+//! `DeleteConflictException` (409), whose message names the attachment class the caller has
+//! to clear — the thing attachment when a thing still holds the certificate, whatever else
+//! is attached, since that is the relation `forceDelete` does not relax. `forceDelete` —
+//! "Forces the deletion of a certificate if it is inactive and is not attached to an IoT
+//! thing" — relaxes the policy refusal alone and detaches those policies, and relaxes
+//! neither the status nor the thing refusal. A delete that takes effect is observable: the
 //! removed certificate is gone from `DescribeCertificate` and from the policy-attachment
-//! relation, and every other certificate is untouched.
+//! relation, and every other certificate is untouched; and a refused delete writes nothing,
+//! so the delete the documented teardown order (detach, deactivate, delete) ends in
+//! succeeds on the certificate the account still holds.
 //!
 //! The tables span what the rule generalises over rather than one request: the three forms
 //! `forceDelete` takes on the wire (absent — the modelled `default false` — explicitly
 //! `false`, explicitly `true`), both statuses a created certificate can carry, several
 //! counts of attached policies (none, one, three) under policy names of different forms,
-//! and ids that satisfy the modelled `CertificateId` constraints without the store holding
-//! them.
+//! several counts of things holding the certificate as a principal (one, two), and ids that
+//! satisfy the modelled `CertificateId` constraints without the store holding them.
 
 use std::sync::Arc;
 
@@ -95,8 +101,18 @@ impl Reply {
 
     /// The `targets` of a `ListTargetsForPolicy` answer.
     fn targets(&self) -> Vec<String> {
+        self.string_list("targets")
+    }
+
+    /// The `principals` of a `ListThingPrincipals` answer.
+    fn principals(&self) -> Vec<String> {
+        self.string_list("principals")
+    }
+
+    /// The string entries of a named list member of the body, empty when it is absent.
+    fn string_list(&self, name: &str) -> Vec<String> {
         self.body
-            .get("targets")
+            .get(name)
             .and_then(Value::as_array)
             .map(|entries| {
                 entries
@@ -134,14 +150,30 @@ impl Emulator {
     }
 
     async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+        self.call_with_headers(method, path, body, &[]).await
+    }
+
+    /// One request, with any number of extra headers — a thing principal is carried in one
+    /// of them (`AttachThingPrincipal$principal` is bound to `x-amzn-principal`).
+    async fn call_with_headers(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        headers: &[(&str, &str)],
+    ) -> Reply {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(value).expect("a request body serializes")
         });
-        let request = http::Request::builder()
+        let mut builder = http::Request::builder()
             .method(method)
             .uri(format!("https://iot.{REGION}.amazonaws.com{path}"))
             .header("authorization", signed_for_iot())
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder
             .body(bytes::Bytes::from(payload))
             .expect("a well-formed request");
 
@@ -212,11 +244,101 @@ impl Emulator {
         .await
     }
 
+    /// `DetachPolicy`: `POST /target-policies/{policyName}` carrying the target, the call
+    /// AWS's own teardown order ("first use the DetachPolicy action to detach all
+    /// policies") starts with.
+    async fn detach_policy(&self, policy_name: &str, target: &str) -> Reply {
+        self.call(
+            "POST",
+            &format!("/target-policies/{policy_name}"),
+            Some(&json!({ "target": target })),
+        )
+        .await
+    }
+
     /// `ListTargetsForPolicy`: `POST /policy-targets/{policyName}`, which reads the
     /// policy-attachment relation from the policy's end.
     async fn list_targets_for_policy(&self, policy_name: &str) -> Reply {
         self.call("POST", &format!("/policy-targets/{policy_name}"), None)
             .await
+    }
+
+    /// `UpdateCertificate`: `PUT /certificates/{certificateId}` with `newStatus` bound as
+    /// an `@httpQuery` parameter — the call AWS's teardown order deactivates the
+    /// certificate with ("use the UpdateCertificate action to set the certificate to the
+    /// INACTIVE status").
+    async fn update_certificate(&self, certificate_id: &str, new_status: &str) -> Reply {
+        self.call(
+            "PUT",
+            &format!("/certificates/{certificate_id}?newStatus={new_status}"),
+            None,
+        )
+        .await
+    }
+
+    /// `CreateThing`: `POST /things/{thingName}`.
+    async fn create_thing(&self, thing_name: &str) -> Reply {
+        self.call("POST", &format!("/things/{thing_name}"), Some(&json!({})))
+            .await
+    }
+
+    /// `AttachThingPrincipal`: `PUT /things/{thingName}/principals`, with the principal in
+    /// the header the model binds it to.
+    async fn attach_thing_principal(&self, thing_name: &str, principal: &str) -> Reply {
+        self.call_with_headers(
+            "PUT",
+            &format!("/things/{thing_name}/principals"),
+            None,
+            &[("x-amzn-principal", principal)],
+        )
+        .await
+    }
+
+    /// `DetachThingPrincipal`: `DELETE /things/{thingName}/principals`, the call AWS's
+    /// teardown order clears a device attachment with.
+    async fn detach_thing_principal(&self, thing_name: &str, principal: &str) -> Reply {
+        self.call_with_headers(
+            "DELETE",
+            &format!("/things/{thing_name}/principals"),
+            None,
+            &[("x-amzn-principal", principal)],
+        )
+        .await
+    }
+
+    /// `ListThingPrincipals`: `GET /things/{thingName}/principals`, which reads the
+    /// thing-principal relation from the thing's end.
+    async fn list_thing_principals(&self, thing_name: &str) -> Reply {
+        self.call("GET", &format!("/things/{thing_name}/principals"), None)
+            .await
+    }
+
+    /// Register `count` things and attach `certificate_arn` to each of them as a principal,
+    /// answering their names. `suffix` keeps one case's things apart from another's, since a
+    /// thing name is the thing's identity for the whole account.
+    async fn attach_to_things(
+        &self,
+        case: &str,
+        certificate_arn: &str,
+        suffix: &str,
+        count: usize,
+    ) -> Vec<String> {
+        let names: Vec<String> = (0..count)
+            .map(|index| format!("device-{suffix}-{index}"))
+            .collect();
+        for name in &names {
+            let created = self.create_thing(name).await;
+            assert_eq!(
+                created.status, 200,
+                "case {case:?}: CreateThing {name} must succeed, got {created:?}"
+            );
+            let attached = self.attach_thing_principal(name, certificate_arn).await;
+            assert_eq!(
+                attached.status, 200,
+                "case {case:?}: AttachThingPrincipal {name} must succeed, got {attached:?}"
+            );
+        }
+        names
     }
 
     /// A certificate issued for a case, as the pair every assertion needs: its id and its
@@ -290,10 +412,267 @@ fn attached_message(certificate_arn: &str) -> String {
     format!("Certificate policies must be detached before deletion (arn: {certificate_arn})")
 }
 
+/// The message AWS IoT refuses a delete of a certificate an IoT thing still has attached
+/// as a principal with: fixed text, with the ARN taken from the stored certificate.
+fn attached_things_message(certificate_arn: &str) -> String {
+    format!("Things must be detached before deletion (arn: {certificate_arn})")
+}
+
 /// The message every reader of one certificate refuses an id the account holds none under
 /// with.
 fn missing_message(certificate_id: &str) -> String {
     format!("CertificateId {certificate_id} does not exist")
+}
+
+#[tokio::test]
+async fn an_attached_thing_refuses_the_delete_and_outranks_an_attached_policy() {
+    let emulator = Emulator::new();
+
+    // "A certificate cannot be deleted if it has a policy or IoT thing attached to it", and
+    // `forceDelete` "Forces the deletion of a certificate if it is inactive and is not
+    // attached to an IoT thing", so a thing holding the certificate as a principal refuses
+    // the delete whichever form `forceDelete` takes — and the refusal names the THING
+    // attachment however many policies are attached as well, because that is the relation
+    // the caller has to clear for the delete to ever succeed.
+    for thing_count in [1usize, 2] {
+        for policy_count in [0usize, 1, 3] {
+            let label = format!("{thing_count} attached things, {policy_count} attached policies");
+            let (id, arn) = emulator.issue(&label, false).await;
+            let things = emulator
+                .attach_to_things(&label, &arn, &id[..8], thing_count)
+                .await;
+            let policies = emulator
+                .attach_policies(&label, &arn, &id[..8], policy_count)
+                .await;
+
+            for (form, force_delete) in force_delete_forms() {
+                let case = format!("{label}, {form}");
+                let refused = emulator.delete(&id, force_delete).await;
+                assert_eq!(
+                    refused.status, 409,
+                    "case {case:?}: an attached thing must refuse the delete 409, got {refused:?}"
+                );
+                assert_eq!(
+                    refused.error_code.as_deref(),
+                    Some("DeleteConflictException"),
+                    "case {case:?}: expected DeleteConflictException, got {refused:?}"
+                );
+                assert_eq!(
+                    refused.message(),
+                    attached_things_message(&arn),
+                    "case {case:?}: expected {:?}, got {refused:?}",
+                    attached_things_message(&arn)
+                );
+
+                // The refusal wrote nothing: the certificate is still readable, every thing
+                // still holds it, and every policy is still attached — so a caller that
+                // follows the message can still detach and retry.
+                let read = emulator.describe(&id).await;
+                assert_eq!(
+                    read.status, 200,
+                    "case {case:?}: a refused delete must leave the certificate readable, \
+                     got {read:?}"
+                );
+                for thing in &things {
+                    let listed = emulator.list_thing_principals(thing).await;
+                    assert!(
+                        listed.principals().contains(&arn),
+                        "case {case:?}: {thing} must still hold {arn} as a principal, \
+                         got {listed:?}"
+                    );
+                }
+                for policy in &policies {
+                    let targets = emulator.list_targets_for_policy(policy).await;
+                    assert!(
+                        targets.targets().contains(&arn),
+                        "case {case:?}: {policy} must still name {arn} as a target, \
+                         got {targets:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_documented_detach_deactivate_delete_sequence_deletes_the_certificate() {
+    let emulator = Emulator::new();
+
+    // "To delete a certificate, first use the DetachPolicy action to detach all policies.
+    // Next, use the UpdateCertificate action to set the certificate to the INACTIVE status"
+    // — with the thing principal detached as well, since a thing attachment holds the
+    // delete back too. A caller that follows that order ends in a delete AWS ACCEPTS: 200
+    // with an empty body on the certificate the account still holds, and only then does the
+    // id stop naming anything.
+    for (label, thing_count, policy_count, set_as_active) in [
+        ("one thing, no policy, issued INACTIVE", 1usize, 0usize, false),
+        ("one thing, one policy, issued ACTIVE", 1, 1, true),
+        ("two things, three policies, issued INACTIVE", 2, 3, false),
+    ] {
+        let (id, arn) = emulator.issue(label, set_as_active).await;
+        let things = emulator
+            .attach_to_things(label, &arn, &id[..8], thing_count)
+            .await;
+        let policies = emulator
+            .attach_policies(label, &arn, &id[..8], policy_count)
+            .await;
+
+        // An ACTIVE certificate is refused for its STATUS — "A certificate cannot be
+        // deleted ... if its status is set to ACTIVE" — so the documented deactivation is
+        // what the caller does first; the attachments are still recorded afterwards.
+        if set_as_active {
+            let refused = emulator.delete(&id, None).await;
+            assert_eq!(
+                refused.status, 406,
+                "case {label:?}: an ACTIVE certificate must be refused 406, got {refused:?}"
+            );
+            assert_eq!(
+                refused.message(),
+                active_message(&id),
+                "case {label:?}: expected {:?}, got {refused:?}",
+                active_message(&id)
+            );
+            let deactivated = emulator
+                .update_certificate(&id, CERTIFICATE_STATUS_INACTIVE)
+                .await;
+            assert_eq!(
+                deactivated.status, 200,
+                "case {label:?}: UpdateCertificate to INACTIVE must succeed, got {deactivated:?}"
+            );
+        }
+        let described = emulator.describe(&id).await;
+        assert_eq!(
+            described.described("status").as_deref(),
+            Some(CERTIFICATE_STATUS_INACTIVE),
+            "case {label:?}: the certificate must be INACTIVE by now, got {described:?}"
+        );
+
+        // While a thing holds the certificate the delete is refused and removes nothing:
+        // the certificate is still the account's afterwards.
+        let refused = emulator.delete(&id, None).await;
+        assert_eq!(
+            refused.status, 409,
+            "case {label:?}: the attached thing must refuse the delete 409, got {refused:?}"
+        );
+        assert_eq!(
+            refused.message(),
+            attached_things_message(&arn),
+            "case {label:?}: expected {:?}, got {refused:?}",
+            attached_things_message(&arn)
+        );
+        let read = emulator.describe(&id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {label:?}: the refused delete must leave the certificate held, got {read:?}"
+        );
+
+        // Detach the things one at a time: every attachment still standing holds the delete
+        // back on its own.
+        for (index, thing) in things.iter().enumerate() {
+            let detached = emulator.detach_thing_principal(thing, &arn).await;
+            assert_eq!(
+                detached.status, 200,
+                "case {label:?}: DetachThingPrincipal {thing} must succeed, got {detached:?}"
+            );
+            let listed = emulator.list_thing_principals(thing).await;
+            assert!(
+                !listed.principals().contains(&arn),
+                "case {label:?}: {thing} must no longer hold {arn}, got {listed:?}"
+            );
+            if index + 1 < things.len() {
+                let still_refused = emulator.delete(&id, None).await;
+                assert_eq!(
+                    still_refused.status, 409,
+                    "case {label:?}: a thing still holding the certificate must refuse the \
+                     delete 409, got {still_refused:?}"
+                );
+                assert_eq!(
+                    still_refused.message(),
+                    attached_things_message(&arn),
+                    "case {label:?}: expected {:?}, got {still_refused:?}",
+                    attached_things_message(&arn)
+                );
+            }
+        }
+
+        // With no thing attached, the attached policies are what is left to clear, and the
+        // refusal now names them.
+        if !policies.is_empty() {
+            let refused = emulator.delete(&id, None).await;
+            assert_eq!(
+                refused.status, 409,
+                "case {label:?}: the attached policies must refuse the delete 409, got {refused:?}"
+            );
+            assert_eq!(
+                refused.message(),
+                attached_message(&arn),
+                "case {label:?}: expected {:?}, got {refused:?}",
+                attached_message(&arn)
+            );
+            for policy in &policies {
+                let detached = emulator.detach_policy(policy, &arn).await;
+                assert_eq!(
+                    detached.status, 200,
+                    "case {label:?}: DetachPolicy {policy} must succeed, got {detached:?}"
+                );
+                let targets = emulator.list_targets_for_policy(policy).await;
+                assert!(
+                    !targets.targets().contains(&arn),
+                    "case {label:?}: {policy} must no longer name {arn}, got {targets:?}"
+                );
+            }
+        }
+
+        // The delete the documented order ends in is the one AWS accepts: 200, empty body,
+        // no error type.
+        let deleted = emulator.delete(&id, None).await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {label:?}: the properly sequenced delete must succeed, got {deleted:?}"
+        );
+        assert!(
+            deleted.is_empty_body(),
+            "case {label:?}: DeleteCertificate models no output members, got {deleted:?}"
+        );
+        assert_eq!(
+            deleted.error_code, None,
+            "case {label:?}: a successful delete carries no error type, got {deleted:?}"
+        );
+
+        // Only now does the id name nothing: the removal is what a later reader sees.
+        let gone = emulator.describe(&id).await;
+        assert_eq!(
+            gone.status, 404,
+            "case {label:?}: the deleted certificate must be gone, got {gone:?}"
+        );
+        let again = emulator.delete(&id, None).await;
+        assert_eq!(
+            again.status, 404,
+            "case {label:?}: deleting the removed id must be refused 404, got {again:?}"
+        );
+        assert_eq!(
+            again.message(),
+            missing_message(&id),
+            "case {label:?}: expected {:?}, got {again:?}",
+            missing_message(&id)
+        );
+
+        // The devices and the policies the sequence detached are untouched by the delete.
+        for thing in &things {
+            let listed = emulator.list_thing_principals(thing).await;
+            assert_eq!(
+                listed.status, 200,
+                "case {label:?}: {thing} must survive the delete, got {listed:?}"
+            );
+        }
+        for policy in &policies {
+            let targets = emulator.list_targets_for_policy(policy).await;
+            assert_eq!(
+                targets.status, 200,
+                "case {label:?}: {policy} must survive the delete, got {targets:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
