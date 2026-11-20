@@ -23,12 +23,16 @@
 //! request appears in a refusal.
 //!
 //! The intersection, containment and orientation requirements a polygon's rings have
-//! to satisfy are read from the `cavalier_contours` crate's closed-polyline
-//! predicates — a self-intersection scan, a polyline-to-polyline intersection search,
-//! a winding number and a signed area — rather than hand-rolled here.
+//! to satisfy are answered by the closed-polyline predicates in
+//! [`super::ring_predicates`], which reads them from the `cavalier_contours` crate,
+//! rather than hand-rolled here.
 
-use cavalier_contours::core::math::Vector2;
-use cavalier_contours::polyline::{PlineCreation, PlineSource, PlineSourceMut, Polyline};
+use cavalier_contours::polyline::{PlineSource, Polyline};
+
+use super::ring_predicates::{
+    closed_ring, encloses, first_vertex, rings_intersect, winding_order, WindingOrder,
+    MIN_RING_CORNERS,
+};
 
 use crate::ops::types::{Circle, GeofenceGeometry};
 
@@ -351,64 +355,8 @@ fn validate_polygon(
             }
         }
     }
+
     Ok(())
-}
-
-/// Fewest corners a ring has to draw to enclose any area: three, a triangle. A ring
-/// listing the same point four times, or two points back and forth, draws fewer.
-const MIN_RING_CORNERS: usize = 3;
-
-/// The bulge of a straight edge: a linear ring's edges are line segments, never arcs.
-const BULGE_STRAIGHT: f64 = 0.0;
-
-/// One linear ring as the predicates below read it: a CLOSED polyline over the ring's
-/// vertices.
-///
-/// A closed polyline carries the edge from its last vertex back to its first one
-/// implicitly, so the ring's repeated closing vertex is dropped; a vertex repeating
-/// the one before it is dropped too, since a zero-length edge is no edge of the ring
-/// and a vertex a request lists twice does not change the ring's shape.
-fn closed_ring(vertices: &[[f64; 2]]) -> Polyline<f64> {
-    let mut ring: Polyline<f64> = Polyline::with_capacity(vertices.len(), true);
-    let mut previous: Option<[f64; 2]> = None;
-    // The ring is closed by here, so its last vertex repeats its first one.
-    for vertex in vertices.iter().take(vertices.len().saturating_sub(1)) {
-        if previous == Some(*vertex) {
-            continue;
-        }
-        ring.add(vertex[0], vertex[1], BULGE_STRAIGHT);
-        previous = Some(*vertex);
-    }
-    ring
-}
-
-/// Whether two rings share any point at all — crossing at one, touching at one, or
-/// running along each other.
-fn rings_intersect(ring: &Polyline<f64>, other: &Polyline<f64>) -> bool {
-    let found = ring.find_intersects(other);
-    !found.basic_intersects.is_empty() || !found.overlapping_intersects.is_empty()
-}
-
-/// The first vertex of a ring, as the point a containment test is asked about, or
-/// `None` for a ring that draws no corner at all — which a ring reaching here cannot
-/// be ([`MIN_RING_CORNERS`]), stated as a value rather than assumed.
-fn first_vertex(ring: &Polyline<f64>) -> Option<Vector2<f64>> {
-    ring.get(0).map(|vertex| Vector2::new(vertex.x, vertex.y))
-}
-
-/// Whether `ring` encloses `point`, whichever way the ring is wound.
-fn encloses(ring: &Polyline<f64>, point: Vector2<f64>) -> bool {
-    ring.winding_number(point) != 0
-}
-
-/// The sequence a ring's vertices are listed in, read from the sign of the area the
-/// ring encloses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WindingOrder {
-    /// The sequence an exterior ring is listed in: positive enclosed area.
-    CounterClockwise,
-    /// The sequence an interior ring is listed in: negative enclosed area.
-    Clockwise,
 }
 
 /// The sequence the vertices of an exterior ring must be listed in, per the
@@ -454,20 +402,6 @@ fn validate_winding(
             ),
         )),
         None => Err(rings_must_not_intersect(path)),
-    }
-}
-
-/// The sequence a ring's vertices are listed in, or `None` when the ring encloses no
-/// area at all and so has no sequence to read: the signed area a closed polyline
-/// encloses is positive counter-clockwise and negative clockwise.
-fn winding_order(ring: &Polyline<f64>) -> Option<WindingOrder> {
-    let enclosed = ring.area();
-    if enclosed > 0.0 {
-        Some(WindingOrder::CounterClockwise)
-    } else if enclosed < 0.0 {
-        Some(WindingOrder::Clockwise)
-    } else {
-        None
     }
 }
 
