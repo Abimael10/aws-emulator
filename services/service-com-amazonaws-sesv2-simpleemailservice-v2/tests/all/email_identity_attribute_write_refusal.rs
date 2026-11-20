@@ -29,6 +29,12 @@
 //! account does hold — a domain, an address and one whose verification has not
 //! completed — which every one of the four writes accepts, with the attributes they
 //! wrote read back through `GetEmailIdentity`.
+//!
+//! A last case walks one identity of each form through the whole lifecycle — absent,
+//! held, deleted, held again — asserting at each step which class the writes answer and
+//! which the record-addressing operations do: the classification is a function of what
+//! the account holds when the call arrives, so a name the account held a moment ago is
+//! refused as invalid input and a name it holds again is written to and read back.
 
 use std::time::{Duration, SystemTime};
 
@@ -432,6 +438,179 @@ async fn an_identity_the_account_holds_is_accepted_by_every_attribute_write() {
             Some(&json!(HELD_SET)),
             "case {identity:?}: expected the configuration set to be associated, got {:?}",
             read.body.get("ConfigurationSetName")
+        );
+    }
+}
+
+/// The identity spellings the lifecycle case below walks from end to end: an address, a
+/// domain, a subdomain, a mixed-case address and an address with a tagged local part —
+/// the forms an `EmailIdentity` takes, each one created, written to, deleted and created
+/// again on an account of its own.
+const LIFECYCLE_IDENTITIES: &[&str] = &[
+    "lifecycle@example.com",
+    "lifecycle.example.com",
+    "sub.lifecycle.example.net",
+    "Lifecycle.Case@Example.ORG",
+    "lifecycle+tag@example.net",
+];
+
+/// `PutEmailIdentityFeedbackAttributes` with the setting supplied.
+async fn put_feedback(ses: &Ses, identity: &str, enabled: bool) -> Reply {
+    ses.call(
+        "PUT",
+        &format!("/v2/email/identities/{}/feedback", label(identity)),
+        Some(json!({ "EmailForwardingEnabled": enabled })),
+    )
+    .await
+}
+
+/// Every write in the `PutEmailIdentity*Attributes` family refuses `identity` as invalid
+/// input, each with the sentence that write words the refusal in.
+async fn assert_refused_as_invalid_input(ses: &Ses, phase: &str, identity: &str) {
+    for (operation, reply, expected) in attribute_writes(ses, identity).await {
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, "BadRequestException"),
+            "case {phase} ({operation}, {identity:?}): expected 400 BadRequestException, got {} \
+             {:?}",
+            reply.status,
+            reply.body
+        );
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {phase} ({operation}, {identity:?}): expected {expected:?}, got {:?}",
+            reply.message()
+        );
+    }
+}
+
+/// The operations that address the identity RECORD report it missing, in the wording each
+/// of them uses.
+async fn assert_record_reported_absent(ses: &Ses, phase: &str, identity: &str) {
+    let rows = [
+        (
+            "GetEmailIdentity",
+            get_identity(ses, identity).await,
+            format!("Email identity <{identity}> does not exist."),
+        ),
+        (
+            "GetEmailIdentityPolicies",
+            get_identity_policies(ses, identity).await,
+            format!("Email identity <{identity}> does not exist."),
+        ),
+        (
+            "DeleteEmailIdentity",
+            delete_identity(ses, identity).await,
+            format!("Email identity {identity} does not exist."),
+        ),
+    ];
+    for (operation, reply, expected) in rows {
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (404, "NotFoundException"),
+            "case {phase} ({operation}, {identity:?}): expected 404 NotFoundException, got {} {:?}",
+            reply.status,
+            reply.body
+        );
+        assert_eq!(
+            reply.message(),
+            expected,
+            "case {phase} ({operation}, {identity:?}): expected {expected:?}, got {:?}",
+            reply.message()
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_refusal_class_follows_what_the_account_holds_at_the_time() {
+    for identity in LIFECYCLE_IDENTITIES {
+        let ses = Ses::new();
+        let set = create_configuration_set(&ses, HELD_SET).await;
+        assert_eq!(
+            set.status, 200,
+            "case {identity:?}: the configuration set the association write names must be \
+             created, got {} {:?}",
+            set.status, set.body
+        );
+
+        // Nothing created yet: the attribute writes refuse the value as invalid input
+        // while the operations addressing the record report it missing — the two classes
+        // answered for one and the same name.
+        assert_refused_as_invalid_input(&ses, "before the create", identity).await;
+        assert_record_reported_absent(&ses, "before the create", identity).await;
+
+        // The account holds it: the write is accepted and every later read reports what
+        // it stored, both settings and a value written twice.
+        let created = create_identity(&ses, identity).await;
+        assert_eq!(
+            created.status, 200,
+            "case {identity:?}: creating the identity must answer 200, got {} {:?}",
+            created.status, created.body
+        );
+        for enabled in [true, false, true, true] {
+            let put = put_feedback(&ses, identity, enabled).await;
+            assert_eq!(
+                put.status, 200,
+                "case ({identity:?}, {enabled:?}): expected the write to be accepted with 200, \
+                 got {} {:?}",
+                put.status, put.body
+            );
+            let read = get_identity(&ses, identity).await;
+            assert_eq!(
+                read.flag("FeedbackForwardingStatus"),
+                enabled,
+                "case ({identity:?}, {enabled:?}): expected FeedbackForwardingStatus {enabled:?} \
+                 to be read back, got {:?}",
+                read.body
+            );
+            if enabled {
+                // `FeedbackForwardingStatus` is modelled with a default of `false`, which
+                // the wire protocol may leave out; `true` is never left out, so the
+                // member itself is pinned on those steps.
+                assert_eq!(
+                    read.body.get("FeedbackForwardingStatus"),
+                    Some(&json!(true)),
+                    "case ({identity:?}, {enabled:?}): expected the answer to carry \
+                     FeedbackForwardingStatus true, got {:?}",
+                    read.body
+                );
+            }
+        }
+
+        // Deleted: the record-addressing operations answer 404 again and the attribute
+        // writes 400 again, on the name the account held a moment ago.
+        let removed = delete_identity(&ses, identity).await;
+        assert_eq!(
+            removed.status, 200,
+            "case {identity:?}: deleting the identity must answer 200, got {} {:?}",
+            removed.status, removed.body
+        );
+        assert_record_reported_absent(&ses, "after the delete", identity).await;
+        assert_refused_as_invalid_input(&ses, "after the delete", identity).await;
+
+        // Created again: the very same write is accepted again, so each refusal above was
+        // about what the account held when the call arrived and not about the name having
+        // once been deleted.
+        let recreated = create_identity(&ses, identity).await;
+        assert_eq!(
+            recreated.status, 200,
+            "case {identity:?}: creating the identity again must answer 200, got {} {:?}",
+            recreated.status, recreated.body
+        );
+        let put = put_feedback(&ses, identity, true).await;
+        assert_eq!(
+            put.status, 200,
+            "case {identity:?}: expected the write to be accepted after the re-create, got {} \
+             {:?}",
+            put.status, put.body
+        );
+        let read = get_identity(&ses, identity).await;
+        assert!(
+            read.flag("FeedbackForwardingStatus"),
+            "case {identity:?}: expected FeedbackForwardingStatus true after the re-create, got \
+             {:?}",
+            read.body
         );
     }
 }

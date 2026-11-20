@@ -52,6 +52,16 @@ impl Reply {
             .to_string()
     }
 
+    /// A boolean member of the body. A boolean modelled with a default of `false` is
+    /// left out of the answer when it carries that default, so an absent member reads
+    /// as `false`.
+    pub fn flag(&self, member: &str) -> bool {
+        self.body
+            .get(member)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
     /// The `NextToken` the answer handed back, if any.
     pub fn next_token(&self) -> Option<String> {
         self.body
