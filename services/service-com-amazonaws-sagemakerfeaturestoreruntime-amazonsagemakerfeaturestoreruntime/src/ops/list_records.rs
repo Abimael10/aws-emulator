@@ -215,27 +215,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
 
         let mut store = state.lock();
-        // `records()` iterates in ascending identifier order (a `BTreeMap`), which is
-        // what makes the cursor below a correct resume point: `filter` keeps every
-        // identifier at or after it regardless of iteration order, and the token the
-        // page emits is the first identifier it did not return. The walk stops at the
-        // page (plus that one identifier), so nothing linear in the whole store is ever
-        // copied. A feature group that resolves but has taken no record yet has no
-        // online store here, and lists nothing.
+        // `records_from` RESUMES the ordered store (a `BTreeMap`) at the cursor rather
+        // than walking it from its first identifier, which is what makes the cursor a
+        // resume point and not just a filter: the walk begins at the identifier the token
+        // names and the token the page emits is the first identifier it did not return.
+        // Only the identifiers this page returns (plus that one) are copied, so no work
+        // here is linear in the records ordered before the cursor. A feature group that
+        // resolves but has taken no record yet has no online store here, and lists
+        // nothing.
         let (record_identifiers, next_identifier) = store
             .group_mut(&input.feature_group_name)
             .map(|group| {
                 let mut remaining = group
-                    .records()
-                    .filter(|record| include_soft_deleted || !record.soft_deleted)
+                    .records_from(resume_at.as_deref())
+                    .filter(|record| include_soft_deleted || !record.soft_deleted);
+                let page: Vec<String> = remaining
+                    .by_ref()
+                    .take(page_size)
                     .map(|record| record.identifier.clone())
-                    .filter(|identifier| {
-                        resume_at
-                            .as_deref()
-                            .is_none_or(|resume| identifier.as_str() >= resume)
-                    });
-                let page: Vec<String> = remaining.by_ref().take(page_size).collect();
-                (page, remaining.next())
+                    .collect();
+                let next = remaining.next().map(|record| record.identifier.clone());
+                (page, next)
             })
             .unwrap_or_default();
         drop(store);

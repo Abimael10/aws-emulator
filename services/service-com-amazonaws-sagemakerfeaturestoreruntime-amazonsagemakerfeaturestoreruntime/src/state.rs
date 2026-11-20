@@ -26,6 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::ops::Bound;
 
 use aws_smithy_types::date_time::{DateTime, Format};
 
@@ -135,9 +136,20 @@ impl FeatureGroupStore {
         self.recompute_next_expiry();
     }
 
-    /// The records of this group, in ascending identifier order.
-    pub fn records(&self) -> impl Iterator<Item = &StoredRecord> {
-        self.records.values()
+    /// The records of this group in ascending identifier order, starting at the first
+    /// identifier at or after `resume_at` — every record the group holds when it names
+    /// none.
+    ///
+    /// The ordered map is RESUMED at that identifier rather than walked from its first
+    /// key, which is what holding the records in a `BTreeMap` is for: a cursor names an
+    /// identifier, and the walk that starts there reaches only the records from it on, so
+    /// a page costs nothing for the records ordered before its cursor. A cursor naming an
+    /// identifier the group no longer holds resumes at the next one above it.
+    pub fn records_from(&self, resume_at: Option<&str>) -> impl Iterator<Item = &StoredRecord> {
+        let start = resume_at.map_or(Bound::Unbounded, Bound::Included);
+        self.records
+            .range::<str, _>((start, Bound::Unbounded))
+            .map(|(_, record)| record)
     }
 
     /// The record `identifier` names, whether or not it is soft-deleted.

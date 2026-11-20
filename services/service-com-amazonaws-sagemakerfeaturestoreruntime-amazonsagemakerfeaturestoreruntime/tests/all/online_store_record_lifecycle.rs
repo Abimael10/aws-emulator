@@ -704,6 +704,292 @@ async fn list_records_pages_through_the_identifiers_in_state() {
     );
 }
 
+/// One `ListRecords` page: the identifiers it carried, and the `NextToken` it emitted.
+async fn list_one_page(
+    emulator: &Emulator,
+    group: &str,
+    max_results: Option<u64>,
+    token: Option<&str>,
+    case: &str,
+) -> (Vec<String>, Option<String>) {
+    let mut request = json!({});
+    if let Some(max) = max_results {
+        request["MaxResults"] = json!(max);
+    }
+    if let Some(token) = token {
+        request["NextToken"] = json!(token);
+    }
+    let (status, body) = emulator.list_records(group, request).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ListRecords 200, got {status} with {body}"
+    );
+    let page: Vec<String> = body["RecordIdentifiers"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: RecordIdentifiers is required, got {body}"))
+        .iter()
+        .map(|identifier| identifier.as_str().unwrap_or_default().to_owned())
+        .collect();
+    if let Some(max) = max_results {
+        assert!(
+            page.len() as u64 <= max,
+            "case {case:?}: expected at most {max} identifiers in a page, got {page:?}"
+        );
+    }
+    let next = body
+        .get("NextToken")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    (page, next)
+}
+
+/// Every identifier a listing yields from `token` on, following each `NextToken` to the
+/// end: a page that hands back a token is never empty, and the pages strictly ascend.
+async fn page_through(
+    emulator: &Emulator,
+    group: &str,
+    max_results: Option<u64>,
+    token: Option<String>,
+    case: &str,
+) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut token = token;
+    // A bound on the number of requests, not on time: every page returns at least one
+    // identifier, so a terminating listing of these rows is far inside it.
+    for _ in 0..64 {
+        let (page, next) = list_one_page(emulator, group, max_results, token.as_deref(), case).await;
+        if next.is_some() {
+            assert!(
+                !page.is_empty(),
+                "case {case:?}: a page that hands back a NextToken must not be empty"
+            );
+        }
+        if let (Some(last), Some(first)) = (seen.last(), page.first()) {
+            assert!(
+                last < first,
+                "case {case:?}: pages must advance in ascending identifier order, got \
+                 {last:?} then {first:?}"
+            );
+        }
+        seen.extend(page);
+        match next {
+            Some(next) => token = Some(next),
+            None => return seen,
+        }
+    }
+    panic!("case {case:?}: pagination did not terminate");
+}
+
+#[tokio::test]
+async fn list_records_resumes_the_ordered_store_at_the_identifier_its_cursor_names() {
+    // Each row differs along what the rule generalises over: how the identifiers sort
+    // against the order they were WRITTEN in, their form, their size, and how many there
+    // are. The identifier is modelled `RecordIdentifierValueAsString` (ValueAsString, len
+    // 0..358400), so a row of 1 000-character identifiers is well inside it.
+    let long = |suffix: &str| format!("{}{suffix}", "x".repeat(997));
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        ("one record", vec!["only".to_owned()]),
+        (
+            "written in descending order",
+            ["C5", "C4", "C3", "C2", "C1"]
+                .map(str::to_owned)
+                .to_vec(),
+        ),
+        (
+            "ordered lexicographically, not numerically",
+            ["C9", "C10", "C1", "C100", "C2"]
+                .map(str::to_owned)
+                .to_vec(),
+        ),
+        (
+            "mixed case and punctuation",
+            ["b", "A", "a", "B-2", "B_1"].map(str::to_owned).to_vec(),
+        ),
+        ("non-ascii", ["\u{e9}", "e", "Z"].map(str::to_owned).to_vec()),
+        (
+            "long identifiers",
+            vec![long("003"), long("001"), long("002")],
+        ),
+    ];
+
+    for (index, (case, written)) in cases.iter().enumerate() {
+        let emulator = Emulator::new();
+        let group = format!("paging{index}");
+        emulator.create_feature_group(&group, "customer_id", "event_time", true);
+        for identifier in written {
+            let (status, body) = emulator
+                .put_record(
+                    &group,
+                    json!({ "Record": [
+                        feature("customer_id", identifier),
+                        feature("event_time", "2024-01-01T00:00:00Z")
+                    ] }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected PutRecord 200, got {status} with {body}"
+            );
+        }
+        // The one order the store enumerates in: ascending identifier.
+        let mut ascending = written.clone();
+        ascending.sort();
+
+        // Paged at any size the model allows, the pages together are that order, once.
+        for max_results in [Some(1), Some(2), Some(100), None] {
+            let label = format!("{case} / MaxResults={max_results:?}");
+            let seen = page_through(&emulator, &group, max_results, None, &label).await;
+            assert_eq!(
+                seen, ascending,
+                "case {label:?}: expected every identifier in ascending order exactly \
+                 once, got {seen:?}"
+            );
+        }
+
+        // Every identifier is a resume point: the token a page of `cut` identifiers hands
+        // back names the (cut + 1)-th identifier, and resuming at it returns exactly the
+        // ordered suffix from that identifier on — nothing before it, nothing twice.
+        for cut in 1..ascending.len() {
+            let label = format!("{case} / resume after {cut}");
+            let (first, token) =
+                list_one_page(&emulator, &group, Some(cut as u64), None, &label).await;
+            assert_eq!(
+                first,
+                ascending[..cut],
+                "case {label:?}: expected the first {cut} identifiers, got {first:?}"
+            );
+            let token = token.unwrap_or_else(|| {
+                panic!("case {label:?}: a truncated page must hand back a NextToken")
+            });
+            let rest = page_through(&emulator, &group, Some(100), Some(token), &label).await;
+            assert_eq!(
+                rest,
+                ascending[cut..],
+                "case {label:?}: expected the suffix {:?}, got {rest:?}",
+                &ascending[cut..]
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_cursor_names_an_identifier_so_it_resumes_from_wherever_that_identifier_sorts() {
+    // Rows: what has happened to the record the cursor names by the time the next page is
+    // asked for. A cursor names an IDENTIFIER, not a position, so the resumed listing is
+    // the ordered suffix at or after it: the record itself when it is still listable, and
+    // otherwise the records above it.
+    let written = ["A", "B", "C", "D"];
+    let cases: Vec<(&str, &str, &str, bool, Vec<&str>)> = vec![
+        (
+            "the cursor's own record hard-deleted mid-order",
+            "B",
+            "HardDelete",
+            false,
+            vec!["C", "D"],
+        ),
+        (
+            "the cursor's own record hard-deleted at the end of the order",
+            "D",
+            "HardDelete",
+            false,
+            vec![],
+        ),
+        (
+            "the cursor's own record soft-deleted, not asked for",
+            "B",
+            "SoftDelete",
+            false,
+            vec!["C", "D"],
+        ),
+        (
+            "the cursor's own record soft-deleted and asked for",
+            "B",
+            "SoftDelete",
+            true,
+            vec!["B", "C", "D"],
+        ),
+    ];
+
+    for (index, (case, cursor_at, mode, include_soft_deleted, expected)) in
+        cases.iter().enumerate()
+    {
+        let emulator = Emulator::new();
+        let group = format!("cursorgap{index}");
+        emulator.create_feature_group(&group, "customer_id", "event_time", true);
+        for identifier in written {
+            emulator
+                .put_record(
+                    &group,
+                    json!({ "Record": [
+                        feature("customer_id", identifier),
+                        feature("event_time", "2024-01-01T00:00:00Z")
+                    ] }),
+                )
+                .await;
+        }
+
+        // The page that stops just before the cursor's record hands back the token that
+        // names it.
+        let cut = written
+            .iter()
+            .position(|identifier| identifier == cursor_at)
+            .expect("the cursor's identifier is one of the written ones");
+        let (page, token) = list_one_page(&emulator, &group, Some(cut as u64), None, case).await;
+        assert_eq!(
+            page,
+            written[..cut],
+            "case {case:?}: expected the identifiers before the cursor, got {page:?}"
+        );
+        let token = token.unwrap_or_else(|| {
+            panic!("case {case:?}: a truncated page must hand back a NextToken")
+        });
+
+        let (status, _) = emulator
+            .delete_record(
+                &group,
+                &format!(
+                    "RecordIdentifierValueAsString={cursor_at}\
+                     &EventTime=2024-01-02T00:00:00Z&DeletionMode={mode}"
+                ),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DeleteRecord 200, got {status}"
+        );
+
+        let (status, body) = emulator
+            .list_records(
+                &group,
+                json!({
+                    "NextToken": token,
+                    "MaxResults": 100,
+                    "IncludeSoftDeletedRecords": include_soft_deleted
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected ListRecords 200, got {status} with {body}"
+        );
+        let resumed: Vec<String> = body["RecordIdentifiers"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: RecordIdentifiers is required, got {body}"))
+            .iter()
+            .map(|identifier| identifier.as_str().unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            resumed, *expected,
+            "case {case:?}: expected the suffix {expected:?}, got {resumed:?}"
+        );
+        let trailing = body.get("NextToken").cloned().unwrap_or(Value::Null);
+        assert!(
+            trailing.is_null(),
+            "case {case:?}: the last page must hand back no NextToken, got {trailing:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn delete_record_removes_the_record_from_the_online_store() {
     // Rows: the two deletion modes, explicit and defaulted, plus a delete aimed at the
