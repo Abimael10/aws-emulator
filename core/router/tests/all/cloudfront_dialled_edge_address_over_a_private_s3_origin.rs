@@ -229,7 +229,14 @@ pub(crate) fn is_dialable(domain: &str) -> bool {
     domain.parse::<SocketAddr>().is_ok()
 }
 
-/// Dial `authority` in the clear and send one HTTP/1.1 `GET`, answering what came back.
+/// Dial `authority` in the clear and send one HTTP/1.1 `GET`, answering what came back: the
+/// [`dial_with`] every viewer that asks for an object makes.
+pub(crate) async fn dial(case: &str, authority: &str, path: &str) -> Served {
+    dial_with(case, authority, "GET", path, "").await
+}
+
+/// Dial `authority` in the clear and send one HTTP/1.1 request of `method` for `path`, carrying
+/// `body` as a JSON entity when the caller sends one, answering what came back.
 ///
 /// This is the VIEWER: a client holding nothing but the address the create published, with no
 /// AWS credential of any kind, speaking the protocol that address answers rather than going
@@ -239,7 +246,13 @@ pub(crate) fn is_dialable(domain: &str) -> bool {
 /// The dial names the LOOPBACK interface explicitly and takes only the PORT from the
 /// published authority — the caller has already held that authority to being one of this
 /// emulator's own listeners — so nothing here opens a connection anywhere else.
-pub(crate) async fn dial(case: &str, authority: &str, path: &str) -> Served {
+pub(crate) async fn dial_with(
+    case: &str,
+    authority: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Served {
     let port = authority
         .parse::<SocketAddr>()
         .unwrap_or_else(|error| {
@@ -257,7 +270,19 @@ pub(crate) async fn dial(case: &str, authority: &str, path: &str) -> Served {
     .unwrap_or_else(|error| {
         panic!("case {case:?}: the published address {authority:?} refused a connection: {error}")
     });
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    // A request carrying an entity states what it is and how long it is; one carrying none
+    // states neither, which is what a viewer asking for an object sends.
+    let entity = if body.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+    };
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\n{entity}Connection: close\r\n\r\n{body}"
+    );
     stream
         .write_all(request.as_bytes())
         .await
