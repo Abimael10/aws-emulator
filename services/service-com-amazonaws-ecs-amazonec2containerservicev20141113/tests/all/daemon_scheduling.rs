@@ -31,6 +31,12 @@
 //!   cluster is refused about that cluster, the read of one daemon is refused about the
 //!   daemon, and the listing of a daemon's rollouts selects none of them and answers the
 //!   empty page;
+//! * `DescribeDaemon` "Describes the specified daemon": the read answers the daemon its
+//!   `daemonArn` identifies out of STORED state — the cluster it runs in, the status the
+//!   last write put it in, the ARN of its most recent daemon deployment, the instants it was
+//!   created and last changed at, and one `currentRevisions` entry per revision it holds
+//!   tasks of, whose per-capacity-provider counts add up to the daemon tasks that exist —
+//!   and because it only reports, repeating it changes nothing a later caller sees;
 //! * `DeleteDaemon`: "Deleting a daemon stops all running daemon tasks on the associated
 //!   container instances", the daemon is answered `DELETE_IN_PROGRESS`, and it leaves
 //!   `ListDaemons` on the clock;
@@ -1195,6 +1201,309 @@ async fn a_deployment_listing_filters_by_status_and_creation_window_and_pages() 
     assert_eq!(
         walked, newest_first,
         "case {CASE:?}: expected the paged walk to report every rollout once"
+    );
+}
+
+/// One row of the daemon-read rule below: the SHAPE of the daemon whose read is asserted.
+///
+/// Each row is its own test, over its own emulator, so one row's walk of the clock is not
+/// another's wait.
+struct ReportedDaemon {
+    case: &'static str,
+    /// The cluster and the daemon task-definition family this row stands up, so no row
+    /// shares another's state.
+    cluster: &'static str,
+    family: &'static str,
+    /// How many container instances the daemon's cluster holds, which is how many running
+    /// daemon tasks the read then has to count.
+    instances: usize,
+    /// How many capacity providers the daemon deploys onto, each of which the read reports
+    /// an entry of its own for.
+    providers: usize,
+    /// Whether an update moves the daemon onto a second revision before it is read, which
+    /// is what makes "the most recent daemon deployment" a different rollout from the one
+    /// the create answered with.
+    updated: bool,
+}
+
+/// The image a row's update moves the daemon onto, so the two revisions of its family are
+/// told apart by what they run.
+const SECOND_IMAGE: &str = "public.ecr.aws/aws-observability/aws-otel-collector:1.33.0";
+
+/// Poll one daemon's own tasks until `instances` of them are RUNNING, every one of them on
+/// `definition`, and answer them. The rollover a row's update starts is waited out HERE,
+/// off the tasks themselves, so what a report says mid-rollover decides nothing.
+async fn poll_daemon_tasks(
+    router: &MultiServiceRouter,
+    cluster: &str,
+    definition: &str,
+    instances: usize,
+    case: &str,
+) -> Vec<Value> {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let tasks = daemon_tasks(router, cluster, "agents", case).await;
+        let running: Vec<&Value> = tasks
+            .iter()
+            .filter(|task| task["lastStatus"].as_str() == Some("RUNNING"))
+            .collect();
+        if running.len() == instances
+            && running
+                .iter()
+                .all(|task| task["taskDefinitionArn"].as_str() == Some(definition))
+        {
+            return tasks;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected {instances} running daemon task(s) on {definition:?}, got \
+             {tasks:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[tokio::test]
+async fn a_daemon_read_reports_a_daemon_whose_cluster_holds_no_container_instance() {
+    a_daemon_read_reports_the_stored_daemon(&ReportedDaemon {
+        case: "a daemon over a cluster that holds no container instance",
+        cluster: "daemon-report-empty",
+        family: "daemonreportempty",
+        instances: 0,
+        providers: 1,
+        updated: false,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_daemon_read_reports_a_daemon_whose_cluster_holds_one_container_instance() {
+    a_daemon_read_reports_the_stored_daemon(&ReportedDaemon {
+        case: "a daemon over a cluster that holds one container instance",
+        cluster: "daemon-report-one",
+        family: "daemonreportone",
+        instances: 1,
+        providers: 1,
+        updated: false,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_daemon_read_reports_a_daemon_spread_over_two_capacity_providers() {
+    a_daemon_read_reports_the_stored_daemon(&ReportedDaemon {
+        case: "a daemon over two capacity providers and three container instances",
+        cluster: "daemon-report-spread",
+        family: "daemonreportspread",
+        instances: 3,
+        providers: 2,
+        updated: false,
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_daemon_read_reports_a_daemon_an_update_moved_onto_a_second_revision() {
+    a_daemon_read_reports_the_stored_daemon(&ReportedDaemon {
+        case: "a daemon an update has moved onto a second revision",
+        cluster: "daemon-report-updated",
+        family: "daemonreportupdated",
+        instances: 2,
+        providers: 1,
+        updated: true,
+    })
+    .await;
+}
+
+/// The daemon-read rule, over ONE row: `DescribeDaemon` "Describes the specified daemon", so
+/// every member of the `DaemonDetail` it answers is what the create and the update WROTE —
+/// the cluster, the status, the ARN of the most recent daemon deployment, the instants the
+/// daemon was created and last changed at, and one `currentRevisions` entry per revision it
+/// holds tasks of, whose per-capacity-provider counts add up to the tasks that exist — and,
+/// because the call only reports, repeating it changes nothing a later caller sees.
+async fn a_daemon_read_reports_the_stored_daemon(row: &ReportedDaemon) {
+    let router = service();
+    let case = row.case;
+    let cluster_arn = create_cluster(&router, row.cluster, case).await;
+    for ordinal in 0..row.instances {
+        register_instance(
+            &router,
+            row.cluster,
+            &format!("i-0{:015x}", ordinal + 1),
+            case,
+        )
+        .await;
+    }
+    let mut providers = Vec::new();
+    for ordinal in 0..row.providers {
+        providers.push(
+            create_managed_provider(
+                &router,
+                row.cluster,
+                &format!("{}-mi-{ordinal}", row.cluster),
+                case,
+            )
+            .await,
+        );
+    }
+    let definition = register_daemon_definition(&router, row.family, IMAGE, case).await;
+    // The WHOLE create answer is needed here, not just the two ARNs [`create_daemon`] hands
+    // back: `createdAt` is one of the members the read has to report back unchanged.
+    let created = ok(
+        &router,
+        "CreateDaemon",
+        json!({
+            "clusterArn": row.cluster,
+            "daemonName": "agents",
+            "daemonTaskDefinitionArn": definition,
+            "capacityProviderArns": providers,
+        }),
+        case,
+    )
+    .await;
+    let daemon_arn = string(&created, "daemonArn", case);
+    let created_at = created["createdAt"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a createdAt, got {created}"));
+
+    // What the read then owes: the daemon's most recent rollout and the definition its tasks
+    // run — the create's, or the update's where the row makes one.
+    let (expected_deployment, expected_definition) = if row.updated {
+        let next = register_daemon_definition(&router, row.family, SECOND_IMAGE, case).await;
+        assert_ne!(
+            next, definition,
+            "case {case:?}: a second registration of a family is a second revision"
+        );
+        let updated = ok(
+            &router,
+            "UpdateDaemon",
+            json!({
+                "daemonArn": daemon_arn,
+                "daemonTaskDefinitionArn": next,
+                "capacityProviderArns": providers,
+            }),
+            case,
+        )
+        .await;
+        let rollout = string(&updated, "deploymentArn", case);
+        assert_ne!(
+            rollout,
+            string(&created, "deploymentArn", case),
+            "case {case:?}: an update starts a NEW rollout, got {updated}"
+        );
+        (rollout, next)
+    } else {
+        (string(&created, "deploymentArn", case), definition.clone())
+    };
+
+    // The clock places the daemon's task on every instance that accepts a placement, and a
+    // row that updates rolls those tasks over onto the revision the update captured. Waited
+    // out on the TASKS, so the settled state the report is then read in is one the report
+    // itself did not decide.
+    let instances = row.instances;
+    let tasks = poll_daemon_tasks(
+        &router,
+        row.cluster,
+        &expected_definition,
+        instances,
+        case,
+    )
+    .await;
+    let hosts = running_hosts(&tasks, case);
+    let mut distinct = hosts.clone();
+    distinct.dedup();
+    assert_eq!(
+        distinct, hosts,
+        "case {case:?}: expected each daemon task on its own instance, got {hosts:?}"
+    );
+    let instances = instances as i64;
+    let daemon = poll_daemon(
+        &router,
+        &daemon_arn,
+        case,
+        "the daemon to report the one revision its tasks run",
+        |daemon| list(daemon, "currentRevisions", case).len() == 1,
+    )
+    .await;
+
+    // Every member of the report is what the create and the update WROTE.
+    assert_eq!(
+        (
+            string(&daemon, "daemonArn", case),
+            string(&daemon, "clusterArn", case),
+            string(&daemon, "status", case),
+            string(&daemon, "deploymentArn", case),
+            daemon["createdAt"].as_f64()
+        ),
+        (
+            daemon_arn.clone(),
+            cluster_arn,
+            "ACTIVE".to_string(),
+            expected_deployment,
+            Some(created_at)
+        ),
+        "case {case:?}: expected the daemon the writes stored, with its MOST RECENT \
+         deployment, got {daemon}"
+    );
+    assert!(
+        daemon["updatedAt"].as_f64() >= Some(created_at),
+        "case {case:?}: expected updatedAt not earlier than createdAt, got {daemon}"
+    );
+
+    // "The current daemon revision details, including the running task counts per capacity
+    // provider": one entry per provider the daemon deploys onto, in the order the daemon
+    // names them, and their counts add up to the totals the entry reports — which are the
+    // TASKS THAT EXIST, as this service's own task reads report them.
+    let revision = sole_revision(&daemon, case);
+    let entries = list(&revision, "capacityProviders", case);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| string(entry, "arn", case))
+            .collect::<Vec<String>>(),
+        providers,
+        "case {case:?}: expected an entry per provider the daemon deploys onto, got {revision}"
+    );
+    let running: i64 = entries
+        .iter()
+        .map(|entry| count(entry, "runningCount", case))
+        .sum();
+    let without: i64 = entries
+        .iter()
+        .map(|entry| count(entry, "withoutDaemonCount", case))
+        .sum();
+    assert_eq!(
+        (
+            running,
+            without,
+            count(&revision, "totalRunningCount", case),
+            count(&revision, "totalWithoutDaemonCount", case),
+            hosts.len() as i64
+        ),
+        (instances, 0, instances, 0, instances),
+        "case {case:?}: expected the provider counts to add up to the totals of a converged \
+         daemon and to the running tasks, got {revision} against {tasks:?}"
+    );
+
+    // The read REPORTS: repeating it answers the same detail and leaves the daemon, its
+    // rollouts and its tasks exactly as they were.
+    let rollouts = list_deployments(&router, &daemon_arn, case).await.len();
+    for repeat in 0..3 {
+        let again = describe_daemon(&router, &daemon_arn, case).await;
+        assert_eq!(
+            again, daemon,
+            "case {case:?}: read {repeat} answered a detail the first read did not"
+        );
+    }
+    assert_eq!(
+        list_deployments(&router, &daemon_arn, case).await.len(),
+        rollouts,
+        "case {case:?}: expected the reads to mint no rollout"
+    );
+    assert_eq!(
+        running_hosts(&daemon_tasks(&router, row.cluster, "agents", case).await, case),
+        hosts,
+        "case {case:?}: expected the reads to leave the daemon's tasks where they were"
     );
 }
 
