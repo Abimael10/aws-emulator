@@ -37,6 +37,11 @@
 //! the account's own published credential), and the `ConnectionId` the refused call carries (a
 //! live one and a well-formed one nothing holds, plus one that could never have been minted,
 //! which is refused as the malformed request it is).
+//!
+//! The REPORTED resource of a refusal is driven over its own rows, which vary the api, the
+//! Region, the stage and the method the refused call addressed: the account is masked down to
+//! its last four digits whatever addressing resolved the resource, and the whole account id
+//! is in none of those sentences.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -491,6 +496,205 @@ async fn an_unauthorized_call_is_refused_before_the_connection_is_read() {
                 stored.last_active_at
             );
         }
+    }
+}
+
+/// The invoke endpoint host of `api_id` in `region`:
+/// `{api-id}.execute-api.{region}.amazonaws.com`, the form a deployed api's own invoke
+/// endpoint takes and the host an SDK client addressing `@connections` sends.
+fn invoke_host(api_id: &str, region: &str) -> String {
+    format!("{api_id}.execute-api.{region}.amazonaws.com")
+}
+
+/// A resolution that reads the addressing back the way the owner of apis and stages answers
+/// it: the api id and the Region are the invoke endpoint's own labels, and the stage is the
+/// invoke path's prefix. Installing it lets a row address ANY api, Region and stage, so the
+/// rule below is driven over more than one of each.
+fn the_addressed_invoke_url(
+    _engine: &dyn Any,
+    host: Option<&str>,
+    prefix: &str,
+) -> Option<AddressedStage> {
+    let mut labels = host?.split('.');
+    let api_id = labels.next()?;
+    if labels.next()? != "execute-api" {
+        return None;
+    }
+    let region = labels.next()?;
+    let stage_name = prefix.strip_prefix('/')?;
+    (!api_id.is_empty() && !stage_name.is_empty()).then(|| AddressedStage {
+        api_id: api_id.to_string(),
+        region: region.to_string(),
+        stage_name: stage_name.to_string(),
+    })
+}
+
+/// An engine resolving every invoke URL through [`the_addressed_invoke_url`], holding the
+/// seeded session with NO document at all in force on it.
+fn engine_addressing_any_invoke_url() -> Arc<InMemoryEngine> {
+    let engine: Arc<InMemoryEngine> = Arc::new(InMemoryEngine::new());
+    mgmt::state::connections_endpoint_authority(&*engine)
+        .expect("the shared cell lives in this engine")
+        .lock()
+        .install_addressed_stage(the_addressed_invoke_url);
+    given_session(&engine);
+    given_policy(&engine, None);
+    engine
+}
+
+/// The mask an `execute-api` refusal writes in front of the account digits it leaves: a
+/// 12-digit account id keeps its LAST FOUR, so the eight before them are replaced. Spelled
+/// out here rather than taken from the code under test.
+const MASKED_ACCOUNT_PREFIX: &str = "********";
+
+/// How many trailing digits of the account a refusal reports unmasked.
+const UNMASKED_ACCOUNT_DIGITS: usize = 4;
+
+/// The resource a refusal names, read out of the sentence where the clause carrying it ends.
+fn resource_clause_of(message: &str) -> Option<&str> {
+    let (_, after) = message.split_once("on resource: ")?;
+    let (resource, _) = after.split_once(" because")?;
+    Some(resource)
+}
+
+/// One ADDRESSING a refusal is read back from: the api the endpoint serves, the Region that
+/// api was created in, the stage the invoke path names, the method the operation is reached
+/// by, the payload the call sends and the `ConnectionId` it carries.
+struct Addressing {
+    case: &'static str,
+    api_id: &'static str,
+    region: &'static str,
+    stage: &'static str,
+    method: &'static str,
+    payload: &'static [u8],
+    connection_id: &'static str,
+}
+
+/// The addressings span what the rule generalises over: the api the endpoint serves, the
+/// Region it was created in, the stage the invoke path names (including a one-character one),
+/// the method the operation is reached by, and the `ConnectionId` the refused call carried — a
+/// live connection, a well-formed id nothing holds, and tokens of other character classes,
+/// none of which may appear in the resource the refusal reports.
+const ADDRESSINGS: &[Addressing] = &[
+    Addressing {
+        case: "POST on a live connection",
+        api_id: "mp67t4dbd4",
+        region: "us-east-1",
+        stage: "test",
+        method: "POST",
+        payload: b"denied",
+        connection_id: MINTED_IDS[0].1,
+    },
+    Addressing {
+        case: "GET on a well-formed id nothing holds",
+        api_id: "a1b2c3d4e5",
+        region: "us-west-2",
+        stage: "dev",
+        method: "GET",
+        payload: b"",
+        connection_id: MINTED_IDS[1].1,
+    },
+    Addressing {
+        case: "DELETE on a live connection of another Region",
+        api_id: "zqx9plm3rk",
+        region: "eu-west-1",
+        stage: "prod",
+        method: "DELETE",
+        payload: b"",
+        connection_id: MINTED_IDS[0].1,
+    },
+    Addressing {
+        case: "POST on a one-character stage",
+        api_id: "q9",
+        region: "ap-southeast-2",
+        stage: "v",
+        method: "POST",
+        payload: b"push",
+        connection_id: MINTED_IDS[2].1,
+    },
+    Addressing {
+        case: "GET on a token of digits and letters",
+        api_id: "0123456789",
+        region: "ca-central-1",
+        stage: "staging",
+        method: "GET",
+        payload: b"",
+        connection_id: MINTED_IDS[3].1,
+    },
+];
+
+/// The refusal reports the resource with the account masked down to its last four digits —
+/// whatever api, Region, stage, method or `ConnectionId` the refused call addressed — and the
+/// whole account id appears nowhere in the resource it names, which is the point of masking
+/// it: the endpoint does not publish the account to a caller it has just refused.
+#[tokio::test]
+async fn the_reported_resource_masks_all_but_the_last_four_account_digits() {
+    let account = engine::emulator_account_id();
+    let last_four = account
+        .get(account.len().saturating_sub(UNMASKED_ACCOUNT_DIGITS)..)
+        .expect("the account id's last four digits");
+    for &Addressing {
+        case,
+        api_id,
+        region,
+        stage,
+        method,
+        payload,
+        connection_id,
+    } in ADDRESSINGS
+    {
+        let engine = engine_addressing_any_invoke_url();
+        let live = MINTED_IDS[0].1;
+        crate::support::register(&engine, live, "192.0.2.24", "pusher/5", connected_at());
+
+        let host = invoke_host(api_id, region);
+        let (status, headers, body) = call_signed_by(
+            &engine,
+            SESSION_KEY_ID,
+            &host,
+            method,
+            &format!("/{stage}/@connections/{connection_id}"),
+            payload.to_vec(),
+        )
+        .await;
+        assert_eq!(
+            status, 403,
+            "case {case:?}: expected HTTP 403, got {status} {}",
+            rendered(&body)
+        );
+        assert_eq!(
+            error_code(&headers),
+            ACCESS_DENIED,
+            "case {case:?}: expected {ACCESS_DENIED} in x-amzn-errortype, got {}",
+            error_code(&headers)
+        );
+
+        let message = error_message(&body);
+        let expected = format!(
+            "User: {principal} is not authorized to perform: {MANAGE_CONNECTIONS} on resource: \
+             arn:aws:execute-api:{region}:{MASKED_ACCOUNT_PREFIX}{last_four}:{api_id}/{stage}/\
+             {method}/@connections/{{connectionId}} {reason}",
+            principal = session_arn(),
+            reason = no_grant(),
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+
+        let reported = resource_clause_of(&message).unwrap_or_else(|| {
+            panic!("case {case:?}: the refusal must name a resource, got {message:?}")
+        });
+        assert!(
+            !reported.contains(account),
+            "case {case:?}: the reported resource must not carry the whole account id \
+             {account:?}, got {reported:?}"
+        );
+        assert!(
+            !reported.contains(connection_id),
+            "case {case:?}: the reported resource names the route's own parameter, not the \
+             id {connection_id:?} the call carried, got {reported:?}"
+        );
     }
 }
 
