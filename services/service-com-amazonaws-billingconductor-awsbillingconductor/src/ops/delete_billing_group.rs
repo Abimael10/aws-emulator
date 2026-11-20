@@ -11,7 +11,12 @@
 //! `UpdateBillingGroup` claiming that name in the CURRENT billing period is refused
 //! with the reason the model enumerates for it
 //! ([`crate::state::billing_group_already_exists_in_current_billing_period`]), and
-//! only from the next billing period on is the name free.
+//! only from the next billing period on is the name free. The charges and the
+//! memberships the group carried in those periods are kept with it: a delete that names
+//! no billing-period range ends a billing-period-scoped record from the period the call
+//! is made in and never earlier ([`crate::state::BillingPeriodSpan::ending_now`]), so
+//! the group's custom line items and account associations go on applying in the closed
+//! periods they really were in effect in and in none from this one on.
 //!
 //! A group that automatically associates newly added accounts is not deletable while
 //! it does: that is the consolidated billing family's election of one group, so the
@@ -198,7 +203,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // One state method removes the group and everything that only existed
         // because of it: its name-index entry, its account associations (whose
         // accounts become UNMONITORED — they are still linked accounts of the payer
-        // account) and the idempotency entries that named it.
+        // account), the custom line items that applied to it and the associations held
+        // to it — each ended at the current billing period, so the periods the group is
+        // still reported for still report what it carried there — and the idempotency
+        // entries that named it.
         //
         // The lookup above already proved the group is stored, so the removal cannot
         // miss; the record it hands back is the group as it stood, which this

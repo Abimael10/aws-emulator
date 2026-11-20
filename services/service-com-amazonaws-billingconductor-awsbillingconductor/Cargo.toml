@@ -33,5 +33,10 @@ service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = tr
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` file, so a new suite is picked up by
+# adding the file.
+automod = { workspace = true }
+
 [lints]
 workspace = true
