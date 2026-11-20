@@ -229,9 +229,6 @@ pub const DESCRIPTION_AUTHORIZATION_PENDING: &str = "Authorization is still pend
 /// A device authorization that was refused (`access_denied`).
 pub const DESCRIPTION_ACCESS_DENIED: &str = "Access denied";
 
-/// A `deviceCode` past its authorization's own lifetime (`expired_token`).
-pub const DESCRIPTION_EXPIRED_DEVICE_CODE: &str = "Expired device code provided";
-
 /// A `refreshToken` past its own lifetime (`expired_token`).
 pub const DESCRIPTION_EXPIRED_REFRESH_TOKEN: &str = "Expired refresh token provided";
 
@@ -272,10 +269,16 @@ pub const ACCESS_TOKEN_EXPIRES_IN: i32 = 3600;
 /// token has its own lifetime rather than the access token's.
 pub const REFRESH_TOKEN_EXPIRES_IN: i32 = 8 * 3600;
 
-/// How long an expired device authorization is kept before it is reclaimed, so a
-/// client polling a stale device code still gets `ExpiredTokenException` rather
-/// than a bare invalid grant. CHOSEN: one further `expiresIn`.
-pub const EXPIRED_RETENTION: Duration = Duration::from_secs(DEVICE_CODE_EXPIRES_IN as u64);
+/// How long an expired TOKEN THIS SERVICE ISSUED is kept before it is reclaimed,
+/// so a client that presents one back just too late is still told that its token
+/// expired rather than that its grant was never issued. CHOSEN: ten minutes.
+///
+/// It applies to the tokens of a sign-in session only. An unredeemed device
+/// authorization gets no such window: once its own `expiresIn` has elapsed the
+/// record is dropped outright (see
+/// [`ComAmazonawsSsooidcAwsssooidcserviceState::purge_expired_device_authorizations`]),
+/// because the grant it stood for no longer exists for anybody.
+pub const EXPIRED_RETENTION: Duration = Duration::from_secs(10 * 60);
 
 /// The ceiling on how many registrations, device authorizations and access tokens
 /// this store holds: the caps that bound caller-driven growth.
@@ -731,16 +734,33 @@ impl ComAmazonawsSsooidcAwsssooidcserviceState {
             .retain(|_, device_code| live_authorizations.contains_key(device_code));
     }
 
+    /// Drops every device authorization whose advertised `expiresIn` has elapsed,
+    /// with the user-code index entries that pointed at them.
+    ///
+    /// An outlived authorization is dropped the instant its lifetime runs out,
+    /// with no retention window: the authorization grant it stood for has simply
+    /// ceased to exist, so from then on the device code it was handed out under
+    /// resolves to nothing at all and is refused exactly as a device code this
+    /// service never issued is. This is owed by the CLOCK alone — the records
+    /// would be gone at this instant whether or not anybody called.
+    pub fn purge_expired_device_authorizations(&mut self, now: SystemTime) {
+        self.device_auths
+            .retain(|_, authorization| !authorization.is_expired(now));
+        self.drop_orphaned_user_codes();
+    }
+
     /// Reclaims every device authorization that can no longer be exchanged — one
-    /// already redeemed, or one more than [`EXPIRED_RETENTION`] past its
-    /// `expiresIn` — and the user-code index entries that pointed at them. An
-    /// authorization still inside the retention window is kept, so a client
-    /// polling a stale device code is still told its token expired.
+    /// already redeemed, or one past its own `expiresIn` — and the user-code
+    /// index entries that pointed at them.
     pub fn purge_spent_device_authorizations(&mut self, now: SystemTime) {
-        self.device_auths.retain(|_, authorization| {
-            authorization.status != DeviceAuthStatus::Consumed
-                && now < authorization.expires_at() + EXPIRED_RETENTION
-        });
+        self.device_auths
+            .retain(|_, authorization| authorization.status != DeviceAuthStatus::Consumed);
+        self.purge_expired_device_authorizations(now);
+    }
+
+    /// Drops the `userCode` index entries that point at no stored authorization,
+    /// so the index never outlives what it indexes.
+    fn drop_orphaned_user_codes(&mut self) {
         let live = &self.device_auths;
         self.user_codes
             .retain(|_, device_code| live.contains_key(device_code));

@@ -16,9 +16,10 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_ssoadmin_swbexternalservice as identity_center;
 use service_com_amazonaws_ssooidc_awsssooidcservice as ssooidc;
 use ssooidc::state::{
-    ACCESS_TOKEN_EXPIRES_IN, CLIENT_SECRET_LIFETIME, DEVICE_CODE_EXPIRES_IN, DEVICE_CODE_INTERVAL,
-    GRANT_TYPE_AUTHORIZATION_CODE, GRANT_TYPE_DEVICE_CODE, GRANT_TYPE_REFRESH_TOKEN,
-    REFRESH_TOKEN_EXPIRES_IN, TOKEN_TYPE_BEARER,
+    ACCESS_TOKEN_EXPIRES_IN, CLIENT_SECRET_LIFETIME, DESCRIPTION_INVALID_DEVICE_CODE,
+    DEVICE_CODE_EXPIRES_IN, DEVICE_CODE_INTERVAL, GRANT_TYPE_AUTHORIZATION_CODE,
+    GRANT_TYPE_DEVICE_CODE, GRANT_TYPE_REFRESH_TOKEN, REFRESH_TOKEN_EXPIRES_IN,
+    TOKEN_TYPE_BEARER,
 };
 
 /// The region most cases sign for; the region table below varies it.
@@ -1053,16 +1054,82 @@ async fn create_token_answers_each_grant_from_the_state_it_resolves() {
     );
 }
 
-/// RULE: a device authorization past its `expiresIn` is an expired token, whatever
-/// its status — the lifetime is read off the stored record, not off the request.
+/// RULE: a device authorization exists only for the `expiresIn` its
+/// StartDeviceAuthorization advertised; once that lifetime has elapsed the grant is
+/// gone, so the `deviceCode` it was handed out under resolves to nothing and is
+/// refused exactly as a `deviceCode` this service never issued is — the same status,
+/// the same modeled shape, the same OAuth `error` and the same fixed text — and the
+/// record is dropped, so no later call can tell an outlived device code from an
+/// unknown one.
+///
+/// The table varies what the rule generalises over: how far past the lifetime the
+/// stored record is, and which status it stood in when the lifetime ran out (never
+/// approved, approved but never redeemed, refused at the verification page). The
+/// refusal every row is compared against is READ OFF the service — the answer to a
+/// device code nothing ever issued — rather than written out here, so the two cannot
+/// drift apart.
 #[tokio::test]
-async fn a_device_authorization_past_its_lifetime_is_an_expired_token() {
+async fn a_device_authorization_past_its_lifetime_is_an_invalid_grant() {
     let emulator = Emulator::new();
     let (client_id, client_secret) = emulator.registered_client(json!({})).await;
 
-    // Each row ages the stored record by a different amount: one second past the
-    // lifetime, and far past it.
-    for overshoot in [1_u64, 60, 86_400] {
+    let (unknown_status, unknown_body) = emulator
+        .create_token(&json!({
+            "clientId": client_id,
+            "clientSecret": client_secret,
+            "grantType": GRANT_TYPE_DEVICE_CODE,
+            "deviceCode": "a-device-code-this-service-never-issued",
+        }))
+        .await;
+    assert_failure(
+        "a device code this service never issued",
+        unknown_status,
+        &unknown_body,
+        400,
+        "InvalidGrantException",
+        "invalid_grant",
+    );
+    assert_eq!(
+        unknown_body["error_description"].as_str(),
+        Some(DESCRIPTION_INVALID_DEVICE_CODE),
+        "case \"a device code this service never issued\": expected the fixed text \
+         {DESCRIPTION_INVALID_DEVICE_CODE:?}, got {unknown_body}"
+    );
+
+    let rows: [(&str, u64, ssooidc::state::DeviceAuthStatus); 6] = [
+        (
+            "one second past the lifetime, never approved",
+            1,
+            ssooidc::state::DeviceAuthStatus::Pending,
+        ),
+        (
+            "a minute past the lifetime, never approved",
+            60,
+            ssooidc::state::DeviceAuthStatus::Pending,
+        ),
+        (
+            "a day past the lifetime, never approved",
+            86_400,
+            ssooidc::state::DeviceAuthStatus::Pending,
+        ),
+        (
+            "one second past the lifetime, approved but never redeemed",
+            1,
+            ssooidc::state::DeviceAuthStatus::Approved,
+        ),
+        (
+            "a day past the lifetime, approved but never redeemed",
+            86_400,
+            ssooidc::state::DeviceAuthStatus::Approved,
+        ),
+        (
+            "one second past the lifetime, refused at the verification page",
+            1,
+            ssooidc::state::DeviceAuthStatus::Denied,
+        ),
+    ];
+
+    for (case, overshoot, status_when_expired) in rows {
         let (status, started) = emulator
             .start_device_authorization(&json!({
                 "clientId": client_id,
@@ -1070,13 +1137,17 @@ async fn a_device_authorization_past_its_lifetime_is_an_expired_token() {
                 "startUrl": start_url(),
             }))
             .await;
-        assert_eq!(status, 200, "StartDeviceAuthorization answered {started}");
+        assert_eq!(
+            status, 200,
+            "case {case:?}: StartDeviceAuthorization answered {started}"
+        );
         let device_code = text(&started, "deviceCode");
+        let user_code = text(&started, "userCode");
 
         // The wall clock cannot be moved, so the record is aged instead: the
         // handler must read the lifetime off what is stored.
-        let aged = Duration::from_secs(u64::from(u32::try_from(DEVICE_CODE_EXPIRES_IN).expect("positive")) + overshoot);
         {
+            let aged = Duration::from_secs(seconds(DEVICE_CODE_EXPIRES_IN) + overshoot);
             let state = emulator.state();
             let mut store = state.lock();
             let record = store
@@ -1084,23 +1155,40 @@ async fn a_device_authorization_past_its_lifetime_is_an_expired_token() {
                 .get_mut(&device_code)
                 .expect("the record is persisted");
             record.created_at -= aged;
+            record.status = status_when_expired;
         }
 
-        let (status, response) = emulator
-            .create_token(&json!({
-                "clientId": client_id,
-                "clientSecret": client_secret,
-                "grantType": GRANT_TYPE_DEVICE_CODE,
-                "deviceCode": device_code,
-            }))
-            .await;
-        assert_failure(
-            &format!("{overshoot} seconds past the lifetime"),
-            status,
-            &response,
-            400,
-            "ExpiredTokenException",
-            "expired_token",
+        // Presented twice: a polling client that keeps going past the TTL must see
+        // the SAME refusal each time, which it can only do if the expired record is
+        // dropped rather than kept to answer differently.
+        for poll in 1..=2 {
+            let (status, response) = emulator
+                .create_token(&json!({
+                    "clientId": client_id,
+                    "clientSecret": client_secret,
+                    "grantType": GRANT_TYPE_DEVICE_CODE,
+                    "deviceCode": device_code,
+                }))
+                .await;
+            assert_eq!(
+                (status, &response),
+                (unknown_status, &unknown_body),
+                "case {case:?} (poll {poll}): expected the refusal of a device code this \
+                 service never issued ({unknown_status} with {unknown_body}), got {status} \
+                 with {response}"
+            );
+        }
+
+        let state = emulator.state();
+        let store = state.lock();
+        assert!(
+            !store.device_auths.contains_key(&device_code),
+            "case {case:?}: the outlived authorization is still resident in {store:?}"
+        );
+        assert!(
+            !store.user_codes.contains_key(&user_code),
+            "case {case:?}: the outlived authorization's user-code index entry is still \
+             resident in {store:?}"
         );
     }
 }

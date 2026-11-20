@@ -338,6 +338,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rotation nets zero entries, and an unauthenticated caller must learn
         // that its credentials are wrong rather than anything about capacity.
         store.purge_expired_tokens(now);
+        // Drop the device authorizations the clock has already killed. An
+        // authorization grant exists only for the lifetime its
+        // `StartDeviceAuthorization` advertised; once that has elapsed the grant
+        // is gone for everybody, so the record goes with it and the device code
+        // it was handed out under resolves to nothing from then on. This is owed
+        // by the clock alone — the same records would be gone at this instant had
+        // nobody called at all.
+        store.purge_expired_device_authorizations(now);
 
         // The grant the request is built on is settled first, against this
         // service's own records; only then is the caller's credential read.
@@ -383,16 +391,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if authorization.client_id != input.client_id {
                         return Err(invalid_grant(st::DESCRIPTION_INVALID_DEVICE_CODE));
                     }
+                    // An authorization past its own lifetime is no grant at all:
+                    // the reclamation above has already dropped it, so this
+                    // answers the one refusal every unredeemable device code gets
+                    // — unknown, spent, another client's, or outlived — and the
+                    // expiry is not disclosed. `ExpiredTokenException` stays for
+                    // the refresh-token arm below, which presents back a token
+                    // this service itself issued.
                     if authorization.is_expired(now) {
-                        return Err(CreateTokenErrorModeled::ExpiredTokenException(
-                            ExpiredTokenException {
-                                error: Some("expired_token".to_string()),
-                                error_description: Some(
-                                    st::DESCRIPTION_EXPIRED_DEVICE_CODE.to_string(),
-                                ),
-                            },
-                        )
-                        .into());
+                        return Err(invalid_grant(st::DESCRIPTION_INVALID_DEVICE_CODE));
                     }
                     match authorization.status {
                         st::DeviceAuthStatus::Denied => {
