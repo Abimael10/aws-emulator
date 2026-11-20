@@ -906,3 +906,230 @@ async fn an_update_this_service_cannot_apply_is_refused_and_writes_nothing() {
         read_back.body
     );
 }
+
+#[tokio::test]
+async fn record_names_are_unique_within_a_registry_and_not_across_registries() {
+    let (router, _engine) = router();
+    let (registry_id, registry_arn) = ready_registry(
+        &router,
+        "name scope",
+        json!({ "name": "name-scope-registry" }),
+    )
+    .await;
+    let (other_registry_id, _other_registry_arn) = ready_registry(
+        &router,
+        "name scope",
+        json!({ "name": "name-scope-other-registry" }),
+    )
+    .await;
+    let (record_id, _record_arn) = draft_record(&router, "name scope", &registry_id, "alpha").await;
+    let (sibling_id, _sibling_arn) =
+        draft_record(&router, "name scope", &registry_id, "beta").await;
+    // A record of the OTHER registry, holding a name this record is renamed to below: the
+    // scope a record name is unique within is one registry, so that name is free here.
+    let (neighbour_id, _neighbour_arn) =
+        draft_record(&router, "name scope", &other_registry_id, "gamma").await;
+
+    // Rows span the names a rename can ask for and the identifier form the record's
+    // registry is addressed by: a name nothing holds, the name the record already holds,
+    // the name a sibling of the same registry holds (bare id and ARN), and a name only a
+    // record of another registry holds.
+    let rows: Vec<(&str, bool, &str, bool)> = vec![
+        (
+            "a name no record of the registry holds",
+            false,
+            "delta",
+            false,
+        ),
+        ("the name the record already holds", false, "delta", false),
+        (
+            "a name a sibling of the same registry holds",
+            false,
+            "beta",
+            true,
+        ),
+        (
+            "the same clash with the registry given as its ARN",
+            true,
+            "beta",
+            true,
+        ),
+        (
+            "a name only a record of another registry holds",
+            false,
+            "gamma",
+            false,
+        ),
+    ];
+
+    for (case, by_arn, wanted, refused) in rows {
+        let registry = if by_arn {
+            registry_arn.as_str()
+        } else {
+            registry_id.as_str()
+        };
+        let answered =
+            update_record(&router, registry, &record_id, json!({ "name": wanted })).await;
+        if refused {
+            let expected = control::duplicate_record_name_message(wanted, registry);
+            assert_eq!(
+                (
+                    answered.status,
+                    answered.error_code.as_deref(),
+                    answered.message()
+                ),
+                (409, Some("ConflictException"), expected.clone()),
+                "case {case:?}: expected this service's duplicate-name refusal \
+                 ({expected:?}), got {} {:?}",
+                answered.status,
+                answered.body
+            );
+        } else {
+            assert_eq!(
+                (answered.status, answered.str_field("name")),
+                (202, wanted),
+                "case {case:?}: the rename is accepted and answered, got {} {:?}",
+                answered.status,
+                answered.body
+            );
+            let settled = record_reaching(&router, case, &registry_id, &record_id, "DRAFT").await;
+            assert_eq!(
+                settled.str_field("name"),
+                wanted,
+                "case {case:?}: a read reports the renamed record, got {:?}",
+                settled.body
+            );
+        }
+    }
+
+    // No row touched another record: the sibling keeps the name a refused rename asked for,
+    // and the record of the other registry keeps the name an accepted rename took.
+    let sibling = get_record(&router, &registry_id, &sibling_id).await;
+    assert_eq!(
+        sibling.str_field("name"),
+        "beta",
+        "case \"after every rename\": the sibling keeps its own name, got {:?}",
+        sibling.body
+    );
+    let neighbour = get_record(&router, &other_registry_id, &neighbour_id).await;
+    assert_eq!(
+        neighbour.str_field("name"),
+        "gamma",
+        "case \"after every rename\": the record of the other registry is untouched, got \
+         {:?}",
+        neighbour.body
+    );
+}
+
+/// Put a registry into `status` directly in this service's store: only this service's own
+/// asynchronous work reaches `CREATING` and `DELETING`, and neither lasts long enough for a
+/// test to address one of the registry's records while it holds.
+fn set_registry_status(engine: &Arc<engine::InMemoryEngine>, registry_id: &str, status: &str) {
+    let state =
+        engine.state::<control::ComAmazonawsAgentregistrycontrolAgentregistrycontrolState>();
+    let mut state = state.lock();
+    let registry = state
+        .registries
+        .get_mut(registry_id)
+        .expect("the registry the suite created");
+    registry.status = status.to_string();
+    registry.pending = None;
+}
+
+/// One row of the registry-state table: the status the record's registry is in when the
+/// edit arrives, and whether the edit is accepted then.
+struct RegistryStateRow {
+    case: &'static str,
+    registry_status: &'static str,
+    accepted: bool,
+}
+
+#[tokio::test]
+async fn an_edit_of_a_record_is_held_to_its_registry_being_ready() {
+    let (router, engine) = router();
+    let (registry_id, _registry_arn) = ready_registry(
+        &router,
+        "registry state",
+        json!({ "name": "registry-state-registry" }),
+    )
+    .await;
+    let (record_id, _record_arn) =
+        draft_record(&router, "registry state", &registry_id, "held").await;
+
+    // Rows span the statuses a registry can be in when an edit of one of its records
+    // arrives: the two transient ones and the usable one.
+    let rows: Vec<RegistryStateRow> = vec![
+        RegistryStateRow {
+            case: "a registry still being created",
+            registry_status: control::REGISTRY_CREATING,
+            accepted: false,
+        },
+        RegistryStateRow {
+            case: "a registry being deleted",
+            registry_status: control::REGISTRY_DELETING,
+            accepted: false,
+        },
+        RegistryStateRow {
+            case: "a ready registry",
+            registry_status: control::REGISTRY_READY,
+            accepted: true,
+        },
+    ];
+
+    for row in rows {
+        let RegistryStateRow {
+            case,
+            registry_status,
+            accepted,
+        } = row;
+        set_registry_status(&engine, &registry_id, registry_status);
+        let wanted = format!("edited with the registry in {registry_status}");
+        let answered = update_record(
+            &router,
+            &registry_id,
+            &record_id,
+            json!({ "displayName": { "optionalValue": wanted } }),
+        )
+        .await;
+        if accepted {
+            assert_eq!(
+                (answered.status, answered.str_field("status")),
+                (202, "UPDATING"),
+                "case {case:?}: an accepted update reports the asynchronous status, got {} \
+                 {:?}",
+                answered.status,
+                answered.body
+            );
+            let settled = record_reaching(&router, case, &registry_id, &record_id, "DRAFT").await;
+            assert_eq!(
+                settled.str_field("displayName"),
+                wanted,
+                "case {case:?}: the settled record carries the edit, got {:?}",
+                settled.body
+            );
+        } else {
+            assert_eq!(
+                (answered.status, answered.error_code.as_deref()),
+                (409, Some("ConflictException")),
+                "case {case:?}: expected the modelled 409 ConflictException, got {} {:?}",
+                answered.status,
+                answered.body
+            );
+            assert!(
+                answered.message().contains(registry_status),
+                "case {case:?}: the refusal names the status the registry is in, got {:?}",
+                answered.message()
+            );
+            // The refused edit wrote nothing: with the registry usable again the record
+            // still carries the display name it was created with.
+            set_registry_status(&engine, &registry_id, control::REGISTRY_READY);
+            let read_back = get_record(&router, &registry_id, &record_id).await;
+            assert_eq!(
+                read_back.str_field("displayName"),
+                "the display name it was created with",
+                "case {case:?}: a refused update leaves the stored record alone, got {:?}",
+                read_back.body
+            );
+        }
+    }
+}
