@@ -71,7 +71,10 @@ pub(crate) fn delivered_code(sns: &Sns, number: &str) -> String {
 
 /// The status the listing reports for `number`, or `None` when the sandbox does not
 /// hold it — read back over the wire, so only persisted state carries it.
-async fn listed_status(sns: &Sns, number: &str) -> Option<String> {
+///
+/// `pub(crate)` so a sibling suite that asserts which status a registration reached
+/// reads it through the SAME listing call rather than writing a second one.
+pub(crate) async fn listed_status(sns: &Sns, number: &str) -> Option<String> {
     let answer = sns.call("ListSMSSandboxPhoneNumbers", &[]).await;
     assert_eq!(
         answer.status, 200,
