@@ -1770,3 +1770,116 @@ fn the_whole_value_rendering_decides_the_two_ends_independently() {
         );
     }
 }
+
+/// RULE: [`super::any_character_runs_as_a_class`] states a run of repetitions that admits
+/// ANY sequence of characters as the one any-character class — `[\s\S]*`, or `[\s\S]+`
+/// where the run itself demands a character — and copies everything else byte for byte.
+///
+/// The rows span the spellings such a run takes (the dot widened with a newline
+/// alternative, that alternation alone, either order of its two alternatives, the
+/// non-capturing group, the class form itself and its reversed members), where the run
+/// sits (opening, between literals, inside a group, twice in one expression), what the
+/// run demands (`*` throughout, a `+` among them, a lazy marker after it), and the forms
+/// that must be left exactly as declared: a dot repetition with no such neighbour, which
+/// admits no line terminator; a quantifier this does not read (`?`, a counted bound); and
+/// the constructs that can hide a dot or a bracket — a character class, a class whose
+/// first member is a literal bracket, and an escape.
+#[test]
+fn an_unrestricted_character_run_is_stated_as_the_any_character_class() {
+    // (case, the model's pattern, what `any_character_runs_as_a_class` states)
+    let rows: [(&str, &str, &str); 18] = [
+        // The recorded form: a PEM member whose run is a dot repetition widened with a
+        // newline alternative, framed by the two PEM delimiters.
+        (
+            "a dot repetition widened with a newline alternative",
+            r"-----BEGIN CERTIFICATE-----.*(.|\n)*-----END CERTIFICATE-----\n?",
+            r"-----BEGIN CERTIFICATE-----[\s\S]*-----END CERTIFICATE-----\n?",
+        ),
+        ("the newline alternative alone", r"(.|\n)*", r"[\s\S]*"),
+        (
+            "the newline alternative in the other order",
+            r"(\n|.)*",
+            r"[\s\S]*",
+        ),
+        ("a non-capturing group", r"(?:.|\n)*x", r"[\s\S]*x"),
+        ("the class form already", r"[\s\S]*", r"[\s\S]*"),
+        ("the class members in the other order", r"[\S\s]*", r"[\s\S]*"),
+        (
+            "a run that demands a character",
+            r".*(.|\n)+",
+            r"[\s\S]+",
+        ),
+        (
+            "a dot repetition after one that demands a character",
+            r"(.|\n)+.*",
+            r"[\s\S]+",
+        ),
+        ("a run inside a group", r"(.*(.|\n)*)", r"([\s\S]*)"),
+        (
+            "two runs in one expression",
+            r"a(.|\n)*b(.|\n)*c",
+            r"a[\s\S]*b[\s\S]*c",
+        ),
+        (
+            "a lazy marker after the run, which it keeps",
+            r"(.|\n)*?x",
+            r"[\s\S]*?x",
+        ),
+        // A URL member's tail: the dot admits no line terminator, so the class form would
+        // state a wider requirement than the member carries.
+        (
+            "a dot repetition with no such neighbour",
+            r"(http|https)://.*",
+            r"(http|https)://.*",
+        ),
+        (
+            "a dot repetition demanding a character, with no such neighbour",
+            r"a.+b",
+            r"a.+b",
+        ),
+        (
+            "a quantifier this rendering does not read",
+            r"(.|\n)?",
+            r"(.|\n)?",
+        ),
+        (
+            "a counted repetition",
+            r"(.|\n){2,5}",
+            r"(.|\n){2,5}",
+        ),
+        (
+            "a dot inside a character class, which is a literal",
+            r"[.*]*",
+            r"[.*]*",
+        ),
+        (
+            "a literal bracket opening a class, before a run",
+            r"[]|]*.*(.|\n)*",
+            r"[]|]*[\s\S]*",
+        ),
+        (
+            "an escaped dot, which is a literal",
+            r"\.*(.|\n)*",
+            r"\.*[\s\S]*",
+        ),
+    ];
+
+    for (case, pattern, stated) in rows {
+        let actual = super::any_character_runs_as_a_class(pattern);
+        assert_eq!(
+            actual, stated,
+            "case {case:?}: expected any_character_runs_as_a_class {stated:?}, got \
+             {actual:?}"
+        );
+    }
+
+    // An expression with nothing to state is handed back unchanged, the empty one included.
+    for pattern in ["", "[a-z]+", r"^[0-9]{12}$"] {
+        let actual = super::any_character_runs_as_a_class(pattern);
+        assert_eq!(
+            actual, pattern,
+            "case {pattern:?}: an expression carrying no unrestricted run is unchanged, got \
+             {actual:?}"
+        );
+    }
+}

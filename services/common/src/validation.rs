@@ -150,6 +150,10 @@
 //!   wired to this one still decline to drop the pair around a top-level alternation, which
 //!   the recordings show AWS dropping ([`unanchored`] explains why); that difference goes
 //!   away as each is deleted;
+//! * a `@pattern` whose model text spells an unrestricted character run the long way
+//!   printed with the one any-character class the services that publish it use
+//!   ([`any_character_runs_as_a_class`], composed with whichever anchor rendering the
+//!   service states);
 //! * the subject half's one fact a violation cannot carry: WHETHER the member was absent
 //!   or was present with no text rendering of its own, so a service that states
 //!   `Value at '<path>' …` for a present-but-unquotable value can still state
@@ -1820,6 +1824,186 @@ pub fn unanchored_unless_published_as_declared(regex: &str, published_as_declare
         return regex.to_string();
     }
     unanchored_keeping_inner_anchors(regex)
+}
+
+/// The class a published expression spells an unrestricted character run with, and the
+/// repetition of it that demands at least one character.
+const ANY_CHARACTER_RUN: &str = r"[\s\S]*";
+const ANY_CHARACTER_RUN_OF_ONE_OR_MORE: &str = r"[\s\S]+";
+
+/// The atoms that match EVERY character, line terminators included — the class holding a
+/// character class and its complement, and the alternation of the dot with a newline, each
+/// in either order and the group in its capturing and non-capturing forms.
+///
+/// A dot is deliberately absent: it is the one atom of a regular expression that excludes a
+/// line terminator, so it widens a run only beside one of these.
+const EVERY_CHARACTER_ATOMS: &[&str] = &[
+    r"[\s\S]",
+    r"[\S\s]",
+    r"(.|\n)",
+    r"(\n|.)",
+    r"(?:.|\n)",
+    r"(?:\n|.)",
+];
+
+/// The expression with every run that admits ANY sequence of characters spelled as the one
+/// any-character class, for the services whose refusals quote a `@pattern` that way.
+///
+/// A model can spell "any sequence of characters, newlines included" several ways — a dot
+/// repetition widened with a newline alternative (`.*(.|\n)*`, `(.|\n)*`) is one, the class
+/// holding a character class and its complement (`[\s\S]*`) is another — and they describe
+/// the SAME language. A service publishes ONE of them for the member's shape, so a refusal
+/// of a member whose model text takes the long form quotes the class form: what a caller
+/// lifts out of the message and compiles locally is the expression the service advertises,
+/// not the model's spelling of it. A model that already writes the class form anywhere in
+/// its own text (an unbounded PEM member beside a certificate one) is the same expression
+/// written the published way, so nothing changes for it.
+///
+/// What is rewritten is a MAXIMAL run of adjacent repetitions, each repeating either every
+/// character ([`EVERY_CHARACTER_ATOMS`]) or every character except a line terminator (`.`),
+/// at least one of them repeating every character — so the run admits any sequence and the
+/// class form states exactly what it stated. The run is quoted [`ANY_CHARACTER_RUN`] where
+/// every repetition admits the empty run (`*`), and [`ANY_CHARACTER_RUN_OF_ONE_OR_MORE`]
+/// where one of them demands a character (`+`), which is what the run itself demands. A
+/// `.*` or `.+` with no such neighbour is quoted exactly as the model declares it: it
+/// excludes line terminators, so the class form would state a wider requirement than the
+/// member carries.
+///
+/// Everything outside such a run is copied byte for byte — the text is spliced, never
+/// reassembled — so every escape, character class and group of the model's own text reaches
+/// the clause as written, wherever in the expression it sits. A run that the model wrote as
+/// a GROUP stops being one, which changes nothing a caller validates with unless the
+/// expression numbers that group in a backreference.
+///
+/// REPORTED, not ENFORCED, as for every rendering above: the constraint walk keeps applying
+/// the model's trait as written, so which values a service accepts does not change here.
+#[must_use]
+pub fn any_character_runs_as_a_class(regex: &str) -> String {
+    let mut stated = String::with_capacity(regex.len());
+    let mut index = 0_usize;
+    while index < regex.len() {
+        if let Some((end, one_or_more)) = any_character_run(regex, index) {
+            stated.push_str(if one_or_more {
+                ANY_CHARACTER_RUN_OF_ONE_OR_MORE
+            } else {
+                ANY_CHARACTER_RUN
+            });
+            index = end;
+            continue;
+        }
+        let end = past_one_atom(regex, index);
+        stated.push_str(&regex[index..end]);
+        index = end;
+    }
+    stated
+}
+
+/// The run of repetitions `regex` admits any sequence of characters with from `from`: where
+/// it ends, and whether it demands at least one character.
+///
+/// `None` when no such run starts there — including a run of dot repetitions alone, which
+/// admits no line terminator and so is not one.
+fn any_character_run(regex: &str, from: usize) -> Option<(usize, bool)> {
+    let mut index = from;
+    let mut every_character = false;
+    let mut one_or_more = false;
+    while let Some((end, repetition)) = unrestricted_repetition(regex, index) {
+        every_character |= repetition.every_character;
+        one_or_more |= repetition.one_or_more;
+        index = end;
+    }
+    every_character.then_some((index, one_or_more))
+}
+
+/// One repetition of an atom that restricts nothing but, for a dot, the line terminators.
+#[derive(Debug, Clone, Copy)]
+struct UnrestrictedRepetition {
+    /// Whether the atom repeated matches every character ([`EVERY_CHARACTER_ATOMS`]) rather
+    /// than every character except a line terminator (`.`).
+    every_character: bool,
+    /// Whether the repetition demands a character (`+`) rather than admitting the empty run
+    /// (`*`).
+    one_or_more: bool,
+}
+
+/// The [`UnrestrictedRepetition`] `regex` carries at `from` and where it ends, or `None`
+/// when it carries none.
+///
+/// Only `*` and `+` are repetitions here: `?` and a counted `{n,m}` bound the run, so the
+/// expression states a requirement the class form would drop. A `+` on a DOT is declined
+/// for the same reason the dot is not an any-character atom — it would demand a character
+/// the class form admits a line terminator for.
+fn unrestricted_repetition(regex: &str, from: usize) -> Option<(usize, UnrestrictedRepetition)> {
+    let rest = regex.get(from..)?;
+    let (atom, every_character) = EVERY_CHARACTER_ATOMS
+        .iter()
+        .find(|atom| rest.starts_with(**atom))
+        .map(|atom| (atom.len(), true))
+        .or_else(|| rest.starts_with('.').then_some((1, false)))?;
+    match rest.as_bytes().get(atom)? {
+        b'*' => Some((
+            from + atom + 1,
+            UnrestrictedRepetition {
+                every_character,
+                one_or_more: false,
+            },
+        )),
+        b'+' if every_character => Some((
+            from + atom + 1,
+            UnrestrictedRepetition {
+                every_character,
+                one_or_more: true,
+            },
+        )),
+        _ => None,
+    }
+}
+
+/// Where the ONE construct `regex` carries at `from` ends, for text that is copied rather
+/// than rewritten: an escape and the character it escapes, a whole character class, or one
+/// character.
+///
+/// Skipping those two as units is what keeps a dot or a class inside them from being read as
+/// an atom of its own.
+fn past_one_atom(regex: &str, from: usize) -> usize {
+    let rest = &regex[from..];
+    let mut characters = rest.char_indices();
+    let Some((_, first)) = characters.next() else {
+        return regex.len();
+    };
+    match first {
+        '\\' => match characters.next() {
+            Some((offset, escaped)) => from + offset + escaped.len_utf8(),
+            None => regex.len(),
+        },
+        '[' => from + class_length(rest),
+        _ => from + first.len_utf8(),
+    }
+}
+
+/// The length of the character class `text` OPENS with, its brackets included — the whole of
+/// `text` when nothing closes it.
+///
+/// A `]` in the class's first position is the literal bracket rather than its end, and a
+/// leading `^` does not occupy a position: the same reading [`regex_syntax`] applies.
+fn class_length(text: &str) -> usize {
+    let mut escaped = false;
+    let mut seen = 0_usize;
+    for (offset, character) in text.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+            seen += 1;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '^' if seen == 0 => {}
+            ']' if seen == 0 => seen = 1,
+            ']' => return offset + 1,
+            _ => seen += 1,
+        }
+    }
+    text.len()
 }
 
 /// The path of `element_member` on element `position` (0-BASED) of the list member

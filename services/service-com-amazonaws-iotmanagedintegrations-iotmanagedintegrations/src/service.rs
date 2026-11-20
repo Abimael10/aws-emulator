@@ -129,6 +129,14 @@
 //! sits beside the ONE renderer every constrained member of every operation reaches
 //! ([`clause`]), so one rule serves them all.
 //!
+//! The same expression is published with an unrestricted character RUN spelled the one way
+//! this service spells one — the any-character class — whichever of the equivalent forms the
+//! model's text uses: this model writes one unbounded member's run as that class
+//! (`CertificatePem`) and another's as a dot repetition widened with a newline alternative
+//! (`CaCertificate`), and a refusal of the second is recorded quoting the first's spelling.
+//! A dot repetition with no such neighbour admits no line terminator and is quoted as
+//! declared, so no member is told of a wider requirement than it carries.
+//!
 //! Everything else about the clause — which constraint classes exist and how each one
 //! words its requirement — stays the framework's, so a constraint class added there
 //! cannot arrive with a sentence of this service's own.
@@ -520,7 +528,8 @@ fn restated(violation: &Violation) -> Option<Violation> {
 }
 
 /// The `@pattern` of a member as this service PUBLISHES it: the expression itself, without
-/// the whole-value anchors the model writes around it.
+/// the whole-value anchors the model writes around it, and with an unrestricted character
+/// run spelled the way this service spells one.
 ///
 /// Smithy expresses a whole-value match by anchoring the trait text, so the `^` and the `$`
 /// are the model's wrapping rather than part of the expression the service advertises — and
@@ -530,19 +539,33 @@ fn restated(violation: &Violation) -> Option<Violation> {
 /// outside the member's class: the clause quotes the character class and the `+`, with
 /// neither anchor.
 ///
+/// A run that admits ANY sequence of characters is advertised as the single any-character
+/// class, whichever of the equivalent spellings the model's text uses for it: this model
+/// writes one unbounded member's run as that class already (`CertificatePem`) and another's
+/// as a dot repetition widened with a newline alternative (`CaCertificate`), and the
+/// expression this service publishes for both is the class form — recorded on a
+/// `CreateProvisioningProfile` whose `CaCertificate` was not PEM at all, whose clause
+/// quotes the two PEM framings around that class.
+///
 /// REPORTED, not ENFORCED: the constraint walk keeps applying the model's own trait as
 /// written, so nothing about which values this service accepts changes here.
 ///
 /// One reading of the anchor pair for the whole tree
-/// (`service_common::validation::unanchored_keeping_inner_anchors`), rather than a copy per
-/// service: the pair is dropped positionally and only when both ends carry one, an escaped
-/// trailing dollar is a literal the expression keeps, and an expression that anchors its
-/// OWN branches (this model's `SmartHomeResourceType`, an alternation of whole-value
-/// branches) is quoted as the model declares it — dropping its ends' anchors would state a
-/// requirement of neither branch. The service's one recorded pattern clause carries no
-/// anchor of its own, so that reading and the plain drop state it identically.
+/// (`service_common::validation::unanchored_keeping_inner_anchors`), and one of the
+/// character run beside it (`service_common::validation::any_character_runs_as_a_class`),
+/// rather than a copy per service: the pair is dropped positionally and only when both ends
+/// carry one, an escaped trailing dollar is a literal the expression keeps, and an
+/// expression that anchors its OWN branches (this model's `SmartHomeResourceType`, an
+/// alternation of whole-value branches) is quoted as the model declares it — dropping its
+/// ends' anchors would state a requirement of neither branch. The service's one recorded
+/// pattern clause of that class carries no anchor of its own, so that reading and the plain
+/// drop state it identically. The run rendering leaves a dot repetition that admits no line
+/// terminator exactly as declared (this model's `OAuthCompleteRedirectUrl`), since the class
+/// form would state a wider requirement than such a member carries.
 fn published_pattern(modelled: &str) -> String {
-    ::service_common::validation::unanchored_keeping_inner_anchors(modelled)
+    ::service_common::validation::any_character_runs_as_a_class(
+        &::service_common::validation::unanchored_keeping_inner_anchors(modelled),
+    )
 }
 
 /// The listing this service publishes for the enum admitting exactly `declared`, or `None`
