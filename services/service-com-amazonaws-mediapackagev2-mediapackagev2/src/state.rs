@@ -944,7 +944,19 @@ pub struct ChannelGroup {
     /// [`ChannelGroupKey`].
     pub region: String,
     pub arn: String,
+    /// The DNS domain this group's egress is announced under — the value its `EgressDomain`
+    /// member carries, which is a domain NAME and nothing else: no scheme, no port, no path.
+    /// Resolved once by the create ([`announced_egress_domain`]) and stored, so every later
+    /// read of this group reports the same name.
     pub egress_domain: String,
+    /// The `host[:port]` every URL beneath this group is rooted on — its channels' ingest
+    /// endpoints and its endpoints' manifests ([`announced_data_plane_domain`]).
+    ///
+    /// SEPARATE from [`ChannelGroup::egress_domain`] because a URL's authority may carry the
+    /// port this emulator is reached on, which a domain name may not: the two differ exactly
+    /// when the group's plane is announced on one of the emulator's own addresses, and are
+    /// the same published hostname when it is announced in AWS's own DNS.
+    pub data_plane_authority: String,
     pub description: Option<String>,
     pub created_at: ::aws_smithy_types::DateTime,
     pub modified_at: ::aws_smithy_types::DateTime,
@@ -2426,18 +2438,40 @@ fn statement_names_anonymous_principal(statement: &::serde_json::Value) -> bool 
     }
 }
 
-/// The egress domain a channel group is given: the host every manifest URL beneath it
-/// is served from, so all of the group's channels and endpoints share one DNS name.
+/// The egress domain a channel group is given IN AWS'S OWN DNS ZONE: the host every
+/// manifest URL beneath it is served from there, so all of the group's channels and
+/// endpoints share one DNS name.
+///
+/// The zone-parameterised derivation is [`egress_domain_in_zone`]; this is it in the zone AWS
+/// publishes this service's own data plane in, which is the domain announced to a caller that
+/// resolves AWS's own hosts.
+pub fn egress_domain(region: &str, group: &str) -> String {
+    egress_domain_in_zone(region, group, AWS_DNS_ZONE)
+}
+
+/// The egress domain a channel group is given in one DNS `zone`: a DOMAIN NAME and nothing
+/// else — dotted labels, no scheme, no port and no path — so it can be resolved, or handed to
+/// a CDN as an origin domain name, as it stands.
 ///
 /// The two opaque labels are derived from the account and from the group's identity, so
 /// the domain is a function of the resource (stable across reads, distinct per group)
 /// rather than of the moment it was created.
-pub fn egress_domain(region: &str, group: &str) -> String {
+///
+/// Only the ZONE differs between a caller that resolves AWS's own hosts ([`egress_domain`])
+/// and one that resolves nothing but this emulator's own addresses
+/// ([`announced_egress_domain`]); the labels in front of it, which are what name the plane,
+/// the Region and the group, are the same either way — so the one reading of a published host
+/// ([`data_plane_of_host`], [`data_plane_region`]) covers both.
+pub fn egress_domain_in_zone(region: &str, group: &str, zone: &str) -> String {
     let account = ::engine::emulator_account_id();
     let group_label = short_digest(&[account, region, group], 8);
     let account_label = short_digest(&[account], 12);
-    format!("{group_label}.egress.{account_label}.{SIGNING_NAME}.{region}.amazonaws.com")
+    format!("{group_label}.egress.{account_label}.{SIGNING_NAME}.{region}.{zone}")
 }
+
+/// The DNS zone AWS itself publishes this service's endpoints and its per-group data-plane
+/// hostnames in.
+const AWS_DNS_ZONE: &str = "amazonaws.com";
 
 /// The ingest host for a group, derived from the SAME domain egress is served from —
 /// the guarantee the service makes is that both sides of a group share its DNS.
@@ -2600,7 +2634,7 @@ pub fn parse_ingest_path(path: &str) -> Option<IngestTarget> {
 /// publish on, so the pair is distinguished the only way it can be there — by the ordinal
 /// their paths already carry (see [`data_plane_url`]).
 pub fn ingest_endpoints(
-    egress_domain: &str,
+    data_plane_authority: &str,
     region: &str,
     group: &str,
     channel: &str,
@@ -2613,7 +2647,7 @@ pub fn ingest_endpoints(
         .map(|index| IngestEndpoint {
             id: Some(index.to_string()),
             url: Some(data_plane_url(
-                &ingest_endpoint_domain(egress_domain, channel, index),
+                &ingest_endpoint_domain(data_plane_authority, channel, index),
                 region,
                 &format!("/in/v1/{group}/{index}/{channel}/index"),
             )),
@@ -2625,11 +2659,11 @@ pub fn ingest_endpoints(
 /// group's ingest DNS when the group's data plane is announced on the hostnames AWS's own
 /// addressing publishes, and the emulator's own address otherwise — which is the one
 /// address a client on this machine can reach, for every endpoint of every channel.
-fn ingest_endpoint_domain(egress_domain: &str, channel: &str, ordinal: u8) -> String {
-    if data_plane_of_host(egress_domain).is_none() {
-        return egress_domain.to_string();
+fn ingest_endpoint_domain(data_plane_authority: &str, channel: &str, ordinal: u8) -> String {
+    if data_plane_of_host(data_plane_authority).is_none() {
+        return data_plane_authority.to_string();
     }
-    let domain = ingest_domain(egress_domain);
+    let domain = ingest_domain(data_plane_authority);
     // Everything after the group's own first label: the DNS both halves of a group's data
     // plane share, which is what each endpoint's own label is prefixed onto.
     let group_dns = domain
@@ -2682,10 +2716,10 @@ impl ManifestKind {
     }
 }
 
-/// The egress URL of one manifest: the group's announced data-plane domain plus the path
+/// The egress URL of one manifest: the group's announced data-plane authority plus the path
 /// that names the group, the channel, the endpoint and the manifest.
 pub fn manifest_url(
-    egress_domain: &str,
+    data_plane_authority: &str,
     region: &str,
     group: &str,
     channel: &str,
@@ -2694,7 +2728,7 @@ pub fn manifest_url(
     kind: ManifestKind,
 ) -> String {
     data_plane_url(
-        egress_domain,
+        data_plane_authority,
         region,
         &format!(
             "/out/v1/{group}/{channel}/{endpoint}/{manifest_name}{}",
@@ -2703,7 +2737,7 @@ pub fn manifest_url(
     )
 }
 
-/// Where a manifest's URL is rooted: the parent group's announced data-plane domain and
+/// Where a manifest's URL is rooted: the parent group's announced data-plane authority and
 /// the Region it serves, plus the names of the group, the channel and the origin endpoint
 /// the manifest belongs to.
 ///
@@ -2711,7 +2745,7 @@ pub fn manifest_url(
 /// its URL from the same values.
 #[derive(Debug, Clone, Copy)]
 pub struct ManifestLocation<'a> {
-    pub egress_domain: &'a str,
+    pub data_plane_authority: &'a str,
     pub region: &'a str,
     pub group: &'a str,
     pub channel: &'a str,
@@ -2721,7 +2755,7 @@ pub struct ManifestLocation<'a> {
 impl ManifestLocation<'_> {
     fn url(&self, manifest_name: &str, kind: ManifestKind) -> String {
         manifest_url(
-            self.egress_domain,
+            self.data_plane_authority,
             self.region,
             self.group,
             self.channel,

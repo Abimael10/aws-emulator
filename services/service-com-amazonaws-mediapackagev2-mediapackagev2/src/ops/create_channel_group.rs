@@ -317,18 +317,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let name = input.channel_group_name.clone();
         let created_at = crate::state::now();
         let arn = crate::state::channel_group_arn(&region, &name);
-        let egress_domain = crate::state::announced_data_plane_domain(
+        // WHERE this group's data plane is announced, decided once here and stored, in the
+        // two forms a client is handed it in: the `host[:port]` every URL beneath the group
+        // is rooted on, and the DNS domain the group's `EgressDomain` member carries, which
+        // is a domain name and nothing else.
+        let data_plane_authority = crate::state::announced_data_plane_domain(
             ctx.parts(),
             ctx.endpoint().as_str(),
             &region,
             &name,
         );
+        let egress_domain =
+            crate::state::announced_egress_domain(&data_plane_authority, &region, &name);
 
         let mut group = crate::state::ChannelGroup {
             name: name.clone(),
             region: region.clone(),
             arn,
             egress_domain,
+            data_plane_authority,
             description: input.description,
             created_at,
             // A group that has only just been created has never been modified, so both

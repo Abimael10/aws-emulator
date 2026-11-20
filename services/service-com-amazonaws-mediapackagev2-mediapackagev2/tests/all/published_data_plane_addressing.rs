@@ -162,10 +162,15 @@ async fn a_group_publishes_its_data_plane_at_the_address_the_create_reached() {
         let (egress_domain, ingest_url, manifest_url) = fixtures(&emulator, row).await;
 
         if row.emulators_own {
-            assert_eq!(
-                egress_domain, row.authority,
-                "case {label:?}: a caller that reached the emulator's own endpoint must be \
-                 given that endpoint, got {egress_domain:?}"
+            // The group's `EgressDomain` is a DOMAIN, so it is the per-group NAME announced in
+            // the zone that endpoint resolves in rather than the endpoint's authority — judged
+            // through the crate's one reading of that form, which
+            // `announced_addresses_per_operation` owns; what is asserted here is that the URLs,
+            // which may carry a port, carry this address.
+            crate::announced_addresses_per_operation::assert_announced_domain(
+                label,
+                row.authority,
+                &egress_domain,
             );
             // Everything the published hostname carried moves into the path: the plane's
             // own namespace, this service's segment, and the Region the address serves.

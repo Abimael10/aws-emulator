@@ -503,12 +503,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.output_locking_mode,
             &input_type,
         );
-        // The ingest URLs are a function of the parent group's egress domain, this
-        // channel's name and its input type, computed once and stored: a later read
-        // returns these bytes. A channel whose input type receives no ingest of its own
-        // gets none, so none is published and none is reachable.
+        // The ingest URLs are a function of the parent group's announced data-plane
+        // authority, this channel's name and its input type, computed once and stored: a
+        // later read returns these bytes. A channel whose input type receives no ingest of
+        // its own gets none, so none is published and none is reachable.
         let ingest_endpoints = crate::state::ingest_endpoints(
-            &group.egress_domain,
+            &group.data_plane_authority,
             &region,
             &group.name,
             &name,

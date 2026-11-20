@@ -709,7 +709,7 @@ fn a_change_to_any_member_of_an_origin_endpoint_moves_its_entity_tag() {
                     ..CreateHlsManifestConfiguration::default()
                 },
                 ManifestLocation {
-                    egress_domain: "host.example",
+                    data_plane_authority: "host.example",
                     region: "us-west-2",
                     group: "group",
                     channel: "channel",

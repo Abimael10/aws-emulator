@@ -22,9 +22,14 @@
 //!   [`super::egress_domain`] builds — which this plane also claims, host-style.
 //!
 //! The choice is made ONCE, when the channel group is created, and stored as the group's
-//! `EgressDomain`: every URL beneath a group — its channels' ingest endpoints and its
+//! data-plane authority: every URL beneath a group — its channels' ingest endpoints and its
 //! endpoints' manifests — is rooted on that one value, so a group's whole data plane is
 //! announced at one address and a later read reports what the create did.
+//!
+//! A group's `EgressDomain` is the same choice read as a DOMAIN NAME
+//! ([`announced_egress_domain`]): the member is a domain a client resolves, or hands to a CDN
+//! as an origin domain name, so it carries dotted labels and nothing else — no scheme, no
+//! path and, unlike a URL's authority, no port.
 //!
 //! [`addressed_data_plane`] is the inverse, and the only reader of either addressing: it
 //! answers which plane a request addresses, in which Region, at which of AWS's own
@@ -47,8 +52,11 @@ const EGRESS_PATH_SEGMENT: &str = "out";
 /// The first path segment of AWS's own INGEST path (`/in/v1/<group>/<index>/<channel>/…`).
 const INGEST_PATH_SEGMENT: &str = "in";
 
-/// The domain every URL beneath one channel group is announced on, resolved when the group
-/// is created and stored as its `EgressDomain`.
+/// The `host[:port]` ROOT every URL beneath one channel group is built on, resolved when the
+/// group is created and stored as the group's data-plane authority.
+///
+/// A URL may carry the port this emulator is reached on; the group's `EgressDomain` member may
+/// not, so that member reads the same choice as a DOMAIN NAME ([`announced_egress_domain`]).
 ///
 /// See the module docs for the three cases. `parts` is the request that created the group
 /// and `served_base` the base URL [`::smithy_server_runtime::OperationContext::endpoint`]
@@ -62,6 +70,38 @@ pub fn announced_data_plane_domain(
     reached_emulator_endpoint(parts)
         .or_else(|| served_endpoint_authority(served_base))
         .unwrap_or_else(|| egress_domain(region, group))
+}
+
+/// The DNS DOMAIN one channel group's egress is announced under — the value its
+/// `EgressDomain` member carries.
+///
+/// The member is a DOMAIN, so the value is a name and nothing else: dotted labels, no scheme,
+/// no path and no port, which is what lets a client resolve it or hand it to a CDN as an
+/// origin domain name. An `authority` that is already one of the EGRESS hostnames this service
+/// publishes ([`data_plane_of_host`]) IS such a name and is reported as it stands; any
+/// other authority is one of the emulator's own addresses, which carries a port and may be an
+/// IP literal rather than a name at all, so the domain is the per-group name
+/// [`egress_domain_in_zone`] builds in the zone this emulator may announce a name of its own
+/// in (`service_common::data_plane_addressing::announced_zone_of_authority`, the workspace's
+/// one reading of that question) — the loopback zone RFC 6761 reserves when the emulator is
+/// reached at an address, which resolves to the interface it is reached on.
+///
+/// The name carries the same labels the AWS-side one does, so it is a host this service
+/// claims and answers on ([`addressed_data_plane`]) exactly as it claims the published one.
+/// The PORT the emulator may be reached on lives only in the full URLs rooted on the group's
+/// authority ([`announced_data_plane_domain`]), which is where a URL may carry it.
+pub fn announced_egress_domain(authority: &str, region: &str, group: &str) -> String {
+    // The EGRESS half specifically: the group's ingest hostnames are published for a channel's
+    // ingest URLs, and this member names the egress side of the plane, so only an egress
+    // hostname is already the name this answers.
+    if data_plane_of_host(authority) == Some(DataPlane::Egress) {
+        return ::service_common::data_plane_addressing::host_only(authority).to_string();
+    }
+    egress_domain_in_zone(
+        region,
+        group,
+        &::service_common::data_plane_addressing::announced_zone_of_authority(authority),
+    )
 }
 
 /// The EMULATOR'S OWN endpoint this request reached — an address or a loopback name, which

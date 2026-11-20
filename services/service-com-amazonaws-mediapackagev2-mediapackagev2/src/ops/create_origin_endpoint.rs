@@ -404,7 +404,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let egress_domain = group.egress_domain.clone();
+        let data_plane_authority = group.data_plane_authority.clone();
         let group_name = group.name.clone();
         let Some(channel) = group.channels.get_mut(&input.channel_name) else {
             return Err(CreateOriginEndpointErrorModeled::ResourceNotFoundException(
@@ -528,7 +528,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let name = input.origin_endpoint_name.clone();
         let at = crate::state::ManifestLocation {
-            egress_domain: &egress_domain,
+            data_plane_authority: &data_plane_authority,
             region: &region,
             group: &group_name,
             channel: &channel.name,
