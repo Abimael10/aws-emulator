@@ -510,6 +510,273 @@ async fn the_announced_media_type_does_not_change_the_payload() {
     );
 }
 
+/// One call of one operation of this service, as it addresses the wire: the route the
+/// model binds the operation to, the method it binds it with, the body that route requires,
+/// and the status this call answers with.
+struct SurfaceCall {
+    operation: &'static str,
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+    status: u16,
+    /// Whether the operation is bound under `/tags/{resourceArn}` — the one surface that
+    /// does not negotiate, announcing every payload as the generic JSON media type.
+    tagging: bool,
+}
+
+/// EVERY operation this service binds, one call each: the nineteen operations of
+/// `smithy_query(query="digest")`, at the route and method that digest states for each.
+///
+/// Sixteen refusals of an ARN no resource carries, the three listings (which answer a
+/// payload whether or not anything is held) and a create that succeeds — so the sweep spans
+/// both status classes as well as the whole operation surface. `index` makes the created
+/// cluster's name its own, so repeating the sweep for another media type collides with
+/// nothing.
+fn surface(index: usize, absent_cluster: &str, absent_snapshot: &str) -> Vec<SurfaceCall> {
+    let own = |operation, method, path: String, body, status| SurfaceCall {
+        operation,
+        method,
+        path,
+        body,
+        status,
+        tagging: false,
+    };
+    let tagging = |operation, method, path: String, body, status| SurfaceCall {
+        operation,
+        method,
+        path,
+        body,
+        status,
+        tagging: true,
+    };
+    vec![
+        // The listings first: on the first media type of the sweep nothing is held yet, so
+        // each answers its empty page, and on every later one the clusters the create row
+        // below left behind.
+        own("ListClusters", "GET", "/clusters".to_string(), None, 200),
+        own(
+            "ListClusterSnapshots",
+            "GET",
+            "/cluster-snapshots".to_string(),
+            None,
+            200,
+        ),
+        own(
+            "ListPendingMaintenanceActions",
+            "GET",
+            "/pending-actions".to_string(),
+            None,
+            200,
+        ),
+        own(
+            "GetCluster",
+            "GET",
+            format!("/cluster/{}", label(absent_cluster)),
+            None,
+            404,
+        ),
+        own(
+            "UpdateCluster",
+            "PUT",
+            format!("/cluster/{}", label(absent_cluster)),
+            Some(json!({"shardCount": 2})),
+            404,
+        ),
+        own(
+            "DeleteCluster",
+            "DELETE",
+            format!("/cluster/{}", label(absent_cluster)),
+            None,
+            404,
+        ),
+        own(
+            "StartCluster",
+            "POST",
+            format!("/cluster/{}/start", label(absent_cluster)),
+            None,
+            404,
+        ),
+        own(
+            "StopCluster",
+            "POST",
+            format!("/cluster/{}/stop", label(absent_cluster)),
+            None,
+            404,
+        ),
+        own(
+            "CreateClusterSnapshot",
+            "POST",
+            "/cluster-snapshot".to_string(),
+            Some(json!({"clusterArn": absent_cluster, "snapshotName": format!("swept{index}")})),
+            404,
+        ),
+        own(
+            "GetClusterSnapshot",
+            "GET",
+            format!("/cluster-snapshot/{}", label(absent_snapshot)),
+            None,
+            404,
+        ),
+        own(
+            "DeleteClusterSnapshot",
+            "DELETE",
+            format!("/cluster-snapshot/{}", label(absent_snapshot)),
+            None,
+            404,
+        ),
+        own(
+            "CopyClusterSnapshot",
+            "POST",
+            format!("/cluster-snapshot/{}/copy", label(absent_snapshot)),
+            Some(json!({"targetSnapshotName": format!("swept-copy{index}")})),
+            404,
+        ),
+        own(
+            "RestoreClusterFromSnapshot",
+            "POST",
+            format!("/cluster-snapshot/{}/restore", label(absent_snapshot)),
+            Some(json!({"clusterName": format!("swept-restored{index}")})),
+            404,
+        ),
+        own(
+            "GetPendingMaintenanceAction",
+            "GET",
+            format!("/pending-action/{}", label(absent_cluster)),
+            None,
+            404,
+        ),
+        own(
+            "ApplyPendingMaintenanceAction",
+            "POST",
+            "/pending-action".to_string(),
+            // `applyAction` is one of the documented actions and `optInType` one of the
+            // modelled enum's values, so the request holds together and the ARN is what
+            // the call is refused for (`smithy_query(query="operation",
+            // operation="ApplyPendingMaintenanceAction")`).
+            Some(json!({
+                "resourceArn": absent_cluster,
+                "applyAction": "ENGINE_UPDATE",
+                "optInType": "IMMEDIATE",
+            })),
+            404,
+        ),
+        tagging(
+            "TagResource",
+            "POST",
+            format!("/tags/{}", label(absent_cluster)),
+            Some(json!({"tags": {"Project": "lionfish"}})),
+            404,
+        ),
+        tagging(
+            "UntagResource",
+            "DELETE",
+            format!("/tags/{}?tagKeys=Project", label(absent_cluster)),
+            None,
+            404,
+        ),
+        tagging(
+            "ListTagsForResource",
+            "GET",
+            format!("/tags/{}", label(absent_cluster)),
+            None,
+            404,
+        ),
+        own(
+            "CreateCluster",
+            "POST",
+            "/cluster".to_string(),
+            Some(minimal_create(&format!("swept{index}"))),
+            200,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn every_operation_of_this_service_announces_the_negotiated_media_type() {
+    // The rule generalises over the OPERATION, so this sweep is every operation this
+    // service binds rather than a chosen few: each is called at the route the model binds
+    // it to, under each JSON media type a request can name for its own payload (including
+    // naming none), and the media type its answer announces must be the negotiated one —
+    // this service's own `application/x-amz-json-1.1` for a request that named none, the
+    // one the request named otherwise, and the generic JSON media type for the three
+    // operations of the ARN-addressed tagging surface. The recorded cases (a `ListClusters`
+    // 200 and a `ListClusterSnapshots` refusal, neither naming a media type) are two rows
+    // of it.
+    let router = emulator();
+    let absent_cluster = format!(
+        "arn:aws:docdb-elastic:{REGION}:{ACCOUNT}:cluster/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    );
+    let absent_snapshot = format!(
+        "arn:aws:docdb-elastic:{REGION}:{ACCOUNT}:cluster-snapshot/ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb"
+    );
+
+    let named: Vec<(&str, Option<&str>)> = vec![
+        ("naming no media type", None),
+        ("naming the generic JSON media type", Some(GENERIC_JSON)),
+        (
+            "naming another AWS JSON version",
+            Some("application/x-amz-json-1.0"),
+        ),
+    ];
+
+    for (index, (named_case, request_media_type)) in named.into_iter().enumerate() {
+        let negotiated = request_media_type.unwrap_or(DEFAULT_MEDIA_TYPE);
+        let mut announced_own = BTreeSet::new();
+        let mut announced_tagging = BTreeSet::new();
+        let mut swept = BTreeSet::new();
+
+        for row in surface(index, &absent_cluster, &absent_snapshot) {
+            let expected = if row.tagging { GENERIC_JSON } else { negotiated };
+            let case = format!("{} {named_case}", row.operation);
+            let (status, media_type, body) =
+                call(&router, row.method, &row.path, row.body, request_media_type).await;
+            assert_eq!(
+                status, row.status,
+                "case {case:?}: expected HTTP {}, got {status} with {body}",
+                row.status
+            );
+            assert!(
+                !body.is_null(),
+                "case {case:?}: expected a JSON payload to announce, got an empty body"
+            );
+            assert_eq!(
+                media_type.as_deref(),
+                Some(expected),
+                "case {case:?}: expected the media type {expected:?}, got {media_type:?}"
+            );
+            swept.insert(row.operation);
+            if row.tagging {
+                announced_tagging.insert(media_type.unwrap_or_default());
+            } else {
+                announced_own.insert(media_type.unwrap_or_default());
+            }
+        }
+
+        // One media type per surface, over every operation and both status classes: the
+        // sweep cannot pass by announcing a different one per operation.
+        assert_eq!(
+            announced_own,
+            [negotiated.to_string()].into_iter().collect(),
+            "case {named_case:?}: this service's own operations must announce ONE media \
+             type, got {announced_own:?}"
+        );
+        assert_eq!(
+            announced_tagging,
+            [GENERIC_JSON.to_string()].into_iter().collect(),
+            "case {named_case:?}: the tagging surface must announce ONE media type, got \
+             {announced_tagging:?}"
+        );
+        // The surface is the whole modelled one: nineteen operations are bound
+        // (`smithy_query(query="digest")`), so a sweep that quietly stopped covering one
+        // of them fails here rather than passing on the rest.
+        assert_eq!(
+            swept.len(),
+            19,
+            "case {named_case:?}: every bound operation must be swept, got {swept:?}"
+        );
+    }
+}
+
 /// One operation of the ARN-addressed tagging surface, as it addresses an ARN on the wire.
 ///
 /// `tags` travels in the BODY of `TagResource` and `tagKeys` as repeated `@httpQuery`
