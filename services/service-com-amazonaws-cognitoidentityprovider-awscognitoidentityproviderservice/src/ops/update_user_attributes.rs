@@ -316,11 +316,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|pool| pool.apply_attribute_update(&plan, now))
                 .ok_or_else(internal_error)?;
 
-            // A pool that routes its email to a custom sender delivers each code this
-            // update sent by handing it to that function instead of mailing it — one
-            // invocation per message, read back from the codes the write recorded. The
-            // app client is the one the access token was issued to, since this
-            // operation names none.
+            // A pool that routes a medium's messages to a custom sender delivers each code
+            // this update sent by handing it to that function instead of sending it — one
+            // invocation per message, read back from the codes the write recorded, each to
+            // the sender of the medium its own attribute is reached over. The app client is
+            // the one the access token was issued to, since this operation names none.
             let client_id = guard
                 .token(&input.access_token)
                 .map(|record| record.client_id.clone());
@@ -333,10 +333,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let issued = user.outstanding_code(
                         &crate::state::CodePurpose::AttributeVerification(attribute.clone()),
                     )?;
-                    crate::state::lambda_triggers::custom_email::custom_email_sender(
+                    let sender =
+                        crate::state::lambda_triggers::custom_sender::Sender::of_attribute(
+                            attribute,
+                        )?;
+                    crate::state::lambda_triggers::custom_sender::pending(
                         pool,
                         user,
-                        crate::state::lambda_triggers::custom_email::CustomEmailSource::UpdateUserAttribute,
+                        sender,
+                        crate::state::lambda_triggers::custom_sender::Stage::UpdateUserAttribute,
                         crate::state::lambda_triggers::Caller::of(ctx.parts(), client_id.as_deref()),
                         input.client_metadata.as_ref(),
                         &issued.code,
@@ -347,11 +352,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         for invocation in pending {
-            crate::state::lambda_triggers::custom_email::invoke_custom_email_sender(
-                ctx, invocation,
-            )
-            .await
-            .map_err(trigger_failed)?;
+            crate::state::lambda_triggers::custom_sender::invoke(ctx, invocation)
+                .await
+                .map_err(trigger_failed)?;
         }
 
         // Delivery details report the messages this update actually sent, so

@@ -342,6 +342,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::sms_configuration_missing_for_auto_verification(
             &auto_verified_attributes,
             input.sms_configuration.as_ref(),
+            Some(&lambda_config),
         ) {
             return Err(invalid_parameter(
                 crate::state::SMS_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
@@ -415,6 +416,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mfa_configuration,
             input.sms_configuration.as_ref(),
             &auto_verified_attributes,
+            Some(&lambda_config),
         ) {
             return Err(invalid_parameter(
                 crate::state::MFA_SMS_CONFIGURATION_REQUIRED_MESSAGE.to_string(),

@@ -3604,6 +3604,21 @@ pub fn desired_delivery_medium_unaddressed_message(medium: &str, attribute: &str
     format!("No {attribute} provided but desired delivery medium was {medium}")
 }
 
+/// The message an `InvalidParameterException` carries for a request that asks a
+/// message to be delivered over SMS by a pool that has no SMS delivery path at
+/// all ([`UserPool::delivers_sms`]).
+///
+/// A text message leaves a pool either through the caller its `SmsConfiguration`
+/// names or by being handed to the function its `CustomSMSSender` names, and a
+/// pool that configures neither can deliver nothing by SMS — so a request that
+/// asks it to is refused rather than answered with a message nobody could ever
+/// receive.
+///
+/// Fixed text: it names neither the pool nor the medium the request asked for,
+/// the missing configuration being the same one for every such request.
+pub const SMS_DELIVERY_UNCONFIGURED_MESSAGE: &str =
+    "User pool does not have SMS configuration to send messages.";
+
 /// What one submitted attribute does to a stored user
 /// ([`plan_attribute_update`]).
 #[derive(Debug)]

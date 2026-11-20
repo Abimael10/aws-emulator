@@ -9,9 +9,10 @@
 //! of the account's values the pool takes as verified — and a function that failed creates
 //! nobody ([`crate::state::lambda_triggers::pre_sign_up`]).
 //!
-//! A pool carrying a `LambdaConfig.CustomEmailSender` has the INVITATION this create sends
-//! handed to that function instead of mailed, carrying the temporary password it invites its
-//! recipient to sign in with ([`crate::state::lambda_triggers::custom_email`]).
+//! A pool carrying a `LambdaConfig.CustomEmailSender` or `LambdaConfig.CustomSMSSender` has
+//! the INVITATION this create sends over that sender's medium handed to the function it names
+//! instead of being sent by this service, carrying the temporary password it invites its
+//! recipient to sign in with ([`crate::state::lambda_triggers::custom_sender`]).
 //!
 //!
 //! ## Shape of an operation
@@ -288,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // delivered the same way the first one was.
                 self.deliver_invitation(&input, ctx, caller, invitation.as_ref())
                     .await?;
-                return Ok(answer);
+                return Ok(*answer);
             }
             Planned::Create(creating) => creating,
         };
@@ -331,12 +332,12 @@ struct Invitation {
     /// The temporary password the message carries, which is what its recipient signs in
     /// with once.
     temporary_password: String,
+    /// The custom senders this invitation is handed to: the DISTINCT senders of the mediums
+    /// the request asked for whose function the pool configures, since each sender is the
+    /// channel of its own medium and a medium carries one message however many times the
+    /// request names it.
+    senders: ::std::collections::BTreeSet<crate::state::lambda_triggers::custom_sender::Sender>,
 }
-
-/// The user attribute whose stored value an invitation sent by email is addressed to, which
-/// is the medium a pool's custom email sender is the channel of
-/// ([`crate::state::DELIVERY_MEDIUM_ATTRIBUTES`] maps the two to each other).
-const EMAIL_ATTRIBUTE: &str = "email";
 
 /// The `MessageActionType` value that sends no message at all: "set to SUPPRESS to suppress
 /// sending the message" (`AdminCreateUser.MessageAction`).
@@ -348,8 +349,10 @@ enum Planned {
     /// A `RESEND`, answered from the user whose invitation it reset, with the invitation it
     /// sends again.
     Resent {
-        /// The answer the resend owes, rendered from the user it reset.
-        answer: AdminCreateUserOutput,
+        /// The answer the resend owes, rendered from the user it reset. Boxed, so this
+        /// variant stays the size of a pointer beside the create's own boxed decision
+        /// rather than carrying a whole user into every `Planned`.
+        answer: Box<AdminCreateUserOutput>,
         /// The invitation it sends again, or `None` where it sends none.
         invitation: Option<Invitation>,
     },
@@ -412,27 +415,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         // (`AdminCreateUser.MessageAction`), and "specify EMAIL if email will be used to
         // send the welcome message. Specify SMS if the phone number will be used. The
         // default value is SMS" (`AdminCreateUser.DesiredDeliveryMediums`) — so the
-        // invitation travels by email exactly where the request asked for that medium and
-        // asked for a message at all. A pool whose `LambdaConfig` routes its email to a
-        // custom sender delivers it by handing the temporary password it carries to that
-        // function, "this trigger rout[ing] all email notifications from a user pool to a
-        // Lambda function" (`LambdaConfigType$CustomEmailSender`), which is the one channel
-        // this emulator carries a message over.
-        let invited_by_email = input
+        // invitation travels over each medium the request asked for, where it asked for a
+        // message at all. A pool whose `LambdaConfig` routes a medium's messages to a custom
+        // sender delivers it by handing the temporary password it carries to that function —
+        // `CustomEmailSender` "rout[ing] all email notifications from a user pool to a
+        // Lambda function" and `CustomSMSSender` "all SMS notifications ... to a Lambda
+        // function that delivers the message using custom logic" (this service's model) —
+        // which is the one channel this emulator carries a message over. The senders are the
+        // DISTINCT senders of the mediums asked for — a medium is one channel however many
+        // times the list names it, so the invitation is handed over once per medium — and
+        // there are two mediums in all ([`crate::state::DELIVERY_MEDIUM_ATTRIBUTES`]), so
+        // what this create hands over is bounded by them rather than by the request's size.
+        let sends_message = input.message_action.as_deref() != Some(SUPPRESS_MESSAGE);
+        let requested_mediums = input
             .desired_delivery_mediums
-            .as_deref()
-            .is_some_and(|mediums| {
-                mediums.iter().any(|medium| {
-                    crate::state::medium_destination_attribute(medium) == Some(EMAIL_ATTRIBUTE)
-                })
-            });
-        let delivers_invitation = invited_by_email
-            && input.message_action.as_deref() != Some(SUPPRESS_MESSAGE)
-            && pool
-                .lambda_config
-                .custom_email_sender
-                .as_ref()
-                .is_some_and(|configured| !configured.lambda_arn.is_empty());
+            .clone()
+            .unwrap_or_default();
+        let senders: ::std::collections::BTreeSet<
+            crate::state::lambda_triggers::custom_sender::Sender,
+        > = requested_mediums
+            .iter()
+            .filter_map(|medium| {
+                crate::state::lambda_triggers::custom_sender::Sender::of_medium(medium)
+            })
+            .filter(|sender| sender.configured_function(pool).is_some())
+            .collect();
+        let delivers_invitation = sends_message && !senders.is_empty();
         // The credential the invitation carries: the one the request submitted, or — "if you
         // don't specify a value, Amazon Cognito generates one for you"
         // (`AdminCreateUser.TemporaryPassword`) — one the pool mints itself
@@ -538,6 +546,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
             }
         }
 
+        // An address is not a delivery path: the POOL has to be able to send over the
+        // medium the request asked for. A text message leaves a pool only through the
+        // caller its `SmsConfiguration` names or by being handed to the function its
+        // `CustomSMSSender` names ([`crate::state::UserPool::delivers_sms`]), so a pool
+        // that configures neither can deliver nothing by SMS, and a create that asks it
+        // to send the invitation that way asks for a message whose recipient could never
+        // receive it — the temporary password it carries would be a credential nobody
+        // holds. Refused before anything is written, so no user exists owing a password
+        // that was never delivered.
+        //
+        // Asked only of a request that SENDS a message: `MessageAction` `SUPPRESS`
+        // "suppress[es] sending the message" (`AdminCreateUser.MessageAction`), so it
+        // needs no delivery path at all, and neither does a create that names no medium.
+        if sends_message
+            && !pool.delivers_sms()
+            && requested_mediums.iter().any(|medium| {
+                crate::state::medium_destination_attribute(medium)
+                    == Some(crate::state::PHONE_NUMBER_VERIFIED_ATTRIBUTE)
+            })
+        {
+            return Err(invalid_parameter(
+                crate::state::SMS_DELIVERY_UNCONFIGURED_MESSAGE.to_string(),
+            ));
+        }
+
         // "The username can't be a duplicate of another username in the same user
         // pool ... You can only provide a value if usernames are a valid sign-in
         // attribute for your user pool. If your user pool only supports phone
@@ -605,14 +638,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
             let username = existing.username.clone();
             let stored = existing.to_user_type();
             return Ok(Planned::Resent {
-                answer: AdminCreateUserOutput {
+                answer: Box::new(AdminCreateUserOutput {
                     user: Some(stored),
-                },
+                }),
                 invitation: temporary_password
                     .filter(|_| delivers_invitation)
                     .map(|temporary_password| Invitation {
                         username,
                         temporary_password,
+                        senders: senders.clone(),
                     }),
             });
         }
@@ -749,20 +783,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
                 .map(|temporary_password| Invitation {
                     username: user.username.clone(),
                     temporary_password,
+                    senders,
                 }),
             user,
             dispatch,
         })))
     }
 
-    /// Deliver `invitation`, which on a pool that routes its email to a custom sender means
-    /// handing the temporary password it carries to the configured function.
+    /// Deliver `invitation`, which on a pool that routes a medium's messages to a custom
+    /// sender means handing the temporary password it carries to the configured function —
+    /// one invocation per medium the create asked for.
     ///
     /// Called with this service's lock RELEASED, and with the account the invitation is for
     /// already stored: the message reports the user as the create or resend left it, and
     /// nothing else of this service waits on the function being invoked. A request that
-    /// sends no invitation, and a pool that configures no custom email sender, hand over
-    /// nothing.
+    /// sends no invitation, and a pool that configures no custom sender for the mediums it
+    /// asked for, hand over nothing.
     async fn deliver_invitation(
         &self,
         input: &AdminCreateUserInput,
@@ -776,18 +812,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
-        crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
-            ctx,
-            &state,
-            &input.user_pool_id,
-            &invitation.username,
-            crate::state::lambda_triggers::custom_email::CustomEmailSource::AdminCreateUser,
-            caller,
-            input.client_metadata.as_ref(),
-            &invitation.temporary_password,
-        )
-        .await
-        .map_err(trigger_failed)
+        for sender in &invitation.senders {
+            crate::state::lambda_triggers::custom_sender::fire(
+                ctx,
+                &state,
+                &input.user_pool_id,
+                &invitation.username,
+                *sender,
+                crate::state::lambda_triggers::custom_sender::Stage::AdminCreateUser,
+                caller,
+                input.client_metadata.as_ref(),
+                &invitation.temporary_password,
+            )
+            .await
+            .map_err(trigger_failed)?;
+        }
+        Ok(())
     }
 
     /// Store the account `creating` decided, as the pool's pre-sign-up function left it, and

@@ -234,17 +234,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of this service can be served while a function is being waited for.
         let issued = self.write_update(&input)?;
 
-        // A pool that routes its email to a custom sender delivers each code this
-        // update sent by handing it to that function instead of mailing it — one
-        // invocation per message. This operation is authorized by IAM credentials
-        // and names no app client, so the event reports none.
+        // A pool that routes a medium's messages to a custom sender delivers each code
+        // this update sent by handing it to that function instead of sending it — one
+        // invocation per message, each to the sender of the medium its own attribute is
+        // reached over. This operation is authorized by IAM credentials and names no app
+        // client, so the event reports none.
         for code in issued {
-            crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+            crate::state::lambda_triggers::custom_sender::fire_over_medium(
                 ctx,
                 &state,
                 &input.user_pool_id,
                 &code.username,
-                crate::state::lambda_triggers::custom_email::CustomEmailSource::UpdateUserAttribute,
+                &code.medium,
+                crate::state::lambda_triggers::custom_sender::Stage::UpdateUserAttribute,
                 crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
                 input.client_metadata.as_ref(),
                 &code.code,
@@ -257,10 +259,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// One issued code and the stored user it was issued to.
+/// One issued code, the stored user it was issued to and the medium its message travelled
+/// over, which is what decides the custom sender it is handed to.
 struct IssuedCode {
     username: String,
     code: String,
+    /// The `DeliveryMediumType` the message travelled over, read off the attribute it was
+    /// addressed to ([`crate::state::delivery_medium`]).
+    medium: String,
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminUpdateUserAttributes<Eng> {
@@ -338,6 +344,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminUpdateUserAt
                 Some(IssuedCode {
                     username: user.username.clone(),
                     code: issued.code.clone(),
+                    medium: crate::state::delivery_medium(attribute)
+                        .unwrap_or_default()
+                        .to_string(),
                 })
             })
             .collect())

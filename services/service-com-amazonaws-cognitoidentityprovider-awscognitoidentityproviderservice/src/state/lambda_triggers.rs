@@ -56,9 +56,17 @@ use ::serde_json::{Map, Value};
 
 use super::{User, UserPool};
 
-/// The custom email sender trigger, whose configured function every code-bearing message of
-/// a pool that configures one is routed to instead of being mailed.
+/// The custom EMAIL sender trigger's own identity, whose configured function every email
+/// message of a pool that configures one is routed to instead of being mailed.
 pub mod custom_email;
+
+/// The custom sender machinery both senders share: the event, the encrypted code and the
+/// invocation a pool that routes a medium's messages to a function owes.
+pub mod custom_sender;
+
+/// The custom SMS sender trigger's own identity, whose configured function every text
+/// message of a pool that configures one is routed to instead of being texted.
+pub mod custom_sms;
 
 /// The encrypted message a custom sender's code travels in.
 pub mod esdk;

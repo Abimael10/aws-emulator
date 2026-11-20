@@ -490,23 +490,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> InitiateAuth<Eng>
             }
             USER_AUTH => {
                 // The code is minted under this service's lock, which this statement owns
-                // and releases: the pool's custom email sender is invoked on no lock at
-                // all, like every other trigger of this service.
+                // and releases: the pool's custom sender is invoked on no lock at all, like
+                // every other trigger of this service.
                 let (answer, issued) = email_otp_sign_in(
                     &mut state.lock(),
                     &input.client_id,
                     &auth_parameters,
                     now,
                 )?;
-                // A pool that routes its email to a custom sender delivers this one-time
-                // password by handing it to that function instead of mailing it.
+                // A pool that routes a medium's messages to a custom sender delivers this
+                // one-time password by handing it to that function instead of sending it.
                 if let Some(issued) = issued {
-                    crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+                    crate::state::lambda_triggers::custom_sender::fire_over_attribute(
                         ctx,
                         &state,
                         &issued.user_pool_id,
                         &issued.username,
-                        crate::state::lambda_triggers::custom_email::CustomEmailSource::Authentication,
+                        &issued.attribute,
+                        crate::state::lambda_triggers::custom_sender::Stage::Authentication,
                         caller,
                         client_metadata,
                         &issued.code,
@@ -792,7 +793,9 @@ async fn password_sign_in(
             let (challenge_name, challenge_parameters, code) =
                 crate::state::second_factor_challenge(&username, &factor)
                     .ok_or_else(internal_error)?;
-            let delivered = code.as_ref().map(|code| code.code.clone());
+            let delivered = code
+                .as_ref()
+                .map(|code| (code.code.clone(), code.attribute.clone()));
             let session = store.lock().start_session(
                 now,
                 crate::state::AuthSession {
@@ -811,18 +814,19 @@ async fn password_sign_in(
                     code,
                 },
             );
-            // A pool that routes its email to a custom sender delivers an emailed
-            // one-time password by handing it to that function instead of mailing
-            // it, as the email challenge of the choice-based flow does.
-            if let Some(delivered) =
-                delivered.filter(|_| challenge_name == crate::state::EMAIL_OTP_CHALLENGE)
-            {
-                crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+            // A pool that routes a medium's messages to a custom sender delivers
+            // a one-time password it sent over that medium by handing it to the
+            // configured function instead of sending it, as the challenge of the
+            // choice-based flow does. Which sender receives it is decided by the
+            // attribute the challenge addressed its message to.
+            if let Some((delivered, attribute)) = delivered {
+                crate::state::lambda_triggers::custom_sender::fire_over_attribute(
                     ctx,
                     store,
                     &user_pool_id,
                     &username,
-                    crate::state::lambda_triggers::custom_email::CustomEmailSource::Authentication,
+                    &attribute,
+                    crate::state::lambda_triggers::custom_sender::Stage::Authentication,
                     caller,
                     client_metadata,
                     &delivered,
@@ -1083,12 +1087,14 @@ fn email_otp_sign_in(
     // second challenge gets its own session and its own code.
     let code = crate::state::VerificationCode::issued_email_otp(EMAIL, &destination, now);
     let delivery = code.delivery_details();
-    // The code itself is handed to the pool's custom email sender, which on a pool that
-    // configures one is the only place this one-time password is delivered at all.
+    // The code itself is handed to the custom sender of the medium it travelled over,
+    // which on a pool that configures one is the only place this one-time password is
+    // delivered at all.
     let issued = IssuedCode {
         user_pool_id: user_pool_id.clone(),
         username: stored_username.clone(),
         code: code.code.clone(),
+        attribute: code.attribute.clone(),
     };
     let session = state.start_session(
         now,
@@ -1132,11 +1138,15 @@ fn email_otp_sign_in(
     ))
 }
 
-/// One issued code and the stored user it was issued to.
+/// One issued code, the stored user it was issued to and the attribute its message was
+/// addressed to, which is what decides the custom sender it is handed to.
 struct IssuedCode {
     user_pool_id: String,
     username: String,
     code: String,
+    /// The user attribute the message was addressed to, whose medium names the sender
+    /// ([`crate::state::lambda_triggers::custom_sender::Sender::of_attribute`]).
+    attribute: String,
 }
 
 /// `AuthFlow=REFRESH_TOKEN_AUTH` and its `REFRESH_TOKEN` alias: "Receive new ID and

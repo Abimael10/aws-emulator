@@ -211,17 +211,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // served while a function is being waited for.
         let issued = self.begin_reset(&input)?;
 
-        // A pool that routes its email to a custom sender delivers this code by handing
-        // it to that function instead of mailing it. It is the same password-reset code
-        // `ForgotPassword` sends, so it is delivered under that stage's source; this
-        // operation is authorized by IAM credentials and names no app client, so the
-        // event reports none.
-        crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+        // A pool that routes a medium's messages to a custom sender delivers this code by
+        // handing it to that function instead of sending it. It is the same password-reset
+        // code `ForgotPassword` sends, so it is delivered under that stage's source, to the
+        // sender of the medium the reset message travelled over; this operation is
+        // authorized by IAM credentials and names no app client, so the event reports none.
+        crate::state::lambda_triggers::custom_sender::fire_over_medium(
             ctx,
             &state,
             &input.user_pool_id,
             &issued.username,
-            crate::state::lambda_triggers::custom_email::CustomEmailSource::ForgotPassword,
+            &issued.medium,
+            crate::state::lambda_triggers::custom_sender::Stage::ForgotPassword,
             crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
             input.client_metadata.as_ref(),
             &issued.code,
@@ -235,10 +236,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// One issued code and the stored user it was issued to.
+/// One issued code, the stored user it was issued to and the medium its message travelled
+/// over, which is what decides the custom sender it is handed to.
 struct IssuedCode {
     username: String,
     code: String,
+    /// The `DeliveryMediumType` the message travelled over, read off the attribute it was
+    /// addressed to ([`crate::state::delivery_medium`]).
+    medium: String,
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminResetUserPassword<Eng> {
@@ -323,6 +328,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminResetUserPas
 
         Ok(IssuedCode {
             username,
+            medium: crate::state::delivery_medium(&stored.attribute)
+                .unwrap_or_default()
+                .to_string(),
             code: stored.code,
         })
     }

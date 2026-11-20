@@ -279,29 +279,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             let details = stored.delivery_details();
 
-            // A pool that routes its email to a custom sender delivers this code by
-            // handing it to that function instead of mailing it. The event is built from
-            // the pool and the user as this call left them, under the lock they are read
-            // from; the app client is the one the access token was issued to, since this
-            // operation names none.
+            // A pool that routes a medium's messages to a custom sender delivers this code
+            // by handing it to that function instead of sending it — the sender of the
+            // medium the attribute this code verifies is reached over. The event is built
+            // from the pool and the user as this call left them, under the lock they are
+            // read from; the app client is the one the access token was issued to, since
+            // this operation names none.
             let client_id = guard
                 .token(&input.access_token)
                 .map(|record| record.client_id.clone());
             let pool = guard.pool(&user_pool_id).ok_or_else(internal_error)?;
             let user = pool.user(&username).ok_or_else(internal_error)?;
-            let pending = crate::state::lambda_triggers::custom_email::custom_email_sender(
-                pool,
-                user,
-                crate::state::lambda_triggers::custom_email::CustomEmailSource::VerifyUserAttribute,
-                crate::state::lambda_triggers::Caller::of(ctx.parts(), client_id.as_deref()),
-                input.client_metadata.as_ref(),
-                &stored.code,
-            );
+            let pending = crate::state::lambda_triggers::custom_sender::Sender::of_attribute(
+                &stored.attribute,
+            )
+            .and_then(|sender| {
+                crate::state::lambda_triggers::custom_sender::pending(
+                    pool,
+                    user,
+                    sender,
+                    crate::state::lambda_triggers::custom_sender::Stage::VerifyUserAttribute,
+                    crate::state::lambda_triggers::Caller::of(ctx.parts(), client_id.as_deref()),
+                    input.client_metadata.as_ref(),
+                    &stored.code,
+                )
+            });
             (details, pending)
         };
 
         if let Some(pending) = pending {
-            crate::state::lambda_triggers::custom_email::invoke_custom_email_sender(ctx, pending)
+            crate::state::lambda_triggers::custom_sender::invoke(ctx, pending)
                 .await
                 .map_err(trigger_failed)?;
         }

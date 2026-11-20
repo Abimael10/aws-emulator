@@ -596,9 +596,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                     .ok_or_else(mfa_method_not_found)?;
                 let challenge_parameters =
                     crate::state::mfa_challenge_parameters(&username, &started);
-                let delivered = started.code.as_ref().map(|code| code.code.clone()).filter(
-                    |_| started.challenge_name == crate::state::EMAIL_OTP_CHALLENGE,
-                );
+                let delivered = started
+                    .code
+                    .as_ref()
+                    .map(|code| (code.code.clone(), code.attribute.clone()));
                 let validity = guard
                     .pool(&input.user_pool_id)
                     .and_then(|pool| pool.clients.get(&input.client_id))
@@ -633,7 +634,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                         authentication_result: None,
                         available_challenges: None,
                     }),
-                    delivered: delivered.map(|code| (username, code)),
+                    delivered: delivered.map(|(code, attribute)| (username, code, attribute)),
                 };
             }
             if session.challenge_name != NEW_PASSWORD_REQUIRED {
@@ -676,17 +677,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                 generation,
             } => (username, generation),
             Answered::Next { output, delivered } => {
-                // A pool that routes its email to a custom sender delivers the one-time
-                // password of the challenge this answer STARTED by handing it to that
-                // function instead of mailing it, as the sign-in does for the challenge it
-                // starts itself.
-                if let Some((username, code)) = delivered {
-                    crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+                // A pool that routes a medium's messages to a custom sender delivers the
+                // one-time password of the challenge this answer STARTED by handing it to
+                // that function instead of sending it, as the sign-in does for the
+                // challenge it starts itself. Which sender receives it is decided by the
+                // attribute the challenge addressed its message to.
+                if let Some((username, code, attribute)) = delivered {
+                    crate::state::lambda_triggers::custom_sender::fire_over_attribute(
                         ctx,
                         &state,
                         &input.user_pool_id,
                         &username,
-                        crate::state::lambda_triggers::custom_email::CustomEmailSource::Authentication,
+                        &attribute,
+                        crate::state::lambda_triggers::custom_sender::Stage::Authentication,
                         crate::state::lambda_triggers::Caller::of(ctx.parts(), None),
                         input.client_metadata.as_ref(),
                         &code,
@@ -762,10 +765,12 @@ enum Answered {
     },
     /// The answer satisfied one challenge and left the NEXT one outstanding, so
     /// the caller gets that challenge rather than tokens — beside the one-time
-    /// password it delivered, if any, and the user it was delivered to.
+    /// password it delivered, if any, the user it was delivered to and the
+    /// attribute it was addressed to, which names the custom sender it is handed
+    /// to.
     Next {
         output: Box<AdminRespondToAuthChallengeOutput>,
-        delivered: Option<(String, String)>,
+        delivered: Option<(String, String, String)>,
     },
 }
 

@@ -367,21 +367,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
         .map_err(trigger_failed)?;
         let registered = self.store(planned, &decision)?;
 
-        // A pool that routes its email to a custom sender delivers this sign-up's code by
-        // handing it to that function instead of mailing it, with the app client the
-        // registration was made through as the event's caller. A sign-up that sent no code
-        // at all — the pool verifies nothing the user holds a value for — hands over
-        // nothing either.
+        // A pool that routes a medium's messages to a custom sender delivers this sign-up's
+        // code by handing it to that function instead of sending it, with the app client the
+        // registration was made through as the event's caller. Which sender receives it is
+        // decided by the medium the code travelled over — the attribute it was addressed to.
+        // A sign-up that sent no code at all — the pool verifies nothing the user holds a
+        // value for — hands over nothing either.
         if let Some(issued_code) = registered.issued_code {
-            crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+            crate::state::lambda_triggers::custom_sender::fire_over_medium(
                 ctx,
                 &state,
                 &registered.user_pool_id,
                 &registered.username,
-                crate::state::lambda_triggers::custom_email::CustomEmailSource::SignUp,
+                &issued_code.medium,
+                crate::state::lambda_triggers::custom_sender::Stage::SignUp,
                 caller,
                 input.client_metadata.as_ref(),
-                &issued_code,
+                &issued_code.code,
             )
             .await
             .map_err(trigger_failed)?;
@@ -392,7 +394,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
 }
 
 /// What a completed registration left behind: the answer it owes its caller, which pool
-/// and user it wrote, and the code it issued for the pool's custom email sender to
+/// and user it wrote, and the code it issued for the pool's custom sender to
 /// deliver.
 struct Registered {
     /// The answer this registration owes, rendered from the stored user.
@@ -402,7 +404,17 @@ struct Registered {
     /// The STORED username of that user, however the request named it.
     username: String,
     /// The code this sign-up issued, or `None` where it sent no message at all.
-    issued_code: Option<String>,
+    issued_code: Option<IssuedCode>,
+}
+
+/// One issued code and the medium its message travelled over, which is what decides the
+/// custom sender it is handed to.
+struct IssuedCode {
+    /// The code itself, which the custom sender is the only recipient of.
+    code: String,
+    /// The `DeliveryMediumType` the message travelled over, read off the attribute it was
+    /// addressed to ([`crate::state::delivery_medium`]).
+    medium: String,
 }
 
 /// What a registration DECIDED before anything was stored: the account it would store, where
@@ -748,9 +760,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> SignUp<Eng> {
         let code_delivery_details = issued
             .as_ref()
             .and_then(crate::state::VerificationCode::delivery_details);
-        // The code itself is handed to the pool's custom email sender, which on a pool
-        // that configures one is the only place this code is delivered at all.
-        let issued_code = issued.map(|code| code.code);
+        // The code itself is handed to the custom sender of the medium it travelled over,
+        // which on a pool that configures one is the only place this code is delivered at
+        // all.
+        let issued_code = issued.map(|code| IssuedCode {
+            medium: crate::state::delivery_medium(&code.attribute)
+                .unwrap_or_default()
+                .to_string(),
+            code: code.code,
+        });
 
         // Read back from the STORED user, so the response reports what a later read of
         // this pool reports.

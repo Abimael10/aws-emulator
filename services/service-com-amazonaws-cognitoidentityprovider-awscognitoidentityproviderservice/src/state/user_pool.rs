@@ -1236,14 +1236,14 @@ impl UserPool {
 
     /// Whether this pool can send an SMS message at all.
     ///
-    /// A text message leaves the pool through the caller its `SmsConfiguration`
-    /// names — the Amazon SNS caller role or the Amazon Web Services End User
-    /// Messaging configuration — which is the ONE reading of that question
-    /// ([`names_an_sms_caller`]). A pool whose configuration names neither, and a
-    /// pool that stores no configuration at all, have nobody to send through, so
-    /// nothing they would deliver by SMS can be delivered.
+    /// A text message leaves the pool over one of the two paths a pool can
+    /// configure for one — the caller its `SmsConfiguration` names or the
+    /// function its `CustomSMSSender` names — which is the ONE reading of that
+    /// question ([`names_an_sms_delivery_path`]). A pool that configures neither
+    /// has nobody to send through and nobody to hand the message to, so nothing
+    /// it would deliver by SMS can be delivered.
     pub fn delivers_sms(&self) -> bool {
-        names_an_sms_caller(self.sms_configuration.as_ref())
+        names_an_sms_delivery_path(self.sms_configuration.as_ref(), Some(&self.lambda_config))
     }
 
     /// Whether `factor` is a first authentication factor this pool admits:

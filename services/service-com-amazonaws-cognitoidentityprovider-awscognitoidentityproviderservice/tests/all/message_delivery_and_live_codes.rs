@@ -426,10 +426,19 @@ async fn stored_attributes(
 async fn a_requested_delivery_medium_needs_the_attribute_that_addresses_it() {
     let engine = engine();
     let setup = router(&engine, false);
+    // The pool carries an SMS delivery path, so each row below is decided by the
+    // ADDRESSING rule alone: a pool with no `SmsConfiguration` and no `CustomSMSSender`
+    // refuses an SMS delivery outright, whatever address the request carries
+    // (`crate::sms_delivery_path`, the suite that owns that rule).
     let (user_pool_id, _client_id) = pool_with_client(
         &setup,
         "delivery-mediums",
-        &json!({ "AutoVerifiedAttributes": ["email"] }),
+        &json!({
+            "AutoVerifiedAttributes": ["email"],
+            "SmsConfiguration": {
+                "SnsCallerArn": "arn:aws:iam::000000000000:role/service-role/cognito-sms",
+            },
+        }),
     )
     .await;
 

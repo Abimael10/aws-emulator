@@ -301,18 +301,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResendConfirmatio
         // served while a function is being waited for.
         let resent = self.resend(input)?;
 
-        // A pool that routes its email to a custom sender delivers this code by handing
-        // it to that function instead of mailing it, with the app client this request
-        // named as the event's caller. A request that issued no code at all — one naming
+        // A pool that routes a medium's messages to a custom sender delivers this code by
+        // handing it to that function instead of sending it, with the app client this
+        // request named as the event's caller. Which sender receives it is decided by the
+        // medium the code travelled over. A request that issued no code at all — one naming
         // a user the pool does not hold, answered with a simulated delivery — hands over
         // nothing either.
         if let Some(issued) = resent.issued {
-            crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+            crate::state::lambda_triggers::custom_sender::fire_over_medium(
                 ctx,
                 &state,
                 &issued.user_pool_id,
                 &issued.username,
-                crate::state::lambda_triggers::custom_email::CustomEmailSource::ResendCode,
+                &issued.medium,
+                crate::state::lambda_triggers::custom_sender::Stage::ResendCode,
                 crate::state::lambda_triggers::Caller::of(ctx.parts(), Some(&input.client_id)),
                 input.client_metadata.as_ref(),
                 &issued.code,
@@ -334,11 +336,15 @@ struct Resent {
     issued: Option<IssuedCode>,
 }
 
-/// One issued code and the stored user it was issued to.
+/// One issued code, the stored user it was issued to and the medium its message travelled
+/// over, which is what decides the custom sender it is handed to.
 struct IssuedCode {
     user_pool_id: String,
     username: String,
     code: String,
+    /// The `DeliveryMediumType` the message travelled over, read off the attribute it was
+    /// addressed to ([`crate::state::delivery_medium`]).
+    medium: String,
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResendConfirmationCode<Eng> {
@@ -429,6 +435,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ResendConfirmatio
             issued: Some(IssuedCode {
                 user_pool_id,
                 username,
+                medium: crate::state::delivery_medium(&stored.attribute)
+                    .unwrap_or_default()
+                    .to_string(),
                 code: stored.code,
             }),
         })

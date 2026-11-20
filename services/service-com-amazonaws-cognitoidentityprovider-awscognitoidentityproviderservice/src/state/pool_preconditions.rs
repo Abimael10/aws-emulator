@@ -28,23 +28,23 @@ pub const PHONE_NUMBER_VERIFIED_ATTRIBUTE: &str = "phone_number";
 /// Whether the configuration a write would leave the pool with asks Amazon
 /// Cognito to verify a phone number with no way to send the message.
 ///
-/// A phone number is verified by a code delivered over SMS, and SMS is sent
-/// through the Amazon SNS caller a pool's `SmsConfiguration` names ("the SMS
-/// configuration with the settings for your Amazon Cognito user pool to send SMS
-/// message with Amazon Simple Notification Service" — `SmsConfigurationType` in
-/// this service's model), so auto-verifying `phone_number` without one asks for
-/// a verification nothing could deliver. Both arguments are the EFFECTIVE values
-/// of the request — what the pool would hold once it is written — so the pair is
-/// judged as the caller left it, whichever operation wrote it.
+/// A phone number is verified by a code delivered over SMS, and a text message
+/// leaves a pool only over one of the two paths a pool can configure for it
+/// ([`names_an_sms_delivery_path`]), so auto-verifying `phone_number` without
+/// either asks for a verification nothing could deliver. Every argument is the
+/// EFFECTIVE value of the request — what the pool would hold once it is written —
+/// so the configuration is judged as the caller left it, whichever operation
+/// wrote it.
 #[must_use]
 pub fn sms_configuration_missing_for_auto_verification(
     auto_verified_attributes: &[String],
     sms_configuration: Option<&SmsConfigurationType>,
+    lambda_config: Option<&LambdaConfigType>,
 ) -> bool {
     auto_verified_attributes
         .iter()
         .any(|attribute| attribute == PHONE_NUMBER_VERIFIED_ATTRIBUTE)
-        && sms_configuration.is_none()
+        && !names_an_sms_delivery_path(sms_configuration, lambda_config)
 }
 
 /// The message a user-pool write is refused with when its `LambdaConfig`
@@ -121,11 +121,12 @@ pub fn mfa_without_sms_delivery(
     mfa_configuration: &str,
     sms_configuration: Option<&SmsConfigurationType>,
     auto_verified_attributes: &[String],
+    lambda_config: Option<&LambdaConfigType>,
 ) -> bool {
     if mfa_configuration == MFA_OFF {
         return false;
     }
-    !names_an_sms_caller(sms_configuration)
+    !names_an_sms_delivery_path(sms_configuration, lambda_config)
         || !auto_verified_attributes
             .iter()
             .any(|attribute| attribute == PHONE_NUMBER_VERIFIED_ATTRIBUTE)
@@ -237,11 +238,40 @@ pub fn sns_caller_role_arn(sms_configuration: Option<&SmsConfigurationType>) -> 
 ///
 /// The ONE reading of that question, so the MFA factor's precondition
 /// (`SetUserPoolMfaConfig`) and the pool's own SMS delivery path
-/// ([`UserPool::delivers_sms`]) cannot answer it differently.
+/// ([`names_an_sms_delivery_path`]) cannot answer it differently.
 #[must_use]
 pub fn names_an_sms_caller(sms_configuration: Option<&SmsConfigurationType>) -> bool {
     sns_caller_role_arn(sms_configuration).is_some()
         || sms_configuration.is_some_and(|sms| sms.eums_sms.is_some())
+}
+
+/// Whether a configuration can deliver a text message AT ALL, over either of the
+/// two paths a pool can configure for one.
+///
+/// A text message leaves a pool through the caller its `SmsConfiguration` names
+/// ([`names_an_sms_caller`]), or it is handed to the function its
+/// `CustomSMSSender` names — that trigger "rout[ing] all SMS notifications from a
+/// user pool to a Lambda function that delivers the message using custom logic"
+/// (`LambdaConfigType$CustomSMSSender` in this service's model), which makes the
+/// function the whole delivery path and asks for no caller to send through. A
+/// configuration that names NEITHER can deliver nothing by SMS.
+///
+/// The ONE reading of that question, taken on the EFFECTIVE values of a request —
+/// what the pool would hold once it is written — so the preconditions a pool
+/// write is held to ([`sms_configuration_missing_for_auto_verification`],
+/// [`mfa_without_sms_delivery`]) and the stored pool's own answer
+/// ([`UserPool::delivers_sms`]) cannot disagree about it.
+#[must_use]
+pub fn names_an_sms_delivery_path(
+    sms_configuration: Option<&SmsConfigurationType>,
+    lambda_config: Option<&LambdaConfigType>,
+) -> bool {
+    names_an_sms_caller(sms_configuration)
+        || lambda_config.is_some_and(|lambda_config| {
+            crate::state::lambda_triggers::custom_sender::Sender::Sms
+                .configured_in(lambda_config)
+                .is_some()
+        })
 }
 
 /// Whether the Amazon SNS caller `sms_configuration` names is one Amazon Cognito

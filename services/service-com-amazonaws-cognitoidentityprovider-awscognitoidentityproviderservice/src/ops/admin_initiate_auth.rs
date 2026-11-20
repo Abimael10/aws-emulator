@@ -589,7 +589,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
                 let (challenge_name, challenge_parameters, code) =
                     crate::state::second_factor_challenge(&username, &factor)
                         .ok_or_else(internal_error)?;
-                let delivered = code.as_ref().map(|code| code.code.clone());
+                let delivered = code
+                    .as_ref()
+                    .map(|code| (code.code.clone(), code.attribute.clone()));
                 let session = state.lock().start_session(
                     now,
                     crate::state::AuthSession {
@@ -608,19 +610,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
                         issued_by: crate::state::SessionIssuer::SignIn,
                     },
                 );
-                // A pool that routes its email to a custom sender delivers an
-                // emailed one-time password by handing it to that function
-                // instead of mailing it, as the client-side sign-in does for the
-                // one-time password of its own email challenge.
-                if let Some(delivered) = delivered.filter(|_| {
-                    challenge_name == crate::state::EMAIL_OTP_CHALLENGE
-                }) {
-                    crate::state::lambda_triggers::custom_email::fire_custom_email_sender(
+                // A pool that routes a medium's messages to a custom sender
+                // delivers a one-time password it sent over that medium by
+                // handing it to the configured function instead of sending it,
+                // as the client-side sign-in does for the one-time password of
+                // its own challenge. Which sender receives it is decided by the
+                // attribute the challenge addressed its message to.
+                if let Some((delivered, attribute)) = delivered {
+                    crate::state::lambda_triggers::custom_sender::fire_over_attribute(
                         ctx,
                         &state,
                         &input.user_pool_id,
                         &username,
-                        crate::state::lambda_triggers::custom_email::CustomEmailSource::Authentication,
+                        &attribute,
+                        crate::state::lambda_triggers::custom_sender::Stage::Authentication,
                         caller,
                         client_metadata,
                         &delivered,

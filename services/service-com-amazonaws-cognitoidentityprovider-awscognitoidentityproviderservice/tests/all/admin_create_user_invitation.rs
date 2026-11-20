@@ -63,6 +63,11 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 /// A well-formed execution role ARN, satisfying Lambda's `Role` pattern.
 const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 
+/// The Amazon SNS caller role a pool's `SmsConfiguration` names, which is the SMS delivery
+/// path the pools below carry: "the ARN of the IAM role in your Amazon Web Services account
+/// that Amazon Cognito will use to send SMS messages" (`SmsConfigurationType.SnsCallerArn`).
+const SNS_CALLER_ROLE: &str = "arn:aws:iam::000000000000:role/service-role/cognito-sms";
+
 /// The module and attribute the trigger function's package carries its handler as.
 const HANDLER: &str = "lambda_function.lambda_handler";
 
@@ -359,6 +364,11 @@ async fn pool_with_client(
 
 /// The same pool, with `password_policy` as its `Policies.PasswordPolicy` — `Value::Null`
 /// for a pool that configures none and so keeps the documented defaults.
+///
+/// The pool also carries an `SmsConfiguration`, which is its SMS delivery path: a create
+/// that asks for the invitation over SMS needs one, since a pool with no SMS path at all
+/// refuses that request ([`crate::message_delivery_and_live_codes`] owns that rule), and
+/// these suites are about which messages the custom EMAIL sender is handed.
 async fn pool_with_policy(
     router: &MultiServiceRouter,
     name: &str,
@@ -372,6 +382,7 @@ async fn pool_with_policy(
             "CustomEmailSender": { "LambdaVersion": "V1_0", "LambdaArn": function_arn },
             "KMSKeyID": key_arn,
         },
+        "SmsConfiguration": { "SnsCallerArn": SNS_CALLER_ROLE },
     });
     if !password_policy.is_null() {
         body["Policies"] = json!({ "PasswordPolicy": password_policy.clone() });
