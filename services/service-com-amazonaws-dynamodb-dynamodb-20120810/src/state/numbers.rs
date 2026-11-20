@@ -63,9 +63,9 @@ impl NumberKey {
         // sits after the integral digits, shifted by the exponent. Both terms come
         // from the request, so every step is checked: an exponent that leaves the
         // documented range is refused as an over- or underflow, whichever direction
-        // it left it in. The arithmetic is done in a width WIDER than the exponent was
-        // read in, so a magnitude stated with an exponent at that integer's own limit is
-        // still reported as the over- or underflow it is.
+        // it left it in. The shift is CHECKED, so a magnitude stated with an exponent at
+        // the limit of the integer it is carried in is still reported as the over- or
+        // underflow it is rather than wrapping into the range.
         let shifted = i64::try_from(integral.len())
             .ok()
             .and_then(|len| len.checked_add(exponent));
@@ -224,12 +224,14 @@ impl NumberKey {
 
 /// The decimal exponent `text` states, or the rule it breaks.
 ///
-/// `NotNumeric` only when the text is no signed run of decimal digits — nothing after the
-/// exponent marker, a sign with no digits behind it, or a character that is not a digit —
-/// because that is the one case where the value cannot be read as a number at all. A text
-/// that IS such a run always states a magnitude, so a magnitude wider than the arithmetic
-/// below reaches is the over- or underflow its SIGN names, the same answer the documented
-/// range gives for a narrower exponent just outside it.
+/// Two faults are told apart here. A text that is no signed run of decimal digits —
+/// nothing after the exponent marker, a sign with no digits behind it, or a character that
+/// is not a digit — is a value that cannot be read as a number at all, and so is a run of
+/// digits NO integer a decimal exponent is carried in can hold: it states a magnitude no
+/// number has. Every run that integer DOES hold states a magnitude, which the caller then
+/// holds to the documented range as the over- or underflow it is. Leading zeros denote
+/// nothing, so the WIDTH of the run decides neither question — only the value its digits
+/// spell.
 fn signed_exponent(text: &str) -> Result<i64, NumberFault> {
     let (negative, digits) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -238,26 +240,18 @@ fn signed_exponent(text: &str) -> Result<i64, NumberFault> {
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(NumberFault::NotNumeric);
     }
-    // Leading zeros denote nothing, so they are dropped before the width is judged: an
-    // exponent spelled with a run of them states the same magnitude a shorter spelling
-    // does.
+    // Dropped before the value is read, so an exponent spelled with a run of them states
+    // the same magnitude a shorter spelling does.
     let significant = digits.trim_start_matches('0');
     if significant.is_empty() {
         return Ok(0);
     }
-    if significant.len() > MAX_EXPONENT_TEXT_DIGITS {
-        return Err(if negative {
-            NumberFault::Underflow
-        } else {
-            NumberFault::Overflow
-        });
-    }
-    let magnitude = significant.parse::<i64>().map_err(|_| {
-        if negative {
-            NumberFault::Underflow
-        } else {
-            NumberFault::Overflow
-        }
-    })?;
-    Ok(if negative { -magnitude } else { magnitude })
+    // Read as the SIGNED integer the text spells, so the bottom of that integer's range is
+    // representable too.
+    let signed = if negative {
+        format!("-{significant}")
+    } else {
+        significant.to_string()
+    };
+    signed.parse::<i64>().map_err(|_| NumberFault::NotNumeric)
 }

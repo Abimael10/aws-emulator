@@ -31,9 +31,9 @@
 //!   the method followed by the setting it writes (`/~1pets/GET/metrics/enabled`), while the
 //!   KEY the stage holds that method's settings under is the method path
 //!   `{resource_path}/{http_method}` or `*/*` as `Stage$methodSettings` documents, whose
-//!   resource half is written as a path NAME: every separator inside it, its leading one
-//!   included, escaped `~1` (`~1pets/GET`). In the path that leading separator is either
-//!   escaped too or left to the pointer's (`/pets/GET/…`, the
+//!   resource half carries no leading separator and every separator inside it literal
+//!   (`pets/GET`) — the `~1` escape belongs to the POINTER. In the path that leading
+//!   separator is either escaped or left to the pointer's (`/pets/GET/…`, the
 //!   spelling `MethodSetting$ResourcePath` states a path in), and a pointer that escapes the
 //!   separator before the method too names the method in ONE token instead. Every one of
 //!   those spellings addresses the one method, so every one is keyed under the one
@@ -957,7 +957,7 @@ const METHOD_SETTING_NAMES: &[(&str, &str)] = &[
 /// {resource_path}/{http_method} for an individual method override, or /\*/\* for
 /// overriding all methods in the stage" (`Stage$methodSettings`), with every `/` INSIDE
 /// the resource path escaped `~1` in the POINTER the way a JSON Pointer requires — the KEY
-/// those tokens resolve to carrying that escape on every separator of the resource path
+/// those tokens resolve to carrying no escape at all
 /// ([`crate::state::method_settings_key`]).
 const METHOD_PATH_TOKENS: usize = 2;
 

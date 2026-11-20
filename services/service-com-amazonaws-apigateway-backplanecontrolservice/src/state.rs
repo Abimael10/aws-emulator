@@ -709,8 +709,8 @@ pub struct StageEntry {
     pub client_certificate_id: Option<String>,
     pub tracing_enabled: bool,
     /// The per-method settings `UpdateStage` writes, keyed by the method each patch
-    /// addressed — `{resource_path}/{http_method}` with the resource half written as a
-    /// path name, or `*/*` for every method of the stage, as [`method_settings_key`]
+    /// addressed — `{resource_path}/{http_method}` with the resource half carrying no
+    /// leading separator, or `*/*` for every method of the stage, as [`method_settings_key`]
     /// derives it from whichever spelling the patch used; empty until a patch sets one,
     /// which is the empty `methodSettings` map a freshly created stage reports.
     pub method_settings: BTreeMap<String, MethodSetting>,

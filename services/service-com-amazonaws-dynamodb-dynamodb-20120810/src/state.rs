@@ -495,19 +495,6 @@ const MAX_EXPONENT: i32 = 125;
 const MAX_NUMBER_TEXT_DIGITS: usize =
     MAX_SIGNIFICANT_DIGITS + (MAX_POINT - MIN_POINT) as usize;
 
-/// The most SIGNIFICANT DIGITS one `N` value's EXPONENT text may carry, leading zeros
-/// dropped, before the magnitude it states is further than the decimal-point arithmetic
-/// below reaches.
-///
-/// Eleven digits already state a magnitude far past the documented exponent range, so an
-/// exponent written with more of them cannot denote a value this service stores: it is
-/// held to the range as the over- or underflow its SIGN names, exactly as a narrower
-/// exponent outside that range is. The bound exists so the arithmetic that shifts the
-/// decimal point is done in a width that cannot overflow, not to tell an exponent from a
-/// text that is no exponent at all — that is a question of syntax, decided by
-/// [`NumberKey::try_parse`].
-const MAX_EXPONENT_TEXT_DIGITS: usize = 11;
-
 /// How often the figures a description reports as `ItemCount` and
 /// `TableSizeBytes`/`IndexSizeBytes` are recomputed from what is stored.
 ///

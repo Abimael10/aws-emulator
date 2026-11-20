@@ -83,7 +83,8 @@ fn canonical_rows() -> Vec<(&'static str, String, String)> {
         ("a fraction that an exponent turns into an integer", "0.0025e4", "25"),
         ("an integer that an exponent turns into a fraction", "250e-4", "0.025"),
         // The exponent's TEXT may carry padding like the mantissa's, however much of
-        // it, and normalises away the same way.
+        // it, and normalises away the same way: a run of leading zeros denotes the same
+        // exponent however long it is.
         ("an exponent padded with leading zeros", "1e0009", "1000000000"),
         ("a signed exponent padded with leading zeros", "1e-0002", "0.01"),
     ]
@@ -170,7 +171,8 @@ fn refusal_rows() -> Vec<(&'static str, Value)> {
         ),
     ];
     // ONE PAST each published bound: 39 significant digits, and an exponent either
-    // side of the documented range.
+    // side of the documented range — beside a run of digits no integer a magnitude is
+    // carried in can hold, and one it can hold that is far out of range.
     rows.push((
         "one digit more than the documented precision",
         json!({"v": {"N": THIRTY_NINE_DIGITS}}),
@@ -182,6 +184,14 @@ fn refusal_rows() -> Vec<(&'static str, Value)> {
     rows.push((
         "an exponent one past the documented minimum",
         json!({"v": {"N": format!("1e{}", MIN_EXPONENT - 1)}}),
+    ));
+    rows.push((
+        "an exponent far wider than the integer a magnitude is carried in",
+        json!({"v": {"N": "1e99999999999999999999999"}}),
+    ));
+    rows.push((
+        "an exponent inside that integer but far past the documented range",
+        json!({"v": {"N": "1e92233720368547758"}}),
     ));
     // PAST the documented range, with the exponent's TEXT padded far wider than the
     // magnitude it states needs: the padding denotes nothing, so what decides the

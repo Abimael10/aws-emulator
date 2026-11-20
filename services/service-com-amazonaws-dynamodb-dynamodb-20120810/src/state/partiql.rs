@@ -3964,15 +3964,21 @@ pub fn source_sort_key_name(table: &Table, index: Option<&str>) -> Option<String
 pub const OVERLAPPING_RANGE_KEY_MESSAGE: &str =
     "Overlapping conditions with range keys are not supported in where clause";
 
-/// Whether this predicate states a condition on `sort_key` inside a DISJUNCTION.
+/// Whether this predicate's disjunction asks for more than one RANGE of `sort_key`.
 ///
 /// A read is served over ONE range of the source's keys, and the branches of an `OR`
-/// each state their own: a branch that constrains the range key covers part of the
+/// each state their own: a branch that NARROWS the range key covers part of the
 /// partition while every branch beside it covers more of it — all of it, where that
 /// branch names the range key not at all — so the ranges the clause asks for overlap and
 /// no one range read answers it. DynamoDB refuses such a clause
 /// ([`OVERLAPPING_RANGE_KEY_MESSAGE`]) rather than planning one of the branches and
 /// filtering the rest, which would report rows from a plan the service never ran.
+///
+/// What NARROWS a range is a key condition on the range key, which is the question
+/// [`narrows_range_key`] asks: a branch whose only mention of the range key is in a form
+/// no key condition takes — a negation, an inequality, a function over the value — asks
+/// for no range of its own and is a FILTER over whatever the clause reads, so a clause
+/// carrying one is served as the union of its branches.
 ///
 /// The walk is an explicit WORKLIST over the tree, the way [`pinned_equalities`] and
 /// [`predicate_attributes`] walk it, so how deeply a clause nests is not a function of
@@ -3984,7 +3990,7 @@ pub fn overlapping_range_key_conditions(predicate: &Predicate, sort_key: &str) -
             Predicate::Any(branches) => {
                 if branches
                     .iter()
-                    .any(|branch| predicate_attributes(branch).contains(sort_key))
+                    .any(|branch| narrows_range_key(branch, sort_key))
                 {
                     return true;
                 }
@@ -3992,6 +3998,47 @@ pub fn overlapping_range_key_conditions(predicate: &Predicate, sort_key: &str) -
             }
             Predicate::All(branches) => pending.extend(branches.iter()),
             Predicate::Not(inner) => pending.push(inner.as_ref()),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `predicate` states a KEY CONDITION on `sort_key` — a condition that narrows
+/// the range of keys a read walks.
+///
+/// The forms a key condition takes on a sort key are the ones `Query` accepts for it:
+/// "sortKeyName = :sortkeyval", "sortKeyName < :sortkeyval", "<=", ">", ">=",
+/// "sortKeyName BETWEEN :sortkeyval1 AND :sortkeyval2" and
+/// "begins_with ( sortKeyName, :sortkeyval )"
+/// (`smithy_query(query="doc",shape="QueryInput",member="KeyConditionExpression")`).
+/// Every other condition on the attribute — `<>`, a negation of any of the forms above,
+/// `IN`, `contains`, an `IS NULL` / `IS MISSING` / `attribute_exists` question, or a
+/// comparison of its SIZE — states no contiguous range of keys at all: it is decided per
+/// item, like a condition on any non-key attribute.
+///
+/// A condition nested under a `NOT` is therefore invisible here: negating a range states
+/// the complement, which is no one range either.
+fn narrows_range_key(predicate: &Predicate, sort_key: &str) -> bool {
+    let names_sort_key = |operand: &PredicateOperand| {
+        matches!(operand, PredicateOperand::Path(path) if path.attribute() == sort_key)
+    };
+    let mut pending = vec![predicate];
+    while let Some(predicate) = pending.pop() {
+        match predicate {
+            Predicate::All(branches) | Predicate::Any(branches) => {
+                pending.extend(branches.iter());
+            }
+            // Nothing a negation covers is a range of its own.
+            Predicate::Not(_) => {}
+            Predicate::Compare(left, op, right)
+                if !matches!(op, CompareOp::NotEqual)
+                    && (names_sort_key(left) || names_sort_key(right)) =>
+            {
+                return true;
+            }
+            Predicate::Between(value, _, _) if names_sort_key(value) => return true,
+            Predicate::BeginsWith(path, _) if path.attribute() == sort_key => return true,
             _ => {}
         }
     }

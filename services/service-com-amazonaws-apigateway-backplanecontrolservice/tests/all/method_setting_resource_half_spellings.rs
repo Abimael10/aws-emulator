@@ -9,10 +9,11 @@
 //! > A `methodSettings` key is the METHOD the patch addressed — "method paths defined
 //! > as {resource_path}/{http_method} for an individual method override, or /\*/\* for
 //! > overriding all methods in the stage" (`Stage$methodSettings`), written as the method
-//! > path itself: the resource path as a path NAME, every separator of it — its leading one
-//! > included — escaped `~1`, then a literal separator before the HTTP method. Inside the
-//! > PATCH PATH that resource path is escaped the same way `PatchOperation$path` spells a
-//! > separator inside a path name, so a pointer that spells its leading separator either way
+//! > path itself: the resource path without the leading separator a resource path is stated
+//! > with and with every separator inside it literal, then a separator before the HTTP
+//! > method. Inside the PATCH PATH that resource path is escaped the way
+//! > `PatchOperation$path` spells a separator inside a path name, so a pointer that spells its
+//! > leading separator either way
 //! > — escaped into its first reference token, or left to the pointer's own leading
 //! > `/` — names the one method and is keyed the one way. A resource half carrying an
 //! > unescaped separator of its own names no method, because nothing in the pointer says where
@@ -55,19 +56,19 @@ struct Row {
 const ROWS: &[Row] = &[
     Row {
         case: "a child resource",
-        key: "~1pets/GET",
+        key: "pets/GET",
         escaped: "/~1pets/GET/caching/enabled",
         unprefixed: Some("/pets/GET/caching/enabled"),
     },
     Row {
         case: "a nested resource path",
-        key: "~1pets~1{petId}/GET",
+        key: "pets/{petId}/GET",
         escaped: "/~1pets~1{petId}/GET/caching/enabled",
         unprefixed: Some("/pets~1{petId}/GET/caching/enabled"),
     },
     Row {
         case: "the root resource",
-        key: "~1/GET",
+        key: "/GET",
         escaped: "/~1/GET/caching/enabled",
         unprefixed: Some("//GET/caching/enabled"),
     },

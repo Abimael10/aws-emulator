@@ -281,18 +281,30 @@ async fn a_next_token_a_listing_cannot_resume_from_is_answered_in_that_listings_
         }
 
         // The alarm LISTING refuses no token: a value it cannot read a cursor out of names no
-        // alarm of the enumeration, so what it names is the position AFTER the last one — the
-        // empty page that ends a walk, carrying no token of its own. Serving the FIRST page for
-        // it would hand a caller continuing a walk the alarms it has already been given and
-        // leave a loop that terminates on an empty page running forever
-        // (`tests/all/paginated_read_cursor.rs` holds that rule over every listing of this
-        // service that serves such a token).
+        // position of the enumeration at all, so it is IGNORED and the listing answers the page
+        // a request carrying no token asks for — its first, which holds the alarm this test
+        // wrote (`tests/all/paginated_read_cursor.rs` holds that rule over every listing of
+        // this service that serves such a token).
         let listed = ok(&router, "DescribeAlarms", &json!({"NextToken": token})).await;
+        let named: Vec<String> = listed["MetricAlarms"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|alarm| alarm.get("AlarmName").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            named,
+            vec!["paged-alarm".to_string()],
+            "case {case:?}: a token the alarm listing cannot read must be ignored and the first \
+             page served, got {listed}"
+        );
         assert_eq!(
             listed,
-            json!({"CompositeAlarms": [], "MetricAlarms": [], "LogAlarms": []}),
-            "case {case:?}: a token the alarm listing cannot read must answer the empty page \
-             that ends a walk, got {listed}"
+            ok(&router, "DescribeAlarms", &json!({})).await,
+            "case {case:?}: that page is the one a request carrying no token is answered with, \
+             got {listed}"
         );
     }
 }

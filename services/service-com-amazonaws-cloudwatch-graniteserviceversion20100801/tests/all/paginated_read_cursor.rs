@@ -5,14 +5,12 @@
 //!
 //! The rule under test: **a `NextToken` names a POSITION in the enumeration, and a listing that
 //! serves such a token rather than refusing it resumes AT that position — never at the
-//! beginning** — so a continuation delivers only the items after the ones already delivered, and
-//! a token this service cannot read a cursor out of names the position past the last item: the
-//! EMPTY page that ends a walk, carrying no token of its own
+//! beginning** — so a continuation delivers only the items after the ones already delivered,
+//! while a value this service cannot read a cursor out of names no position at all and is
+//! IGNORED: the listing answers the page a request carrying no token asks for, its first
 //! (`DescribeAlarmsInput$NextToken` "The token returned by a previous call to indicate that
 //! there is more data available.", `ListAlarmMuteRulesOutput$NextToken` "If this field is
-//! absent, there are no more results to retrieve."). Restarting the scan for such a token is
-//! what makes a paging client double-count an item and makes a walk that terminates on an empty
-//! page never terminate.
+//! absent, there are no more results to retrieve.").
 //!
 //! The rows differ along what the rule generalises over: which listing is walked (the alarm
 //! listing narrowed by a name prefix, the same listing asked for a composite alarm's children,
@@ -39,7 +37,7 @@ const PREFIX: &str = "cursor-alarm-";
 ///
 /// The first is no cursor at all; the second reads as a hexadecimal cursor whose bytes are not
 /// text; the third is the padded base64 blob AWS carries its own tokens in. None of them names
-/// an item of this service's enumerations, so each names the position after the last one.
+/// an item of this service's enumerations, so each of them is ignored.
 const FOREIGN_TOKENS: [(&str, &str); 3] = [
     ("a value that is no cursor at all", "not-a-cursor"),
     ("a cursor whose bytes are not text", "fffe"),
@@ -59,15 +57,6 @@ fn listed_alarms(listed: &Value) -> Vec<String> {
         .filter_map(|alarm| alarm.get("AlarmName").and_then(Value::as_str))
         .map(ToString::to_string)
         .collect()
-}
-
-/// Whether an answer reports an empty page of EVERY list it carries, which is what an exhausted
-/// walk of the alarm listing asks for: "the operation returns only a list of metric alarms" is a
-/// filter on which list holds something, not on which lists are reported.
-fn every_alarm_list_is_empty(listed: &Value) -> bool {
-    ["CompositeAlarms", "MetricAlarms", "LogAlarms"]
-        .iter()
-        .all(|member| listed[*member].as_array().is_some_and(Vec::is_empty))
 }
 
 /// The token an answer owes the next page, if any.
@@ -137,11 +126,9 @@ async fn a_continued_alarm_listing_delivers_only_the_alarms_after_the_ones_alrea
 }
 
 #[tokio::test]
-async fn an_unreadable_token_ends_the_alarm_walk_instead_of_restarting_it() {
+async fn an_unreadable_token_is_ignored_by_the_alarm_listing() {
     let router = build_router();
     let names = given_alarms(&router, 2).await;
-    // The listing is delivered first, so a continuation that restarted the scan would hand back
-    // alarms this caller has already been given.
     let first = ok(
         &router,
         "DescribeAlarms",
@@ -161,14 +148,17 @@ async fn an_unreadable_token_ends_the_alarm_walk_instead_of_restarting_it() {
             &json!({"AlarmNamePrefix": PREFIX, "MaxRecords": 2, "NextToken": token}),
         )
         .await;
-        assert!(
-            every_alarm_list_is_empty(&listed),
-            "case {case:?}: expected the empty page that ends a walk, got {listed}"
+        assert_eq!(
+            listed_alarms(&listed),
+            names,
+            "case {case:?}: expected the token ignored and the first page served, got {listed}"
         );
+        // Ignored, so the whole answer is the one the first page carries — the token it owes
+        // the NEXT page included.
         assert_eq!(
             next_token(&listed),
-            None,
-            "case {case:?}: an exhausted page owes no token, got {listed}"
+            next_token(&first),
+            "case {case:?}: expected the first page's own token, got {listed}"
         );
     }
 
@@ -194,7 +184,7 @@ async fn an_unreadable_token_ends_the_alarm_walk_instead_of_restarting_it() {
 }
 
 #[tokio::test]
-async fn an_unreadable_token_ends_a_relationship_walk_instead_of_restarting_it() {
+async fn an_unreadable_token_is_ignored_by_a_relationship_walk() {
     let router = build_router();
     let children = given_alarms(&router, 2).await;
     let parent = "cursor-parent";
@@ -227,20 +217,16 @@ async fn an_unreadable_token_ends_a_relationship_walk_instead_of_restarting_it()
             &json!({"ChildrenOfAlarmName": parent, "MaxRecords": 2, "NextToken": token}),
         )
         .await;
-        assert!(
-            every_alarm_list_is_empty(&listed),
-            "case {case:?}: expected the empty page that ends a walk, got {listed}"
-        );
         assert_eq!(
-            next_token(&listed),
-            None,
-            "case {case:?}: an exhausted page owes no token, got {listed}"
+            listed_alarms(&listed),
+            children,
+            "case {case:?}: expected the token ignored and the first page served, got {listed}"
         );
     }
 }
 
 #[tokio::test]
-async fn an_unreadable_token_ends_the_mute_rule_walk_instead_of_restarting_it() {
+async fn an_unreadable_token_is_ignored_by_the_mute_rule_listing() {
     let router = build_router();
     // The same rule, read through the OTHER listing of this service that serves a token it
     // cannot read: one rule decides what such a token names for both.
@@ -271,13 +257,8 @@ async fn an_unreadable_token_ends_the_mute_rule_walk_instead_of_restarting_it() 
         .await;
         assert_eq!(
             listed_arns(&listed),
-            Vec::<String>::new(),
-            "case {case:?}: expected the empty page that ends a walk, got {listed}"
-        );
-        assert_eq!(
-            next_token(&listed),
-            None,
-            "case {case:?}: an exhausted page owes no token, got {listed}"
+            listed_arns(&first),
+            "case {case:?}: expected the token ignored and the first page served, got {listed}"
         );
     }
 }

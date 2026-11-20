@@ -8,13 +8,15 @@
 //!   stored. The rows span the write surfaces a value can arrive through, where in the
 //!   value it sits (top level, inside a list, inside a map, as a set-free scalar of an
 //!   update) and the read surface that compares against one.
-//! * A number's EXPONENT is a signed run of decimal digits or it is no exponent at all, and
-//!   that is what tells the two defects apart: a run of digits always states a MAGNITUDE,
-//!   however wide it is written, which is then held to the documented range and over- or
-//!   underflows it; only a text whose exponent is no such run cannot be converted to a
-//!   number at all. The rows walk both published bounds, one past each of them, the limits
-//!   of the 32-bit integer a decimal scale is held in, far past each of those, and an
-//!   exponent padded with a long run of leading zeros.
+//! * A number's EXPONENT is a signed run of decimal digits carried in a 64-bit integer, and
+//!   only then held to the documented range, so the two defects stay apart: a run that
+//!   integer can hold states a MAGNITUDE, which over- or underflows that range, and only a
+//!   text whose exponent is no such run — or a run no such integer can hold, which states a
+//!   magnitude no number has — cannot be converted to a number at all. Padding zeros denote
+//!   the same exponent however many there are, so the text's WIDTH decides nothing. The rows
+//!   walk both published bounds, one past each of them, the limits of the integer the
+//!   exponent is carried in and one past each of those, far past them, and an exponent
+//!   padded with a long run of leading zeros.
 //! * A value's NESTING is bounded wherever it is read: one inside the documented quota
 //!   ("DynamoDB supports nested attributes up to 32 levels deep") is stored, and one past
 //!   it is refused with a 400 `ValidationException` and stores nothing — including one
@@ -44,10 +46,10 @@ const NULL_CLAUSE: &str = "One or more parameter values were invalid: Null attri
 const MAX_EXPONENT: i32 = 125;
 const MIN_EXPONENT: i32 = -130;
 
-/// The two limits of the 32-bit integer a decimal exponent is carried in, as a text
+/// The two limits of the integer a decimal exponent is carried in, as a text
 /// spells them.
-const MAX_SIGNED_32: &str = "2147483647";
-const MIN_SIGNED_32: &str = "-2147483648";
+const MAX_SIGNED_64: &str = "9223372036854775807";
+const MIN_SIGNED_64: &str = "-9223372036854775808";
 
 /// The clause a magnitude outside the documented range earns, either way out.
 const OVERFLOW_CLAUSE: &str =
@@ -501,17 +503,18 @@ async fn a_value_nesting_past_the_supported_levels_is_refused_however_deep_it_go
 }
 
 #[tokio::test]
-async fn an_exponent_states_a_magnitude_that_is_then_range_checked() {
+async fn an_exponent_is_read_as_an_integer_and_then_range_checked() {
     let router = seeded().await;
 
     // Each row: the case, the `N` text, and the clause the refusal must carry — the
-    // magnitude clauses wherever the exponent is a signed run of decimal digits and the
-    // magnitude it states leaves the documented range, however wide that run is written,
-    // and the conversion clause only for a text whose exponent is no such run at all.
-    // The rows walk one past each published bound, the limits of the 32-bit integer the
-    // decimal scale is held in and far past each of them, an exponent spelled with a run
-    // of leading zeros, and a mantissa that normalises to zero (which has no magnitude of
-    // its own, so the exponent it wrote is what is held to the range).
+    // magnitude clauses wherever the exponent is a run of digits the integer it is carried
+    // in can hold and the magnitude it states leaves the documented range, however wide that
+    // run is written, and the conversion clause for a text whose exponent is no such run at
+    // all or is one no such integer can hold. The rows walk one past each published bound,
+    // the limits of that integer and one past each of them, far past them, an exponent
+    // spelled with a long run of leading zeros, and a mantissa that normalises to zero
+    // (which has no magnitude of its own, so the exponent it wrote is what is held to the
+    // range).
     let rows: Vec<(&str, String, String)> = vec![
         (
             "an exponent one past the documented maximum",
@@ -525,41 +528,71 @@ async fn an_exponent_states_a_magnitude_that_is_then_range_checked() {
         ),
         (
             "an exponent at the top of the integer it is read into",
-            format!("1E{MAX_SIGNED_32}"),
+            format!("1E{MAX_SIGNED_64}"),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
             "an exponent at the bottom of the integer it is read into",
-            format!("1E{MIN_SIGNED_32}"),
+            format!("1E{MIN_SIGNED_64}"),
             UNDERFLOW_CLAUSE.to_string(),
         ),
         (
             "a zero carrying an exponent at the top of that integer",
-            format!("0E{MAX_SIGNED_32}"),
+            format!("0E{MAX_SIGNED_64}"),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
             "a zero carrying an exponent at the bottom of that integer",
-            format!("0E{MIN_SIGNED_32}"),
+            format!("0E{MIN_SIGNED_64}"),
             UNDERFLOW_CLAUSE.to_string(),
         ),
         (
             "an exponent one past the top of that integer",
+            "1E9223372036854775808".to_string(),
+            conversion_clause("1E9223372036854775808"),
+        ),
+        (
+            "an exponent one past the bottom of that integer",
+            "1E-9223372036854775809".to_string(),
+            conversion_clause("1E-9223372036854775809"),
+        ),
+        (
+            "an exponent far past the width of that integer",
+            "1E99999999999999999999999".to_string(),
+            conversion_clause("1E99999999999999999999999"),
+        ),
+        (
+            "an exponent inside that integer but far past the documented range",
+            "1E92233720368547758".to_string(),
+            OVERFLOW_CLAUSE.to_string(),
+        ),
+        (
+            "a negative exponent inside that integer but far past the documented range",
+            "1E-92233720368547758".to_string(),
+            UNDERFLOW_CLAUSE.to_string(),
+        ),
+        (
+            "a zero carrying an exponent inside that integer but past the documented range",
+            "0E92233720368547758".to_string(),
+            OVERFLOW_CLAUSE.to_string(),
+        ),
+        (
+            "an exponent past the width of a 32-bit scale",
             "1E2147483648".to_string(),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
-            "an exponent one past the bottom of that integer",
+            "a negative exponent past that width",
             "1E-2147483649".to_string(),
             UNDERFLOW_CLAUSE.to_string(),
         ),
         (
-            "an exponent far past the width of that integer",
+            "an exponent far past that width",
             "1E99999999999".to_string(),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
-            "an exponent far past the width of that integer, the other way",
+            "an exponent far past that width, the other way",
             "1E-99999999999".to_string(),
             UNDERFLOW_CLAUSE.to_string(),
         ),

@@ -143,12 +143,12 @@ fn gated_rows() -> Vec<GatedRow> {
         (
             "one named method at INFO",
             vec![replace("/~1pets/GET/logging/loglevel", "INFO")],
-            vec![("~1pets/GET", "loggingLevel", json!("INFO"))],
+            vec![("pets/GET", "loggingLevel", json!("INFO"))],
         ),
         (
             "a level addressed by its member name",
             vec![replace("/~1pets/POST/loggingLevel", "ERROR")],
-            vec![("~1pets/POST", "loggingLevel", json!("ERROR"))],
+            vec![("pets/POST", "loggingLevel", json!("ERROR"))],
         ),
         (
             "a level under the logLevel spelling of its group",
@@ -168,7 +168,7 @@ fn gated_rows() -> Vec<GatedRow> {
         (
             "the data trace addressed by its member name",
             vec![replace("/~1pets/DELETE/dataTraceEnabled", "true")],
-            vec![("~1pets/DELETE", "dataTraceEnabled", json!(true))],
+            vec![("pets/DELETE", "dataTraceEnabled", json!(true))],
         ),
         (
             "both logging settings of one method at once",
@@ -177,8 +177,8 @@ fn gated_rows() -> Vec<GatedRow> {
                 replace("/~1pets/PUT/logging/dataTrace", "true"),
             ],
             vec![
-                ("~1pets/PUT", "loggingLevel", json!("INFO")),
-                ("~1pets/PUT", "dataTraceEnabled", json!(true)),
+                ("pets/PUT", "loggingLevel", json!("INFO")),
+                ("pets/PUT", "dataTraceEnabled", json!(true)),
             ],
         ),
         (
@@ -313,7 +313,7 @@ async fn a_configuration_that_enables_no_execution_logging_needs_no_account_role
         (
             "a throttle burst limit",
             vec![replace("/~1pets/GET/throttling/burstLimit", "42")],
-            vec!["methodSettings", "~1pets/GET", "throttlingBurstLimit"],
+            vec!["methodSettings", "pets/GET", "throttlingBurstLimit"],
             json!(42),
         ),
         (

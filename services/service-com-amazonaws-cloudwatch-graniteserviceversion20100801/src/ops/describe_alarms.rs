@@ -242,9 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Which POSITION of this enumeration the request's `NextToken` names, by the one rule
         // every listing of this service that SERVES such a token shares
         // ([`crate::state::ResumedAt`]). This read refuses no token: a value this service
-        // cannot read a cursor out of names the position AFTER the last alarm — the empty page
-        // that ends a walk — so a caller resuming from a token that travelled through a store
-        // or a log is neither refused nor handed the alarms it has already been given.
+        // cannot read a cursor out of names no position of the enumeration at all, so it is
+        // ignored and the listing answers its FIRST page — the answer a request carrying no
+        // token gets.
         let start_at = crate::state::ResumedAt::of(input.next_token.as_deref());
 
         // One page size for every path below, so paging behaves the same whichever filter
@@ -287,7 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The alarm NAME is the identity and therefore the paging order and the cursor
             // on this path too.
             related.sort();
-            let from = start_at.start_of(related.len(), |cursor| {
+            let from = start_at.start_of(|cursor| {
                 related.partition_point(|name| name.as_str() < cursor)
             });
             let page = related.get(from..).unwrap_or_default();
@@ -432,7 +432,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // metric and composite alarms still advances exactly once.
         matching.sort_by(|left, right| left.0.cmp(right.0));
 
-        let from = start_at.start_of(matching.len(), |cursor| {
+        let from = start_at.start_of(|cursor| {
             matching.partition_point(|(name, _)| name.as_str() < cursor)
         });
         let page = matching.get(from..).unwrap_or_default();

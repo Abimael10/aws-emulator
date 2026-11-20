@@ -2802,52 +2802,49 @@ pub fn requested_page(token: Option<&str>) -> Option<&str> {
 /// including the one PAST the last item.
 ///
 /// Shared by every listing of this service that SERVES a token it cannot read instead of
-/// refusing one, so one rule decides which position such a token names: not the first, which
-/// would deliver the items the walk already delivered a second time and never terminate, but the
-/// one after the last — the empty page that ends a walk. A listing that refuses such a token
+/// refusing one, so one rule decides what such a token does: it names no position of this
+/// enumeration at all, and a listing that does not refuse it IGNORES it — answering the page a
+/// request carrying no token asks for, the FIRST one. A listing that refuses such a token
 /// instead reads the cursor itself ([`decode_page_token`]) and words the refusal its own model
 /// declares ([`invalid_next_token_message`]).
 pub enum ResumedAt {
-    /// The beginning: what a request carrying no token asks for.
+    /// The beginning: what a request carrying no token — or one this service cannot read a
+    /// cursor out of, which names no position — asks for.
     TheFirstItem,
     /// The item the token's cursor names — the one the previous page stopped before.
     TheItemNamed(String),
-    /// Past every item the listing holds: the position a token this service cannot read a
-    /// cursor out of names, served as the EMPTY page that ends a walk, which carries no token of
-    /// its own because there is nothing after it.
-    NoItemAtAll,
 }
 
 impl ResumedAt {
-    /// Which of the three `token` asks for.
+    /// Which of the two `token` asks for.
     ///
     /// An EMPTY `NextToken` is no token at all and asks for the first page, the one rule every
     /// paginated read of this service shares ([`requested_page`]). A value this service did not
-    /// mint carries no cursor of this enumeration ([`decode_page_token`]), so there is no item
-    /// of the listing it can name: what it names is the position after the last one.
+    /// mint carries no cursor of this enumeration ([`decode_page_token`]), so it names no item
+    /// of the listing and nothing for the page to resume from: it is ignored, exactly as a
+    /// request that carried no token at all is answered.
     #[must_use]
     pub fn of(token: Option<&str>) -> Self {
         match requested_page(token) {
             None => Self::TheFirstItem,
             Some(token) => match decode_page_token(token) {
                 Some(cursor) => Self::TheItemNamed(cursor),
-                None => Self::NoItemAtAll,
+                None => Self::TheFirstItem,
             },
         }
     }
 
-    /// The index this position falls at in a listing of `len` items, where `before` reports how
-    /// many of them sort before the cursor a token named.
+    /// The index this position falls at in the listing, where `before` reports how many of its
+    /// items sort before the cursor a token named.
     ///
     /// The listing's own order is the caller's — a key is both the paging order and the cursor —
-    /// so only the three POSITIONS are decided here; `before` is how the caller locates one of
+    /// so only the POSITIONS are decided here; `before` is how the caller locates one of
     /// them in the order it sorted.
     #[must_use]
-    pub fn start_of(&self, len: usize, before: impl FnOnce(&str) -> usize) -> usize {
+    pub fn start_of(&self, before: impl FnOnce(&str) -> usize) -> usize {
         match self {
             Self::TheFirstItem => 0,
             Self::TheItemNamed(cursor) => before(cursor),
-            Self::NoItemAtAll => len,
         }
     }
 }
@@ -2864,7 +2861,7 @@ impl ResumedAt {
 /// sentence its own recordings show (`crate::ops::list_metric_streams`), the Contributor Insights
 /// listings their coded one ([`insight_rule_records::invalid_page_token_message`]), and two reads
 /// refuse such a token not at all because they serve a page instead: the alarm listing and the
-/// alarm mute rule listing both serve the empty page that ends a walk ([`ResumedAt`]). So this
+/// alarm mute rule listing both ignore it and serve their first page ([`ResumedAt`]). So this
 /// is the sentence of the reads recorded quoting
 /// the token — the alarm HISTORY listing and the alarm CONTRIBUTOR read
 /// (`crate::ops::describe_alarm_contributors`) — not a fourth wording of one class.

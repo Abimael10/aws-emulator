@@ -9,14 +9,15 @@
 //! > Keys (designated as /{method_setting_key) are method paths defined as
 //! > {resource_path}/{http_method} for an individual method override, or /\*/\* for
 //! > overriding all methods in the stage". A key therefore names a METHOD, as the method
-//! > path itself: the resource path written as a path NAME — every separator in it, its
-//! > leading one included, escaped `~1` the way `PatchOperation$path` requires of a path
-//! > name — then a literal separator, then the HTTP method; and `*/*` for the whole-stage
-//! > path `/*/*`, whose resource half names no resource path. A patch may spell that method
-//! > several ways (the resource path's leading separator escaped or left to the pointer's
-//! > own, the separator before the HTTP method escaped too so the whole method path rides in
-//! > one reference token), and every one of them addresses the one method, so a stage holds
-//! > exactly ONE entry per method however many spellings wrote it.
+//! > path itself: the resource path WITHOUT the leading separator a resource path is stated
+//! > with and with every separator inside it literal, then a separator, then the HTTP method;
+//! > and `*/*` for the whole-stage path `/*/*`, whose resource half names no resource path.
+//! > The `~1` escape is `PatchOperation$path`'s ("Any slash ("/") character appearing in path
+//! > names must be escaped with "~1"") and belongs to the POINTER, not to the key. A patch
+//! > may spell that method several ways (the resource path's leading separator escaped or left
+//! > to the pointer's own, the separator before the HTTP method escaped too so the whole
+//! > method path rides in one reference token), and every one of them addresses the one
+//! > method, so a stage holds exactly ONE entry per method however many spellings wrote it.
 //!
 //! The rows span what the rule generalises over: the DEPTH of the resource path (the root, a
 //! child, a nested one), the wildcard that stands for every method, and each spelling of the
@@ -51,7 +52,7 @@ struct Row {
 const ROWS: &[Row] = &[
     Row {
         case: "a child resource",
-        key: "~1pets/GET",
+        key: "pets/GET",
         spellings: &[
             // The resource path's leading separator escaped into the first token.
             ("/~1pets/GET/metrics/enabled", "metricsEnabled"),
@@ -64,7 +65,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "a nested resource path",
-        key: "~1pets~1{petId}/DELETE",
+        key: "pets/{petId}/DELETE",
         spellings: &[
             (
                 "/~1pets~1{petId}/DELETE/metrics/enabled",
@@ -79,7 +80,7 @@ const ROWS: &[Row] = &[
     },
     Row {
         case: "the root resource",
-        key: "~1/GET",
+        key: "/GET",
         spellings: &[
             ("/~1/GET/metrics/enabled", "metricsEnabled"),
             ("//GET/caching/enabled", "cachingEnabled"),
@@ -111,15 +112,15 @@ fn reported_keys(body: &Value) -> Vec<String> {
 }
 
 /// The `methodSettings` key the method `verb` of `resource_path` is reported under, derived
-/// from the method rather than remembered: the resource path written as a path name, then a
-/// literal separator and the verb. The wildcard resource half names no resource path, so it
+/// from the method rather than remembered: the resource path without its leading separator,
+/// then a separator and the verb. The wildcard resource half names no resource path, so it
 /// is carried over as it stands.
 fn method_key(resource_path: &str, verb: &str) -> String {
     if resource_path.trim_start_matches('/') == "*" {
         return format!("*/{verb}");
     }
     let path = resource_path.strip_prefix('/').unwrap_or(resource_path);
-    format!("{}/{verb}", format!("/{path}").replace('/', "~1"))
+    format!("{path}/{verb}")
 }
 
 #[tokio::test]
@@ -150,13 +151,11 @@ async fn every_spelling_of_one_method_writes_the_one_documented_key() {
                 keys, expected_keys,
                 "case {case}: expected the keys {expected_keys:?}, got {keys:?}"
             );
-            // Every key but the whole-stage one carries the escape on the resource path it
-            // names: that half is a path NAME, and only the separator before the verb is
-            // literal.
+            // Every key states its method path with literal separators: the `~1` escape is
+            // the patch pointer's spelling of a path name, not part of the key.
             assert!(
-                keys.iter()
-                    .all(|key| key == "*/*" || key.starts_with("~1")),
-                "case {case}: a per-method key states its resource path as a path name, got \
+                keys.iter().all(|key| !key.contains('~')),
+                "case {case}: a key states its method path with literal separators, got \
                  {keys:?}"
             );
             let read = get_stage(&gateway, &api, "prod").await;
@@ -253,9 +252,9 @@ async fn a_method_entry_is_removed_by_any_spelling_that_names_it() {
 }
 
 /// RULE: the key of a `methodSettings` entry is the METHOD PATH `Stage$methodSettings`
-/// documents — `{resource_path}/{http_method}`, the resource path written as a path name with
-/// every separator of it escaped `~1` — whichever of the spellings the patch POINTER
-/// addressed the entry by.
+/// documents — `{resource_path}/{http_method}`, the resource path without its leading
+/// separator and every separator inside it literal — whichever of the spellings the patch
+/// POINTER addressed the entry by.
 ///
 /// The key is DERIVED here from the resource path and the verb of each row, so the row proves
 /// the form rather than one remembered string.
@@ -282,8 +281,8 @@ async fn a_key_is_the_documented_method_path_derived_from_the_method_it_names() 
 
     let mut expected_keys: Vec<String> = Vec::new();
     for (case, resource_path, verb) in rows {
-        // The method path as a key: the resource path is written as a path name, so every
-        // separator of it is escaped.
+        // The method path as a key: the resource path without its leading separator, every
+        // separator inside it literal.
         let expected_key = method_key(resource_path, verb);
         // The pointer that addresses a setting of that same method: a separator INSIDE the
         // resource path is escaped `~1`, as `PatchOperation$path` requires of a path name.
@@ -311,9 +310,8 @@ async fn a_key_is_the_documented_method_path_derived_from_the_method_it_names() 
             "case {case}: expected the keys {expected_keys:?}, got {keys:?}"
         );
         assert!(
-            keys.iter()
-                .all(|key| key == "*/*" || key.starts_with("~1")),
-            "case {case}: a per-method key states its resource path as a path name, got \
+            keys.iter().all(|key| !key.contains('~')),
+            "case {case}: a key states its method path with literal separators, got \
              {keys:?}"
         );
 

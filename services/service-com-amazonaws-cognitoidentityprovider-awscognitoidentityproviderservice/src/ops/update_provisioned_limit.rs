@@ -213,12 +213,11 @@ fn invalid_definition(failure: crate::state::LimitLookupFailure) -> UpdateProvis
 /// request exceeded your account's service quota. To increase your limit, use
 /// or submit a Service Quotas increase request" (this service's model).
 ///
-/// The other two are malformed PARAMETERS — `InvalidParameterException`,
+/// The other is a malformed PARAMETER — `InvalidParameterException`,
 /// "thrown when the Amazon Cognito service encounters an invalid parameter"
 /// (this service's model) — and nothing about the account: a rate below the
 /// rate the limit includes is under the bottom of the range this operation
-/// accepts, and a rate that is already in force asks this operation to set the
-/// provisioned limit to the value it is already set to, which adjusts nothing.
+/// accepts.
 fn refused(refusal: crate::state::RateRefusal) -> UpdateProvisionedLimitError {
     use crate::state::RateRefusal;
     let message = Some(refusal.message());
@@ -228,7 +227,7 @@ fn refused(refusal: crate::state::RateRefusal) -> UpdateProvisionedLimitError {
                 ServiceQuotaExceededException { message },
             )
         }
-        RateRefusal::AlreadyInForce | RateRefusal::BelowFreeRate { .. } => {
+        RateRefusal::BelowFreeRate { .. } => {
             UpdateProvisionedLimitErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message,

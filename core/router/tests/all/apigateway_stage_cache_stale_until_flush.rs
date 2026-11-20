@@ -532,9 +532,9 @@ async fn front(
     let setting = stage
         .get("methodSettings")
         // The key is the method path `Stage$methodSettings` documents: the resource path
-        // written as a path name, every separator of it (its leading one included) escaped
-        // `~1`, then a literal separator and the HTTP method.
-        .and_then(|settings| settings.get(format!("~1{FRONT_PART}/GET")))
+        // without the leading separator a resource path is stated with, every separator
+        // inside it literal, then a separator and the HTTP method.
+        .and_then(|settings| settings.get(format!("{FRONT_PART}/GET")))
         .cloned()
         .unwrap_or(Value::Null);
     match caching {

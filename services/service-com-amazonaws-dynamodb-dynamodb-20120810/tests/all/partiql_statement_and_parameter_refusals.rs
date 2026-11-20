@@ -4,13 +4,14 @@
 //! the set of inputs it holds for rather than over one statement.
 //!
 //! 1. A numeric PARAMETER is a number this service can CONVERT or it is not, and those are
-//!    two different refusals: a text whose exponent is no signed run of decimal digits is
-//!    reported as a parameter that cannot be converted to a numeric value (echoing the
-//!    text), while a text whose exponent IS such a run states a magnitude, and a magnitude
-//!    outside the documented 10^-130..10^125 range is reported as the over- or underflow it
-//!    is — however many digits that exponent is written with. The rows walk both sides of
-//!    the width the decimal scale is held in and both ends of the documented range, on
-//!    every surface that binds a parameter.
+//!    two different refusals: a text whose exponent is no signed run of decimal digits \u2014 or
+//!    is a run no integer a decimal exponent is carried in can hold, which states a
+//!    magnitude no number has \u2014 is reported as a parameter that cannot be converted to a
+//!    numeric value (echoing the text), while a text whose exponent IS such a run states a
+//!    magnitude, and a magnitude outside the documented 10^-130..10^125 range is reported as
+//!    the over- or underflow it is, however many digits that exponent is written with. The
+//!    rows walk both sides of the width the exponent is carried in and both ends of the
+//!    documented range, on every surface that binds a parameter.
 //! 2. A request that mixes reads and writes is refused as a whole, in the sentence the
 //!    SURFACE states for its own shape: a batch and a transaction word it differently, and
 //!    neither wording mentions the statements, so the rows vary how many statements the
@@ -23,7 +24,9 @@
 //! 4. A transaction answers no per-statement image, so a `RETURNING` clause is refused
 //!    behind the slot that carried it and the transaction commits nothing.
 //! 5. A read is served over ONE range of its source's keys, so a `WHERE` clause whose `OR`
-//!    branches each ask for their own range of the sort key is refused rather than planned.
+//!    branches each state their own KEY CONDITION on the sort key is refused rather than
+//!    planned; a branch whose only mention of that key is in a form no key condition takes
+//!    states no range and is a filter, so such a clause is served.
 //! 6. `EXISTS(<select>)` is the check statement: the single statement surface and the batch
 //!    refuse it, and a write transaction applies it as the condition it is.
 //!
@@ -135,11 +138,11 @@ const UNDERFLOW_CLAUSE: &str =
 
 /// The documented exponent range of a DynamoDB number: "Number: ... can have up to 38
 /// digits of precision. Exponent range is 10^-130 to 10^125" ("Service, Account, and Table
-/// Quotas"). The two limits of the integer the exponent is carried in are the 32-bit ones.
+/// Quotas"). The two limits of the integer the exponent is carried in are the 64-bit ones.
 const MAX_EXPONENT: i32 = 125;
 const MIN_EXPONENT: i32 = -130;
-const MAX_SIGNED_32: &str = "2147483647";
-const MIN_SIGNED_32: &str = "-2147483648";
+const MAX_SIGNED_64: &str = "9223372036854775807";
+const MIN_SIGNED_64: &str = "-9223372036854775808";
 
 #[tokio::test]
 async fn a_numeric_parameter_outside_the_numeric_domain_states_the_rule_it_broke() {
@@ -148,21 +151,37 @@ async fn a_numeric_parameter_outside_the_numeric_domain_states_the_rule_it_broke
     // Each row: the case, the `N` text the parameter carries, and the whole sentence the
     // refusal must state. The rows walk the two sides of the width the exponent is carried
     // in — one past each of its limits, and far past it both ways — beside one past each
-    // end of the documented range, a text that is no number at all, and a mantissa that
-    // normalises to zero under an exponent outside the documented range.
+    // end of the documented range, a magnitude far out of range that the integer still
+    // holds, a text that is no number at all, and a mantissa that normalises to zero under
+    // an exponent outside the documented range.
     let rows: Vec<(&str, String, String)> = vec![
         (
-            "an exponent one past the top of the integer the scale is held in",
+            "an exponent one past the top of the integer it is carried in",
+            "1e9223372036854775808".to_string(),
+            conversion_clause("1e9223372036854775808"),
+        ),
+        (
+            "an exponent one past the bottom of that integer",
+            "1e-9223372036854775809".to_string(),
+            conversion_clause("1e-9223372036854775809"),
+        ),
+        (
+            "an exponent far past the width of that integer",
+            "1e99999999999999999999999".to_string(),
+            conversion_clause("1e99999999999999999999999"),
+        ),
+        (
+            "an exponent past the width of a 32-bit scale",
             "1e2147483648".to_string(),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
-            "an exponent one past the bottom of that integer",
+            "a negative exponent past that width",
             "1e-2147483649".to_string(),
             UNDERFLOW_CLAUSE.to_string(),
         ),
         (
-            "an exponent far past the width of that integer",
+            "an exponent far past that width",
             "1e99999999999".to_string(),
             OVERFLOW_CLAUSE.to_string(),
         ),
@@ -183,13 +202,18 @@ async fn a_numeric_parameter_outside_the_numeric_domain_states_the_rule_it_broke
         ),
         (
             "an exponent at the top of that integer, which states a magnitude",
-            format!("1e{MAX_SIGNED_32}"),
+            format!("1e{MAX_SIGNED_64}"),
             OVERFLOW_CLAUSE.to_string(),
         ),
         (
             "an exponent at the bottom of that integer, which states a magnitude",
-            format!("1e{MIN_SIGNED_32}"),
+            format!("1e{MIN_SIGNED_64}"),
             UNDERFLOW_CLAUSE.to_string(),
+        ),
+        (
+            "an exponent inside that integer but far past the documented range",
+            "1e92233720368547758".to_string(),
+            OVERFLOW_CLAUSE.to_string(),
         ),
         (
             "a magnitude one past the documented maximum",
@@ -869,7 +893,9 @@ async fn a_where_clause_stating_a_range_key_inside_a_disjunction_is_refused() {
     }
 
     // The controls: a clause whose disjunction names no key of the source is served, so is
-    // one that states the sort key in the top-level conjunction (one range), and so is a
+    // one that states the sort key in the top-level conjunction (one range), one whose
+    // sort-key branch states no KEY CONDITION — a negation or an inequality narrows no
+    // range of keys, so the clause is served as the union of its branches — and so is a
     // disjunction over the TABLE's sort key when the source is the index it is not a key
     // of.
     for (case, statement, items) in [
@@ -881,6 +907,25 @@ async fn a_where_clause_stating_a_range_key_inside_a_disjunction_is_refused() {
         (
             "the sort key in the top-level conjunction",
             format!("SELECT pk FROM \"{PAIRED}\" WHERE pk = 'p1' AND sk = 1 AND note = 'n1'"),
+            json!([{"pk": {"S": "p1"}}]),
+        ),
+        (
+            "a negated sort-key branch, which states no key condition",
+            format!(
+                "SELECT pk FROM \"{PAIRED}\" WHERE pk = 'p1' AND (NOT sk = 2 OR note = 'x')"
+            ),
+            json!([{"pk": {"S": "p1"}}]),
+        ),
+        (
+            "a bare partition branch beside a negated sort-key branch",
+            format!(
+                "SELECT pk FROM \"{PAIRED}\" WHERE pk = 'p1' OR (pk = 'p1' AND NOT sk = 1)"
+            ),
+            json!([{"pk": {"S": "p1"}}]),
+        ),
+        (
+            "a sort-key branch stating an inequality, which narrows no range",
+            format!("SELECT pk FROM \"{PAIRED}\" WHERE pk = 'p1' AND (sk <> 1 OR note = 'n1')"),
             json!([{"pk": {"S": "p1"}}]),
         ),
         (

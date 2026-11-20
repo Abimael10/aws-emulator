@@ -28,8 +28,8 @@
 //!
 //! The rows differ along what the rule generalises over: the RESOURCE the overridden method
 //! sits on — the api's root resource, a child of it, a child of that child, and a parameterised
-//! one, which are the shapes the resource half of a method-path key takes and the ones whose
-//! separators that key escapes — which verb of each resource carries the override, and the
+//! one, which are the shapes the resource half of a method-path key takes — which verb of each
+//! resource carries the override, and the
 //! STATUS the stage answered with, which is what separates what `ERROR` writes from what `INFO`
 //! writes. The recorded case is one row of it: a stage at `ERROR` with one method of one
 //! resource raised to `INFO`.
@@ -269,12 +269,13 @@ fn traced_line(request_id: &str, line: &str) -> String {
 }
 
 /// The `methodSettings` key the method `verb` of `resource_path` is held under: the method path
-/// `{resource_path}/{http_method}` (`Stage$methodSettings`) — the resource path written as a path
-/// name, every separator of it (the leading one included) escaped `~1`, joined by a literal
-/// separator to the verb.
+/// `{resource_path}/{http_method}` (`Stage$methodSettings`) — the resource path WITHOUT the leading
+/// separator a resource path is stated with and with every separator inside it literal, joined by a
+/// separator to the verb. The `~1` escape is the patch POINTER's spelling of a path name
+/// ([`method_patch_path`]), not part of the key.
 fn method_key(resource_path: &str, verb: &str) -> String {
     let unprefixed = resource_path.strip_prefix('/').unwrap_or(resource_path);
-    format!("{}/{verb}", format!("/{unprefixed}").replace('/', "~1"))
+    format!("{unprefixed}/{verb}")
 }
 
 /// The patch path that addresses a setting of that same method, behind the pointer's own leading

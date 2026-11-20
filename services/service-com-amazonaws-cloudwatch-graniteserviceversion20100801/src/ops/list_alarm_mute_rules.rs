@@ -98,8 +98,8 @@ pub enum ListAlarmMuteRulesErrorModeled {
     // answer with rather than the scaffold's 501.
     InternalServiceFault(InternalServiceFault),
     // Declared because the model declares it, and not answered by the handler below: a
-    // `NextToken` this listing cannot resume from names the position past its last rule, which
-    // is a page it SERVES rather than a request it refuses ([`ResumedAt`]).
+    // `NextToken` this listing cannot resume from names no position of its enumeration, so it
+    // is ignored and the first page is served rather than the request refused ([`ResumedAt`]).
     InvalidNextToken(InvalidNextToken),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(key, stored)| (&key.name, stored))
             .collect();
         selected.sort_unstable_by_key(|(name, _)| *name);
-        let from = resume.start_of(selected.len(), |cursor| {
+        let from = resume.start_of(|cursor| {
             selected.partition_point(|(name, _)| name.as_str() < cursor)
         });
         let page = selected.get(from..).unwrap_or_default();
