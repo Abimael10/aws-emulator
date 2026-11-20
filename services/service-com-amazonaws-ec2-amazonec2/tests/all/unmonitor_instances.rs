@@ -21,8 +21,8 @@
 //! 3. an instance whose monitoring is already off with nothing owed is left exactly as it
 //!    is, so the call reports the settled state rather than re-entering the transient one;
 //! 4. only an instance that is up — `running`, or `pending` on its way to it — can have
-//!    monitoring turned off; an instance in any other state is refused
-//!    `IncorrectInstanceState`;
+//!    monitoring turned off; an instance in any other state is refused `InvalidState` with
+//!    the fixed sentence that names nothing of the request;
 //! 5. an instance id this service cannot resolve is refused, the FORM before the lookup —
 //!    a value outside the instance-id form at the parameter layer this operation reads its
 //!    `InstanceIds` list in, a well-formed id nothing was launched for as not found — and a
@@ -468,25 +468,25 @@ async fn unmonitor_instances_refuses_what_it_cannot_act_on_and_changes_nothing()
             case: "a stopped instance",
             names: Names::Parked(InstanceStateName::Stopped),
             status: 400,
-            code: "IncorrectInstanceState",
+            code: "InvalidState",
         },
         RefusalRow {
             case: "an instance on its way to stopped",
             names: Names::Parked(InstanceStateName::Stopping),
             status: 400,
-            code: "IncorrectInstanceState",
+            code: "InvalidState",
         },
         RefusalRow {
             case: "an instance on its way to terminated",
             names: Names::Parked(InstanceStateName::ShuttingDown),
             status: 400,
-            code: "IncorrectInstanceState",
+            code: "InvalidState",
         },
         RefusalRow {
             case: "a terminated instance",
             names: Names::Parked(InstanceStateName::Terminated),
             status: 400,
-            code: "IncorrectInstanceState",
+            code: "InvalidState",
         },
         RefusalRow {
             case: "an id of no instance",
@@ -586,13 +586,10 @@ async fn unmonitor_instances_refuses_what_it_cannot_act_on_and_changes_nothing()
                     .find(|(parked_state, _)| *parked_state == state)
                     .map(|(_, instance_id)| instance_id.clone())
                     .unwrap_or_else(|| panic!("case {case:?}: the row must have an instance"));
-                // The refusal names the instance the request named and the action its
-                // state does not admit, and reports no state: the state the row parked
-                // the instance in does not appear in the sentence.
-                let message = format!(
-                    "The instance '{instance_id}' is not in a state from which it can be \
-                     unmonitored."
-                );
+                // The monitoring pair's refusal interpolates nothing at all: neither the
+                // instance the request named nor the state the row parked it in appears in
+                // the sentence.
+                let message = "Instance is not in a supported state.".to_string();
                 (
                     instance_fields(std::slice::from_ref(&instance_id)),
                     Some(message),

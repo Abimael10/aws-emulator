@@ -10,6 +10,12 @@
 //! ([`crate::state::ComAmazonawsEc2Amazonec2State::set_instance_monitoring`]), which
 //! `UnmonitorInstances` writes the other direction through.
 //!
+//! An instance whose lifecycle state has nothing running to monitor is refused
+//! `InvalidState` with the fixed sentence that names nothing of the request
+//! ([`crate::scaffolded::Scaffolded::instance_state_not_supported`]) — the refusal both
+//! halves of the monitoring move answer, and not the `IncorrectInstanceState` the
+//! lifecycle operations beside them answer.
+//!
 //! The `InstanceIds` list is validated as a request PARAMETER
 //! ([`crate::state::require_instance_record_by_parameter`]), so a value outside the
 //! instance-id form is refused `InvalidParameterValue` naming the parameter and the form
@@ -199,7 +205,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 instance.state,
                 InstanceStateName::Running | InstanceStateName::Pending
             ) {
-                return Err(Scaffolded::incorrect_instance_state(instance_id, "monitored"));
+                // The monitoring pair word this refusal as the fixed sentence of
+                // `InvalidState` — naming neither the instance nor its state — rather than
+                // as the `IncorrectInstanceState` of the lifecycle operations beside them
+                // ([`crate::scaffolded::Scaffolded::instance_state_not_supported`]).
+                return Err(Scaffolded::instance_state_not_supported());
             }
         }
 

@@ -512,6 +512,19 @@ impl<E> Scaffolded<E> {
         )
     }
 
+    /// `InvalidState` (HTTP 400): the instance's lifecycle state is not one the operation
+    /// supports, worded as the fixed sentence "Instance is not in a supported state."
+    ///
+    /// The fifth sentence of the instance-state class, and the shortest: it interpolates
+    /// NOTHING — neither the instance the request named, nor the state it is in, nor the
+    /// states the operation supports — so the text an operation answers is the same whichever
+    /// instance of whichever unsupported state it refused. It is the refusal of the
+    /// detailed-monitoring pair, which is recorded answering it for an instance that is not
+    /// up, rather than the `IncorrectInstanceState` of the lifecycle operations beside them.
+    pub fn instance_state_not_supported() -> Self {
+        Self::service_error("InvalidState", 400, "Instance is not in a supported state.")
+    }
+
     /// `OperationNotPermitted` (HTTP 400): the request is well formed and the
     /// resource exists, but an attribute on it forbids the action.
     pub fn operation_not_permitted(message: impl Into<String>) -> Self {

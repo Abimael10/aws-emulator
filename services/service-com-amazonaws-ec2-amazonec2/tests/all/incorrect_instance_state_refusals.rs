@@ -12,7 +12,9 @@
 //! `IncorrectInstanceState` and ONE sentence — the instance id the request named, the
 //! action its state does not admit, and a closing full stop. The state the instance is
 //! actually in is NOT part of the sentence, so the text an operation answers is the same
-//! whichever state it refused.
+//! whichever state it refused. The detailed-monitoring pair is not of this family: it
+//! answers the fixed `InvalidState` sentence instead, covered by
+//! `tests/all/monitoring_state_refusal.rs`.
 //!
 //! Each assertion is driven from a TABLE whose rows differ along what the rule
 //! generalises over — the operation, the action it names, whether its request carries a
@@ -135,28 +137,6 @@ const FAMILIES: &[Family] = &[
             InstanceStateName::Stopped,
             InstanceStateName::Stopping,
             InstanceStateName::ShuttingDown,
-        ],
-    },
-    Family {
-        action: "MonitorInstances",
-        names_action: "monitored",
-        batched: true,
-        refused: &[
-            InstanceStateName::Stopped,
-            InstanceStateName::Stopping,
-            InstanceStateName::ShuttingDown,
-            InstanceStateName::Terminated,
-        ],
-    },
-    Family {
-        action: "UnmonitorInstances",
-        names_action: "unmonitored",
-        batched: true,
-        refused: &[
-            InstanceStateName::Stopped,
-            InstanceStateName::Stopping,
-            InstanceStateName::ShuttingDown,
-            InstanceStateName::Terminated,
         ],
     },
     Family {

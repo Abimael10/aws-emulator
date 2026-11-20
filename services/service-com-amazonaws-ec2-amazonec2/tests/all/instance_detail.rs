@@ -1085,7 +1085,10 @@ async fn monitoring_refuses_what_it_cannot_act_on_and_changes_nothing() {
             action: "MonitorInstances",
             params: vec![p("InstanceId.1", &terminated)],
             status: 400,
-            code: "IncorrectInstanceState",
+            // The monitoring pair's own refusal for a state with nothing running to
+            // monitor; its wording is a table of its own in
+            // `tests/all/monitoring_state_refusal.rs`.
+            code: "InvalidState",
         },
         RefusalRow {
             case: "one resolvable instance beside one that is not",

@@ -14,6 +14,24 @@
 //! instance whose metrics are never published has no utilisation to graph and no breach to
 //! fire on.
 //!
+//! # The aggregate series beside them
+//!
+//! A measurement of one instance is also a contribution to the series of the instances it is
+//! one OF, which is what the aggregate dimensions select: "`InstanceType`: This dimension
+//! filters the data you request for all instances running with this specified instance type"
+//! and "`ImageId`: This dimension filters the data you request for all instances running this
+//! Amazon EC2 Amazon Machine Image (AMI)", both "available for instances with detailed
+//! monitoring enabled" (Amazon EC2 User Guide, instance metric dimensions). So a guest
+//! measurement of an instance with DETAILED monitoring is published a second and a third time,
+//! into the series dimensioned on that instance's type ([`INSTANCE_TYPE_DIMENSION`]) and on
+//! the image it was launched from ([`IMAGE_ID_DIMENSION`]) — one contribution per instance per
+//! period, so the statistics a reader takes of an aggregate period are the statistics of the
+//! instances that were measured in it: its `SampleCount` is how many of them there were, its
+//! `Maximum` the largest reading any of them took. An instance with BASIC monitoring
+//! contributes to neither, which is what makes those dimensions a thing detailed monitoring
+//! buys, and a status check's verdict contributes to neither either: it is a verdict about one
+//! named instance rather than a quantity measured on a guest.
+//!
 //! # When a sample happens
 //!
 //! At the cadence the instance's MONITORING STATE selects, which is the distinction between
@@ -102,10 +120,22 @@ use super::{
 /// The namespace Amazon EC2 publishes an instance's own metrics under.
 pub const NAMESPACE: &str = "AWS/EC2";
 
-/// The one dimension an instance's own series is dimensioned on: "`InstanceId`: This dimension
+/// The dimension an instance's OWN series is dimensioned on: "`InstanceId`: This dimension
 /// filters the data you request for only the identified instance" (Amazon EC2 User Guide,
 /// instance metric dimensions).
 pub const INSTANCE_ID_DIMENSION: &str = "InstanceId";
+
+/// The dimension the series of every instance of ONE instance type is rolled up under:
+/// "`InstanceType`: This dimension filters the data you request for all instances running
+/// with this specified instance type ... available for instances with detailed monitoring
+/// enabled" (Amazon EC2 User Guide, instance metric dimensions).
+pub const INSTANCE_TYPE_DIMENSION: &str = "InstanceType";
+
+/// The dimension the series of every instance launched from ONE image is rolled up under:
+/// "`ImageId`: This dimension filters the data you request for all instances running this
+/// Amazon EC2 Amazon Machine Image (AMI) ... available for instances with detailed monitoring
+/// enabled" (Amazon EC2 User Guide, instance metric dimensions).
+pub const IMAGE_ID_DIMENSION: &str = "ImageId";
 
 /// The `StandardUnit` value a percentage is published in.
 pub const PERCENT_UNIT: &str = "Percent";
@@ -327,6 +357,10 @@ struct DueSample {
     value: f64,
     /// The start of the period it was taken in, which is the time stamp it carries.
     period_start_secs: i64,
+    /// The AGGREGATE series this reading is also a contribution to, as `(dimension name,
+    /// dimension value)` — empty for a reading that is published under the instance's own
+    /// dimension alone ([`aggregate_dimensions`]).
+    aggregates: Vec<(&'static str, String)>,
 }
 
 /// Publish every `AWS/EC2` datapoint the account's instances owe, and answer whether this store
@@ -451,10 +485,44 @@ fn due_samples(store: &mut ComAmazonawsEc2Amazonec2State, now: SystemTime) -> Ve
                 metric,
                 value,
                 period_start_secs: start,
+                aggregates: aggregate_dimensions(instance, metric),
             });
         }
     }
     samples
+}
+
+/// The AGGREGATE series one reading of `metric` on `instance` is also a contribution to, as
+/// `(dimension name, dimension value)`.
+///
+/// The two aggregate dimensions are "available for instances with detailed monitoring enabled"
+/// (Amazon EC2 User Guide, instance metric dimensions — quoted in the module docs), so an
+/// instance publishing at the basic cadence contributes to neither: there is no roll-up of a
+/// measurement that was not taken every minute. What is rolled up is a quantity measured on the
+/// guest; a status check's verdict is about one named instance, so it is published under that
+/// instance's own dimension alone.
+///
+/// A dimension whose value this store does not hold for the instance — an instance with no
+/// image recorded for it — yields no series rather than one dimensioned on nothing.
+fn aggregate_dimensions(
+    instance: &InstanceRecord,
+    metric: &InstanceMetric,
+) -> Vec<(&'static str, String)> {
+    if !matches!(metric.class, MetricClass::Instance)
+        || !is_detailed_monitoring(&instance.monitoring_state)
+    {
+        return Vec::new();
+    }
+    [
+        (INSTANCE_TYPE_DIMENSION, Some(instance.instance_type.clone())),
+        (IMAGE_ID_DIMENSION, instance.image_id.clone()),
+    ]
+    .into_iter()
+    .filter_map(|(dimension, value)| {
+        let value = value?;
+        (!value.is_empty()).then_some((dimension, value))
+    })
+    .collect()
 }
 
 /// Whether the guest of `instance` had come up by `closed_at`, the instant a period ended.
@@ -519,6 +587,11 @@ const CHECK_FAILED: f64 = 1.0;
 /// Append the samples to the CloudWatch metric store, and make the alarms watching those series
 /// due for evaluation.
 ///
+/// Each reading is appended to the instance's OWN series and to every aggregate series it is a
+/// contribution to ([`DueSample::aggregates`]): CloudWatch aggregates the datapoints a period
+/// holds, so one contribution per instance per period is what makes an aggregate period's
+/// statistics the statistics of the instances measured in it.
+///
 /// The datapoints go into the CloudWatch emulator's OWN store — the same one `ListMetrics`,
 /// `GetMetricStatistics` and the alarm evaluation read — so one metric has one home and the
 /// publisher and its readers cannot drift. They never travel over `PutMetricData`, which refuses
@@ -530,16 +603,6 @@ fn append<Eng: Send + Sync + 'static>(engine: &Eng, samples: &[DueSample], at: S
     let mut store = state.lock();
     let mut written: Vec<cloudwatch::state::WrittenSeries> = Vec::new();
     for sample in samples {
-        let key = cloudwatch::state::MetricKey {
-            namespace: NAMESPACE.to_string(),
-            metric_name: sample.metric.name.to_string(),
-            dimensions: [(
-                INSTANCE_ID_DIMENSION.to_string(),
-                sample.instance_id.clone(),
-            )]
-            .into_iter()
-            .collect(),
-        };
         let datum = cloudwatch::state::StoredDatum {
             // The period's own start: the reading is the reading of that period, so an
             // `Average`, a `Minimum` and a `Maximum` over it all answer from this one datapoint.
@@ -552,22 +615,34 @@ fn append<Eng: Send + Sync + 'static>(engine: &Eng, samples: &[DueSample], at: S
             unit: Some(sample.metric.unit.to_string()),
             storage_resolution: STANDARD_STORAGE_RESOLUTION_SECONDS,
         };
-        if store.append_datapoints(key.clone(), vec![datum]).is_err() {
-            // The metric store holds no more series. Whatever request this reading came off was
-            // already answered, so nothing is failed for it; the dropped reading is reported
-            // where a developer can see it.
-            ::tracing::warn!(
-                instance = %sample.instance_id,
-                metric = %sample.metric.name,
-                "the CloudWatch metric store is at capacity, so this instance's measurement was \
-                 not published"
-            );
-            continue;
+        let own = (INSTANCE_ID_DIMENSION, sample.instance_id.clone());
+        for (dimension, value) in std::iter::once(own).chain(sample.aggregates.iter().cloned()) {
+            let key = cloudwatch::state::MetricKey {
+                namespace: NAMESPACE.to_string(),
+                metric_name: sample.metric.name.to_string(),
+                dimensions: [(dimension.to_string(), value)].into_iter().collect(),
+            };
+            if store
+                .append_datapoints(key.clone(), vec![datum.clone()])
+                .is_err()
+            {
+                // The metric store holds no more series. Whatever request this reading came off
+                // was already answered, so nothing is failed for it; the dropped reading is
+                // reported where a developer can see it.
+                ::tracing::warn!(
+                    instance = %sample.instance_id,
+                    metric = %sample.metric.name,
+                    dimension = %dimension,
+                    "the CloudWatch metric store is at capacity, so this instance's measurement \
+                     was not published"
+                );
+                continue;
+            }
+            written.push(cloudwatch::state::WrittenSeries {
+                key,
+                units: vec![sample.metric.unit.to_string()],
+            });
         }
-        written.push(cloudwatch::state::WrittenSeries {
-            key,
-            units: vec![sample.metric.unit.to_string()],
-        });
     }
     // An instance alarm is an alarm on one of these series, so the arriving datapoints are what
     // makes its next evaluation due — exactly as a published datapoint does.

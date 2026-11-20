@@ -10,6 +10,11 @@
 //! ([`crate::state::ComAmazonawsEc2Amazonec2State::set_instance_monitoring`]), which
 //! `MonitorInstances` writes the other direction through.
 //!
+//! An instance whose lifecycle state has nothing running to monitor is refused
+//! `InvalidState` with the fixed sentence that names nothing of the request
+//! ([`crate::scaffolded::Scaffolded::instance_state_not_supported`]), the refusal
+//! `MonitorInstances` answers for the same class of instance.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -179,7 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 instance.state,
                 InstanceStateName::Running | InstanceStateName::Pending
             ) {
-                return Err(Scaffolded::incorrect_instance_state(instance_id, "unmonitored"));
+                // The one refusal of the monitoring pair, worded as `MonitorInstances`
+                // words it: the fixed `InvalidState` sentence that names nothing of the
+                // request.
+                return Err(Scaffolded::instance_state_not_supported());
             }
         }
 
