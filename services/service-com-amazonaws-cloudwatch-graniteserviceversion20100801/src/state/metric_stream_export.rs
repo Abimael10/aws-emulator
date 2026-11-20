@@ -47,7 +47,11 @@
 //! access Amazon Kinesis Data Firehose resources. This IAM role must already exist and must be
 //! in the same account as the metric stream. This IAM role must include the following
 //! permissions: firehose:PutRecord firehose:PutRecordBatch" (`PutMetricStreamInput$RoleArn`) —
-//! so a role IAM answers withholds that write exports nothing.
+//! and TAKING a role on has two halves, both of which have to hold for a record to be pushed:
+//! the role's own trust policy has to let the metric-streams service principal assume it
+//! ([`DELIVERY_PRINCIPALS`]), and the permissions in force on it have to allow that write
+//! ([`PUT_RECORD_ACTION`]). A role IAM answers withholds either exports nothing, and the
+//! stream's own `PublishErrorRate` is what reports it ([`metering`]).
 //!
 //! A stream configured for one of the OpenTelemetry output formats exports the same metric
 //! updates, selected by the same filters and summarised over the same periods, in the records
@@ -125,6 +129,40 @@ const DELIVERY_STREAM_RESOURCE_TYPE: &str = "deliverystream";
 /// `PutMetricStreamInput$RoleArn` names it: "This IAM role must include the following
 /// permissions: firehose:PutRecord firehose:PutRecordBatch".
 const PUT_RECORD_ACTION: &str = "firehose:PutRecord";
+
+/// The service principals a metric stream's role has to trust for CloudWatch to be able to take
+/// it on.
+///
+/// "The ARN of an IAM role that this metric stream will use to access Amazon Kinesis Data
+/// Firehose resources" (`PutMetricStreamInput$RoleArn`): the export is made BY the metric-streams
+/// side of CloudWatch, as its own service principal, so a trust document naming it names this
+/// assume — and so does one naming the service as a whole, which is the same service taking the
+/// role on ([`super::alarm_actions::CLOUDWATCH_SERVICE_PRINCIPAL`]).
+const DELIVERY_PRINCIPALS: [&str; 2] = [
+    METRIC_STREAMS_SERVICE_PRINCIPAL,
+    super::alarm_actions::CLOUDWATCH_SERVICE_PRINCIPAL,
+];
+
+/// The service principal the metric-streams side of CloudWatch makes an export as.
+const METRIC_STREAMS_SERVICE_PRINCIPAL: &str = "streams.metrics.cloudwatch.amazonaws.com";
+
+/// The suffix every AWS service principal carries after the service's own label, which is what
+/// the Regional spelling of one is written around.
+const PRINCIPAL_SUFFIX: &str = ".amazonaws.com";
+
+/// [`DELIVERY_PRINCIPALS`] as a trust policy may name them: each of them, and the Regional
+/// `<service>.<region>.amazonaws.com` spelling a document written for one Region's resources names
+/// the same service under — so a document admitting any of them admits the export.
+fn delivery_principals(region: &str) -> Vec<String> {
+    let mut offered: Vec<String> = Vec::new();
+    for principal in DELIVERY_PRINCIPALS {
+        offered.push(principal.to_string());
+        if let Some(service) = principal.strip_suffix(PRINCIPAL_SUFFIX) {
+            offered.push(format!("{service}.{region}{PRINCIPAL_SUFFIX}"));
+        }
+    }
+    offered
+}
 
 /// How many records ONE request exports.
 ///
@@ -218,7 +256,9 @@ fn period_start(timestamp_secs: f64) -> f64 {
 /// publisher's fan-out cannot block another's read. The datapoints a record reports are only
 /// read: a record is a reading of what the store already holds. What a delivery WRITES is the
 /// stream's own metering, counting the updates that reached the destination
-/// ([`metering::exported`]) — a stream that delivered nothing writes nothing.
+/// ([`metering::exported`]) — a stream that delivered nothing writes nothing — beside the share
+/// of the attempt that did not reach it ([`metering::publish_error_rate`]), which a stream that
+/// ATTEMPTED a publish reports whether it placed anything or not.
 pub async fn export_published<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -242,14 +282,18 @@ pub async fn export_published<Eng: Send + Sync + 'static>(
         if records.is_empty() {
             continue;
         }
-        let delivered = deliver(ctx, &export, &records).await;
+        let pushed = deliver(ctx, &export, &records).await;
         // The stream's own counters report what it STREAMED, so they count the records the
         // destination took and are stamped with the instant it took them.
-        let exported = metering::exported(&export.measured, delivered);
+        let exported = metering::exported(&export.measured, pushed.taken);
         let now = super::now_secs();
-        state
-            .lock()
-            .meter_exported_updates(&export.stream.name, exported, now);
+        let mut store = state.lock();
+        store.meter_exported_updates(&export.stream.name, exported, now);
+        // And its error rate reports the share of the attempt that did not reach the
+        // destination, which is the only series a stream that placed nothing publishes.
+        if let Some(rate) = metering::publish_error_rate(pushed.attempted, pushed.taken) {
+            store.meter_publish_error_rate(&export.stream.name, rate, now);
+        }
     }
 }
 
@@ -634,18 +678,44 @@ fn insert_number(value: &mut Map<String, Value>, member: &str, statistic: f64) {
     }
 }
 
+/// What ONE push into a destination did: how many records it attempted and how many the
+/// destination took.
+///
+/// The two figures are what both of a stream's own readings are computed from: the records that
+/// arrived are the updates it streamed ([`metering::exported`]), and the ones left over are the
+/// share of the attempt that failed ([`metering::publish_error_rate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Pushed {
+    /// The records the push set out to place.
+    attempted: usize,
+    /// How many of them the destination took.
+    taken: usize,
+}
+
+impl Pushed {
+    /// A push none of whose records reached the destination.
+    fn none_of(attempted: usize) -> Self {
+        Self {
+            attempted,
+            taken: 0,
+        }
+    }
+}
+
 /// Push one stream's records into the delivery stream its `FirehoseArn` names, oldest first, and
-/// answer how many of them the destination took.
+/// answer what the push did.
 ///
 /// Every failure is LOGGED and changes nothing a caller is told: an export is asynchronous and
 /// is not part of any operation's answer, exactly as an alarm action's delivery is not
 /// ([`super::alarm_actions`]). What it does change is what the stream is metered for: a record
-/// the destination never took is not an update the stream streamed.
+/// the destination never took is not an update the stream streamed, and the share of the attempt
+/// that did not arrive is what its error rate reports.
 async fn deliver(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     export: &StreamExport,
     records: &[Vec<u8>],
-) -> usize {
+) -> Pushed {
+    let attempted = records.len();
     let Some(stream_name) = ::service_common::arn::resource_id_of_type(
         &export.firehose_arn,
         DELIVERY_STREAM_RESOURCE_TYPE,
@@ -655,7 +725,7 @@ async fn deliver(
             "this metric stream's destination names no Firehose delivery stream, so nothing \
              was exported"
         );
-        return 0;
+        return Pushed::none_of(attempted);
     };
     // The Region the destination is addressed in comes from its own ARN, which a request
     // carried, so it is held to the grammar a Region is written in before it reaches an
@@ -668,7 +738,7 @@ async fn deliver(
             "this metric stream's destination names no Region this emulator can reach, so \
              nothing was exported"
         );
-        return 0;
+        return Pushed::none_of(attempted);
     };
     // The export is the ROLE's write to make, so a role IAM answers does not allow it exports
     // nothing: a record the destination's service would have refused the call to is never
@@ -682,8 +752,32 @@ async fn deliver(
             "this metric stream names no role to put records into its destination under, so \
              nothing was exported"
         );
-        return 0;
+        return Pushed::none_of(attempted);
     };
+    // The IDENTITY first: a role CloudWatch cannot assume is a role no write can be made under,
+    // so nothing is pushed for it and no permission of it is asked about. Only a role IAM
+    // ANSWERED about stops an export — a value naming no role of this account, a role this
+    // account's IAM holds nothing under (such a role is routinely provisioned out of band) and
+    // an emulator with no IAM to ask all leave the export to be made, exactly as that question
+    // is read everywhere else in this emulator
+    // ([`service_common::iam_role::held_role_is_unassumable_by_every`]).
+    let offered = delivery_principals(region);
+    let principals: Vec<&str> = offered.iter().map(String::as_str).collect();
+    if ::service_common::iam_role::held_role_is_unassumable_by_every(
+        ctx,
+        region,
+        role_arn,
+        &principals,
+    )
+    .await
+    {
+        ::tracing::warn!(
+            role_arn = %role_arn,
+            firehose_arn = %export.firehose_arn,
+            "this metric stream's role cannot be assumed by CloudWatch, so nothing was exported"
+        );
+        return Pushed::none_of(attempted);
+    }
     if ::service_common::iam_role::role_withholds_action(
         ctx,
         region,
@@ -699,7 +793,7 @@ async fn deliver(
             "this metric stream's role is not allowed to put records into its destination, \
              so nothing was exported"
         );
-        return 0;
+        return Pushed::none_of(attempted);
     }
     let client = firehose_client(ctx.callback(), region);
     // One `PutRecord` per record, awaited in turn: the destination takes the records in the
@@ -730,11 +824,11 @@ async fn deliver(
             // The destination answered this put a failure, so the ones after it would be
             // answered the same way: the rest of this stream's records are left for the next
             // update rather than re-asked for here.
-            return taken;
+            return Pushed { attempted, taken };
         }
         taken += 1;
     }
-    taken
+    Pushed { attempted, taken }
 }
 
 /// How a failed export is worded in the warning: the SDK's own rendering of the answer the

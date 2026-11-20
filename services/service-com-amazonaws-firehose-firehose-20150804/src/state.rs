@@ -26,6 +26,7 @@ pub mod delivery;
 pub mod iceberg_catalog;
 pub mod kinesis_source;
 pub mod producer;
+pub mod stream_metrics;
 
 use crate::ops::types::{
     AmazonOpenSearchServerlessDestinationConfiguration,

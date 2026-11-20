@@ -206,6 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // mints the id the record is stored under — so no id is ever handed out for a
         // record that was not stored. The guard lives in this block alone: the delivery
         // below is awaited with no lock of this store held.
+        // The record's own data length, which is what the ingestion counters measure and what
+        // every buffer budget in this crate charges against — read before the bytes are moved
+        // into the buffer.
+        let record_bytes = input.record.data.len();
         let ingested = {
             let mut store = state.lock();
             store.materialise_due(now);
@@ -235,6 +239,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record_id) = record_id else {
             return Err(at_capacity(&input.delivery_stream_name));
         };
+
+        // The stream was given a record, so its ingestion counters report it: one record and
+        // its data bytes, published into the one metric store with no guard of this service's
+        // own held (`crate::state::stream_metrics`).
+        let mut measured = crate::state::stream_metrics::Measured::new();
+        measured.record_ingested(&input.delivery_stream_name, 1, record_bytes, now);
+        measured.publish(&*self.engine);
 
         // The buffer this record joined is delivered to the stream's destination once it
         // is due, which is what the producer's data eventually being in the destination

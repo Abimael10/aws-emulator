@@ -3492,15 +3492,57 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
         if !count.is_finite() || count <= 0.0 {
             return;
         }
-        let datum = StoredDatum {
-            timestamp_secs: now_secs,
-            sample_count: count,
-            sum: count,
-            minimum: 1.0,
-            maximum: 1.0,
-            unit: None,
-            storage_resolution: SELF_METERED_STORAGE_RESOLUTION,
-        };
+        self.store_self_metered(
+            key,
+            StoredDatum {
+                timestamp_secs: now_secs,
+                sample_count: count,
+                sum: count,
+                minimum: 1.0,
+                maximum: 1.0,
+                unit: None,
+                storage_resolution: SELF_METERED_STORAGE_RESOLUTION,
+            },
+            now_secs,
+        );
+    }
+
+    /// Store one RATIO this service publishes about itself into the series `key` names: ONE
+    /// observation of `ratio`, stamped `now_secs`.
+    ///
+    /// The counterpart of [`Self::append_self_metered_count`] for a series whose datapoints are
+    /// not tallies but shares of one measured event — the fraction of a batch of work that
+    /// failed, say — so a `Maximum` over a window is the worst share that window saw and an
+    /// `Average` is the mean share over the events it held. ZERO is a measurement like any
+    /// other here: an event that failed none of its work observed a share of nothing, which is
+    /// what tells a healthy publisher from one that has published nothing at all.
+    ///
+    /// Everything else is [`Self::append_self_metered_count`]'s: the reserved namespaces no
+    /// caller may publish into, the unit a bare number carries ([`UNIT_NONE`]), and the
+    /// evaluation of an alarm over the series becoming due because a datapoint arrived in it.
+    pub fn append_self_metered_ratio(&mut self, key: MetricKey, ratio: f64, now_secs: f64) {
+        if !ratio.is_finite() || ratio < 0.0 {
+            return;
+        }
+        self.store_self_metered(
+            key,
+            StoredDatum {
+                timestamp_secs: now_secs,
+                sample_count: 1.0,
+                sum: ratio,
+                minimum: ratio,
+                maximum: ratio,
+                unit: None,
+                storage_resolution: SELF_METERED_STORAGE_RESOLUTION,
+            },
+            now_secs,
+        );
+    }
+
+    /// Store one datapoint of the telemetry this service publishes about itself, and make the
+    /// alarms watching that series due — the one write both self-metering seams above make, so
+    /// a count and a ratio cannot be stored or watched differently.
+    fn store_self_metered(&mut self, key: MetricKey, datum: StoredDatum, now_secs: f64) {
         let watched = key.clone();
         if self.append_datapoints(key, vec![datum]).is_err() {
             return;

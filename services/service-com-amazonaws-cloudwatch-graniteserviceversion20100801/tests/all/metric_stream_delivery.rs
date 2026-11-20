@@ -81,6 +81,19 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
+        Self::mounted(false)
+    }
+
+    /// The same pipeline with the IAM emulator mounted beside it, for a suite whose rows turn on
+    /// what IAM holds for the role a stream exports under: the trust document a role carries is
+    /// read off IAM's own store, so a suite that writes one needs IAM on the same engine.
+    pub(crate) fn with_iam() -> Self {
+        Self::mounted(true)
+    }
+
+    /// CloudWatch, Amazon Data Firehose and Amazon S3 on one engine, and IAM beside them when
+    /// `with_iam`.
+    fn mounted(with_iam: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signature verification is the emulator's concern, not this service's.
@@ -98,7 +111,51 @@ impl Emulator {
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
             Arc::clone(&engine),
         ));
+        if with_iam {
+            router.register_service(
+                service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
+            );
+        }
         Self { router }
+    }
+
+    /// One `awsQuery` call to IAM, which must succeed; answers the raw XML.
+    ///
+    /// IAM's wire is `application/x-www-form-urlencoded`, so each value is percent-encoded over
+    /// the whole non-alphanumeric set by the maintained RFC 3986 coder — a trust document's
+    /// braces, quotes and colons survive the round trip that way.
+    pub(crate) async fn iam(&self, case: &str, action: &str, params: &[(&str, String)]) -> String {
+        let mut body = format!("Action={action}&Version=2010-05-08");
+        for (name, value) in params {
+            body.push('&');
+            body.push_str(name);
+            body.push('=');
+            body.push_str(
+                &::percent_encoding::utf8_percent_encode(
+                    value,
+                    ::percent_encoding::NON_ALPHANUMERIC,
+                )
+                .to_string(),
+            );
+        }
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "iam.amazonaws.com")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("authorization", authorization("iam"))
+            .body(bytes::Bytes::from(body))
+            .expect("the test request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let text = String::from_utf8_lossy(response.body()).to_string();
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the {action} setup call must succeed, got {status} with {text}"
+        );
+        text
     }
 
     /// One `awsJson` RPC call against the service whose signing name is `signing_name`.

@@ -1597,6 +1597,20 @@ fn release_budget(
     store.buffered_bytes = store.buffered_bytes.saturating_sub(bytes);
 }
 
+/// How old the OLDEST record of a delivery was at `now`.
+///
+/// What the freshness of a delivery to Amazon S3 measures: the records are held in arrival
+/// order, so the first of them is the oldest, and its age is how long the data this write placed
+/// had been waiting in the stream. A delivery carrying no record at all, and one whose oldest
+/// record is stamped ahead of `now`, is no wait at all.
+fn oldest_record_age(delivery: &PendingDelivery, now: SystemTime) -> Duration {
+    delivery
+        .records
+        .first()
+        .and_then(|record| now.duration_since(record.received_at).ok())
+        .unwrap_or_default()
+}
+
 /// Put a delivery that could not be made back in its stream's buffer, ahead of whatever
 /// arrived since, and hold the next attempt off until [`DELIVERY_RETRY_SPAN`] has passed.
 ///
@@ -1828,10 +1842,35 @@ pub async fn deliver_due<Eng: Send + Sync + 'static>(
             // the metadata file they hold: the catalog never points at a metadata file that
             // was not written.
             iceberg::advance_catalog(engine, &advances, now);
+            // What reached an Amazon S3 destination is what this stream's delivery counters
+            // report: the records of the buffer, their data bytes, the delivery itself and how
+            // old the oldest record of it was when it was written
+            // (`crate::state::stream_metrics`). A stream with no Amazon S3 location at all
+            // delivered to no such destination, so it reports nothing here.
+            let delivered_to_s3 = (!delivery.targets.is_empty()).then(|| {
+                let mut measured = crate::state::stream_metrics::Measured::new();
+                measured.record_delivered_to_s3(
+                    &delivery.stream,
+                    delivery.records.len(),
+                    delivery
+                        .records
+                        .iter()
+                        .map(|record| record.data.len())
+                        .sum(),
+                    oldest_record_age(&delivery, now),
+                    now,
+                );
+                measured
+            });
             // Written, so these records are no longer held anywhere in this process and
             // the budget they were charged against is theirs no longer.
-            let mut store = state.lock();
-            release_budget(&mut store, &delivery);
+            {
+                let mut store = state.lock();
+                release_budget(&mut store, &delivery);
+            }
+            if let Some(measured) = delivered_to_s3 {
+                measured.publish(engine);
+            }
             continue;
         }
         // The Amazon S3 half of this buffer could not be written, so the whole of it is

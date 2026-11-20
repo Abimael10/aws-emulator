@@ -25,12 +25,20 @@
 //!   configures no additional statistic, and the total is the greater exactly when a
 //!   configuration added statistics to what was streamed — by one per configured statistic per
 //!   record.
+//! * [`PUBLISH_ERROR_RATE`] reports the SHARE of a publish attempt's metric updates that did not
+//!   reach the destination: one observation per attempt the stream made, 0 for an attempt every
+//!   record of which was published and up to 1 for one none of it was. So a stream that cannot
+//!   publish at all — its role cannot be assumed, its role may not put records into the
+//!   destination, the destination refused the put — reports a non-zero rate while a healthy one
+//!   reports zero, which is what tells the two apart from the publisher's side.
 //!
-//! Both are stamped with the instant the export was MADE rather than with the period the records
-//! report: the counters are a reading of the stream's own throughput, so a backdated datapoint
-//! streamed now is metered now. A stream that exports nothing — one `StopMetricStreams` has
-//! taken out of service, or one whose destination took no record — meters nothing: there is no
-//! update to count, which is what tells a stopped stream from a running one by its own metrics.
+//! All three are stamped with the instant the export was MADE rather than with the period the
+//! records report: the counters are a reading of the stream's own throughput, so a backdated
+//! datapoint streamed now is metered now. A stream that MAKES no attempt at all — one
+//! `StopMetricStreams` has taken out of service, or one whose filters selected nothing — meters
+//! nothing on any of the three: there is neither an update to count nor an attempt to report a
+//! rate for, which is what tells a stopped stream from a running one by its own metrics. A stream
+//! that attempted a publish and placed no record of it counts no update and reports the rate.
 
 use super::MeasuredPeriod;
 use crate::state::{
@@ -47,6 +55,11 @@ pub const METRIC_UPDATE: &str = "MetricUpdate";
 
 /// The metric counting the same exports with each statistic of an update counted separately.
 pub const TOTAL_METRIC_UPDATE: &str = "TotalMetricUpdate";
+
+/// The metric reporting the share of a publish attempt's metric updates the destination did not
+/// take: a `Maximum` over a window is the worst share that window saw, and a window holding only
+/// zeros is a stream that published everything it attempted.
+pub const PUBLISH_ERROR_RATE: &str = "PublishErrorRate";
 
 /// The dimension naming WHICH stream a metering series is about.
 pub const STREAM_NAME_DIMENSION: &str = "MetricStreamName";
@@ -70,6 +83,23 @@ pub fn metering_key(metric_name: &str, stream_name: &str) -> MetricKey {
         metric_name: metric_name.to_string(),
         dimensions,
     }
+}
+
+/// The share of ONE publish attempt's metric updates that did not reach the destination, as
+/// [`PUBLISH_ERROR_RATE`] reports it, or `None` for a stream that attempted nothing (which has no
+/// share to report).
+///
+/// The attempt is the records the stream pushed and the ones the destination took, so the share
+/// is the records left over divided by the records pushed: 0 when every one of them was
+/// published, 1 when none was, and the fraction in between for a push the destination broke off
+/// partway.
+#[must_use]
+pub(super) fn publish_error_rate(attempted: usize, taken: usize) -> Option<f64> {
+    if attempted == 0 {
+        return None;
+    }
+    let failed = attempted.saturating_sub(taken);
+    Some(failed as f64 / attempted as f64)
 }
 
 /// What one export counts as: the updates it carried, and those updates' statistics.
@@ -126,6 +156,21 @@ impl State {
         ] {
             self.append_self_metered_count(metering_key(metric_name, stream_name), count, now_secs);
         }
+    }
+
+    /// Report `rate` as the share of one publish attempt by the stream named `stream_name` that
+    /// did not reach the destination, stamped `now_secs`.
+    ///
+    /// One observation per attempt, through the seam a self-published SHARE goes through
+    /// ([`State::append_self_metered_ratio`]): a `Maximum` over a window is the worst share that
+    /// window saw, and an `Average` is the mean share over the attempts it held. An attempt that
+    /// published everything observes 0, which is a measurement and not an absence.
+    pub fn meter_publish_error_rate(&mut self, stream_name: &str, rate: f64, now_secs: f64) {
+        self.append_self_metered_ratio(
+            metering_key(PUBLISH_ERROR_RATE, stream_name),
+            rate,
+            now_secs,
+        );
     }
 }
 
@@ -224,6 +269,32 @@ mod tests {
                      {counted:?}"
                 );
             }
+        }
+    }
+
+    /// RULE: the error rate of one publish attempt is the records the destination did not take
+    /// over the records the attempt pushed; an attempt that pushed nothing has no rate at all.
+    #[test]
+    fn the_error_rate_is_the_share_of_the_attempt_that_did_not_reach_the_destination() {
+        // The rows differ along what the rule generalises over: how many records one attempt
+        // pushed, how many of them the destination took (all, none, some), and the size of the
+        // attempt — so the rate is asserted as a SHARE rather than for one batch size.
+        let rows: [(&str, usize, usize, Option<f64>); 8] = [
+            ("nothing attempted", 0, 0, None),
+            ("one record, published", 1, 1, Some(0.0)),
+            ("one record, refused", 1, 0, Some(1.0)),
+            ("four records, all published", 4, 4, Some(0.0)),
+            ("four records, none published", 4, 0, Some(1.0)),
+            ("four records, one published", 4, 1, Some(0.75)),
+            ("four records, three published", 4, 3, Some(0.25)),
+            ("twenty records, ten published", 20, 10, Some(0.5)),
+        ];
+        for (case, attempted, taken, expected) in rows {
+            let rate = publish_error_rate(attempted, taken);
+            assert_eq!(
+                rate, expected,
+                "case {case:?}: expected {expected:?}, got {rate:?}"
+            );
         }
     }
 }

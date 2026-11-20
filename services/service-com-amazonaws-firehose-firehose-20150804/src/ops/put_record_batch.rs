@@ -240,6 +240,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .map(|record| record.data)
             .collect();
+        // Each record's own data length, which is what the ingestion counters measure and what
+        // every buffer budget in this crate charges against — read before the bytes are moved
+        // into the buffer, and positionally aligned with the entries the ingest answers.
+        let record_bytes: Vec<usize> = records.iter().map(Vec::len).collect();
         // WHICH producer this put came from decides whether a stream that takes data from
         // CloudWatch Logs only takes these records (`crate::state::producer`). Resolved
         // before the store is locked: it reads the shared directory of in-flight
@@ -286,6 +290,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .filter(|entry| entry.error_code.is_some())
             .count();
+
+        // The counters report what the stream ACCEPTED, which is the entries that came back
+        // with a record id: a record the buffer had no room for was not ingested, so it is
+        // neither counted nor charged for. Published into the one metric store with no guard of
+        // this service's own held (`crate::state::stream_metrics`).
+        let accepted_bytes: usize = request_responses
+            .iter()
+            .zip(&record_bytes)
+            .filter(|(entry, _)| entry.record_id.is_some())
+            .map(|(_, bytes)| *bytes)
+            .sum();
+        let accepted_records = request_responses.len() - failed_put_count;
+        let mut measured = crate::state::stream_metrics::Measured::new();
+        measured.record_ingested(
+            &input.delivery_stream_name,
+            accepted_records,
+            accepted_bytes,
+            now,
+        );
+        measured.publish(&*self.engine);
 
         // The buffer these records joined is delivered to the stream's destination once it
         // is due. This put delivers only what an EARLIER buffer was already owed (nothing
