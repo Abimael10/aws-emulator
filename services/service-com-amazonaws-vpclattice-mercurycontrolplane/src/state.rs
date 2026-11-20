@@ -25,12 +25,24 @@
 //! still has, live in the `vpc_associations` child module
 //! ([`ServiceNetworkVpcAssociation`], [`associated_vpc_count`](
 //! ComAmazonawsVpclatticeMercurycontrolplaneState::associated_vpc_count)).
+//!
+//! What an AUTH POLICY holds, which identifiers name one, the document the service
+//! accepts and the state a read derives for it live in the `auth_policies` child module,
+//! which the auth-policy operations share ([`AuthPolicy`], [`auth_policy_target`],
+//! [`check_auth_policy_document`], [`auth_policy_state`](
+//! ComAmazonawsVpclatticeMercurycontrolplaneState::auth_policy_state)).
 
 mod announced_dns;
+mod auth_policies;
 mod targets;
 mod vpc_associations;
 
 pub use announced_dns::{announced_dns_entry, announced_dns_name, AnnouncedService};
+pub use auth_policies::{
+    auth_policy_target, check_auth_policy_document, AuthPolicy, AUTH_POLICY_MEMBER,
+    AUTH_POLICY_STATE_ACTIVE, AUTH_POLICY_STATE_INACTIVE, AUTH_TYPE_AWS_IAM,
+    MALFORMED_AUTH_POLICY_MESSAGE,
+};
 pub use targets::{
     check_target_owner, connections_drain, not_registered_message, TargetHealth, TargetRejection,
     HEALTH_CHECK_MEMBER, TARGET_DRAINING_TIME, TARGET_FAILURE_INVALID_TARGET,
@@ -1549,6 +1561,13 @@ pub struct ComAmazonawsVpclatticeMercurycontrolplaneState {
     /// delete, so the resource ceilings above bound this map too; each document is at
     /// most the `@length` ceiling the model puts on `PolicyString`.
     pub resource_policies: HashMap<String, String>,
+    /// `<resource id>` -> the auth policy `PutAuthPolicy` attached to that resource, for
+    /// the kinds whose identifier the operation accepts ([`auth_policy_target`]). One
+    /// entry per resource that has an auth policy, written only for a resource this
+    /// store holds and removed by that resource's delete, so the resource ceilings above
+    /// bound this map too; each document is at most the `@length` ceiling the model puts
+    /// on `AuthPolicyString`.
+    pub auth_policies: HashMap<String, AuthPolicy>,
     /// `<ARN resource kind>/<name>` -> id. A name must be unique to the account, so a
     /// second create under a taken name is a `ConflictException`. One key per stored
     /// resource, so the resource ceilings bound this map too.

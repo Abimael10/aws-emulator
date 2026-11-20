@@ -212,6 +212,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A resource policy belongs to the resource it is attached to, so it goes
             // with it rather than outliving it.
             store.resource_policies.remove(&removed.id);
+            // "If you delete a service network, all resources related to the service
+            // network, such as the resource policy, auth policy, and access log
+            // subscriptions, are also deleted" (this operation's own documentation).
+            store.auth_policies.remove(&removed.id);
             // A clientToken record must not outlive the resource it created.
             store.idempotency_tokens.forget_resource(&removed.id);
         }

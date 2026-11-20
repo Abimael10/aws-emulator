@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAuthPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAuthPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAuthPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the auth policy attached to the service network or service its
+//! `resourceIdentifier` names — the document as stored, when it was attached and when it
+//! last changed, and the state that resource's auth type gives it right now. A resource
+//! that carries no auth policy reads back as a resource without one, not as a refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +120,18 @@ impl From<GetAuthPolicyErrorModeled> for GetAuthPolicyError {
     }
 }
 
+/// HTTP 404 for a `resourceIdentifier` that names no persisted resource, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the named kind's resource-type
+/// token.
+fn not_found(kind: crate::state::ResourceKind, resource_identifier: &str) -> GetAuthPolicyError {
+    GetAuthPolicyErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        kind,
+        resource_identifier,
+    ))
+    .into()
+}
+
 /// The `GetAuthPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +168,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAuthPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAuthPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAuthPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetAuthPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // The same resolution the put of an auth policy uses: the kind and the id the
+        // identifier names, under either modelled form, reported as a not-found when
+        // nothing holds it.
+        let Some((kind, id)) = crate::state::auth_policy_target(&input.resource_identifier) else {
+            return Err(not_found(
+                crate::state::UNRESOLVED_POLICY_TARGET_KIND,
+                &input.resource_identifier,
+            ));
+        };
+        let store = state.lock();
+        if !store.holds(kind, &id) {
+            return Err(not_found(kind, &input.resource_identifier));
+        }
+        // A resource that has no auth policy is still a resource: the read succeeds and
+        // reports none of the members the model declares optional. Nothing is written —
+        // this operation is `@readonly`, so a resource without a policy does not get one
+        // from being read, and the state it reports is derived from the resource's auth
+        // type at this instant rather than from anything stored with the document.
+        let Some(policy) = store.auth_policies.get(&id) else {
+            return Ok(GetAuthPolicyOutput::default());
+        };
+        Ok(GetAuthPolicyOutput {
+            policy: Some(policy.policy.clone()),
+            state: Some(store.auth_policy_state(kind, &id).to_string()),
+            created_at: Some(crate::state::timestamp(policy.created_at)),
+            last_updated_at: Some(crate::state::timestamp(policy.last_updated_at)),
+        })
     }
 }

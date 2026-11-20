@@ -17,7 +17,14 @@ pub struct GetAuthPolicyInput {
     pub resource_identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.vpclattice#GetAuthPolicyResponse")]
+/// `GetAuthPolicyResponse`, with its schema written out instead of derived because
+/// `createdAt` and `lastUpdatedAt` are `@timestampFormat("date-time")`; the note in
+/// `shared_types` says why that cannot be derived here. Member for member this is the
+/// model's shape: same ids, same order, same indices.
+///
+/// The derive's `DeserializableStruct` impl is deliberately not reproduced: this shape
+/// is an operation OUTPUT, which the server only ever serializes
+/// (`Operation::Output` requires `SerializableStruct`; only `Input` is deserialized).
 #[derive(Debug, Clone, Default)]
 pub struct GetAuthPolicyOutput {
     pub policy: Option<String>,
@@ -26,3 +33,55 @@ pub struct GetAuthPolicyOutput {
     pub last_updated_at: Option<::aws_smithy_types::DateTime>,
 }
 
+#[allow(non_upper_case_globals)]
+impl GetAuthPolicyOutput {
+    const M_POLICY: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetAuthPolicyResponse", "policy", String, 0);
+    // `AuthPolicyState` is an enum shape, which the generator writes as
+    // `ShapeType::String`.
+    const M_STATE: ::aws_smithy_schema::Schema =
+        shared_types::member_of!("GetAuthPolicyResponse", "state", String, 1);
+    const M_CREATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetAuthPolicyResponse", "createdAt", 2);
+    const M_LAST_UPDATED_AT: ::aws_smithy_schema::Schema =
+        shared_types::date_time_member_of!("GetAuthPolicyResponse", "lastUpdatedAt", 3);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.vpclattice#GetAuthPolicyResponse",
+            shared_types::NAMESPACE,
+            "GetAuthPolicyResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_POLICY,
+            &Self::M_STATE,
+            &Self::M_CREATED_AT,
+            &Self::M_LAST_UPDATED_AT,
+        ],
+    );
+}
+
+pub static GET_AUTH_POLICY_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &GetAuthPolicyOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetAuthPolicyOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(value) = self.policy.as_ref() {
+            serializer.write_string(&Self::M_POLICY, value.as_str())?;
+        }
+        if let Some(value) = self.state.as_ref() {
+            serializer.write_string(&Self::M_STATE, value.as_str())?;
+        }
+        if let Some(value) = self.created_at.as_ref() {
+            serializer.write_timestamp(&Self::M_CREATED_AT, value)?;
+        }
+        if let Some(value) = self.last_updated_at.as_ref() {
+            serializer.write_timestamp(&Self::M_LAST_UPDATED_AT, value)?;
+        }
+        Ok(())
+    }
+}

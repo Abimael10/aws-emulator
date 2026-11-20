@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAuthPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAuthPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAuthPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes the auth policy attached to the service network or service its
+//! `resourceIdentifier` names, so a later read reports that resource as carrying none.
+//! The resource itself and its auth type are untouched: "If you are trying to remove the
+//! auth policy completely, you must set the auth type to NONE" (this operation's own
+//! documentation).
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +109,18 @@ impl From<DeleteAuthPolicyErrorModeled> for DeleteAuthPolicyError {
     }
 }
 
+/// HTTP 404 for a `resourceIdentifier` that names no persisted resource, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the named kind's resource-type
+/// token.
+fn not_found(kind: crate::state::ResourceKind, resource_identifier: &str) -> DeleteAuthPolicyError {
+    DeleteAuthPolicyErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        kind,
+        resource_identifier,
+    ))
+    .into()
+}
+
 /// The `DeleteAuthPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -148,18 +157,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAuthPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAuthPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAuthPolicy"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteAuthPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // The same resolution the put and the read of an auth policy use: the kind and
+        // the id the identifier names, under either modelled form, reported as a
+        // not-found when nothing holds it.
+        let Some((kind, id)) = crate::state::auth_policy_target(&input.resource_identifier) else {
+            return Err(not_found(
+                crate::state::UNRESOLVED_POLICY_TARGET_KIND,
+                &input.resource_identifier,
+            ));
+        };
+        let mut store = state.lock();
+        if !store.holds(kind, &id) {
+            return Err(not_found(kind, &input.resource_identifier));
+        }
+        // The operation is `@idempotent`: a resource that carries no auth policy is
+        // already in the state this call asks for, so the delete succeeds either way.
+        // Only the policy goes — the resource keeps its auth type, which is why removing
+        // auth altogether takes an update of that auth type as well.
+        store.auth_policies.remove(&id);
+        // The model gives this response no members; the 204 is the whole answer.
+        Ok(DeleteAuthPolicyOutput {})
     }
 }

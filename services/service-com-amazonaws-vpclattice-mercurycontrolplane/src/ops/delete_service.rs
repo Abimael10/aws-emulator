@@ -218,6 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // listener of this service, and no resource policy attached to it, outlives it.
         store.remove_listeners_of(&removed.id);
         store.resource_policies.remove(&removed.id);
+        store.auth_policies.remove(&removed.id);
         // A clientToken record must not outlive the resource it created.
         store.idempotency_tokens.forget_resource(&removed.id);
         Ok(DeleteServiceOutput {

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutAuthPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutAuthPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutAuthPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: attaches the submitted auth policy to the service network or service its
+//! `resourceIdentifier` names, replacing whatever document that resource carried, and
+//! reports the stored document with the state that resource's auth type gives it: a
+//! policy decides requests only while that auth type is `AWS_IAM`. A document the
+//! service cannot read as a JSON policy is refused and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -125,6 +122,18 @@ impl From<PutAuthPolicyErrorModeled> for PutAuthPolicyError {
     }
 }
 
+/// HTTP 404 for a `resourceIdentifier` that names no persisted resource, built by the
+/// service's shared error construction ([`crate::state::resource_not_found`]): AWS's
+/// not-found message over the submitted identifier, and the named kind's resource-type
+/// token.
+fn not_found(kind: crate::state::ResourceKind, resource_identifier: &str) -> PutAuthPolicyError {
+    PutAuthPolicyErrorModeled::ResourceNotFoundException(crate::state::resource_not_found(
+        kind,
+        resource_identifier,
+    ))
+    .into()
+}
+
 /// The `PutAuthPolicy` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -161,18 +170,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutAuthPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutAuthPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutAuthPolicy"))
+        let _ = ctx;
+        // `policy` is `@required` and carries `AuthPolicyString`'s `@length` ceiling, and
+        // `resourceIdentifier` its `@length` and `@pattern`, so an absent or over-long
+        // document and an identifier of no modelled form are already refused before this
+        // handler runs.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutAuthPolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the vpc-lattice state store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        // The document is judged BEFORE the store is touched, so a policy the service
+        // cannot read leaves the resource carrying exactly the policy it had.
+        if let Err(violation) = crate::state::check_auth_policy_document(&input.policy) {
+            return Err(PutAuthPolicyErrorModeled::ValidationException(
+                crate::state::service_rule_exception(&violation),
+            )
+            .into());
+        }
+        // An auth policy is attached to a resource that EXISTS, under either modelled
+        // form of its identifier (the bare id or the resource's ARN); a resource no
+        // registry holds is a not-found over the kind the caller named. An identifier
+        // naming no kind a policy can be attached to is reported against the first kind
+        // those identifiers enumerate, so the caller still gets the modelled not-found
+        // rather than a refusal the model does not declare.
+        let Some((kind, id)) = crate::state::auth_policy_target(&input.resource_identifier) else {
+            return Err(not_found(
+                crate::state::UNRESOLVED_POLICY_TARGET_KIND,
+                &input.resource_identifier,
+            ));
+        };
+        let mut store = state.lock();
+        if !store.holds(kind, &id) {
+            return Err(not_found(kind, &input.resource_identifier));
+        }
+        // "Creates or updates the auth policy": a second put replaces the first, and the
+        // response reports the document as STORED plus the state the attached resource's
+        // auth type gives it — the policy is only active under `AWS_IAM`, so a resource
+        // whose auth type is `NONE` keeps the policy inactive until that changes.
+        let policy_state = store.auth_policy_state(kind, &id);
+        let stored = store.put_auth_policy(id, input.policy, std::time::SystemTime::now());
+        Ok(PutAuthPolicyOutput {
+            policy: Some(stored.policy.clone()),
+            state: Some(policy_state.to_string()),
+        })
     }
 }
