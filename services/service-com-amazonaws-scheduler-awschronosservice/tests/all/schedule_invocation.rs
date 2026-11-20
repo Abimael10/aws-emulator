@@ -329,7 +329,7 @@ pub(crate) async fn bodies(router: &MultiServiceRouter, url: &str) -> Vec<String
 
 /// The bodies of the messages the queue at `url` holds once it holds at least
 /// `wanted`, or whatever it holds after `patience`.
-async fn bodies_once(
+pub(crate) async fn bodies_once(
     router: &MultiServiceRouter,
     url: &str,
     wanted: usize,

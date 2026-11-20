@@ -19,7 +19,9 @@
 //! an invocation that did not reach its target — the attempts its
 //! retry policy admits, and the dead-letter route the last of them takes — is
 //! [`dead_letter`]. A target that names an API OPERATION rather than a resource — a
-//! UNIVERSAL target — is [`universal_target`].
+//! UNIVERSAL target — is [`universal_target`]. A target naming an EVENT BUS is a
+//! templated EventBridge target, whose own kind and the parameters it carries are
+//! [`event_bridge_target`].
 //!
 //! Whether the CALLER may hand this service the execution role its request names at
 //! all — the `iam:PassRole` every operation that carries a `Target.RoleArn` charges
@@ -29,6 +31,7 @@
 //! principal both stand on is [`caller_identity`].
 
 mod dead_letter;
+mod event_bridge_target;
 mod occurrence;
 mod schedule_definition;
 mod universal_target;
@@ -39,6 +42,7 @@ pub mod invocation;
 pub mod pass_role;
 
 pub use caller_authorization::{caller_denial, ANY_RESOURCE};
+pub(crate) use event_bridge_target::event_bridge_target_violation;
 pub use invocation::{drive_invocation_clock, Invocations};
 pub use occurrence::Occurrences;
 pub use schedule_definition::*;

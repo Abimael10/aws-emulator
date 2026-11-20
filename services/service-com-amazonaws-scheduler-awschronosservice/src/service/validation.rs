@@ -67,6 +67,18 @@ pub(super) fn refusal(violations: &[Violation]) -> Option<Refused> {
     })
 }
 
+/// The message ONE violation a HANDLER found itself is stated in.
+///
+/// A constraint the framework's boundary walk leaves UNAPPLIED — a `@pattern` written with
+/// look-around, which the regex engine that walk compiles an expression with cannot express
+/// — is applied by the operation that accepts the member instead
+/// ([`crate::state::event_bridge_target`]). What such a violation is WORDED in is this
+/// module all the same: the same envelope and the same clause as a violation the walk found,
+/// so this service states one constraint refusal however the constraint was applied.
+pub(crate) fn self_applied(violation: &Violation) -> String {
+    envelope(&[clause(violation)]).unwrap_or_default()
+}
+
 /// The `message` for a set of violations: the count, then one clause per violation in the
 /// order the walk found them.
 fn message(violations: &[Violation]) -> Option<String> {

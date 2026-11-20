@@ -237,6 +237,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // too: a schedule whose target names no call is refused rather than
             // stored.
             .or_else(|| crate::state::universal_target_violation(&input.target.arn))
+            // `EventBridgeParameters$Source` is constrained by a `@pattern` the request
+            // boundary cannot apply — it is written with look-around — and a constraint
+            // the model declares is a requirement however it is applied, so a source
+            // outside that expression is refused here rather than stored.
+            .or_else(|| crate::state::event_bridge_target_violation(&input.target))
         {
             return Err(
                 CreateScheduleErrorModeled::ValidationException(ValidationException { message })

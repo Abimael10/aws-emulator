@@ -62,8 +62,10 @@
 //! ([`rendered_input`]), handed to the API the target names. A TEMPLATED target names
 //! a RESOURCE, and the API is the one that kind of resource is invoked by:
 //! `sqs:SendMessage` for a queue, `sns:Publish` for a topic,
-//! `lambda:InvokeFunction` for a function and `states:StartExecution` for a state
-//! machine. A UNIVERSAL target names the CALL itself
+//! `lambda:InvokeFunction` for a function, `states:StartExecution` for a state
+//! machine and `events:PutEvents` for an event bus — whose request also carries the
+//! members the target's own parameters for that kind state ([`deliver`]). A UNIVERSAL
+//! target names the CALL itself
 //! (`arn:aws:scheduler:::aws-sdk:<service>:<operation>`), and the invocation is that
 //! operation with the input as its own request ([`super::universal_target`]). The call
 //! is made over the in-process callback either way, so what the target holds afterwards
@@ -92,8 +94,8 @@
 //! policy admits, and what the dead-letter message carries — is [`super::dead_letter`];
 //! the attempts themselves wait on this clock, so nothing sleeps between them either.
 //!
-//! The remaining templated target kinds (the ECS task, the EventBridge bus, the Kinesis
-//! stream and the SageMaker pipeline) are NOT invoked here: an occurrence whose target
+//! The remaining templated target kinds (the ECS task, the Kinesis stream and the
+//! SageMaker pipeline) are NOT invoked here: an occurrence whose target
 //! kind this does not invoke is recorded as not attempted — never as delivered, and
 //! never as a failure of a call nothing made. The same holds for a universal target
 //! naming an operation this emulator makes no call for.
@@ -101,13 +103,14 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{FlexibleTimeWindow, Target};
+use crate::ops::types::{EventBridgeParameters, FlexibleTimeWindow, Target};
 
 use super::dead_letter::{
-    dead_letter_attributes, failure_of, withheld, Attempt, Exhaustion, Failure, Report,
-    RetryBounds, ACCESS_DENIED_CODE, AUTHORIZATION_ERROR_CODE, QUERY_ACCESS_DENIED_CODE,
+    dead_letter_attributes, failure_of, failure_of_entry, withheld, Attempt, Exhaustion, Failure,
+    Report, RetryBounds, ACCESS_DENIED_CODE, AUTHORIZATION_ERROR_CODE, QUERY_ACCESS_DENIED_CODE,
     RETRY_INTERVAL,
 };
+use super::event_bridge_target::{names_event_bus, EVENTS_ARN_NAMESPACE};
 use super::universal_target::{self, UniversalCall};
 use super::{
     occurrence::Occurrences, service_state, ComAmazonawsSchedulerAwschronosserviceState,
@@ -205,6 +208,8 @@ const PUBLISH_ACTION: &str = "sns:Publish";
 const INVOKE_FUNCTION_ACTION: &str = "lambda:InvokeFunction";
 /// See [`SEND_MESSAGE_ACTION`].
 const START_EXECUTION_ACTION: &str = "states:StartExecution";
+/// See [`SEND_MESSAGE_ACTION`].
+const PUT_EVENTS_ACTION: &str = "events:PutEvents";
 
 /// What the clock has done and which clock is running it: the whole of this
 /// module's state, held in the store so it survives the task that reads it.
@@ -956,7 +961,7 @@ async fn perform(
             Err(why) => return Attempt::NotAttempted(why),
         }
     } else {
-        match invoking_action(parsed.vendor) {
+        match invoking_action(&parsed) {
             Some(action) => Called::Templated(action),
             None => {
                 return Attempt::NotAttempted(format!(
@@ -1004,12 +1009,18 @@ async fn perform(
 
 /// The IAM action a target of this kind's invocation is authorized by, or `None` for
 /// a kind this emulator does not invoke.
-fn invoking_action(vendor: &str) -> Option<&'static str> {
-    match vendor {
+///
+/// The kind is the ARN's vendor for every target whose service invokes one kind of
+/// resource, and the vendor TOGETHER WITH the resource type where it invokes several:
+/// Amazon EventBridge's `PutEvents` publishes onto an event bus, so an ARN of that
+/// service naming another of its resources names no target this module invokes.
+fn invoking_action(target: &::service_common::arn::Arn<'_>) -> Option<&'static str> {
+    match target.vendor {
         SQS_ARN_NAMESPACE => Some(SEND_MESSAGE_ACTION),
         SNS_ARN_NAMESPACE => Some(PUBLISH_ACTION),
         LAMBDA_ARN_NAMESPACE => Some(INVOKE_FUNCTION_ACTION),
         STATES_ARN_NAMESPACE => Some(START_EXECUTION_ACTION),
+        EVENTS_ARN_NAMESPACE if names_event_bus(target) => Some(PUT_EVENTS_ACTION),
         _ => None,
     }
 }
@@ -1198,6 +1209,20 @@ const INVOCATION_TYPE_MEMBER: &str = "InvocationType";
 const STATE_MACHINE_ARN_MEMBER: &str = "StateMachineArn";
 /// See [`QUEUE_URL_MEMBER`].
 const EXECUTION_INPUT_MEMBER: &str = "Input";
+/// See [`QUEUE_URL_MEMBER`]. Amazon EventBridge's `PutEvents` takes a LIST of entries
+/// rather than one flat request, each entry naming the bus it is published onto
+/// (`EventBusName`, "the name or ARN of the event bus to receive the event"), the
+/// `Source` and `DetailType` of the event and its `Detail` \u2014 so an event-bus target's
+/// request carries one entry, built from the target's own parameters and the payload.
+const ENTRIES_MEMBER: &str = "Entries";
+/// See [`ENTRIES_MEMBER`].
+const EVENT_BUS_NAME_MEMBER: &str = "EventBusName";
+/// See [`ENTRIES_MEMBER`].
+const SOURCE_MEMBER: &str = "Source";
+/// See [`ENTRIES_MEMBER`].
+const DETAIL_TYPE_MEMBER: &str = "DetailType";
+/// See [`ENTRIES_MEMBER`].
+const DETAIL_MEMBER: &str = "Detail";
 
 /// The FAILED EVENT one undelivered invocation IS: the request the attempt carried to
 /// the target's own API, with `payload` where that request carries it.
@@ -1272,6 +1297,26 @@ fn failed_event(target: &Target, region: &str, payload: &str) -> String {
         STATES_ARN_NAMESPACE => {
             request.insert(STATE_MACHINE_ARN_MEMBER.to_string(), text(arn));
             request.insert(EXECUTION_INPUT_MEMBER.to_string(), text(payload));
+        }
+        EVENTS_ARN_NAMESPACE if names_event_bus(&parsed) => {
+            // `PutEvents` takes its events as a LIST, so the request that failed is the
+            // one entry this invocation published ([`put_events`]): the bus the target
+            // names, the source and detail type its parameters state, and the payload
+            // as the event's own detail.
+            let mut entry = ::serde_json::Map::new();
+            entry.insert(EVENT_BUS_NAME_MEMBER.to_string(), text(arn));
+            if let Some(parameters) = target.event_bridge_parameters.as_ref() {
+                entry.insert(SOURCE_MEMBER.to_string(), text(&parameters.source));
+                entry.insert(
+                    DETAIL_TYPE_MEMBER.to_string(),
+                    text(&parameters.detail_type),
+                );
+            }
+            entry.insert(DETAIL_MEMBER.to_string(), text(payload));
+            request.insert(
+                ENTRIES_MEMBER.to_string(),
+                ::serde_json::Value::Array(vec![::serde_json::Value::Object(entry)]),
+            );
         }
         // A kind this emulator does not invoke, no call of which ever fails: nothing
         // is attempted for it, so nothing of it is dead-lettered either.
@@ -1441,8 +1486,80 @@ async fn deliver(
                 .send()
                 .await,
         ),
+        EVENTS_ARN_NAMESPACE if names_event_bus(parsed) => {
+            put_events(
+                callback,
+                region,
+                arn,
+                target.event_bridge_parameters.as_ref(),
+                body,
+            )
+            .await
+        }
         vendor => Attempt::NotAttempted(format!(
             "this emulator does not invoke a target of {vendor}"
+        )),
+    }
+}
+
+/// The per-entry error codes `PutEvents` reports that ANOTHER attempt could come to
+/// something else, which that operation's own model classifies for its caller:
+/// "retryable errors include `InternalFailure` […] `ThrottlingException`"
+/// (`PutEventsResultEntry$ErrorCode`), every other code it lists being non-retryable.
+const RETRYABLE_ENTRY_CODES: [&str; 2] = ["InternalFailure", "ThrottlingException"];
+
+/// Publish one occurrence onto the event bus `bus_arn` names, which is how a TEMPLATED
+/// EventBridge target is invoked.
+///
+/// `Target$EventBridgeParameters` is "the templated target type for the EventBridge
+/// `PutEvents` API operation", so the invocation is that call carrying ONE entry: the
+/// bus the target's ARN names (`PutEventsRequestEntry$EventBusName` is "the name or ARN
+/// of the event bus to receive the event", so the ARN addresses it directly), the
+/// `Source` and `DetailType` the target's parameters state, and the invocation's own
+/// payload as `Detail` — the event's JSON object, which is why `Target$Input` "must be
+/// a well-formed JSON" for this kind of target.
+///
+/// Nothing of the entry is invented: a target stating no parameters states neither
+/// `Source` nor `DetailType`, and what the publication then comes to is EventBridge's
+/// own answer rather than a refusal worded here.
+async fn put_events(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    bus_arn: &str,
+    parameters: Option<&EventBridgeParameters>,
+    body: &str,
+) -> Attempt {
+    let mut entry = ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
+        .event_bus_name(bus_arn)
+        .detail(body);
+    if let Some(parameters) = parameters {
+        entry = entry
+            .source(&parameters.source)
+            .detail_type(&parameters.detail_type);
+    }
+    let answer = ::service_common::eventbridge_client::eventbridge_client(callback, region)
+        .put_events()
+        .entries(entry.build())
+        .send()
+        .await;
+    let published = match answer {
+        Ok(published) => published,
+        Err(error) => return Attempt::Failed(failure_of(&error)),
+    };
+    // `PutEvents` answers a verdict per ENTRY rather than failing the call, so a
+    // published entry is one whose row carries no error code, and a row that carries one
+    // is this attempt's failure.
+    let failed = published.entries().iter().find_map(|entry| {
+        entry
+            .error_code()
+            .map(|code| (code, entry.error_message().unwrap_or_default()))
+    });
+    match failed {
+        None => Attempt::Delivered,
+        Some((code, message)) => Attempt::Failed(failure_of_entry(
+            code,
+            message,
+            RETRYABLE_ENTRY_CODES.contains(&code),
         )),
     }
 }

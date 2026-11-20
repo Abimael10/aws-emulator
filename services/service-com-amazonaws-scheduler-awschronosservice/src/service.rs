@@ -71,7 +71,7 @@
 //! a refusal and a handler's error report their text in the SAME member.
 
 mod error_detail;
-mod validation;
+pub(crate) mod validation;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::ProtocolError;

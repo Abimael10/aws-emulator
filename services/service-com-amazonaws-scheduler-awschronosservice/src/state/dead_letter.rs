@@ -310,10 +310,25 @@ where
 /// authorization refusal the answering service gives such a call, under the `code` that
 /// service answers it with, which no further attempt would be answered differently.
 pub(crate) fn withheld(code: &str, message: String) -> Failure {
+    failure_of_entry(code, &message, false)
+}
+
+/// The failure one ENTRY of a batched call reported on its own row.
+///
+/// Some target APIs answer a verdict per entry rather than failing the request — Amazon
+/// EventBridge's `PutEvents` answers 200 with an error code against the entries it did
+/// not publish — so the code and message come off that row, and whether another attempt
+/// is worth making is what the answering operation's own model states for that code
+/// rather than what a status says ([`failure_of`] reads it off the status for a call that
+/// failed as a whole).
+///
+/// The one hand-built [`Failure`] of this module: [`withheld`] is this with the
+/// retryability a refusal of the request itself has.
+pub(crate) fn failure_of_entry(code: &str, message: &str, retryable: bool) -> Failure {
     Failure {
         code: code.to_string(),
-        message,
-        retryable: false,
+        message: message.to_string(),
+        retryable,
     }
 }
 

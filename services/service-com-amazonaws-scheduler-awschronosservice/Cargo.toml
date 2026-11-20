@@ -60,6 +60,17 @@ aws-sdk-sqs = { version = "1", default-features = false }
 aws-sdk-sns = { version = "1", default-features = false }
 aws-sdk-lambda = { version = "1", default-features = false }
 aws-sdk-sfn = { version = "1", default-features = false }
+# The client an occurrence of a schedule whose target is an EVENT BUS publishes through
+# (`events:PutEvents`), built by the one shared construction of that hop
+# (`service_common::eventbridge_client`); the generated types spell the entry such a
+# publication carries.
+aws-sdk-eventbridge = { version = "1", default-features = false }
+# The engine the modelled `@pattern` of `EventBridgeParameters$Source` is matched with:
+# that expression is written with look-around, which the request boundary's own regex
+# engine cannot compile, so the constraint is applied by this one over the model's own
+# text (`state::event_bridge_target`), as the sibling service crates in the same position
+# do.
+fancy-regex = "0.16"
 # The tree's ONE statement of how an AWS API call is made in process — which service an
 # SDK service id names, its endpoint, signing name and protocol, and how an operation's
 # input is bound to a request — which AWS Step Functions' AWS SDK integration family
@@ -94,6 +105,10 @@ service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 # assumed ROLE session — the identity a least-privilege policy is attached to — rather
 # than only a long-term key.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# Amazon EventBridge, mounted beside this one on that same engine: a schedule whose
+# target is an event BUS is asserted where a client observes it — on the rule that bus
+# routes the published event to, and on that rule's own target.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 
 [lints]
 workspace = true

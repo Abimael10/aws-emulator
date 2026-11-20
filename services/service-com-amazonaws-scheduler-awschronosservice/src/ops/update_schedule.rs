@@ -264,6 +264,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // too: an update that would leave a target naming no call is refused
             // rather than applied.
             .or_else(|| crate::state::universal_target_violation(&input.target.arn))
+            // `EventBridgeParameters$Source` is constrained by a `@pattern` the request
+            // boundary cannot apply — it is written with look-around — and a constraint
+            // the model declares is a requirement however it is applied, so an update
+            // that would leave a source outside that expression is refused rather than
+            // applied.
+            .or_else(|| crate::state::event_bridge_target_violation(&input.target))
         {
             return Err(
                 UpdateScheduleErrorModeled::ValidationException(ValidationException { message })
