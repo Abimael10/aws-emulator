@@ -141,7 +141,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // `ctx` carries the request metadata the ARN of a rule the SERVICE
+        // defined is rooted in.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetResolverRuleErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -153,17 +154,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Gets information about a specified Resolver rule": a pure read,
         // projected straight off the stored record, so nothing about it changes
-        // for the next caller.
-        let store = state.lock();
-        let Some(record) = store.resolver_rules.get(&input.resolver_rule_id) else {
-            return Err(GetResolverRuleErrorModeled::ResourceNotFoundException(
-                crate::state::resolver_rule_not_found(&input.resolver_rule_id),
-            )
-            .into());
-        };
+        // for the next caller. The store is locked for the lookup alone.
+        let stored = state
+            .lock()
+            .resolver_rules
+            .get(&input.resolver_rule_id)
+            .map(crate::state::ResolverRuleRecord::to_rule);
+        if let Some(rule) = stored {
+            return Ok(GetResolverRuleOutput {
+                resolver_rule: Some(rule),
+            });
+        }
 
-        Ok(GetResolverRuleOutput {
-            resolver_rule: Some(record.to_rule()),
-        })
+        // A rule Route 53 Resolver defined for the account itself is served to
+        // every account, so an id `ListResolverRules` reported for one resolves
+        // here too rather than being reported as missing.
+        if let Some(defined) = crate::state::autodefined_resolver_rule(&input.resolver_rule_id) {
+            let region = crate::state::request_region(&ctx.parts().headers);
+            return Ok(GetResolverRuleOutput {
+                resolver_rule: Some(defined.to_rule(&region)),
+            });
+        }
+
+        Err(GetResolverRuleErrorModeled::ResourceNotFoundException(
+            crate::state::resolver_rule_not_found(&input.resolver_rule_id),
+        )
+        .into())
     }
 }

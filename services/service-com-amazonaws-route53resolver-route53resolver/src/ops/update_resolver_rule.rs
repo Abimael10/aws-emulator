@@ -165,7 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // `ctx` carries the request's tracing header, which the step sentence
+        // this call stamps on the rule is reported under.
+        let trace_root = crate::state::request_trace_root(&ctx.parts().headers);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateResolverRuleErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -261,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // If you don't specify a parameter, it retains its current value." So
         // only the members the new settings name are written, and a request
         // that names none writes nothing at all — it does not move the rule's
-        // `ModificationTime`.
+        // `ModificationTime` and does not restate the step it stands in.
         let mut written = false;
         if let Some(name) = config.name.clone() {
             record.name = Some(name);
@@ -277,6 +279,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if written {
             record.modification_time = crate::state::now_rfc3339();
+            // "A detailed description of the status of a Resolver rule": the
+            // settings this call wrote are in effect when it answers, so the
+            // step the rule now stands in is the one this update reached, and
+            // the sentence describing it is stamped on the record under the
+            // trace of THIS request — so every later projection of the rule
+            // describes it by the change rather than by its creation.
+            record.status_message = Some(crate::state::rule_status_message(
+                crate::state::RULE_STATUS_MESSAGE_UPDATED,
+                &trace_root,
+            ));
         }
 
         Ok(UpdateResolverRuleOutput {

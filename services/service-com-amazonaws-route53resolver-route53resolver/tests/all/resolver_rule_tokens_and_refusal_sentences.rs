@@ -31,7 +31,9 @@
 
 use serde_json::{json, Value};
 
-use super::harness::{call, emulator, error_type, ok, string_member, traced_message, Emulator};
+use super::harness::{
+    call, emulator, error_type, ok, string_member, traced_message, Emulator, ACCOUNT,
+};
 use super::resolver_query_log_config_associations::{association, config_id};
 use super::resolver_rule_deletion::{associate, forward_rule, outbound_endpoint};
 
@@ -120,7 +122,12 @@ fn rule(body: &Value) -> &Value {
         .unwrap_or_else(|| panic!("the response carries a ResolverRule, got {body}"))
 }
 
-/// Every rule `ListResolverRules` reports.
+/// Every rule of the ACCOUNT'S OWN that `ListResolverRules` reports.
+///
+/// The listing also reports the rules Route 53 Resolver defines for every
+/// account, which no request of this account created and no create can mint a
+/// second of, so a case counting what a create left behind counts the rules
+/// owned by the account.
 async fn listed_rules(router: &Emulator) -> Vec<Value> {
     let listed = ok(router, "ListResolverRules", json!({})).await;
     listed
@@ -128,6 +135,9 @@ async fn listed_rules(router: &Emulator) -> Vec<Value> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default()
+        .into_iter()
+        .filter(|item| string_member(item, "OwnerId") == ACCOUNT)
+        .collect()
 }
 
 /// The request that creates the rule a replay is compared against, under

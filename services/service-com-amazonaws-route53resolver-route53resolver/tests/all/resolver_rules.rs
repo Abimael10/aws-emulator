@@ -18,9 +18,46 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    call, emulator, error_type, expect_error, ok, parse_time, string_member, without_status,
-    Emulator, ACCOUNT, REGION,
+    call, call_in_region, emulator, error_type, expect_error, ok, parse_time, string_member,
+    without_status, Emulator, ACCOUNT, REGION,
 };
+
+/// The `Id` of the recursive rule Route 53 Resolver defines for every account
+/// and Region, and the members every projection of it carries.
+///
+/// They are the service's own, identical for every account: the rule resolves
+/// every name no other rule selects (`DomainName` the DNS root, `RuleType`
+/// `RECURSIVE`, which "only Resolver can create"), it is owned by the service
+/// rather than by the account reading it, and it is shared with nobody. Written
+/// out here, rather than read from the crate, so a case asserts the catalog and
+/// not the code's own copy of it.
+const INTERNET_RESOLVER_ID: &str = "rslvr-autodefined-rr-internet-resolver";
+const INTERNET_RESOLVER_NAME: &str = "Internet Resolver";
+const INTERNET_RESOLVER_DOMAIN: &str = ".";
+const INTERNET_RESOLVER_TYPE: &str = "RECURSIVE";
+const INTERNET_RESOLVER_OWNER: &str = "Route 53 Resolver";
+
+/// The whole `ResolverRule` the account is served for that rule in `region`.
+///
+/// Its ARN is rooted in the Region the request was signed for and carries NO
+/// account field, because the rule is a resource of the service and not of the
+/// account that reads it. Every other member is the same string in every Region,
+/// and the members a rule carries because a request made it — the target
+/// addresses, the endpoint, the creation and modification instants and the
+/// status message a call stamps — are absent, because no call made this rule.
+fn internet_resolver_rule(region: &str) -> Value {
+    json!({
+        "Id": INTERNET_RESOLVER_ID,
+        "Arn": format!("arn:aws:route53resolver:{region}::autodefined-rule/{INTERNET_RESOLVER_ID}"),
+        "CreatorRequestId": "",
+        "Name": INTERNET_RESOLVER_NAME,
+        "DomainName": INTERNET_RESOLVER_DOMAIN,
+        "RuleType": INTERNET_RESOLVER_TYPE,
+        "OwnerId": INTERNET_RESOLVER_OWNER,
+        "ShareStatus": "NOT_SHARED",
+        "Status": "COMPLETE",
+    })
+}
 
 /// Create a Resolver endpoint of `direction` and return its `Id`, so a rule has
 /// a real stored endpoint to route its queries through.
@@ -1240,6 +1277,27 @@ pub fn listed_ids(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The whole Resolver rule collection of an account whose own rules are `ids`:
+/// the rules Route 53 Resolver defines for every account, which were there
+/// before any of them, and then the account's own in creation order.
+///
+/// `pub` because [`super::resolver_rule_listing_bounds`] enumerates the same
+/// collection.
+pub fn whole_catalog(ids: &[String]) -> Vec<String> {
+    let mut all = vec![INTERNET_RESOLVER_ID.to_string()];
+    all.extend(ids.iter().cloned());
+    all
+}
+
+/// The element of one `ListResolverRules` page whose `Id` is `id`.
+fn listed_entry(body: &Value, id: &str) -> Option<Value> {
+    body.get("ResolverRules")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| string_member(item, "Id") == id)
+        .cloned()
+}
+
 /// `ListResolverRules` enumerates the stored rules in creation order, projects
 /// each one exactly as its reader does — the rule domain in the canonical
 /// fully-qualified form it is stored in — and restricts the page to the rules
@@ -1262,27 +1320,25 @@ async fn rules_are_listed_from_state_and_filtered_on_every_documented_member() {
     let listed = ok(&router, "ListResolverRules", json!({})).await;
     assert_eq!(
         listed_ids(&listed),
-        ids,
-        "case \"no filters\": every stored rule must be listed in creation order, got {listed}"
+        whole_catalog(&ids),
+        "case \"no filters\": every stored rule must be listed in creation order, behind the \
+         rules Resolver defines for the account, got {listed}"
     );
-    for (index, id) in ids.iter().enumerate() {
+    for id in &ids {
         let fetched = ok(
             &router,
             "GetResolverRule",
             json!({ "ResolverRuleId": id.clone() }),
         )
         .await;
-        let from_list = listed
-            .get("ResolverRules")
-            .and_then(Value::as_array)
-            .and_then(|items| items.get(index))
-            .expect("the page carries this rule");
+        let from_list = listed_entry(&listed, id)
+            .unwrap_or_else(|| panic!("case {id:?}: the page carries this rule, got {listed}"));
         assert_eq!(
-            from_list,
+            &from_list,
             rule(&fetched),
             "case {id:?}: the listed rule must be the stored one, got {from_list}"
         );
-        let domain = string_member(from_list, "DomainName");
+        let domain = string_member(&from_list, "DomainName");
         assert!(
             domain.ends_with('.'),
             "case {id:?}: a listed rule domain must be fully qualified, got {domain:?}"
@@ -1344,9 +1400,9 @@ async fn rules_are_listed_from_state_and_filtered_on_every_documented_member() {
             vec![ids[1].clone()],
         ),
         (
-            "Status, the status every stored rule reports",
+            "Status, the status every rule of the collection reports",
             json!([{ "Name": "Status", "Values": ["COMPLETE"] }]),
-            ids.clone(),
+            whole_catalog(&ids),
         ),
         (
             "Status, one no rule reports",
@@ -1389,7 +1445,11 @@ async fn rules_are_listed_from_state_and_filtered_on_every_documented_member() {
             json!([{ "Name": "Type", "Values": [] }]),
             vec![],
         ),
-        ("an empty filter list restricts nothing", json!([]), ids.clone()),
+        (
+            "an empty filter list restricts nothing",
+            json!([]),
+            whole_catalog(&ids),
+        ),
     ];
 
     for (case, filters, expected) in cases {
@@ -1465,7 +1525,8 @@ async fn paging_walks_every_rule_exactly_once() {
             }
         }
         assert_eq!(
-            walked, ids,
+            walked,
+            whole_catalog(&ids),
             "case {case:?}: paging must walk every rule exactly once, in creation order"
         );
     }
@@ -1526,5 +1587,177 @@ async fn paging_walks_every_rule_exactly_once() {
         listed_ids(&resumed),
         vec![ids[1].clone()],
         "case \"the cursor's own query\": the second page must resume after the first, got {resumed}"
+    );
+}
+
+/// Call one operation signed for `region`, which must succeed, and return its
+/// body — the Region being what the ARN of a rule the SERVICE defined is rooted
+/// in.
+async fn ok_in_region(router: &MultiServiceRouter, region: &str, operation: &str, body: Value) -> Value {
+    let (status, parsed) = call_in_region(router, region, operation, body).await;
+    assert_eq!(
+        status, 200,
+        "{operation} in {region} must succeed, got {status}: {parsed}"
+    );
+    parsed
+}
+
+/// Every account is served the rules Route 53 Resolver defines for it: the
+/// recursive rule for the DNS root is the first rule `ListResolverRules`
+/// reports, whatever the account has created of its own, and
+/// `GetResolverRule` reads it back by the id the listing reported.
+///
+/// The rows differ along what the rule generalises over: the Region the request
+/// is signed for, which is the only part of the projection that varies, and how
+/// many rules of its own the account holds — none, so the catalog is all a
+/// clean account is served, and several, which the defined rule still precedes.
+#[tokio::test]
+async fn the_rules_resolver_defines_for_the_account_are_served_to_every_reader() {
+    for (case, region, own_rules) in [
+        ("a clean account, the Region every other case signs for", REGION, false),
+        ("a clean account, another Region", "eu-central-1", false),
+        ("an account holding rules of its own", REGION, true),
+    ] {
+        let router = emulator();
+        let mut own: Vec<String> = Vec::new();
+        if own_rules {
+            let (_, _, ids) = seed_rules(&router).await;
+            own = ids;
+        }
+
+        let listed = ok_in_region(&router, region, "ListResolverRules", json!({})).await;
+        assert_eq!(
+            listed_ids(&listed),
+            whole_catalog(&own),
+            "case {case:?}: the defined rule must lead the listing, got {listed}"
+        );
+        let first = listed
+            .get("ResolverRules")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: the page carries rules, got {listed}"));
+        assert_eq!(
+            first,
+            internet_resolver_rule(region),
+            "case {case:?}: the defined rule must be projected as the service defines it, got \
+             {first}"
+        );
+
+        // The id the listing reported resolves, through the reader every client
+        // polls a rule with, to that very same projection.
+        let fetched = ok_in_region(
+            &router,
+            region,
+            "GetResolverRule",
+            json!({ "ResolverRuleId": INTERNET_RESOLVER_ID }),
+        )
+        .await;
+        assert_eq!(
+            rule(&fetched),
+            &internet_resolver_rule(region),
+            "case {case:?}: the read must answer the rule the listing reported, got {fetched}"
+        );
+    }
+}
+
+/// A rule Route 53 Resolver defined is part of the collection a filtered or
+/// paged `ListResolverRules` selects out of: a filter whose values the rule
+/// matches reports it, one whose values it does not leaves it out, and it is
+/// the first page of a page-at-a-time walk.
+///
+/// The rows differ along the member filtered on (every documented one the rule
+/// carries), the number of values, whether the rule matches, and whether a
+/// second filter agrees — which is what the selection generalises over.
+#[tokio::test]
+async fn a_rule_resolver_defined_is_selected_by_the_filters_it_matches() {
+    let router = emulator();
+    let (first_endpoint, _, ids) = seed_rules(&router).await;
+    let defined = vec![INTERNET_RESOLVER_ID.to_string()];
+
+    let cases: Vec<(&str, Value, Vec<String>)> = vec![
+        (
+            "Type, the type only Resolver itself creates",
+            json!([{ "Name": "Type", "Values": [INTERNET_RESOLVER_TYPE] }]),
+            defined.clone(),
+        ),
+        (
+            "TYPE, the early spelling of the same filter",
+            json!([{ "Name": "TYPE", "Values": [INTERNET_RESOLVER_TYPE] }]),
+            defined.clone(),
+        ),
+        (
+            "Name, the name the service defines",
+            json!([{ "Name": "Name", "Values": [INTERNET_RESOLVER_NAME] }]),
+            defined.clone(),
+        ),
+        (
+            "DomainName, the root the rule selects on",
+            json!([{ "Name": "DomainName", "Values": [INTERNET_RESOLVER_DOMAIN] }]),
+            defined.clone(),
+        ),
+        (
+            "DomainName, the root beside a domain of the account's own",
+            json!([{
+                "Name": "DomainName",
+                "Values": [INTERNET_RESOLVER_DOMAIN, "one.list.example.com"],
+            }]),
+            vec![INTERNET_RESOLVER_ID.to_string(), ids[0].clone()],
+        ),
+        (
+            "Type, a type the defined rule does not report",
+            json!([{ "Name": "Type", "Values": ["FORWARD"] }]),
+            vec![ids[0].clone(), ids[1].clone()],
+        ),
+        (
+            "Name, a name the defined rule does not carry",
+            json!([{ "Name": "Name", "Values": ["list-system"] }]),
+            vec![ids[2].clone()],
+        ),
+        (
+            "CreatorRequestId, which no request of the account's created the \
+             defined rule under",
+            json!([{ "Name": "CreatorRequestId", "Values": ["req-list-system"] }]),
+            vec![ids[2].clone()],
+        ),
+        (
+            "ResolverEndpointId, which the defined rule routes through none of",
+            json!([{ "Name": "ResolverEndpointId", "Values": [first_endpoint.clone()] }]),
+            vec![ids[0].clone()],
+        ),
+        (
+            "two filters the defined rule both matches",
+            json!([
+                { "Name": "Name", "Values": [INTERNET_RESOLVER_NAME] },
+                { "Name": "Type", "Values": [INTERNET_RESOLVER_TYPE] },
+            ]),
+            defined.clone(),
+        ),
+        (
+            "two filters, one of which the defined rule does not match",
+            json!([
+                { "Name": "Name", "Values": [INTERNET_RESOLVER_NAME] },
+                { "Name": "Type", "Values": ["FORWARD"] },
+            ]),
+            vec![],
+        ),
+    ];
+
+    for (case, filters, expected) in cases {
+        let listed = ok(&router, "ListResolverRules", json!({ "Filters": filters })).await;
+        assert_eq!(
+            listed_ids(&listed),
+            expected,
+            "case {case:?}: the filtered page is wrong, got {listed}"
+        );
+    }
+
+    // The defined rule is a FIXED prefix of the collection, so a page-at-a-time
+    // walk reads it first and reads it once.
+    let first_page = ok(&router, "ListResolverRules", json!({ "MaxResults": 1 })).await;
+    assert_eq!(
+        listed_ids(&first_page),
+        defined,
+        "case \"one rule per page\": the first page is the defined rule, got {first_page}"
     );
 }

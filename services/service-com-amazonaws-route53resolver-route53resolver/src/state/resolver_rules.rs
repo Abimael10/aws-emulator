@@ -86,19 +86,22 @@ pub fn rule_content_digest(content: &RuleContent<'_>) -> String {
     hex::encode(&hasher.finalize()[..16])
 }
 
-/// The sentence a Resolver rule's `StatusMessage` states for the step the call
-/// that CREATED it reached — the settled step every stored rule stands in
-/// ([`RULE_STATUS_COMPLETE`]), which is the only step a rule of this store is
-/// ever moved into by a caller.
+/// The sentences a Resolver rule's `StatusMessage` states for the lifecycle step
+/// a call left it in: the settled step a create reached, and the settled step an
+/// update left the rule's new settings in ([`RULE_STATUS_COMPLETE`] in both
+/// cases, which is the only step a rule of this store is ever moved into by a
+/// caller).
 ///
 /// `ResolverRule$StatusMessage` is "a detailed description of the status of a
 /// Resolver rule"
 /// (`smithy_query(query="doc",shape="ResolverRule",member="StatusMessage")`),
-/// and what Route 53 Resolver describes there is the lifecycle step the rule
-/// reached: fixed text for that step, with nothing the caller asked for in it,
-/// exactly as a DNS Firewall resource's step sentence is
-/// ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE`]).
-pub const RULE_STATUS_MESSAGE_CREATED: &str = "Successfully created Resolver Rule";
+/// and what Route 53 Resolver describes there is the step the LAST call on the
+/// rule reached: fixed text for that step, with nothing the caller asked for in
+/// it, exactly as a DNS Firewall resource's step sentence is
+/// ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE`]) — so a rule a caller has
+/// changed describes its status by the change, not by its creation.
+pub const RULE_STATUS_MESSAGE_CREATED: &str = "Successfully created Resolver Rule.";
+pub const RULE_STATUS_MESSAGE_UPDATED: &str = "Successfully updated Resolver Rule.";
 
 /// The `StatusMessage` a Resolver rule reports for the step `stated`, opened by
 /// the trace clause Route 53 Resolver stamps on it: the trace id of the request
@@ -108,10 +111,10 @@ pub const RULE_STATUS_MESSAGE_CREATED: &str = "Successfully created Resolver Rul
 /// ([`request_trace_root`]), the same id this service's refusals quote
 /// ([`traced_message`]) — so it is a different value on every call and is never
 /// derived from anything the caller asked about. It is stamped onto the record
-/// ONCE, by the call that reached the step, and carried by every later
-/// projection of the rule, which is why a read reports the sentence the create
-/// answered rather than a freshly traced one. The whole message fits
-/// `StatusMessage` (length 0..255).
+/// by the call that reached the step and carried by every later projection of
+/// the rule, which is why a read reports the sentence the last write answered
+/// rather than a freshly traced one. The whole message fits `StatusMessage`
+/// (length 0..255).
 pub fn rule_status_message(stated: &str, trace_root: &str) -> String {
     format!("[Trace id: {trace_root}] {stated}")
 }
@@ -224,6 +227,188 @@ impl ResolverRuleRecord {
             RuleFilterKey::Type => values.contains(self.rule_type.as_str()),
         }
     }
+}
+
+/// The `OwnerId` a Resolver rule the SERVICE defined reports: Route 53 Resolver
+/// itself, not the account that reads the rule.
+///
+/// A rule nothing in the account created is a resource of the service, which is
+/// what naming the service as its owner says about it — the same thing a
+/// published DNS Firewall domain list says through
+/// [`MANAGED_FIREWALL_DOMAIN_LIST_OWNER`]. It fits `AccountId`
+/// (length 12..32).
+///
+/// Source: the Resolver rule catalog every account and Region is served, whose
+/// owner name, ids and shape Route 53 Resolver publishes for its own rules and
+/// nothing derives; it carries no account of any caller and names nothing of
+/// this emulator's.
+pub const AUTODEFINED_RESOLVER_RULE_OWNER: &str = "Route 53 Resolver";
+
+/// The `RuleTypeOption` of a rule that resolves a name recursively, out of the
+/// model's enum (`smithy_query(query="shape",shape="RuleTypeOption")`):
+/// "currently, only Resolver can create rules that have a value of `RECURSIVE`
+/// for `RuleType`", so it is the type of the rules in
+/// [`AUTODEFINED_RESOLVER_RULES`] and of no rule a caller creates.
+pub const RULE_TYPE_RECURSIVE: &str = "RECURSIVE";
+
+/// One Resolver rule Route 53 Resolver defines for an account itself, rather
+/// than one a `CreateResolverRule` made.
+///
+/// An autodefined rule belongs to the service, not to the account that reads it:
+/// it is served to every account in every Region, no request created it, and
+/// nothing an account does changes it. So — exactly as a published DNS Firewall
+/// domain list is ([`ManagedFirewallDomainList`]) — it is NOT a stored record
+/// but a catalog entry, and every member a response reports for it is computed
+/// from this entry plus the Region the request was signed for.
+#[derive(Debug, Clone, Copy)]
+pub struct AutodefinedResolverRule {
+    /// The `Id` Route 53 Resolver defines this rule under: the service's own
+    /// identifier for it, identical for every account and every process that
+    /// reads it, derived from nothing of the caller's, and fitting `ResourceId`
+    /// (length 1..64).
+    pub defined_id: &'static str,
+    /// The rule's `Name`, as the service defines it.
+    pub name: &'static str,
+    /// The `DomainName` the rule selects on, in the canonical fully-qualified
+    /// form every rule reports one in ([`canonical_domain_name`]).
+    pub domain_name: &'static str,
+    /// The rule's `RuleType` — what Resolver does with a query matching that
+    /// domain.
+    pub rule_type: &'static str,
+}
+
+/// The Resolver rules Route 53 Resolver defines for every account, in the order
+/// `ListResolverRules` reports them: ahead of the account's own rules, because
+/// they existed before any of them.
+///
+/// The recursive rule for the DNS root is what makes a VPC's Resolver answer
+/// every name no other rule selects by resolving it on the public internet,
+/// which is why every account and Region has it and why no caller can create
+/// one ([`RULE_TYPE_RECURSIVE`]).
+///
+/// Source: the Resolver rule catalog cited on
+/// [`AUTODEFINED_RESOLVER_RULE_OWNER`]; the id, name, domain and type are the
+/// service's own, and the Region of the request is the only part of the entry's
+/// projection that varies.
+pub const AUTODEFINED_RESOLVER_RULES: &[AutodefinedResolverRule] = &[AutodefinedResolverRule {
+    defined_id: "rslvr-autodefined-rr-internet-resolver",
+    name: "Internet Resolver",
+    domain_name: ".",
+    rule_type: RULE_TYPE_RECURSIVE,
+}];
+
+impl AutodefinedResolverRule {
+    /// This rule's `Id`: the one the service defines it under
+    /// ([`Self::defined_id`]), so every read of it — by any account, in any
+    /// process — reports the same id, and nothing of the caller's reaches it.
+    pub fn id(&self) -> &'static str {
+        self.defined_id
+    }
+
+    /// This rule's `Arn`: the defined id under this service's own namespace in
+    /// the Region the request was signed for, with NO account field.
+    ///
+    /// The rule is not a resource of the account reading it — that is what the
+    /// owner it reports ([`AUTODEFINED_RESOLVER_RULE_OWNER`]) says — so the
+    /// account field of its ARN is empty, and this does not go through
+    /// `::engine::emulator_arn`, which exists to root a resource of THIS
+    /// account.
+    pub fn arn(&self, region: &str) -> String {
+        format!(
+            "arn:aws:{ARN_NAMESPACE}:{region}::autodefined-rule/{}",
+            self.id()
+        )
+    }
+
+    /// Project the catalog entry onto the modelled `ResolverRule`, the shape
+    /// `ListResolverRules` and `GetResolverRule` report a rule as.
+    ///
+    /// The members a rule of the account carries because a request made it —
+    /// `TargetIps`, `ResolverEndpointId`, `DelegationRecord`, the creation and
+    /// modification instants, and the `StatusMessage` describing the step a call
+    /// reached ([`RULE_STATUS_MESSAGE_CREATED`]) — are absent, because no call
+    /// made this rule and no call has changed it.
+    pub fn to_rule(&self, region: &str) -> ResolverRule {
+        ResolverRule {
+            id: Some(self.id().to_string()),
+            // `CreatorRequestId` is "a unique string that you specified when
+            // you created the Resolver rule": nothing the account did created
+            // this rule, so there is no such string to report and the member is
+            // served empty.
+            creator_request_id: Some(String::new()),
+            arn: Some(self.arn(region)),
+            domain_name: Some(self.domain_name.to_string()),
+            // The rule is in effect for every account the moment the account
+            // exists, so it stands in the settled step
+            // ([`RULE_STATUS_COMPLETE`]) and no call of this account's ever
+            // moves it out of it.
+            status: Some(RULE_STATUS_COMPLETE.to_string()),
+            status_message: None,
+            rule_type: Some(self.rule_type.to_string()),
+            name: Some(self.name.to_string()),
+            target_ips: None,
+            resolver_endpoint_id: None,
+            owner_id: Some(AUTODEFINED_RESOLVER_RULE_OWNER.to_string()),
+            // The service shares the rule with nobody: every account simply has
+            // it.
+            share_status: Some(SHARE_STATUS_NOT_SHARED.to_string()),
+            creation_time: None,
+            modification_time: None,
+            delegation_record: None,
+        }
+    }
+
+    /// Whether this rule satisfies one `ListResolverRules` filter, decided on
+    /// the values it presents exactly as [`ResolverRuleRecord::matches_filter`]
+    /// decides it for a stored rule — so a filtered listing selects out of the
+    /// whole collection and not only out of the account's own rules. A member
+    /// the rule does not carry matches nothing.
+    pub fn matches_filter(&self, key: RuleFilterKey, values: &HashSet<String>) -> bool {
+        match key {
+            // The empty `CreatorRequestId` the rule reports: no request created
+            // it, so only a filter asking for that empty string selects it.
+            RuleFilterKey::CreatorRequestId => values.contains(""),
+            RuleFilterKey::DomainName => values.contains(self.domain_name),
+            RuleFilterKey::Name => values.contains(self.name),
+            RuleFilterKey::ResolverEndpointId => false,
+            RuleFilterKey::Status => values.contains(RULE_STATUS_COMPLETE),
+            RuleFilterKey::Type => values.contains(self.rule_type),
+        }
+    }
+}
+
+/// The autodefined rule this `ResolverRuleId` names, or `None` for an id that
+/// names none.
+///
+/// Every operation that resolves a `ResolverRuleId` to a rule it REPORTS
+/// consults this after the store, so an id `ListResolverRules` reported means
+/// one rule throughout the service rather than resolving in the operation that
+/// lists them and nowhere else.
+pub fn autodefined_resolver_rule(id: &str) -> Option<&'static AutodefinedResolverRule> {
+    AUTODEFINED_RESOLVER_RULES
+        .iter()
+        .find(|defined| defined.id() == id)
+}
+
+/// Every autodefined rule's projection for `region` that `filters` select: the
+/// FIXED prefix of the Resolver rule collection.
+///
+/// `ListResolverRules` pages this ahead of the account's own rules, so a rule a
+/// caller creates while it is paging only ever appends past the page it has
+/// already read.
+pub fn autodefined_rules_page(
+    region: &str,
+    filters: &[(RuleFilterKey, HashSet<String>)],
+) -> Vec<ResolverRule> {
+    AUTODEFINED_RESOLVER_RULES
+        .iter()
+        .filter(|defined| {
+            filters
+                .iter()
+                .all(|(key, values)| defined.matches_filter(*key, values))
+        })
+        .map(|defined| defined.to_rule(region))
+        .collect()
 }
 
 /// The member a `ListResolverRules` filter selects on.

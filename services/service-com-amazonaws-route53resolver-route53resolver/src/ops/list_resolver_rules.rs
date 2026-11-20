@@ -157,7 +157,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // `ctx` carries the request metadata the ARN of a rule the SERVICE
+        // defined is rooted in.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListResolverRulesErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {
@@ -235,20 +236,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read: the page is computed from the stored records and the
         // cursor is a pure function of the offset, so nothing is written. The
         // store lock is released as soon as the page is built.
+        let region = crate::state::request_region(&ctx.parts().headers);
         let page = {
             let store = state.lock();
-            let matching: Vec<ResolverRule> = store
-                .rules_in_creation_order()
-                .into_iter()
-                // Filters combine with AND; one matches when the value the rule
-                // presents for that member is among the filter's values.
-                .filter(|record| {
-                    filters
-                        .iter()
-                        .all(|(key, values)| record.matches_filter(*key, values))
-                })
-                .map(crate::state::ResolverRuleRecord::to_rule)
-                .collect();
+            // The rules Route 53 Resolver defines for the account itself are
+            // part of the collection this operation reports, ahead of the
+            // account's own records: they existed before any of them, and that
+            // keeps them a FIXED prefix, so a create while a caller is paging
+            // only ever appends past the page it has already read.
+            let matching: Vec<ResolverRule> =
+                crate::state::autodefined_rules_page(&region, &filters)
+                    .into_iter()
+                    .chain(
+                        store
+                            .rules_in_creation_order()
+                            .into_iter()
+                            // Filters combine with AND; one matches when the
+                            // value the rule presents for that member is among
+                            // the filter's values.
+                            .filter(|record| {
+                                filters
+                                    .iter()
+                                    .all(|(key, values)| record.matches_filter(*key, values))
+                            })
+                            .map(crate::state::ResolverRuleRecord::to_rule),
+                    )
+                    .collect();
 
             // The cursor indexes the FILTERED collection, so resuming under a
             // different `Filters` is an unknown cursor and not a page cut at the

@@ -10,13 +10,15 @@
 //! shared [`super::harness`], so what is asserted is the HTTP behaviour and not
 //! a handler called directly.
 //!
-//! What these cases pin is the rule the slice implements: a stored Resolver rule
-//! carries the sentence describing the lifecycle step its create reached —
-//! "a detailed description of the status of a Resolver rule", traced to the
-//! request that reached that step — and EVERY projection of the rule reports it,
-//! because create, read, list, update and delete all answer through the one
-//! `ResolverRule` serializer. So the member is never absent from a listed rule,
-//! and a reader never reports a rule the listing describes differently.
+//! What these cases pin is the rule the slice implements: a stored Resolver
+//! rule carries the sentence describing the lifecycle step its LAST write
+//! reached — "a detailed description of the status of a Resolver rule", traced
+//! to the request that reached that step — and EVERY projection of the rule
+//! reports it, because create, read, list, update and delete all answer through
+//! the one `ResolverRule` serializer. So the member is never absent from a
+//! listed rule, a reader never reports a rule the listing describes
+//! differently, and a rule a caller has changed describes its status by that
+//! change rather than by its creation.
 
 use serde_json::{json, Value};
 use service_common::xray_trace::is_trace_id;
@@ -24,10 +26,12 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{call_tracing, emulator, ok, string_member, tracing_chain, Emulator};
 
-/// The sentence Route 53 Resolver states for a rule that stands in the settled
-/// step its create reached. It is fixed text for that step, with no part of the
-/// request in it.
-const CREATED_SENTENCE: &str = "Successfully created Resolver Rule";
+/// The sentences Route 53 Resolver states for the settled step a write left a
+/// rule in: the step its create reached, and the step an update left its new
+/// settings in. Each is fixed text for that step, with no part of the request
+/// in it.
+const CREATED_SENTENCE: &str = "Successfully created Resolver Rule.";
+const UPDATED_SENTENCE: &str = "Successfully updated Resolver Rule.";
 
 /// `StatusMessage`'s modelled maximum length, from the member's `length` trait
 /// (0..255) on `ResolverRule$StatusMessage`
@@ -235,10 +239,11 @@ async fn listed_rule(
     }
 }
 
-/// Every projection of a created rule describes the step it reports: the create
-/// answers the step's sentence under the trace of the call that reached it, and
-/// the read, the listing (unpaged, paged and filtered) and the update all report
-/// that same sentence — the listing is not a reduced projection of its own.
+/// Every projection of a rule describes the step it reports: a write answers
+/// the step's sentence under the trace of the call that reached it, and the
+/// read and the listing (unpaged, paged and filtered) report that same sentence
+/// — the listing is not a reduced projection of its own. A write that changes
+/// nothing reaches no new step, so it restates the one the rule stands in.
 #[tokio::test]
 async fn every_rule_projection_describes_the_step_it_reports() {
     for RuleCase {
@@ -356,15 +361,19 @@ async fn every_rule_projection_describes_the_step_it_reports() {
             );
         }
 
-        // An update writes the rule's settings and leaves it in that same
-        // settled step, so the sentence describing its status is unchanged.
-        let updated = ok(
+        // An update writes the rule's settings, which are in effect when it
+        // answers, so the rule stands in the settled step THAT call reached and
+        // describes its status by the update, under the trace of the updating
+        // call.
+        let (update_chain, update_root) = tracing_chain(43);
+        let updated = ok_traced(
             &router,
             "UpdateResolverRule",
             json!({
                 "ResolverRuleId": id.clone(),
                 "Config": { "Name": "status-renamed" },
             }),
+            Some(update_chain.as_str()),
         )
         .await;
         assert_eq!(
@@ -372,11 +381,66 @@ async fn every_rule_projection_describes_the_step_it_reports() {
             SETTLED,
             "case {case:?}: an update leaves the rule settled, got {updated}"
         );
+        let after_update = string_member(rule(&updated), "StatusMessage");
+        let Some((trace, stated)) = traced_step(&after_update) else {
+            panic!(
+                "case {case:?}: the update must describe the rule's status as the step's sentence \
+                 under the trace of the call that reached it, got {after_update:?}"
+            );
+        };
         assert_eq!(
-            string_member(rule(&updated), "StatusMessage"),
-            message,
-            "case {case:?}: the update must describe the rule's status as the step it stands in, \
-             got {updated}"
+            stated, UPDATED_SENTENCE,
+            "case {case:?}: expected the updated step's sentence, got {after_update:?}"
+        );
+        assert_eq!(
+            trace, update_root,
+            "case {case:?}: the step must be reported under the trace of the updating call, got \
+             {after_update:?}"
+        );
+        assert!(
+            after_update.len() <= STATUS_MESSAGE_MAX,
+            "case {case:?}: StatusMessage must satisfy its modelled length \
+             0..{STATUS_MESSAGE_MAX}, got {after_update:?}"
+        );
+
+        // And a later read reports that same sentence: the step the rule stands
+        // in is the one its last write left it in, for every projection of it.
+        let reread = ok(
+            &router,
+            "GetResolverRule",
+            json!({ "ResolverRuleId": id.clone() }),
+        )
+        .await;
+        assert_eq!(
+            string_member(rule(&reread), "StatusMessage"),
+            after_update,
+            "case {case:?}: the read after the update must describe the step the update left the \
+             rule in, got {reread}"
+        );
+        let listed = listed_rule(&router, &json!({}), &arn, case)
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: the listing must report the rule"));
+        assert_eq!(
+            string_member(&listed, "StatusMessage"),
+            after_update,
+            "case {case:?}: a listed rule must describe its status as the read does, got {listed}"
+        );
+
+        // An update that names no new setting writes nothing, so it reaches no
+        // new step and leaves the sentence the last write stamped.
+        let (idle_chain, _) = tracing_chain(44);
+        let idle = ok_traced(
+            &router,
+            "UpdateResolverRule",
+            json!({ "ResolverRuleId": id.clone(), "Config": {} }),
+            Some(idle_chain.as_str()),
+        )
+        .await;
+        assert_eq!(
+            string_member(rule(&idle), "StatusMessage"),
+            after_update,
+            "case {case:?}: an update that changes nothing must leave the step the rule stands \
+             in, got {idle}"
         );
 
         // And so does the delete, which answers the rule it took out as the
@@ -389,7 +453,7 @@ async fn every_rule_projection_describes_the_step_it_reports() {
         .await;
         assert_eq!(
             string_member(rule(&deleted), "StatusMessage"),
-            message,
+            after_update,
             "case {case:?}: the delete must answer the stored rule's status description, got \
              {deleted}"
         );

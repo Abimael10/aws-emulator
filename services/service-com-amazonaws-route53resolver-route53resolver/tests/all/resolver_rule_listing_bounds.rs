@@ -25,7 +25,7 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 };
 use super::harness::{call, emulator, error_type, ok, string_member, Emulator};
 use super::resolver_rule_deletion::{forward_rule, outbound_endpoint};
-use super::resolver_rules::listed_ids;
+use super::resolver_rules::{listed_ids, whole_catalog};
 
 /// The published bounds of `ListResolverRules$MaxResults`, from the range the
 /// model puts on the member's target
@@ -116,8 +116,9 @@ async fn max_results_reports_the_page_size_applied() {
         let listed = ok(&router, "ListResolverRules", request).await;
         assert_eq!(
             listed_ids(&listed),
-            ids,
-            "case {case:?}: the page must carry every stored rule in creation order, got {listed}"
+            whole_catalog(&ids),
+            "case {case:?}: the page must carry every rule of the collection in creation order, \
+             got {listed}"
         );
         assert_eq!(
             listed.get("MaxResults").and_then(Value::as_i64),
@@ -266,7 +267,7 @@ async fn the_listing_follows_the_stored_collection() {
     let listed = ok(&router, "ListResolverRules", json!({})).await;
     assert_eq!(
         listed_ids(&listed),
-        expected,
+        whole_catalog(&expected),
         "case \"the seeded collection\": every stored rule must be listed, got {listed}"
     );
 
@@ -283,7 +284,7 @@ async fn the_listing_follows_the_stored_collection() {
     let listed = ok(&router, "ListResolverRules", json!({})).await;
     assert_eq!(
         listed_ids(&listed),
-        expected,
+        whole_catalog(&expected),
         "case \"a rule created later\": it must be appended in creation order, got {listed}"
     );
 
@@ -299,7 +300,7 @@ async fn the_listing_follows_the_stored_collection() {
     let listed = ok(&router, "ListResolverRules", json!({})).await;
     assert_eq!(
         listed_ids(&listed),
-        expected,
+        whole_catalog(&expected),
         "case \"a deleted rule\": it must leave the listing, got {listed}"
     );
     let filtered = ok(
