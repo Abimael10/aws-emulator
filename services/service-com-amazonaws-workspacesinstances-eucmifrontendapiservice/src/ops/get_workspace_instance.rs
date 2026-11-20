@@ -165,10 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // `@readonly`: the only writes this reporting call makes are materialising
-        // the moves the clock already owed — `ALLOCATING -> ALLOCATED`,
-        // `DEALLOCATING -> DEALLOCATED`, and dropping a torn-down record whose
-        // retention has run out — each of which was due at the same instant whether
-        // or not anybody read the instance.
+        // the moves the clock already owed — `ALLOCATING -> ALLOCATED` and
+        // `DEALLOCATING -> DEALLOCATED` — each of which was due at the same instant
+        // whether or not anybody read the instance. A record that has reached the
+        // terminal `DEALLOCATED` is still a record: the lookup keeps resolving it, so a
+        // caller polling for the end of the lifecycle reads it there.
         //
         // An id whose instance belongs to another Region names no instance HERE, so it
         // answers the same not-found this service gives an id it never minted.

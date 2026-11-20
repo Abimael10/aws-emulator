@@ -530,7 +530,7 @@ async fn an_unknown_instance_is_not_found_with_this_services_status_and_resource
 }
 
 #[tokio::test]
-async fn a_torn_down_instance_is_answered_the_same_way_as_one_that_never_existed() {
+async fn a_torn_down_instance_is_served_where_only_an_unknown_id_is_refused() {
     let router = router();
 
     let created = call(
@@ -585,29 +585,40 @@ async fn a_torn_down_instance_is_answered_the_same_way_as_one_that_never_existed
         "case \"delete\": expected HTTP 200, got {status} with {payload}"
     );
 
-    // The delete starts an asynchronous teardown, so the instance is still reported
-    // for a while (the `instance_deletion_lifecycle` suite spans that window). Only
-    // once the teardown and its retention have both fallen due does the id name no
-    // stored record, and then it is answered exactly like one that never existed.
-    tokio::time::sleep(
-        wsinst::state::DEALLOCATION_SPAN
-            + wsinst::state::DEALLOCATED_RETENTION
-            + std::time::Duration::from_millis(250),
-    )
-    .await;
-
+    // The delete starts an asynchronous teardown that ends in the terminal
+    // `DEALLOCATED` (the `instance_deletion_lifecycle` suite spans that lifecycle), and
+    // a deallocated instance is a stored instance: rule 2 is about an id that names NO
+    // record, so these operations keep SERVING this one and refuse only the id this
+    // service never minted.
+    let deallocated =
+        crate::workspace_instance_lifecycle::poll_until_provision_state(&router, &id, "DEALLOCATED")
+            .await;
+    assert_eq!(
+        deallocated.get("WorkspaceInstanceId").and_then(Value::as_str),
+        Some(id.as_str()),
+        "case \"read back a deallocated instance\": expected {id:?}, got {deallocated}"
+    );
     for operation in [
         "GetWorkspaceInstance",
         "DeleteWorkspaceInstance",
         "ListTagsForResource",
     ] {
-        let case = format!("{operation} after the teardown completed");
+        let (status, payload) = call(&router, operation, json!({ "WorkspaceInstanceId": id })).await;
+        assert_eq!(
+            status, 200,
+            "case \"{operation} on a deallocated instance\": expected HTTP 200, got {status} with {payload}"
+        );
+
+        // The same operation, on an id of the same modelled shape this service never
+        // minted: THAT is the not-found.
+        let unknown = "wsinst-00000000notreal";
+        let case = format!("{operation} on the unknown {unknown}");
         assert_not_found(
             &router,
             &case,
             operation,
-            &id,
-            json!({ "WorkspaceInstanceId": id }),
+            unknown,
+            json!({ "WorkspaceInstanceId": unknown }),
         )
         .await;
     }

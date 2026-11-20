@@ -168,9 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // Materialise what the clock already owed before anything is read: the instance
-        // transitions, the removal of a torn-down record past its retention, and the
-        // attachments a teardown has released. Each was due at its stored instant
-        // whether or not this call came.
+        // transitions and the attachments a teardown has released. Each was due at its
+        // stored instant whether or not this call came.
         let now = std::time::Instant::now();
         state.settle_all(now);
         // And what the service that OWNS this volume has already done: a volume removed

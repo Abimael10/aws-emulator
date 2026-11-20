@@ -115,12 +115,12 @@ pub const VOLUME_QUOTA_CODE: &str = "L-VolumesPerAccount";
 /// so `DeleteWorkspaceInstance` releases a slot as soon as it is accepted rather than
 /// when the teardown it starts finishes. The reasoning is that the quota is on RUNNING
 /// instances and an instance in a deallocation state is not one; the alternative
-/// (holding the slot until the record stops being reported) would keep a deleted
-/// instance's capacity for the teardown span and its retention.
+/// (holding the slot until the record stops being reported) would never give the
+/// capacity back, since a torn-down record is KEPT in its terminal state.
 ///
-/// Because a tearing-down record still OCCUPIES the store while it is reported, a
-/// create/delete burst can leave more records held than this; [`MAX_HELD_INSTANCES`]
-/// is what keeps that bounded.
+/// Because a torn-down record still OCCUPIES the store — `DEALLOCATED` is a terminal
+/// lifecycle state, not a removal — a create/delete burst leaves more records held
+/// than this; [`MAX_HELD_INSTANCES`] is what keeps that bounded.
 pub const MAX_INSTANCES: usize = 500;
 
 /// The number of WorkSpace Instance RECORDS this emulator will hold at once in one
@@ -128,11 +128,10 @@ pub const MAX_INSTANCES: usize = 500;
 /// [`MAX_INSTANCES`].
 ///
 /// CHOSEN, like [`MAX_INSTANCES`], and for the same purpose: a caller that creates and
-/// deletes in a tight loop leaves behind records that are still reported for
-/// [`DEALLOCATION_SPAN`] + [`DEALLOCATED_RETENTION`] each, and without a second bound
-/// the store could grow without bound even though no instance is running. A create
-/// past this bound is refused through the same modelled
-/// `ServiceQuotaExceededException`, never by exhausting memory.
+/// deletes in a tight loop leaves behind records this service goes on reporting in
+/// their terminal state, and without a second bound the store could grow without bound
+/// even though no instance is running. A create past this bound is refused through the
+/// same modelled `ServiceQuotaExceededException`, never by exhausting memory.
 pub const MAX_HELD_INSTANCES: usize = 2 * MAX_INSTANCES;
 
 /// The number of volumes this emulator will hold at once in one Region.
@@ -204,17 +203,6 @@ pub const ALLOCATION_SPAN: Duration = Duration::from_millis(500);
 /// stored on the record ([`WorkspaceInstanceRecord::deallocation_due`]) and
 /// materialised lazily by [`WorkspaceInstanceRecord::settle`]; nothing sleeps.
 pub const DEALLOCATION_SPAN: Duration = Duration::from_millis(500);
-
-/// How long a torn-down instance stays reported in the terminal `DEALLOCATED` state
-/// before the service stops reporting it at all.
-///
-/// A deleted resource does eventually stop being reported: past this span a `Get`
-/// answers `ResourceNotFoundException` and a `List` no longer carries the instance,
-/// whichever `ProvisionStates` filter is asked for. AWS documents no retention for a
-/// deleted WorkSpace Instance, so the span is CHOSEN; it is non-zero so the terminal
-/// `DEALLOCATED` state is observable, and it is materialised lazily like the two
-/// transitions above ([`WorkspaceInstanceRecord::is_forgotten`]).
-pub const DEALLOCATED_RETENTION: Duration = Duration::from_millis(500);
 
 /// How long after `ModifyVolume` the modification that call starts becomes due, so
 /// the target configuration it asked for becomes the volume's configuration.
@@ -1656,8 +1644,7 @@ pub struct WorkspaceInstanceRecord {
     pub allocation_due: Instant,
     /// The instant the `DEALLOCATING -> DEALLOCATED` transition falls due, set by
     /// the `DeleteWorkspaceInstance` that started the teardown and `None` on a record
-    /// no delete has been accepted for. Monotonic, like [`Self::allocation_due`], and
-    /// also the point the retention of [`DEALLOCATED_RETENTION`] is measured from.
+    /// no delete has been accepted for. Monotonic, like [`Self::allocation_due`].
     pub deallocation_due: Option<Instant>,
 }
 
@@ -1705,8 +1692,8 @@ impl WorkspaceInstanceRecord {
     /// Record that the TERMINATION of the managed instance failed: the teardown is in
     /// the terminal [`PROVISION_STATE_ERROR_DEALLOCATING`] and carries what EC2
     /// answered. The teardown deadline [`Self::begin_deallocation`] set stays, so the
-    /// record is still reported for one [`DEALLOCATED_RETENTION`] past it
-    /// ([`Self::is_forgotten`]) and the store stays bounded.
+    /// record goes on reporting that a delete was accepted for it
+    /// ([`Self::is_tearing_down`]) and holds no running-instance slot.
     pub fn deallocation_failed(&mut self, error: EC2InstanceError) {
         self.provision_state = PROVISION_STATE_ERROR_DEALLOCATING.to_string();
         self.ec2_instance_errors.push(error);
@@ -1748,17 +1735,6 @@ impl WorkspaceInstanceRecord {
     /// torn down and no longer one of the account's running instances.
     pub fn is_tearing_down(&self) -> bool {
         self.deallocation_due.is_some()
-    }
-
-    /// Whether the clock has already taken this torn-down record past
-    /// [`DEALLOCATED_RETENTION`], so the service no longer reports it at all.
-    ///
-    /// Measured from the teardown deadline, so the record is reported in
-    /// `DEALLOCATING` for one [`DEALLOCATION_SPAN`] and then in `DEALLOCATED` for one
-    /// [`DEALLOCATED_RETENTION`] before it goes.
-    pub fn is_forgotten(&self, now: Instant) -> bool {
-        self.deallocation_due
-            .is_some_and(|due| now >= due + DEALLOCATED_RETENTION)
     }
 }
 
@@ -2147,13 +2123,14 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
     /// Apply every clock-due transition, then hand back Region `region`'s record for
     /// `id`.
     ///
-    /// `None` for an id this service never minted, for one whose teardown has taken it
-    /// past [`DEALLOCATED_RETENTION`] (a torn-down record the clock has already made
-    /// due for removal is removed here, so a reporting operation answers not-found for
-    /// it rather than reporting a resource the service would have forgotten by now),
-    /// and for one whose record belongs to ANOTHER Region: that instance is not one
-    /// this Region's endpoint holds, so every operation looking it up here answers
-    /// exactly as it does for an id that was never minted.
+    /// `None` for an id this service never minted and for one whose record belongs to
+    /// ANOTHER Region: that instance is not one this Region's endpoint holds, so every
+    /// operation looking it up here answers exactly as it does for an id that was never
+    /// minted.
+    ///
+    /// A record a delete has torn down is NOT one of those: `DEALLOCATED` is a terminal
+    /// lifecycle state of the resource, not its removal, so the record stays stored and
+    /// keeps being handed back.
     pub fn settled(
         &mut self,
         region: &str,
@@ -2170,44 +2147,26 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
         id: &str,
         now: Instant,
     ) -> Option<&mut WorkspaceInstanceRecord> {
-        // The clock-due work is done under its own borrow, so the forgotten record can
-        // be dropped (which needs the store again) before the record is handed back.
         // The Region is checked FIRST: a call signed for another Region must not even
         // settle this record, since to that caller the instance does not exist.
-        let forgotten = {
-            let record = self.instances.get_mut(id)?;
-            if record.region != region {
-                return None;
-            }
-            record.settle(now);
-            record.is_forgotten(now)
-        };
-        if forgotten {
-            self.forget(id);
+        let record = self.instances.get_mut(id)?;
+        if record.region != region {
             return None;
         }
-        self.instances.get_mut(id)
+        record.settle(now);
+        Some(record)
     }
 
-    /// Apply every clock-due transition across the whole store, and drop every record
-    /// whose teardown retention has elapsed.
+    /// Apply every clock-due transition across the whole store.
     ///
     /// The volume attachments are settled with the instances: tearing a WorkSpace
     /// Instance down detaches the volumes attached to it, and that was owed at the
     /// instant the delete was accepted whether or not anybody called afterwards — so a
-    /// volume whose instance is tearing down (or is no longer reported at all) holds no
-    /// attachment, and is free to be attached elsewhere or deleted.
+    /// volume whose instance is tearing down holds no attachment, and is free to be
+    /// attached elsewhere or deleted.
     pub fn settle_all(&mut self, now: Instant) {
-        let forgotten: Vec<String> = self
-            .instances
-            .values_mut()
-            .filter_map(|record| {
-                record.settle(now);
-                record.is_forgotten(now).then(|| record.id.clone())
-            })
-            .collect();
-        for id in forgotten {
-            self.forget(&id);
+        for record in self.instances.values_mut() {
+            record.settle(now);
         }
         // Disjoint field borrows: the instances are read while the volumes are written.
         let instances = &self.instances;
@@ -2233,19 +2192,6 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
         }
         for key in retired {
             self.volume_modification_tokens.remove(&key);
-        }
-    }
-
-    /// Stop reporting a torn-down record: the record goes, and so does the
-    /// `ClientToken` of the create that made it, since a later create carrying that
-    /// token must not be refused for an id the service no longer knows. The claim is
-    /// retired under the Region the record belonged to, which is the Region that create
-    /// was signed for.
-    fn forget(&mut self, id: &str) {
-        if let Some(removed) = self.instances.remove(id) {
-            if let Some(token) = removed.client_token {
-                self.client_tokens.remove(&(removed.region, token));
-            }
         }
     }
 
@@ -2284,8 +2230,8 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
     /// minted for another Region's list — and its caller is refused with
     /// [`invalid_next_token`] rather than seeked to a guessed-at place in the store.
     ///
-    /// Settle the store ([`Self::settle_all`]) before asking, so a record the clock
-    /// has already made due for removal cannot resolve.
+    /// Settle the store ([`Self::settle_all`]) before asking, so the page the token
+    /// resumes is read in the states the clock has already made due.
     pub fn instance_resume_point(&self, region: &str, candidate: &str) -> Option<String> {
         self.instances
             .get(candidate)
@@ -2323,11 +2269,13 @@ impl ComAmazonawsWorkspacesinstancesEucmifrontendapiserviceState {
     /// belongs to another Region: that volume is not one this Region's endpoint holds,
     /// so the delete answers not-found and the volume itself is left untouched.
     ///
-    /// The `ClientToken` of the create that made the volume is retired WITH the record,
-    /// exactly as [`Self::forget`] retires an instance's: a later create carrying that
-    /// token must not be refused for an id the service no longer knows, and a claim that
-    /// outlived its resource would let a create/delete cycle grow the claim map without
-    /// bound even though [`MAX_VOLUMES`] holds.
+    /// The `ClientToken` of the create that made the volume is retired WITH the record:
+    /// a later create carrying that token must not be refused for an id the service no
+    /// longer knows, and a claim that outlived its resource would let a create/delete
+    /// cycle grow the claim map without bound even though [`MAX_VOLUMES`] holds. (A
+    /// WorkSpace Instance's token is not retired this way, because nothing removes an
+    /// instance record: a delete tears the instance down and leaves it reported in the
+    /// terminal `DEALLOCATED`, so the id its token claims keeps resolving.)
     pub fn remove_volume(&mut self, region: &str, id: &str) -> Option<VolumeRecord> {
         if self.volumes.get(id)?.region != region {
             return None;

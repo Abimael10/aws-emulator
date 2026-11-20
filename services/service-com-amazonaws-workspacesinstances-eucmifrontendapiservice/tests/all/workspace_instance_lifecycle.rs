@@ -673,6 +673,46 @@ pub(crate) async fn provision_state(router: &MultiServiceRouter, id: &str) -> St
         .to_string()
 }
 
+/// How long [`poll_until_provision_state`] keeps looking before it fails the case.
+///
+/// The spans this service's transitions fall due after are tens of milliseconds, so
+/// this is pure slack for a loaded machine rather than a span anything waits out: no
+/// case asserts anything about how long the wait took.
+pub(crate) const POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long [`poll_until_provision_state`] waits between two reads.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Read `GetWorkspaceInstance` until it reports `wanted`, and hand back the response it
+/// reported it in.
+///
+/// Waits for the CONDITION, never for a span: this service materialises a transition
+/// lazily at the instant it stored for it, so a reader that keeps looking sees the new
+/// state as soon as the clock has made it due, however fast or loaded the host is.
+pub(crate) async fn poll_until_provision_state(
+    router: &MultiServiceRouter,
+    id: &str,
+    wanted: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let (status, payload) = call(
+            router,
+            "GetWorkspaceInstance",
+            json!({ "WorkspaceInstanceId": id }),
+        )
+        .await;
+        if status == 200 && payload["ProvisionState"].as_str() == Some(wanted) {
+            return payload;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case poll {id:?} to {wanted:?}: expected that state inside the poll deadline, last read HTTP {status} with {payload}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 #[tokio::test]
 async fn provision_state_is_the_transient_allocating_until_the_span_is_due() {
     // Two assertions, neither of which races the wall clock:
@@ -970,12 +1010,12 @@ async fn the_stored_tag_set_cannot_grow_past_what_the_model_can_report() {
 }
 
 #[tokio::test]
-async fn delete_removes_the_instance_from_every_view_once_the_teardown_completes() {
+async fn delete_leaves_the_instance_reported_in_its_terminal_state() {
     let router = router();
-    let doomed = create(
+    let torn_down = create(
         &router,
         json!({
-            "ClientToken": "tok-doomed",
+            "ClientToken": "tok-torn-down",
             "ManagedInstance": launchable_managed_instance(),
         }),
     )
@@ -985,19 +1025,33 @@ async fn delete_removes_the_instance_from_every_view_once_the_teardown_completes
     ok(
         &router,
         "DeleteWorkspaceInstance",
-        json!({ "WorkspaceInstanceId": doomed }),
+        json!({ "WorkspaceInstanceId": torn_down }),
     )
     .await;
 
     // Deletion is ASYNCHRONOUS teardown, so the record is still reported right after
-    // the call (the `instance_deletion_lifecycle` suite spans that window). It stops
-    // being reported once the teardown and its retention have both fallen due.
-    tokio::time::sleep(
-        wsinst::state::DEALLOCATION_SPAN
-            + wsinst::state::DEALLOCATED_RETENTION
-            + std::time::Duration::from_millis(250),
-    )
-    .await;
+    // the call (the `instance_deletion_lifecycle` suite spans that window), and
+    // `DEALLOCATED` is a modelled lifecycle VALUE rather than the resource's removal:
+    // the clock carries the record there and it goes on being reported, with
+    // everything read off it, out of the store.
+    let reported = poll_until_provision_state(&router, &torn_down, "DEALLOCATED").await;
+    assert_eq!(
+        reported["WorkspaceInstanceId"].as_str(),
+        Some(torn_down.as_str()),
+        "case the torn-down instance: expected it to still report its own id, got {reported}"
+    );
+    assert!(
+        reported["EC2ManagedInstance"]["InstanceId"].as_str().is_some(),
+        "case the torn-down instance: expected the managed EC2 instance to still be reported, got {reported}"
+    );
+    assert_eq!(
+        reported["BillingConfiguration"]["BillingMode"].as_str(),
+        // The documented default for a create that names no `BillingConfiguration`,
+        // stated as the literal value so a change to the crate constant cannot quietly
+        // change what this case accepts.
+        Some("HOURLY"),
+        "case the torn-down instance: expected the billing configuration it was created with, got {reported}"
+    );
 
     for operation in [
         "GetWorkspaceInstance",
@@ -1007,54 +1061,45 @@ async fn delete_removes_the_instance_from_every_view_once_the_teardown_completes
         let (status, payload) = call(
             &router,
             operation,
-            json!({ "WorkspaceInstanceId": doomed }),
+            json!({ "WorkspaceInstanceId": torn_down }),
         )
         .await;
-        // This service answers `ResourceNotFoundException` with HTTP 400, not the 404
-        // its shape declares — see `crate::state::RESOURCE_NOT_FOUND_STATUS`, and the
-        // table in `tests/all/wire_error_responses.rs` that spans this rule.
         assert_eq!(
-            status, 400,
-            "case {operation} after delete: expected HTTP 400, got {status} with {payload}"
-        );
-        assert_eq!(
-            error_code(&payload),
-            "ResourceNotFoundException",
-            "case {operation} after delete: expected ResourceNotFoundException, got {payload}"
+            status, 200,
+            "case {operation} on the torn-down instance: expected HTTP 200, got {status} with {payload}"
         );
     }
 
-    let listed = list_all_ids(&router, json!({})).await;
+    let mut listed = list_all_ids(&router, json!({})).await;
+    listed.sort();
+    let mut expected = vec![survivor.clone(), torn_down.clone()];
+    expected.sort();
     assert_eq!(
-        listed,
-        vec![survivor.clone()],
-        "case list-after-delete: expected only {survivor:?}, got {listed:?}"
+        listed, expected,
+        "case list-after-delete: expected both instances to be listed, got {listed:?}"
     );
 
-    // The torn-down record's `ClientToken` was retired with it, so replaying that
-    // create does not hand back an id that no longer exists.
-    let replayed = create(
+    // The `ClientToken` the create spent is still spent, because the instance it
+    // created still exists: replaying that create is refused with the conflict naming
+    // it rather than minting a second instance.
+    let (status, payload) = call(
         &router,
+        "CreateWorkspaceInstance",
         json!({
-            "ClientToken": "tok-doomed",
+            "ClientToken": "tok-torn-down",
             "ManagedInstance": launchable_managed_instance(),
         }),
     )
     .await;
-    assert_ne!(
-        replayed, doomed,
-        "case replay-after-delete: expected a new instance, got the deleted {doomed:?}"
-    );
-    let got = ok(
-        &router,
-        "GetWorkspaceInstance",
-        json!({ "WorkspaceInstanceId": replayed }),
-    )
-    .await;
     assert_eq!(
-        got["WorkspaceInstanceId"].as_str(),
-        Some(replayed.as_str()),
-        "case replay-after-delete: expected the new instance to be readable, got {got}"
+        (status, error_code(&payload).as_str()),
+        (409, "ConflictException"),
+        "case replay-after-delete: expected the spent token to be refused, got {status} with {payload}"
+    );
+    assert_eq!(
+        payload["ResourceId"].as_str(),
+        Some(torn_down.as_str()),
+        "case replay-after-delete: expected the conflict to name {torn_down:?}, got {payload}"
     );
 }
 

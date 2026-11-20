@@ -404,10 +404,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             };
             let mut state = state.lock();
-            // The moves the clock already owes, materialised before anything is read:
-            // a torn-down record past its retention is no longer reported, and neither is
-            // the `ClientToken` of the create that made it, so the refusal below cannot
-            // name an id this service has stopped knowing.
+            // The moves the clock already owes, materialised before anything is read,
+            // so the quota below counts the records in the states the clock has already
+            // put them in.
             state.settle_all(std::time::Instant::now());
 
             // `@idempotent` + `@idempotencyToken`: a `ClientToken` this service has

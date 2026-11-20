@@ -158,7 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The same clock-due settle, and the same Region scope, every other
         // single-instance operation looks a record up through: an instance of another
-        // Region, or one whose teardown retention has elapsed, is not here to untag.
+        // Region is not here to untag.
         let Some(record) = state.settled_mut(
             &region,
             &input.workspace_instance_id,

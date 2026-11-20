@@ -159,11 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Deleting a WorkSpace Instance is ASYNCHRONOUS teardown: "Usage of this API
             // will result in deletion of the resource in question", not in the resource
             // being gone by the time this call answers. The call is accepted, the instance
-            // moves to the transient `DEALLOCATING`, and it keeps being reported — by
-            // `GetWorkspaceInstance` and by `ListWorkspaceInstances`, including under a
-            // `ProvisionStates` filter naming that state — until the teardown has finished
-            // and the record's retention has elapsed. Removing it inside the request would
-            // make a state the model declares unobservable.
+            // moves to the transient `DEALLOCATING`, and once the teardown has finished it
+            // is reported in the terminal `DEALLOCATED` — by `GetWorkspaceInstance` and by
+            // `ListWorkspaceInstances`, including under a `ProvisionStates` filter naming
+            // either state. `DEALLOCATED` is a modelled lifecycle VALUE, not the absence of
+            // the resource, so the record and everything read off it (its id, its managed
+            // instance, its billing configuration and its tags) are RETAINED: dropping it
+            // would make the end of the lifecycle unobservable to a caller polling for it,
+            // and removing it inside the request would do the same to the state before it.
             let Some(record) = state.settled_mut(&region, &input.workspace_instance_id, now) else {
                 return Err(crate::state::instance_not_found_error(
                     &input.workspace_instance_id,

@@ -152,9 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // Read through the same clock-due settle every other instance lookup uses, so
-        // a record whose teardown retention has elapsed is not reported here either,
-        // and scoped to the request's Region, so an instance of another Region is not
-        // found here.
+        // the tags of an instance the clock has moved on are read off the same record a
+        // `Get` reports, and scoped to the request's Region, so an instance of another
+        // Region is not found here.
         let Some(record) = state.settled(
             &region,
             &input.workspace_instance_id,

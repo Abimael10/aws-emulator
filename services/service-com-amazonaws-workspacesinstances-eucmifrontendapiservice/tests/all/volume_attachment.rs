@@ -625,32 +625,33 @@ async fn a_teardown_releases_the_attachments_of_the_instance_it_tears_down() {
 
     ok(&router, "DeleteVolume", json!({ "VolumeId": &volume })).await;
 
-    // Past the teardown and the retention the instance is not reported at all, so both
-    // calls answer not-found for it rather than a conflict.
-    tokio::time::sleep(
-        wsinst::state::DEALLOCATION_SPAN
-            + wsinst::state::DEALLOCATED_RETENTION
-            + std::time::Duration::from_millis(250),
+    // The teardown ends in the terminal `DEALLOCATED`, where the instance is still a
+    // stored instance: it is tearing down for good, so the attach keeps being refused
+    // for the instance's STATE rather than for an id that resolves to nothing.
+    crate::workspace_instance_lifecycle::poll_until_provision_state(
+        &router,
+        &instance,
+        "DEALLOCATED",
     )
     .await;
-    assert_not_found(
+    assert_conflict(
         &router,
-        "an attach past the retention",
+        "an attach once the teardown finished",
         "AssociateVolume",
         attach_body(&instance, &fresh, "/dev/sdg"),
         &instance,
         wsinst::state::WORKSPACE_INSTANCE_RESOURCE_TYPE,
-        wsinst::state::INSTANCE_NOT_FOUND_MESSAGE,
+        wsinst::state::INSTANCE_TEARING_DOWN_MESSAGE,
     )
     .await;
-    assert_not_found(
+    assert_conflict(
         &router,
-        "a detach past the retention",
+        "a detach once the teardown finished",
         "DisassociateVolume",
         detach_body(&instance, &fresh, None, None),
-        &instance,
-        wsinst::state::WORKSPACE_INSTANCE_RESOURCE_TYPE,
-        wsinst::state::INSTANCE_NOT_FOUND_MESSAGE,
+        &fresh,
+        wsinst::state::VOLUME_RESOURCE_TYPE,
+        wsinst::state::VOLUME_NOT_ATTACHED_MESSAGE,
     )
     .await;
 }

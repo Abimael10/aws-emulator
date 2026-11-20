@@ -160,11 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let page_size = crate::state::page_size(input.max_results, crate::state::DEFAULT_MAX_RESULTS);
 
         let mut state = state.lock();
-        // The moves the clock already owes (`ALLOCATING -> ALLOCATED`,
-        // `DEALLOCATING -> DEALLOCATED`, and dropping a torn-down record past its
-        // retention), materialised before the page is read so the listing reports the
-        // same state a `Get` would — and before the resume point below is resolved, so
-        // a record the clock has already dropped cannot resolve one.
+        // The moves the clock already owes (`ALLOCATING -> ALLOCATED` and
+        // `DEALLOCATING -> DEALLOCATED`), materialised before the page is read so the
+        // listing reports the same state a `Get` would — and before the resume point
+        // below is resolved, so the page resumes where those states put it.
         state.settle_all(std::time::Instant::now());
 
         // The `NextToken` this operation mints carries the `WorkspaceInstanceId` the
