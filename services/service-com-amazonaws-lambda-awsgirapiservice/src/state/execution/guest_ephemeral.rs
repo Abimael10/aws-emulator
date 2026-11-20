@@ -108,9 +108,14 @@ _TMP_MAX_NAME = 255
 _TMP_MAX_PATH = 4096
 # What the RECORD of one entry costs the storage, beside the bytes of a file: a filesystem
 # keeps an inode and a directory entry for every name it holds, so a tree of names and no
-# content is not free on one either. Taken as one block plus the name itself, which is what the
-# smallest entry of a real filesystem occupies.
+# content is not free on one either. Taken as ONE BLOCK, which is what the smallest entry of a
+# real filesystem occupies — a filesystem hands space out in whole blocks, so this is a block
+# like every other charge against the storage ([`_tmp_occupies`]) and what a reading reports as
+# available stays exactly what may still be written.
 _TMP_ENTRY_BYTES = 4096
+# How much of a grown file's zeros are put there at a time ([`_tmp_zero_fill`]), so that making
+# a file as long as the storage allows does not build a second copy of it beside the file.
+_TMP_FILL_CHUNK = 1024 * 1024
 # How many files one invocation may have OPEN at once: "File descriptors: 1,024" is the quota
 # AWS states for an execution environment.
 _TMP_MAX_DESCRIPTORS = 1024
@@ -210,6 +215,35 @@ def _tmp_names(resolved):
     return sorted(named)
 
 
+def _tmp_occupies(length):
+    """How much of the storage a file of `length` bytes TAKES UP: whole blocks.
+
+    A filesystem hands space out in blocks ([`_TMP_BLOCK_SIZE`], which is the block size a
+    reading of this one reports), so a file occupies the blocks its bytes need and a partly
+    filled block is taken up by it. Every charge against the storage is therefore a whole
+    number of blocks, which is what makes the space a reading reports as available
+    ([`_tmp_statvfs`], stated in those same blocks) exactly the space a write may still take:
+    a growth to what the reading reports is admitted, and one byte more is refused as a full
+    device refuses it.
+    """
+    blocks = (max(0, length) + _TMP_BLOCK_SIZE - 1) // _TMP_BLOCK_SIZE
+    return blocks * _TMP_BLOCK_SIZE
+
+
+def _tmp_zero_fill(held, wanted):
+    """Grow the bytes `held` to `wanted`, which a grown file reads as zeros.
+
+    Written a chunk at a time ([`_TMP_FILL_CHUNK`]): these bytes are the storage's own, so
+    putting them there builds no second copy of the whole file beside it — a file grown to what
+    the storage allows would otherwise cost twice its length at once.
+    """
+    chunk = bytes(_TMP_FILL_CHUNK)
+    while len(held) < wanted:
+        at = len(held)
+        step = min(_TMP_FILL_CHUNK, wanted - at)
+        held[at:at + step] = chunk if step == _TMP_FILL_CHUNK else chunk[:step]
+
+
 def _tmp_room():
     """How many bytes may still be WRITTEN: what is left of the function's configured size,
     held to what this host really holds for one environment."""
@@ -219,7 +253,7 @@ def _tmp_room():
 
 def _tmp_free():
     """How much of the storage is FREE, which is what a filesystem reading reports: the size
-    the function is configured for, less what has been written to it.
+    the function is configured for, less what its entries take up ([`_tmp_occupies`]).
 
     What a reading reports is the function's own configuration — `EphemeralStorage.Size` is the
     size of the directory it has — rather than what this host happens to hold for it, which is
@@ -231,12 +265,15 @@ def _tmp_free():
 def _tmp_charge(grown, resolved):
     """Account for the storage growing by `grown` bytes, which may be negative.
 
-    A growth past what the storage has left is refused the way a full device refuses one, and
-    nothing of it is written. What the storage GREW by is reported to the host, because these
-    bytes are a disk on the real runtime and are held in this process's memory here: the memory
-    a run is measured holding is what the function allocated and not the files it wrote. How
-    much of that the host leaves out is its own decision and bounded by it, per run and for the
-    process together, so what is reported here moves no bound of the run.
+    The amount is a whole number of BLOCKS, because that is how a filesystem hands space out
+    ([`_tmp_occupies`]): what a reading of this one reports as available is therefore exactly
+    what may still be written. A growth past what the storage has left is refused the way a
+    full device refuses one, and nothing of it is written. What the storage GREW by is reported
+    to the host, because these bytes are a disk on the real runtime and are held in this
+    process's memory here: the memory a run is measured holding is what the function allocated
+    and not the files it wrote. How much of that the host leaves out is its own decision and
+    bounded by it, per run and for the process together, so what is reported here moves no
+    bound of the run.
     """
     if grown <= 0:
         _TMP_SPACE["held"] = max(0, _TMP_SPACE["held"] + grown)
@@ -274,13 +311,13 @@ def _tmp_admit(resolved):
     _tmp_named(resolved)
     if len(_TMP_FILES) + len(_TMP_DIRECTORIES) >= _tmp_inodes():
         raise OSError(errno.ENOSPC, _TMP_NO_SPACE, resolved)
-    _tmp_charge(_TMP_ENTRY_BYTES + len(resolved), resolved)
+    _tmp_charge(_TMP_ENTRY_BYTES, resolved)
 
 
 def _tmp_release(resolved):
     """Give back what the RECORD of the entry at `resolved` held, and the number it was
     identified by: a path the storage no longer holds is remembered nowhere."""
-    _tmp_charge(-(_TMP_ENTRY_BYTES + len(resolved)), resolved)
+    _tmp_charge(-_TMP_ENTRY_BYTES, resolved)
     _TMP_TIMES.pop(resolved, None)
     _TMP_MODES.pop(resolved, None)
     _TMP_INODES.pop(resolved, None)
@@ -319,7 +356,10 @@ def _tmp_stat_result(resolved, kind):
             "st_mtime_ns": nanoseconds,
             "st_ctime_ns": nanoseconds,
             "st_blksize": _TMP_BLOCK_SIZE,
-            "st_blocks": (size + 511) // 512,
+            # The 512-byte units ALLOCATED for it, which is what this member reports: the
+            # whole blocks the entry takes up ([`_tmp_occupies`]) and not its bytes rounded
+            # up, so what a reading says the entry costs is what the storage charged for it.
+            "st_blocks": _tmp_occupies(size) // 512,
         },
     )
 
@@ -430,9 +470,9 @@ def _tmp_write_at(resolved, position, chunk):
     held = _TMP_FILES[resolved]
     end = position + len(chunk)
     if end > len(held):
-        _tmp_charge(end - len(held), resolved)
+        _tmp_charge(_tmp_occupies(end) - _tmp_occupies(len(held)), resolved)
     if position > len(held):
-        held.extend(b"\x00" * (position - len(held)))
+        _tmp_zero_fill(held, position)
     held[position:end] = chunk
     _TMP_TIMES[resolved] = _tmp_now()
     return len(chunk)
@@ -443,9 +483,9 @@ def _tmp_truncate_to(resolved, size):
     held = _TMP_FILES[resolved]
     size = max(0, int(size))
     if size != len(held):
-        _tmp_charge(size - len(held), resolved)
+        _tmp_charge(_tmp_occupies(size) - _tmp_occupies(len(held)), resolved)
     if size > len(held):
-        held.extend(b"\x00" * (size - len(held)))
+        _tmp_zero_fill(held, size)
     elif size < len(held):
         del held[size:]
     _TMP_TIMES[resolved] = _tmp_now()
@@ -459,7 +499,7 @@ def _tmp_remove(resolved):
         raise _mount_absent(resolved)
     if kind != "file":
         raise IsADirectoryError(errno.EISDIR, "Is a directory", resolved)
-    _tmp_charge(-len(_TMP_FILES[resolved]), resolved)
+    _tmp_charge(-_tmp_occupies(len(_TMP_FILES[resolved])), resolved)
     del _TMP_FILES[resolved]
     _tmp_release(resolved)
 
@@ -1084,10 +1124,8 @@ def _fs_rename(source, target, *, src_dir_fd=None, dst_dir_fd=None):
     ]
     for path in moved:
         under = to_path + path[len(from_path):]
-        # The entry keeps its record and its number — a rename moves a name rather than
-        # making one — so what the storage holds for it changes only by the length of the
-        # name itself.
-        _tmp_charge(len(under) - len(path), under)
+        # The entry keeps its record, its space and its number — a rename moves a name rather
+        # than making one — so what the storage holds for it is unchanged.
         if path in _TMP_FILES:
             _TMP_FILES[under] = _TMP_FILES.pop(path)
         else:
