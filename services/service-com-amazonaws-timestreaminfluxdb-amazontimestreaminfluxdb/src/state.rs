@@ -40,6 +40,10 @@ mod ports;
 /// carries — the slice the three tagging operations share.
 mod tags;
 
+/// How a backup of one of the records above becomes a resource again: which family the
+/// restored resource belongs to, and the record it is built as.
+mod restores;
+
 /// The SOCKET one DB instance's own InfluxDB v2 HTTP API is served on, and the data that
 /// API reads and writes — the address `endpoint` and `port` report for a client to dial.
 pub mod influx_data_plane;
@@ -48,6 +52,7 @@ pub use backups::*;
 pub use clusters::*;
 pub use marketplace::*;
 pub use ports::*;
+pub use restores::*;
 pub use tags::*;
 
 /// `Status` values this service's records use, each one a member of
@@ -65,6 +70,8 @@ pub const STATUS_REBOOTING: &str = "REBOOTING";
 pub const STATUS_UPDATING_INSTANCE_TYPE: &str = "UPDATING_INSTANCE_TYPE";
 /// See [`STATUS_CREATING`].
 pub const STATUS_UPDATING_DEPLOYMENT_TYPE: &str = "UPDATING_DEPLOYMENT_TYPE";
+/// See [`STATUS_CREATING`].
+pub const STATUS_RESTORING: &str = "RESTORING";
 
 /// The `resourceType` this service reports on `ConflictException` /
 /// `ResourceNotFoundException` for a DB instance — a member of

@@ -16,10 +16,12 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{ClusterConfiguration, LogDeliveryConfiguration, MaintenanceSchedule};
 
+use super::influx_data_plane::TimeSeriesSnapshot;
 use super::{
     engine_type, family_arn, service_managed_db_parameter_group,
     ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState, DbCluster, DbInstance,
-    NamedResource, ARN_SEGMENT_DB_BACKUP, RESOURCE_TYPE_DB_BACKUP, TRANSITION_SPAN,
+    NamedResource, ARN_SEGMENT_DB_BACKUP, RESOURCE_TYPE_DB_BACKUP, RESOURCE_TYPE_DB_CLUSTER,
+    RESOURCE_TYPE_DB_INSTANCE, TRANSITION_SPAN,
 };
 
 /// `DbBackupStatus` values this service's backup records use, each one a member of
@@ -69,21 +71,28 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 /// How many characters the `YYYY-MM-DD` form of the modelled `Date` carries.
 const DATE_TEXT_LEN: usize = 10;
 
-/// The configuration of the DB resource a backup was taken from, as it stood at that
-/// instant: the members every backup output shape reports "at the time of backup".
+/// The DB resource a backup was taken from, as it stood at that instant: the
+/// configuration members every backup output shape reports "at the time of backup", and
+/// the resource's own InfluxDB data.
 ///
 /// It is a snapshot, not a reference: the values are copied off the source record when the
 /// backup is created, so the backup keeps reporting them however the source changes later.
+/// Restoring the backup builds the restored resource out of exactly these values.
 #[derive(Debug, Clone)]
 pub struct DbBackupSnapshot {
+    /// Which family the resource the backup was taken from belongs to, a member of
+    /// `crate::ops::types::RESOURCE_TYPE_VALUES` (the modelled `ResourceType` enum): what
+    /// a restore of this backup reports as the restored resource's type when the request
+    /// asks for no deployment type of its own.
+    pub resource_type: String,
     /// The engine the source resource runs, a member of the modelled `EngineType` enum.
     pub engine_type: String,
     /// The source's deployment type, a member of the modelled `ResourceDeploymentType`
     /// enum — which covers both the DB instance deployment types and the cluster one.
     pub deployment_type: Option<String>,
-    pub db_instance_type: Option<String>,
+    pub db_instance_type: String,
     pub db_storage_type: Option<String>,
-    pub allocated_storage: Option<i32>,
+    pub allocated_storage: i32,
     /// The id of the DB parameter group in force on the source resource.
     pub db_parameter_group_id: Option<String>,
     /// The node composition of the source, reported only for a DB cluster: a DB instance
@@ -101,20 +110,33 @@ pub struct DbBackupSnapshot {
     pub network_type: Option<String>,
     pub influx_auth_parameters_secret_arn: String,
     pub kms_key_id: Option<String>,
+    /// The source's own InfluxDB data as it stood at that instant: the admin user its
+    /// plane authenticated and the points its buckets held, for a source this emulator
+    /// serves an InfluxDB API for. `None` for a DB cluster, whose nodes are reached
+    /// through the cluster's endpoints and publish no socket of their own, so there is no
+    /// plane to capture.
+    pub data: Option<TimeSeriesSnapshot>,
 }
 
 impl DbBackupSnapshot {
     /// The snapshot of a DB instance, with the engine resolved by the caller (it follows
     /// from the DB parameter group applied to the instance, which only the store can
     /// resolve — see
-    /// [`ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState::db_instance_engine_type`]).
-    pub fn of_db_instance(instance: &DbInstance, engine_type: &str) -> Self {
+    /// [`ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState::db_instance_engine_type`])
+    /// and `data` the copy of the instance's own InfluxDB store, which only the store can
+    /// reach either.
+    pub fn of_db_instance(
+        instance: &DbInstance,
+        engine_type: &str,
+        data: Option<TimeSeriesSnapshot>,
+    ) -> Self {
         Self {
+            resource_type: RESOURCE_TYPE_DB_INSTANCE.to_string(),
             engine_type: engine_type.to_string(),
             deployment_type: instance.deployment_type.clone(),
-            db_instance_type: Some(instance.db_instance_type.clone()),
+            db_instance_type: instance.db_instance_type.clone(),
             db_storage_type: instance.db_storage_type.clone(),
-            allocated_storage: Some(instance.allocated_storage),
+            allocated_storage: instance.allocated_storage,
             db_parameter_group_id: instance.db_parameter_group_identifier.clone(),
             cluster_configuration: None,
             failover_mode: None,
@@ -130,6 +152,7 @@ impl DbBackupSnapshot {
             network_type: instance.network_type.clone(),
             influx_auth_parameters_secret_arn: instance.influx_auth_parameters_secret_arn.clone(),
             kms_key_id: instance.kms_key_id.clone(),
+            data,
         }
     }
 
@@ -137,11 +160,12 @@ impl DbBackupSnapshot {
     /// to be resolved for it; the group captured is the one actually APPLIED to it.
     pub fn of_db_cluster(cluster: &DbCluster) -> Self {
         Self {
+            resource_type: RESOURCE_TYPE_DB_CLUSTER.to_string(),
             engine_type: cluster.engine_type.clone(),
             deployment_type: Some(cluster.deployment_type.clone()),
-            db_instance_type: Some(cluster.db_instance_type.clone()),
+            db_instance_type: cluster.db_instance_type.clone(),
             db_storage_type: cluster.db_storage_type.clone(),
-            allocated_storage: Some(cluster.allocated_storage),
+            allocated_storage: cluster.allocated_storage,
             db_parameter_group_id: cluster.effective_db_parameter_group_identifier.clone(),
             cluster_configuration: Some(cluster.cluster_configuration.clone()),
             failover_mode: Some(cluster.failover_mode.clone()),
@@ -154,6 +178,9 @@ impl DbBackupSnapshot {
             network_type: cluster.network_type.clone(),
             influx_auth_parameters_secret_arn: cluster.influx_auth_parameters_secret_arn.clone(),
             kms_key_id: cluster.kms_key_id.clone(),
+            // A cluster's nodes publish no InfluxDB socket, so a cluster has no plane to
+            // capture the data of.
+            data: None,
         }
     }
 }
@@ -227,14 +254,14 @@ macro_rules! db_backup_record_projections {
                         kms_key_id: self.snapshot.kms_key_id.clone(),
                         cluster_configuration: self.snapshot.cluster_configuration.clone(),
                         db_parameter_group_id: self.snapshot.db_parameter_group_id.clone(),
-                        db_instance_type: self.snapshot.db_instance_type.clone(),
+                        db_instance_type: Some(self.snapshot.db_instance_type.clone()),
                         log_delivery_configuration: self
                             .snapshot
                             .log_delivery_configuration
                             .clone(),
                         failover_mode: self.snapshot.failover_mode.clone(),
                         db_storage_type: self.snapshot.db_storage_type.clone(),
-                        allocated_storage: self.snapshot.allocated_storage,
+                        allocated_storage: Some(self.snapshot.allocated_storage),
                         vpc_subnet_ids: Some(self.snapshot.vpc_subnet_ids.clone()),
                         vpc_security_group_ids: Some(
                             self.snapshot.vpc_security_group_ids.clone(),
@@ -263,6 +290,21 @@ db_backup_record_projections! {
 /// resource segments the modelled `Arn` pattern allows.
 pub fn db_backup_arn(region: &str, id: &str) -> String {
     family_arn(ARN_SEGMENT_DB_BACKUP, region, id)
+}
+
+/// The refusal every call aimed at one DB backup gets when the identifier it names
+/// resolves to no backup this account and Region holds — the one spelling of that
+/// sentence, so a read of a backup and a restore from one refuse the same miss alike.
+///
+/// Its only variable part is the identifier the request asked for, which the `resourceId`
+/// the model marks required on `ResourceNotFoundException` carries as well.
+#[must_use]
+pub fn db_backup_not_found(identifier: &str) -> crate::ops::types::ResourceNotFoundException {
+    crate::ops::types::ResourceNotFoundException {
+        message: format!("DB backup {identifier} not found"),
+        resource_id: identifier.to_string(),
+        resource_type: RESOURCE_TYPE_DB_BACKUP.to_string(),
+    }
 }
 
 /// The date a retention of `retention_days` days puts a backup taken at `created_at`
@@ -348,7 +390,22 @@ impl ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState {
     pub fn db_resource_snapshot(&self, db_resource_id: &str) -> Option<DbBackupSnapshot> {
         if let Some(instance) = self.db_instances.get(db_resource_id) {
             let engine = self.db_instance_engine_type(instance);
-            return Some(DbBackupSnapshot::of_db_instance(instance, engine));
+            // A backup of a DB instance captures the instance's own InfluxDB data as well
+            // as its configuration, so restoring it brings the points back: that is what
+            // backing a resource up MEANS, and the restore request carries no password, so
+            // the admin user the captured plane authenticated comes with them.
+            //
+            // The copy is bounded by the store it is taken from: one DB instance's plane
+            // holds at most
+            // [`super::influx_data_plane::time_series::MAX_POINTS_PER_BUCKET`] points per
+            // bucket and mints no bucket after its create, so a snapshot can never be
+            // larger than the instance it captures, and the number of snapshots the state
+            // holds is capped by [`DB_BACKUP_QUOTA`].
+            let data = self
+                .db_instance_planes
+                .get(db_resource_id)
+                .and_then(|plane| plane.series().lock().ok().map(|series| series.snapshot()));
+            return Some(DbBackupSnapshot::of_db_instance(instance, engine, data));
         }
         self.db_clusters
             .get(db_resource_id)

@@ -148,7 +148,11 @@ async fn gated_cases(router: &MultiServiceRouter) -> Vec<GatedCase> {
 }
 
 /// Assert `answer` is the modelled refusal this error class carries.
-fn assert_missing_subscription_refusal(case: &str, answer: (u16, Value)) {
+///
+/// `pub(crate)` because the gate is about the DEPLOYMENT TYPE rather than about one
+/// operation: the restore suite asserts the same refusal for a restore that asks for a
+/// gated deployment type, and a second spelling of it would let the two drift.
+pub(crate) fn assert_missing_subscription_refusal(case: &str, answer: (u16, Value)) {
     let (status, body) = answer;
     assert_eq!(
         status, 400,

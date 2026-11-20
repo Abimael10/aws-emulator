@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreFromDbBackup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreFromDbBackup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreFromDbBackup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -196,18 +187,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreFromDbBackup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreFromDbBackupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreFromDbBackup"))
+        use crate::state as st;
+
+        let Some(handle) = st::service_state(&*self.engine) else {
+            return Err(RestoreFromDbBackupErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the service state store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        let region = st::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `port` carries a constraint the model documents without declaring it, so the
+        // framework's boundary walk admits values InfluxDB does not accept connections on
+        // (see [`crate::state::UNAVAILABLE_PORT_SPANS`]). Checked before anything is
+        // minted, stored or served, so a refused restore persists no resource.
+        if let Some(port) = input.port.filter(|port| st::port_is_unavailable(*port)) {
+            return Err(RestoreFromDbBackupErrorModeled::ValidationException(
+                st::unavailable_port(port),
+            )
+            .into());
+        }
+
+        // `restoreToTime` selects the point in time a CONTINUOUS backup is restored to. A
+        // backup this API creates is an on-demand snapshot of one instant
+        // (`CreateDbBackup` is documented "Creates a new on-demand backup"), so the only
+        // state there is to restore is the one the backup captured, whatever point inside
+        // its window the request names, and no output member reports the time back.
+        let _ = &input.restore_to_time;
+
+        let overrides = st::RestoreOverrides {
+            deployment_type: input.deployment_type,
+            vpc_subnet_ids: input.vpc_subnet_ids,
+            vpc_security_group_ids: input.vpc_security_group_ids,
+            publicly_accessible: input.publicly_accessible,
+            log_delivery_configuration: input.log_delivery_configuration,
+            maintenance_schedule: input.maintenance_schedule,
+            port: input.port,
+            network_type: input.network_type,
+            db_backup_configurations: input.db_backup_configurations,
+            kms_key_id: input.kms_key_id,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        // The whole store-locked section is a BLOCK, so the guard is released at its end
+        // and no non-`Send` guard is held across the socket work that follows.
+        let restored = {
+            let mut state = handle.lock();
+            state.restore_from_db_backup(
+                &region,
+                &input.name,
+                &input.db_backup_id,
+                input.restore_mode.as_deref(),
+                &overrides,
+                now,
+            )
+        };
+        let restored = match restored {
+            Ok(restored) => restored,
+            Err(st::RestoreRefusal::NotFound(error)) => {
+                return Err(
+                    RestoreFromDbBackupErrorModeled::ResourceNotFoundException(error).into(),
+                )
+            }
+            Err(st::RestoreRefusal::Conflict(error)) => {
+                return Err(RestoreFromDbBackupErrorModeled::ConflictException(error).into())
+            }
+            Err(st::RestoreRefusal::QuotaExceeded(error)) => {
+                return Err(
+                    RestoreFromDbBackupErrorModeled::ServiceQuotaExceededException(error).into(),
+                )
+            }
+            Err(st::RestoreRefusal::Invalid(error)) => {
+                return Err(RestoreFromDbBackupErrorModeled::ValidationException(error).into())
+            }
+        };
+
+        // A restored DB instance serves the InfluxDB data the backup captured at the
+        // address it reports: a resource this restore minted is published on a socket of
+        // its own, and one restored in place keeps the address a client may be dialling
+        // and answers the restored data there. Awaited rather than spawned, so the address
+        // this call reports is the address every later read reports.
+        if let Some(data) = restored.data.clone() {
+            st::influx_data_plane::restore_db_instance_plane(
+                &*self.engine,
+                &handle,
+                &restored.resource_id,
+                data,
+            )
+            .await;
+        }
+
+        Ok(RestoreFromDbBackupOutput {
+            restored_db_resource_id: Some(restored.resource_id),
+            restore_status: Some(st::RESTORE_STATUS_RESTORING.to_string()),
+            resource_type: Some(restored.resource_type.to_string()),
+            engine_type: Some(restored.engine_type),
+            deployment_type: Some(restored.deployment_type),
+        })
     }
 }

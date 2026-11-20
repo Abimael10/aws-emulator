@@ -30,6 +30,8 @@ use super::{
 pub const CLUSTER_STATUS_CREATING: &str = "CREATING";
 /// See [`CLUSTER_STATUS_CREATING`].
 pub const CLUSTER_STATUS_AVAILABLE: &str = "AVAILABLE";
+/// See [`CLUSTER_STATUS_CREATING`].
+pub const CLUSTER_STATUS_RESTORING: &str = "RESTORING";
 
 /// The cluster type a create that names none gets: the only member of the modelled
 /// `ClusterDeploymentType` enum (`crate::ops::types::CLUSTER_DEPLOYMENT_TYPE_VALUES`).

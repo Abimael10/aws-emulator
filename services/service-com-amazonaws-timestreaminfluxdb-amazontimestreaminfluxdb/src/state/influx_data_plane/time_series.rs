@@ -274,6 +274,53 @@ impl TimeSeries {
     pub fn has_session(&self, session: &str) -> bool {
         self.session_set.contains(session)
     }
+
+    /// A copy of this instance's data as it stands at this instant — what a backup of the
+    /// instance captures.
+    #[must_use]
+    pub fn snapshot(&self) -> TimeSeriesSnapshot {
+        TimeSeriesSnapshot {
+            credential: self.credential.clone(),
+            buckets: self.buckets.clone(),
+        }
+    }
+
+    /// The store a resource restored from a backup serves: the admin user and the buckets
+    /// the backup captured, and no session at all.
+    ///
+    /// A session is a live sign-in on the plane the backup was taken from, not data the
+    /// backup holds, so the restored plane starts with none and a client signs in again.
+    #[must_use]
+    pub fn restored(snapshot: TimeSeriesSnapshot) -> Self {
+        Self {
+            credential: snapshot.credential,
+            buckets: snapshot.buckets,
+            sessions: Vec::new(),
+            session_set: BTreeSet::new(),
+            session_seq: 0,
+        }
+    }
+}
+
+/// One DB instance's data as it stood at an instant: the admin user its plane
+/// authenticates and the points its buckets held.
+///
+/// Taken when a backup of the instance is created and kept on that backup's record, so
+/// restoring the backup brings back both — the admin user included, which is why a
+/// restore request carries no password of its own.
+#[derive(Debug, Clone)]
+pub struct TimeSeriesSnapshot {
+    credential: AdminCredential,
+    buckets: BTreeMap<String, Vec<Point>>,
+}
+
+impl TimeSeriesSnapshot {
+    /// The admin user the captured plane authenticated, and so the one a plane restored
+    /// from this snapshot authenticates.
+    #[must_use]
+    pub fn credential(&self) -> &AdminCredential {
+        &self.credential
+    }
 }
 
 #[cfg(test)]

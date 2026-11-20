@@ -49,6 +49,16 @@ pub(crate) struct Answer {
 }
 
 impl Answer {
+    /// The status the answer carries.
+    pub(crate) fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// The body it carries.
+    pub(crate) fn body(&self) -> &str {
+        &self.body
+    }
+
     /// The value of the response header `name`, if it carries one.
     fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -81,7 +91,10 @@ fn loopback_port(case: &str, host: &str, port: i64) -> u16 {
 /// Written over a raw socket rather than with an HTTP client crate because what is under
 /// test is that the ADDRESS the control plane reported answers the InfluxDB API at all:
 /// the request is exactly the bytes an InfluxDB client sends.
-async fn exchange(
+///
+/// `pub(crate)` because the restore suite asserts the same thing about the address a
+/// RESTORED instance reports, and a second spelling of this dial would let the two drift.
+pub(crate) async fn exchange(
     case: &str,
     host: &str,
     port: i64,
@@ -145,7 +158,7 @@ fn parsed(case: &str, raw: &[u8]) -> Answer {
 
 /// The `Authorization: Basic` value for `user:password`, encoded the way an HTTP client
 /// encodes it.
-fn basic(user: &str, password: &str) -> String {
+pub(crate) fn basic(user: &str, password: &str) -> String {
     use base64::Engine as _;
     format!(
         "Basic {}",
@@ -383,7 +396,10 @@ async fn every_instance_serves_the_influxdb_api_at_the_address_it_reports() {
 /// The points the instance `id` holds in its own bucket, as `(measurement, first field
 /// value, timestamp)` — read from the store the control plane and the socket share, so what
 /// is asserted is state and not an echo.
-fn stored_points(
+///
+/// `pub(crate)` for the same reason as [`exchange`]: the restore suite reads the data a
+/// restored instance serves out of the same store.
+pub(crate) fn stored_points(
     engine: &Arc<engine::InMemoryEngine>,
     id: &str,
 ) -> Vec<(String, String, i64)> {

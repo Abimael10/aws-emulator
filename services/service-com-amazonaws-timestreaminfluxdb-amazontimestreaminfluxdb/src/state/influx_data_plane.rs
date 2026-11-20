@@ -55,7 +55,7 @@ pub mod v2_api;
 /// buckets hold.
 pub mod time_series;
 
-pub use time_series::{AdminCredential, SharedTimeSeries, TimeSeries};
+pub use time_series::{AdminCredential, SharedTimeSeries, TimeSeries, TimeSeriesSnapshot};
 
 /// How long one request on this socket may take before the connection is given up on.
 ///
@@ -135,10 +135,50 @@ pub async fn serve_db_instance_plane<Eng: Send + Sync + 'static>(
     id: &str,
     credential: AdminCredential,
 ) {
+    serve_over(engine, state, id, TimeSeries::new(credential)).await;
+}
+
+/// Bring the DB instance `id` onto a socket serving the data a backup captured — what a
+/// restore does, because the restored resource holds the data and the admin user of the
+/// resource the backup was taken from and the restore request carries no password.
+///
+/// An instance that is ALREADY served keeps its address, a client may be dialling it, and
+/// the restored data is written into the store that address answers from; one that is not
+/// (a resource this restore just minted) is published on a socket of its own.
+pub async fn restore_db_instance_plane<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &::engine::ServiceState<super::ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState>,
+    id: &str,
+    data: TimeSeriesSnapshot,
+) {
+    let held = state
+        .lock()
+        .db_instance_planes
+        .get(id)
+        .map(|plane| Arc::clone(plane.series()));
+    match held {
+        Some(series) => {
+            if let Ok(mut store) = series.lock() {
+                *store = TimeSeries::restored(data);
+            }
+        }
+        None => serve_over(engine, state, id, TimeSeries::restored(data)).await,
+    }
+}
+
+/// Open the socket the DB instance `id` is served on over `store` — the data it answers
+/// from — and publish its address onto the instance's record. The one spelling of that
+/// walk, shared by the create and by a restore that mints a resource.
+async fn serve_over<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    state: &::engine::ServiceState<super::ComAmazonawsTimestreaminfluxdbAmazontimestreaminfluxdbState>,
+    id: &str,
+    store: TimeSeries,
+) {
     if state.lock().db_instance_planes.contains_key(id) {
         return;
     }
-    let series: SharedTimeSeries = Arc::new(Mutex::new(TimeSeries::new(credential)));
+    let series: SharedTimeSeries = Arc::new(Mutex::new(store));
     let Some(plane) = open(engine, state, id, series).await else {
         return;
     };
