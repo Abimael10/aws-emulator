@@ -25,6 +25,11 @@
 //! runtime role for a step on the cluster", `Step$ExecutionRoleArn`) runs as THAT role
 //! whatever the cluster's instances obtain, which is what a runtime role is for.
 //!
+//! WHICH role a cluster's work runs as is also what its AWS calls are AUTHORIZED against —
+//! the permissions in force on that role decide what the work may really do, and a call they
+//! refuse is not made ([`work_role_arn`], which resolves the role out of the value that named
+//! it so every such reading asks about the same principal).
+//!
 //! IAM is reached the way any emulated service reaches another, through the ONE in-process
 //! IAM client this tree shares ([`::service_common::iam_client::iam_client`]), so nothing
 //! here names another service crate. Where IAM answers nothing about the profile — a
@@ -82,6 +87,51 @@ pub async fn cluster_step_credentials(
     }
 }
 
+/// The roles IAM holds in the instance profile `job_flow_role` names.
+///
+/// `None` where nothing was learned: a value naming no instance profile of this account, an
+/// answer this emulator could not read, and any failure of the hop at all, including an
+/// emulator with no IAM mounted — the non-answer every reading here takes of those.
+async fn profile_roles(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    job_flow_role: &str,
+) -> Option<Vec<::aws_sdk_iam::types::Role>> {
+    let name = instance_profile_name(job_flow_role)?;
+    let held = ::service_common::iam_client::iam_client(ctx, region)
+        .get_instance_profile()
+        .instance_profile_name(name)
+        .send()
+        .await
+        .ok()?;
+    Some(held.instance_profile()?.roles().to_vec())
+}
+
+/// The ROLE whose permissions an AWS call made by a cluster's work is authorized against,
+/// out of the value that NAMED it.
+///
+/// A step carrying a runtime role of its own runs as THAT role ("the Amazon Resource Name
+/// (ARN) of the runtime role for a step on the cluster", `Step$ExecutionRoleArn`), so such a
+/// value names the role itself. Every other value is the cluster's instance profile, and
+/// what the nodes run as is the role IAM holds in it — "An instance profile can contain only
+/// one IAM role" (`AddRoleToInstanceProfile`), so that one role is the answer.
+///
+/// `None` where nothing is known: a value naming neither, a profile IAM holds no record of
+/// or that carries no role, and every failure [`profile_roles`] answers nothing for.
+pub async fn work_role_arn(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    named: &str,
+) -> Option<String> {
+    if ::service_common::iam_role::role_name(named).is_some() {
+        return Some(named.to_string());
+    }
+    profile_roles(ctx, region, named)
+        .await?
+        .first()
+        .and_then(|role| (!role.arn().is_empty()).then(|| role.arn().to_string()))
+}
+
 /// What IAM holds about the instance profile `job_flow_role` names: whether a role those
 /// instances may assume is in it.
 async fn obtained_credential(
@@ -89,24 +139,13 @@ async fn obtained_credential(
     region: &str,
     job_flow_role: &str,
 ) -> ObtainedCredential {
-    let Some(name) = instance_profile_name(job_flow_role) else {
-        return ObtainedCredential::Unknown;
-    };
-    let answered = ::service_common::iam_client::iam_client(ctx, region)
-        .get_instance_profile()
-        .instance_profile_name(name)
-        .send()
-        .await;
-    let Ok(held) = answered else {
-        return ObtainedCredential::Unknown;
-    };
-    let Some(profile) = held.instance_profile() else {
+    let Some(roles) = profile_roles(ctx, region, job_flow_role).await else {
         return ObtainedCredential::Unknown;
     };
     // A trust document IAM holds and this cannot read is no evidence either way, so it leaves
     // the answer unknown rather than reporting a credential the instances do not obtain.
     let mut unreadable = false;
-    for role in profile.roles() {
+    for role in &roles {
         let admits = role.assume_role_policy_document().and_then(|document| {
             ::service_common::iam_trust_policy::admits_service_principal(
                 document,

@@ -13994,6 +13994,7 @@ dependencies = [
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-glue-awsglue",
+ "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-identitystore-awsidentitystore",
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-s3-amazons3",

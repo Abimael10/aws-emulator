@@ -47,6 +47,23 @@
 //! emulated service reaches another, over the in-process callback with the one shared client
 //! builder ([`service_common::s3_client`]), so the files land in the very store
 //! `s3:ListObjectsV2` and `s3:GetObject` read and no connection leaves this process.
+//!
+//! # Whose permissions decide whether a file lands
+//!
+//! The push is the NODE's: the agent runs on the cluster's Amazon EC2 instances, so it writes
+//! with what those instances hold — the role of the instance profile the launch named, or a
+//! step's own runtime role where it carries one ([`super::work_role_arn`]). So the permissions
+//! in force on THAT role decide whether a file lands: a statement that denies `s3:PutObject`
+//! on the key a file would be written under ([`PUT_OBJECT_ACTION`], asked of IAM through the
+//! tree's one reading of what a role may do, [`::service_common::iam_role::role_denies_action`])
+//! suppresses that write, and the step is then owed its files like any other round that did not
+//! land — so a prefix whose write is refused stays EMPTY however many calls report the cluster,
+//! and nothing points a reader at a file nobody could write.
+//!
+//! An empty or unreadable policy set is no such statement and suppresses nothing, exactly as
+//! that reading states: a role IAM holds no identity policy for — the routine state of one
+//! provisioned out of band — says nothing about what its nodes may do, and an emulator with no
+//! IAM mounted answers nothing at all.
 
 use std::io::Write;
 
@@ -55,6 +72,21 @@ use super::*;
 /// The media type each delivered file carries: the object IS a gzip stream, which a reader
 /// fetches and decompresses, rather than a transport encoding of plain text.
 pub const LOG_OBJECT_MEDIA_TYPE: &str = "application/x-gzip";
+
+/// The IAM action ONE delivered file's write is decided on: the action Amazon S3 names an
+/// object write by.
+///
+/// SOURCE: the Service Authorization Reference for Amazon S3, where `PutObject` is the action
+/// for "the `PUT Object` operation" — the call this delivery makes for each file.
+pub const PUT_OBJECT_ACTION: &str = "s3:PutObject";
+
+/// The ARN of the object at `key` in `bucket`, which is the resource that write is decided
+/// against: an Amazon S3 object ARN names no Region and no account, so it is the bucket and
+/// the key alone.
+#[must_use]
+pub fn object_arn(bucket: &str, key: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/{key}")
+}
 
 /// The key segment under one cluster's log prefix that keys the directories by step.
 pub const STEPS_SEGMENT: &str = "steps";
@@ -339,6 +371,11 @@ pub struct PendingLogObject {
 pub struct PendingStepLogs {
     /// The step they belong to, for the tracing of a failed write.
     pub step_id: String,
+    /// WHO the push is made by, as the launch named it: the step's own runtime role where it
+    /// carries one, and otherwise the cluster's instance profile, whose role the nodes that
+    /// push the files assume. The permissions in force on that role are what decide whether a
+    /// file lands (see the module docs); `None` for a cluster that named neither.
+    pub pushed_by: Option<String>,
     /// The files themselves, one per name in [`STEP_LOG_OBJECTS`].
     pub objects: Vec<PendingLogObject>,
 }
@@ -365,6 +402,9 @@ impl ComAmazonawsEmrElasticmapreduceState {
             .log_uri
             .as_deref()
             .and_then(LogDestination::parse);
+        // WHO the cluster's nodes push with, read before the steps are walked: a step with no
+        // runtime role of its own is pushed by the instance profile the launch named.
+        let cluster_pushed_by = cluster.job_flow_role.clone();
         let mut owed: Vec<PendingStepLogs> = Vec::new();
         for (index, step) in cluster.steps.iter_mut().enumerate() {
             // Only a step that really RAN leaves a log directory: one the queue dropped
@@ -406,6 +446,10 @@ impl ComAmazonawsEmrElasticmapreduceState {
             step.delivered_log_uri = Some(format!("s3://{}/{prefix}", destination.bucket));
             owed.push(PendingStepLogs {
                 step_id: step.id.clone(),
+                pushed_by: step
+                    .execution_role_arn
+                    .clone()
+                    .or_else(|| cluster_pushed_by.clone()),
                 objects,
             });
         }
@@ -434,6 +478,10 @@ impl ComAmazonawsEmrElasticmapreduceState {
 /// performed: the delivery was owed from the instant the step ended, whoever asks about it
 /// next, and the write may not happen under this service's lock. The store is taken only to
 /// materialise the steps' transitions and to take what is owed.
+///
+/// Each file is written only where the permissions in force on the role the push is made by
+/// do not deny the object write (see the module docs), so a step whose files IAM refuses is
+/// left owed them rather than reporting a directory the object store does not hold.
 pub async fn deliver_due_step_logs<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -457,7 +505,38 @@ pub async fn deliver_due_step_logs<Eng: Send + Sync + 'static>(
     let client = ::service_common::s3_client::s3_client(ctx.callback(), region);
     let mut undelivered: Vec<String> = Vec::new();
     for logs in owed {
+        // The ROLE the node's push is authorized against, resolved once for this step's
+        // directory: its own runtime role, or the role the cluster's instances assume through
+        // their instance profile. Nothing resolved is nothing known about the permissions in
+        // force, which withholds no write (see the module docs).
+        let pushed_by = match logs.pushed_by.as_deref() {
+            Some(named) => super::work_role_arn(ctx, region, named).await,
+            None => None,
+        };
         for object in &logs.objects {
+            if let Some(role_arn) = pushed_by.as_deref() {
+                let resource = object_arn(&object.bucket, &object.key);
+                if ::service_common::iam_role::role_denies_action(
+                    ctx,
+                    region,
+                    role_arn,
+                    PUT_OBJECT_ACTION,
+                    &resource,
+                )
+                .await
+                {
+                    ::tracing::warn!(
+                        cluster_id = %cluster_id,
+                        step_id = %logs.step_id,
+                        role_arn = %role_arn,
+                        resource = %resource,
+                        "an Amazon EMR step log file was not written: the permissions in force \
+                         on the role the cluster's nodes run as deny the object write"
+                    );
+                    undelivered.push(logs.step_id.clone());
+                    break;
+                }
+            }
             if let Err(error) = client
                 .put_object()
                 .bucket(&object.bucket)

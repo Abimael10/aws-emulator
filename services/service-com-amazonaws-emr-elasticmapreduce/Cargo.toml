@@ -125,6 +125,12 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # Amazon EC2's resource: the suite that asserts the resolved placement creates the VPC and
 # the subnet through Amazon EC2 itself, mounted on the same engine.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# The log files a cluster's nodes push to its `LogUri` are written with what those instances
+# hold — the role of the instance profile the launch named — so the suite that asserts which
+# writes land mounts IAM beside Amazon EMR on ONE engine and builds each instance profile the
+# way a client builds one (`CreateRole`, `PutRolePolicy`, `CreateInstanceProfile`,
+# `AddRoleToInstanceProfile`).
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true
