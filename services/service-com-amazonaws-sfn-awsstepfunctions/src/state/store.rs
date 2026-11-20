@@ -398,6 +398,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             execution_arn: execution_arn.to_string(),
             state_name: state_name.to_string(),
             handed_at: now,
+            // The hand-over is the last progress reported so far: the work has just been
+            // handed the token, so it has missed no heartbeat.
+            heartbeat_at: now,
             answer: None,
             retained_bytes: 0,
         };
@@ -433,12 +436,38 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         CallbackHandoverReply::Recorded
     }
 
-    /// Whether the store holds a handover of `token` that nothing has answered yet, which
-    /// is a task outstanding with the work the call handed it to.
-    pub fn callback_handover_is_open(&self, token: &str) -> bool {
+    /// Restart the heartbeat window of the handed-over token `token` at `now`, and report
+    /// whether the store held an OPEN handover of it.
+    ///
+    /// "This action resets the Heartbeat clock": a callback task is answerable — and so
+    /// heartbeatable — from the instant its state's own call carried the token, before the
+    /// suspended task exists ([`super::callbacks`]), so the window of a task in that
+    /// window is moved on here exactly as [`Self::restart_heartbeat_window`] moves a
+    /// stored task's on. No byte of the record changes size, so the store's total is
+    /// unaffected.
+    pub fn restart_handover_heartbeat_window(&mut self, token: &str, now: SystemTime) -> bool {
+        let Some(handover) = self
+            .callback_handovers
+            .get_mut(token)
+            .filter(|handover| handover.answer.is_none())
+        else {
+            return false;
+        };
+        handover.heartbeat_at = now;
+        true
+    }
+
+    /// When the work holding `token` last reported progress, for the walk whose call is
+    /// still carrying it: the hand-over, moved on by each heartbeat quoting the token.
+    ///
+    /// `None` where the store holds no handover of the token, or holds one something has
+    /// already ANSWERED — a task that is answered is waiting on no further heartbeat, so
+    /// nothing of the kind bounds the call still in flight.
+    pub fn callback_handover_heartbeat_at(&self, token: &str) -> Option<SystemTime> {
         self.callback_handovers
             .get(token)
-            .is_some_and(|handover| handover.answer.is_none())
+            .filter(|handover| handover.answer.is_none())
+            .map(|handover| handover.heartbeat_at)
     }
 
     /// END the handover of `token` and report what answered it, if anything did.

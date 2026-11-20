@@ -24,6 +24,10 @@
 //!   and report the task answered, interpreting nothing: the execution they would
 //!   continue has not been written yet, and continuing it twice is exactly what must not
 //!   happen;
+//! * `SendTaskHeartbeat` moves the handover's own heartbeat window on — "this action
+//!   resets the Heartbeat clock" — which is what the walk waiting for the call re-reads
+//!   while it waits, so a worker that reports progress inside the window keeps its task
+//!   alive however long its work takes;
 //! * the walk reads the answer back when the call returns
 //!   ([`super::integration::Tasks::settle_handover`]), which both ENDS the handover and
 //!   decides the state: an answer is the task's own outcome, and no answer suspends at
@@ -68,6 +72,12 @@ impl<Eng: Send + Sync + 'static> CallbackHandovers for StoredHandovers<Eng> {
         let state = super::service_state(&*self.engine)?;
         let settled = state.lock().settle_callback_handover(token);
         settled
+    }
+
+    fn progressed_at(&self, token: &str) -> Option<::std::time::SystemTime> {
+        let state = super::service_state(&*self.engine)?;
+        let progressed = state.lock().callback_handover_heartbeat_at(token);
+        progressed
     }
 }
 

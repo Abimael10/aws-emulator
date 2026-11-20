@@ -118,6 +118,7 @@ impl Interpreter<'_> {
         call: &super::super::integration::Call,
         request: &Value,
         within: Option<Duration>,
+        alive: Option<&super::super::integration::Alive>,
     ) -> Option<(super::super::integration::Answer, ::std::time::SystemTime)> {
         if let Some(started) = self.started.take() {
             if !started.is_for(call, request) {
@@ -158,7 +159,14 @@ impl Interpreter<'_> {
         // the same turn can unwind what this one has already done.
         self.probing = None;
         let began = super::super::now();
-        let answer = self.tasks.perform(call, request, within);
+        // A call carrying a CALLBACK token is held to the heartbeat window of that token
+        // as well as to its own span: the work the token went to is what reports the
+        // progress that window is measured from, so the window is re-read while the call
+        // is in flight rather than fixed at the instant it was handed over.
+        let answer = match alive {
+            Some(alive) => self.tasks.perform_while_alive(call, request, within, alive),
+            None => self.tasks.perform(call, request, within),
+        };
         self.spent_calling(
             super::super::now()
                 .duration_since(began)
@@ -2300,12 +2308,14 @@ impl Interpreter<'_> {
             .map_err(|failure| self.task_fault(name, &work, failure, at))?;
         // "HeartbeatSeconds […] If more time than the specified seconds elapses between
         // heartbeats from the task, this state fails with a States.Timeout error name":
-        // the heartbeats of a task are sent by whoever is DOING its work, and the work
-        // of a service integration is performed by this emulator itself — so no
-        // heartbeat arrives for one and the window the member declares closes at its own
-        // length. What bounds such a task is therefore whichever of the two spans the
-        // state declared runs out first, while each member is still REPORTED as the
-        // definition wrote it.
+        // the heartbeats of a task are sent by whoever is DOING its work. The work of a
+        // service integration this emulator performs itself sends none, so the window the
+        // member declares closes at its own length and what bounds such a task is
+        // whichever of the two spans the state declared runs out first. A CALLBACK task's
+        // work is somebody ELSE's — whoever the token went to — so the window of one is
+        // bounded below instead, from the last heartbeat quoting its token
+        // ([`super::super::integration::Alive`]). Each member is still REPORTED as the
+        // definition wrote it either way.
         let bounded = match (within, heartbeat.map(Duration::from_secs)) {
             (Some(timeout), Some(heartbeat)) => Some(timeout.min(heartbeat)),
             (timeout, heartbeat) => timeout.or(heartbeat),
@@ -2563,7 +2573,26 @@ impl Interpreter<'_> {
             // so that a sibling's is started beside it: the turn unwinds, and the walk
             // takes it up again at this very state once the call answers
             // ([`Interpreter::perform_call`]).
-            let Some((answered, began)) = me.perform_call(&call, called, me.call_within(bounded))
+            //
+            // A CALLBACK task's `HeartbeatSeconds` bounds the span between two reports of
+            // progress from the work its token went to, so it is handed over WITH the
+            // token rather than folded into the span the call itself is held to: the
+            // window is re-read while the call is in flight, and each heartbeat quoting
+            // the token starts it again. What bounds such a call is therefore the state's
+            // own `TimeoutSeconds`, "its maximum allowed duration, regardless of the
+            // number of SendTaskHeartbeat requests received".
+            let alive = token.as_ref().zip(heartbeat).map(|(token, seconds)| {
+                super::super::integration::Alive {
+                    token: token.clone(),
+                    window: Duration::from_secs(seconds),
+                }
+            });
+            let held_to = match alive {
+                Some(_) => within,
+                None => bounded,
+            };
+            let Some((answered, began)) =
+                me.perform_call(&call, called, me.call_within(held_to), alive.as_ref())
             else {
                 return (Err(unwound()), at);
             };

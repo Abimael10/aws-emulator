@@ -18,7 +18,9 @@
 //! The same call reports a CALLBACK (`.waitForTaskToken`) task still making progress:
 //! whoever holds the token the `Task` state's own integration call carried heartbeats
 //! that task exactly as a worker heartbeats an activity's, and the window the state's
-//! `HeartbeatSeconds` opens runs again from this instant.
+//! `HeartbeatSeconds` opens runs again from this instant — whether that task is the one
+//! the walk suspended at or one whose own call is still in flight, carrying the token to
+//! the work that answers it ([`crate::state::callbacks`]).
 //!
 //! ## Shape of an operation
 //!
@@ -191,10 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A CALLBACK task's token names a task from the instant the `Task` state's own
         // call CARRIED it, which is BEFORE that call has come back and so before the
         // suspended task exists ([`crate::state::callbacks`]): the work holding it is
-        // making progress, and nothing of the heartbeat window has started — the task's
-        // own window opens when the walk records it — so this reports progress and
-        // changes nothing.
-        if store.callback_handover_is_open(&input.task_token) {
+        // making progress, and the window its state's `HeartbeatSeconds` opened runs from
+        // the hand-over, so "this action resets the Heartbeat clock" is written against
+        // the hand-over the walk waiting for that call re-reads.
+        if store.restart_handover_heartbeat_window(&input.task_token, now) {
             return Ok(SendTaskHeartbeatOutput {});
         }
 

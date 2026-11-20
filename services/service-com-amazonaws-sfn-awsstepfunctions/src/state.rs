@@ -1340,6 +1340,12 @@ pub struct CallbackHandover {
     pub state_name: String,
     /// When it was handed over, which is what [`MAX_HANDOVER_DURATION`] is measured from.
     pub handed_at: SystemTime,
+    /// When the work holding the token last reported PROGRESS: the hand-over itself, and
+    /// then every `SendTaskHeartbeat` quoting the token ("this action resets the Heartbeat
+    /// clock"). The window the scheduling state's `HeartbeatSeconds` opens is measured
+    /// from here, so heartbeats bound the IDLE span between two of them rather than the
+    /// whole span the work takes.
+    pub heartbeat_at: SystemTime,
     /// What a `SendTask*` answered it with, once one has: the `output` a success carried,
     /// or the `error` and `cause` a failure named. `None` while nothing has answered it.
     pub answer: Option<integration::Replied>,

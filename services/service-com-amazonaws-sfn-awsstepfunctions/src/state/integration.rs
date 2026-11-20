@@ -2132,6 +2132,15 @@ pub trait CallbackHandovers: Send + Sync {
     /// of the handover either way: after this the token is answered through the task the
     /// store records for it.
     fn settled(&self, token: &str) -> Option<Replied>;
+
+    /// When the work holding `token` last reported PROGRESS: the instant the handover was
+    /// recorded, moved on by every `SendTaskHeartbeat` quoting the token.
+    ///
+    /// Asked WHILE the call carrying the token is in flight, so the heartbeat window the
+    /// scheduling state declared is measured from the last heartbeat rather than from the
+    /// hand-over for ever. `None` where no unanswered handover of the token is held, which
+    /// is a task waiting on no further heartbeat.
+    fn progressed_at(&self, token: &str) -> Option<SystemTime>;
 }
 
 /// See [`CallbackHandovers`].
@@ -2218,6 +2227,47 @@ pub struct InFlight {
     /// reports is measured from here, so a call started while a sibling's was in flight
     /// reports the span it really took rather than what was left of it.
     began: ::std::time::SystemTime,
+    /// The HEARTBEAT window this call's own task is alive inside, for a call carrying a
+    /// callback token whose state declared one: `None` for every call nothing heartbeats,
+    /// which is bounded by `waited` alone.
+    alive: Option<Liveness>,
+}
+
+/// The HEARTBEAT window of a CALLBACK task, as the walk that hands the token over states
+/// it: the token the call carries and the span the state's `HeartbeatSeconds` opens.
+///
+/// "If more time than the specified seconds elapses between heartbeats from the task, this
+/// state fails with a States.Timeout error name": the member bounds the span between two
+/// reports of progress, so it is stated apart from the `TimeoutSeconds` that bounds the
+/// task's whole duration and is re-read while the call is in flight
+/// ([`Tasks::perform_while_alive`]).
+#[derive(Debug, Clone)]
+pub struct Alive {
+    /// The token the call carries, which a `SendTaskHeartbeat` quotes to report progress.
+    pub token: String,
+    /// The window `HeartbeatSeconds` opens, which each heartbeat starts again.
+    pub window: Duration,
+}
+
+/// [`Alive`] with the records the last heartbeat is read back from, which is what an
+/// in-flight call is really held to.
+struct Liveness {
+    alive: Alive,
+    handovers: Handovers,
+}
+
+impl Liveness {
+    /// What is LEFT of the heartbeat window at `now`: the last progress the work reported
+    /// plus the window, less the instant this is asked at.
+    ///
+    /// Re-read at every turn of the wait, so a heartbeat that arrived since the last turn
+    /// moves the bound on; `None` where nothing holds an unanswered handover of the token
+    /// any more, which is a task waiting on no further heartbeat.
+    fn left(&self, now: SystemTime) -> Option<Duration> {
+        let progressed = self.handovers.progressed_at(&self.alive.token)?;
+        let due = progressed.checked_add(self.alive.window)?;
+        Some(due.duration_since(now).unwrap_or_default())
+    }
 }
 
 impl InFlight {
@@ -2239,34 +2289,66 @@ impl InFlight {
         self.began
     }
 
+    /// Hold this call to the HEARTBEAT window `alive` states as well, reading the last
+    /// heartbeat back through `handovers`.
+    ///
+    /// `None` leaves the call held to its own span alone, which is every call nothing
+    /// heartbeats.
+    #[must_use]
+    fn while_alive(mut self, alive: Option<(Alive, Handovers)>) -> Self {
+        self.alive = alive.map(|(alive, handovers)| Liveness { alive, handovers });
+        self
+    }
+
     /// Wait for this call's answer, for what is left of the span it was given.
     ///
     /// The bound is the one [`Tasks::perform`] holds a call to, counted from the instant
     /// the call was STARTED: a call that has not answered inside it is the task's own
     /// timeout, and the thread the walk holds is released there.
+    ///
+    /// A call carrying a callback token whose state declared `HeartbeatSeconds` is held to
+    /// that window TOO, and that window is re-read at every turn of the wait: each
+    /// `SendTaskHeartbeat` on the token moves it on, so the member bounds the span between
+    /// two reports of progress rather than the whole span the work takes, and a window
+    /// that really did lapse closes the task at the instant it was due.
     pub fn settle(self) -> Answer {
-        match self.answered.try_recv() {
-            Ok(answer) => return answer,
-            Err(::std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(unavailable(&self.call))
+        loop {
+            match self.answered.try_recv() {
+                Ok(answer) => return answer,
+                Err(::std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(unavailable(&self.call))
+                }
+                Err(::std::sync::mpsc::TryRecvError::Empty) => {}
             }
-            Err(::std::sync::mpsc::TryRecvError::Empty) => {}
-        }
-        let left = self.waited.saturating_sub(
-            super::now()
-                .duration_since(self.began)
-                .unwrap_or_default(),
-        );
-        if left.is_zero() {
-            return Err(timed_out(&self.call, self.waited));
-        }
-        match self.answered.recv_timeout(left) {
-            Ok(answer) => answer,
-            Err(::std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                Err(timed_out(&self.call, self.waited))
+            let now = super::now();
+            let left = self
+                .waited
+                .saturating_sub(now.duration_since(self.began).unwrap_or_default());
+            if left.is_zero() {
+                return Err(timed_out(&self.call, self.waited));
             }
-            Err(::std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(unavailable(&self.call))
+            // What is LEFT of the heartbeat window, asked again on every turn: a window
+            // nothing moved on has lapsed, and the task it belongs to is closed by the
+            // bound its own state declared.
+            let alive = match &self.alive {
+                Some(liveness) => match liveness.left(now) {
+                    Some(window) if window.is_zero() => {
+                        return Err(stopped_heartbeating(&self.call, liveness.alive.window))
+                    }
+                    window => window,
+                },
+                None => None,
+            };
+            let turn = alive.map_or(left, |alive| alive.min(left));
+            match self.answered.recv_timeout(turn) {
+                Ok(answer) => return answer,
+                // Whichever bound this turn ended on, the next turn decides what it was:
+                // the whole span the call was given, or a heartbeat window that may have
+                // been moved on while this turn waited.
+                Err(::std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(::std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(unavailable(&self.call))
+                }
             }
         }
     }
@@ -2290,6 +2372,29 @@ pub trait Tasks: Send + Sync {
     /// emulator's own ceiling ([`MAX_CALL_DURATION`]) as the only bound, and a
     /// declared timeout longer than that ceiling does not lift it.
     fn perform(&self, call: &Call, request: &Value, within: Option<Duration>) -> Answer;
+
+    /// Make `call` with `request` as [`Tasks::perform`] does, held ALSO to the heartbeat
+    /// window of the callback token it carries (`alive`).
+    ///
+    /// "This action resets the Heartbeat clock": the window is re-read while the call is
+    /// in flight, so each `SendTaskHeartbeat` quoting the token moves the bound on and the
+    /// member bounds the span between two reports of progress rather than the whole span
+    /// the work takes — which is the one thing `HeartbeatSeconds` exists to do. A window
+    /// nothing reports progress inside closes the task at the instant it was due.
+    ///
+    /// The default ignores the window, for a [`Tasks`] with no record of the hand-over to
+    /// read a heartbeat back from: such a call is held to `within` alone, exactly as every
+    /// call nothing heartbeats is.
+    fn perform_while_alive(
+        &self,
+        call: &Call,
+        request: &Value,
+        within: Option<Duration>,
+        alive: &Alive,
+    ) -> Answer {
+        let _ = alive;
+        self.perform(call, request, within)
+    }
 
     /// START `call` with `request` and answer what the walk takes its answer from later,
     /// without waiting for it here.
@@ -3130,6 +3235,23 @@ fn timed_out(call: &Call, waited: Duration) -> Failed {
     }
 }
 
+/// What a task fails with when the HEARTBEAT window of the callback token its call carries
+/// lapsed (`window`): the work holding the token went that long without reporting progress,
+/// which is the same ASL timeout name a whole-task bound running out carries.
+///
+/// "If more time than the specified seconds elapses between heartbeats from the task, this
+/// state fails with a States.Timeout error name" — so the window bounds the IDLE span
+/// between two heartbeats, and only a window nothing moved on reaches here.
+fn stopped_heartbeating(call: &Call, window: Duration) -> Failed {
+    Failed {
+        error: super::asl::TIMEOUT_ERROR.to_string(),
+        cause: format!(
+            "the task token {} carries went {window:?} without a heartbeat",
+            call.described()
+        ),
+    }
+}
+
 impl Dispatcher {
     /// Hand `call` with `request` to the asynchronous task that makes it, and answer what
     /// the walk takes its answer from.
@@ -3181,6 +3303,7 @@ impl Dispatcher {
             answered,
             waited,
             began: super::now(),
+            alive: None,
         })
     }
 }
@@ -3191,6 +3314,25 @@ impl Tasks for Dispatcher {
         // is released at that bound.
         self.hand_over_call(call, request, within)
             .map_or_else(Err, InFlight::settle)
+    }
+
+    fn perform_while_alive(
+        &self,
+        call: &Call,
+        request: &Value,
+        within: Option<Duration>,
+        alive: &Alive,
+    ) -> Answer {
+        // The heartbeats of a callback task are reported against the hand-over this walk
+        // recorded, so the window is read back through the same records a `SendTask*`
+        // answers the token through: a walk with none of them cannot observe a heartbeat
+        // at all, and its call is held to `within` alone.
+        let watched = self
+            .handovers
+            .clone()
+            .map(|handovers| (alive.clone(), handovers));
+        self.hand_over_call(call, request, within)
+            .map_or_else(Err, |in_flight| in_flight.while_alive(watched).settle())
     }
 
     fn begin(&self, call: &Call, request: &Value, within: Option<Duration>) -> Option<InFlight> {
