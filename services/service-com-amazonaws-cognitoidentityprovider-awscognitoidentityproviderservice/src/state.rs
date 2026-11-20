@@ -4195,13 +4195,18 @@ pub fn base64_url(bytes: &[u8]) -> String {
         .to_string()
 }
 
-/// `time` as the modelled timestamp type.
+/// `time` as the modelled timestamp type, at the resolution Amazon Cognito
+/// reports an instant in.
+///
+/// Every timestamp member of this service targets `DateType`, a plain
+/// `timestamp` with no format override, so the protocol renders it as a number
+/// of seconds since the epoch ("Amazon Cognito returns this timestamp in UNIX
+/// epoch time format", `UserPoolType.CreationDate`). The fraction carries whole
+/// milliseconds and nothing finer: the clock is read at whatever resolution the
+/// host offers, so the sub-millisecond digits are truncated here rather than
+/// emitted, and two reads of an unmodified resource render identically.
 pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
-    ::aws_smithy_types::DateTime::from_secs_f64(
-        time.duration_since(UNIX_EPOCH)
-            .map(|since| since.as_secs_f64())
-            .unwrap_or_default(),
-    )
+    ::aws_smithy_types::DateTime::from_millis(unix_millis(time))
 }
 
 /// `time` as whole seconds since the epoch, for a token claim.
@@ -4211,8 +4216,8 @@ fn unix_seconds(time: SystemTime) -> i64 {
         .unwrap_or_default()
 }
 
-/// `time` as whole milliseconds since the epoch, the unit a rendered linked
-/// identity reports its creation instant in.
+/// `time` as whole milliseconds since the epoch, the resolution a rendered
+/// timestamp and a rendered linked identity each report an instant at.
 fn unix_millis(time: SystemTime) -> i64 {
     time.duration_since(UNIX_EPOCH)
         .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
