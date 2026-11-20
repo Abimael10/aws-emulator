@@ -137,7 +137,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An unknown id and a deleted one are the same answer: the record is gone.
             None => Err(GetAccessGrantErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Access grant '{}' does not exist.", input.grant_id),
+                    message: crate::state::ACCESS_GRANT_NOT_FOUND_MESSAGE.to_string(),
                     resource_type: Some("AccessGrant".to_string()),
                     resource_id: Some(input.grant_id.clone()),
                     error_code: None,

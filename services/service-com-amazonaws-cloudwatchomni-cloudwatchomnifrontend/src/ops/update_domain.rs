@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An unknown id and a deleted one are the same answer: the record is gone.
             return Err(UpdateDomainErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Domain '{}' does not exist.", input.domain_id),
+                    message: crate::state::DOMAIN_NOT_FOUND_MESSAGE.to_string(),
                     resource_type: Some("Domain".to_string()),
                     resource_id: Some(input.domain_id.clone()),
                     error_code: None,

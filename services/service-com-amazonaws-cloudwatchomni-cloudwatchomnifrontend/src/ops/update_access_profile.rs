@@ -177,10 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(UpdateAccessProfileErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Access profile '{}' does not exist in space '{}'.",
-                        input.profile_id, input.space_id
-                    ),
+                    message: crate::state::ACCESS_PROFILE_NOT_FOUND_MESSAGE.to_string(),
                     resource_type: Some("AccessProfile".to_string()),
                     resource_id: Some(input.profile_id.clone()),
                     error_code: None,

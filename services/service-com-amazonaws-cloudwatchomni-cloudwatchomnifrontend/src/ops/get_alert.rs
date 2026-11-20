@@ -146,9 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An unknown id and a deleted one are the same answer: the record is gone.
             None => Err(GetAlertErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Alert '{}' does not exist in space '{}'.",
-                        input.alert_id, input.space_id
+                    message: crate::state::alert_not_found_message(
+                        &input.alert_id,
+                        &input.space_id,
                     ),
                     resource_type: Some("Alert".to_string()),
                     resource_id: Some(input.alert_id.clone()),

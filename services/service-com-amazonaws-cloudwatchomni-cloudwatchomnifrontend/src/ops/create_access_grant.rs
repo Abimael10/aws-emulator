@@ -262,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.domains.contains_key(&input.domain_id) {
             return Err(CreateAccessGrantErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Domain '{}' does not exist.", input.domain_id),
+                    message: crate::state::DOMAIN_NOT_FOUND_MESSAGE.to_string(),
                     resource_type: Some("Domain".to_string()),
                     resource_id: Some(input.domain_id.clone()),
                     error_code: None,
@@ -279,10 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !space_in_domain {
             return Err(CreateAccessGrantErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "Space '{}' does not exist in domain '{}'.",
-                        input.space_id, input.domain_id
-                    ),
+                    message: crate::state::SPACE_NOT_FOUND_MESSAGE.to_string(),
                     resource_type: Some("Space".to_string()),
                     resource_id: Some(input.space_id.clone()),
                     error_code: None,

@@ -136,7 +136,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An unknown id and a deleted one are the same answer: the record is gone.
             None => Err(GetSpaceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("Space '{}' does not exist.", input.space_id),
+                    message: crate::state::SPACE_NOT_FOUND_MESSAGE.to_string(),
                     resource_type: Some("Space".to_string()),
                     resource_id: Some(input.space_id.clone()),
                     error_code: None,

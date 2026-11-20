@@ -174,7 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.domains.contains_key(domain_id) {
                 return Err(ListSpacesErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!("Domain '{domain_id}' does not exist."),
+                        message: crate::state::DOMAIN_NOT_FOUND_MESSAGE.to_string(),
                         resource_type: Some("Domain".to_string()),
                         resource_id: Some(domain_id.to_string()),
                         error_code: None,

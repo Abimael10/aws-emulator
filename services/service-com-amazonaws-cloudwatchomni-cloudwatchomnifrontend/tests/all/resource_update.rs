@@ -21,8 +21,11 @@
 //! modelled 404, a rename onto a sibling's name is the modelled 409, a definition that
 //! violates its own rule is the modelled 400 — and none of them writes anything. The
 //! MESSAGE each refusal carries is a requirement too, so the suite also asserts it over a
-//! table: a miss names the kind of resource that is missing and then the identifier the
-//! request addressed it by, and a dashboard body is held to a schema CLOSED at every
+//! table, for EVERY resource kind this service reports a miss for: one text per kind,
+//! stated identically by every operation that reports a miss of that kind, carrying only
+//! the variable parts that kind's text has — a dashboard's id, a view's name, an alert's
+//! id with the space it was looked for in, and nothing at all for a domain, a space, an
+//! access profile or an access grant. A dashboard body is held to a schema CLOSED at every
 //! object it declares, one clause per violated constraint.
 //!
 //! Each assertion names its case and the actual value, so a failure identifies the row of
@@ -40,31 +43,63 @@ use smithy_server_runtime::{
 
 use service_com_amazonaws_cloudwatchomni_cloudwatchomnifrontend as omni;
 
-use omni::ops::create_access_profile::CreateAccessProfile;
+use omni::ops::create_access_grant::{
+    CreateAccessGrant, CreateAccessGrantError, CreateAccessGrantErrorModeled,
+};
+use omni::ops::create_access_profile::{
+    CreateAccessProfile, CreateAccessProfileError, CreateAccessProfileErrorModeled,
+};
 use omni::ops::create_domain::CreateDomain;
 use omni::ops::create_omni_dashboard::CreateOmniDashboard;
-use omni::ops::create_space::CreateSpace;
+use omni::ops::create_space::{CreateSpace, CreateSpaceError, CreateSpaceErrorModeled};
 use omni::ops::create_view::CreateView;
 use omni::ops::delete_view::{DeleteView, DeleteViewError, DeleteViewErrorModeled};
-use omni::ops::get_access_profile::{GetAccessProfile, GetAccessProfileError};
+use omni::ops::get_access_grant::{
+    GetAccessGrant, GetAccessGrantError, GetAccessGrantErrorModeled,
+};
+use omni::ops::get_access_profile::{
+    GetAccessProfile, GetAccessProfileError, GetAccessProfileErrorModeled,
+};
+use omni::ops::get_alert::{GetAlert, GetAlertError, GetAlertErrorModeled};
+use omni::ops::get_domain::{GetDomain, GetDomainError, GetDomainErrorModeled};
 use omni::ops::get_omni_dashboard::{
     GetOmniDashboard, GetOmniDashboardError, GetOmniDashboardErrorModeled,
 };
+use omni::ops::get_space::{GetSpace, GetSpaceError, GetSpaceErrorModeled};
 use omni::ops::get_view::{GetView, GetViewError, GetViewErrorModeled};
+use omni::ops::list_access_grants::{
+    ListAccessGrants, ListAccessGrantsError, ListAccessGrantsErrorModeled,
+};
+use omni::ops::list_omni_dashboards::{
+    ListOmniDashboards, ListOmniDashboardsError, ListOmniDashboardsErrorModeled,
+};
+use omni::ops::list_spaces::{ListSpaces, ListSpacesError, ListSpacesErrorModeled};
 use omni::ops::types::{
-    AccessProfile, CreateAccessProfileInput, CreateDomainInput, CreateOmniDashboardInput,
-    CreateSpaceInput, CreateViewInput, DeleteViewInput, DeleteViewOutput, GetAccessProfileInput,
-    GetAccessProfileOutput, GetOmniDashboardInput, GetViewInput, GetViewOutput, OmniDashboard,
-    UpdateAccessProfileInput, UpdateAccessProfileOutput, UpdateOmniDashboardInput, UpdateViewInput,
+    AccessGrant, AccessGrantPrincipal, AccessProfile, CreateAccessGrantInput,
+    CreateAccessProfileInput, CreateDomainInput, CreateOmniDashboardInput, CreateSpaceInput,
+    CreateViewInput, DeleteViewInput, DeleteViewOutput, GetAccessGrantInput, GetAccessGrantOutput,
+    GetAccessProfileInput, GetAccessProfileOutput, GetAlertInput, GetAlertOutput, GetDomainInput,
+    GetDomainOutput, GetOmniDashboardInput, GetSpaceInput, GetSpaceOutput, GetViewInput,
+    GetViewOutput, ListAccessGrantsInput, ListAccessGrantsOutput, ListOmniDashboardsInput,
+    ListOmniDashboardsOutput, ListSpacesInput, ListSpacesOutput, OmniDashboard, Space,
+    UpdateAccessProfileInput, UpdateAccessProfileOutput, UpdateDomainInput, UpdateDomainOutput,
+    UpdateOmniDashboardInput, UpdateSpaceInput, UpdateSpaceOutput, UpdateViewInput,
     UpdateViewOutput, GET_ACCESS_PROFILE_INPUT_SCHEMA, UPDATE_ACCESS_PROFILE_INPUT_SCHEMA,
 };
-use omni::ops::update_access_profile::{UpdateAccessProfile, UpdateAccessProfileError};
+use omni::ops::update_access_profile::{
+    UpdateAccessProfile, UpdateAccessProfileError, UpdateAccessProfileErrorModeled,
+};
+use omni::ops::update_domain::{UpdateDomain, UpdateDomainError, UpdateDomainErrorModeled};
 use omni::ops::update_omni_dashboard::{
     UpdateOmniDashboard, UpdateOmniDashboardError, UpdateOmniDashboardErrorModeled,
 };
+use omni::ops::update_space::{UpdateSpace, UpdateSpaceError, UpdateSpaceErrorModeled};
 use omni::ops::update_view::{UpdateView, UpdateViewError, UpdateViewErrorModeled};
 use omni::scaffolded::Scaffolded;
-use omni::state::{ASSUME_STATUS_ALLOWED, VIEW_TYPE_USER};
+use omni::state::{
+    ACCESS_GRANT_NOT_FOUND_MESSAGE, ACCESS_PROFILE_NOT_FOUND_MESSAGE, ASSUME_STATUS_ALLOWED,
+    DOMAIN_NOT_FOUND_MESSAGE, SPACE_NOT_FOUND_MESSAGE, VIEW_TYPE_USER,
+};
 
 /// The region the suite signs for.
 const REGION: &str = "us-west-2";
@@ -2049,3 +2084,616 @@ async fn a_patched_body_that_is_not_json_is_refused_at_the_position_the_parse_fa
         "expected the conforming body to persist, got {patched:?} and {stored:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// The remaining resource kinds this service reports a miss for.
+//
+// The two tables above pin the wording for the kinds whose text has a place for the
+// identifier (a dashboard, a view). The tables below pin it for the rest — a domain, a
+// space, an access profile, an access grant and an alert — against the SAME rule: one
+// text per resource kind, stated identically by every operation that reports a miss of
+// that kind, carrying only the variable parts that kind's text has and taking those from
+// the request.
+// ---------------------------------------------------------------------------------------
+
+/// AWS's text for a miss of a domain: wholly fixed, naming no identifier.
+const DOMAIN_MISS: &str = "Domain not found";
+
+/// AWS's text for a miss of a space.
+const SPACE_MISS: &str = "Space not found";
+
+/// AWS's text for a miss of an access profile, in the sentence case it is worded in.
+const ACCESS_PROFILE_MISS: &str = "Access profile not found";
+
+/// AWS's text for a miss of an access grant, naming the resource by its modelled
+/// CamelCase shape name.
+const ACCESS_GRANT_MISS: &str = "AccessGrant not found";
+
+/// The message a miss of an alert carries: the fixed words around the alert id and the
+/// space id the request addressed it by, with no trailing period.
+fn alert_miss(alert_id: &str, space_id: &str) -> String {
+    format!("No alert '{alert_id}' in space '{space_id}'")
+}
+
+impl Omni {
+    async fn get_domain(&self, domain_id: &str) -> Result<GetDomainOutput, GetDomainError> {
+        GetDomain::new(Arc::clone(&self.engine))
+            .handle(
+                GetDomainInput {
+                    domain_id: domain_id.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    /// A patch of `domain_id` that asks for nothing, so the request reaches the lookup
+    /// whatever it would have changed.
+    async fn update_domain(
+        &self,
+        domain_id: &str,
+    ) -> Result<UpdateDomainOutput, UpdateDomainError> {
+        UpdateDomain::new(Arc::clone(&self.engine))
+            .handle(
+                UpdateDomainInput {
+                    domain_id: domain_id.to_string(),
+                    ..Default::default()
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    /// A create that names `domain_id` as the parent of the space it would mint.
+    async fn create_space_in(&self, domain_id: &str, name: &str) -> Result<Space, CreateSpaceError> {
+        CreateSpace::new(Arc::clone(&self.engine))
+            .handle(
+                CreateSpaceInput {
+                    name: name.to_string(),
+                    domain_id: domain_id.to_string(),
+                    data_access_role_arn: DATA_ACCESS_ROLE_ARN.to_string(),
+                    ..Default::default()
+                },
+                &self.ctx(),
+            )
+            .await
+            .map(|output| output.space)
+    }
+
+    /// A listing filtered by `domain_id`.
+    async fn list_spaces_in(&self, domain_id: &str) -> Result<ListSpacesOutput, ListSpacesError> {
+        ListSpaces::new(Arc::clone(&self.engine))
+            .handle(
+                ListSpacesInput {
+                    domain_id: Some(domain_id.to_string()),
+                    ..Default::default()
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    /// A grant listing filtered by whichever parent the row names.
+    async fn list_grants(
+        &self,
+        domain_id: Option<&str>,
+        space_id: Option<&str>,
+    ) -> Result<ListAccessGrantsOutput, ListAccessGrantsError> {
+        ListAccessGrants::new(Arc::clone(&self.engine))
+            .handle(
+                ListAccessGrantsInput {
+                    domain_id: domain_id.map(str::to_string),
+                    space_id: space_id.map(str::to_string),
+                    ..Default::default()
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    async fn get_space(&self, space_id: &str) -> Result<GetSpaceOutput, GetSpaceError> {
+        GetSpace::new(Arc::clone(&self.engine))
+            .handle(
+                GetSpaceInput {
+                    space_id: space_id.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    /// A patch of `space_id` that asks for nothing, for the same reason as
+    /// [`Omni::update_domain`].
+    async fn update_space(&self, space_id: &str) -> Result<UpdateSpaceOutput, UpdateSpaceError> {
+        UpdateSpace::new(Arc::clone(&self.engine))
+            .handle(
+                UpdateSpaceInput {
+                    space_id: space_id.to_string(),
+                    ..Default::default()
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    /// A create that names `space_id` as the parent of the profile it would mint.
+    async fn create_profile_in(
+        &self,
+        space_id: &str,
+        name: &str,
+    ) -> Result<AccessProfile, CreateAccessProfileError> {
+        CreateAccessProfile::new(Arc::clone(&self.engine))
+            .handle(
+                CreateAccessProfileInput {
+                    space_id: space_id.to_string(),
+                    name: name.to_string(),
+                    ..Default::default()
+                },
+                &self.ctx(),
+            )
+            .await
+            .map(|output| output.access_profile)
+    }
+
+    /// A dashboard listing scoped to `space_id`.
+    async fn list_dashboards(
+        &self,
+        space_id: &str,
+    ) -> Result<ListOmniDashboardsOutput, ListOmniDashboardsError> {
+        ListOmniDashboards::new(Arc::clone(&self.engine))
+            .handle(
+                ListOmniDashboardsInput {
+                    space_id: space_id.to_string(),
+                    ..Default::default()
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    /// A grant of `space_id` in `domain_id`, through the handler that owns it.
+    async fn create_grant(
+        &self,
+        domain_id: &str,
+        space_id: &str,
+        name: &str,
+    ) -> Result<AccessGrant, CreateAccessGrantError> {
+        CreateAccessGrant::new(Arc::clone(&self.engine))
+            .handle(
+                CreateAccessGrantInput {
+                    domain_id: domain_id.to_string(),
+                    space_id: space_id.to_string(),
+                    name: name.to_string(),
+                    permission: "READ".to_string(),
+                    principal: AccessGrantPrincipal {
+                        principal_type: "IAM_ROLE".to_string(),
+                        principal_id: Some("role/OmniReader".to_string()),
+                        principal_attributes: None,
+                    },
+                    ..Default::default()
+                },
+                &self.ctx(),
+            )
+            .await
+            .map(|output| output.access_grant)
+    }
+
+    async fn get_grant(
+        &self,
+        grant_id: &str,
+    ) -> Result<GetAccessGrantOutput, GetAccessGrantError> {
+        GetAccessGrant::new(Arc::clone(&self.engine))
+            .handle(
+                GetAccessGrantInput {
+                    grant_id: grant_id.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+
+    async fn get_alert(
+        &self,
+        space_id: &str,
+        alert_id: &str,
+    ) -> Result<GetAlertOutput, GetAlertError> {
+        GetAlert::new(Arc::clone(&self.engine))
+            .handle(
+                GetAlertInput {
+                    space_id: space_id.to_string(),
+                    alert_id: alert_id.to_string(),
+                },
+                &self.ctx(),
+            )
+            .await
+    }
+}
+
+/// GUARD on "one text per kind": the wording every handler reaches for is the one the
+/// tables below require, so a second copy of it that drifted fails here rather than in
+/// whichever operation happened to be asserted.
+#[test]
+fn every_kind_is_worded_in_exactly_one_place() {
+    for (kind, shared, required) in [
+        ("a domain", DOMAIN_NOT_FOUND_MESSAGE, DOMAIN_MISS),
+        ("a space", SPACE_NOT_FOUND_MESSAGE, SPACE_MISS),
+        (
+            "an access profile",
+            ACCESS_PROFILE_NOT_FOUND_MESSAGE,
+            ACCESS_PROFILE_MISS,
+        ),
+        (
+            "an access grant",
+            ACCESS_GRANT_NOT_FOUND_MESSAGE,
+            ACCESS_GRANT_MISS,
+        ),
+    ] {
+        assert_eq!(
+            shared, required,
+            "case {kind:?}: expected the shared wording {required:?}, got {shared:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_domain_the_store_does_not_hold_is_one_text_whichever_operation_reports_it() {
+    let omni = Omni::new();
+    // A live domain and a live space, so every refusal below is a lookup that missed
+    // rather than a store with nothing in it.
+    let live_domain = omni.domain("domain-miss").await;
+    let live_space = omni.space("domain-miss", "domain-miss-space").await;
+
+    // Rows span the `DomainId` class (`^d-[0-9a-z]{1,25}$`): the shortest id the pattern
+    // admits, one of mixed digits, and the longest it admits — the text is the same fixed
+    // sentence whatever the request carried.
+    for (case, domain_id) in [
+        ("the shortest DomainId the pattern admits", "d-0".to_string()),
+        (
+            "a DomainId of mixed digits",
+            "d-3f9q2xkb70wzna15cdt8r".to_string(),
+        ),
+        (
+            "the longest DomainId the pattern admits",
+            format!("d-{}", "z".repeat(25)),
+        ),
+    ] {
+        let read = refusal_message!(
+            case,
+            omni.get_domain(&domain_id).await,
+            GetDomainErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        let patched = refusal_message!(
+            case,
+            omni.update_domain(&domain_id).await,
+            UpdateDomainErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        let created = refusal_message!(
+            case,
+            omni.create_space_in(&domain_id, "orphan-space").await,
+            CreateSpaceErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        let spaces = refusal_message!(
+            case,
+            omni.list_spaces_in(&domain_id).await,
+            ListSpacesErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        let grants = refusal_message!(
+            case,
+            omni.list_grants(Some(&domain_id), None).await,
+            ListAccessGrantsErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        for (operation, actual) in [
+            ("GetDomain", read),
+            ("UpdateDomain", patched),
+            ("CreateSpace", created),
+            ("ListSpaces", spaces),
+            ("ListAccessGrants", grants),
+        ] {
+            assert_eq!(
+                actual, DOMAIN_MISS,
+                "case {case:?}: {operation} expected {DOMAIN_MISS:?}, got {actual:?}"
+            );
+            assert!(
+                !actual.contains(&domain_id),
+                "case {case:?}: {operation} disclosed the requested domainId: {actual:?}"
+            );
+        }
+    }
+
+    // Nothing above made the live records unreadable: the domain and its space still
+    // answer, so the refusals are what the lookup found and not a blanket answer.
+    let held = omni
+        .get_domain(&live_domain)
+        .await
+        .unwrap_or_else(|error| panic!("the live domain stopped resolving: {error:?}"));
+    assert_eq!(
+        held.domain.domain_id, live_domain,
+        "expected the live domain back, got {held:?}"
+    );
+    let listed = omni
+        .list_spaces_in(&live_domain)
+        .await
+        .unwrap_or_else(|error| panic!("the live domain's spaces stopped listing: {error:?}"));
+    assert!(
+        listed
+            .items
+            .iter()
+            .any(|summary| summary.space_id == live_space),
+        "expected the live space listed under its domain, got {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_space_the_store_does_not_hold_is_one_text_whichever_operation_reports_it() {
+    let omni = Omni::new();
+    let live_domain = omni.domain("space-miss").await;
+    let live_space = omni.space("space-miss", "space-miss-live").await;
+
+    // Rows span the `SpaceId` class (its UUID pattern): an id of nil digits, one of mixed
+    // digits, and one at the top of the alphabet the pattern admits.
+    for (case, space_id) in [
+        ("an id of nil digits", MISSING_SPACE_ID.to_string()),
+        (
+            "an id of mixed digits",
+            "2b7d41e0-9c3a-4f55-8a16-0d4e7b6c9a12".to_string(),
+        ),
+        (
+            "an id at the top of the pattern's alphabet",
+            "ffffffff-ffff-4fff-bfff-ffffffffffff".to_string(),
+        ),
+    ] {
+        let read = refusal_message!(
+            case,
+            omni.get_space(&space_id).await,
+            GetSpaceErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        let patched = refusal_message!(
+            case,
+            omni.update_space(&space_id).await,
+            UpdateSpaceErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        let profile = refusal_message!(
+            case,
+            omni.create_profile_in(&space_id, "orphan profile").await,
+            CreateAccessProfileErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        let dashboards = refusal_message!(
+            case,
+            omni.list_dashboards(&space_id).await,
+            ListOmniDashboardsErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        let grants = refusal_message!(
+            case,
+            omni.list_grants(None, Some(&space_id)).await,
+            ListAccessGrantsErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        // A create whose space is missing UNDER a domain that exists reports the space
+        // that is missing, and says nothing of the domain that is not.
+        let grant = refusal_message!(
+            case,
+            omni.create_grant(&live_domain, &space_id, "orphan-grant")
+                .await,
+            CreateAccessGrantErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        for (operation, actual) in [
+            ("GetSpace", read),
+            ("UpdateSpace", patched),
+            ("CreateAccessProfile", profile),
+            ("ListOmniDashboards", dashboards),
+            ("ListAccessGrants", grants),
+            ("CreateAccessGrant", grant),
+        ] {
+            assert_eq!(
+                actual, SPACE_MISS,
+                "case {case:?}: {operation} expected {SPACE_MISS:?}, got {actual:?}"
+            );
+            for disclosed in [space_id.as_str(), live_domain.as_str()] {
+                assert!(
+                    !actual.contains(disclosed),
+                    "case {case:?}: {operation} disclosed {disclosed:?}: {actual:?}"
+                );
+            }
+        }
+    }
+
+    // The live space still answers, so the refusals above are lookups that missed.
+    let held = omni
+        .get_space(&live_space)
+        .await
+        .unwrap_or_else(|error| panic!("the live space stopped resolving: {error:?}"));
+    assert_eq!(
+        held.space.space_id, live_space,
+        "expected the live space back, got {held:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_access_profile_the_store_does_not_hold_is_one_text_whichever_operation_reports_it() {
+    let omni = Omni::new();
+    let space_id = omni.space("profile-miss", "profile-miss-space").await;
+    let other_space = omni.space("profile-miss", "profile-miss-other").await;
+    let elsewhere = omni
+        .create_profile("profile-miss", &other_space, "profile elsewhere", None)
+        .await;
+
+    // Rows span the `ProfileId` class (`^[a-zA-Z0-9_-]+$`) and, as the last row, a LIVE
+    // profile addressed under a space that does not hold it: a profile is addressed by its
+    // space AND its id, so that row is a miss too — and the text names neither.
+    for (case, profile_id) in [
+        ("an id the store holds nothing under", MISSING_PROFILE_ID.to_string()),
+        (
+            "an id carrying the punctuation its pattern admits",
+            "Profile_9-X".to_string(),
+        ),
+        (
+            "a live profile addressed under another space",
+            elsewhere.profile_id.clone(),
+        ),
+    ] {
+        let read = refusal_message!(
+            case,
+            omni.get_profile(&space_id, &profile_id).await,
+            GetAccessProfileErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        let patched = refusal_message!(
+            case,
+            omni.update_profile(&UpdateAccessProfileInput {
+                space_id: space_id.clone(),
+                profile_id: profile_id.clone(),
+                name: Some("renamed".to_string()),
+                description: Some("second".to_string()),
+            })
+            .await,
+            UpdateAccessProfileErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        for (operation, actual) in [("GetAccessProfile", read), ("UpdateAccessProfile", patched)] {
+            assert_eq!(
+                actual, ACCESS_PROFILE_MISS,
+                "case {case:?}: {operation} expected {ACCESS_PROFILE_MISS:?}, got {actual:?}"
+            );
+            for disclosed in [profile_id.as_str(), space_id.as_str()] {
+                assert!(
+                    !actual.contains(disclosed),
+                    "case {case:?}: {operation} disclosed {disclosed:?}: {actual:?}"
+                );
+            }
+        }
+    }
+
+    // The profile the other space DOES hold is untouched by the refusals above, and still
+    // carries what it was created with.
+    let stored = omni
+        .stored_profile("profile-miss", &other_space, &elsewhere.profile_id)
+        .await;
+    assert_eq!(
+        (stored.name.as_str(), stored.description.as_deref()),
+        ("profile elsewhere", None),
+        "a refused patch changed the profile it could not find: {stored:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_access_grant_the_store_does_not_hold_is_named_by_its_kind_alone() {
+    let omni = Omni::new();
+    let domain_id = omni.domain("grant-miss").await;
+    let space_id = omni.space("grant-miss", "grant-miss-space").await;
+    let live = omni
+        .create_grant(&domain_id, &space_id, "grant-live")
+        .await
+        .unwrap_or_else(|error| panic!("CreateAccessGrant failed: {error:?}"));
+
+    // Rows span the `GrantId` class (its UUID pattern), as the space rows do: a grant is
+    // addressed by its id alone, so the miss is the same text for each of them.
+    for (case, grant_id) in [
+        ("an id of nil digits", "00000000-0000-4000-8000-000000000000"),
+        ("an id of mixed digits", "496d9e19-c704-4a21-9b65-0f3ad28e5c17"),
+        (
+            "an id at the top of the pattern's alphabet",
+            "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        ),
+    ] {
+        let read = refusal_message!(
+            case,
+            omni.get_grant(grant_id).await,
+            GetAccessGrantErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        assert_eq!(
+            read, ACCESS_GRANT_MISS,
+            "case {case:?}: GetAccessGrant expected {ACCESS_GRANT_MISS:?}, got {read:?}"
+        );
+        assert!(
+            !read.contains(grant_id),
+            "case {case:?}: GetAccessGrant disclosed the requested grantId: {read:?}"
+        );
+    }
+
+    // The grant the store DOES hold still reads back, so the refusals above are lookups
+    // that missed rather than a reader that refuses everything.
+    let held = omni
+        .get_grant(&live.grant_id)
+        .await
+        .unwrap_or_else(|error| panic!("the live grant stopped resolving: {error:?}"));
+    assert_eq!(
+        (
+            held.access_grant.grant_id.as_str(),
+            held.access_grant.name.as_deref()
+        ),
+        (live.grant_id.as_str(), Some("grant-live")),
+        "expected the live grant back, got {held:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_alert_the_store_does_not_hold_is_named_with_the_space_it_was_looked_for_in() {
+    let omni = Omni::new();
+    let space_id = omni.space("alert-miss", "alert-miss-space").await;
+
+    // Rows span the `AlertId` class (`^[0-9a-f]{32}$`) and the spaces an alert can be
+    // looked for in: three ids under a LIVE space, and one under a space the store holds
+    // nothing under either — both variables are taken from the REQUEST, so the last row
+    // reports the space id it carried even though nothing is stored under it.
+    for (case, space, alert_id) in [
+        ("an alertId of nil digits", space_id.clone(), "0".repeat(32)),
+        (
+            "an alertId of mixed digits",
+            space_id.clone(),
+            "e3f90a17bc45d8206f1ae7cd39b4502f".to_string(),
+        ),
+        (
+            "an alertId at the top of the pattern's alphabet",
+            space_id.clone(),
+            "f".repeat(32),
+        ),
+        (
+            "an alertId under a space the store does not hold",
+            MISSING_SPACE_ID.to_string(),
+            "0123456789abcdef0123456789abcdef".to_string(),
+        ),
+    ] {
+        let expected = alert_miss(&alert_id, &space);
+        let read = refusal_message!(
+            case,
+            omni.get_alert(&space, &alert_id).await,
+            GetAlertErrorModeled::ResourceNotFoundException,
+            NOT_FOUND.0,
+            NOT_FOUND.1
+        );
+        assert_eq!(
+            read, expected,
+            "case {case:?}: GetAlert expected {expected:?}, got {read:?}"
+        );
+        assert!(
+            !read.ends_with('.'),
+            "case {case:?}: GetAlert closed the message with a period: {read:?}"
+        );
+    }
+}
+

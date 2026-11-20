@@ -1481,8 +1481,9 @@ mod domain_admission;
 pub use domain_admission::{client_token_required_message, DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT};
 
 pub use resource_not_found::{
-    dashboard_not_found_message, view_not_found_message, DASHBOARD_NOT_FOUND_RESOURCE,
-    VIEW_NOT_FOUND_RESOURCE,
+    alert_not_found_message, dashboard_not_found_message, view_not_found_message,
+    ACCESS_GRANT_NOT_FOUND_MESSAGE, ACCESS_PROFILE_NOT_FOUND_MESSAGE, DASHBOARD_NOT_FOUND_RESOURCE,
+    DOMAIN_NOT_FOUND_MESSAGE, SPACE_NOT_FOUND_MESSAGE, VIEW_NOT_FOUND_RESOURCE,
 };
 
 pub use view_definition::{view_definition_rejection, INVALID_VIEW_DEFINITION};
