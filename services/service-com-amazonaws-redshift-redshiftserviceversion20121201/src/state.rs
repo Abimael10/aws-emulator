@@ -1159,6 +1159,12 @@ pub enum ClusterSnapshotNotFoundWording {
     /// the OPERATION, so a read and a write word the same fault differently for
     /// the same name.
     SnapshotThenNotFound,
+    /// `Snapshot not found: <SnapshotIdentifier>` — the same shape of sentence
+    /// as [`Self::NotFoundThenIdentifier`] with the noun the service puts on the
+    /// wire rather than the modelled shape's name, which is what the
+    /// reserved-node exchange reads answer for a snapshot they are asked to plan
+    /// an exchange from.
+    SnapshotNotFoundThenIdentifier,
 }
 
 /// The `ClusterSnapshotNotFoundFault` message `wording` words, naming the
@@ -1173,6 +1179,9 @@ pub fn cluster_snapshot_not_found_message(
         }
         ClusterSnapshotNotFoundWording::SnapshotThenNotFound => {
             format!("Snapshot {snapshot_identifier} not found.")
+        }
+        ClusterSnapshotNotFoundWording::SnapshotNotFoundThenIdentifier => {
+            format!("Snapshot not found: {snapshot_identifier}")
         }
     }
 }

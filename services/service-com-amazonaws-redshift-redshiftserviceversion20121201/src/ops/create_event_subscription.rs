@@ -266,6 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     CreateEventSubscriptionErrorModeled::SNSTopicArnNotFoundFault(
                         SNSTopicArnNotFoundFault {
                             message: Some(st::notifications::sns_topic_not_found_message(
+                                st::notifications::SnsTopicArnNotFoundWording::FailedToCreateSubscription,
                                 &input.sns_topic_arn,
                             )),
                         },

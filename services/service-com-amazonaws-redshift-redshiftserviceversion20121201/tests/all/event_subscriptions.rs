@@ -636,21 +636,7 @@ async fn a_topic_amazon_sns_does_not_hold_is_refused() {
     // Amazon SNS mounted beside this emulator, so the question CAN be put to the
     // service that owns topics.
     let emulator = Emulator::with_sns();
-    let client = ::aws_sdk_sns::Client::from_conf(
-        ::aws_sdk_sns::Config::builder()
-            .behavior_version(::aws_sdk_sns::config::BehaviorVersion::latest())
-            .region(::aws_sdk_sns::config::Region::new("us-west-2"))
-            .endpoint_url("https://sns.us-west-2.amazonaws.com")
-            .credentials_provider(emulator.callback().aws_credentials_provider())
-            .http_client(emulator.callback().http_client())
-            .retry_config(::aws_sdk_sns::config::retry::RetryConfig::disabled())
-            .timeout_config(::aws_sdk_sns::config::timeout::TimeoutConfig::disabled())
-            .identity_cache(::aws_sdk_sns::config::IdentityCache::no_cache())
-            .stalled_stream_protection(
-                ::aws_sdk_sns::config::StalledStreamProtectionConfig::disabled(),
-            )
-            .build(),
-    );
+    let client = crate::event_notifications::sns(&emulator);
     // Two topics that EXIST, so the refusals below cannot be an "every topic is
     // refused" artefact, and so the rule is shown over more than one name.
     let mut held: Vec<String> = Vec::new();
@@ -1598,4 +1584,135 @@ async fn the_modify_path_refuses_an_unrecognized_value_with_the_same_sentence() 
         let read = describe_one(&emulator, &created.name).await;
         assert_describes(row.case, "the read after the refusal", &read.body, &created);
     }
+}
+
+/// The sentence `CreateEventSubscription` refuses an unresolvable topic with:
+/// the write that failed, then the topic ARN it could not resolve.
+fn expected_create_topic_refusal(topic_arn: &str) -> String {
+    format!("Failed to create Subscription. Topic: {topic_arn} not found.")
+}
+
+/// RULE under test: the status (404) and the awsQuery code
+/// (`SNSTopicArnNotFound`) of this fault are what the model fixes, but the
+/// MESSAGE is an attribute of the OPERATION — the create states the write that
+/// failed and the topic ARN the request carried, whatever that ARN looks like,
+/// and the topic ARN is its only variable part.
+///
+/// The rows differ along what the rule generalises over: the Region, the account
+/// and the form and length of the topic name inside the ARN — none of which the
+/// sentence depends on. A topic Amazon SNS DOES hold is the positive control, so
+/// the sentence cannot be an "every create is refused" artefact, and the refused
+/// create is shown to store nothing.
+#[tokio::test]
+async fn a_create_refused_on_its_topic_states_the_write_that_failed() {
+    let emulator = Emulator::with_sns();
+    let client = crate::event_notifications::sns(&emulator);
+
+    // The control: a topic that EXISTS, created where topics live.
+    let held = client
+        .create_topic()
+        .name("redshift-events-held")
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("setup: CreateTopic failed: {error:?}"))
+        .topic_arn()
+        .unwrap_or_default()
+        .to_string();
+
+    // (case, the topic ARN the request names)
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "a topic name Amazon SNS holds nothing under",
+            topic_arn("no-such-topic"),
+        ),
+        ("a one-character topic name", topic_arn("t")),
+        ("a FIFO topic name", topic_arn("missing-topic.fifo")),
+        (
+            "a topic name of the longest form Amazon SNS admits",
+            topic_arn(&"a".repeat(256)),
+        ),
+        (
+            "a topic in another Region",
+            "arn:aws:sns:eu-central-1:000000000000:missing-topic".to_string(),
+        ),
+    ];
+
+    for (position, (case, topic)) in rows.iter().enumerate() {
+        let name = format!("sub-topic-wording-{position}");
+        let row = CreateCase {
+            topic: topic.clone(),
+            ..CreateCase::new("a topic wording row", &name)
+        };
+        let answer = create_subscription(&emulator, &row).await;
+        assert_refused(case, &answer, 404, "SNSTopicArnNotFound");
+        let expected = expected_create_topic_refusal(topic);
+        assert_eq!(
+            answer.text("Message").as_deref(),
+            Some(expected.as_str()),
+            "case {case:?}: expected the message {expected:?}, got {:?}",
+            answer.text("Message")
+        );
+
+        // The refusal stored nothing, so the name it was asked for identifies no
+        // subscription afterwards.
+        let read = describe_one(&emulator, &name).await;
+        assert_subscription_not_found(case, &read, &name);
+    }
+
+    // The control: the held topic is served, so the sentence above is the answer
+    // to an unresolvable topic rather than to every create.
+    let served_name = "sub-topic-wording-held";
+    let served = create_subscription(
+        &emulator,
+        &CreateCase {
+            topic: held.clone(),
+            ..CreateCase::new("the held topic", served_name)
+        },
+    )
+    .await;
+    assert_eq!(
+        served.status, 200,
+        "case \"the held topic\": expected 200, got {} with body {}",
+        served.status, served.body
+    );
+
+    // The sentence belongs to the CREATE: the modify path refuses the same
+    // unresolvable topic on the same channel while wording it as its own
+    // operation does, and the subscription keeps the topic it had.
+    let missing = topic_arn("no-such-topic");
+    let moved = call_with(
+        &emulator,
+        "ModifyEventSubscription",
+        &[
+            ("SubscriptionName".to_string(), served_name.to_string()),
+            ("SnsTopicArn".to_string(), missing.clone()),
+        ],
+    )
+    .await;
+    assert_refused("a modify onto an unresolvable topic", &moved, 404, "SNSTopicArnNotFound");
+    // The modify words the same fault its own way — the sentence the fault's
+    // documentation states — so the two paths are shown not to share one.
+    let modify_expected = format!(
+        "An Amazon SNS topic with the specified Amazon Resource Name (ARN) {missing} does not \
+         exist."
+    );
+    assert_eq!(
+        moved.text("Message").as_deref(),
+        Some(modify_expected.as_str()),
+        "case \"a modify onto an unresolvable topic\": expected {modify_expected:?}, got {:?}",
+        moved.text("Message")
+    );
+    assert_ne!(
+        moved.text("Message").as_deref(),
+        Some(expected_create_topic_refusal(&missing).as_str()),
+        "case \"a modify onto an unresolvable topic\": expected a sentence of the modify's own, \
+         got the create's"
+    );
+    let described = describe_one(&emulator, served_name).await;
+    assert_eq!(
+        described.text("SnsTopicArn").as_deref(),
+        Some(held.as_str()),
+        "case \"a modify onto an unresolvable topic\": expected the topic unchanged, got {:?}",
+        described.text("SnsTopicArn")
+    );
 }

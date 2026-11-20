@@ -222,6 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ModifyEventSubscriptionErrorModeled::SNSTopicArnNotFoundFault(
                             SNSTopicArnNotFoundFault {
                                 message: Some(st::notifications::sns_topic_not_found_message(
+                                    st::notifications::SnsTopicArnNotFoundWording::TopicDoesNotExist,
                                     requested,
                                 )),
                             },

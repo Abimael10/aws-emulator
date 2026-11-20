@@ -566,10 +566,13 @@ pub fn exchange_cluster_not_found_message(cluster_identifier: &str) -> String {
 }
 
 /// What a reserved-node exchange operation answers a `SnapshotIdentifier` that
-/// names no snapshot this account holds, worded like its sibling
-/// [`exchange_cluster_not_found_message`].
+/// names no snapshot this account holds: this family's own wording from the
+/// per-operation catalog, [`ClusterSnapshotNotFoundWording`].
 pub fn exchange_snapshot_not_found_message(snapshot_identifier: &str) -> String {
-    format!("The snapshot {snapshot_identifier} was not found.")
+    cluster_snapshot_not_found_message(
+        ClusterSnapshotNotFoundWording::SnapshotNotFoundThenIdentifier,
+        snapshot_identifier,
+    )
 }
 
 /// Why a reservation cannot take part in an exchange, classified so each

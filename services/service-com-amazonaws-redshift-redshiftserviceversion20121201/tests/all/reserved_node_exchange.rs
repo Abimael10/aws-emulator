@@ -549,7 +549,7 @@ async fn the_options_read_resolves_the_resource_then_its_node_type() {
                 ("SnapshotIdentifier", "no-such-snapshot"),
             ],
             "ClusterSnapshotNotFound",
-            "The snapshot no-such-snapshot was not found.",
+            "Snapshot not found: no-such-snapshot",
         ),
     ] {
         let answer = emulator
@@ -623,6 +623,53 @@ async fn the_options_read_resolves_the_resource_then_its_node_type() {
             answer.text("Message").as_deref(),
             Some(ONLY_DS2),
             "case {case}, through its snapshot: expected the message {ONLY_DS2:?}, got {:?}",
+            answer.text("Message")
+        );
+    }
+}
+
+/// RULE under test: the status (404) and the awsQuery code
+/// (`ClusterSnapshotNotFound`) of this fault are what the model fixes, but the
+/// MESSAGE is an attribute of the OPERATION — the exchange options read states
+/// the resource kind it could not find and then the identifier the request
+/// named, whatever that identifier looks like, and the identifier is its only
+/// variable part.
+///
+/// The rows differ along what the rule generalises over: the form and the length
+/// of the `SnapshotIdentifier`, which the sentence does not depend on. A snapshot
+/// that DOES exist is the positive control the suite already drives
+/// ([`the_options_read_resolves_the_resource_then_its_node_type`] takes one past
+/// this lookup).
+#[tokio::test]
+async fn an_options_read_naming_no_snapshot_states_the_resource_then_the_identifier() {
+    let emulator = Emulator::new();
+
+    // (case, the SnapshotIdentifier the request names)
+    for (case, identifier) in [
+        ("a plain name", "no-such-snapshot"),
+        ("a single character", "s"),
+        ("a name carrying digits and dashes", "snap-2024-07-01-0001"),
+        (
+            "an automated snapshot's own naming form",
+            "rs:ds2-cluster-2024-07-01-00-00-00",
+        ),
+        ("a name of the longest form the service admits", &"s".repeat(255)),
+    ] {
+        let answer = emulator
+            .call(
+                "GetReservedNodeExchangeConfigurationOptions",
+                &[
+                    ("ActionType", state::EXCHANGE_ACTION_RESTORE_CLUSTER),
+                    ("SnapshotIdentifier", identifier),
+                ],
+            )
+            .await;
+        assert_refused(case, &answer, 404, "ClusterSnapshotNotFound");
+        let expected = format!("Snapshot not found: {identifier}");
+        assert_eq!(
+            answer.text("Message").as_deref(),
+            Some(expected.as_str()),
+            "case {case}: expected the message {expected:?}, got {:?}",
             answer.text("Message")
         );
     }

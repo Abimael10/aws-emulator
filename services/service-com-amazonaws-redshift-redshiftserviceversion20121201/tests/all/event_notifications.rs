@@ -54,7 +54,7 @@ const PAST_PROVISIONING: Duration = Duration::from_millis(900);
 /// An Amazon SNS client for [`REGION`] over the in-process callback into this
 /// emulator — the same seam the service itself publishes a notification through,
 /// so the suite's setup reaches SNS exactly the way the handler does.
-fn sns(emulator: &Emulator) -> aws_sdk_sns::Client {
+pub(crate) fn sns(emulator: &Emulator) -> aws_sdk_sns::Client {
     let callback = emulator.callback();
     let config = aws_sdk_sns::Config::builder()
         .behavior_version(aws_sdk_sns::config::BehaviorVersion::latest())

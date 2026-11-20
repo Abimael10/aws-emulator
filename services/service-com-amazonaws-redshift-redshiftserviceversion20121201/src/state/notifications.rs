@@ -489,15 +489,49 @@ pub async fn resolve_topic(
     }
 }
 
-/// Why a subscription naming a topic Amazon SNS holds nothing under is refused,
-/// naming the ARN the request carried.
+/// Which sentence an `SNSTopicArnNotFoundFault` is worded with.
 ///
-/// `smithy_query(query="shape", shape="SNSTopicArnNotFoundFault")` — "An Amazon
-/// SNS topic with the specified Amazon Resource Name (ARN) does not exist" — which
-/// is the fixed text; the ARN the request named is the variable part, because that
-/// is what the caller has to fix.
-pub fn sns_topic_not_found_message(topic_arn: &str) -> String {
-    format!("An Amazon SNS topic with the specified Amazon Resource Name (ARN) {topic_arn} does not exist.")
+/// The same split the cluster and snapshot refusals of this service already take
+/// ([`super::ClusterNotFoundWording`], [`super::ClusterSnapshotNotFoundWording`]):
+/// the fault's status (404) and awsQuery code (`SNSTopicArnNotFound`) are what the
+/// model fixes, while the sentence around the ARN is an attribute of the
+/// OPERATION — the write that failed names ITSELF in it. Naming each wording here
+/// keeps the choice at the handler that makes it, so no operation can quietly
+/// inherit another one's sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnsTopicArnNotFoundWording {
+    /// `Failed to create Subscription. Topic: <SnsTopicArn> not found.` — what
+    /// `CreateEventSubscription` answers: the write that failed, then the topic it
+    /// could not resolve.
+    FailedToCreateSubscription,
+    /// `An Amazon SNS topic with the specified Amazon Resource Name (ARN)
+    /// <SnsTopicArn> does not exist.` — the sentence the fault's own documentation
+    /// states (`smithy_query(query="shape", shape="SNSTopicArnNotFoundFault")`),
+    /// which every other path that resolves a topic carries until a recorded
+    /// refusal gives it one of its own.
+    TopicDoesNotExist,
+}
+
+/// Why an operation naming a topic Amazon SNS holds nothing under is refused,
+/// worded as `wording` words it and naming the ARN the request carried.
+///
+/// The ARN is the variable part in both sentences, because that is what the caller
+/// has to fix.
+pub fn sns_topic_not_found_message(
+    wording: SnsTopicArnNotFoundWording,
+    topic_arn: &str,
+) -> String {
+    match wording {
+        SnsTopicArnNotFoundWording::FailedToCreateSubscription => {
+            format!("Failed to create Subscription. Topic: {topic_arn} not found.")
+        }
+        SnsTopicArnNotFoundWording::TopicDoesNotExist => {
+            format!(
+                "An Amazon SNS topic with the specified Amazon Resource Name (ARN) {topic_arn} \
+                 does not exist."
+            )
+        }
+    }
 }
 
 /// The Amazon SNS client an event notification is published through: the IN-PROCESS callback into this same emulator.
