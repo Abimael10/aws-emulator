@@ -58,10 +58,11 @@ const GHOST_ID: &str = "11111111-2222-4333-8444-555555555555-1";
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body names BOTH cluster types: the fixed sentence it
-/// states about a body it will not read, which names no member at all — the two cluster-type
-/// members are alternatives, so a body carrying both is no create it can read.
-const ONE_CLUSTER_TYPE_MESSAGE: &str = "Invalid request body";
+/// What MSK answers a create whose body names BOTH cluster types: the fixed sentence stating
+/// that only one of the two may be given, which names no member at all — the two cluster-type
+/// members are alternatives, so a body carrying both names one too many.
+const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
 
 /// What MSK answers a request whose `CurrentVersion` is not a version token at all.
 const INVALID_CURRENT_VERSION_MESSAGE: &str = "Invalid parameter currentVersion.";
@@ -271,9 +272,9 @@ async fn a_provisioned_create_refuses_a_version_the_catalog_does_not_publish() {
 /// RULE: `CreateClusterV2` names exactly ONE cluster type, and the two ways of
 /// getting that wrong are two DIFFERENT refusals — a missing cluster type blames the
 /// `clusterType` parameter with the sentence that says one is required, while naming
-/// both kinds is refused for the BODY it carries, with MSK's body-level sentence and no
-/// `invalidParameter` — so a client can tell the two input errors apart. Neither
-/// registers anything.
+/// both kinds is refused for the PAIR it carries, with the sentence that says only one may
+/// be given and no `invalidParameter` — so a client can tell the two input errors apart.
+/// Neither registers anything.
 #[tokio::test]
 async fn the_two_cluster_type_refusals_are_distinct() {
     let emulator = Emulator::new();

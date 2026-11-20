@@ -9,9 +9,9 @@
 //!   must be populated, and nothing of the rest of the request;
 //! * an update that would change a stored SLO's evaluation kind states the DIRECTION it
 //!   attempted, read off the stored record's kind and the kind of the supplied config;
-//! * a create whose name is already stored states the ARN of the objective that holds that
-//!   name and the predicate for a resource that is already there — the same sentence this
-//!   service words every refusal about one particular objective with;
+//! * a create whose name is already stored states the FIXED sentence for an identifier that
+//!   is already taken, naming neither the resource nor the identifier — unlike every refusal
+//!   this service words about one particular objective, which states that objective's ARN;
 //! * the TAGGING plane, which addresses every kind of resource by `ResourceArn` alone, names
 //!   the resource generically and echoes the ARN the request carried, whichever kind that ARN
 //!   addresses;
@@ -44,14 +44,11 @@ use crate::tag_attachment::tag_resource;
 pub(crate) const MISSING_SLI_CONFIG: &str =
     "Either SliConfig or RequestBasedSliConfig must be populated";
 
-/// The sentence a create whose `Name` is already stored is refused with: the one sentence this
-/// service states ABOUT ONE PARTICULAR SLO — the capitalised type name, the ARN that addresses
-/// the objective in single quotes, and the predicate for a resource that is already there,
-/// closed by a period. The only variable part is that ARN, which is the one the name the
-/// request sent denotes in this account and region.
-pub(crate) fn name_already_taken(arn: &str) -> String {
-    format!("Slo with arn '{arn}' already exists.")
-}
+/// The sentence a create whose `Name` is already stored is refused with: fixed text, with no
+/// variable part at all — it states that a resource with the same identifier is already
+/// there and names neither the resource kind nor the identifier that was taken.
+pub(crate) const SAME_IDENTIFIER_ALREADY_EXISTS: &str =
+    "A resource with the same identifier already exists";
 
 /// The sentence the `ConflictException` shape itself is DOCUMENTED with
 /// (`smithy_query(query="shape",shape="ConflictException")`). A shape's documentation is not
@@ -342,17 +339,16 @@ async fn an_update_that_switches_the_evaluation_kind_states_the_direction() {
     }
 }
 
-/// Assert that `message` is the whole sentence of the taken-identifier conflict class — which
-/// names the ARN of the objective that holds the name — and not the error shape's
+/// Assert that `message` is the whole sentence of the taken-identifier conflict class — fixed
+/// text that names neither the resource nor the identifier — and not the error shape's
 /// documentation.
 ///
 /// `pub(crate)` so the sibling suites that assert the same rule over their own rows check it
 /// through this one spelling rather than a second copy.
-pub(crate) fn assert_name_already_taken(label: &str, message: &str, arn: &str) {
-    let expected = name_already_taken(arn);
+pub(crate) fn assert_name_already_taken(label: &str, message: &str) {
     assert_eq!(
-        message, expected,
-        "case {label}: expected {expected:?}, got {message:?}"
+        message, SAME_IDENTIFIER_ALREADY_EXISTS,
+        "case {label}: expected {SAME_IDENTIFIER_ALREADY_EXISTS:?}, got {message:?}"
     );
     assert_ne!(
         message, CONFLICT_SHAPE_DOC,
@@ -362,7 +358,7 @@ pub(crate) fn assert_name_already_taken(label: &str, message: &str, arn: &str) {
 }
 
 /// A create under a `Name` already stored is refused 409 `ConflictException` with the sentence
-/// of that error class, which names the ARN of the objective already holding the name.
+/// of that error class, which is fixed text.
 ///
 /// The rows differ along the name's form — the character classes the modelled
 /// `ServiceLevelObjectiveName` pattern `^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$` admits
@@ -426,12 +422,12 @@ async fn a_create_whose_identifier_is_taken_is_refused_with_that_classs_sentence
                 "case {label}: expected a ConflictException, got {answer}"
             );
             let message = answer["Message"].as_str().unwrap_or_default();
-            assert_name_already_taken(&label, message, &stored_arn);
-            // The only variable part is the objective's ARN, so nothing else of the refused
-            // request's own body reaches the sentence.
+            assert_name_already_taken(&label, message);
+            // The sentence has no variable part at all, so nothing of the refused request's
+            // own body — and no identifier of the record that holds the name — reaches it.
             assert!(
-                !message.contains("description"),
-                "case {label}: expected a sentence carrying only the ARN, got {message:?}"
+                !message.contains("description") && !message.contains(&stored_arn),
+                "case {label}: expected a sentence carrying no identifier, got {message:?}"
             );
         }
 
@@ -533,10 +529,10 @@ async fn every_loser_of_a_create_race_reads_the_same_sentence() {
                 "case {label}: expected a ConflictException, got {loser}"
             );
             let message = loser["Message"].as_str().unwrap_or_default();
-            assert_name_already_taken(&label, message, &stored_arn);
+            assert_name_already_taken(&label, message);
             assert!(
-                !message.contains("racer"),
-                "case {label}: expected a sentence carrying only the ARN, got {message:?}"
+                !message.contains("racer") && !message.contains(&stored_arn),
+                "case {label}: expected a sentence carrying no identifier, got {message:?}"
             );
         }
 
@@ -557,9 +553,8 @@ async fn every_loser_of_a_create_race_reads_the_same_sentence() {
     }
 }
 
-/// A conflict leaves the record that HOLDS the name readable by its own ARN, which is the
-/// identifier its sentence states — so a refused caller learns which resource took the name
-/// and can read it.
+/// A conflict leaves the record that HOLDS the name readable by its own ARN — the refusal
+/// wrote nothing — while its sentence states no identifier at all.
 ///
 /// The rows differ along the name's form and along which service level indicator the stored
 /// record carries, which the sentence does not depend on: it is one sentence about that
@@ -607,7 +602,7 @@ async fn a_conflict_leaves_the_stored_record_readable_by_its_own_arn() {
             "case {name:?}: expected HTTP 409 for a taken identifier, got {status} with {refusal}"
         );
         let message = refusal["Message"].as_str().unwrap_or_default();
-        assert_name_already_taken(name, message, &stored_arn);
+        assert_name_already_taken(name, message);
 
         // The record the conflict was about is still the stored one, read back by the very
         // ARN the refusal stated: the refusal wrote nothing and named the resource that holds

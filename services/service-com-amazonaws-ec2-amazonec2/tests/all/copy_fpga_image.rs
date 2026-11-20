@@ -5,16 +5,17 @@
 //!
 //! The rules under test are:
 //!
-//! 1. A SOURCE AFI THE COPY CANNOT RESOLVE IS REFUSED WITH ONE ANSWER, whatever is wrong
-//!    with it: 400 `InvalidFpgaImageID.Malformed` with the id kind's `Image ID '<id>' is
-//!    invalid.`. The copy's source is named by a REGION and an id together, which is an
-//!    addressing this service resolves only for the AFIs it holds, so a source it cannot
-//!    resolve is reported as an id it cannot READ rather than as a stored AFI that is
-//!    missing. The operations that act on an AFI OF THEIR OWN REGION decode the id the same
-//!    way, so the same id table run through them is answered as unreadable too, and their
-//!    `Image ID '<id>' not found.` under `InvalidFpgaImageID.NotFound` is reserved for an
-//!    identifier this service DID issue that the store holds no AFI under — the id of a copy
-//!    the delete has removed, which rule 3 drives.
+//! 1. A SOURCE AFI THE COPY CANNOT RESOLVE IS TOLD APART BY WHAT IS WRONG WITH IT: a value
+//!    outside the printed form EC2 issues an AFI id in is 400 `InvalidFpgaImageID.Malformed`
+//!    with the id kind's `Image ID '<id>' is invalid.`, read before there is anything to look
+//!    up, and a value INSIDE that form which resolves to no AFI of the store is 400
+//!    `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.`. The copy's source is
+//!    named by a REGION and an id together, so the id is read for its form and then RESOLVED.
+//!    The operations that act on an AFI OF THEIR OWN REGION are the contrast: they DECODE the
+//!    identifier before the lookup, so the same id table run through them answers unreadable
+//!    for every value the mint never issued, and their not-found half is reserved for an
+//!    identifier this service DID issue — the id of a copy the delete has removed, which rule
+//!    3 drives.
 //! 2. `SourceRegion` HAS TO NAME A REGION of the account's partition — "the Region that
 //!    contains the source AFI" — so a value that names none is refused with
 //!    `InvalidParameterValue` naming the value that is no Region's name.
@@ -55,10 +56,11 @@ const DRY_RUN_STATUS: u16 = 412;
 
 /// The answer every operation that takes an AFI id has for a value that is not an AFI id at
 /// all — the first half of the malformed-before-not-found pair.
-const UNRESOLVABLE_SOURCE_CODE: &str = "InvalidFpgaImageID.Malformed";
+const UNREADABLE_SOURCE_CODE: &str = "InvalidFpgaImageID.Malformed";
 
-/// The answer those same operations have for an identifier this service DID issue that names
-/// no stored AFI — the id of a copy a delete has removed.
+/// The answer the COPY has for a value inside the printed id form that resolves to no AFI of
+/// the store, and the one the decoding operations have for an identifier this service DID
+/// issue that names no stored AFI — the id of a copy a delete has removed.
 const UNKNOWN_SOURCE_CODE: &str = "InvalidFpgaImageID.NotFound";
 
 /// A well-formed AFI id, in the long (17 hex digit) form EC2 mints today, that the account
@@ -109,58 +111,89 @@ fn stored_afi_count(engine: &engine::InMemoryEngine) -> usize {
 // RULE 1: a source the copy cannot resolve
 // ---------------------------------------------------------------------------
 
-/// `(case, the id, the code the operations that resolve one named AFI OF THEIR OWN REGION
-/// answer it with)`. The ids differ along prefix, suffix length and alphabet; every row is a
-/// value this service never ISSUED an AFI id as — a hand-written long form sits above every
-/// identifier the mint has reached — so the operations that decode the id before they look it
-/// up answer each of them as unreadable, which is also the one refusal the COPY has for a
-/// source it cannot resolve.
-fn unresolvable_source_rows() -> [(&'static str, &'static str, &'static str); 9] {
+/// `(case, the id, the code the COPY answers it with, the code the operations that DECODE an
+/// AFI id of their own Region answer it with)`. The ids differ along prefix, suffix length and
+/// alphabet; the two accepted id FORMS (8 and 17 hex digits) are the rows the copy resolves
+/// and reports as NOT FOUND, where the decoding operations answer every row — each a value the
+/// mint never issued — as unreadable.
+fn unresolvable_source_rows() -> [(&'static str, &'static str, &'static str, &'static str); 9] {
     [
         (
             "the long id form, which nothing was ever issued under",
             UNKNOWN_FPGA_IMAGE_ID,
-            UNRESOLVABLE_SOURCE_CODE,
+            UNKNOWN_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
         ),
         (
             "the short id form, which nothing was ever issued under",
             "afi-01234567",
-            UNRESOLVABLE_SOURCE_CODE,
+            UNKNOWN_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
         ),
-        ("no prefix at all", "0123456789abcdef0", UNRESOLVABLE_SOURCE_CODE),
+        (
+            "no prefix at all",
+            "0123456789abcdef0",
+            UNREADABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
+        ),
         (
             "another resource's prefix",
             "ami-0123456789abcdef0",
-            UNRESOLVABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
         ),
-        ("the prefix alone", "afi-", UNRESOLVABLE_SOURCE_CODE),
-        ("a suffix that is too short", "afi-0123456", UNRESOLVABLE_SOURCE_CODE),
+        (
+            "the prefix alone",
+            "afi-",
+            UNREADABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
+        ),
+        (
+            "a suffix that is too short",
+            "afi-0123456",
+            UNREADABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
+        ),
         (
             "a suffix that is too long",
             "afi-0123456789abcdef01",
-            UNRESOLVABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
         ),
         (
             "a suffix outside the hexadecimal alphabet",
             "afi-0123456789abcdefg",
-            UNRESOLVABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
         ),
         (
             "an uppercase suffix",
             "afi-0123456789ABCDEF0",
-            UNRESOLVABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
         ),
     ]
 }
 
-/// Every source id `CopyFpgaImage` cannot resolve is refused with the ONE answer this
-/// operation has for such a source — the id kind's unreadable sentence — and nothing is
-/// stored by a refusal.
+/// The sentence the pair's half `code` is worded with, about `fpga_image_id`: the id kind's
+/// `Image ID '<id>' is invalid.` for a value it cannot read, and `Image ID '<id>' not found.`
+/// for one it read and could not resolve.
+fn expected_message(code: &str, fpga_image_id: &str) -> String {
+    if code == UNKNOWN_SOURCE_CODE {
+        format!("Image ID '{fpga_image_id}' not found.")
+    } else {
+        format!("Image ID '{fpga_image_id}' is invalid.")
+    }
+}
+
+/// Every source id `CopyFpgaImage` cannot resolve is refused by what is wrong with it —
+/// unreadable before any lookup, not found once the form is read — and nothing is stored by a
+/// refusal.
 #[tokio::test]
-async fn a_source_the_copy_cannot_resolve_is_refused_as_an_id_it_cannot_read() {
+async fn a_source_the_copy_cannot_resolve_is_refused_by_the_id_kinds_pair() {
     let (router, engine) = emulator();
 
-    for (case, source_fpga_image_id, _) in unresolvable_source_rows() {
+    for (case, source_fpga_image_id, expected_code, _) in unresolvable_source_rows() {
         let (status, body) = op(&router, "CopyFpgaImage", &copy_params(source_fpga_image_id)).await;
         assert_eq!(
             status, 400,
@@ -168,14 +201,14 @@ async fn a_source_the_copy_cannot_resolve_is_refused_as_an_id_it_cannot_read() {
         );
         assert_eq!(
             error_code(&body),
-            UNRESOLVABLE_SOURCE_CODE,
-            "case {case:?}: expected {UNRESOLVABLE_SOURCE_CODE}, got {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
         );
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
-        let expected_message = format!("Image ID '{source_fpga_image_id}' is invalid.");
+        let expected = expected_message(expected_code, source_fpga_image_id);
         assert_eq!(
-            message, expected_message,
-            "case {case:?}: expected the message {expected_message:?}, got {message:?}"
+            message, expected,
+            "case {case:?}: expected the message {expected:?}, got {message:?}"
         );
     }
 
@@ -187,9 +220,9 @@ async fn a_source_the_copy_cannot_resolve_is_refused_as_an_id_it_cannot_read() {
     );
 }
 
-/// RULE 1, the Region half: the copy's ONE refusal for an unresolved source is the same
-/// whatever Region the request named it in — and a source the store DOES hold is copied from
-/// either way, so the refusal is about the id and not about the Region member.
+/// RULE 1, the Region half: the copy's refusal for an unresolved source is the same whatever
+/// Region the request named it in — and a source the store DOES hold is copied from either
+/// way, so the refusal is about the id and not about the Region member.
 ///
 /// The rows differ along the Region named: the one signed for, and three others of the
 /// account's partition.
@@ -221,11 +254,11 @@ async fn an_unresolved_source_is_refused_the_same_way_in_every_region() {
         );
         assert_eq!(
             error_code(&body),
-            UNRESOLVABLE_SOURCE_CODE,
-            "case {case:?}: expected {UNRESOLVABLE_SOURCE_CODE}, got {body}"
+            UNKNOWN_SOURCE_CODE,
+            "case {case:?}: expected {UNKNOWN_SOURCE_CODE}, got {body}"
         );
         let message = unescaped(&element(&body, "Message").unwrap_or_default());
-        let expected_message = format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' is invalid.");
+        let expected_message = format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' not found.");
         assert_eq!(
             message, expected_message,
             "case {case:?}: expected the message {expected_message:?}, got {message:?}"
@@ -252,7 +285,7 @@ async fn an_unresolved_source_is_refused_the_same_way_in_every_region() {
 async fn resolving_an_afi_of_this_region_still_answers_malformed_before_not_found() {
     let (router, _engine) = emulator();
 
-    for (case, fpga_image_id, expected_code) in unresolvable_source_rows() {
+    for (case, fpga_image_id, _, expected_code) in unresolvable_source_rows() {
         for action in ["DeleteFpgaImage", "ResetFpgaImageAttribute"] {
             let mut params = vec![p("FpgaImageId", fpga_image_id)];
             if action == "ResetFpgaImageAttribute" {
@@ -700,7 +733,7 @@ async fn a_dry_run_copy_is_answered_before_the_source_is_resolved_and_writes_not
             "a source that is not an AFI id at all",
             "not-an-afi-id",
             400,
-            UNRESOLVABLE_SOURCE_CODE,
+            UNREADABLE_SOURCE_CODE,
         ),
     ];
 

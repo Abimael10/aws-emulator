@@ -12,8 +12,10 @@
 //!
 //! Five refusal classes live here:
 //!
-//! * a resource that does not exist, whatever kind of resource it is and whichever
-//!   identifier was asked for: the one fixed sentence [`resource_not_found`];
+//! * a resource that does not exist: the one fixed sentence [`resource_not_found`] for a
+//!   resource INSIDE an instance or in the phone-number inventory, and
+//!   [`instance_not_found`] — which names the instance the request addressed — for an
+//!   operation whose addressed resource IS the instance;
 //! * a parameter whose value is not one the service accepts ([`invalid_parameter`]),
 //!   which names the offending member;
 //! * a value longer (or shorter) than the maximum (minimum) the model declares for it
@@ -36,26 +38,44 @@ use crate::ops::types::{
     InvalidParameterException, InvalidRequestException, ResourceNotFoundException,
 };
 
-/// The `Message` every Connect `ResourceNotFoundException` carries.
+/// The `Message` a Connect `ResourceNotFoundException` carries for a resource INSIDE an
+/// instance, or in the phone-number inventory.
 ///
 /// Entirely fixed text — it says neither which kind of resource was missing nor which
-/// identifier was asked for — so it is the whole requirement for this error class: the
-/// instance plane, a resource INSIDE an instance (an unknown queue, flow, hours of
-/// operation or storage association) and the phone-number plane all state it, and none
-/// of them quotes the identifier the request carried.
+/// identifier was asked for — so it is the whole requirement for those classes: an unknown
+/// queue, flow, hours of operation or storage association, and a phone number this account
+/// never claimed, all state it, and none of them quotes the identifier the request carried.
+/// The operations whose addressed resource is the INSTANCE ITSELF name that instance instead
+/// ([`instance_not_found`]).
 pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource not found";
 
 /// Connect's refusal for a request that names a resource this account does not hold —
 /// including an identifier that named one until a delete retired it.
 ///
-/// Every operation of this service words its modelled 404 here, whichever resource it
-/// could not resolve: an `InstanceId` that names no instance, and a resource missing
-/// from an instance that is there, are the same refusal in the same words, so the
-/// service has exactly one spelling of it. See [`RESOURCE_NOT_FOUND_MESSAGE`] for why
-/// this sentence takes nothing from the request.
+/// Every operation of this service that could not resolve a resource INSIDE an instance, or a
+/// phone number, words its modelled 404 here, whichever resource it was: the two are the same
+/// refusal in the same words, so the service has exactly one spelling of it. See
+/// [`RESOURCE_NOT_FOUND_MESSAGE`] for why this sentence takes nothing from the request, and
+/// [`instance_not_found`] for the refusal of an operation that addresses an instance.
 pub fn resource_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+    }
+}
+
+/// Connect's refusal for an operation whose ADDRESSED RESOURCE IS AN INSTANCE that this
+/// account does not hold — including an identifier that named one until a delete retired it:
+/// `Instance <instanceId> not found`.
+///
+/// The resource the request addressed is the instance, so the refusal says WHICH instance was
+/// not found: the sentence names the kind and carries one variable part, the `InstanceId` the
+/// REQUEST carried, which is the identifier the caller has to correct. An operation that
+/// resolved the instance and then failed to resolve a resource INSIDE it reports the generic
+/// [`resource_not_found`] instead: there the instance is the container rather than the
+/// addressed resource.
+pub fn instance_not_found(instance_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!("Instance {instance_id} not found")),
     }
 }
 
@@ -152,7 +172,7 @@ pub fn instance_id_is_not_valid() -> InvalidRequestException {
 ///   could read, whatever the store holds ([`instance_id_is_not_valid`]).
 ///
 /// Anything between those ends is an identifier as far as the model is concerned, so it
-/// is RESOLVED — and answered [`resource_not_found`] when nothing holds it, however
+/// is RESOLVED — and answered [`instance_not_found`] when nothing holds it, however
 /// unlike a minted id it looks. (That is the narrower companion check
 /// [`super::is_resource_id`], which the queue plane applies to its own labels in its own
 /// wording; the instance plane's recorded refusals are the two above.)
@@ -199,13 +219,27 @@ pub const QUEUE_NAME_MAX_LENGTH: usize = 127;
 mod tests {
     use super::*;
 
-    /// The not-found sentence is fixed: it is the same string whatever was asked for.
+    /// The not-found sentence for a resource inside an instance is fixed: it is the same
+    /// string whatever was asked for. The sentence for an INSTANCE names the instance.
     #[test]
-    fn the_not_found_message_is_fixed_text() {
+    fn the_not_found_messages_name_only_an_instance() {
         assert_eq!(
             resource_not_found().message.as_deref(),
             Some("Resource not found")
         );
+        for instance_id in [
+            "11111111-2222-3333-4444-555555555555",
+            "support",
+            &"i".repeat(INSTANCE_ID_MAX_LENGTH),
+        ] {
+            let expected = format!("Instance {instance_id} not found");
+            let actual = instance_not_found(instance_id).message;
+            assert_eq!(
+                actual.as_deref(),
+                Some(expected.as_str()),
+                "case {instance_id:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
     }
 
     /// A parameter refusal names the member and nothing else.

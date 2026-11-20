@@ -5,12 +5,11 @@
 //! The base path mappings of one domain name, oldest first, one `position`/`limit` page at a
 //! time. Reads only.
 //!
-//! A page that holds no element is answered by leaving the member OUT: a domain name that
-//! carries no mapping — one that never carried one, and one whose last mapping was deleted —
-//! is answered the bare JSON object, with no `item` list, no cursor and no page-size echo
-//! ([`crate::state::Page::reported_held_items`], the reading this collection reports its page
-//! under; the listings of this service whose empty page carries the member report theirs
-//! through [`crate::state::Page::reported_items`] beside it).
+//! A page that holds no element is answered with the member as the EMPTY list: a domain name
+//! that carries no mapping — one that never carried one, and one whose last mapping was
+//! deleted — is answered an empty `item` list, with no cursor and no page-size echo beside it
+//! ([`crate::state::Page::reported_items`], the one reading every listing of this service
+//! reports its page under).
 //!
 //! ## Shape of an operation
 //!
@@ -196,11 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         Ok(Paged::new(
             GetBasePathMappingsOutput {
-                // The page's elements, through the reading for a listing that answers an
-                // empty page with NO member at all
-                // (`crate::state::Page::reported_held_items`): a domain name that carries no
-                // mapping, however it came to carry none, is answered the bare object.
-                items: page.reported_held_items(items),
+                // The page's elements, through the one reading every listing of this service
+                // reports its page under (`crate::state::Page::reported_items`): "the current
+                // page of elements from this collection" is a list a client counts, so a
+                // domain name that carries no mapping, however it came to carry none, is
+                // answered the EMPTY list rather than no member at all.
+                items: page.reported_items(items),
                 position: page.next_position.clone(),
             },
             page.echoed_limit(),

@@ -1111,8 +1111,7 @@ async fn a_change_set_is_deleted_by_request_by_execution_and_with_its_stack() {
 
     // "When you execute a change set, CloudFormation deletes all other change sets
     // associated with the stack because they aren't valid for the updated stack": the plan
-    // is invalidated, and the record stays — it reads back in the modelled `OBSOLETE`
-    // execution status.
+    // goes, so a read of it is answered as a change set the stack does not hold.
     create_creating_change_set(&router, "siblings", "first-set", template).await;
     create_change_set(
         &router,
@@ -1132,15 +1131,9 @@ async fn a_change_set_is_deleted_by_request_by_execution_and_with_its_stack() {
     assert_eq!(code, 200, "the first change set executes, got {code} {body}");
     let (code, body) = describe_change_set(&router, "second-set", Some("siblings")).await;
     assert_eq!(
-        code, 200,
-        "case \"executing a change set\": the stack's other change sets stay addressable, \
+        code, 404,
+        "case \"executing a change set\": the stack's other plans are taken away, \
          got {code} {body}"
-    );
-    assert_eq!(
-        xml_text(&body, "ExecutionStatus").as_deref(),
-        Some(execution_status::OBSOLETE),
-        "case \"executing a change set\": the stack's other change sets report the plan the \
-         execution invalidated, got {body}"
     );
     let (code, _) = describe_change_set(&router, "first-set", Some("siblings")).await;
     assert_eq!(

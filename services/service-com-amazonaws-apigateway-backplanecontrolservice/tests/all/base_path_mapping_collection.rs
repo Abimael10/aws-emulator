@@ -96,14 +96,14 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
     let domain_name = "collection.example.com";
     created_domain(&gateway, domain_name, json!({})).await;
 
-    // A domain name that carries no mapping is answered the bare JSON object: the page holds
-    // no element, so this listing reports no page member at all — and nothing beside it
-    // either, because nothing follows a page that ended the collection.
+    // A domain name that carries no mapping is answered an EMPTY page: the page member as
+    // the empty list, the way every listing of this service reports a page of nothing — and
+    // nothing beside it either, because nothing follows a page that ended the collection.
     let empty = page_of(&gateway, domain_name, "", "the empty collection").await;
     assert_eq!(
         empty,
-        json!({}),
-        "case the empty collection: expected no page member at all, got {empty:?}"
+        json!({ "item": [] }),
+        "case the empty collection: expected the empty page member, got {empty:?}"
     );
 
     // The creates differ along what the rule generalises over: the SPELLING of the base
@@ -505,18 +505,18 @@ async fn the_listing_reports_the_stored_mappings_as_later_calls_leave_them() {
     }
 }
 
-/// RULE: an EMPTY page of this collection is answered with NO page member at all — the bare
-/// JSON object, carrying no `item` list, no `position` (nothing follows a page that ended the
-/// collection) and no page-size echo — however the page came to hold nothing.
+/// RULE: an EMPTY page of this collection is answered with its page member as the EMPTY list
+/// — "the current page of elements from this collection" is a list a client counts — and
+/// nothing beside it: no `position` (nothing follows a page that ended the collection) and no
+/// page-size echo, however the page came to hold nothing.
 ///
 /// The rows differ along what the rule generalises over — how the page came to be empty (a
 /// domain name that never held a mapping, one emptied of its only mapping, one emptied of
 /// several) crossed with the page size the request asked for (none, the smallest, the
 /// published maximum) — so no row is the specification. The last block is the contrast: the
-/// member is absent because the page holds nothing, and carries the mapping once there is
-/// one.
+/// list is empty because the page holds nothing, and carries the mapping once there is one.
 #[tokio::test]
-async fn an_empty_page_of_this_collection_is_answered_with_no_page_member() {
+async fn an_empty_page_of_this_collection_is_answered_with_the_empty_page_member() {
     /// The page sizes a request may ask of the collection: none at all, the smallest, and
     /// the published maximum ("The maximum number of returned results per page. The default
     /// value is 25 and the maximum value is 500",
@@ -556,14 +556,14 @@ async fn an_empty_page_of_this_collection_is_answered_with_no_page_member() {
             let body = page_of(&gateway, &domain_name, query, &case).await;
             assert_eq!(
                 body,
-                json!({}),
-                "case {case}: expected no page member at all and nothing beside it, got \
+                json!({ "item": [] }),
+                "case {case}: expected the empty page member and nothing beside it, got \
                  {body:?}"
             );
         }
 
-        // The contrast: one mapping created again, and the page carries it — so the absent
-        // member is a page of nothing rather than this listing never filling it.
+        // The contrast: one mapping created again, and the page carries it — so the empty
+        // list is a page of nothing rather than this listing never filling it.
         created_mapping(
             &gateway,
             &domain_name,

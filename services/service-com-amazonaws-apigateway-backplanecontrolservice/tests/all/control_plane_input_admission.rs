@@ -439,9 +439,9 @@ async fn a_base_path_is_admitted_only_inside_the_character_class_api_gateway_sta
                 .await;
             assert_eq!(
                 listed.body,
-                json!({}),
+                json!({ "item": [] }),
                 "case {}: a refused create must store nothing, so the collection answers \
-                 the bare object its listing carries for an empty page, got {:?}",
+                 the empty page its listing carries, got {:?}",
                 row.case,
                 listed.body
             );

@@ -48,8 +48,8 @@ pub use chat_contacts::{
 /// `crate::state` like everything else here.
 mod refusals;
 pub use refusals::{
-    instance_id_is_not_valid, instance_label_refusal, invalid_parameter, invalid_request,
-    page_size_below_minimum, resource_not_found, value_above_maximum_length,
+    instance_id_is_not_valid, instance_label_refusal, instance_not_found, invalid_parameter,
+    invalid_request, page_size_below_minimum, resource_not_found, value_above_maximum_length,
     value_below_minimum_length, INSTANCE_ID_MAX_LENGTH, INSTANCE_ID_NOT_VALID_MESSAGE,
     INVALID_REQUEST_MESSAGE, QUEUE_NAME_MAX_LENGTH, QUEUE_NAME_MIN_LENGTH, QUEUE_NAME_PARAMETER,
     RESOURCE_NOT_FOUND_MESSAGE,

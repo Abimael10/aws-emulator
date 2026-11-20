@@ -72,8 +72,9 @@
 //! A deployed branch is VISITED, at the default domain the control plane reports for it:
 //! `Branch$displayName` "is used as the default domain prefix" and `App$defaultDomain`
 //! is "the default domain for the Amplify app", so the site of a branch answers at
-//! `<displayName>.<defaultDomain>`. Every app announces the address this emulator is
-//! reached at (`crate::state::announced_default_domain`), so such a site is
+//! `<displayName>.<defaultDomain>`. Every app's default domain is the DNS name this service
+//! generates from the app's own id in the zone this emulator may announce in
+//! (`crate::state::announced_default_domain`), so such a site is
 //! addressed by a HOST whose
 //! first label names a branch rather than a service, and the framework resolves no
 //! service from it, so nothing would claim the request; a client that resolves nothing but

@@ -4,11 +4,13 @@
 //! hold, driven over HTTP through the same `MultiServiceRouter` the emulator serves
 //! with.
 //!
-//! RULE: Connect states one sentence for this error class, whatever resource resolved to
-//! nothing — an `InstanceId` that never named an instance, one `DeleteInstance` retired,
-//! or a resource missing from an instance that IS there. The service answers HTTP 404
-//! (the model's error binding) with `Message` exactly `Resource not found`, all fixed
-//! text: it names no resource kind and quotes no identifier the request carried.
+//! RULE: Connect reports the resource the operation ADDRESSED as missing. The service
+//! answers HTTP 404 (the model's error binding) with `ResourceNotFoundException`, and the
+//! sentence follows that resource: an operation whose addressed resource IS the instance — an
+//! `InstanceId` that never named one, or one `DeleteInstance` retired — names it,
+//! `Instance <instanceId> not found`, while every operation that resolves the instance as the
+//! CONTAINER of the resource it addresses states the fixed `Resource not found`, which names
+//! no resource kind and quotes no identifier.
 //!
 //! The suites below assert that rule over a TABLE: every operation of this service that
 //! has to resolve an `InstanceId` crossed with identifiers of several forms and lengths,
@@ -181,9 +183,21 @@ fn message_of(body: &Value) -> String {
     body["Message"].as_str().unwrap_or_default().to_string()
 }
 
-/// The sentence every `ResourceNotFoundException` of this service carries, written out
-/// here rather than read off the implementation so the suite pins the text itself.
+/// The sentence a `ResourceNotFoundException` about a resource INSIDE an instance carries,
+/// written out here rather than read off the implementation so the suite pins the text itself.
 const RESOURCE_NOT_FOUND: &str = "Resource not found";
+
+/// The sentence a `ResourceNotFoundException` about the INSTANCE ITSELF carries, whose one
+/// variable part is the identifier the request carried.
+fn instance_not_found(instance_id: &str) -> String {
+    format!("Instance {instance_id} not found")
+}
+
+/// Whether `operation`'s own addressed resource IS the instance, so a missing instance is
+/// reported by naming it rather than with the fixed sentence for a resource inside one.
+fn addresses_the_instance_itself(operation: &str) -> bool {
+    matches!(operation, "DescribeInstance" | "DeleteInstance")
+}
 
 /// Whether an operation checks the FORM of its `InstanceId` label before it resolves
 /// anything: the queue plane does, so a label that is not an identifier this service
@@ -200,8 +214,8 @@ fn checks_the_labels_form(operation: &str) -> bool {
 }
 
 /// Drive every instance-resolving call against `instance_id` and assert the rule on each
-/// answer: 404, `ResourceNotFoundException`, and AWS's fixed sentence for this error
-/// class, which quotes nothing the request carried.
+/// answer: 404, `ResourceNotFoundException`, and the sentence of the resource that operation
+/// ADDRESSED — the instance named, or the fixed sentence for a resource inside one.
 ///
 /// `of_the_identifier_form` says whether `instance_id` has the form this service mints;
 /// when it does not, the operations that check that form first are left out, since their
@@ -230,15 +244,20 @@ async fn assert_every_call_reports_the_instance_missing(
             "case {case:?}/{}: expected error code ResourceNotFoundException, got {:?}",
             call.operation, answer.error_code
         );
+        let expected = if addresses_the_instance_itself(call.operation) {
+            instance_not_found(instance_id)
+        } else {
+            RESOURCE_NOT_FOUND.to_string()
+        };
         assert_eq!(
-            actual, RESOURCE_NOT_FOUND,
-            "case {case:?}/{}: expected message {RESOURCE_NOT_FOUND:?}, got {actual:?}",
+            actual, expected,
+            "case {case:?}/{}: expected message {expected:?}, got {actual:?}",
             call.operation
         );
-        // The sentence has no variable part, so the identifier asked for is not quoted
-        // back. Only a label long enough not to occur in the sentence by accident is
-        // checked.
-        if instance_id.len() >= 4 {
+        // The sentence for a resource inside an instance has no variable part, so the
+        // identifier asked for is not quoted back. Only a label long enough not to occur in
+        // the sentence by accident is checked.
+        if instance_id.len() >= 4 && !addresses_the_instance_itself(call.operation) {
             assert!(
                 !answer.body.to_string().contains(instance_id),
                 "case {case:?}/{}: the refusal must not quote the identifier the request \
@@ -251,7 +270,8 @@ async fn assert_every_call_reports_the_instance_missing(
 }
 
 /// RULE: an `InstanceId` that names no instance is refused with
-/// `ResourceNotFoundException` (404) whose message is the fixed `Resource not found`, for
+/// `ResourceNotFoundException` (404) — naming the instance where the addressed resource is the
+/// instance itself, and the fixed `Resource not found` where it is a resource inside one — for
 /// every operation that resolves an `InstanceId`.
 ///
 /// The table spans the identifier's form and length: the UUID shape Connect mints, both

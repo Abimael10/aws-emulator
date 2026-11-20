@@ -8,14 +8,18 @@
 //! as one EC2 could have ISSUED — the `afi-` prefix followed by 8 or 17 lowercase
 //! hexadecimal digits, of which not every digit is `0` — and refuses anything else with HTTP
 //! 400 `InvalidFpgaImageID.Malformed` and the FPGA-image kind's own sentence,
-//! `Image ID '<value>' is invalid.`, built from the value the REQUEST sent. The operations
-//! that ACT on one named AFI read the id strictly: EC2's long id form is an obfuscated
-//! identifier the service decodes, so a value no issue of this kind ever produced earns that
-//! same unreadable-id refusal from them, and `InvalidFpgaImageID.NotFound` is reserved for an
-//! identifier this service DID issue that the account holds no AFI under, so a client can tell
-//! a typo from an image that has gone (`super::fpga_image_unresolvable_id_refusals` holds that
-//! per-operation table). The null (all-zero) id is outside the form because the mint counts
-//! from one, so no AFI can ever hold it.
+//! `Image ID '<value>' is invalid.`, built from the value the REQUEST sent. What a value
+//! INSIDE that printed form which the account holds no AFI under earns is the answering
+//! OPERATION's own refusal: the operations that ACT on one named AFI read the id strictly —
+//! EC2's long id form is an obfuscated identifier the service decodes, so a value no issue of
+//! this kind ever produced earns that same unreadable-id refusal from them, and
+//! `InvalidFpgaImageID.NotFound` is reserved for an identifier this service DID issue that the
+//! account holds no AFI under, so a client can tell a typo from an image that has gone — while
+//! the COPY, whose source is named by a Region and an id together, reads the form and then
+//! RESOLVES it, so any value in that form it cannot resolve is the not-found half
+//! (`super::fpga_image_unresolvable_id_refusals` holds that per-operation table). The null
+//! (all-zero) id is outside the form because the mint counts from one, so no AFI can ever
+//! hold it.
 //!
 //! Each row is a distinct input along what the rule generalises over:
 //!
@@ -60,7 +64,8 @@ const SOURCE_REGION: &str = REGION;
 /// The parameters each operation that resolves an AFI id is called with, for `fpga_image_id`.
 ///
 /// `CopyFpgaImage` is in the list because it takes an AFI id too — it reads the id of its
-/// SOURCE — and it reads it the same way: the form first, then the lookup.
+/// SOURCE — and it reads the FORM the same way, before anything is looked up; what it does
+/// with a value INSIDE that form is its own ([`unissued_answer`]).
 fn resolver_params(action: &str, fpga_image_id: &str) -> Params {
     match action {
         "ResetFpgaImageAttribute" | "DescribeFpgaImageAttribute" => vec![
@@ -78,10 +83,11 @@ fn resolver_params(action: &str, fpga_image_id: &str) -> Params {
 /// The operations that resolve ONE named AFI: each judges the id's FORM before looking it up.
 ///
 /// What a value in the printed id form that this service never ISSUED earns is
-/// [`unissued_answer`]: the delete, the reset and the copy all decode the id before they
-/// resolve anything, so each answers the unreadable-id refusal, while the attribute describe
-/// REPORTS on the id it was given and answers EC2's common missing-id sentence. What an id the
-/// service DID issue that names no stored AFI earns is [`absent_answer`].
+/// [`unissued_answer`]: the delete and the reset decode the id before they resolve anything,
+/// so each answers the unreadable-id refusal; the COPY resolves the value it read, so it
+/// answers the not-found half; and the attribute describe REPORTS on the id it was given and
+/// answers EC2's common missing-id sentence. What an id the service DID issue that names no
+/// stored AFI earns is [`absent_answer`].
 const REGIONAL_RESOLVERS: [&str; 4] = [
     "DeleteFpgaImage",
     "ResetFpgaImageAttribute",
@@ -98,6 +104,12 @@ fn unissued_answer(action: &str, fpga_image_id: &str) -> (&'static str, String) 
             INVALID_FPGA_IMAGE_ID_NOT_FOUND,
             format!("The fpga-image ID '{fpga_image_id}' does not exist"),
         ),
+        // The copy resolves the value it read rather than decoding it, so a source in the
+        // printed form that names no AFI of the store is a source that is MISSING.
+        "CopyFpgaImage" => (
+            INVALID_FPGA_IMAGE_ID_NOT_FOUND,
+            format!("Image ID '{fpga_image_id}' not found."),
+        ),
         _ => (
             INVALID_FPGA_IMAGE_ID_MALFORMED,
             format!("Image ID '{fpga_image_id}' is invalid."),
@@ -110,10 +122,6 @@ fn unissued_answer(action: &str, fpga_image_id: &str) -> (&'static str, String) 
 /// [`unissued_answer`] is.
 fn absent_answer(action: &str, fpga_image_id: &str) -> (&'static str, String) {
     match action {
-        "CopyFpgaImage" => (
-            INVALID_FPGA_IMAGE_ID_MALFORMED,
-            format!("Image ID '{fpga_image_id}' is invalid."),
-        ),
         "DescribeFpgaImageAttribute" => (
             INVALID_FPGA_IMAGE_ID_NOT_FOUND,
             format!("The fpga-image ID '{fpga_image_id}' does not exist"),
@@ -273,9 +281,9 @@ async fn an_afi_id_outside_the_issued_form_is_refused_as_malformed() {
 }
 
 /// RULE: a value in the printed AFI id form that this service never ISSUED is answered by the
-/// OPERATION's own refusal — the unreadable-id refusal from the three operations that decode
-/// the id before they resolve anything (the delete, the reset and the copy, whose source is
-/// named by a Region and an id together), and EC2's common missing-id sentence from the
+/// OPERATION's own refusal — the unreadable-id refusal from the two operations that decode
+/// the id before they resolve anything (the delete and the reset), the not-found half from the
+/// copy, which resolves the value it read, and EC2's common missing-id sentence from the
 /// attribute describe, which reports on the id it was given.
 #[tokio::test]
 async fn an_afi_id_inside_the_issued_form_is_answered_by_each_operations_own_refusal() {

@@ -272,37 +272,6 @@ impl StoredChangeSet {
         self.execution_status == execution_status::EXECUTE_IN_PROGRESS
     }
 
-    /// INVALIDATE this change set's plan, because another change set of its stack has been
-    /// executed: "a change set might be … in an `OBSOLETE` state because the stack was
-    /// already updated" (`DescribeChangeSetOutput$ExecutionStatus`).
-    ///
-    /// The RECORD stays: every read keeps reporting it and `ListChangeSets` keeps listing it,
-    /// and what changes is the `ExecutionStatus` alone — so a caller reconciling the stack's
-    /// outstanding plans sees a stale plan rather than a change set that never existed, and a
-    /// call asking for it to be executed is refused on that status
-    /// ([`Self::not_executable_refusal`]).
-    ///
-    /// Only a plan that could still be executed is invalidated. A change set whose own
-    /// execution has begun carries the record of a change the stack took
-    /// ([`Self::execution_began`]), and one whose creation left no plan at all keeps
-    /// reporting `UNAVAILABLE`, which already says it cannot be executed. A creation still in
-    /// flight is computing its plan against the configuration this execution superseded, so
-    /// the transition it owes reaches `OBSOLETE` where it would have reported a plan ready to
-    /// execute — and still reaches `UNAVAILABLE` where that creation ends with no plan.
-    pub fn obsolete(&mut self) {
-        if self.execution_began() {
-            return;
-        }
-        if let Some(pending) = self.pending.as_mut() {
-            if pending.execution_status.as_deref() == Some(execution_status::AVAILABLE) {
-                pending.execution_status = Some(execution_status::OBSOLETE.to_string());
-            }
-        }
-        if self.execution_status == execution_status::AVAILABLE {
-            self.execution_status = execution_status::OBSOLETE.to_string();
-        }
-    }
-
     /// The `InvalidChangeSetStatusException` message `ExecuteChangeSet` answers for this
     /// change set, or `None` when it is executable ([`Self::is_executable`]).
     ///

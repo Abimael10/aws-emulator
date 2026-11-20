@@ -1473,13 +1473,13 @@ pub mod execution_status {
     /// the stack policy in force refused one of the actions its plan would have taken, so
     /// the plan was not carried out and the change set is no longer executable.
     pub const EXECUTE_FAILED: &str = "EXECUTE_FAILED";
-    /// The status of a change set another change set's execution SUPERSEDED: "a change set
-    /// might be ... in an `OBSOLETE` state because the stack was already updated"
-    /// (`DescribeChangeSetOutput$ExecutionStatus`). The plan was computed against a stack
-    /// configuration that is no longer the one in force, so it can no longer be executed —
-    /// and the record stays, because a caller that comes back to it must be told its plan is
-    /// stale rather than that it never existed
-    /// ([`super::StoredChangeSet::obsolete`]).
+    /// The modelled status of a change set whose plan was computed against a stack
+    /// configuration that is no longer the one in force: "a change set might be ... in an
+    /// `OBSOLETE` state because the stack was already updated"
+    /// (`DescribeChangeSetOutput$ExecutionStatus`). Executing a change set does not leave the
+    /// stack's other plans in it — CloudFormation deletes them — so nothing in this emulator
+    /// puts a change set here; it is named because the status surface is held to the model's
+    /// whole enum.
     pub const OBSOLETE: &str = "OBSOLETE";
 }
 

@@ -11,11 +11,11 @@
 //! configuration a v1 `CreateCluster` does, so it is regrouped by
 //! [`crate::state::provisioned_create_input`] and minted through the one
 //! provisioned path ([`crate::state::Cluster::provisioned`]); a `Serverless` body
-//! is minted by [`crate::state::Cluster::serverless`]. The two are alternatives,
-//! so a request naming both, or neither, describes no cluster and is a
-//! `BadRequestException` — two DIFFERENT ones: naming neither is a refusal of the
-//! cluster-type parameter the request left unset, while naming both is a refusal of
-//! the SELECTION, which names no member.
+//! is minted by [`crate::state::Cluster::serverless`]. The two are alternatives, so a
+//! request has to name EXACTLY ONE of them: naming both, or neither, describes no one
+//! cluster and is a `BadRequestException` — two DIFFERENT ones, because the two requests are
+//! wrong in different ways: naming neither is a refusal of the cluster-type parameter the
+//! request left unset, while naming both states that only one of the two may be given.
 //!
 //! A provisioned body also names the broker software its cluster would run, so
 //! its `KafkaVersion` is admitted against the catalog this service publishes
@@ -141,17 +141,19 @@ const CLUSTER_TYPE_MEMBER: &str = "clusterType";
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body names BOTH cluster types: the fixed sentence it
-/// states about a body it will not read, naming nothing of the request.
+/// What MSK answers a create whose body names BOTH cluster types: the fixed sentence stating
+/// that only one of the two may be given, naming nothing of the request.
 ///
 /// The two cluster-type members are ALTERNATIVES, so a body carrying both describes two
-/// different clusters and is no create MSK can read at all: the refusal is taken on the body
-/// before any member is validated, which is why it names neither member and carries no
-/// `invalidParameter` ([`unreadable_cluster_body`]). A create naming NEITHER kind is a body
-/// MSK does read — it simply makes no selection — so that one blames the cluster-type
-/// parameter the request left unset ([`NO_CLUSTER_TYPE_MESSAGE`]). The two answers differ in
-/// both message and `invalidParameter`, so a client can tell the two input errors apart.
-const UNREADABLE_BODY_MESSAGE: &str = "Invalid request body";
+/// different clusters: the refusal says that only one may be named, which is the one thing
+/// the caller has to change. A create naming NEITHER kind makes no selection at all, so that
+/// one blames the cluster-type parameter the request left unset
+/// ([`NO_CLUSTER_TYPE_MESSAGE`]). The two answers differ in message and in
+/// `invalidParameter`, so a client can tell the two input errors apart — and both differ from
+/// what a body MSK cannot deserialize at all earns, which is the framework's own refusal of a
+/// body it could not read.
+const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
 
 /// The member a serverless body carries its VPC configurations — and so the
 /// subnets each one is reached through — in, as the wire spells it.
@@ -275,11 +277,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let body = match (provisioned, serverless) {
             (Some(request), None) => ClusterBody::Provisioned(Box::new(request)),
             (None, Some(request)) => ClusterBody::Serverless(request),
-            // A body naming BOTH kinds asks for two clusters at once, which is no
-            // create MSK can READ: it refuses the BODY, in the one sentence it states about
-            // a body it will not read and with no member named
-            // ([`unreadable_cluster_body`]).
-            (Some(_), Some(_)) => return Err(unreadable_cluster_body()),
+            // A body naming BOTH kinds asks for two clusters at once, so it names one
+            // cluster type too many: the refusal states that only one of the two may be
+            // given, and names no member, because either of them — and only one of them —
+            // could have stayed ([`both_cluster_types`]).
+            (Some(_), Some(_)) => return Err(both_cluster_types()),
             // A body naming NEITHER kind names no cluster type at all, and either
             // member would have named one, so the refusal blames the abstract
             // parameter MSK names rather than one of the two alternatives.
@@ -664,13 +666,14 @@ fn bad_request(parameter: &str, message: String) -> CreateClusterV2Error {
 }
 
 /// Refuse a create whose body names BOTH cluster types: the modeled
-/// `BadRequestException` carrying MSK's one sentence for a body it will not read
-/// ([`UNREADABLE_BODY_MESSAGE`]) and NO `invalidParameter`, because the decision is taken on
-/// the BODY the request carried rather than on one member a caller could repair on its own.
-fn unreadable_cluster_body() -> CreateClusterV2Error {
+/// `BadRequestException` carrying MSK's one sentence for a body that names one cluster type
+/// too many ([`ONE_CLUSTER_TYPE_MESSAGE`]) and NO `invalidParameter`, because the decision is
+/// taken on the PAIR the request carried rather than on one member at fault — either of the
+/// two could have stayed.
+fn both_cluster_types() -> CreateClusterV2Error {
     CreateClusterV2ErrorModeled::BadRequestException(BadRequestException {
         invalid_parameter: None,
-        message: Some(UNREADABLE_BODY_MESSAGE.to_string()),
+        message: Some(ONE_CLUSTER_TYPE_MESSAGE.to_string()),
     })
     .into()
 }

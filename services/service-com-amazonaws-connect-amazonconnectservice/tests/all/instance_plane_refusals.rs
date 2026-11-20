@@ -22,8 +22,9 @@
 //! longer than the maximum is not an identifier the service can read — the same error,
 //! `Instance id is not valid`. Both those sentences are fixed and quote no label. Every
 //! other label is RESOLVED, however unlike a minted identifier it looks, and one that
-//! holds nothing is `ResourceNotFoundException` (404) with this service's one not-found
-//! sentence, `Resource not found`, which is fixed text too and quotes no label either.
+//! holds nothing is `ResourceNotFoundException` (404) naming the instance the request
+//! addressed, `Instance <instanceId> not found` — the one sentence of this plane that has a
+//! variable part, and that part is the label the request carried.
 
 use serde_json::{json, Value};
 
@@ -36,10 +37,12 @@ const INVALID_REQUEST: &str = "Invalid request";
 /// The sentence it answers an identifier longer than the modelled maximum with.
 const INSTANCE_ID_NOT_VALID: &str = "Instance id is not valid";
 
-/// The sentence it answers an identifier that resolves to nothing with: this service's
-/// one not-found sentence, written out here rather than read off the implementation so
-/// the suite pins the text itself.
-const RESOURCE_NOT_FOUND: &str = "Resource not found";
+/// The sentence it answers an identifier that resolves to no instance with: the instance
+/// plane's not-found sentence, written out here rather than read off the implementation so
+/// the suite pins the text itself. Its one variable part is the label the request carried.
+fn instance_not_found(instance_id: &str) -> String {
+    format!("Instance {instance_id} not found")
+}
 
 /// The modelled `@length` maximum of `com.amazonaws.connect#InstanceId`
 /// (`smithy_query(query="shape",shape="InstanceId")` -> length min 1 max 100), written
@@ -255,7 +258,7 @@ struct Expected {
     /// The `x-amzn-errortype` the modelled error shape is named by.
     code: &'static str,
     /// The `Message` the error carries.
-    message: &'static str,
+    message: String,
 }
 
 /// RULE: the instance plane places its `InstanceId` label in one of three classes before
@@ -275,89 +278,99 @@ async fn the_instance_plane_classifies_its_label_before_resolving() {
     // because the store is empty.
     let (live_id, _) = connect.create_instance(connect_managed("neighbour")).await;
 
-    let blank = Expected {
-        status: 400,
-        code: "InvalidRequestException",
-        message: INVALID_REQUEST,
-    };
-    let too_long = Expected {
-        status: 400,
-        code: "InvalidRequestException",
-        message: INSTANCE_ID_NOT_VALID,
-    };
-    let absent = Expected {
-        status: 404,
-        code: "ResourceNotFoundException",
-        message: RESOURCE_NOT_FOUND,
-    };
+    // Which class the row's label falls in. The 404 names the instance the request
+    // addressed, so its sentence is built from the row's own label.
+    #[derive(Clone, Copy)]
+    enum Class {
+        Blank,
+        TooLong,
+        Absent,
+    }
 
-    // (case, the label as the request carries it, the label after decoding, the answer)
-    let rows: Vec<(&str, String, String, &Expected)> = vec![
-        ("one space", "%20".to_string(), " ".to_string(), &blank),
+    // (case, the label as the request carries it, the label after decoding, the class)
+    let rows: Vec<(&str, String, String, Class)> = vec![
+        ("one space", "%20".to_string(), " ".to_string(), Class::Blank),
         (
             "several spaces",
             "%20%20%20".to_string(),
             "   ".to_string(),
-            &blank,
+            Class::Blank,
         ),
-        ("a tab", "%09".to_string(), "\t".to_string(), &blank),
+        ("a tab", "%09".to_string(), "\t".to_string(), Class::Blank),
         (
             "one past the modelled maximum length",
             "i".repeat(INSTANCE_ID_MAX_LENGTH + 1),
             "i".repeat(INSTANCE_ID_MAX_LENGTH + 1),
-            &too_long,
+            Class::TooLong,
         ),
         (
             "far past the modelled maximum length",
             "i".repeat(INSTANCE_ID_MAX_LENGTH * 3),
             "i".repeat(INSTANCE_ID_MAX_LENGTH * 3),
-            &too_long,
+            Class::TooLong,
         ),
         (
             "a name, not an identifier",
             "support".to_string(),
             "support".to_string(),
-            &absent,
+            Class::Absent,
         ),
         (
             "a prefix of an identifier",
             "7f3c9b21".to_string(),
             "7f3c9b21".to_string(),
-            &absent,
+            Class::Absent,
         ),
         (
             "the right groups, a non-hex character",
             "1111111z-2222-3333-4444-555555555555".to_string(),
             "1111111z-2222-3333-4444-555555555555".to_string(),
-            &absent,
+            Class::Absent,
         ),
         (
             "one character, the modelled minimum length",
             "a".to_string(),
             "a".to_string(),
-            &absent,
+            Class::Absent,
         ),
         (
             "the modelled maximum length",
             "i".repeat(INSTANCE_ID_MAX_LENGTH),
             "i".repeat(INSTANCE_ID_MAX_LENGTH),
-            &absent,
+            Class::Absent,
         ),
         (
             "an identifier of the minted form that holds nothing",
             "7f3c9b21-0d4e-4a86-9c15-2b6f8e5d1a30".to_string(),
             "7f3c9b21-0d4e-4a86-9c15-2b6f8e5d1a30".to_string(),
-            &absent,
+            Class::Absent,
         ),
         (
             "the same identifier in upper case",
             "7F3C9B21-0D4E-4A86-9C15-2B6F8E5D1A30".to_string(),
             "7F3C9B21-0D4E-4A86-9C15-2B6F8E5D1A30".to_string(),
-            &absent,
+            Class::Absent,
         ),
     ];
 
-    for (case, sent, label, expected) in rows {
+    for (case, sent, label, class) in rows {
+        let expected = match class {
+            Class::Blank => Expected {
+                status: 400,
+                code: "InvalidRequestException",
+                message: INVALID_REQUEST.to_string(),
+            },
+            Class::TooLong => Expected {
+                status: 400,
+                code: "InvalidRequestException",
+                message: INSTANCE_ID_NOT_VALID.to_string(),
+            },
+            Class::Absent => Expected {
+                status: 404,
+                code: "ResourceNotFoundException",
+                message: instance_not_found(&label),
+            },
+        };
         for (operation, method) in INSTANCE_PLANE {
             assert_ne!(
                 label, live_id,
@@ -382,10 +395,10 @@ async fn the_instance_plane_classifies_its_label_before_resolving() {
                 "case {case:?}/{operation}: expected message {:?}, got {actual:?}",
                 expected.message
             );
-            // All three sentences are fixed, so the label cannot appear in any of these
+            // The two 400 sentences are fixed, so the label cannot appear in those
             // replies. Only a label long enough not to occur in a sentence by accident is
             // checked: a one-character label is a letter of the sentence itself.
-            if label.trim().len() >= 4 {
+            if matches!(class, Class::Blank | Class::TooLong) && label.trim().len() >= 4 {
                 assert!(
                     !answer.body.to_string().contains(label.trim()),
                     "case {case:?}/{operation}: the refusal must not quote the label, got {}",
@@ -458,15 +471,15 @@ async fn a_minted_identifier_is_resolved_through_the_whole_plane() {
             .send_answer(method, &format!("/instance/{instance_id}"), None)
             .await;
         let actual = message_of(&answer.body);
+        let expected = instance_not_found(&instance_id);
         assert_eq!(
             answer.status, 404,
             "{operation} of a retired identifier: expected HTTP 404, got {} {}",
             answer.status, answer.body
         );
         assert_eq!(
-            actual, RESOURCE_NOT_FOUND,
-            "{operation} of a retired identifier: expected {RESOURCE_NOT_FOUND:?}, got \
-             {actual:?}"
+            actual, expected,
+            "{operation} of a retired identifier: expected {expected:?}, got {actual:?}"
         );
     }
 

@@ -36,21 +36,22 @@ const SIGNED_FOR_AMPLIFY: &str = "AWS4-HMAC-SHA256 \
 pub(crate) const ACCOUNT_ID: &str = "000000000000";
 pub(crate) const REGION: &str = "us-east-1";
 
-/// The address an app announces its hosting under, which is what `App$defaultDomain`
-/// carries: the ADDRESS this emulator is reached at, which is the one address a client told
-/// the domain can dial.
+/// The DNS default domain this service generates for the app `app_id` created through
+/// `endpoint`: the app's own id as a label in the zone this emulator may announce a name of
+/// its own in, which is what `App$defaultDomain` carries.
 ///
-/// Written here independently of the service, so a suite pins the announced address and not
-/// the code that composes it: a request that addressed an endpoint of its own is announced
-/// that endpoint, and one that addressed a host naming some SERVICE — a caller resolving
-/// AWS's own hostnames — is announced the address this process is served at, which for this
-/// in-process harness, serving no port at all, is the host of the base an unserved emulator
-/// publishes (`smithy_server_runtime::UNSERVED_URL_BASE`, a name RFC 6761 reserves so
-/// nothing resolves it).
+/// Written here independently of the service, so a suite pins the announced domain and not
+/// the code that composes it: the zone is the endpoint's own host, the loopback zone RFC 6761
+/// reserves where that endpoint is an ADDRESS (which names no zone, and names the interface
+/// that zone resolves to), and — for a request that addressed a host naming some SERVICE, a
+/// caller resolving AWS's own hostnames, which is no zone this emulator may announce in — the
+/// host of the base an unserved emulator publishes (`smithy_server_runtime::UNSERVED_URL_BASE`,
+/// a name RFC 6761 reserves so nothing resolves it), which is what this in-process harness,
+/// serving no port at all, is reached at.
 ///
 /// `pub(crate)` so the sibling suites that assert the announced domain and compose a site's
 /// address from it read the one spelling rather than each writing it.
-pub(crate) fn announced_domain(endpoint: &str) -> String {
+pub(crate) fn announced_domain(app_id: &str, endpoint: &str) -> String {
     let host = endpoint.rsplit('@').next().unwrap_or(endpoint);
     let bare = match host.find(']') {
         Some(end) => &host[1..end],
@@ -60,13 +61,20 @@ pub(crate) fn announced_domain(endpoint: &str) -> String {
     let names_an_aws_endpoint = [".amazonaws.com", ".amazonaws.com.cn", ".api.aws", ".on.aws"]
         .iter()
         .any(|suffix| bare.ends_with(suffix));
-    if names_an_aws_endpoint {
-        return smithy_server_runtime::UNSERVED_URL_BASE
+    let zone = if names_an_aws_endpoint {
+        smithy_server_runtime::UNSERVED_URL_BASE
             .trim_start_matches("https://")
-            .to_string();
-    }
-    endpoint.to_string()
+            .to_string()
+    } else if bare.parse::<std::net::IpAddr>().is_ok() {
+        LOOPBACK_ZONE.to_string()
+    } else {
+        bare
+    };
+    format!("{app_id}.{zone}")
 }
+
+/// The zone a resolver answers with the loopback interface, which RFC 6761 reserves.
+pub(crate) const LOOPBACK_ZONE: &str = "localhost";
 
 /// One response, reduced to what a client branches on.
 ///
@@ -558,7 +566,7 @@ async fn create_app_mints_and_persists_a_record_get_app_reads_back_field_for_fie
         );
         assert_eq!(
             string_member(&app, "defaultDomain"),
-            announced_domain(&format!("amplify.{REGION}.amazonaws.com")),
+            announced_domain(&app_id, &format!("amplify.{REGION}.amazonaws.com")),
             "case {label:?}: defaultDomain must be the hosting domain this app announces, \
              got {:?}",
             app.get("defaultDomain")

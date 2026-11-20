@@ -4,9 +4,9 @@
 //! its place in the order of decisions.
 //!
 //! The rule under test: a `CreateClusterV2` body that names BOTH cluster types describes two
-//! different clusters, so it is no create Amazon MSK can READ at all — it is refused on the
-//! BODY, with HTTP 400 `BadRequestException`, MSK's one fixed sentence for a body it will not
-//! read and NO
+//! different clusters, so it names one cluster type too many — it is refused on the
+//! BODY, with HTTP 400 `BadRequestException`, MSK's one fixed sentence stating that only one
+//! of the two may be given and NO
 //! `invalidParameter`, because no single member is at fault. That decision is taken on the
 //! body alone, so it comes BEFORE every decision taken on a member's value or on the
 //! registry: a body naming both kinds reads the same sentence whether one of the blocks
@@ -34,9 +34,10 @@ use crate::refusal_wording::PARAMETERS_NOT_VALID;
 /// MSK's fixed sentence for a create whose body names both cluster types, written out
 /// here rather than read from the service's own constant, so the wording is pinned by this
 /// suite instead of by the code under test: the two members are ALTERNATIVES, so a body
-/// carrying both is a body MSK will not read, and the sentence it states about such a body
-/// names nothing of the request.
-const ONE_CLUSTER_TYPE_MESSAGE: &str = "Invalid request body";
+/// carrying both names one cluster type too many, and the sentence states that only one may
+/// be given, naming nothing of the request.
+const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
 
 /// MSK's fixed sentence for a create that names NO cluster type, and the parameter it blames.
 const NO_CLUSTER_TYPE_MESSAGE: &str =
@@ -119,7 +120,7 @@ fn both_kinds_outside_a_modelled_bound(name: &str) -> Value {
 }
 
 /// Assert `reply` is the selection refusal: the fixed sentence and no member named.
-fn assert_invalid_request_body(reply: &Reply, case: &str) {
+fn assert_one_cluster_type(reply: &Reply, case: &str) {
     assert_eq!(
         (reply.status, reply.error_code(), reply.error_message()),
         (400, "BadRequestException", ONE_CLUSTER_TYPE_MESSAGE),
@@ -164,7 +165,7 @@ async fn a_body_naming_both_cluster_types_is_refused_on_the_selection() {
 
     for (case, body) in both_cluster_type_rows("both-kinds-free") {
         let reply = emulator.create_cluster_v2(body).await;
-        assert_invalid_request_body(&reply, case);
+        assert_one_cluster_type(&reply, case);
     }
 
     // A body naming NEITHER kind is the other class: a different sentence, and a member named.
@@ -268,7 +269,7 @@ async fn the_body_refusal_precedes_the_registry() {
     // asked.
     for (case, body) in both_cluster_type_rows(taken) {
         let reply = emulator.create_cluster_v2(body).await;
-        assert_invalid_request_body(&reply, case);
+        assert_one_cluster_type(&reply, case);
     }
 
     // The store still holds the one cluster the served create registered.

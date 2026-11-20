@@ -10,17 +10,17 @@
 //! told both composes `https://<displayName>.<defaultDomain>/` — the deployed page, the
 //! branch's basic-authorization challenge, or the redirect a rule states.
 //!
-//! The member is the DOMAIN an app's sites are published under, and this emulator publishes
-//! one address for every app it hosts: the ADDRESS it is reached at
-//! ([`announced_default_domain`]), so a client told the domain can dial it.
+//! The member is the DOMAIN an app's sites are published under, which this service GENERATES
+//! from the app's own id in the zone this emulator may announce a name of its own in
+//! ([`announced_default_domain`]), so one app's domain names that app and no other and the
+//! name leads back to this process rather than to a zone AWS serves.
 //!
-//! A name a service hands a client is a name the client RESOLVES and then dials, so an
-//! address in a zone AWS serves resolves nowhere near this process — or, worse, at genuine
-//! AWS infrastructure, carrying the caller's credentials out of the emulated environment.
-//! What such an address cannot carry — WHICH app, and which of its branches — is carried in
-//! the PATH this plane ALSO serves a site under ([`hosted_site_path`]), exactly as the shared
-//! data-plane reading states for a plane served on the emulator's own endpoint, so a client
-//! that resolves nothing but one local endpoint can still fetch the site.
+//! A DNS name is a name a client RESOLVES and then dials, and a client configured with this
+//! emulator's endpoint resolves nothing else — so what such a name cannot carry (WHICH app,
+//! and which of its branches) is carried in the PATH this plane ALSO serves a site under
+//! ([`hosted_site_path`]), exactly as the shared data-plane reading states for a plane served
+//! on the emulator's own endpoint. Nothing here dials the generated domain: it is a value the
+//! control plane reports and the edge compares an addressed host against.
 //!
 //! The member is a DOMAIN, so the value is an address and nothing else: no scheme, no path.
 //!
@@ -38,28 +38,40 @@
 //! nothing but this emulator's own endpoint ([`hosted_site_path`], read back by
 //! [`addressed_hosted_site`]).
 
-/// The default domain an app's hosting is ANNOUNCED under: the `host[:port]` this emulator is
-/// reached at.
+/// The default domain an app's hosting is ANNOUNCED under: the app's own id as a label in the
+/// zone this emulator may announce a name of its own in, `<appId>.<zone>`.
 ///
 /// `App$defaultDomain` is "the default domain for the Amplify app" and a client composes a
-/// branch's site address by prefixing the branch's label to it, so what the member carries is
-/// an address a client DIALS — which means it has to be an address that leads back to this
-/// process: the endpoint the request reached this emulator on, or the address this process is
-/// served at for a request that addressed a host naming some service (a caller resolving
-/// AWS's own hostnames). An address in a zone AWS serves resolves nowhere near this process.
+/// branch's site address by prefixing the branch's label to it, so the member carries a
+/// GENERATED DNS name of that app's hosting and nothing else: no scheme and no path. The LABEL
+/// is the one thing that names the app — its id — so two apps never share a domain and one
+/// app's domain names that app.
 ///
-/// The value is the address alone — no scheme and no path — and what such an address cannot
-/// carry (which app, and which of its branches) is the label a client writes in front of it
-/// and the PATH this plane serves the same site under ([`hosted_site_path`]), which names the
-/// app and the branch.
+/// The ZONE is the one this emulator may announce in
+/// ([`::service_common::data_plane_addressing::announced_zone_of_authority`], the workspace's
+/// one reading of that question): a name a service hands a client is a name the client RESOLVES
+/// and then dials, so it has to lead back to this process — the zone of the endpoint the
+/// request reached this emulator on, and the loopback zone RFC 6761 reserves where that
+/// endpoint is an address rather than a name. A name in a zone AWS serves resolves nowhere near
+/// this process, or at genuine AWS infrastructure, so this never announces one.
+///
+/// What such a name cannot carry (which branch, and which app for a client that resolves
+/// nothing but this emulator's endpoint) is the label a client writes in front of it and the
+/// PATH this plane serves the same site under ([`hosted_site_path`]), which names the app and
+/// the branch.
 ///
 /// Composed ONCE, by the create, and persisted as the app's `defaultDomain`, so every later
 /// read of that app reports the same string whatever it is addressed at.
-pub fn announced_default_domain(ctx: &::smithy_server_runtime::OperationContext<'_>) -> String {
-    ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(ctx.parts())
-        .unwrap_or_else(|| {
-            ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)
-        })
+pub fn announced_default_domain(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    app_id: &str,
+) -> String {
+    let addressed = ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(
+        ctx.parts(),
+    )
+    .unwrap_or_else(|| ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx));
+    let zone = ::service_common::data_plane_addressing::announced_zone_of_authority(&addressed);
+    format!("{app_id}.{zone}")
 }
 
 /// The segment that names THIS plane under the reserved data-plane marker, ahead of the

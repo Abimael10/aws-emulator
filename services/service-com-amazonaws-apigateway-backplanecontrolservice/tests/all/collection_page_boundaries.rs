@@ -116,11 +116,10 @@ async fn a_collection_that_holds_no_element_reports_the_empty_page_member() {
 
     for (case, uri) in &rows {
         let answer = listed(&gateway, uri, case).await;
-        // The envelope each listing is recorded answering an empty page with: the page
-        // member as the empty list, except for the base path mappings of a domain name,
-        // whose own recorded empty answer is the bare success object
+        // The envelope every listing of this service is recorded answering an empty page
+        // with: the page member as the empty list
         // (`crate::emptied_collection_page_member::empty_page_body`).
-        let expected = crate::emptied_collection_page_member::empty_page_body(case);
+        let expected = crate::emptied_collection_page_member::empty_page_body();
         assert_eq!(
             answer.body, expected,
             "case {case}: expected {expected:?} for a collection that holds no \

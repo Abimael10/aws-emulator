@@ -171,12 +171,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let store = state.lock();
 
-        // Connect states ONE not-found sentence for every resource, quoting nothing the
-        // request carried (`crate::state::resource_not_found`), so an `InstanceId` that
-        // resolves to no instance is refused in those same words.
+        // The addressed resource of this operation IS the instance, so an `InstanceId` that
+        // resolves to no instance is refused in the words Connect names a missing instance
+        // with (`crate::state::instance_not_found`): the sentence's one variable part is the
+        // identifier the request carried.
         let instance = store.instances.get(&input.instance_id).ok_or_else(|| {
             DescribeInstanceErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(),
+                crate::state::instance_not_found(&input.instance_id),
             )
         })?;
 

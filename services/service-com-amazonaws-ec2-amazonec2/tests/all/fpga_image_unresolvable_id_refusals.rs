@@ -16,15 +16,16 @@
 //!    * `DescribeFpgaImages` makes the SAME answer as for a value that is no AFI id at all:
 //!      it reports on "the AFIs available to you", so it judges the id it was given rather
 //!      than resolving one resource of the account's own Region;
-//!    * `CopyFpgaImage` makes that same answer: its source is named by a REGION and an id
-//!      together, which is an addressing this service resolves only for the AFIs it holds, so
-//!      a source it cannot resolve is an id it cannot read rather than a stored AFI that is
-//!      missing;
+//!    * `CopyFpgaImage` answers `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not
+//!      found.`: its source is named by a REGION and an id together, so the id is read for
+//!      its printed FORM and then resolved, and a value in that form it cannot resolve is a
+//!      source that is missing rather than one it cannot read;
 //!    * `DeleteFpgaImage` and `ResetFpgaImageAttribute`, which ACT on ONE named AFI OF THEIR
-//!      OWN REGION, make it too: EC2's long id form is an obfuscated identifier the service
-//!      decodes before the lookup, so a value no issue of this kind ever produced is one they
-//!      cannot read — their `InvalidFpgaImageID.NotFound` with `Image ID '<id>' not found.` is
-//!      reserved for an identifier this service DID issue, which rule 3 drives;
+//!      OWN REGION, answer the unreadable-id refusal instead: EC2's long id form is an
+//!      obfuscated identifier the service decodes before the lookup, so a value no issue of
+//!      this kind ever produced is one they cannot read — their `InvalidFpgaImageID.NotFound`
+//!      with `Image ID '<id>' not found.` is reserved for an identifier this service DID
+//!      issue, which rule 3 drives;
 //!    * `DescribeFpgaImageAttribute` answers the not-found code with EC2's common missing-id
 //!      sentence instead, naming the `fpga-image` resource type.
 //! 3. The two readings are about the ID and not about the operation's subject: the id of a
@@ -99,7 +100,7 @@ fn unreadable_message(fpga_image_id: &str) -> String {
 /// Every operation that resolves an AFI id, with the answer it makes for a value in the
 /// printed id form that this service never ISSUED.
 const RESOLVERS: [(&str, Unresolved); 5] = [
-    ("CopyFpgaImage", Unresolved::Unreadable),
+    ("CopyFpgaImage", Unresolved::NotFoundImageId),
     ("DescribeFpgaImages", Unresolved::Unreadable),
     ("DeleteFpgaImage", Unresolved::Unreadable),
     ("ResetFpgaImageAttribute", Unresolved::Unreadable),
@@ -107,10 +108,10 @@ const RESOLVERS: [(&str, Unresolved); 5] = [
 ];
 
 /// The same table for an identifier this service DID issue that names no stored AFI — the id
-/// of an AFI a delete has removed: the two operations that act on one named AFI word that
-/// cause `Image ID '<id>' not found.`.
+/// of an AFI a delete has removed: the operations that resolve one named AFI, the copy
+/// included, word that cause `Image ID '<id>' not found.`.
 const RESOLVERS_OF_AN_ISSUED_ID: [(&str, Unresolved); 5] = [
-    ("CopyFpgaImage", Unresolved::Unreadable),
+    ("CopyFpgaImage", Unresolved::NotFoundImageId),
     ("DescribeFpgaImages", Unresolved::Unreadable),
     ("DeleteFpgaImage", Unresolved::NotFoundImageId),
     ("ResetFpgaImageAttribute", Unresolved::NotFoundImageId),
@@ -249,9 +250,9 @@ async fn a_value_outside_the_issued_afi_id_form_is_refused_the_same_way_everywhe
 }
 
 /// RULE 2: a value in the printed id form that this service never ISSUED is answered by the
-/// OPERATION's own refusal — the unreadable-id refusal from the four that judge or decode the
-/// id they were given, and the not-found code with its own sentence from the attribute
-/// describe.
+/// OPERATION's own refusal — the unreadable-id refusal from the ones that judge or decode the
+/// id they were given, the not-found code with its own sentence from the copy, which resolves
+/// the value it read, and from the attribute describe.
 #[tokio::test]
 async fn an_unresolved_afi_id_is_answered_by_each_operations_own_refusal() {
     let (router, engine) = emulator();

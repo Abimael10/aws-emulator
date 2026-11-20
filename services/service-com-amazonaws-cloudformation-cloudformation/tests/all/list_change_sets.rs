@@ -8,9 +8,8 @@
 //! reports in full — its id and name, the stack it plans changes for, the creation and
 //! execution statuses it has reached with the reason that came with the first of them, the
 //! instant it was created and the settings it was created with. A change set a request
-//! deleted or a completed stack deletion took with it is no longer held and so no longer
-//! listed, while one an execution SUPERSEDED is still held and still listed, reporting the
-//! `OBSOLETE` execution status that invalidation put it in; a `StackName` that resolves to
+//! deleted, one another change set's execution took away, or one a completed stack deletion
+//! took with it is no longer held and so no longer listed; a `StackName` that resolves to
 //! no stack is refused rather than answered with an empty list.
 //!
 //! The recorded trace this suite was written for — one `CREATE` change set on a stack in
@@ -565,9 +564,8 @@ async fn the_stack_is_named_by_name_or_by_stack_id_and_an_unknown_name_is_refuse
     );
 }
 
-/// A change set stops being listed when it stops being held: deleted by request, or taken
-/// by its stack's deletion. A change set another change set's execution INVALIDATED is
-/// still held, so it is still listed — in the `OBSOLETE` execution status.
+/// A change set stops being listed when it stops being held: deleted by request, taken
+/// away by another change set's execution, or taken by its stack's deletion.
 #[tokio::test]
 async fn a_change_set_that_is_no_longer_held_is_no_longer_listed() {
     let case = "a change set that is no longer held";
@@ -618,9 +616,8 @@ async fn a_change_set_that_is_no_longer_held_is_no_longer_listed() {
     );
 
     // "When you execute a change set, CloudFormation deletes all other change sets
-    // associated with the stack": the plans they describe are invalidated, so every record
-    // the stack still holds is listed — the executed one reporting its execution and the
-    // superseded one reporting `OBSOLETE`.
+    // associated with the stack": the plans they describe go, so the only record the stack
+    // still holds is the executed one, reporting its execution.
     let (status, body) = call(
         &router,
         "ExecuteChangeSet",
@@ -640,21 +637,15 @@ async fn a_change_set_that_is_no_longer_held_is_no_longer_listed() {
     let summaries = wire_summaries(&body);
     assert_eq!(
         listed_names(&summaries),
-        vec!["cs-list-gone-a".to_string(), "cs-list-gone-c".to_string()],
-        "case \"a change set superseded by an execution\": both records are still held, got \
-         {body}"
+        vec!["cs-list-gone-a".to_string()],
+        "case \"a change set superseded by an execution\": only the executed record is still \
+         held, got {body}"
     );
     assert_eq!(
         summaries[0].execution_status.as_deref(),
         Some(execution_status::EXECUTE_COMPLETE),
         "case \"a change set superseded by an execution\": the executed one reports its \
          execution, got {body}"
-    );
-    assert_eq!(
-        summaries[1].execution_status.as_deref(),
-        Some(execution_status::OBSOLETE),
-        "case \"a change set superseded by an execution\": the superseded one reports the \
-         plan the execution invalidated, got {body}"
     );
 
     let (status, body) =

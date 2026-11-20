@@ -12,24 +12,26 @@
 //! `Branch$displayName` "is used as the default domain prefix"
 //! (`(shape="Branch",member="displayName")`), so the member is the DOMAIN the app's sites
 //! are published under and a client composes a site's address by prefixing the branch's
-//! label to it. A client RESOLVES that address and then dials it, so what this emulator
-//! publishes is the address it is REACHED at — never a host AWS serves, which resolves
-//! nowhere near this process.
+//! label to it. This service GENERATES that domain from the one thing that names the app —
+//! its own id — as a label in the zone this emulator may announce a name of its own in, so
+//! the LABEL follows the app, and the zone leads back to this process rather than to one AWS
+//! serves.
 //!
-//! So the value is an address and nothing else — no scheme and no path — composed ONCE when
-//! the app is created and reported unchanged by every later read, whichever endpoint that
-//! read is addressed at. What the address cannot carry — which app, and which of its
-//! branches — is carried in the path that names the app and the branch, which the same site
-//! is ALSO served under.
+//! So the value is a domain name and nothing else — no scheme, no path, no port — composed
+//! ONCE when the app is created and reported unchanged by every later read, whichever
+//! endpoint that read is addressed at. A client that resolves nothing but this emulator's own
+//! endpoint cannot dial a DNS name at all, so the same site is ALSO served under the path
+//! that names the app and the branch.
 //!
 //! The table below spans the class that rule generalises over: every spelling of the
 //! emulator's own endpoint a client is configured with (the IPv4 loopback address, the
 //! loopback name, a bracketed IPv6 literal, each on its own port, and one naming no port),
-//! and the service's own published host beside them. Each row asserts BOTH halves — the
-//! address reported, and that a `GET` of the address built from it is answered by the site
-//! that branch deployed — because the two together are what a client told the domain can do.
-//! The suite's last two tests assert the FORM of that address over a table of app names, and
-//! that every app of one emulator announces the one address it answers at.
+//! and the service's own published host beside them — none of which moves the app's own
+//! label. Each row asserts BOTH halves — the domain reported, and that a `GET` of the
+//! address built from it is answered by the site that branch deployed — because the two
+//! together are what a client told the domain can do.
+//! The suite's last two tests assert the FORM of that domain over a table of app names, and
+//! that every app of one emulator announces a domain of its own.
 //!
 //! The harness (`Emulator`) and the deployment driver (`Hosted`) are the ones
 //! `app_branch_lifecycle` and `hosted_branch_site` already drive.
@@ -95,12 +97,13 @@ async fn read_app(emulator: &Emulator, endpoint: &str, app_id: &str) -> Value {
     reply.member("app")
 }
 
-/// Rule: an app's default domain is the address this emulator is reached at, and the site of
+/// Rule: an app's default domain is the DNS name generated from its own id in a zone that
+/// leads back to this emulator, and the site of
 /// a branch of that app is served at the address a client composes from it, host-style with
-/// the branch's label ahead of that address, and under the path that names the app and the
+/// the branch's label ahead of that domain, and under the path that names the app and the
 /// branch for a client that resolves only this emulator's own endpoint.
 #[tokio::test]
-async fn an_app_announces_the_address_this_emulator_is_reached_at() {
+async fn an_app_announces_the_domain_generated_from_its_own_id() {
     for row in rows() {
         let case = row.case;
         let emulator = Emulator::new();
@@ -120,16 +123,16 @@ async fn an_app_announces_the_address_this_emulator_is_reached_at() {
         let app_id = string_member(&app, "appId");
         let reported = string_member(&app, "defaultDomain");
 
-        let expected = announced_domain(row.endpoint);
+        let expected = announced_domain(&app_id, row.endpoint);
         assert_eq!(
             reported, expected,
-            "case {case:?}: expected the announced address {expected:?}, got {reported:?}"
+            "case {case:?}: expected the announced domain {expected:?}, got {reported:?}"
         );
-        // The announced value is an ADDRESS and nothing else: a name a branch label is
+        // The announced value is a DOMAIN and nothing else: a name a branch label is
         // prefixed to, carrying no scheme and no path.
         assert!(
             !reported.contains('/') && !reported.contains(' '),
-            "case {case:?}: an address carries no scheme and no path, got {reported:?}"
+            "case {case:?}: a domain carries no scheme and no path, got {reported:?}"
         );
 
         // The same value is reported by every reader, and by one addressed somewhere
@@ -232,14 +235,13 @@ async fn an_app_announces_the_address_this_emulator_is_reached_at() {
     }
 }
 
-/// Rule: the announced address follows the ENDPOINT the create was addressed at and nothing
-/// else a request carried, so each app announces the same address through one endpoint — and
-/// each app's site is still addressed on its own, because the app is named in the PATH the
-/// plane serves its sites under.
+/// Rule: the announced domain follows the APP and nothing a request carried, so two apps of
+/// one emulator announce two domains — and each app's site is also addressed on its own by the
+/// PATH the plane serves its sites under, which names the app.
 ///
 /// The rows differ along what the rule generalises over — how many apps one emulator holds
 /// and the names they were created with (a plain name, one carrying digits and hyphens, one
-/// repeated so two apps differ in nothing a request stated) — because the announced address
+/// repeated so two apps differ in nothing a request stated) — because the announced domain
 /// follows neither the app's name nor anything else a request carried.
 #[tokio::test]
 async fn every_app_announces_its_own_domain_whichever_endpoint_created_it() {
@@ -268,7 +270,7 @@ async fn every_app_announces_its_own_domain_whichever_endpoint_created_it() {
             let reported = string_member(&app, "defaultDomain");
             assert_eq!(
                 reported,
-                announced_domain(endpoint),
+                announced_domain(&app_id, endpoint),
                 "case {case}: expected the domain this app announces, got {reported:?}"
             );
             announced.push((app_id, reported));
@@ -299,16 +301,16 @@ async fn every_app_announces_its_own_domain_whichever_endpoint_created_it() {
     }
 }
 
-/// Rule: the announced domain is the ADDRESS this emulator is reached at and nothing else —
-/// no scheme, no path, no credential — which is the form a client prefixes a branch's label
-/// to and the one address it can dial.
+/// Rule: the announced domain is a DOMAIN NAME and nothing else — no scheme, no path, no
+/// credential, no port — generated from the app's own id, which is the form a client prefixes
+/// a branch's label to.
 ///
 /// The rows differ along the one thing a request can vary that the member might have
 /// followed — the app's `name` (a plain one, one carrying digits, hyphens and mixed case,
 /// the shortest and the longest the member allows) — crossed with the endpoint the create
-/// was addressed at, which is what the address DOES follow.
+/// was addressed at, which the domain does not follow either.
 #[tokio::test]
-async fn an_apps_default_domain_is_the_address_this_emulator_is_reached_at() {
+async fn an_apps_default_domain_is_the_name_generated_from_its_id() {
     // "The name of the Amplify app" is `length 1..255`
     // (`smithy_query(query="shape",shape="CreateAppRequest")`), so the rows below are the
     // ends of that range beside two ordinary names.
@@ -336,20 +338,18 @@ async fn an_apps_default_domain_is_the_address_this_emulator_is_reached_at() {
             let app_id = string_member(&app, "appId");
             let reported = string_member(&app, "defaultDomain");
 
-            // The address this emulator is reached at: a client resolves the value it was
-            // handed and then dials it, so it has to lead back here rather than to a host
-            // AWS serves.
-            let expected = announced_domain(row.endpoint);
+            // The DNS name this service generates for this app: its own id as a label in the
+            // zone this emulator may announce in, whatever else the request carried.
+            let expected = announced_domain(&app_id, row.endpoint);
             assert_eq!(
                 reported, expected,
-                "case {case:?}: expected the address {expected:?} this emulator is reached \
-                 at, got {reported:?}"
+                "case {case:?}: expected the generated domain {expected:?}, got {reported:?}"
             );
-            // An ADDRESS and nothing else: no scheme, no path and no credential.
-            for carried in ['/', ' ', '@', '?'] {
+            // A DOMAIN NAME and nothing else: no scheme, no path, no credential and no port.
+            for carried in ['/', ' ', '@', '?', ':'] {
                 assert!(
                     !reported.contains(carried),
-                    "case {case:?}: an address carries no {carried:?}, got {reported:?}"
+                    "case {case:?}: a domain carries no {carried:?}, got {reported:?}"
                 );
             }
             // ROUND TRIP: the same address is what a later read of the app reports.
@@ -363,12 +363,11 @@ async fn an_apps_default_domain_is_the_address_this_emulator_is_reached_at() {
     }
 }
 
-/// Rule, read the other way: the address is where this EMULATOR answers rather than a name of
-/// the app, so every app created through one endpoint announces the same address — and each
-/// app's site is still addressed on its own, because the PATH this plane serves its sites
-/// under names the app.
+/// Rule, read the other way: the domain names the APP, so every app of one emulator
+/// announces a domain of its own — and each app's site is also addressed by the PATH this
+/// plane serves its sites under, which names the app.
 #[tokio::test]
-async fn every_app_of_one_emulator_announces_the_one_address_it_answers_at() {
+async fn every_app_of_one_emulator_announces_a_domain_of_its_own() {
     let emulator = Emulator::new();
     let endpoint = "127.0.0.1:44285";
     let mut announced: Vec<(String, String)> = Vec::new();
@@ -393,22 +392,22 @@ async fn every_app_of_one_emulator_announces_the_one_address_it_answers_at() {
         ));
     }
     for (app_id, domain) in &announced {
-        let expected = announced_domain(endpoint);
+        let expected = announced_domain(app_id, endpoint);
         assert_eq!(
             domain, &expected,
-            "case app {app_id}: every app announces the address this emulator answers at, \
+            "case app {app_id}: every app announces the domain generated from its own id, \
              got {announced:?}"
         );
-        // Each app keeps a site address of its own, because the path names the app.
+        // No two apps of one emulator announce one domain, and each app keeps a site
+        // address of its own, because the path names the app too.
         assert!(
             announced
                 .iter()
                 .filter(|(other_id, _)| other_id != app_id)
-                .all(|(other_id, _)| other_id != app_id
+                .all(|(other_id, other_domain)| other_domain != domain
                     && !format!("{LOCAL_MARKER}/{app_id}/")
                         .starts_with(&format!("{LOCAL_MARKER}/{other_id}/"))),
-            "case app {app_id}: the path this plane serves its sites under names one app \
-             only, got {announced:?}"
+            "case app {app_id}: one domain names one app, got {announced:?}"
         );
     }
 }

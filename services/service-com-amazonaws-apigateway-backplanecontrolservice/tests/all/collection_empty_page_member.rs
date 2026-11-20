@@ -421,18 +421,11 @@ async fn every_paginated_listing_of_this_service_reports_its_page_as_the_listing
 
     for (case, uri, held) in &rows {
         let body = listed(&gateway, uri, case).await;
-        // Whether an EMPTY page carries the member at all is the LISTING's own answer, named
-        // once by the shared reading of an empty page.
-        let empty_page_carries_the_member =
-            crate::emptied_collection_page_member::empty_page_body(case)
-                .get("item")
-                .is_some();
+        // Every listing of this service reports its page member, as the empty list where the
+        // page holds nothing — the one body the shared reading of an empty page names
+        // (`crate::emptied_collection_page_member::empty_page_body`).
         let Some(reported) = body.get("item") else {
-            assert!(
-                !empty_page_carries_the_member && *held == Some(0),
-                "case {case}: expected the page member, got {body:?}"
-            );
-            continue;
+            panic!("case {case}: expected the page member, got {body:?}");
         };
         let elements = reported
             .as_array()
