@@ -72,7 +72,7 @@ pub(crate) const ACCESS_DENIED_STATUS: u16 = 400;
 pub(crate) const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
 /// The API versions the IAM and STS setup calls below are made at.
-const IAM_VERSION: &str = "2010-05-08";
+pub(crate) const IAM_VERSION: &str = "2010-05-08";
 const STS_VERSION: &str = "2011-06-15";
 
 /// A principal a call is signed as: the access key id it presents, and the ARN a refusal
@@ -185,7 +185,7 @@ impl Emulator {
     }
 
     /// One awsQuery call to IAM or STS, signed with the account's own credential.
-    async fn query(
+    pub(crate) async fn query(
         &self,
         signing_name: &str,
         version: &str,
@@ -307,7 +307,7 @@ impl Emulator {
     /// An IAM role a STATE MACHINE acts as: trusted by this service's own principal, and
     /// allowed every action of this service, so the integration call a `Task` state makes is
     /// really served. Answers its ARN.
-    async fn state_machine_role(&self, role_name: &str) -> String {
+    pub(crate) async fn state_machine_role(&self, role_name: &str) -> String {
         let trust = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -333,7 +333,7 @@ impl Emulator {
 
     /// Replace the inline policy of the role `role_name`, which is how a grant is put in
     /// place and withdrawn again.
-    async fn put_role_policy(&self, role_name: &str, policy: &Value) {
+    pub(crate) async fn put_role_policy(&self, role_name: &str, policy: &Value) {
         self.query(
             "iam",
             IAM_VERSION,
@@ -1150,7 +1150,7 @@ const CALLBACK_RESOURCE: &str = "arn:aws:states:::states:startExecution.waitForT
 
 /// An ACTIVITY and a state machine whose one `Task` hands its work to that activity: the two
 /// together are what queues a task a worker can be handed a token for.
-async fn activity_handoff(emulator: &Emulator, name: &str) -> (String, String) {
+pub(crate) async fn activity_handoff(emulator: &Emulator, name: &str) -> (String, String) {
     let created = emulator
         .sfn("CreateActivity", &json!({ "name": name }))
         .await;
@@ -1175,7 +1175,7 @@ async fn activity_handoff(emulator: &Emulator, name: &str) -> (String, String) {
 /// A token of an OUTSTANDING activity task, as `GetActivityTask` hands it to a worker: one
 /// execution of `machine` queues a task on `activity`, and the poll is repeated until the
 /// worker is handed its token or the deadline passes.
-async fn activity_task_token(
+pub(crate) async fn activity_task_token(
     emulator: &Emulator,
     case: &str,
     activity: &str,
@@ -1213,7 +1213,7 @@ async fn activity_task_token(
 ///
 /// `role_arn` is the role the machine acts as, which this service assumes to make the
 /// integration call — so it has to be one this service may assume.
-async fn callback_machine(emulator: &Emulator, name: &str, role_arn: &str) -> String {
+pub(crate) async fn callback_machine(emulator: &Emulator, name: &str, role_arn: &str) -> String {
     let child = emulator
         .sfn(
             "CreateStateMachine",
@@ -1254,7 +1254,7 @@ async fn callback_machine(emulator: &Emulator, name: &str, role_arn: &str) -> St
 /// at it: one execution of `machine` hands its token to the child it starts, so the token is
 /// read back out of the child's own input — the work outside holding it, exactly as a Lambda
 /// handler holds the token its invocation was given.
-async fn callback_task_token(
+pub(crate) async fn callback_task_token(
     emulator: &Emulator,
     case: &str,
     machine: &str,
