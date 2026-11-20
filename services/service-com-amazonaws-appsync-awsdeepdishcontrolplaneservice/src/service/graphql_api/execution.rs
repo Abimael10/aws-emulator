@@ -315,6 +315,11 @@ const LAMBDA_DATA_SOURCE: &str = "AWS_LAMBDA";
 /// ([`super::dynamodb`]).
 const DYNAMODB_DATA_SOURCE: &str = "AMAZON_DYNAMODB";
 
+/// The `DataSourceType` of a data source that is an HTTP ENDPOINT: "the data source is an HTTP
+/// endpoint" (`DataSource$type`), which a step resolving against one SENDS the request its
+/// request half rendered to ([`super::http_endpoint`]).
+const HTTP_DATA_SOURCE: &str = crate::state::HTTP_DATA_SOURCE_TYPE;
+
 /// The member a request function returns the result of a local resolver in, and — for a data
 /// source that is a function — the event that function is invoked with: AppSync's Lambda
 /// data-source request carries `{"version", "operation", "payload"}`, and the `payload` IS
@@ -1541,6 +1546,34 @@ impl Execution<'_> {
                     ..Raised::default()
                 }))),
             },
+            // The endpoint a `type=HTTP` data source names is ADDRESSING for the emulator's own
+            // in-process transport and never a host this process connects to: the request is
+            // dispatched back into this same emulator, so no socket is opened, no name is
+            // resolved, and nothing outside this process is reachable through it
+            // ([`super::http_endpoint`]).
+            HTTP_DATA_SOURCE => match super::http_endpoint::answered(
+                self.context,
+                &super::http_endpoint::Configured {
+                    name: &data_source.name,
+                    endpoint: data_source.endpoint.as_deref(),
+                    authorization_type: data_source.authorization_type.as_deref(),
+                    signing_region: data_source.signing_region.as_deref(),
+                    signing_service_name: data_source.signing_service_name.as_deref(),
+                    service_role_arn: data_source.service_role_arn.as_deref(),
+                },
+                requested,
+            )
+            .await
+            {
+                Ok(result) => DataSourceOutcome::Result(result),
+                // Carried as a RAISED failure, so the step's own `ctx.error` states the type
+                // the refusal is of and an error of the field reports it as its `errorType`.
+                Err(refused) => DataSourceOutcome::Answered(Failure::Raised(Box::new(Raised {
+                    message: refused.message,
+                    error_type: Some(refused.error_type),
+                    ..Raised::default()
+                }))),
+            },
             other => DataSourceOutcome::NotCalled(
                 format!(
                     "{DATA_SOURCE_NOT_CALLED} {other} data source {}.",
@@ -2348,6 +2381,15 @@ struct StepDataSource {
     /// `dynamodbConfig.useCallerCredentials` — whether such a call is made under the CALLER's
     /// own credentials rather than under the data source's role.
     use_caller_credentials: bool,
+    /// `httpConfig.endpoint` of an `HTTP` data source: the endpoint a step resolving against it
+    /// sends its request to, and `None` for every other type — which configures none.
+    endpoint: Option<String>,
+    /// `httpConfig.authorizationConfig.authorizationType` and the `awsIamConfig` it carries:
+    /// whether such a request is signed, and for which service and Region
+    /// ([`super::http_endpoint`]).
+    authorization_type: Option<String>,
+    signing_region: Option<String>,
+    signing_service_name: Option<String>,
 }
 
 /// The data source `name` of `api`, or `None` when the API holds none under that name.
@@ -2382,6 +2424,27 @@ fn step_data_source(api: &GraphqlApiRecord, name: Option<&str>) -> Option<StepDa
                 .dynamodb_config
                 .as_ref()
                 .is_some_and(|config| config.use_caller_credentials),
+            endpoint: record
+                .http_config
+                .as_ref()
+                .and_then(|config| config.endpoint.clone()),
+            authorization_type: record
+                .http_config
+                .as_ref()
+                .and_then(|config| config.authorization_config.as_ref())
+                .map(|authorization| authorization.authorization_type.clone()),
+            signing_region: record
+                .http_config
+                .as_ref()
+                .and_then(|config| config.authorization_config.as_ref())
+                .and_then(|authorization| authorization.aws_iam_config.as_ref())
+                .and_then(|iam| iam.signing_region.clone()),
+            signing_service_name: record
+                .http_config
+                .as_ref()
+                .and_then(|config| config.authorization_config.as_ref())
+                .and_then(|authorization| authorization.aws_iam_config.as_ref())
+                .and_then(|iam| iam.signing_service_name.clone()),
         })
 }
 
@@ -2485,7 +2548,7 @@ fn direct_event(base: &FieldContext, stash: &Json, previous: Option<&Json>) -> J
 /// set at all and the text is empty; every other selection is a brace-delimited block, one
 /// selected field per line, with each field's own sub-selection nested inside it.
 fn selection_set_graphql(selections: &[SelectedField], depth: usize) -> String {
-    if selections.is_empty() {
+    if selections.is_empty() || depth >= MAX_SELECTION_DEPTH {
         return String::new();
     }
     let indent = "  ".repeat(depth.saturating_add(1));
@@ -2523,7 +2586,7 @@ fn written_arguments(arguments: &JsonMap<String, Json>) -> String {
     }
     let written: Vec<String> = arguments
         .iter()
-        .map(|(name, value)| format!("{name}: {}", written_value(value)))
+        .map(|(name, value)| format!("{name}: {}", written_value(value, 0)))
         .collect();
     format!("({})", written.join(", "))
 }
@@ -2533,19 +2596,32 @@ fn written_arguments(arguments: &JsonMap<String, Json>) -> String {
 /// GraphQL's literals are JSON's but for an INPUT OBJECT, whose member names are written bare
 /// rather than quoted — so a value is written through the one serializer this crate writes JSON
 /// with, and an object member by member.
-fn written_value(value: &Json) -> String {
+///
+/// `depth` is how deep in a value this rendering already is, and it goes no deeper than the
+/// depth this endpoint reads one to ([`MAX_SELECTION_DEPTH`]): a composite at that depth is
+/// written as the empty composite it is the kind of. Nothing a SERVED request carries reaches
+/// that arm — an argument is read no deeper than the bound, variables included
+/// ([`nests_deeper_than`]) — and the arm is what keeps this rendering's own recursion inside it.
+fn written_value(value: &Json, depth: usize) -> String {
     match value {
-        Json::Object(members) => {
+        Json::Object(members) if depth < MAX_SELECTION_DEPTH => {
             let written: Vec<String> = members
                 .iter()
-                .map(|(name, member)| format!("{name}: {}", written_value(member)))
+                .map(|(name, member)| {
+                    format!("{name}: {}", written_value(member, depth.saturating_add(1)))
+                })
                 .collect();
             format!("{{{}}}", written.join(", "))
         }
-        Json::Array(elements) => {
-            let written: Vec<String> = elements.iter().map(written_value).collect();
+        Json::Array(elements) if depth < MAX_SELECTION_DEPTH => {
+            let written: Vec<String> = elements
+                .iter()
+                .map(|element| written_value(element, depth.saturating_add(1)))
+                .collect();
             format!("[{}]", written.join(", "))
         }
+        Json::Object(_) => String::from("{}"),
+        Json::Array(_) => String::from("[]"),
         other => other.to_string(),
     }
 }
@@ -3007,10 +3083,20 @@ fn read_value(
         return Ok(Json::Null);
     }
     let read = match value {
-        Value::Variable(variable) => variable
-            .name()
-            .and_then(|name| variables.get(name.text().as_str()).cloned())
-            .unwrap_or(Json::Null),
+        // A variable is substituted by the value the REQUEST carries for it, which is the one
+        // value here that the document's own nesting bound does not reach: it is read no deeper
+        // than this endpoint reads a selection set, so a value nested past that bound is refused
+        // with the sentence the document's own nesting is refused with rather than walked.
+        Value::Variable(variable) => {
+            let carried = variable
+                .name()
+                .and_then(|name| variables.get(name.text().as_str()).cloned())
+                .unwrap_or(Json::Null);
+            if nests_deeper_than(&carried, MAX_SELECTION_DEPTH.saturating_sub(depth)) {
+                return Err(format!("{TOO_DEEP} {MAX_SELECTION_DEPTH}."));
+            }
+            carried
+        }
         Value::StringValue(text) => Json::String(String::from(text.clone())),
         Value::ListValue(list) => {
             let mut elements: Vec<Json> = Vec::new();
@@ -3058,6 +3144,27 @@ fn read_value(
     }
     *held -= weight;
     Ok(read)
+}
+
+/// Whether `value` nests deeper than `depth` levels.
+///
+/// Measured by a walk that stops AT that depth, so it costs no more frames than the depth it is
+/// asked about however deep the value is: a value a caller carried in the request's own
+/// `variables` is read to the depth this endpoint reads a document to ([`MAX_SELECTION_DEPTH`]),
+/// and one nested past it is refused rather than walked — which is what keeps the renderings of
+/// an argument ([`written_value`]) within that same depth.
+fn nests_deeper_than(value: &Json, depth: usize) -> bool {
+    match (value, depth) {
+        (Json::Object(members), 0) => !members.is_empty(),
+        (Json::Object(members), _) => members
+            .values()
+            .any(|member| nests_deeper_than(member, depth.saturating_sub(1))),
+        (Json::Array(elements), 0) => !elements.is_empty(),
+        (Json::Array(elements), _) => elements
+            .iter()
+            .any(|element| nests_deeper_than(element, depth.saturating_sub(1))),
+        _ => false,
+    }
 }
 
 /// How an operation the document does not hold is stated.

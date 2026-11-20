@@ -51,12 +51,14 @@ pub mod dynamodb;
 pub mod event_bridge;
 pub mod execution;
 pub mod field_logs;
+pub mod http_endpoint;
 pub mod introspection;
 pub mod lambda;
 pub mod mapping_template;
 pub mod metrics;
 pub mod query;
 pub mod realtime;
+pub mod role_session;
 
 /// Everything one of these sockets needs to answer from: the service's own store, the API
 /// the socket belongs to (the socket itself says which, so no host has to name it), where

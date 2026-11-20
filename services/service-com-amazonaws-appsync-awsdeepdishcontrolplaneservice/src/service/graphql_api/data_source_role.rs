@@ -10,6 +10,11 @@
 //! action the call performs and the resource it acts on, so a refusal of one reads exactly
 //! like a refusal of the other.
 //!
+//! A call AppSync SIGNS and sends to an AWS API instead ([`super::http_endpoint`]) asks that
+//! question of nobody here: it is made AS a session of the role ([`super::role_session`]) and
+//! the service it reaches decides it, so what this module contributes there is the SESSION
+//! these two readings name ([`assumed_role_principal`], [`ROLE_SESSION_NAME`]).
+//!
 //! Nothing here writes: it asks IAM what it holds about the role and states a sentence.
 
 use super::PlaneContext;
@@ -97,8 +102,9 @@ pub fn assumed_role_principal(role_arn: &str) -> String {
 const ROLE_RESOURCE_PREFIX: &str = "role/";
 
 /// The name of the role SESSION AppSync makes a data source's calls under, which a refusal
-/// naming the session principal carries.
-const ROLE_SESSION_NAME: &str = "APPSYNC_ASSUME_ROLE";
+/// naming the session principal carries — and the name the session a signed call is MADE with is
+/// opened under ([`super::role_session`]), so one name answers both.
+pub const ROLE_SESSION_NAME: &str = "APPSYNC_ASSUME_ROLE";
 
 /// The partition a role ARN this emulator cannot parse is named under.
 const DEFAULT_PARTITION: &str = "aws";
