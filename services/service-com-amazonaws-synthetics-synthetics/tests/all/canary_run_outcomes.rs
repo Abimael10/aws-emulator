@@ -22,6 +22,14 @@
 //!
 //! 3. **A state-transition refusal names the transition and the canary's current state, and
 //!    no identifier.** One sentence for `StartCanary`, `StopCanary` and `DeleteCanary`.
+//!
+//! 4. **The whole one-shot lifecycle, rules 1 and 2 together.** Each `StartCanary` of a
+//!    run-once canary opens exactly ONE run; that run reaches the verdict its own work
+//!    produced, with a timeline whose `Completed` is at or after its `Started`; and the
+//!    canary then settles back to `STOPPED` by itself — no `StopCanary` is involved —
+//!    whatever that verdict was, because a run's verdict is not a canary create or update
+//!    failure (`CanaryStatus$StateReasonCode`: "If the canary creation or update failed,
+//!    this field displays the reason code").
 
 use serde_json::{json, Value};
 
@@ -430,6 +438,274 @@ async fn a_canary_stops_itself_only_when_its_schedule_runs_it_once() {
             );
             ok(&format!("{case}/stop"), aws.stop(name).await);
         }
+    }
+}
+
+/// The two expressions the model documents as running a canary once.
+/// `CanaryScheduleOutput$Expression`: "Specifying `rate(0 minute)` or `rate(0 hour)` is a
+/// special value that causes the canary to run only once when it is started."
+const RUN_ONCE_EXPRESSIONS: [&str; 2] = ["rate(0 minute)", "rate(0 hour)"];
+
+/// One row of the one-shot table below: a canary on a run-once schedule, the artifact
+/// location and the grant its run is judged by, and the verdict that work therefore
+/// produces.
+struct OneShot {
+    case: &'static str,
+    /// The canary's name, which is also the folder its artifacts are stored under.
+    name: &'static str,
+    /// Which of [`RUN_ONCE_EXPRESSIONS`] the schedule is written with, by index.
+    spelling: usize,
+    /// The artifact location the canary writes to, in the suite's bucket.
+    location: String,
+    /// The inline permissions policy the execution role carries.
+    statements: Value,
+    /// Whether the run therefore passes.
+    passes: bool,
+}
+
+/// Every run the canary's history holds, once there are `expected` of them and none is still
+/// `RUNNING`: the condition is waited OUT rather than slept for, so no assertion below
+/// depends on how fast the host runs.
+async fn settled_runs(aws: &Synthetics, case: &str, name: &str, expected: usize) -> Vec<Value> {
+    let answer = poll_until(
+        &format!("{case}/runs"),
+        || aws.runs(name, json!({ "RunType": "CANARY_RUN" })),
+        |answer: &Answer| {
+            let listed = answer.at("CanaryRuns").as_array().cloned().unwrap_or_default();
+            listed.len() == expected
+                && listed.iter().all(|run| {
+                    run["Status"]["State"]
+                        .as_str()
+                        .is_some_and(|state| state != "RUNNING")
+                })
+        },
+    )
+    .await;
+    answer
+        .at("CanaryRuns")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// What a FINISHED run reports: the verdict its own work produced, the failure-only fields
+/// only when that verdict is a failure, and a timeline that closes at or after it opened.
+fn assert_finished_run(case: &str, run: &Value, passes: bool) {
+    let expected_state = if passes { "PASSED" } else { "FAILED" };
+    assert_eq!(
+        run["Status"]["State"].as_str(),
+        Some(expected_state),
+        "case {case}: expected {expected_state}, got {:?}",
+        run["Status"]
+    );
+    if passes {
+        assert!(
+            run["Status"]["StateReason"].is_null() && run["Status"]["StateReasonCode"].is_null(),
+            "case {case}: the failure-only fields belong to a run that failed, got {:?}",
+            run["Status"]
+        );
+    } else {
+        assert_eq!(
+            run["Status"]["StateReasonCode"].as_str(),
+            Some("EXECUTION_FAILURE"),
+            "case {case}: expected EXECUTION_FAILURE, got {:?}",
+            run["Status"]
+        );
+        assert!(
+            run["Status"]["StateReason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "case {case}: expected a reason for the failure, got {:?}",
+            run["Status"]
+        );
+    }
+    let started = run["Timeline"]["Started"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {case}: expected a Started instant, got {run}"));
+    let completed = run["Timeline"]["Completed"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {case}: expected a Completed instant, got {run}"));
+    assert!(
+        completed >= started,
+        "case {case}: expected Completed at or after Started, got {completed} and {started}"
+    );
+}
+
+/// Wait for the canary to settle back out of `RUNNING` on its own, and assert what the
+/// settled record reports: the terminal state, a stop instant at or after the start instant,
+/// and no canary-level failure, whatever its run came to.
+async fn assert_stops_itself(aws: &Synthetics, case: &str, name: &str) {
+    let canary = poll_until(
+        &format!("{case}/stopped"),
+        || aws.get(name),
+        |answer: &Answer| answer.string_at("Canary.Status.State") == "STOPPED",
+    )
+    .await;
+    assert_eq!(
+        canary.string_at("Canary.Status.State"),
+        "STOPPED",
+        "case {case}: expected a run-once canary to settle to STOPPED with no StopCanary \
+         call, got {:?}",
+        canary.at("Canary.Status")
+    );
+    // A run's verdict is not a canary create or update failure, so the canary reports no
+    // reason for having finished its one run — whether that run passed or failed.
+    assert!(
+        canary.at("Canary.Status.StateReason").is_null()
+            && canary.at("Canary.Status.StateReasonCode").is_null(),
+        "case {case}: expected no canary-level failure on a canary that ran, got {:?}",
+        canary.at("Canary.Status")
+    );
+    let last_started = canary
+        .at("Canary.Timeline.LastStarted")
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {case}: expected LastStarted, got {:?}", canary.body));
+    let last_stopped = canary
+        .at("Canary.Timeline.LastStopped")
+        .as_f64()
+        .unwrap_or_else(|| panic!("case {case}: expected LastStopped, got {:?}", canary.body));
+    assert!(
+        last_stopped >= last_started,
+        "case {case}: expected LastStopped at or after LastStarted, got {last_stopped} and \
+         {last_started}"
+    );
+}
+
+/// RULE: a `StartCanary` of a canary whose schedule runs it ONCE opens exactly one run, that
+/// run records the verdict its own work produced with a timeline that closes at or after it
+/// opened, and the canary then settles back to `STOPPED` by itself — whatever the verdict —
+/// so the one-shot lifecycle completes and can be driven again.
+///
+/// The rows differ along what the rule generalises over: which of the two documented
+/// run-once spellings the schedule uses, the form of the artifact location, the form of the
+/// grant the execution role carries, and the verdict the run therefore reaches (so both
+/// members of `CanaryRunState`'s terminal pair).
+#[tokio::test]
+async fn a_run_once_canary_records_its_runs_verdict_and_then_stops_itself() {
+    let (aws, iam, s3) = Synthetics::with_account_services(REGION);
+    create_bucket(&s3).await;
+
+    let rows = [
+        OneShot {
+            case: "run once in minutes, every action allowed, bucket only",
+            name: "one-shot-bare",
+            spelling: 0,
+            location: format!("s3://{BUCKET}"),
+            statements: json!([statement("Allow", json!("*"), json!("*"))]),
+            passes: true,
+        },
+        OneShot {
+            case: "run once in hours, the write allowed under the location's own prefix",
+            name: "one-shot-nested",
+            spelling: 1,
+            location: format!("s3://{BUCKET}/team/one-shot"),
+            statements: json!([statement(
+                "Allow",
+                json!(ARTIFACT_WRITE_ACTION),
+                json!(format!("arn:aws:s3:::{BUCKET}/team/one-shot/*")),
+            )]),
+            passes: true,
+        },
+        OneShot {
+            case: "run once in minutes, the write allowed on the bucket's objects",
+            name: "one-shot-trailing",
+            spelling: 0,
+            location: format!("s3://{BUCKET}/one-shot-trailing/"),
+            statements: json!([statement(
+                "Allow",
+                json!(ARTIFACT_WRITE_ACTION),
+                json!(format!("arn:aws:s3:::{BUCKET}/*")),
+            )]),
+            passes: true,
+        },
+        OneShot {
+            case: "run once in hours, a role carrying no permissions at all",
+            name: "one-shot-no-grant",
+            spelling: 1,
+            location: format!("s3://{BUCKET}/one-shot-no-grant"),
+            statements: json!([]),
+            passes: false,
+        },
+        OneShot {
+            case: "run once in minutes, the write denied outright",
+            name: "one-shot-denied",
+            spelling: 0,
+            location: format!("s3://{BUCKET}/one-shot-denied"),
+            statements: json!([
+                statement("Allow", json!("*"), json!("*")),
+                statement(
+                    "Deny",
+                    json!(ARTIFACT_WRITE_ACTION),
+                    json!(format!("arn:aws:s3:::{BUCKET}/*")),
+                ),
+            ]),
+            passes: false,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let schedule = RUN_ONCE_EXPRESSIONS[row.spelling];
+        let role = create_role(&iam, &format!("{}-role", row.name), row.statements).await;
+        ready_canary(
+            &aws,
+            case,
+            canary_body(row.name, &role, &row.location, schedule),
+        )
+        .await;
+
+        // The start is the only call that moves the canary: nothing below stops it.
+        ok(&format!("{case}/start"), aws.start(row.name).await);
+        let runs = settled_runs(&aws, case, row.name, 1).await;
+        assert_eq!(
+            runs.len(),
+            1,
+            "case {case}: expected one start to open exactly one run, got {runs:?}"
+        );
+        assert_finished_run(case, &runs[0], row.passes);
+
+        // The artifact the run is judged by: stored where the location says, or nowhere at
+        // all when the role withheld the write.
+        let run_id = runs[0]["Id"].as_str().unwrap_or_default().to_string();
+        let prefix = row
+            .location
+            .strip_prefix(&format!("s3://{BUCKET}"))
+            .unwrap_or_default()
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        let folder = if prefix.is_empty() {
+            format!("{}/{run_id}", row.name)
+        } else {
+            format!("{prefix}/{}/{run_id}", row.name)
+        };
+        let keys = keys_under(&s3, &folder).await;
+        let expected_keys: Vec<String> = if row.passes {
+            vec![format!("{folder}/{REPORT_OBJECT}")]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            keys, expected_keys,
+            "case {case}: expected {expected_keys:?} under {folder}, got {keys:?}"
+        );
+
+        assert_stops_itself(&aws, case, row.name).await;
+
+        // The one-shot lifecycle is repeatable: a canary that stopped itself starts again,
+        // and that start opens one more run — never a second run of the first start.
+        ok(&format!("{case}/restart"), aws.start(row.name).await);
+        let runs = settled_runs(&aws, case, row.name, 2).await;
+        assert_eq!(
+            runs.len(),
+            2,
+            "case {case}: expected a second start to open one more run, got {runs:?}"
+        );
+        assert_finished_run(case, &runs[0], row.passes);
+        assert_ne!(
+            runs[0]["Id"], runs[1]["Id"],
+            "case {case}: expected two runs with ids of their own, got {runs:?}"
+        );
+        assert_stops_itself(&aws, case, row.name).await;
     }
 }
 
