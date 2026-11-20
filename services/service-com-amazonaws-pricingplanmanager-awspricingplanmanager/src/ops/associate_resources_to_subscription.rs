@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateResourcesToSubscription
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateResourcesToSubscription`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateResourcesToSubscription::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the resources a request names to a subscription already in service: the record's
+//! `resourceArns` grows by the ones it does not cover yet, in the order the request named
+//! them, and the answer is the stored record plus its new `ETag`.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,157 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateResourcesToSubscription` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateResourcesToSubscriptionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateResourcesToSubscription"))
+        // The ARN's syntax is checked before the store is reached and before the
+        // `If-Match` header and the named resources are weighed: a value that is not a
+        // subscription ARN is a malformed request, not a subscription that is absent.
+        if !crate::state::is_subscription_arn(&input.arn) {
+            return Err(
+                AssociateResourcesToSubscriptionErrorModeled::ValidationException(
+                    crate::state::invalid_subscription_arn(&input.arn),
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AssociateResourcesToSubscriptionErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::STORE_UNAVAILABLE_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let AssociateResourcesToSubscriptionInput {
+            arn,
+            resource_arns,
+            if_match,
+            client_token: _,
+        } = input;
+
+        let now = crate::state::now();
+        let region = crate::state::request_region(ctx);
+
+        // What the subscription would be left covering decides the request: its status and
+        // any change already pending on it, the resources it already covers, and the
+        // modelled maximum for the set. Read under the guard — which is then DROPPED,
+        // because the eligibility gate below asks another service and no lock of this store
+        // may be held across that call.
+        let (plan_family, plan_tier, covering) = {
+            let mut store = state.lock();
+            store.apply_due_changes(now);
+            let record = resolve(&mut store, &arn, &if_match)?;
+            let covering = match crate::state::plan_resource_addition(record, &resource_arns) {
+                Ok(covering) => covering,
+                Err(refusal) => return Err(refused(refusal, &arn)),
+            };
+            (
+                record.plan_family.clone(),
+                record.plan_tier.clone(),
+                covering,
+            )
+        };
+
+        // Whether a resource may join this subscription's PLAN is the other question, and
+        // it is asked of the set the subscription WOULD cover: a distribution being added
+        // is eligible when a web ACL the subscription already covers fronts it, exactly as
+        // it would have been had the same resources been named at create time. Only the
+        // resources THIS request names can be refused — what the subscription already
+        // covers was admitted when it joined.
+        let ineligible = crate::state::ineligible_resources(
+            ctx,
+            &region,
+            &plan_family,
+            &plan_tier,
+            &covering,
+        )
+        .await;
+        let ineligible: Vec<String> = resource_arns
+            .iter()
+            .filter(|named| ineligible.contains(named))
+            .cloned()
+            .collect();
+        if !ineligible.is_empty() {
+            return Err(
+                AssociateResourcesToSubscriptionErrorModeled::ValidationException(
+                    ValidationException {
+                        message: crate::state::ineligible_resources_message(&ineligible),
+                        // "The identifier of the resource that failed validation" — which
+                        // is a single resource only when exactly one failed; the message
+                        // carries the whole list either way.
+                        resource_id: match ineligible.as_slice() {
+                            [only] => Some(only.clone()),
+                            _ => None,
+                        },
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // Up to the clock first, exactly as the read above was: a change that fell due
+        // while the gate ran has happened, with or without this call.
+        store.apply_due_changes(crate::state::now());
+        // The eTag moves on every write, so a record that still answers to the caller's
+        // `If-Match` is the one read above, unchanged while the gate ran.
+        let record = resolve(&mut store, &arn, &if_match)?;
+        // The answer carries "the details of the subscription with the newly added
+        // resources", so the addition is applied before it is reported, and the
+        // subscription reports the status of a change that is being applied until the
+        // clock says the change has taken effect.
+        record.resource_arns = covering;
+        record.begin_sync(now);
+
+        Ok(AssociateResourcesToSubscriptionOutput {
+            subscription: record.to_subscription(),
+            e_tag: record.etag(),
+        })
     }
+}
+
+/// The subscription `arn` names, for a caller holding `if_match`, or this operation's
+/// modelled refusal: 404 for an ARN the store does not hold, 400 for an entity tag the
+/// service has not issued for it.
+fn resolve<'store>(
+    store: &'store mut crate::state::ComAmazonawsPricingplanmanagerAwspricingplanmanagerState,
+    arn: &str,
+    if_match: &str,
+) -> Result<&'store mut crate::state::SubscriptionRecord, AssociateResourcesToSubscriptionError> {
+    store.resolve_for_mutation(arn, if_match).map_err(|failure| {
+        match failure {
+            crate::state::PreconditionFailure::NotFound => {
+                AssociateResourcesToSubscriptionErrorModeled::ResourceNotFoundException(
+                    crate::state::subscription_not_found(arn),
+                )
+            }
+            crate::state::PreconditionFailure::ETagMismatch => {
+                AssociateResourcesToSubscriptionErrorModeled::ValidationException(
+                    crate::state::stale_etag(if_match),
+                )
+            }
+        }
+        .into()
+    })
+}
+
+/// This operation's answer to a resource change the rule refuses: the conflict for a
+/// request the record's own pending state refuses, the business-rule failure for one its
+/// resources or its timing refuse — the same classes `DisassociateResourcesFromSubscription`
+/// answers, because it is the same rule.
+fn refused(
+    refusal: crate::state::ResourceChangeRefusal,
+    arn: &str,
+) -> AssociateResourcesToSubscriptionError {
+    match refusal.into_modelled(arn) {
+        crate::state::ResourceChangeError::Conflict(conflict) => {
+            AssociateResourcesToSubscriptionErrorModeled::ConflictException(conflict)
+        }
+        crate::state::ResourceChangeError::Validation(validation) => {
+            AssociateResourcesToSubscriptionErrorModeled::ValidationException(validation)
+        }
+    }
+    .into()
 }

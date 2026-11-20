@@ -19,8 +19,9 @@ use crate::ops::types::{
     STATUS_VALUES,
 };
 
-/// Whether the resources a subscription names are eligible for the plan family it asks
-/// for — a question about state ANOTHER service holds, so it lives on its own.
+/// Whether the resources a subscription names are eligible for the plan — its family and
+/// its tier — that it asks for; the family half is a question about state ANOTHER service
+/// holds, so it lives on its own.
 pub mod resource_eligibility;
 
 /// Which resource set a stored subscription may hold, and how a change to it is refused —
@@ -32,8 +33,9 @@ pub use resource_eligibility::{
 };
 
 pub use subscription_resources::{
-    is_required_resource, plan_resource_removal, required_resources_message,
-    ResourceChangeError, ResourceChangeRefusal, RESOURCE_CHANGE_STATUS,
+    is_required_resource, plan_resource_addition, plan_resource_removal,
+    required_resources_message, ResourceChangeError, ResourceChangeRefusal,
+    RESOURCE_CHANGE_STATUS,
 };
 
 /// The region an unsigned request is served in. A signed request carries its own
@@ -61,6 +63,14 @@ pub const MAX_SUBSCRIPTIONS: usize = 200;
 /// service's own choice; it is bounded so paging is real — a store larger than one
 /// page is handed back across several pages joined by `nextToken`.
 pub const LIST_PAGE_SIZE: usize = 10;
+
+/// How many resources ONE subscription covers.
+///
+/// Modelled, not chosen: `Subscription$resourceArns` and every input that writes it
+/// target `ResourceArns`, `@length(min: 1, max: 10)` — "A list of 1 to 10 resource ARNs
+/// to include in the subscription" (`smithy_query(query="shape", shape="ResourceArns")`)
+/// — so a subscription covering more resources than this could not be reported at all.
+pub const MAX_SUBSCRIPTION_RESOURCES: usize = 10;
 
 /// The published plan tiers, lowest to highest.
 ///

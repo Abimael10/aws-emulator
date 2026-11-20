@@ -14,8 +14,9 @@
 //! So a request that changes the set is weighed against the set it would LEAVE BEHIND
 //! rather than against the resources it names — a subscription covering two resources of a
 //! required kind may lose one of them, because what is left still satisfies the family's
-//! composition. It is admitted only when the subscription still covers a resource of every
-//! kind its plan family requires and at least one resource at all,
+//! composition, and a subscription may grow only while the set it would end up with still
+//! fits the modelled list. It is admitted only when the subscription still covers a
+//! resource of every kind its plan family requires and at least one resource at all,
 //! and only while the subscription's own state admits a change — "The subscription must be
 //! in an active state that is not pending other changes"
 //! (`smithy_query(query="doc", shape="AssociateResourcesToSubscription")`), and
@@ -33,7 +34,7 @@
 //! resource ARN in exactly one place.
 
 use super::resource_eligibility::{distribution_id, names_a_web_acl, CLOUDFRONT_PLAN_FAMILY};
-use super::{scheduled_change_pending, Status, SubscriptionRecord};
+use super::{scheduled_change_pending, Status, SubscriptionRecord, MAX_SUBSCRIPTION_RESOURCES};
 use crate::ops::types::{ConflictException, ValidationException};
 
 /// The status in which a subscription's resource set may be changed: the one in which
@@ -135,10 +136,16 @@ pub enum ResourceChangeRefusal {
     /// The request named a resource the subscription does not cover, so there is nothing
     /// of that name to remove.
     NotAssociated(String),
+    /// The request named a resource the subscription already covers, so there is nothing
+    /// of that name to add.
+    AlreadyAssociated(String),
     /// The request named resources the subscription's plan family requires it keep.
     Required(Vec<String>),
     /// The change would leave the subscription covering no resource at all.
     LeavesNoResources,
+    /// The change would leave the subscription covering more resources than one
+    /// subscription may hold: it covers `covered` and the request adds `adding`.
+    TooManyResources { covered: usize, adding: usize },
 }
 
 /// The modelled error a [`ResourceChangeRefusal`] is answered with: the conflict for a
@@ -181,6 +188,15 @@ impl ResourceChangeRefusal {
                     resource_id: Some(resource),
                 })
             }
+            Self::AlreadyAssociated(resource) => {
+                ResourceChangeError::Validation(ValidationException {
+                    message: format!(
+                        "Cannot add {resource} to subscription {arn}: the resource is \
+                         already associated with this subscription."
+                    ),
+                    resource_id: Some(resource),
+                })
+            }
             Self::Required(required) => ResourceChangeError::Validation(ValidationException {
                 message: required_resources_message(&required),
                 resource_id: match required.as_slice() {
@@ -195,6 +211,16 @@ impl ResourceChangeRefusal {
                 ),
                 resource_id: Some(arn.to_string()),
             }),
+            Self::TooManyResources { covered, adding } => {
+                ResourceChangeError::Validation(ValidationException {
+                    message: format!(
+                        "Cannot change the resources of subscription {arn}: it covers \
+                         {covered} and the request adds {adding}; a subscription must \
+                         include at most {MAX_SUBSCRIPTION_RESOURCES} resources."
+                    ),
+                    resource_id: Some(arn.to_string()),
+                })
+            }
         }
     }
 }
@@ -252,6 +278,54 @@ pub fn plan_resource_removal(
         return Err(ResourceChangeRefusal::LeavesNoResources);
     }
     Ok(retained)
+}
+
+/// The resource set `record` is left with once the resources `requested` names are added,
+/// or why that addition is refused.
+///
+/// The mirror of [`plan_resource_removal`], and the same shape of answer: what decides the
+/// request is the set it would leave the subscription covering, so the rule holds for one
+/// resource or for ten, named in any order, and the caller writes the returned set back
+/// only on the success arm. A resource the subscription already covers is nothing this call
+/// can add, exactly as one it does not cover is nothing a removal can take off; a resource
+/// the request names twice names one resource.
+///
+/// Whether a resource may join this subscription's PLAN is a different question, and one
+/// that may need another service's answer: [`super::resource_eligibility`] owns it.
+pub fn plan_resource_addition(
+    record: &SubscriptionRecord,
+    requested: &[String],
+) -> Result<Vec<String>, ResourceChangeRefusal> {
+    if record.status != RESOURCE_CHANGE_STATUS {
+        return Err(ResourceChangeRefusal::Status(record.status));
+    }
+    // "The subscription must be in an active state that is not pending other changes" — a
+    // subscription with a downgrade or a cancellation already scheduled is pending one.
+    if record.scheduled_change.is_some() {
+        return Err(ResourceChangeRefusal::ChangePending);
+    }
+    // In the order the request named them, so a caller reading the refusal sees its own
+    // list's entries in its own order.
+    for resource in requested {
+        if record.resource_arns.iter().any(|held| held == resource) {
+            return Err(ResourceChangeRefusal::AlreadyAssociated(resource.clone()));
+        }
+    }
+    let mut covering = record.resource_arns.clone();
+    for resource in requested {
+        if !covering.iter().any(|held| held == resource) {
+            covering.push(resource.clone());
+        }
+    }
+    // `resourceArns` is `@length(max: 10)` on the shape a subscription is REPORTED through,
+    // so a set larger than that is not a subscription this service could answer with.
+    if covering.len() > MAX_SUBSCRIPTION_RESOURCES {
+        return Err(ResourceChangeRefusal::TooManyResources {
+            covered: record.resource_arns.len(),
+            adding: covering.len() - record.resource_arns.len(),
+        });
+    }
+    Ok(covering)
 }
 
 #[cfg(test)]
@@ -499,6 +573,206 @@ mod tests {
             let expected = case
                 .expected
                 .map(|retained| retained.iter().map(|arn| (*arn).to_string()).collect());
+            assert_eq!(
+                actual, expected,
+                "case {:?}: expected {expected:?}, got {actual:?}",
+                case.label
+            );
+        }
+    }
+
+    /// An addition is weighed against the set it would leave the subscription covering:
+    /// the named resources go on the end in request order, a repeat inside one request
+    /// names one resource, a resource the subscription already covers is nothing to add,
+    /// the set never grows past the modelled maximum, and a subscription that is not
+    /// active, or that is pending a change of its own, refuses the change outright.
+    #[test]
+    fn an_addition_is_weighed_against_the_set_it_would_leave_covered() {
+        struct Case {
+            label: &'static str,
+            plan_family: &'static str,
+            held: &'static [&'static str],
+            status: Status,
+            /// Whether the subscription already has a change scheduled on it.
+            scheduled: bool,
+            added: &'static [&'static str],
+            expected: Result<&'static [&'static str], ResourceChangeRefusal>,
+        }
+
+        /// A stored set of exactly [`MAX_SUBSCRIPTION_RESOURCES`] resources, and one of
+        /// one short of it, so the rows below walk the modelled bound.
+        const FULL: &[&str] = &[
+            DISTRIBUTION,
+            WEB_ACL,
+            "arn:aws:route53:::hostedzone/Z1",
+            "arn:aws:route53:::hostedzone/Z2",
+            "arn:aws:route53:::hostedzone/Z3",
+            "arn:aws:route53:::hostedzone/Z4",
+            "arn:aws:route53:::hostedzone/Z5",
+            "arn:aws:route53:::hostedzone/Z6",
+            "arn:aws:route53:::hostedzone/Z7",
+            "arn:aws:route53:::hostedzone/Z8",
+        ];
+        const ALMOST_FULL: &[&str] = &[
+            DISTRIBUTION,
+            WEB_ACL,
+            "arn:aws:route53:::hostedzone/Z1",
+            "arn:aws:route53:::hostedzone/Z2",
+            "arn:aws:route53:::hostedzone/Z3",
+            "arn:aws:route53:::hostedzone/Z4",
+            "arn:aws:route53:::hostedzone/Z5",
+            "arn:aws:route53:::hostedzone/Z6",
+            "arn:aws:route53:::hostedzone/Z7",
+        ];
+
+        let cases = [
+            Case {
+                label: "one optional resource joins the CloudFront pair",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL],
+                status: Status::Active,
+                scheduled: false,
+                added: &[HOSTED_ZONE],
+                expected: Ok(&[DISTRIBUTION, WEB_ACL, HOSTED_ZONE]),
+            },
+            Case {
+                label: "two resources at once, in the order the request names them",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL],
+                status: Status::Active,
+                scheduled: false,
+                added: &[KEY_VALUE_STORE, HOSTED_ZONE],
+                expected: Ok(&[DISTRIBUTION, WEB_ACL, KEY_VALUE_STORE, HOSTED_ZONE]),
+            },
+            Case {
+                label: "a second distribution of a CloudFront subscription",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL],
+                status: Status::Active,
+                scheduled: false,
+                added: &[SECOND_DISTRIBUTION],
+                expected: Ok(&[DISTRIBUTION, WEB_ACL, SECOND_DISTRIBUTION]),
+            },
+            Case {
+                label: "a resource named twice names one resource",
+                plan_family: "Route53",
+                held: &[HOSTED_ZONE],
+                status: Status::Active,
+                scheduled: false,
+                added: &[KEY_VALUE_STORE, KEY_VALUE_STORE],
+                expected: Ok(&[HOSTED_ZONE, KEY_VALUE_STORE]),
+            },
+            Case {
+                label: "a resource the subscription already covers",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL],
+                status: Status::Active,
+                scheduled: false,
+                added: &[WEB_ACL],
+                expected: Err(ResourceChangeRefusal::AlreadyAssociated(
+                    WEB_ACL.to_string(),
+                )),
+            },
+            Case {
+                label: "an already covered resource named behind a new one",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL],
+                status: Status::Active,
+                scheduled: false,
+                added: &[HOSTED_ZONE, DISTRIBUTION],
+                expected: Err(ResourceChangeRefusal::AlreadyAssociated(
+                    DISTRIBUTION.to_string(),
+                )),
+            },
+            Case {
+                label: "the last resource the subscription has room for",
+                plan_family: "CloudFront",
+                held: ALMOST_FULL,
+                status: Status::Active,
+                scheduled: false,
+                added: &[KEY_VALUE_STORE],
+                expected: Ok(&[
+                    DISTRIBUTION,
+                    WEB_ACL,
+                    "arn:aws:route53:::hostedzone/Z1",
+                    "arn:aws:route53:::hostedzone/Z2",
+                    "arn:aws:route53:::hostedzone/Z3",
+                    "arn:aws:route53:::hostedzone/Z4",
+                    "arn:aws:route53:::hostedzone/Z5",
+                    "arn:aws:route53:::hostedzone/Z6",
+                    "arn:aws:route53:::hostedzone/Z7",
+                    KEY_VALUE_STORE,
+                ]),
+            },
+            Case {
+                label: "one resource past the modelled maximum",
+                plan_family: "CloudFront",
+                held: FULL,
+                status: Status::Active,
+                scheduled: false,
+                added: &[KEY_VALUE_STORE],
+                expected: Err(ResourceChangeRefusal::TooManyResources {
+                    covered: MAX_SUBSCRIPTION_RESOURCES,
+                    adding: 1,
+                }),
+            },
+            Case {
+                label: "two resources where there is room for one",
+                plan_family: "CloudFront",
+                held: ALMOST_FULL,
+                status: Status::Active,
+                scheduled: false,
+                added: &[KEY_VALUE_STORE, HOSTED_ZONE],
+                expected: Err(ResourceChangeRefusal::TooManyResources {
+                    covered: MAX_SUBSCRIPTION_RESOURCES - 1,
+                    adding: 2,
+                }),
+            },
+            Case {
+                label: "a subscription waiting for approval",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL],
+                status: Status::PendingApproval,
+                scheduled: false,
+                added: &[HOSTED_ZONE],
+                expected: Err(ResourceChangeRefusal::Status(Status::PendingApproval)),
+            },
+            Case {
+                label: "a subscription applying a change",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL],
+                status: Status::SyncInProgress,
+                scheduled: false,
+                added: &[HOSTED_ZONE],
+                expected: Err(ResourceChangeRefusal::Status(Status::SyncInProgress)),
+            },
+            Case {
+                label: "a failed subscription",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL],
+                status: Status::Failed,
+                scheduled: false,
+                added: &[HOSTED_ZONE],
+                expected: Err(ResourceChangeRefusal::Status(Status::Failed)),
+            },
+            Case {
+                label: "a subscription with a change already scheduled",
+                plan_family: "CloudFront",
+                held: &[DISTRIBUTION, WEB_ACL],
+                status: Status::Active,
+                scheduled: true,
+                added: &[HOSTED_ZONE],
+                expected: Err(ResourceChangeRefusal::ChangePending),
+            },
+        ];
+
+        for case in cases {
+            let subject = record(case.plan_family, case.held, case.status, case.scheduled);
+            let requested: Vec<String> = case.added.iter().map(|arn| (*arn).to_string()).collect();
+            let actual = plan_resource_addition(&subject, &requested);
+            let expected = case
+                .expected
+                .map(|covering| covering.iter().map(|arn| (*arn).to_string()).collect());
             assert_eq!(
                 actual, expected,
                 "case {:?}: expected {expected:?}, got {actual:?}",

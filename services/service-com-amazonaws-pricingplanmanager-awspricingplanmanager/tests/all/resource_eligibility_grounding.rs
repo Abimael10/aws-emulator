@@ -14,6 +14,10 @@
 //! by nothing, one CloudFront does not hold — needs CloudFront and WAFv2 beside this
 //! service and lives in `core/router/tests/all/pricing_plan_subscription_resource_eligibility.rs`.
 //!
+//! The eligibility question the plan TIER answers needs no owning service, so it is not
+//! this suite's subject: each row below asks for a tier that covers the resources it
+//! names, and the tier gate itself is a table in `subscription_lifecycle`.
+//!
 //! The rows differ along what the rule generalises over: the plan family, and the vendors,
 //! resource types and count of the resources one request names.
 
@@ -83,47 +87,56 @@ async fn a_subscription_is_created_where_no_owning_service_can_be_asked() {
     let hosted_zone = format!("arn:aws:route53::{ACCOUNT}:hostedzone/Z1EXAMPLE1EXAMPLE");
     let key_value_store = format!("arn:aws:cloudfront::{ACCOUNT}:key-value-store/kvs-1");
 
-    // (case, plan family, the resources the request names)
-    let rows: [(&str, &str, Vec<String>); 6] = [
+    // (case, plan family, plan tier, the resources the request names)
+    let rows: [(&str, &str, &str, Vec<String>); 6] = [
         (
             "the CloudFront family over a distribution and a web ACL",
             "CloudFront",
+            "FREE",
             vec![distribution.clone(), web_acl.clone()],
         ),
         (
             "the CloudFront family over a distribution alone",
             "CloudFront",
+            "FREE",
             vec![distribution.clone()],
         ),
         (
             "the CloudFront family over two distributions and a web ACL",
             "CloudFront",
+            "FREE",
             vec![distribution.clone(), second.clone(), web_acl.clone()],
         ),
         (
+            // A KeyValueStore is covered from a paid tier up, so the tier this row asks
+            // for is one that covers it: what the row is about is that no CloudFront is
+            // asked about a resource of that vendor which is not a distribution.
             "the CloudFront family over another resource of that vendor",
             "CloudFront",
+            "PRO",
             vec![key_value_store.clone(), web_acl.clone()],
         ),
         (
             "the family named in lower case, over a distribution alone",
             "cloudfront",
+            "FREE",
             vec![distribution.clone()],
         ),
         (
             "another plan family over a hosted zone",
             "Route53",
+            "FREE",
             vec![hosted_zone.clone()],
         ),
     ];
 
-    for (case, family, resources) in &rows {
+    for (case, family, tier, resources) in &rows {
         let (status, created) = call(
             &router,
             "CreateSubscription",
             &json!({
                 "planFamily": family,
-                "planTier": "FREE",
+                "planTier": tier,
                 "resourceArns": resources,
                 "approvalMode": "IMMEDIATE",
             }),

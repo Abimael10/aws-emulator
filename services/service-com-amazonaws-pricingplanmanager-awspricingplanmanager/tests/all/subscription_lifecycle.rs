@@ -21,7 +21,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_pricingplanmanager_awspricingplanmanager::state::{
     format_date_time, parse_date_time,
     ComAmazonawsPricingplanmanagerAwspricingplanmanagerState as ServiceState, LIST_PAGE_SIZE,
-    MAX_SUBSCRIPTIONS, PLAN_TIERS_ASCENDING,
+    MAX_SUBSCRIPTIONS, MAX_SUBSCRIPTION_RESOURCES, PLAN_TIERS_ASCENDING,
 };
 
 // The HTTP harness is `subscription_wire_form`'s — the ONE harness of this crate's
@@ -302,6 +302,11 @@ async fn if_match_is_enforced_by_every_mutating_operation() {
             operation: "ApprovePaidSubscription",
             approval: Some("MANUAL"),
             extra: || json!({}),
+        },
+        Case {
+            operation: "AssociateResourcesToSubscription",
+            approval: Some("IMMEDIATE"),
+            extra: || json!({"resourceArns": ["arn:aws:route53:::hostedzone/Z1IFMATCH"]}),
         },
     ];
 
@@ -1006,6 +1011,28 @@ async fn bad_requests_are_refused_with_the_modelled_error() {
             code: "ResourceNotFoundException",
         },
         Case {
+            label: "an arn the store does not hold, adding resources",
+            operation: "AssociateResourcesToSubscription",
+            body: json!({
+                "arn": absent_arn.clone(),
+                "resourceArns": ["arn:aws:route53:::hostedzone/Z1EXAMPLE"],
+            }),
+            if_match: Some("1"),
+            status: 404,
+            code: "ResourceNotFoundException",
+        },
+        Case {
+            label: "an arn that is not a subscription ARN, adding resources",
+            operation: "AssociateResourcesToSubscription",
+            body: json!({
+                "arn": "subscription/not-an-arn",
+                "resourceArns": ["arn:aws:route53:::hostedzone/Z1EXAMPLE"],
+            }),
+            if_match: Some("1"),
+            status: 400,
+            code: "ValidationException",
+        },
+        Case {
             label: "a nextToken this service never issued",
             operation: "ListSubscriptions",
             body: json!({"nextToken": "not-a-token-this-service-issued"}),
@@ -1329,6 +1356,693 @@ async fn a_page_token_survives_the_deletion_of_the_record_it_resumes_after() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Associate: the resources a subscription covers
+// ---------------------------------------------------------------------------
+
+/// `AssociateResourcesToSubscription(arn, resources)` under `if_match`.
+///
+/// The ARN builders this section's rows use — `distribution`, `web_acl`, `hosted_zone`,
+/// `key_value_store` — and the body builder `create_body_naming` and the settle poll
+/// `poll_until_active` are the disassociation section's, so the suite keeps ONE of each.
+async fn associate(
+    router: &MultiServiceRouter,
+    arn: &str,
+    resources: &[String],
+    if_match: &str,
+) -> Answer {
+    call(
+        router,
+        "AssociateResourcesToSubscription",
+        json!({"arn": arn, "resourceArns": resources}),
+        Some(if_match),
+    )
+    .await
+}
+
+/// What `GetSubscription` reports for `arn`: `(the body, the ETag)`.
+async fn read_back(router: &MultiServiceRouter, arn: &str, case: &str) -> (Value, String) {
+    let read = call(router, "GetSubscription", json!({"arn": arn}), None).await;
+    assert_eq!(
+        read.status, 200,
+        "case {case}: GetSubscription must answer the stored subscription, got {} {:?}",
+        read.status, read.body
+    );
+    let etag = read.require_etag(case);
+    (read.body, etag)
+}
+
+/// The resources a request names JOIN the subscription: they go onto the stored set in the
+/// order the request named them, the answer reports the change as being applied, a read
+/// reports exactly what was stored, and the subscription settles back to `ACTIVE` on the
+/// clock still covering the whole set.
+///
+/// The rows differ along everything the rule generalises over — the plan family and tier,
+/// which resources the subscription already covers and how many, how many join and in which
+/// order, the vendor and type of each one, and a resource the request names twice.
+#[tokio::test]
+async fn associated_resources_join_the_subscription_and_read_back() {
+    struct Case {
+        label: &'static str,
+        family: &'static str,
+        tier: &'static str,
+        /// The resources the subscription is created over.
+        held: Vec<String>,
+        /// The resources the request names.
+        named: Vec<String>,
+        /// The set the subscription must cover afterwards, in order.
+        covering: Vec<String>,
+    }
+
+    let dist = distribution("E1JOINS");
+    let acl = web_acl("acl-joins");
+    let zone = hosted_zone("Z1JOINS");
+    let second_zone = hosted_zone("Z2JOINS");
+    let kvs = key_value_store("kvs-joins");
+    // One short of the modelled maximum, so the last row fills the set exactly.
+    let almost_full: Vec<String> = (0..MAX_SUBSCRIPTION_RESOURCES - 1)
+        .map(|index| hosted_zone(&format!("Z{index}FULL")))
+        .collect();
+
+    let cases = vec![
+        Case {
+            label: "one hosted zone joins a free CloudFront subscription",
+            family: "CloudFront",
+            tier: "FREE",
+            held: vec![dist.clone(), acl.clone()],
+            named: vec![zone.clone()],
+            covering: vec![dist.clone(), acl.clone(), zone.clone()],
+        },
+        Case {
+            label: "two resources of different vendors join at once",
+            family: "CloudFront",
+            tier: "PRO",
+            held: vec![dist.clone()],
+            named: vec![zone.clone(), acl.clone()],
+            covering: vec![dist.clone(), zone.clone(), acl.clone()],
+        },
+        Case {
+            label: "a KeyValueStore joins a paid subscription",
+            family: "CloudFront",
+            tier: "BUSINESS",
+            held: vec![dist.clone(), acl.clone()],
+            named: vec![kvs.clone()],
+            covering: vec![dist.clone(), acl.clone(), kvs.clone()],
+        },
+        Case {
+            label: "a resource the request names twice joins once",
+            family: "Route53",
+            tier: "FREE",
+            held: vec![zone.clone()],
+            named: vec![second_zone.clone(), second_zone.clone()],
+            covering: vec![zone.clone(), second_zone.clone()],
+        },
+        Case {
+            label: "a second resource of a required kind",
+            family: "CloudFront",
+            tier: "PREMIUM",
+            held: vec![dist.clone(), acl.clone()],
+            named: vec![distribution("E2JOINS")],
+            covering: vec![dist.clone(), acl.clone(), distribution("E2JOINS")],
+        },
+        Case {
+            label: "the last resource the subscription has room for",
+            family: "Route53",
+            tier: "PRO",
+            held: almost_full.clone(),
+            named: vec![kvs.clone()],
+            covering: almost_full.iter().cloned().chain([kvs.clone()]).collect(),
+        },
+    ];
+
+    let router = router();
+    for case in &cases {
+        let label = case.label;
+        let created = create(
+            &router,
+            create_body_naming(case.family, case.tier, &case.held, Some("IMMEDIATE")),
+        )
+        .await;
+        let arn = created.string("arn");
+        let etag_before = created.require_etag(label);
+
+        let answer = associate(&router, &arn, &case.named, &etag_before).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {label:?}: the association must succeed, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.body["resourceArns"],
+            json!(case.covering),
+            "case {label:?}: expected the subscription to cover {:?}, got {:?}",
+            case.covering,
+            answer.body["resourceArns"]
+        );
+        assert_eq!(
+            answer.string("status"),
+            "SYNC_IN_PROGRESS",
+            "case {label:?}: a resource change is reported as being applied, got {:?}",
+            answer.body
+        );
+        let etag_after = answer.require_etag(label);
+        assert_ne!(
+            etag_after, etag_before,
+            "case {label:?}: a write must hand out a new concurrency token"
+        );
+
+        // The ROUND TRIP: the answer is a report of the STORE, so the reader answers the
+        // same subscription and the same token.
+        let (read, read_etag) = read_back(&router, &arn, label).await;
+        assert_eq!(
+            read, answer.body,
+            "case {label:?}: the association must report what it stored, got {read:?}"
+        );
+        assert_eq!(
+            read_etag, etag_after,
+            "case {label:?}: the reader must report the token the write handed out"
+        );
+
+        // The change the call started is owed by the clock, so the subscription reaches
+        // ACTIVE on its own, still covering the whole set.
+        let settled = poll_until_active(&router, &arn, label).await;
+        assert_eq!(
+            settled.body["resourceArns"],
+            json!(case.covering),
+            "case {label:?}: the settled subscription must keep the set, got {:?}",
+            settled.body["resourceArns"]
+        );
+    }
+}
+
+/// The fixed text AWS states a resource-eligibility refusal with; the ineligible ARNs the
+/// request named follow it, in the order it named them, and then the full stop.
+const NOT_ELIGIBLE_PREFIX: &str =
+    "The following resources are not eligible for this subscription tier: ";
+
+/// A resource the subscription's plan TIER does not cover is refused with the modelled
+/// business-rule error naming it, and nothing is stored — on the call that creates a
+/// subscription over it and on the call that adds it to one. Every tier that does cover it
+/// admits the very same resource.
+///
+/// The rows differ along the tier (every published one, and one the docs do not publish),
+/// the resource kinds one request names, how many of them the tier does not cover, and
+/// their position in the request.
+#[tokio::test]
+async fn a_resource_the_tier_does_not_cover_is_refused_on_create_and_on_associate() {
+    struct Case {
+        label: &'static str,
+        tier: &'static str,
+        /// The resources the request names.
+        named: Vec<String>,
+        /// The positions in `named` the tier does not cover; empty when it covers them all.
+        ineligible: Vec<usize>,
+    }
+
+    let cases = vec![
+        Case {
+            label: "a KeyValueStore on the free tier",
+            tier: "FREE",
+            named: vec![key_value_store("kvs-free")],
+            ineligible: vec![0],
+        },
+        Case {
+            label: "a KeyValueStore beside a resource the free tier does cover",
+            tier: "FREE",
+            named: vec![hosted_zone("Z1TIER"), key_value_store("kvs-beside")],
+            ineligible: vec![1],
+        },
+        Case {
+            label: "two KeyValueStores on the free tier",
+            tier: "FREE",
+            named: vec![key_value_store("kvs-one"), key_value_store("kvs-two")],
+            ineligible: vec![0, 1],
+        },
+        Case {
+            label: "a hosted zone on the free tier",
+            tier: "FREE",
+            named: vec![hosted_zone("Z2TIER")],
+            ineligible: Vec::new(),
+        },
+        Case {
+            label: "a KeyValueStore on the first paid tier",
+            tier: "PRO",
+            named: vec![key_value_store("kvs-pro")],
+            ineligible: Vec::new(),
+        },
+        Case {
+            label: "a KeyValueStore on a higher paid tier",
+            tier: "BUSINESS",
+            named: vec![key_value_store("kvs-business")],
+            ineligible: Vec::new(),
+        },
+        Case {
+            label: "a KeyValueStore on the highest published tier",
+            tier: "PREMIUM",
+            named: vec![key_value_store("kvs-premium")],
+            ineligible: Vec::new(),
+        },
+        Case {
+            label: "a KeyValueStore on a tier the service docs do not publish",
+            tier: "ENTERPRISE",
+            named: vec![key_value_store("kvs-unpublished")],
+            ineligible: Vec::new(),
+        },
+    ];
+
+    let router = router();
+    for case in &cases {
+        let label = case.label;
+        let refused_message = format!(
+            "{NOT_ELIGIBLE_PREFIX}{}.",
+            case.ineligible
+                .iter()
+                .map(|position| case.named[*position].clone())
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
+
+        // (1) named at create time: a refused call stores no subscription at all.
+        let arns_before = all_arns(&router).await;
+        let answered = call(
+            &router,
+            "CreateSubscription",
+            create_body_naming("CloudFront", case.tier, &case.named, Some("IMMEDIATE")),
+            None,
+        )
+        .await;
+        if case.ineligible.is_empty() {
+            assert_eq!(
+                answered.status, 200,
+                "case {label}: creating over resources the tier covers must succeed, got {} {:?}",
+                answered.status, answered.body
+            );
+            assert_eq!(
+                answered.body["resourceArns"],
+                json!(case.named),
+                "case {label}: the created subscription must cover the resources named, got {:?}",
+                answered.body["resourceArns"]
+            );
+        } else {
+            assert_eq!(
+                answered.status, 400,
+                "case {label}: creating over a resource the tier does not cover must be \
+                 refused, got {} {:?}",
+                answered.status, answered.body
+            );
+            assert_eq!(
+                answered.error_code.as_deref(),
+                Some("ValidationException"),
+                "case {label}: unexpected error code for {:?}",
+                answered.body
+            );
+            assert_eq!(
+                answered.message(label),
+                refused_message,
+                "case {label}: expected the message {refused_message:?}"
+            );
+            assert_eq!(
+                all_arns(&router).await,
+                arns_before,
+                "case {label}: a refused create must store no subscription"
+            );
+        }
+
+        // (2) added to a subscription already in service: a refused call leaves the
+        // resources it covers exactly as they were.
+        let held = vec![distribution("E1TIER"), web_acl("acl-tier")];
+        let created = create(
+            &router,
+            create_body_naming("CloudFront", case.tier, &held, Some("IMMEDIATE")),
+        )
+        .await;
+        let arn = created.string("arn");
+        let etag_before = created.require_etag(label);
+
+        let answered = associate(&router, &arn, &case.named, &etag_before).await;
+        if case.ineligible.is_empty() {
+            assert_eq!(
+                answered.status, 200,
+                "case {label}: adding resources the tier covers must succeed, got {} {:?}",
+                answered.status, answered.body
+            );
+            let expected: Vec<String> =
+                held.iter().chain(case.named.iter()).cloned().collect();
+            assert_eq!(
+                answered.body["resourceArns"],
+                json!(expected),
+                "case {label}: expected the subscription to cover {expected:?}, got {:?}",
+                answered.body["resourceArns"]
+            );
+        } else {
+            assert_eq!(
+                answered.status, 400,
+                "case {label}: adding a resource the tier does not cover must be refused, \
+                 got {} {:?}",
+                answered.status, answered.body
+            );
+            assert_eq!(
+                answered.error_code.as_deref(),
+                Some("ValidationException"),
+                "case {label}: unexpected error code for {:?}",
+                answered.body
+            );
+            assert_eq!(
+                answered.message(label),
+                refused_message,
+                "case {label}: expected the message {refused_message:?}"
+            );
+            let (read, read_etag) = read_back(&router, &arn, label).await;
+            assert_eq!(
+                read["resourceArns"],
+                json!(held),
+                "case {label}: a refused association must keep the resources it covered, \
+                 got {read:?}"
+            );
+            assert_eq!(
+                read_etag, etag_before,
+                "case {label}: a refused association must not mint a new ETag"
+            );
+        }
+    }
+}
+
+/// A subscription covers at most the modelled number of resources, so an association that
+/// would take it past that bound is refused and the subscription keeps what it had. The
+/// rows walk the bound: up to it, exactly at it, and one past it from either side.
+#[tokio::test]
+async fn an_association_past_the_modelled_resource_bound_is_refused() {
+    // (case, how many resources the subscription starts with, how many the request adds,
+    //  whether the request is admitted)
+    let rows: [(&str, usize, usize, bool); 5] = [
+        ("room for more than the request adds", 5, 2, true),
+        ("exactly filling the bound", MAX_SUBSCRIPTION_RESOURCES - 1, 1, true),
+        ("one past the bound", MAX_SUBSCRIPTION_RESOURCES, 1, false),
+        ("two past the bound", MAX_SUBSCRIPTION_RESOURCES - 1, 2, false),
+        ("far past the bound", 5, MAX_SUBSCRIPTION_RESOURCES, false),
+    ];
+
+    let router = router();
+    for (case, initial, adding, admitted) in rows {
+        let held: Vec<String> = (0..initial)
+            .map(|index| hosted_zone(&format!("Z{index}HELD")))
+            .collect();
+        let created = create(
+            &router,
+            create_body_naming("Route53", "PRO", &held, Some("IMMEDIATE")),
+        )
+        .await;
+        let arn = created.string("arn");
+        let etag = created.require_etag(case);
+        let named: Vec<String> = (0..adding)
+            .map(|index| hosted_zone(&format!("Z{index}BOUND")))
+            .collect();
+
+        let answered = associate(&router, &arn, &named, &etag).await;
+        if admitted {
+            assert_eq!(
+                answered.status, 200,
+                "case {case:?}: {initial} + {adding} resources is within the bound, got {} {:?}",
+                answered.status, answered.body
+            );
+            let expected: Vec<String> = held.iter().chain(named.iter()).cloned().collect();
+            assert_eq!(
+                answered.body["resourceArns"],
+                json!(expected),
+                "case {case:?}: expected the subscription to cover {expected:?}, got {:?}",
+                answered.body["resourceArns"]
+            );
+        } else {
+            assert_eq!(
+                (answered.status, answered.error_code.as_deref()),
+                (400, Some("ValidationException")),
+                "case {case:?}: {initial} + {adding} resources is past the bound of \
+                 {MAX_SUBSCRIPTION_RESOURCES}, got {} {:?}",
+                answered.status,
+                answered.body
+            );
+            assert_eq!(
+                answered.message(case),
+                format!(
+                    "Cannot change the resources of subscription {arn}: it covers \
+                     {initial} and the request adds {adding}; a subscription must \
+                     include at most {MAX_SUBSCRIPTION_RESOURCES} resources."
+                ),
+                "case {case:?}: unexpected message for {:?}",
+                answered.body
+            );
+            let (read, read_etag) = read_back(&router, &arn, case).await;
+            assert_eq!(
+                read["resourceArns"],
+                json!(held),
+                "case {case:?}: a refused association must keep the resources it covered, \
+                 got {read:?}"
+            );
+            assert_eq!(
+                read_etag, etag,
+                "case {case:?}: a refused association must not mint a new ETag"
+            );
+        }
+    }
+}
+
+/// Resources join only a subscription that is ACTIVE and has no change pending: "The
+/// subscription must be in an active state that is not pending other changes." A status
+/// that does not admit a change is the modelled `ValidationException` (400) naming it, a
+/// change already scheduled is the modelled `ConflictException` (409), both are inert, and
+/// the identical request is admitted once the subscription admits a change again.
+#[tokio::test]
+async fn resources_join_only_an_active_subscription_with_no_pending_change() {
+    let router = router();
+    let dist = distribution("E1STATE");
+    let acl = web_acl("acl-state");
+    let held = vec![dist.clone(), acl.clone()];
+    let named = vec![hosted_zone("Z1STATE")];
+
+    // (a) a subscription held for approval: nothing covers its resources yet.
+    let case = "a subscription awaiting approval";
+    let pending = create(
+        &router,
+        create_body_naming("CloudFront", "PRO", &held, Some("MANUAL")),
+    )
+    .await;
+    let pending_arn = pending.string("arn");
+    let pending_etag = pending.require_etag(case);
+    assert_eq!(
+        pending.string("status"),
+        "PENDING_APPROVAL",
+        "case {case}: the subject must start out awaiting approval, got {:?}",
+        pending.body
+    );
+    let refused = associate(&router, &pending_arn, &named, &pending_etag).await;
+    assert_eq!(
+        (refused.status, refused.error_code.as_deref()),
+        (400, Some("ValidationException")),
+        "case {case}: a status that does not admit a change refuses one, got {} {:?}",
+        refused.status,
+        refused.body
+    );
+    assert_eq!(
+        refused.message(case),
+        format!(
+            "Cannot change the resources of subscription {pending_arn}: the subscription \
+             is PENDING_APPROVAL; its resources can be changed only while it is ACTIVE."
+        ),
+        "case {case}: unexpected message for {:?}",
+        refused.body
+    );
+    let (read, read_etag) = read_back(&router, &pending_arn, case).await;
+    assert_eq!(
+        read, pending.body,
+        "case {case}: a refused association must change nothing, got {read:?}"
+    );
+    assert_eq!(
+        read_etag, pending_etag,
+        "case {case}: a refused association must not mint a new ETag"
+    );
+
+    // The positive control: once approved, the very same request is admitted.
+    let approved = call(
+        &router,
+        "ApprovePaidSubscription",
+        json!({"arn": pending_arn.clone()}),
+        Some(&pending_etag),
+    )
+    .await;
+    assert_eq!(
+        approved.status, 200,
+        "case {case}: the approval must succeed, got {} {:?}",
+        approved.status, approved.body
+    );
+    let admitted = associate(&router, &pending_arn, &named, &approved.require_etag(case)).await;
+    assert_eq!(
+        admitted.status, 200,
+        "case {case}: after approval the same request must be admitted, got {} {:?}",
+        admitted.status, admitted.body
+    );
+    assert_eq!(
+        admitted.body["resourceArns"],
+        json!([dist.clone(), acl.clone(), named[0].clone()]),
+        "case {case}: expected the named resource to join, got {:?}",
+        admitted.body["resourceArns"]
+    );
+
+    // (b) a change of its own still being applied: the association just admitted is in
+    // flight, so another one is refused until the clock settles it.
+    let case = "a change still being applied";
+    let in_flight = associate(
+        &router,
+        &pending_arn,
+        &[hosted_zone("Z2STATE")],
+        &admitted.require_etag(case),
+    )
+    .await;
+    assert_eq!(
+        (in_flight.status, in_flight.error_code.as_deref()),
+        (400, Some("ValidationException")),
+        "case {case}: a change in flight refuses another, got {} {:?}",
+        in_flight.status,
+        in_flight.body
+    );
+    assert_eq!(
+        in_flight.message(case),
+        format!(
+            "Cannot change the resources of subscription {pending_arn}: the subscription \
+             is SYNC_IN_PROGRESS; its resources can be changed only while it is ACTIVE."
+        ),
+        "case {case}: unexpected message for {:?}",
+        in_flight.body
+    );
+    let settled = poll_until_active(&router, &pending_arn, case).await;
+    let after = associate(
+        &router,
+        &pending_arn,
+        &[hosted_zone("Z2STATE")],
+        &settled.require_etag(case),
+    )
+    .await;
+    assert_eq!(
+        after.status, 200,
+        "case {case}: the same request must be admitted once the change has taken effect, \
+         got {} {:?}",
+        after.status, after.body
+    );
+
+    // (c) a subscription with a change SCHEDULED on it: the conflict every mutator of this
+    // service answers.
+    let case = "a subscription with a scheduled downgrade";
+    let created = create(
+        &router,
+        create_body_naming("CloudFront", "PREMIUM", &held, Some("IMMEDIATE")),
+    )
+    .await;
+    let arn = created.string("arn");
+    let downgraded = call(
+        &router,
+        "UpdateSubscription",
+        json!({"arn": arn.clone(), "planTier": "FREE"}),
+        Some(&created.require_etag(case)),
+    )
+    .await;
+    assert_eq!(
+        downgraded.status, 200,
+        "case {case}: the downgrade must be scheduled, got {} {:?}",
+        downgraded.status, downgraded.body
+    );
+    assert!(
+        downgraded.body.get("scheduledChange").is_some(),
+        "case {case}: the subject must carry a pending change, got {:?}",
+        downgraded.body
+    );
+    let etag = downgraded.require_etag(case);
+    let refused = associate(&router, &arn, &named, &etag).await;
+    assert_eq!(
+        (refused.status, refused.error_code.as_deref()),
+        (409, Some("ConflictException")),
+        "case {case}: a pending change is the modelled conflict, got {} {:?}",
+        refused.status,
+        refused.body
+    );
+    let (read, read_etag) = read_back(&router, &arn, case).await;
+    assert_eq!(
+        read, downgraded.body,
+        "case {case}: a refused association must change nothing, got {read:?}"
+    );
+    assert_eq!(
+        read_etag, etag,
+        "case {case}: a refused association must not mint a new ETag"
+    );
+}
+
+/// A resource the subscription already covers is nothing to add: the request is refused
+/// with the modelled business-rule error naming that resource, and the stored set is left
+/// alone — the mirror of a removal naming a resource the subscription does not cover.
+#[tokio::test]
+async fn adding_a_resource_the_subscription_already_covers_is_refused() {
+    let router = router();
+    let dist = distribution("E1COVERED");
+    let acl = web_acl("acl-covered");
+    let zone = hosted_zone("Z1COVERED");
+    let held = vec![dist.clone(), acl.clone(), zone.clone()];
+
+    // (case, the resources the request names, the one the refusal must name)
+    let rows: [(&str, Vec<String>, String); 4] = [
+        ("the required distribution", vec![dist.clone()], dist.clone()),
+        ("the required web ACL", vec![acl.clone()], acl.clone()),
+        ("an optional resource", vec![zone.clone()], zone.clone()),
+        (
+            "a covered resource named behind a new one",
+            vec![hosted_zone("Z2COVERED"), zone.clone()],
+            zone.clone(),
+        ),
+    ];
+
+    for (case, named, offending) in rows {
+        let created = create(
+            &router,
+            create_body_naming("CloudFront", "PRO", &held, Some("IMMEDIATE")),
+        )
+        .await;
+        let arn = created.string("arn");
+        let etag = created.require_etag(case);
+
+        let refused = associate(&router, &arn, &named, &etag).await;
+        assert_eq!(
+            (refused.status, refused.error_code.as_deref()),
+            (400, Some("ValidationException")),
+            "case {case:?}: expected the business-rule refusal, got {} {:?}",
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.message(case),
+            format!(
+                "Cannot add {offending} to subscription {arn}: the resource is already \
+                 associated with this subscription."
+            ),
+            "case {case:?}: unexpected message for {:?}",
+            refused.body
+        );
+        assert_eq!(
+            refused.body.get("resourceId").and_then(Value::as_str),
+            Some(offending.as_str()),
+            "case {case:?}: the refusal must name the offending resource, got {:?}",
+            refused.body
+        );
+        let (read, read_etag) = read_back(&router, &arn, case).await;
+        assert_eq!(
+            read["resourceArns"],
+            json!(held),
+            "case {case:?}: a refused association must keep the resources it covered, \
+             got {read:?}"
+        );
+        assert_eq!(
+            read_etag, etag,
+            "case {case:?}: a refused association must not mint a new ETag"
+        );
+    }
+}
+
 /// The operations this slice does not implement still answer 501, so a client can tell
 /// "not written yet" from an empty success.
 #[tokio::test]
@@ -1338,13 +2052,7 @@ async fn the_operations_outside_this_slice_still_answer_501() {
     let arn = created.string("arn");
     let etag = created.require_etag("stubs");
 
-    let cases = [
-        (
-            "AssociateResourcesToSubscription",
-            json!({"arn": arn.clone(), "resourceArns": [format!("arn:aws:cloudfront::{ACCOUNT}:distribution/EX")]}),
-        ),
-        ("CancelSubscriptionChange", json!({"arn": arn.clone()})),
-    ];
+    let cases = [("CancelSubscriptionChange", json!({"arn": arn.clone()}))];
 
     for (operation, body) in &cases {
         let answer = call(&router, operation, body.clone(), Some(&etag)).await;

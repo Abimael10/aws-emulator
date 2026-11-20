@@ -33,3 +33,31 @@ AssertionError: unexpected answer to a KeyValueStore on the FREE tier: NotImplem
 Boot the pricing-plan-manager emulator
 Call AssociateResourcesToSubscription and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution and residual
+
+`AssociateResourcesToSubscription` is implemented (`src/ops/associate_resources_to_subscription.rs`,
+scaffold marker removed): it resolves the subscription ARN and `If-Match`, weighs the request through
+the shared resource-set rule `state::subscription_resources::plan_resource_addition` (status, pending
+change, a resource already associated, the modelled 10-resource maximum) and the plan-family/plan-tier
+eligibility gate, stores the resulting set and reports it `SYNC_IN_PROGRESS` until the clock settles it
+to `ACTIVE`, exactly as `DisassociateResourcesFromSubscription` does. The key
+`pricing-plan-manager|AssociateResourcesToSubscription|NotImplemented` replays as fixed, and the unit
+`hosted-zone-joins-and-leaves-a-free-subscription` now joins and leaves the subscription.
+
+RESIDUAL, still open and tracked here rather than re-filed: the check assertion key of unit
+`free-subscription-refuses-a-key-value-store-and-keeps-its-resources` is not closed. The call is now
+refused as that assertion expects in class and effect — HTTP 400 `ValidationException`, nothing stored,
+the subscription keeps its resources — but the assertion also compares the MESSAGE, and the recorded
+key does not disclose the sentence AWS words this tier gate with. The emulator answers with the one
+wording this service is recorded issuing for a resource a tier does not cover, "The following resources
+are not eligible for this subscription tier: <arns>."
+(`state::resource_eligibility::ineligible_resources_message`, shared with `CreateSubscription`). When a
+recording shows AWS's own sentence for the tier gate, that function and
+`state::resource_eligibility::covered_by_plan_tier` are where it changes; the latter also places only
+one resource kind today (a CloudFront KeyValueStore is covered from a paid tier up) and would become a
+tier-to-kind table if a recording places another kind or another tier.
+
+The same two units also fail on causes filed elsewhere: the post-cancel poll of
+`20261111T105841Z-pricing-plan-manager-cancelling-a-free-subscription-never-completes-and-publishes.md`
+(behavioural grounding `20261114T092337Z-...-the-createsubscription-eligibility.md`).

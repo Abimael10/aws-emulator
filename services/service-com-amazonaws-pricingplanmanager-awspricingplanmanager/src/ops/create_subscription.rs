@@ -242,13 +242,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The resources a subscription covers have to be ELIGIBLE for the plan family it
-        // asks for: for the CloudFront family the named distribution must be fronted by
-        // the WAF web ACL the same request names, which is a fact CloudFront holds
+        // The resources a subscription covers have to be ELIGIBLE for the plan it asks
+        // for — its family and its tier: for the CloudFront family the named distribution
+        // must be fronted by the WAF web ACL the same request names, which is a fact
+        // CloudFront holds, and the free tier does not cover a KeyValueStore
         // (`crate::state::resource_eligibility`). The gate runs before anything is
         // minted, so a refused call leaves no subscription behind.
-        let ineligible =
-            crate::state::ineligible_resources(ctx, &region, &plan_family, &resource_arns).await;
+        let ineligible = crate::state::ineligible_resources(
+            ctx,
+            &region,
+            &plan_family,
+            &plan_tier,
+            &resource_arns,
+        )
+        .await;
         if !ineligible.is_empty() {
             return Err(CreateSubscriptionErrorModeled::ValidationException(
                 ValidationException {
