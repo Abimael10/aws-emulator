@@ -20,33 +20,23 @@ use super::{project_paths, DocumentPath, Item};
 /// The `Item` a single-item read reports: what `projection` names of the item the key
 /// addressed, or the whole item when the request named no projection — "If no attribute
 /// names are specified, then all attributes are returned"
-/// (`Get$ProjectionExpression`). A key that holds no item reports none, whichever
-/// projection the request carried.
+/// (`Get$ProjectionExpression`).
+///
+/// Whether there is an item at the key is the ONLY thing that decides whether there is
+/// anything to report: "If there is no matching item, GetItem does not return any data and
+/// there will be no Item element in the response" (`GetItem`), and correspondingly "if a
+/// requested item could not be retrieved, the corresponding ItemResponse object is Null"
+/// (`TransactGetItems$Responses`). What the projection names decides only the CONTENTS of
+/// what is reported, so an item that was found but whose projection names no location of it
+/// is reported as the map with nothing in it that it projected to — "if the requested item
+/// has no projected attributes, the corresponding ItemResponse object is an empty Map", the
+/// map of projected name-value pairs that `ItemResponse` carries being the empty one.
+///
+/// The same holds for a read that reports its items as a LIST — `Query`, `Scan` and the
+/// per-table list of a batched read: an element that projected nothing is still an element.
 pub fn reported_item(item: Option<Item>, projection: Option<&[DocumentPath]>) -> Option<Item> {
     match (item, projection) {
         (Some(item), Some(paths)) => Some(project_paths(&item, paths)),
         (item, _) => item,
     }
-}
-
-/// The same, for a read that reports what it found in an OPTIONAL `Item` MEMBER rather than
-/// as an element of a list: `GetItem`'s own `Item`, and the `Item` of one `ItemResponse` of
-/// a transactional read.
-///
-/// Such a member is reported only when there is an attribute to report: "if the requested
-/// item has no projected attributes, the corresponding ItemResponse object is an empty Map"
-/// (`TransactGetItems$Responses`) — the RESPONSE object is the empty one, so the member it
-/// would have carried is absent, and a caller that tests for the member reads "nothing was
-/// projected" rather than finding a map with nothing in it. A projection that matches no
-/// location of the item found therefore reports no member at all, exactly as a key that
-/// holds no item does.
-///
-/// A read that reports its items as a LIST — `Query`, `Scan`, and the per-table list of a
-/// batched read — has no member to leave out, so it keeps [`reported_item`]: an element that
-/// projected nothing is still an element of the list.
-pub fn reported_item_member(
-    item: Option<Item>,
-    projection: Option<&[DocumentPath]>,
-) -> Option<Item> {
-    reported_item(item, projection).filter(|item| !item.is_empty())
 }

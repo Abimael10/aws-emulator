@@ -860,8 +860,8 @@ struct ProjectionCase {
 /// RULE: a key-addressed read reports what its projection names of the item it found — the
 /// value at each path, wrapped in the containers the path stepped through — and the whole
 /// item when it names no projection at all; a path that addresses nothing in the item
-/// contributes nothing, and a projection that addresses nothing AT ALL reports no `Item`
-/// member (`tests/all/projected_item_member_absence.rs` takes that axis).
+/// contributes nothing, so a projection that addresses nothing AT ALL reports an empty
+/// `Item` (`tests/all/projected_item_member_absence.rs` takes that axis).
 #[tokio::test]
 async fn a_projected_read_reports_only_the_paths_it_names() {
     let router = emulator();
@@ -913,9 +913,9 @@ async fn a_projected_read_reports_only_the_paths_it_names() {
             reported: json!({"v": {"S": "secret-1"}}),
         },
         ProjectionCase {
-            case: "a path the item holds nothing at, which reports no Item member at all",
+            case: "a path the item holds nothing at, which reports the empty projection",
             request: read_of(table, NESTED_PARTITION, Some("absent")),
-            reported: Value::Null,
+            reported: json!({}),
         },
     ];
 

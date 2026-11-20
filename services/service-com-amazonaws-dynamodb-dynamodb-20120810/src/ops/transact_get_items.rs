@@ -5,8 +5,9 @@
 //! each carrying the stored item behind that `Get`'s `Key` — "if a requested item could not
 //! be retrieved, the corresponding ItemResponse object is Null, or if the requested item has
 //! no projected attributes, the corresponding ItemResponse object is an empty Map". A key
-//! that holds no item therefore reports an `ItemResponse` with no `Item`, and so does one
-//! whose projection matched no location of the item it found.
+//! that holds no item therefore reports an `ItemResponse` with no `Item`, while one whose
+//! projection matched no location of the item it found reports that `Item` as the empty map
+//! of projected pairs it projected to.
 //!
 //! The items are read against the SAME stored items `GetItem` reads, so a transactional
 //! read sees what any earlier write left. An unknown — or not yet `ACTIVE` — table is
@@ -334,12 +335,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "ProjectionExpression - One or more attributes of the specified item to
             // retrieve from the table. [...] If no attribute names are specified, then
             // all attributes of the specified item are returned" (`Get`): what this
-            // element asked for of the item it found — and no `Item` member at all when
-            // the projection matched no location of it, which is the empty
-            // `ItemResponse` the member's own doc states
-            // ([`crate::state::reported_item_member`]).
+            // element asked for of the item it found. Only a key that holds NO item
+            // reports no `Item` member — the `Null` ItemResponse of a get that "could not
+            // be retrieved" — so an element whose projection matched no location of its
+            // item reports the empty map of projected pairs that `ItemResponse` carries
+            // ([`crate::state::reported_item`]).
             responses.push(ItemResponse {
-                item: crate::state::reported_item_member(item, projected.as_deref()),
+                item: crate::state::reported_item(item, projected.as_deref()),
             });
         }
 

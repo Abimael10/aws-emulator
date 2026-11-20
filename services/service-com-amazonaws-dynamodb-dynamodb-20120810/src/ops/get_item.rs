@@ -10,7 +10,9 @@
 //! `ProjectionExpression` with its `ExpressionAttributeNames` aliases, or the legacy
 //! `AttributesToGet` list, read into the one path list every read of this service
 //! reports through ([`crate::state::requested_projection`]) — and the whole item when
-//! the request names no projection. `ConsistentRead` needs no handling beyond its effect
+//! the request names no projection; a projection that names no location of the item found
+//! reports `Item` as the empty map it projected to, the absent member standing for the
+//! absent item alone ([`crate::state::reported_item`]). `ConsistentRead` needs no handling beyond its effect
 //! on `ConsumedCapacity`: this store has one copy of each item, so every read of it is
 //! strongly consistent.
 //!
@@ -371,10 +373,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetItemOutput {
             // "Item - A map of attribute names to AttributeValue objects, as specified
             // by ProjectionExpression": what the request asked for of the item it found,
-            // and the whole item when it asked for no projection at all. A projection that
-            // matches no location of that item reports the member not at all
-            // ([`crate::state::reported_item_member`]).
-            item: crate::state::reported_item_member(item, projected.as_deref()),
+            // and the whole item when it asked for no projection at all. Only a key that
+            // holds NO item reports no member — "if there is no matching item, GetItem does
+            // not return any data and there will be no Item element in the response" — so a
+            // projection that matches no location of the item found reports the map with
+            // nothing in it that it projected to ([`crate::state::reported_item`]).
+            item: crate::state::reported_item(item, projected.as_deref()),
             consumed_capacity: crate::state::consumed_capacity(
                 input.return_consumed_capacity.as_deref(),
                 &name,

@@ -3,13 +3,16 @@
 //! What a read that reports an item in an `Item` MEMBER answers when the projection it
 //! applied matched nothing, driven end to end.
 //!
-//! RULE under test: an optional `Item` member is reported only when there is an attribute
-//! to report — "if the requested item has no projected attributes, the corresponding
-//! ItemResponse object is an empty Map" (`TransactGetItems$Responses`), so the RESPONSE
-//! object is the empty one and the member it would have carried is absent. A projection
-//! that matches no location of the item it found therefore reports NO member at all,
-//! exactly as a key that holds no item does, and a client that tests for the member reads
-//! "nothing was projected" rather than finding a map with nothing in it.
+//! RULE under test: whether the key addresses a stored item is the only thing that decides
+//! whether such a read reports the member at all — "if there is no matching item, GetItem
+//! does not return any data and there will be no Item element in the response" (`GetItem`),
+//! and "if a requested item could not be retrieved, the corresponding ItemResponse object is
+//! Null" (`TransactGetItems$Responses`). The projection decides only the CONTENTS of what is
+//! reported, so an item that WAS found reports the member whatever its projection matched:
+//! a projection naming no location of that item reports the map with nothing in it that it
+//! projected to ("if the requested item has no projected attributes, the corresponding
+//! ItemResponse object is an empty Map" — the map of projected name-value pairs being the
+//! empty one), never the absence that stands for "there is no such item".
 //!
 //! The rows span what the rule generalises over: the READER that carries such a member
 //! (`GetItem` and each element of a `TransactGetItems`), the FORM of the projection that
@@ -17,12 +20,12 @@
 //! alias, a path into a map the item holds nothing at, a path into a list past its end, a
 //! path through a scalar, several such paths at once), and the item the projection was
 //! applied to (one with attributes of every shape, and a key that holds no item at all) —
-//! each beside a projection that DOES match, so the rows show the member present and
-//! absent for the same reader and the same item.
+//! each beside a projection that DOES match, so the rows show what the member carries for
+//! the same reader and the same item.
 //!
-//! The complement is pinned beside it: a reader that reports its items as a LIST has no
-//! member to leave out, so `Query`, `Scan` and the per-table list of a `BatchGetItem`
-//! still carry an element for an item that projected nothing.
+//! The complement is pinned beside it: a reader that reports its items as a LIST carries an
+//! element for an item that projected nothing too, so `Query`, `Scan` and the per-table list
+//! of a `BatchGetItem` answer that element as the empty map.
 
 use serde_json::{json, Value};
 
@@ -55,7 +58,8 @@ fn absent_key() -> Value {
 }
 
 /// One row: the case, the key read, the projection, its aliases, and the `Item` the read
-/// must report — `None` where the member must be ABSENT.
+/// must report — `None` where the member must be ABSENT, which is only where the key holds
+/// no item.
 struct Row {
     case: &'static str,
     key: Value,
@@ -72,47 +76,54 @@ fn rows() -> Vec<Row> {
             key: seed_key(),
             expression: "absent",
             names: Value::Null,
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "that attribute reached through an alias",
             key: seed_key(),
             expression: "#a",
             names: json!({"#a": "absent"}),
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "a path into a map the item holds nothing at",
             key: seed_key(),
             expression: "doc.gap",
             names: Value::Null,
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "a path past the end of a stored list",
             key: seed_key(),
             expression: "parts[9]",
             names: Value::Null,
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "a path through a scalar, which holds no member",
             key: seed_key(),
             expression: "note.gap",
             names: Value::Null,
-            reported: None,
+            reported: Some(json!({})),
         },
         Row {
             case: "several paths that all match nothing",
             key: seed_key(),
             expression: "absent, doc.gap, parts[9]",
             names: Value::Null,
+            reported: Some(json!({})),
+        },
+        Row {
+            case: "a key that holds no item, which reports NO member",
+            key: absent_key(),
+            expression: "note",
+            names: Value::Null,
             reported: None,
         },
         Row {
-            case: "a key that holds no item, which reports no member either",
+            case: "a key that holds no item, read with a projection matching nothing",
             key: absent_key(),
-            expression: "note",
+            expression: "absent",
             names: Value::Null,
             reported: None,
         },
@@ -180,7 +191,7 @@ fn transact_body(row: &Row) -> Value {
 }
 
 #[tokio::test]
-async fn a_single_item_read_reports_no_item_member_when_its_projection_matched_nothing() {
+async fn a_single_item_read_reports_the_item_member_of_every_item_it_found() {
     let router = seeded().await;
 
     for row in rows() {
@@ -191,17 +202,18 @@ async fn a_single_item_read_reports_no_item_member_when_its_projection_matched_n
             "case {:?} (GetItem): expected {:?}, got {read}",
             row.case, row.reported
         );
-        assert_ne!(
-            reported,
-            Some(json!({})),
-            "case {:?} (GetItem): an empty map is never reported, got {read}",
+        // The member is absent only where there was no item to report.
+        assert_eq!(
+            reported.is_none(),
+            row.reported.is_none(),
+            "case {:?} (GetItem): only a key holding no item reports no member, got {read}",
             row.case
         );
     }
 }
 
 #[tokio::test]
-async fn an_element_of_a_transactional_read_reports_no_item_member_either() {
+async fn an_element_of_a_transactional_read_reports_it_the_same_way() {
     let router = seeded().await;
 
     for row in rows() {
@@ -218,10 +230,11 @@ async fn an_element_of_a_transactional_read_reports_no_item_member_either() {
             "case {:?} (TransactGetItems): expected {:?}, got {read}",
             row.case, row.reported
         );
-        assert_ne!(
-            reported,
-            Some(json!({})),
-            "case {:?} (TransactGetItems): an empty map is never reported, got {read}",
+        assert_eq!(
+            reported.is_none(),
+            row.reported.is_none(),
+            "case {:?} (TransactGetItems): only a get that retrieved no item reports no \
+             member, got {read}",
             row.case
         );
     }
@@ -250,11 +263,11 @@ async fn the_projected_reads_leave_the_stored_item_whole() {
 }
 
 #[tokio::test]
-async fn a_reader_that_reports_a_list_still_carries_an_element_that_projected_nothing() {
+async fn a_reader_that_reports_a_list_carries_an_element_that_projected_nothing_too() {
     let router = seeded().await;
 
-    // The readers that report their items as a LIST have no member to omit, so an item
-    // whose projection matched nothing is still an element of that list.
+    // An item whose projection matched nothing is still an element of the list a reader
+    // reports its items in, answered as the empty map it projected to.
     let listed: [(&str, Value); 3] = [
         (
             "Query",
