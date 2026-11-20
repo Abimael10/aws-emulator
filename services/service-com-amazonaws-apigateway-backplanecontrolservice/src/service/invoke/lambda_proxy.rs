@@ -109,6 +109,11 @@ use crate::ops::types::GetIntegrationOutput;
 use super::{IntegratedResponse, MethodRequest, UnservedIntegration, API_CONFIGURATION_ERROR,
             INTEGRATION_TIMEOUT, JSON_CONTENT_TYPE};
 
+/// WHICH INVOCATION of the function the integration asks for, in a file of its own: the
+/// `InvocationType` an integration's own `requestParameters` map onto the integration request
+/// is read there, by both integration types that invoke a function.
+pub(super) mod invocation_type;
+
 /// The vendor field of every AWS integration ARN, and the resource prefix of its PATH
 /// form — read from the operation that VALIDATES an integration's `uri`
 /// ([`crate::ops::put_integration`]), so the call that stores an ARN and this plane, which
@@ -168,6 +173,12 @@ const BAD_GATEWAY_MESSAGE: &str = "Internal server error";
 /// ([`crate::ops::test_invoke_method`]): one vocabulary, so a developer reading either sees
 /// the same sentence for the same answer.
 pub(super) const MALFORMED_PROXY_RESPONSE: &str = "Malformed Lambda proxy response";
+
+/// The status API Gateway answers a caller whose integration invoked its function for no
+/// answer — the asynchronous invocation of a backend function: the API answers the 200 OK
+/// response immediately, without waiting for the function to finish, so the caller is told
+/// the invocation was made and nothing about the run.
+const ACCEPTED_STATUS: u16 = 200;
 
 /// The member the function's returned document carries the response status in.
 const STATUS_CODE_MEMBER: &str = "statusCode";
@@ -349,7 +360,38 @@ pub(super) async fn performed(
     } else {
         addressed_region.to_string()
     };
-    Some(served(ctx, &at, function, call, waited_for(integration), integration.credentials.as_deref()).await)
+    Some(
+        served(
+            ctx,
+            &at,
+            function,
+            call,
+            &Invocation {
+                within: waited_for(integration),
+                credentials: integration.credentials.clone(),
+                // WHICH invocation is made is the integration's own records' to say
+                // ([`invocation_type`]): a proxy integration passes the client request
+                // through as-is, and the type of the call that carries it is no part of that
+                // request.
+                kind: invocation_type::asked_for(integration, &call.inputs),
+            },
+        )
+        .await,
+    )
+}
+
+/// How the call to a proxy integration's function is MADE, as the integration's own records
+/// state it — everything about the invocation that is not the function it addresses.
+#[derive(Debug, Clone)]
+struct Invocation {
+    /// How long the call waits for the function's answer: `Integration$timeoutInMillis`, read
+    /// through [`waited_for`].
+    within: Duration,
+    /// `Integration$credentials`: the role the call is made under, or `None` for one made as
+    /// this service's own principal.
+    credentials: Option<String>,
+    /// The `InvocationType` the integration asks for ([`invocation_type::asked_for`]).
+    kind: ::aws_sdk_lambda::types::InvocationType,
 }
 
 /// The two parts of an `AWS_PROXY` `uri` that decide the invocation: the Region of the
@@ -396,16 +438,15 @@ pub(super) fn invoked_function_path(resource: &str) -> Option<&str> {
 /// The method response this call earns: the function's policy decides whether the
 /// invocation is made, the run decides what it answered, and that answer IS the response.
 ///
-/// `within` is how long the integration waits for that answer ([`waited_for`]): the wait is
-/// bounded here rather than left to the function's own runtime, so the caller is answered
-/// whatever the run does with its time.
+/// `invocation` is how the integration's records say the call is made ([`Invocation`]): the
+/// wait is bounded here rather than left to the function's own runtime, so the caller is
+/// answered whatever the run does with its time.
 async fn served(
     ctx: &OperationContext<'_>,
     region: &str,
     function: &str,
     call: &MethodRequest,
-    within: Duration,
-    credentials: Option<&str>,
+    invocation: &Invocation,
 ) -> Result<ProxyAnswer, UnservedIntegration> {
     // The stage's own work begins here. The trace context it propagates onto the invocation
     // was decided when the method request was built — ONCE for the request, so an
@@ -418,9 +459,8 @@ async fn served(
         region,
         function,
         call,
-        within,
         propagated.header.as_deref(),
-        credentials,
+        invocation,
     )
     .await;
     // What the stage recorded about the request it served, submitted once the outcome is
@@ -457,12 +497,21 @@ async fn invoked(
     region: &str,
     function: &str,
     call: &MethodRequest,
-    within: Duration,
     trace: Option<&str>,
-    credentials: Option<&str>,
+    invocation_made: &Invocation,
 ) -> Result<ProxyAnswer, UnservedIntegration> {
+    let within = invocation_made.within;
     let client = lambda_client(ctx, region);
-    if let Some(reason) = unpermitted(ctx, region, &client, function, call, credentials).await {
+    if let Some(reason) = unpermitted(
+        ctx,
+        region,
+        &client,
+        function,
+        call,
+        invocation_made.credentials.as_deref(),
+    )
+    .await
+    {
         return Err(UnservedIntegration {
             refusal: API_CONFIGURATION_ERROR,
             reason,
@@ -486,7 +535,7 @@ async fn invoked(
     let invocation = client
         .invoke()
         .function_name(function)
-        .invocation_type(::aws_sdk_lambda::types::InvocationType::RequestResponse)
+        .invocation_type(invocation_made.kind.clone())
         .payload(::aws_sdk_lambda::primitives::Blob::new(payload))
         .customize()
         .mutate_request(move |request| {
@@ -556,6 +605,26 @@ async fn invoked(
             });
         }
     };
+    // An invocation that was not made for the function's ANSWER has none for this call to be
+    // served from: an asynchronous one is answered as soon as it is queued and a validating
+    // one runs nothing at all ([`invocation_type::awaits_the_run`]), so no run has produced a
+    // proxy response at this point and the caller is answered the moment the invocation was
+    // accepted — the 200 with no body AWS answers a method whose integration invokes its
+    // function asynchronously with, rather than the `502` an answer that is no proxy response
+    // earns, because the function returned nothing malformed: it has not returned at all.
+    if !invocation_type::awaits_the_run(&invocation_made.kind) {
+        return Ok(ProxyAnswer {
+            response: accepted(),
+            configuration_error: None,
+            exchanged: Some(super::stage_logs::Exchanged {
+                sent,
+                received: answered
+                    .payload()
+                    .map(|payload| payload.as_ref().to_vec())
+                    .unwrap_or_default(),
+            }),
+        });
+    }
     // "FunctionError: if present, indicates that an error occurred during function
     // execution" — a run that errored returned no proxy response, which API Gateway answers
     // the same way it answers one it cannot read. What API Gateway LOGS about that class names
@@ -640,6 +709,19 @@ fn bad_gateway() -> IntegratedResponse {
         content_type: JSON_CONTENT_TYPE.to_string(),
         // Under the member every refusal of this endpoint carries its sentence in.
         body: super::serialized_envelope(super::MESSAGE_MEMBER, BAD_GATEWAY_MESSAGE),
+        headers: BTreeMap::new(),
+    }
+}
+
+/// The response API Gateway answers a proxy integration whose invocation was made for no
+/// answer of the function's with ([`ACCEPTED_STATUS`]): the status the accepted invocation
+/// earns the caller, carrying no body, because the run the caller is not waiting for has
+/// produced nothing to carry.
+fn accepted() -> IntegratedResponse {
+    IntegratedResponse {
+        status: ACCEPTED_STATUS,
+        content_type: JSON_CONTENT_TYPE.to_string(),
+        body: Vec::new(),
         headers: BTreeMap::new(),
     }
 }

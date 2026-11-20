@@ -57,6 +57,19 @@ mod stated_request_identity;
 #[path = "execute_api_data_plane/response_override_status_type.rs"]
 mod response_override_status_type;
 
+/// WHICH INVOCATION of its Lambda function a method's integration makes — the `InvocationType`
+/// its `requestParameters` map onto the integration request — and what the caller is served
+/// for one made for no answer, in its own file beside this one, declared as the siblings above
+/// are.
+#[path = "execute_api_data_plane/lambda_event_invocation_type.rs"]
+mod lambda_event_invocation_type;
+
+/// What a `TOKEN` authorizer's own `identityValidationExpression` decides about the identity a
+/// request presents, BEFORE its function is invoked, in its own file beside this one, declared
+/// as the siblings above are.
+#[path = "execute_api_data_plane/token_authorizer_identity_validation.rs"]
+mod token_authorizer_identity_validation;
+
 /// The region the invoke host is addressed in. Any region is served — the host's region
 /// label is not matched against a list — so one is enough to drive the data plane, and
 /// `src/service/invoke.rs`'s own unit test varies the label.

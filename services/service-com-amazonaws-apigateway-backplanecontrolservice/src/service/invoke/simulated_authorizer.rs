@@ -17,7 +17,10 @@
 //! 3. a `TOKEN` or `REQUEST` authorizer IS a Lambda function, so the decision is that
 //!    function's return value, obtained by invoking it ([`super::custom_authorizer`]) with
 //!    the event its own type documents — and the policy it returned decides the method the
-//!    simulation addresses, exactly as a deployed stage's decision is taken.
+//!    simulation addresses, exactly as a deployed stage's decision is taken. A `TOKEN`
+//!    authorizer's own `identityValidationExpression` is applied to the presented token
+//!    BEFORE that invocation, so a token it does not match is refused here having invoked
+//!    nothing;
 //!
 //! One module, one set of steps: a simulated execution and a request to a deployed stage
 //! cannot answer one stored authorizer differently, because neither the identity reading,
@@ -180,6 +183,23 @@ pub(crate) async fn simulated<Eng: Send + Sync + 'static>(
         ));
         report.refusal = Some(UNAUTHORIZED);
         return report;
+    }
+    // The authorizer's own `identityValidationExpression` decides a simulated execution as it
+    // decides a request to a deployed stage: a token it does not match is refused before the
+    // function is invoked, so the simulation reports no decision and the log says why
+    // ([`custom_authorizer::unvalidated_token`], the one reading of that member).
+    if token {
+        if let Some(reason) = custom_authorizer::unvalidated_token(
+            authorizer,
+            presented.first.as_deref().unwrap_or_default(),
+        ) {
+            report.steps.push(format!(
+                "Authorizer {name} was not invoked: {reason}",
+                name = authorizer.name
+            ));
+            report.refusal = Some(UNAUTHORIZED);
+            return report;
+        }
     }
     let event = if token {
         custom_authorizer::token_event(presented.first.as_deref().unwrap_or_default(), method_arn)

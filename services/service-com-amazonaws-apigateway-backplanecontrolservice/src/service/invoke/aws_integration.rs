@@ -1519,7 +1519,13 @@ fn mapped_path_parameter(
 /// quotes of a static value, or the method request parameter the expression names — read
 /// off the same inputs a mapping template of this call is rendered from, so a simulated
 /// invocation and a real one resolve one mapping alike.
-fn mapped_value(source: &str, inputs: &TemplateInputs) -> Option<String> {
+///
+/// `pub(super)` because the invocation type a Lambda integration's own `requestParameters`
+/// ask for is one more such source
+/// ([`super::lambda_proxy::invocation_type`]): one reading of what a mapping
+/// expression names, so an integration request parameter resolves alike whichever member of
+/// the call it decides.
+pub(super) fn mapped_value(source: &str, inputs: &TemplateInputs) -> Option<String> {
     if is_static_mapping_value(source) {
         return source
             .strip_prefix('\'')

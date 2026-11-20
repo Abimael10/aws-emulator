@@ -12,7 +12,12 @@
 //! for that action is the Lambda data-plane path
 //! `path/{version}/functions/{function-arn}/invocations`. So the `uri` names ONE function,
 //! read through the ONE reading of that path this tree has
-//! ([`super::super::lambda_proxy::invoked_function_path`]), and the call is the `Invoke` of it.
+//! ([`super::super::lambda_proxy::invoked_function_path`]), and the call is the `Invoke` of it
+//! — made under the `InvocationType` the integration's own `requestParameters` map onto the
+//! integration request ([`invocation_type`]), which is how a method whose backend is invoked
+//! ASYNCHRONOUSLY is configured: the invocation is answered as soon as Lambda has queued it,
+//! with no payload of a run, and that answer is mapped by this integration's own responses
+//! like every other.
 //!
 //! What makes this integration the NON-PROXY one is everything around that invocation, and
 //! none of it is this module's own invention:
@@ -77,6 +82,7 @@ use super::super::lambda_proxy::{
     invocation_admitted, invocation_refused, invoked_function_path, lambda_client, stated_role,
     waited_for, INVALID_PERMISSIONS_REASON, INVOKE_FUNCTION_ACTION, LAMBDA_SUBDOMAIN,
 };
+use super::super::lambda_proxy::invocation_type;
 use super::super::{MethodRequest, UnservedIntegration, INTEGRATION_TIMEOUT};
 use super::{
     bounded, integration_request_body, named_service, substituted, unanswered, Answered, Backend,
@@ -133,6 +139,10 @@ pub(super) struct Call {
     /// How long the invocation waits for the function's answer: the integration's own
     /// `timeoutInMillis`.
     within: Duration,
+    /// WHICH invocation is made: the `InvocationType` the integration's own
+    /// `requestParameters` map onto the integration request ([`invocation_type`]), which is
+    /// what decides whether the answer this call is served from carries a run at all.
+    invocation: ::aws_sdk_lambda::types::InvocationType,
     /// The integration request's body, which IS the event the function is handed.
     body: Vec<u8>,
 }
@@ -259,6 +269,7 @@ fn resolved(
         function: function.to_string(),
         assumes_role: stated_role(integration.credentials.as_deref()).is_some(),
         within: waited_for(integration),
+        invocation: invocation_type::asked_for(integration, &call.inputs),
         body,
     })
 }
@@ -290,7 +301,7 @@ pub(super) async fn answered(
     let invocation = client
         .invoke()
         .function_name(&call.function)
-        .invocation_type(::aws_sdk_lambda::types::InvocationType::RequestResponse)
+        .invocation_type(call.invocation.clone())
         .payload(::aws_sdk_lambda::primitives::Blob::new(call.body.clone()))
         .send();
     let answer = match ::tokio::time::timeout(call.within, invocation).await {
@@ -392,6 +403,7 @@ mod tests {
             function: function.to_string(),
             assumes_role: true,
             within: Duration::from_millis(29_000),
+            invocation: ::aws_sdk_lambda::types::InvocationType::RequestResponse,
             body: Vec::new(),
         }
     }

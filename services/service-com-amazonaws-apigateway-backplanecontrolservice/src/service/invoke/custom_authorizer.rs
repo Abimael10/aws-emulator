@@ -129,6 +129,57 @@ fn waited_for() -> Duration {
     Duration::from_millis(millis)
 }
 
+/// Why the identity `presented` to the `TOKEN` authorizer `authorizer` does not satisfy its
+/// own `identityValidationExpression`, or `None` when it does — including when the authorizer
+/// declares none, which admits every token to the invocation.
+///
+/// `Authorizer$identityValidationExpression` is "a validation expression for the incoming
+/// identity token. For `TOKEN` authorizers, this value is a regular expression […] It will
+/// invoke the authorizer's Lambda function when there is a match. Otherwise, it will return a
+/// 401 Unauthorized response without calling the Lambda function"
+/// (`smithy_query(query="doc", shape="Authorizer", member="identityValidationExpression")`),
+/// so the expression is the authorizer's FIRST filter: it is applied to the value the identity
+/// source carried, before anything is invoked and before any held result is looked for, and a
+/// token it does not match earns the request [`super::UNAUTHORIZED`].
+///
+/// The same member decides a `COGNITO_USER_POOLS` authorizer's own evaluation, where the
+/// subject is the token's audience ([`super::cognito_user_pools`]); the model states it
+/// applies to neither the `REQUEST` authorizer ("the validation expression does not apply to
+/// the `REQUEST` authorizer") nor, having no incoming identity token of its own, to anything
+/// else — so the callers ask this only for a `TOKEN` authorizer.
+///
+/// An expression this engine does not build a regular expression of within its budgets
+/// decides nothing: it is logged and the token is left to the authorizer's own function,
+/// rather than refusing a call on a reading of the configuration this emulator could not
+/// perform — the same choice the user-pool reading of this member makes.
+pub(super) fn unvalidated_token(
+    authorizer: &crate::state::AuthorizerEntry,
+    presented: &str,
+) -> Option<String> {
+    let expression = authorizer
+        .identity_validation_expression
+        .as_deref()
+        .map(str::trim)
+        .filter(|expression| !expression.is_empty())?;
+    let Some(pattern) = super::stored_pattern(expression) else {
+        ::tracing::warn!(
+            authorizer = %authorizer.name,
+            "the authorizer's identityValidationExpression is not a regular expression this \
+             emulator evaluates within its compiled-size budget, so it decides nothing about \
+             the presented token"
+        );
+        return None;
+    };
+    if pattern.is_match(presented) {
+        return None;
+    }
+    Some(
+        "the presented identity token does not match the authorizer's identity validation \
+         expression, so the authorizer's function was not invoked"
+            .to_string(),
+    )
+}
+
 /// What the method's `CUSTOM` authorizer is to be asked, when the stage holds no usable
 /// result for this identity: everything the invocation needs, read off the records under the
 /// store lock so the call itself is made with no lock held.

@@ -2994,6 +2994,18 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
     if token && presented.is_none() {
         return Authorized::Refused(UNAUTHORIZED);
     }
+    // ... and the token a `TOKEN` authorizer was presented has to satisfy the authorizer's own
+    // `identityValidationExpression` before the function is asked anything at all, which is
+    // the one reading of that member ([`custom_authorizer::unvalidated_token`]).
+    if token {
+        if let Some(reason) = custom_authorizer::unvalidated_token(
+            authorizer,
+            presented.as_deref().unwrap_or_default(),
+        ) {
+            tracing::warn!(authorizer = %authorizer.name, %reason, "refusing an invoke");
+            return Authorized::Refused(UNAUTHORIZED);
+        }
+    }
     // Where this stage holds a result for this identity, which is both where one is looked
     // for and where the one the caller obtains is stored.
     let cache_key = authorizer_cache_key(authorizer, &identity_values);
@@ -4557,7 +4569,9 @@ const PATTERN_DFA_LIMIT: usize = 64 * 1024;
 ///
 /// The ONE compile of a caller-stored regular expression this data plane makes: an
 /// `IntegrationResponse$selectionPattern` ([`aws_integration`]) and an
-/// `Authorizer$identityValidationExpression` ([`cognito_user_pools`]) are both patterns a
+/// `Authorizer$identityValidationExpression` ([`cognito_user_pools`] for the audience of a
+/// presented user-pool token, [`custom_authorizer`] for the token a `TOKEN` authorizer is
+/// presented) are both patterns a
 /// CONTROL-PLANE call stored and a REQUEST is then matched against, so both are built here —
 /// under budgets, by the maintained engine whose matching is linear in the subject with no
 /// backtracking blowup, so a stored pattern cannot make a request to a deployed stage
