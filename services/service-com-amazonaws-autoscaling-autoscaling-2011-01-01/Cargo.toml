@@ -59,6 +59,13 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # holds, so an alarm this service reports is one CloudWatch's own `DescribeAlarms` resolves
 # (`state::scaling_policies`).
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# A launch template's `BlockDeviceMappings` may name a customer managed KMS key for a volume
+# the launch creates, and that key — its state above all — is the service that OWNS keys' own
+# fact: a key that produces no data key produces no volume, so the key a group launches under
+# is resolved in the store `kms:CreateKey`, `kms:DisableKey` and `kms:ScheduleKeyDeletion`
+# write and `kms:DescribeKey` reports (`state::volume_encryption_keys`), the way the stores
+# above are read.
+service-com-amazonaws-kms-trentservice = { workspace = true }
 # `service-common` carries the ONE reading of which IAM entity a caller-supplied IAM ARN
 # names, which that instance-profile ARN is read through, and the ONE in-process
 # EventBridge client an emulated service publishes an event through.

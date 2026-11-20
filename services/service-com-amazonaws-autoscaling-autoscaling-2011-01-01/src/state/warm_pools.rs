@@ -484,6 +484,7 @@ impl AutoScalingState {
         );
         let launched_ids = launch.launched_ids.clone();
         let unplaced_message = launch.unplaced_message(UNPLACED_WARM_POOL_INSTANCE_MESSAGE);
+        let unplaced_status_code = launch.unplaced_status_code();
         let unplaced = launch.unplaced;
         if !taken.is_empty() {
             if let Some(pool) = self
@@ -546,6 +547,7 @@ impl AutoScalingState {
                     &arn,
                     warm_pool_failed_launch_description(&unplaced_message),
                     unplaced_message.clone(),
+                    unplaced_status_code,
                     cause.clone(),
                     now,
                 );

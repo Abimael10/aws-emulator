@@ -97,6 +97,12 @@ pub mod elb_classic_instances;
 /// the consumer of the template, is what resolves.
 pub mod iam_instance_profiles;
 
+/// The KMS key the volumes of a group's launch are encrypted under, resolved against the
+/// account's own KMS store: a reference Amazon EC2 stores verbatim and this service, as the
+/// consumer of the template, is what resolves — a key that produces no data key produces no
+/// volume, so the launch places nothing.
+pub mod volume_encryption_keys;
+
 /// The service-linked role a group calls other Amazon Web Services under: the role the
 /// request named, or the one this service binds the group to when it named none.
 pub mod service_linked_role;
@@ -475,6 +481,9 @@ pub const ACTIVITY_IN_PROGRESS: &str = "InProgress";
 pub const ACTIVITY_SUCCESSFUL: &str = "Successful";
 /// A scaling activity that did not place the instance it was started for.
 pub const ACTIVITY_FAILED: &str = "Failed";
+/// A scaling activity whose instance was launched into no service and taken back, so the
+/// capacity change it was started for was cancelled rather than attempted and failed.
+pub const ACTIVITY_CANCELLED: &str = "Cancelled";
 
 /// `Activity$AutoScalingGroupState` for a group that still exists.
 pub const GROUP_STATE_IN_SERVICE: &str = "InService";
@@ -507,6 +516,46 @@ pub const UNPLACED_INSTANCE_MESSAGE: &str =
 /// instance to name, so it names the reason instead.
 pub fn failed_launch_description(status_message: &str) -> String {
     format!("Launching a new EC2 instance. Status Reason: {status_message}")
+}
+
+/// Why a launch placed nothing, and the terminal `ScalingActivityStatusCode` the activity of
+/// each unit it did not place ends in.
+///
+/// "If an attempt to launch instances failed, the StatusCode value is Failed or Cancelled and
+/// the StatusMessage element in the response indicates the cause of the failure"
+/// (`DescribeScalingActivities`' own documentation): WHICH of the two a launch records is a
+/// property of the reason it did not place the instance — a launch that could not be made at
+/// all FAILED, and one whose instance was launched into no service and taken back was
+/// CANCELLED — so the reason and the code travel together from the one place that judges the
+/// launch ([`ec2_instances::launch_failure_reason`]) to the recorder.
+#[derive(Debug, Clone)]
+pub struct BlockedLaunch {
+    /// The cause the activity reports under `Activity$StatusMessage`.
+    pub status_message: String,
+    /// The terminal status code the activity ends in.
+    pub status_code: &'static str,
+}
+
+impl BlockedLaunch {
+    /// A launch that could not be MADE: the group's configuration asks for an instance the
+    /// account's own state cannot produce.
+    #[must_use]
+    pub fn failed(status_message: String) -> Self {
+        Self {
+            status_message,
+            status_code: ACTIVITY_FAILED,
+        }
+    }
+
+    /// A launch whose instance would never reach service and is taken back, so the capacity
+    /// change ends CANCELLED.
+    #[must_use]
+    pub fn cancelled(status_message: String) -> Self {
+        Self {
+            status_message,
+            status_code: ACTIVITY_CANCELLED,
+        }
+    }
 }
 
 /// What the activity of a launch the group made to MEET its desired capacity records as
@@ -1875,20 +1924,24 @@ impl AutoScalingState {
         })
     }
 
-    /// Append a scaling activity that FAILED: the capacity change asked for an
+    /// Append a scaling activity that placed NOTHING: the capacity change asked for an
     /// instance that was not placed, so the group reports no instance for it and the
     /// activity it recorded says so instead of claiming a launch that never happened.
     ///
     /// `description` is what the activity set out to do and `status_message` is why it
     /// did not — the two the API reports apart
     /// ([`StoredActivity::to_activity`]); [`failed_launch_description`] builds the one
-    /// from the other for a launch.
+    /// from the other for a launch. `status_code` is the terminal code the reason ends the
+    /// activity in ([`BlockedLaunch`]), so the one recorder serves both of the two the
+    /// operation documents for a launch that placed nothing.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_failed_activity(
         &mut self,
         group_name: &str,
         group_arn: &str,
         description: String,
         status_message: String,
+        status_code: &str,
         cause: String,
         start_time: SystemTime,
     ) -> String {
@@ -1899,9 +1952,9 @@ impl AutoScalingState {
             description: Some(description),
             cause,
             start_time,
-            // Nothing is owed on a launch that failed: it ended when it failed.
+            // Nothing is owed on a launch that placed nothing: it ended when it did.
             end_time: Some(start_time),
-            status_code: ACTIVITY_FAILED.to_string(),
+            status_code: status_code.to_string(),
             status_message: Some(status_message),
             progress: 100,
             details: None,
@@ -2252,6 +2305,7 @@ impl AutoScalingState {
         );
         let launched_ids = launch.launched_ids.clone();
         let unplaced_message = launch.unplaced_message(UNPLACED_INSTANCE_MESSAGE);
+        let unplaced_status_code = launch.unplaced_status_code();
         let unplaced = launch.unplaced;
 
         let group = self
@@ -2311,6 +2365,7 @@ impl AutoScalingState {
                 &arn,
                 failed_launch_description(&unplaced_message),
                 unplaced_message.clone(),
+                unplaced_status_code,
                 cause.to_string(),
                 now,
             );
@@ -2605,7 +2660,10 @@ impl AutoScalingState {
             let unresolved = elbv2_targets::unresolved_attachments(engine, group);
             if !unresolved.is_empty() {
                 let reason = elbv2_targets::launch_blocked_message(&unresolved);
-                return GroupLaunchOutcome::unplaced(request.count, Some(reason));
+                return GroupLaunchOutcome::unplaced(
+                    request.count,
+                    Some(BlockedLaunch::failed(reason)),
+                );
             }
         }
         let region = group.region.clone();
@@ -2686,11 +2744,12 @@ impl AutoScalingState {
         // at the instant of the launch rather than when the group was configured: a group
         // launching from a floating launch-template version launches from whatever that
         // version says now, so a configuration the account's own stores cannot satisfy
-        // places nothing and records the reason instead of reporting an instance that
-        // could not exist ([`ec2_instances::launch_failure_reason`]).
+        // places nothing and records the reason — in the terminal status code that reason
+        // ends an activity in — instead of reporting an instance that could not exist
+        // ([`ec2_instances::launch_failure_reason`]).
         if wanted > 0 {
-            if let Some(reason) = ec2_instances::launch_failure_reason(engine, &launch_request) {
-                return GroupLaunchOutcome::unplaced(request.count, Some(reason));
+            if let Some(blocked) = ec2_instances::launch_failure_reason(engine, &launch_request) {
+                return GroupLaunchOutcome::unplaced(request.count, Some(blocked));
             }
         }
         let launched = ec2_instances::launch(engine, &launch_request);
@@ -3135,6 +3194,7 @@ impl AutoScalingState {
         );
         let launched_ids = launch.launched_ids.clone();
         let unplaced_message = launch.unplaced_message(UNPLACED_INSTANCE_MESSAGE);
+        let unplaced_status_code = launch.unplaced_status_code();
         let unplaced = launch.unplaced;
         let replaced = if launched_ids.is_empty() {
             Vec::new()
@@ -3177,6 +3237,7 @@ impl AutoScalingState {
                 &arn,
                 failed_launch_description(&unplaced_message),
                 unplaced_message.clone(),
+                unplaced_status_code,
                 cause.to_string(),
                 now,
             );
@@ -3246,14 +3307,14 @@ struct GroupLaunchOutcome {
     launched_ids: Vec<String>,
     /// How many of the instances asked for were not placed.
     unplaced: usize,
-    /// The sentence each unplaced unit's failed activity records in place of the
-    /// account's own, when something about the group stopped the launch outright.
-    blocked: Option<String>,
+    /// The reason each unplaced unit's terminal activity records, and the code it ends in,
+    /// when something about the group stopped the launch outright.
+    blocked: Option<BlockedLaunch>,
 }
 
 impl GroupLaunchOutcome {
     /// A launch that placed nothing, for `blocked`'s reason when it carries one.
-    fn unplaced(count: usize, blocked: Option<String>) -> Self {
+    fn unplaced(count: usize, blocked: Option<BlockedLaunch>) -> Self {
         Self {
             launched_ids: Vec::new(),
             unplaced: count,
@@ -3261,11 +3322,22 @@ impl GroupLaunchOutcome {
         }
     }
 
-    /// What the failed activity of each unplaced unit of this launch records: the reason
+    /// What the activity of each unplaced unit of this launch records: the reason
     /// the launch itself carries, or `account` — what an account that could not place the
     /// instance records — when it carries none.
     fn unplaced_message(&self, account: &str) -> String {
-        self.blocked.clone().unwrap_or_else(|| account.to_string())
+        self.blocked
+            .as_ref()
+            .map_or_else(|| account.to_string(), |blocked| blocked.status_message.clone())
+    }
+
+    /// The terminal status code those activities end in: the one the launch's own reason
+    /// carries, and [`ACTIVITY_FAILED`] for a unit the account could not place — which is
+    /// an attempt that failed.
+    fn unplaced_status_code(&self) -> &'static str {
+        self.blocked
+            .as_ref()
+            .map_or(ACTIVITY_FAILED, |blocked| blocked.status_code)
     }
 }
 
