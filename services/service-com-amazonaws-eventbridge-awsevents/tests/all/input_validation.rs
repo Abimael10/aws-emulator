@@ -1004,31 +1004,25 @@ async fn put_events_fails_an_entry_whose_detail_type_is_over_the_documented_maxi
     );
 }
 
-/// The expression a `@pattern` refusal reports is the one a value has to satisfy,
-/// without the `^`/`$` the model writes to demand a whole-string match. The rows span
-/// six operations and six pattern-constrained members — a top-level member, a nested
-/// list element and a list-of-strings element — plus one control row per OTHER
-/// constraint class this service can be made to violate (a string's length maximum, a
-/// list's length minimum on two operations, an integer's range bounds, and an absent
-/// required member), which keep the wording they had.
+/// The expression a `@pattern` refusal reports is the member's modelled expression
+/// exactly as the model spells it, `^`/`$` included. The rows span six operations and
+/// six pattern-constrained members — a top-level member, a nested list element and a
+/// list-of-strings element — plus one control row per OTHER constraint class this
+/// service can be made to violate (a string's length maximum, a list's length minimum
+/// on two operations, an integer's range bounds, and an absent required member), which
+/// keep the wording they had.
 #[tokio::test]
-async fn a_pattern_refusal_reports_the_expression_without_the_models_anchors() {
+async fn a_pattern_refusal_reports_the_expression_the_model_spells() {
     let emulator = emulator();
 
-    // The expression as a refusal must report it: the model's spelling minus its outer
-    // anchors. Written out here rather than reusing the service's helper, so the test
-    // states the expectation independently of the code under test.
-    fn expression(model_pattern: &str) -> String {
-        model_pattern
-            .trim_start_matches('^')
-            .trim_end_matches('$')
-            .to_string()
-    }
+    // The expression as a refusal must report it: the model's own spelling, which is
+    // what this service matched the value against. Written out in the row constants
+    // above rather than taken from the service, so a wrong constant in the
+    // implementation cannot make a row pass.
     fn pattern_message(value: &str, path: &str, model_pattern: &str) -> String {
         format!(
             "1 validation error detected: Value '{value}' at '{path}' failed to satisfy \
-             constraint: Member must satisfy regular expression pattern: {}",
-            expression(model_pattern)
+             constraint: Member must satisfy regular expression pattern: {model_pattern}"
         )
     }
 
@@ -1205,17 +1199,18 @@ async fn a_pattern_refusal_reports_the_expression_without_the_models_anchors() {
         );
     }
 
-    // And the expression is usable as-is: whatever the member, the reported pattern
-    // carries neither the leading `^` nor the trailing `$` of the model's spelling.
+    // And the expression is the model's own: whatever the member, the reported pattern
+    // carries the anchors the model spells it with, so a client comparing it against the
+    // model's own text finds them equal.
     const CLAUSE: &str = "Member must satisfy regular expression pattern: ";
     for (case, _, _, expected) in &rows {
         let Some((_, reported)) = expected.split_once(CLAUSE) else {
             continue;
         };
         assert!(
-            !reported.starts_with('^') && !reported.ends_with('$'),
-            "case {case:?}: the reported expression must carry no outer anchor, got \
-             {reported:?}"
+            reported.starts_with('^') && reported.ends_with('$'),
+            "case {case:?}: the reported expression must be the modelled one, anchors \
+             included, got {reported:?}"
         );
     }
 }

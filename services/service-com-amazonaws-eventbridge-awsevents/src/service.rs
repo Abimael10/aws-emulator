@@ -28,8 +28,8 @@
 //!   generated routing table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. This service words one here: the constraint clauses
-//!   the framework states, with a `@pattern` requirement reported without the
-//!   anchors the model spells it with. See the inline note on that method.
+//!   the framework states, with a `@pattern` requirement reported as the model
+//!   spells the expression. See the inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -68,12 +68,10 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 ///
 /// Every requirement but two is worded exactly as the framework words it:
 ///
-/// * `@pattern` is reported as the expression a value must satisfy WITHOUT the
-///   anchors the model spells it with (`crate::state::pattern_requirement`): the
-///   anchoring is how the model makes the match total, not part of the expression
-///   the service asks a value to satisfy, and a client that lifts the expression
-///   out of the message to re-validate its input cannot use one wrapped in
-///   anchors it never sent.
+/// * `@pattern` is reported as the member's modelled expression exactly as the
+///   model spells it (`crate::state::pattern_requirement`): the anchoring is
+///   part of the expression this service matches a value against, so an
+///   expression reported without it would describe values this service refuses.
 /// * an enum value set is listed in the order this service lists that type's values
 ///   in, which is not the order the model declares them in: the violations are
 ///   restated through [`enum_value_sets`] before they are worded, so the requirement
@@ -502,9 +500,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // This service states a constraint violation through the one builder in
         // `crate::state`, which is also what a handler enforcing an unmodelled
         // constraint reaches, so a refusal found at the boundary and one found in a
-        // handler read identically. The only difference from the framework's own
-        // wording is that a `@pattern` requirement is reported unanchored — see
-        // [`constraint_clause`].
+        // handler read identically. The requirement sentences are the framework's
+        // own, save for the two [`constraint_clause`] states otherwise.
         //
         // The code stays `ValidationException` (HTTP 400), which is what the
         // framework would have answered; `override_refusal` replaces the code and

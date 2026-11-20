@@ -182,7 +182,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
             Some("") => Some(None),
             Some(pattern) => {
-                if let Err(reason) = crate::state::event_pattern::parse(pattern) {
+                if let Err(reason) = crate::state::event_pattern::parse_as(
+                    pattern,
+                    crate::state::event_pattern::Validator::ArchiveCompiler,
+                ) {
                     return Err(UpdateArchiveErrorModeled::InvalidEventPatternException(
                         InvalidEventPatternException {
                             message: Some(reason),

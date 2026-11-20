@@ -200,9 +200,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "An event pattern to use to filter events sent to the archive": the
         // pattern is validated through the same interpreter that will evaluate
-        // it, so an archive is never stored carrying a filter nothing can apply.
+        // it, so an archive is never stored carrying a filter nothing can apply
+        // — as the ARCHIVE validator words its refusals
+        // (`crate::state::event_pattern::Validator::ArchiveCompiler`).
         if let Some(pattern) = input.event_pattern.as_deref() {
-            if let Err(reason) = crate::state::event_pattern::parse(pattern) {
+            if let Err(reason) = crate::state::event_pattern::parse_as(
+                pattern,
+                crate::state::event_pattern::Validator::ArchiveCompiler,
+            ) {
                 return Err(CreateArchiveErrorModeled::InvalidEventPatternException(
                     InvalidEventPatternException {
                         message: Some(reason),

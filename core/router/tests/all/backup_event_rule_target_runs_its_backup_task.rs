@@ -415,7 +415,20 @@ pub(crate) async fn executions_once_started(
     case: &str,
     arn: &str,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + RUN_BUDGET;
+    executions_once_started_within(router, case, arn, RUN_BUDGET).await
+}
+
+/// [`executions_once_started`] with the patience the caller states, for a firing whose instant is
+/// named by the schedule rather than falling a fixed span after the rule was written: one of
+/// those is due up to a whole period after the wait begins, which is longer than the budget a
+/// published event's handover needs.
+pub(crate) async fn executions_once_started_within(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+    patience: Duration,
+) -> Vec<Value> {
+    let deadline = Instant::now() + patience;
     loop {
         let held = executions(router, case, arn).await;
         if !held.is_empty() {

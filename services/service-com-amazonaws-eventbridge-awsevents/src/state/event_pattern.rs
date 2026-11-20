@@ -64,6 +64,15 @@ const ANYTHING_BUT_VALUE: &str =
 /// the kinds of token that are not strings, rather than the match type's own
 /// pattern — what was read is one member of a list and not the operand itself
 /// ([`validate_negated_operator`]).
+///
+/// The list is named for the match type it belongs to, and the validators this
+/// service runs a pattern through do not spell that match type alike: the one
+/// that compiles a RULE's pattern names it by the SHORT name of the comparison
+/// it folds (`ignore-case`), while the others name it in full
+/// ([`Validator::anything_but_ignore_case_list`]). Both sentences are otherwise
+/// the one sentence, so the kinds of token that are not strings are listed once.
+const ANYTHING_BUT_IGNORE_CASE_LIST_FOR_A_RULE: &str =
+    "Inside anything-but/ignore-case list, number|start|null|boolean is not supported.";
 const ANYTHING_BUT_IGNORE_CASE_LIST: &str =
     "Inside anything-but/equals-ignore-case list, number|start|null|boolean is not supported.";
 
@@ -188,17 +197,37 @@ const CANNOT_COMPARE_NUMBER: &str = "Cannot compare number : ";
 /// Which of the two validators this service runs a pattern through is reading
 /// it.
 ///
-/// They refuse the same patterns for the same reasons everywhere but one
-/// construct ([`OR_NEEDS_TWO_OBJECTS`]), so the distinction travels as a
-/// parameter of the one parse rather than as a second copy of it.
+/// They refuse the same patterns for the same reasons everywhere but two
+/// sentences ([`OR_NEEDS_TWO_OBJECTS`],
+/// [`ANYTHING_BUT_IGNORE_CASE_LIST_FOR_A_RULE`]), so the distinction travels as
+/// a parameter of the one parse rather than as a second copy of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Validator {
-    /// The compiler a pattern that is about to be STORED goes through:
-    /// `PutRule`, `CreateArchive`, `UpdateArchive`, and the parse routing
-    /// takes of a stored pattern.
-    Compiler,
+    /// The compiler a RULE's pattern goes through: `PutRule`, and the parse
+    /// routing takes of a stored pattern.
+    RuleCompiler,
+    /// The compiler an ARCHIVE's pattern goes through: `CreateArchive` and
+    /// `UpdateArchive`.
+    ArchiveCompiler,
     /// The checker `TestEventPattern` answers from, which stores nothing.
     Checker,
+}
+
+impl Validator {
+    /// Whether this validator reads a list of match terms where the checker
+    /// reads a relationship too short to relate anything ([`validate_object`]).
+    fn compiles(self) -> bool {
+        !matches!(self, Self::Checker)
+    }
+
+    /// How this validator names the list the case-folding match type is handed
+    /// under `anything-but` ([`ANYTHING_BUT_IGNORE_CASE_LIST_FOR_A_RULE`]).
+    fn anything_but_ignore_case_list(self) -> &'static str {
+        match self {
+            Self::RuleCompiler => ANYTHING_BUT_IGNORE_CASE_LIST_FOR_A_RULE,
+            Self::ArchiveCompiler | Self::Checker => ANYTHING_BUT_IGNORE_CASE_LIST,
+        }
+    }
 }
 
 /// The most characters the event pattern of a RULE may carry.
@@ -230,8 +259,9 @@ pub fn length_violation(rule_name: &str, pattern: &str) -> Option<String> {
     })
 }
 
-/// Parse `pattern` as the pattern COMPILER reads it — the validator every
-/// operation that stores a pattern, and routing itself, goes through.
+/// Parse `pattern` as the RULE compiler reads it — the validator `PutRule` and
+/// routing itself go through (an archive's pattern is read by its own,
+/// [`Validator::ArchiveCompiler`]).
 ///
 /// What comes back is the WHOLE message of the `InvalidEventPatternException`
 /// a caller answers with: the opening ([`INVALID_PATTERN`]), the reason, and
@@ -241,7 +271,7 @@ pub fn length_violation(rule_name: &str, pattern: &str) -> Option<String> {
 /// field path of this module's own making, since the location clause is what
 /// points a caller at the text to change.
 pub fn parse(pattern: &str) -> Result<Map<String, Value>, String> {
-    parse_as(pattern, Validator::Compiler)
+    parse_as(pattern, Validator::RuleCompiler)
 }
 
 /// [`parse`], read by `validator`: the same parse, worded as that validator
@@ -818,17 +848,15 @@ fn validate_object(
             // which is what makes a lone object naming no match type an
             // unrecognized match type rather than a branch of an `$or`.
             if branches.len() < OR_RELATED_OBJECTS {
-                match validator {
-                    Validator::Checker => {
-                        return Err(at.refuse(Read::Whole, OR_NEEDS_TWO_OBJECTS));
-                    }
-                    Validator::Compiler => branches
-                        .iter()
-                        .enumerate()
-                        .try_for_each(|(index, term)| {
-                            validate_term(term, key, &at.index(index))
-                        })?,
+                if !validator.compiles() {
+                    return Err(at.refuse(Read::Whole, OR_NEEDS_TWO_OBJECTS));
                 }
+                branches
+                    .iter()
+                    .enumerate()
+                    .try_for_each(|(index, term)| {
+                        validate_term(term, key, &at.index(index), validator)
+                    })?;
                 continue;
             }
             for (index, branch) in branches.iter().enumerate() {
@@ -852,7 +880,7 @@ fn validate_object(
                     return Err(at.refuse(Read::Whole, EMPTY_ARRAY));
                 }
                 for (index, term) in terms.iter().enumerate() {
-                    validate_term(term, key, &at.index(index))?;
+                    validate_term(term, key, &at.index(index), validator)?;
                 }
             }
             Value::Object(child) => {
@@ -886,7 +914,12 @@ fn validate_object(
 /// names: a literal term is matched by VALUE and not by comparison, so it
 /// needs no double to carry it ([`same_value`]) — which is why the numbers the
 /// comparisons refuse are still terms this one admits.
-fn validate_term(term: &Value, member: &str, at: &At<'_>) -> Result<(), Refusal> {
+fn validate_term(
+    term: &Value,
+    member: &str,
+    at: &At<'_>,
+    validator: Validator,
+) -> Result<(), Refusal> {
     match term {
         Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => Ok(()),
         Value::Object(map) if map.len() == 1 => {
@@ -895,7 +928,7 @@ fn validate_term(term: &Value, member: &str, at: &At<'_>) -> Result<(), Refusal>
                 .next()
                 .expect("a single-entry map has a first entry");
             let operand = at.key(operator);
-            validate_operator(operator, argument, &operand, &operand)
+            validate_operator(operator, argument, &operand, &operand, validator)
         }
         Value::Object(map) if map.is_empty() => Err(at.refuse(Read::Whole, EMPTY_OBJECT)),
         // The reader finds this out on the SECOND match type the object
@@ -935,6 +968,7 @@ fn validate_operator(
     argument: &Value,
     at: &At<'_>,
     handed: &At<'_>,
+    validator: Validator,
 ) -> Result<(), Refusal> {
     // A type the operator does not take is decided from the argument's
     // opening token alone, which is as much of it as the reader had read.
@@ -961,7 +995,7 @@ fn validate_operator(
             Value::Object(map) if map.len() == 1 => match map.get(IGNORE_CASE) {
                 Some(nested) => {
                     let folded = at.key(IGNORE_CASE);
-                    validate_operator(IGNORE_CASE, nested, &folded, &folded)
+                    validate_operator(IGNORE_CASE, nested, &folded, &folded, validator)
                 }
                 None => bad(A_STRING),
             },
@@ -1071,10 +1105,13 @@ fn validate_operator(
                                 one,
                                 &nested_at.index(index),
                                 &nested_at,
+                                validator,
                             )
                         })
                     }
-                    one => validate_negated_operator(nested, one, &nested_at, &nested_at),
+                    one => {
+                        validate_negated_operator(nested, one, &nested_at, &nested_at, validator)
+                    }
                 }
             }
             _ => bad("a value, a list of values, or one nested string operator"),
@@ -1207,10 +1244,11 @@ fn validate_negated_operator(
     argument: &Value,
     at: &At<'_>,
     handed: &At<'_>,
+    validator: Validator,
 ) -> Result<(), Refusal> {
     if operator == IGNORE_CASE && !at.is(handed) && !argument.is_string() {
         return Err(operand_refusal(
-            at.refuse(Read::Opening, ANYTHING_BUT_IGNORE_CASE_LIST),
+            at.refuse(Read::Opening, validator.anything_but_ignore_case_list()),
             at,
             handed,
         ));
@@ -1230,7 +1268,7 @@ fn validate_negated_operator(
             handed,
         ));
     }
-    validate_operator(operator, argument, at, handed)
+    validate_operator(operator, argument, at, handed, validator)
 }
 
 /// `refusal`, as the readers of the operand at `at` state it: once by the

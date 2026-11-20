@@ -64,7 +64,7 @@
 //! table, roles, state machine and scheduled rule, nothing published, and a real AWS Backup job
 //! at the far end.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -74,9 +74,10 @@ use smithy_server_runtime::MultiServiceRouter;
 // principals and actions the chain is made of. `tests/all/main.rs` is one crate root, so this
 // suite borrows that wiring rather than restating it.
 use crate::backup_event_rule_target_runs_its_backup_task::{
-    backup, events, executions_once_started, job_once_settled, member, once_terminal, router,
-    BACKUP_PRINCIPAL, COMPLETED, DYNAMODB_TYPE, EVENTS_PRINCIPAL, LOOK_INTERVAL, RUN_BUDGET,
-    START_BACKUP_JOB_ACTION, START_BACKUP_JOB_TASK, START_EXECUTION_ACTION, STATES_PRINCIPAL,
+    backup, events, executions_once_started_within, job_once_settled, member, once_terminal,
+    router, BACKUP_PRINCIPAL, COMPLETED, DYNAMODB_TYPE, EVENTS_PRINCIPAL, LOOK_INTERVAL,
+    RUN_BUDGET, START_BACKUP_JOB_ACTION, START_BACKUP_JOB_TASK, START_EXECUTION_ACTION,
+    STATES_PRINCIPAL,
 };
 // The shared stack waiter, the awsQuery CloudFormation caller and the reader of a stack's
 // outputs this test crate writes ONCE rather than per suite. They sign for the same Region the
@@ -310,6 +311,14 @@ async fn job_in_vault_once_listed(
     }
 }
 
+/// How long a row waits for its schedule's FIRST firing to reach the target. Generous, because
+/// the forms do not become due alike: a `rate` row's first firing falls inside the first period,
+/// while a `cron` row's falls at the first instant its expression NAMES — up to a whole minute
+/// after the stack is deployed, for the minute-resolution expression the row states. It is a
+/// bound on a WAIT and not on the chain: what the chain below asserts on is what the firing
+/// really produced.
+const FIRING_PATIENCE: Duration = Duration::from_secs(180);
+
 /// The one execution of the machine at `machine_arn`, waited for and then read in its terminal
 /// status.
 ///
@@ -323,7 +332,8 @@ async fn terminal_execution(
     case: &str,
     machine_arn: &str,
 ) -> Value {
-    let started = executions_once_started(router, case, machine_arn).await;
+    let started =
+        executions_once_started_within(router, case, machine_arn, FIRING_PATIENCE).await;
     let execution_arn = member(case, &started[0], "/executionArn");
     once_terminal(router, case, &execution_arn).await
 }

@@ -4593,12 +4593,11 @@ pub fn parse_delivered_event(text: &str) -> Option<::serde_json::Value> {
 /// an unmodelled constraint itself can reach, so a refusal found at the
 /// boundary and one found in a handler read identically.
 ///
-/// NOTE: the subject half, the requirement half and [`unanchored`] are the same
-/// for every service and belong in `services/common/src/validation.rs` — whose
-/// module docs record that migration as a change of its own. They are inlined
-/// here, as they are in the ~24 other service crates that state them
-/// (`grep -rln 'fn unanchored' services/*/src`), and are to be MOVED there
-/// rather than copied again.
+/// NOTE: the subject half and the requirement half are the same for every
+/// service and belong in `services/common/src/validation.rs` — whose module docs
+/// record that migration as a change of its own. They are inlined here, as they
+/// are in the ~24 other service crates that state them, and are to be MOVED
+/// there rather than copied again.
 pub fn constraint_clause(member_path: &str, value: Option<&str>, requirement: &str) -> String {
     let subject = match value {
         Some(shown) => format!("Value '{shown}'"),
@@ -4608,13 +4607,14 @@ pub fn constraint_clause(member_path: &str, value: Option<&str>, requirement: &s
 }
 
 /// The requirement clause for a `@pattern` violation: the expression the value
-/// had to satisfy, rendered WITHOUT the anchors the model spells it with (see
-/// [`unanchored`]).
+/// had to satisfy, exactly as the model spells it.
+///
+/// The expression this service reports is the one its own validation applied,
+/// which is the member's modelled `@pattern` — anchors included, since the
+/// anchoring is part of the expression a value is matched against and an
+/// expression without it describes values this service refuses.
 pub fn pattern_requirement(pattern: &str) -> String {
-    format!(
-        "Member must satisfy regular expression pattern: {}",
-        unanchored(pattern)
-    )
+    format!("Member must satisfy regular expression pattern: {pattern}")
 }
 
 /// The `ValidationException` message over one or more clauses: how many
@@ -4627,30 +4627,6 @@ pub fn validation_envelope(clauses: &[String]) -> String {
             many.len(),
             many.join("; ")
         ),
-    }
-}
-
-/// A `@pattern` expression without the anchors a model may spell it with: the
-/// requirement reported is the expression a value must satisfy, not the
-/// anchoring the model uses to make the match total.
-///
-/// Only the expression's OUTER anchors go: an anchor inside the expression (one
-/// per branch of an alternation, say) is part of its own structure, and
-/// dropping it would change which strings the reported expression describes. A
-/// `$` escaped by a backslash is a literal dollar sign rather than the end
-/// anchor, so it stays.
-pub fn unanchored(pattern: &str) -> &str {
-    let body = pattern.strip_prefix('^').unwrap_or(pattern);
-    match body.strip_suffix('$') {
-        Some(trimmed) => {
-            let backslashes = trimmed.len() - trimmed.trim_end_matches('\\').len();
-            if backslashes % 2 == 0 {
-                trimmed
-            } else {
-                body
-            }
-        }
-        None => body,
     }
 }
 
@@ -4709,12 +4685,14 @@ pub fn encode_page_token(after: &str) -> String {
 
 /// What every list operation refuses a `NextToken` it cannot resume from with.
 ///
-/// The service states the parameter that was rejected and nothing else — no
-/// reason clause and no echo of the token — so a token this service never
-/// minted and a well-formed one whose position is gone are refused in exactly
-/// these words. Written once, so the twelve paginated listings cannot word it
-/// differently.
-pub const INVALID_NEXT_TOKEN: &str = "Parameter NextToken is not valid.";
+/// The service states the parameter that was rejected and the reason clause
+/// every refusal of a parameter of this service carries — the request is
+/// malformed, which is all a token it cannot resume from says — and nothing of
+/// the token or the listing, so a token this service never minted and a
+/// well-formed one whose position is gone are refused in exactly these words.
+/// Written once, so the twelve paginated listings cannot word it differently.
+pub const INVALID_NEXT_TOKEN: &str =
+    "Parameter NextToken is not valid. Reason: The request is malformed.";
 
 /// Decode a list page token. `None` when it is not one this service minted,
 /// which the caller turns into a refusal rather than an empty page.

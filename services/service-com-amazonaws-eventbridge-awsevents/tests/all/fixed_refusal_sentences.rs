@@ -312,12 +312,14 @@ async fn a_delete_precondition_states_one_sentence_whatever_the_resource_or_the_
 }
 
 /// A `NextToken` this service cannot resume from is refused with one sentence
-/// naming the parameter, whichever listing was asked and whatever the token
-/// looked like: no reason clause, and nothing of the token or the listing in it.
+/// naming the parameter and the reason clause a refused parameter of this service
+/// carries, whichever listing was asked and whatever the token looked like:
+/// nothing of the token or the listing is in it.
 #[tokio::test]
 async fn a_next_token_this_service_cannot_resume_from_is_refused_with_one_sentence() {
     let router = emulator();
-    const INVALID_NEXT_TOKEN: &str = "Parameter NextToken is not valid.";
+    const INVALID_NEXT_TOKEN: &str =
+        "Parameter NextToken is not valid. Reason: The request is malformed.";
     given_rule(&router, "the rule the target listing pages", None, "paged", 2).await;
 
     // The token forms differ along WHY this service cannot resume from them: text
