@@ -19,6 +19,12 @@ pub use geofence_geometry::{validate_geofence_geometry, GeometryRefusal};
 /// the shapes they are stated about.
 mod ring_predicates;
 
+/// What a geofence write checks about ONE linear ring before any shape question is asked of
+/// it — how few vertices it may list, the geometry-wide vertex budget it counts toward and
+/// how far an edge may span in longitude — asserted at each published bound and one step
+/// past it.
+mod linear_rings;
+
 /// The verdict each ring form of a polygon geometry earns, asserted through those checks:
 /// a question about one function, so it is asked beside it rather than through a request.
 mod ring_geometry;

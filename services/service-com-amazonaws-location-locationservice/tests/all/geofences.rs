@@ -253,6 +253,44 @@ fn geofence_cases() -> Vec<GeofenceCase> {
             },
             properties: None,
         },
+        GeofenceCase {
+            case: "a ring with a vertex in the middle of one of its edges",
+            geofence_id: "mid-edge-vertex",
+            // Three vertices on one line in the same direction are a corner the ring
+            // turns through by no angle at all: the same boundary as the square without
+            // it, so the ring is a valid one.
+            geometry: || {
+                json!({
+                    "Polygon": [[
+                        [0.0, 0.0],
+                        [0.005, 0.0],
+                        [0.01, 0.0],
+                        [0.01, 0.01],
+                        [0.0, 0.01],
+                        [0.0, 0.0],
+                    ]]
+                })
+            },
+            properties: None,
+        },
+        GeofenceCase {
+            case: "a ring that lists one vertex twice in a row",
+            geofence_id: "repeated_vertex",
+            // A vertex repeated in a row names an edge of no length, which names the
+            // same boundary: the ring is valid and is stored as it was given.
+            geometry: || {
+                json!({
+                    "Polygon": [[
+                        [0.0, 0.0],
+                        [0.01, 0.0],
+                        [0.01, 0.0],
+                        [0.01, 0.01],
+                        [0.0, 0.0],
+                    ]]
+                })
+            },
+            properties: None,
+        },
     ]
 }
 
@@ -618,6 +656,40 @@ fn rejected_cases() -> Vec<RejectedCase> {
             },
             member: "Geometry.Polygon[0]",
             message: "'Geometry.Polygon[0]' must not cross the antimeridian.",
+        },
+        RejectedCase {
+            case: "an interior ring inside another interior ring",
+            // "Interior rings must not contain other interior rings."
+            geometry: || {
+                json!({
+                    "Polygon": [
+                        [[-0.04, -0.04], [0.04, -0.04], [0.04, 0.04], [-0.04, 0.04], [-0.04, -0.04]],
+                        [[-0.02, -0.02], [-0.02, 0.02], [0.02, 0.02], [0.02, -0.02], [-0.02, -0.02]],
+                        [[-0.01, -0.01], [-0.01, 0.01], [0.01, 0.01], [0.01, -0.01], [-0.01, -0.01]],
+                    ]
+                })
+            },
+            member: RING_MEMBER,
+            message: RING_REQUIREMENT,
+        },
+        RejectedCase {
+            case: "a ring that doubles back along one of its edges",
+            // "No ring is permitted to intersect itself": a ring that runs back down the
+            // edge it just came up meets itself along that overlap, which a ring that
+            // merely turns through a corner does not.
+            geometry: || {
+                json!({
+                    "Polygon": [[
+                        [0.0, 0.0],
+                        [0.02, 0.0],
+                        [0.01, 0.0],
+                        [0.01, 0.02],
+                        [0.0, 0.0],
+                    ]]
+                })
+            },
+            member: RING_MEMBER,
+            message: RING_REQUIREMENT,
         },
         RejectedCase {
             case: "an empty geobuf blob",

@@ -269,7 +269,7 @@ fn validate_polygon(
                 ),
             ));
         }
-        let mut coords = Vec::with_capacity(ring.len());
+        let mut coords: Vec<[f64; 2]> = Vec::with_capacity(ring.len());
         for vertex in ring {
             let position = super::wgs84_position(vertex)
                 .map_err(|why| GeometryRefusal::new(path.ring(index), why))?;
