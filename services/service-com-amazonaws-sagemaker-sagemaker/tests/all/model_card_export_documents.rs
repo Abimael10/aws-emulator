@@ -194,9 +194,10 @@ async fn a_completed_export_writes_the_card_version_as_a_pdf_object() {
             "case {case:?}: a completed export carries no FailureReason, got {settled}"
         );
         // The artifact is the object the export wrote: the prefix the output path names,
-        // then the card, the version that was exported and the job that exported it — and
-        // the `https://` spellings reach the same bucket and prefix the `s3://` one does.
-        let key = format!("{prefix}{card}-{exported}-{job}.pdf");
+        // then the card as its own path segment and the job that exported it as the file
+        // stem — and the `https://` spellings reach the same bucket and prefix the `s3://`
+        // one does.
+        let key = format!("{prefix}{card}/{job}.pdf");
         let expected_uri = format!("s3://{BUCKET}/{key}");
         assert_eq!(
             settled
@@ -227,12 +228,14 @@ async fn a_completed_export_writes_the_card_version_as_a_pdf_object() {
                 document.len()
             );
         }
-        // Nothing else was written: the export leaves ONE object behind.
-        let other_version = if exported == 1 { 2 } else { 1 };
-        let absent = format!("{prefix}{card}-{other_version}-{job}.pdf");
+        // Nothing else was written: the export leaves ONE object behind, under exactly the
+        // key the artifact it reported names. In particular nothing sits at a key carrying
+        // the version that was exported — a key no response hands the client, and so an
+        // object no client can read or delete.
+        let absent = format!("{prefix}{card}-{exported}-{job}.pdf");
         assert!(
             emulator.object_bytes(BUCKET, &absent).await.is_none(),
-            "case {case:?}: the export must write only its own version's document, but \
+            "case {case:?}: the export must write only the object it reported, but \
              Amazon S3 holds {absent}"
         );
     }
@@ -292,7 +295,7 @@ async fn the_document_carries_the_exported_versions_own_content() {
             "case {case:?}: expected Completed, got {settled}"
         );
 
-        let key = format!("docs/{card}-1-{job}.pdf");
+        let key = format!("docs/{card}/{job}.pdf");
         let first = emulator
             .object_bytes(BUCKET, &key)
             .await
@@ -323,7 +326,7 @@ async fn the_document_carries_the_exported_versions_own_content() {
             "case {case:?}: the second export must complete too, got {settled}"
         );
         // Each job leaves its OWN object, and the first job's document is untouched.
-        let second_key = format!("docs/{card}-1-second-export.pdf");
+        let second_key = format!("docs/{card}/second-export.pdf");
         let again = emulator
             .object_bytes(BUCKET, &second_key)
             .await
@@ -413,7 +416,7 @@ async fn an_export_that_writes_nothing_fails_and_names_no_artifact() {
         // And the bucket that does exist is untouched by the failed export.
         assert!(
             emulator
-                .object_bytes(BUCKET, &format!("cards/{card}-1-{job}.pdf"))
+                .object_bytes(BUCKET, &format!("cards/{card}/{job}.pdf"))
                 .await
                 .is_none(),
             "case {case:?}: a failed export must write nothing anywhere"

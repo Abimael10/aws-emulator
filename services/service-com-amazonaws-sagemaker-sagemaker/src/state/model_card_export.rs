@@ -36,20 +36,23 @@ pub enum ModelCardExportOutcome {
     Failed(String),
 }
 
-/// Where the document of `card_name` version `version`, exported by the job `job_name`, is
-/// written under the output location `output`.
+/// Where the document the job `job_name` exported of the card `card_name` is written under
+/// the output location `output`.
 ///
-/// One object under the path the request named, named for the card, the job that exported
-/// it and the version that was exported — so two export jobs of one card each leave their
-/// own document, and the key is a function of what was exported and carries nothing from
-/// the moment the export ran: re-running one job rewrites the same object with the same
-/// bytes.
+/// One object under the path the request named, addressed by exactly the two names that
+/// identify the export job itself — the card is its own path segment and the job is the
+/// file stem, the layout the job's own `ModelCardExportJobArn`
+/// (`model-card/<card>/export-job/<job>`) is built from — and by nothing else. So a client
+/// holding only what the API named it (the request's output path, the card and the job)
+/// addresses the very object the export wrote, and the key carries nothing from the moment
+/// the export ran: re-running one job rewrites the same object with the same bytes. The
+/// version that was exported is NOT part of it: a job name is unique within its card, so
+/// two export jobs of one card each leave their own document.
 #[must_use]
 pub fn model_card_export_object(
     output: &S3Location,
     card_name: &str,
     job_name: &str,
-    version: i32,
 ) -> S3Location {
     // The output path is a PREFIX, so a value that already ends in the Amazon S3 delimiter
     // gains no second one and a bucket named with no prefix at all gains no leading one.
@@ -60,7 +63,7 @@ pub fn model_card_export_object(
     };
     S3Location {
         bucket: output.bucket.clone(),
-        key: format!("{prefix}{card_name}-{version}-{job_name}{MODEL_CARD_PDF_SUFFIX}"),
+        key: format!("{prefix}{card_name}/{job_name}{MODEL_CARD_PDF_SUFFIX}"),
     }
 }
 
@@ -234,12 +237,7 @@ pub async fn run_model_card_export(
             "the output location names no Amazon S3 bucket",
         ));
     };
-    let object = model_card_export_object(
-        &output,
-        export.card_name,
-        export.job_name,
-        export.version,
-    );
+    let object = model_card_export_object(&output, export.card_name, export.job_name);
     let document = model_card_document(
         export.card_name,
         export.version,
