@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: rds.aurora-writer-reader-endpoint-query-routing rds.deep-rds-sql-truth-force-ssl-plaintext-login-rejected rds.snaprestore-final-snapshot-on-delete-restores-rows rds.rds-sql-connectivity-postgres-mysql rds.create-shard-group-wrong-cluster-state-rejected rds.read-replica-promote-lifecycle
+Issue-Trace-Ids: rds.aurora-writer-reader-endpoint-query-routing rds.deep-rds-sql-truth-force-ssl-plaintext-login-rejected rds.snaprestore-final-snapshot-on-delete-restores-rows rds.rds-sql-connectivity-postgres-mysql rds.create-shard-group-wrong-cluster-state-rejected rds.read-replica-promote-lifecycle rds.read-replica-replication-query-and-promote rds.replica-uncommitted-primary-write-absent-until-commit rds.deploy-rds-2-cfn-mysql-sql-then-dbname-change-replaces-instance
 Issue-Key: rds.aurora-writer-reader-endpoint-query-routing|run#30|AssertionError|assert port == 5432, f"aurora-postgresql must listen on 5432, got {port!r}"
 Issue-Key: rds.aurora-writer-reader-endpoint-query-routing|run#23|AssertionError|assert writer_ep != reader_ep, (
 Issue-Key: rds.deep-rds-sql-truth-force-ssl-plaintext-login-rejected|run#21|AssertionError|assert port == _PORT, f"postgres must listen on {_PORT}; DescribeDBInstances says {port!r}"
@@ -11,6 +11,9 @@ Issue-Key: rds.create-shard-group-wrong-cluster-state-rejected|_error#18|Asserti
 Issue-Key: rds.create-shard-group-wrong-cluster-state-rejected|_wait_cluster_status#15|Timeout|time.sleep(poll_s)
 Issue-Key: rds.read-replica-promote-lifecycle|run#17|KeyError|assert replica_before["StatusInfos"][0]["Status"] == "replicating", (
 Issue-Key: rds.read-replica-promote-lifecycle|_wait_until#12|Timeout|last = probe()
+Issue-Key: rds.read-replica-replication-query-and-promote|run#24|AssertionError|assert rep_addr != src_addr, (
+Issue-Key: rds.replica-uncommitted-primary-write-absent-until-commit|run#14|AssertionError|assert rep_addr != src_addr, (
+Issue-Key: rds.deploy-rds-2-cfn-mysql-sql-then-dbname-change-replaces-instance|run#55|AssertionError|assert host_b != host_a, f"replacement kept the same Endpoint.Address {host_a!r}"
 Issue-Commit: 8b0f35809934c567f1bf7b94b8ce8845151fefb8
 
 # rds: the endpoint a served engine publishes cannot be both AWS's (engine port, per-resource DNS address) and dialable, and three checks die in a wait this fixer could not place
@@ -65,7 +68,18 @@ then the control plane can publish AWS's form and still be reachable.
 Traces: rds.aurora-writer-reader-endpoint-query-routing (both endpoints `127.0.0.1`, and
 the port assertion behind it), rds.deep-rds-sql-truth-force-ssl-plaintext-login-rejected
 (5432 expected), rds.snaprestore-final-snapshot-on-delete-restores-rows (the restored
-instance's address equals the source's).
+instance's address equals the source's), rds.read-replica-replication-query-and-promote and
+rds.replica-uncommitted-primary-write-absent-until-commit (a read replica advertises
+`127.0.0.1`, the same host as the source it was made from, so a reader cannot be pointed at
+it), rds.deploy-rds-2-cfn-mysql-sql-then-dbname-change-replaces-instance (the instance
+CloudFormation provisions for a `DBName` replacement publishes the replaced instance's
+address).
+
+> _Those last three keys were re-filed here from
+> `issues/things-that-now-work/20261115T181413Z-rds-3-net-new-behavioral-causes-every-db.md`,
+> whose causes 2 and 3 are fixed and whose cause 1 is this same cause: two live DB instances
+> of a SERVED engine share the one address the core binds. They are kept on this report so
+> they are not recorded as working while the core change above is outstanding._
 
 === Cause 2 of 4: the Limitless shard-group check never gets past its cluster wait ===
 AWS: `CreateDBShardGroup` against a cluster that is not available is refused

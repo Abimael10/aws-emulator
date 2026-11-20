@@ -11,8 +11,11 @@
 //! held at the instant the snapshot was taken, and this report computes its list from those
 //! captured records — narrowed by the snapshot, the source DB instance, the instance's
 //! resource id, the snapshot type and each documented filter — so a tenant database created
-//! or deleted after the snapshot was taken does not change what the snapshot reports, and a
-//! snapshot of a single-tenant instance reports none.
+//! or deleted after the snapshot was taken does not change what the snapshot reports. The
+//! command "only applies to RDS for Oracle DB instances in the multi-tenant configuration",
+//! so those are the snapshots a named `DBSnapshotIdentifier` is resolved among: naming the
+//! snapshot of a single-tenant instance is the modelled `DBSnapshotNotFoundFault`, while a
+//! request that names no snapshot reports on the multi-tenant ones and leaves the others out.
 //!
 //! The tables below span what the rule generalises over: the container-database engines a
 //! multi-tenant instance runs and a single-tenant engine, instances holding none, one and
@@ -265,9 +268,29 @@ async fn a_snapshot_reports_the_tenant_databases_it_captured() {
         take_available_snapshot(&router, row.instance, row.snapshot).await;
 
         // "This command only applies to RDS for Oracle DB instances in the multi-tenant
-        // configuration", whose engine names end in `-cdb`: a snapshot of a single-tenant
-        // instance captured no tenant database, so it is reported on with an empty list —
-        // the snapshot exists, so there is nothing for the one modelled fault to report.
+        // configuration", whose engine names end in `-cdb`. Naming the snapshot of a
+        // single-tenant instance therefore resolves no snapshot of this command's own, and
+        // is refused exactly as a never-created identifier is — so a caller can tell "this
+        // snapshot holds no tenant database" from "this is not a multi-tenant snapshot".
+        if !row.engine.ends_with("-cdb") {
+            let refused = expect_error(
+                case,
+                call(
+                    &router,
+                    "DescribeDBSnapshotTenantDatabases",
+                    &params!["DBSnapshotIdentifier" => row.snapshot],
+                )
+                .await,
+                404,
+                "DBSnapshotNotFound",
+            );
+            assert_eq!(
+                text(&refused, "Message"),
+                format!("DBSnapshot {} not found.", row.snapshot),
+                "case {case:?}: the fault names the snapshot the request asked for: {refused}"
+            );
+            continue;
+        }
         let body = describe(
             &router,
             case,
@@ -675,16 +698,48 @@ async fn the_report_refuses_what_aws_refuses() {
     take_available_snapshot(&router, "emu-ref-other", "emu-ref-other-snap").await;
     create_available_instance(&router, "emu-ref-single", "postgres").await;
     take_available_snapshot(&router, "emu-ref-single", "emu-ref-single-snap").await;
+    // Two more single-tenant engines, so the rows below span the configuration rather than
+    // one engine: a MySQL-family instance, and an ORACLE instance that is not a container
+    // database — the engine this command is about, in the configuration it is not about.
+    create_available_instance(&router, "emu-ref-maria", "mariadb").await;
+    take_available_snapshot(&router, "emu-ref-maria", "emu-ref-maria-snap").await;
+    create_available_instance(&router, "emu-ref-noncdb", "oracle-ee").await;
+    take_available_snapshot(&router, "emu-ref-noncdb", "emu-ref-noncdb-snap").await;
 
-    // A request that names a DB SNAPSHOT this service holds none of is the one fault this
+    // A request that names a DB SNAPSHOT this report resolves none of is the one fault this
     // report models, a 404 `DBSnapshotNotFound` — the only error the operation declares. The
-    // rows differ along what the rule generalises over: what else the request narrows by
-    // beside the identifier that resolves to nothing.
+    // rows differ along what the rule generalises over: whether the identifier names no
+    // snapshot at all or names one taken off an instance outside the multi-tenant
+    // configuration this command "only applies to" (three such engines, including Oracle
+    // itself without a container database), and what else the request narrows by beside it.
     for (case, parameters, message) in [
         (
             "a snapshot that does not exist",
             owned_params!["DBSnapshotIdentifier" => "emu-ref-missing"],
             "DBSnapshot emu-ref-missing not found.",
+        ),
+        (
+            "an existing snapshot of a single-tenant postgres instance",
+            owned_params!["DBSnapshotIdentifier" => "emu-ref-single-snap"],
+            "DBSnapshot emu-ref-single-snap not found.",
+        ),
+        (
+            "an existing snapshot of a single-tenant mariadb instance",
+            owned_params!["DBSnapshotIdentifier" => "emu-ref-maria-snap"],
+            "DBSnapshot emu-ref-maria-snap not found.",
+        ),
+        (
+            "an existing snapshot of an Oracle instance that is no container database",
+            owned_params!["DBSnapshotIdentifier" => "emu-ref-noncdb-snap"],
+            "DBSnapshot emu-ref-noncdb-snap not found.",
+        ),
+        (
+            "that same snapshot, alongside the DB instance it was taken of",
+            owned_params![
+                "DBSnapshotIdentifier" => "emu-ref-noncdb-snap",
+                "DBInstanceIdentifier" => "emu-ref-noncdb",
+            ],
+            "DBSnapshot emu-ref-noncdb-snap not found.",
         ),
         (
             "a snapshot that does not exist, alongside a snapshot type",
@@ -915,17 +970,20 @@ async fn a_report_longer_than_one_page_walks_through_its_marker() {
 #[tokio::test]
 async fn a_selection_that_carries_no_tenant_database_is_an_empty_report() {
     // The rule: `DBSnapshotNotFoundFault` — the one error this operation models — answers
-    // one question only, whether this service holds a DB snapshot under the identifier the
-    // request named, so every other narrowing the request carries selects which rows the
-    // report carries, and a selection that comes out with none is a 200 whose
+    // one question only, whether this service holds a DB snapshot of a MULTI-TENANT instance
+    // (the configuration the command "only applies to") under the identifier the request
+    // named, so every other narrowing the request carries selects which rows the report
+    // carries, and a selection that comes out with none is a 200 whose
     // `DBSnapshotTenantDatabases` list is empty and which carries no `Marker`.
     //
     // The rows below span what that generalises over: which narrowing empties the report (a
-    // snapshot that captured nothing, a single-tenant engine the command "only applies" past,
-    // the source DB instance — one this service holds and one it does not — the DB resource
-    // id, the snapshot type, each documented filter name), whether the resource is named by
-    // the selector, by the filter's identifier form or by the filter's ARN form, the case the
-    // instance identifier is spelled in, and a filter value that names no snapshot at all.
+    // snapshot that captured nothing, a single-tenant engine the command "only applies" past
+    // — reached through a FILTER, since naming such a snapshot as the subject is the fault
+    // above — the source DB instance, one this service holds and one it does not, the DB
+    // resource id, the snapshot type, each documented filter name), whether the resource is
+    // named by the selector, by the filter's identifier form or by the filter's ARN form, the
+    // case the instance identifier is spelled in, and a filter value that names no snapshot
+    // at all.
     let router = emulator();
     create_available_instance(&router, "emu-nil-cdb", "oracle-ee-cdb").await;
     create_tenant(
@@ -959,10 +1017,6 @@ async fn a_selection_that_carries_no_tenant_database_is_an_empty_report() {
         (
             "a multi-tenant snapshot that captured no tenant database",
             owned_params!["DBSnapshotIdentifier" => "emu-nil-bare-snap"],
-        ),
-        (
-            "a snapshot taken off a single-tenant engine",
-            owned_params!["DBSnapshotIdentifier" => "emu-nil-single-snap"],
         ),
         (
             "a snapshot taken off a single-tenant engine, named by the db-snapshot-id filter",

@@ -204,11 +204,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // RDS is regional: a request sees only the snapshots of the region it was signed
         // for. Naming a snapshot narrows the report to that one snapshot's tenant databases,
         // and is the ONE question the modelled fault answers: `DBSnapshotNotFoundFault` is
-        // documented as "DBSnapshotIdentifier doesn't refer to an existing DB snapshot", so
-        // it is raised when — and only when — this service holds no DB snapshot under the
-        // identifier the request named in the signed region. A snapshot that does exist is
-        // then narrowed like any other row, exactly as `DescribeDBSnapshots` narrows its
-        // own, so a selection that comes out empty is a successful empty report.
+        // documented as "DBSnapshotIdentifier doesn't refer to an existing DB snapshot".
+        //
+        // This command "only applies to RDS for Oracle DB instances in the multi-tenant
+        // configuration", so the snapshots it resolves a named identifier against are the
+        // snapshots of instances in THAT configuration ([`crate::state::is_multi_tenant_engine`])
+        // and no others: a snapshot taken off a single-tenant instance is not a DB snapshot
+        // this operation has, so naming it refuses exactly as naming a never-created
+        // identifier does, rather than reporting the snapshot as one that holds no tenant
+        // database. A caller asking whether a snapshot is a multi-tenant one can then tell
+        // "no tenant databases in it" from "not a multi-tenant snapshot at all".
+        //
+        // It narrows only the RESOLUTION of a named subject. An UNNARROWED report still reads
+        // every snapshot of the region and leaves the single-tenant ones out of its rows (the
+        // `is_multi_tenant_engine` filter below), because such a request named no snapshot
+        // for the fault to be about.
         //
         // `DBSnapshotIdentifier` is resolved verbatim, as the identifier the snapshot was
         // taken under: the member documents "the value must match the ID of an existing DB
@@ -223,6 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let record = store
                     .db_snapshots
                     .get(&(region.clone(), requested.clone()))
+                    .filter(|snapshot| crate::state::is_multi_tenant_engine(&snapshot.engine))
                     .ok_or_else(|| not_found(db_snapshot_not_found_message(requested)))?;
                 vec![record]
             }
@@ -254,8 +265,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             // "This command only applies to RDS for Oracle DB instances in the multi-tenant
             // configuration": a snapshot of a single-tenant instance captured no tenant
-            // database, so it contributes no row to this report — it narrows what is
-            // REPORTED and never whether the snapshot the request named exists.
+            // database, so it contributes no row to an unnarrowed report. A request that
+            // NAMED such a snapshot never reaches here — it is refused where the subject is
+            // resolved above — so this filter is what empties the report for a request that
+            // named no snapshot of its own.
             .filter(|snapshot| crate::state::is_multi_tenant_engine(&snapshot.engine))
             .filter(|snapshot| {
                 filters

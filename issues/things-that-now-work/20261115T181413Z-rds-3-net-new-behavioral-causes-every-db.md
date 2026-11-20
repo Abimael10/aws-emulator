@@ -1,11 +1,8 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: rds.read-replica-replication-query-and-promote rds.replica-uncommitted-primary-write-absent-until-commit rds.deploy-rds-2-cfn-mysql-sql-then-dbname-change-replaces-instance rds.describe-snapshot-tenant-databases rds.mariadb-require-secure-transport-plaintext-login-rejected
+Issue-Trace-Ids: rds.describe-snapshot-tenant-databases rds.mariadb-require-secure-transport-plaintext-login-rejected
 Issue-Shape-Id: com.amazonaws.rds#AmazonRDSv19
-Issue-Key: rds.read-replica-replication-query-and-promote|run#24|AssertionError|assert rep_addr != src_addr, (
-Issue-Key: rds.replica-uncommitted-primary-write-absent-until-commit|run#14|AssertionError|assert rep_addr != src_addr, (
-Issue-Key: rds.deploy-rds-2-cfn-mysql-sql-then-dbname-change-replaces-instance|run#55|AssertionError|assert host_b != host_a, f"replacement kept the same Endpoint.Address {host_a!r}"
 Issue-Key: rds.describe-snapshot-tenant-databases|_client_error#13|AssertionError|raise AssertionError(f"expected DBSnapshotNotFound, but the call SUCCEEDED and returned {result!r}")
 Issue-Key: rds|ModifyDBParameterGroup|InvalidParameterValue
 Issue-Commit: 860eb666e989875e1daa85fefb4b7f7b73b30cd3
@@ -13,6 +10,15 @@ Issue-Commit: 860eb666e989875e1daa85fefb4b7f7b73b30cd3
 # rds: 3 net-new behavioral causes — every DB instance publishes the same loopback Endpoint.Address, DescribeDBSnapshotTenantDatabases answers 200 for an existing non-multi-tenant snapshot, and the mariadb parameter family has no require_secure_transport
 
 > _Note: this issue was identified against the code base at commit `860eb666e989875e1daa85fefb4b7f7b73b30cd3`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+> _Causes 2 and 3 are fixed. Cause 1 — two live DB instances of a SERVED engine publishing the
+> one address the core binds — is blocked on the read-only core
+> (`vendor/server/src/listeners.rs`: `bind_std`/`bind_tokio` bind every resource listener on the
+> one operator-chosen interface, and `ResourceListener::host`/`port` are the only address a
+> service can publish), so its three trace ids and replay keys were moved to the open report
+> that already owns that blocker and states the required core change:
+> `issues/things-that-do-not-work/20261118T181500Z-rds-the-published-endpoint-of-a-served-engine-is-the-core-listeners.md`
+> (its cause 1). The header above therefore carries only the keys that pass._
 
 ## Operation
 DescribeDBInstances
