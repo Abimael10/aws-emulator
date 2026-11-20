@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchAssets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchAssets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchAssets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Searches the assets this account's store holds
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::assets`]) — the records `PutAsset` wrote
+//! and `GetAsset` reads back — and reports the matching ones as search result items, one
+//! bounded page at a time. Read-only: nothing about an asset changes because it was
+//! searched for.
+//!
+//! What a request may ask for, and how each part is answered:
+//!
+//! * `SearchText` is matched as FREE TEXT against the asset's own searchable text: its name,
+//!   its identifier, its description, the asset type it is an instance of, the glossary terms
+//!   associated with it and the metadata its forms and attachments carry. Every term of the
+//!   text (split on whitespace) has to be carried by one of those values, and a term is
+//!   carried by a value when one of the value's words — or the whole of it — begins with the
+//!   term, compared without regard to case, so a client that searches for part of a name
+//!   finds the asset it named.
+//! * `FilterClause` is a tree of ATTRIBUTE and MAP filters under `AndAllFilters` /
+//!   `OrAnyFilters`, each comparing the values the asset carries for ONE attribute of it
+//!   ([`Attribute`]) against the value the filter sent. The attribute namespace is the
+//!   asset's own modelled members, named without regard to case.
+//! * `Sort` orders the hits by one such attribute, ascending unless the request asks for
+//!   `DESCENDING`; a request that names no `Sort` is answered RELEVANCE-ranked, the asset
+//!   whose text matched the most prominently first ([`TextQuery::relevance`]).
+//! * `MaxResults` and `NextToken` page over that one total order, and the token is OPAQUE —
+//!   minted by this store for THIS ordering ([`crate::state::pagination`]), so a value it did
+//!   not mint names no position and is refused.
+//!
+//! "At least one of searchText or filterClause must be provided"
+//! (`SearchAssetsRequest$SearchText`), so a request carrying neither is refused with the
+//! modelled `InvalidInputException` rather than answered with every asset; so is a filter or
+//! a sort naming an attribute no asset carries, because a filter the service cannot evaluate
+//! must not be answered as though it selected nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -79,6 +102,527 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::state::AssetEntry;
+
+/// The page size this search uses when the request names no `MaxResults`. Source: the
+/// model's `MaxResults` target `SearchMaxResults`, whose range is 1..100, so a request that
+/// names no page size is served the largest page that range admits.
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The separator between the parts of an ordering key (and so of the cursor inside a
+/// `NextToken`).
+///
+/// `U+0001` cannot appear in any value this search orders by: every member of an asset is
+/// drawn from a shape whose pattern admits `\u0020` and up, so the separator can never be
+/// confused with a character inside one of the parts it joins.
+const KEY_SEPARATOR: char = '\u{1}';
+
+/// Ceiling on the filters one `FilterClause` may carry, counting every clause of its tree.
+///
+/// This emulator's own bound, not an AWS quota: `SearchFilterClauseList` bounds one LEVEL at
+/// ten clauses and puts no bound on the nesting, so the work one request can buy — every
+/// filter is evaluated against every stored asset — is bounded here. A request past it is
+/// refused with `InvalidInputException`.
+const MAX_FILTER_CLAUSES: usize = 64;
+
+/// Ceiling on how deeply one `FilterClause` may nest, for the same reason as
+/// [`MAX_FILTER_CLAUSES`]: the tree is walked recursively, so its depth is bounded rather
+/// than left to the request.
+const MAX_FILTER_DEPTH: usize = 10;
+
+/// Ceiling on the terms one `SearchText` may carry, for the same reason: each term is
+/// matched against every searchable value of every stored asset.
+const MAX_SEARCH_TERMS: usize = 64;
+
+/// How prominently a hit in the asset's NAME counts towards its relevance, the most
+/// prominent of the places a term can match.
+///
+/// The weights below are this emulator's ranking: AWS documents that the search "returns
+/// matching assets with relevance-ranked results" without publishing the formula, so what is
+/// fixed here is the ORDER they express — a match on an asset's name is more relevant than
+/// one on its identifier, which is more relevant than one on its description, which is more
+/// relevant than one anywhere in its metadata — and that ties are broken by the asset's
+/// identifier, so every search has one total order to page over.
+const NAME_WEIGHT: u32 = 8;
+
+/// How prominently a hit in the asset's identifier counts. See [`NAME_WEIGHT`].
+const ID_WEIGHT: u32 = 4;
+
+/// How prominently a hit in the asset's description counts. See [`NAME_WEIGHT`].
+const DESCRIPTION_WEIGHT: u32 = 2;
+
+/// How prominently a hit anywhere else in the asset's metadata counts — the asset type it is
+/// an instance of, a glossary term it carries, a form's name, type or content, an
+/// attachment's. See [`NAME_WEIGHT`].
+const METADATA_WEIGHT: u32 = 1;
+
+/// The sentence this search refuses a request that names neither text nor filter with: the
+/// model's own statement of the requirement (`SearchAssetsRequest$SearchText` — "At least one
+/// of searchText or filterClause must be provided").
+const SEARCH_NAMES_NOTHING: &str =
+    "At least one of searchText or filterClause must be provided.";
+
+/// One attribute of an asset a filter may compare and a `Sort` may order by.
+///
+/// The namespace is the asset's OWN modelled members: `Id`, `Name`, `Description`,
+/// `AssetTypeId`, `CreatedAt`, `UpdatedAt`, `GlossaryTerms`, `Forms` and `Attachments`
+/// (`smithy_query operation=GetAsset`), which are the values the catalog holds for an asset
+/// and so the only ones it can compare. `AssetName` and `AssetDescription` are admitted
+/// beside `Name` and `Description` because they are the SEARCH's own spelling of those two
+/// members (`SearchResultItem$AssetName`, `SearchResultItem$AssetDescription`), so an
+/// attribute is named the same way whichever of the two shapes a client reads it off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attribute {
+    /// `AssetId`: the identifier the asset is addressed by.
+    Id,
+    /// `AssetName`: the name the put stored.
+    Name,
+    /// `AssetDescription`: the description the put stored, which an asset may carry none of.
+    Description,
+    /// `AssetTypeId`: the asset type the asset is an instance of.
+    AssetTypeId,
+    /// `CreatedAt`: the instant the asset was first stored.
+    CreatedAt,
+    /// `UpdatedAt`: the instant the latest write to the asset was served.
+    UpdatedAt,
+    /// `GlossaryTerms`: the ids of the terms associated with the asset, a list.
+    GlossaryTerms,
+    /// `Forms`: the asset's forms, keyed by form name — a MAP attribute.
+    Forms,
+    /// `Attachments`: the asset's attachments, keyed by attachment name — a MAP attribute.
+    Attachments,
+}
+
+impl Attribute {
+    /// The attribute `attribute` names, or `None` when it names none of them.
+    ///
+    /// The name is folded before it is looked up, for the reason every other name of this
+    /// service is ([`crate::state::fold_name`]): an attribute is named without regard to
+    /// case, so the same attribute is reachable whether a request spells it the way the shape
+    /// does or in the lower camel case an SDK's own field names use.
+    fn named(attribute: &str) -> Option<Self> {
+        Some(match crate::state::fold_name(attribute).as_str() {
+            "id" => Self::Id,
+            "name" | "assetname" => Self::Name,
+            "description" | "assetdescription" => Self::Description,
+            "assettypeid" => Self::AssetTypeId,
+            "createdat" => Self::CreatedAt,
+            "updatedat" => Self::UpdatedAt,
+            "glossaryterms" => Self::GlossaryTerms,
+            "forms" => Self::Forms,
+            "attachments" => Self::Attachments,
+            _ => return None,
+        })
+    }
+
+    /// Whether this attribute holds a MAP of values keyed by name, which is what a
+    /// `MapFilter` compares one entry of and what an `AttributeFilter` therefore cannot
+    /// compare a single value against.
+    fn is_map(self) -> bool {
+        matches!(self, Self::Forms | Self::Attachments)
+    }
+
+    /// Whether this attribute holds an INSTANT, which is compared as a point in time rather
+    /// than as text.
+    fn is_instant(self) -> bool {
+        matches!(self, Self::CreatedAt | Self::UpdatedAt)
+    }
+
+    /// The instants `asset` carries for this attribute, empty for an attribute that holds no
+    /// instant. Both instants are stamped by the server on every stored asset, so a
+    /// timestamp attribute always carries exactly one.
+    fn instants(self, asset: &AssetEntry) -> Vec<i64> {
+        match self {
+            Self::CreatedAt => vec![system_time_millis(asset.created_at)],
+            Self::UpdatedAt => vec![system_time_millis(asset.updated_at)],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The text values `asset` carries for this attribute: EMPTY when it carries none, which
+    /// is what `notExists` reports on and what makes every other comparison miss.
+    ///
+    /// A MAP attribute reports the names its entries are keyed by, as a READ of the asset
+    /// reports them: an entry's own value is reached by key ([`Self::entry_texts`]), so what
+    /// the whole attribute reports is whether the asset carries any entry at all.
+    fn texts(self, asset: &AssetEntry) -> Vec<String> {
+        match self {
+            Self::Id => vec![asset.id.clone()],
+            Self::Name => vec![asset.name.clone()],
+            Self::Description => asset.description.clone().into_iter().collect(),
+            Self::AssetTypeId => vec![asset.asset_type_id.clone()],
+            Self::GlossaryTerms => asset.glossary_terms_list(),
+            Self::CreatedAt | Self::UpdatedAt => Vec::new(),
+            Self::Forms => asset.reported_forms_map().into_keys().collect(),
+            Self::Attachments => asset.attachments_map().into_keys().collect(),
+        }
+    }
+
+    /// The values the entry `key` names in this map attribute holds: the strings that entry
+    /// carries — the form type it names and the content it carries — and nothing when the
+    /// asset holds no entry under that name.
+    ///
+    /// The entries are the ones a READ of the asset reports
+    /// ([`crate::state::AssetEntry::reported_forms_map`],
+    /// [`crate::state::AssetEntry::attachments_map`]), so a filter cannot select on an entry
+    /// a client cannot then read, or miss one it can.
+    fn entry_texts(self, asset: &AssetEntry, key: &str) -> Vec<String> {
+        let entry = match self {
+            Self::Forms => asset.reported_forms_map().remove(key),
+            Self::Attachments => asset.attachments_map().remove(key),
+            _ => None,
+        };
+        entry
+            .into_iter()
+            .flat_map(|form| [form.form_type_id, form.content])
+            .flatten()
+            .collect()
+    }
+
+    /// Whether a `Sort` may order by this attribute: a map attribute names a whole map of
+    /// values rather than one value per asset, so it orders nothing.
+    fn is_orderable(self) -> bool {
+        !self.is_map()
+    }
+
+    /// The value this attribute orders `asset` by, rendered so that lexicographic order over
+    /// the rendering is the order of the values themselves, or `None` for an asset carrying
+    /// no value for it — which sorts last.
+    ///
+    /// A text value is folded for the ORDERING alone, so that two spellings of one name sort
+    /// together rather than every uppercase value sorting before every lowercase one; a
+    /// multi-valued attribute orders by the first value it holds, in the order the asset
+    /// holds them.
+    fn ordering_value(self, asset: &AssetEntry) -> Option<String> {
+        if self.is_instant() {
+            return self.instants(asset).first().copied().map(ordered_millis);
+        }
+        self.texts(asset)
+            .first()
+            .map(|value| crate::state::fold_name(value))
+    }
+}
+
+/// The values one filter compares: either everything an attribute holds, or everything the
+/// one entry a `MapFilter` names holds.
+#[derive(Debug)]
+enum Subject {
+    /// Every value the asset carries for this attribute.
+    Attribute(Attribute),
+    /// Every value the entry `key` of this map attribute carries.
+    MapEntry { attribute: Attribute, key: String },
+}
+
+impl Subject {
+    /// The text values `asset` carries for this subject.
+    fn texts(&self, asset: &AssetEntry) -> Vec<String> {
+        match self {
+            Self::Attribute(attribute) => attribute.texts(asset),
+            Self::MapEntry { attribute, key } => attribute.entry_texts(asset, key),
+        }
+    }
+
+    /// The instants `asset` carries for this subject. A map entry carries text, never an
+    /// instant.
+    fn instants(&self, asset: &AssetEntry) -> Vec<i64> {
+        match self {
+            Self::Attribute(attribute) => attribute.instants(asset),
+            Self::MapEntry { .. } => Vec::new(),
+        }
+    }
+
+    /// Whether `asset` carries any value for this subject, which is what `notExists` is the
+    /// negation of.
+    fn exists(&self, asset: &AssetEntry) -> bool {
+        !self.texts(asset).is_empty() || !self.instants(asset).is_empty()
+    }
+}
+
+/// How a comparison relates the value the asset carries to the value the filter sent.
+/// Source: the `SearchFilterOperator` enum, less `notExists` which compares nothing
+/// (`smithy_query shape=SearchFilterOperator`).
+#[derive(Debug, Clone, Copy)]
+enum Order {
+    Equals,
+    GreaterThan,
+    GreaterThanOrEquals,
+    LessThan,
+    LessThanOrEquals,
+}
+
+impl Order {
+    /// Whether a stored value standing in `ordering` to the wanted value satisfies this
+    /// operator.
+    fn admits(self, ordering: ::std::cmp::Ordering) -> bool {
+        use ::std::cmp::Ordering::{Equal, Greater, Less};
+        match self {
+            Self::Equals => ordering == Equal,
+            Self::GreaterThan => ordering == Greater,
+            Self::GreaterThanOrEquals => ordering != Less,
+            Self::LessThan => ordering == Less,
+            Self::LessThanOrEquals => ordering != Greater,
+        }
+    }
+}
+
+/// What one filter tests about the values its subject carries.
+#[derive(Debug)]
+enum Test {
+    /// `notExists`: the subject carries no value at all.
+    NotExists,
+    /// Some value the subject carries stands in `order` to this text. Text is compared as
+    /// the catalog stores it, so `equals` is satisfied by the spelling the write stored.
+    Text { order: Order, wanted: String },
+    /// Some instant the subject carries stands in `order` to this instant.
+    Instant { order: Order, millis: i64 },
+}
+
+/// A `FilterClause` as the search evaluates it.
+#[derive(Debug)]
+enum Filter {
+    /// `AndAllFilters`: every clause must match.
+    All(Vec<Filter>),
+    /// `OrAnyFilters`: at least one clause must match.
+    Any(Vec<Filter>),
+    /// One comparison of the values a subject carries.
+    Compare { subject: Subject, test: Test },
+}
+
+impl Filter {
+    /// Whether `asset` satisfies this filter.
+    fn matches(&self, asset: &AssetEntry) -> bool {
+        match self {
+            Self::All(clauses) => clauses.iter().all(|clause| clause.matches(asset)),
+            Self::Any(clauses) => clauses.iter().any(|clause| clause.matches(asset)),
+            Self::Compare { subject, test } => match test {
+                Test::NotExists => !subject.exists(asset),
+                Test::Text { order, wanted } => subject
+                    .texts(asset)
+                    .iter()
+                    .any(|value| order.admits(value.as_str().cmp(wanted.as_str()))),
+                Test::Instant { order, millis } => subject
+                    .instants(asset)
+                    .iter()
+                    .any(|value| order.admits(value.cmp(millis))),
+            },
+        }
+    }
+}
+
+/// A `SearchText` as the search evaluates it: the terms it splits into, each folded, so a
+/// term is matched without regard to case.
+#[derive(Debug)]
+struct TextQuery {
+    terms: Vec<String>,
+}
+
+impl TextQuery {
+    /// Read the request's `SearchText`, refusing text carrying more terms than this search
+    /// matches ([`MAX_SEARCH_TERMS`]).
+    fn parse(text: &str) -> Result<Self, SearchAssetsError> {
+        let terms: Vec<String> = text
+            .split_whitespace()
+            .map(crate::state::fold_name)
+            .collect();
+        if terms.len() > MAX_SEARCH_TERMS {
+            return Err(invalid_input(format!(
+                "SearchText carries {} terms, more than the {MAX_SEARCH_TERMS} this catalog \
+                 matches",
+                terms.len()
+            )));
+        }
+        Ok(Self { terms })
+    }
+
+    /// How relevant `fields` are to this query, or `None` when they do not match it at all:
+    /// EVERY term has to be carried by one of the values, and what each term contributes is
+    /// the weight of the most prominent place it was found in ([`NAME_WEIGHT`]).
+    fn relevance(&self, fields: &[(u32, &str)]) -> Option<u64> {
+        let mut score = 0_u64;
+        for term in &self.terms {
+            let weight = fields
+                .iter()
+                .filter(|(_, value)| value_carries(value, term))
+                .map(|(weight, _)| u64::from(*weight))
+                .max()?;
+            score = score.saturating_add(weight);
+        }
+        Some(score)
+    }
+}
+
+/// The words one value is searched BY: the pieces it splits into on everything that is not a
+/// word character, plus the whole value, so a value is reached through each of its words and
+/// as a whole.
+///
+/// An UNDERSCORE is a word character here, as it is in the names this catalog holds, so a
+/// name that joins its parts with underscores is one word and a name that joins them with
+/// punctuation is reached through each part.
+fn words(value: &str) -> Vec<&str> {
+    let mut words: Vec<&str> = value
+        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    if !value.is_empty() && !words.contains(&value) {
+        words.push(value);
+    }
+    words
+}
+
+/// Whether `value` carries the already-folded search term `term`: one of its words — or the
+/// whole of it — begins with the term, compared without regard to case.
+///
+/// A term is matched against the BEGINNING of a word rather than only against the whole of
+/// it, which is what makes a search for part of a name find the asset carrying it; the empty
+/// term is carried by every value, so text that splits into no term at all narrows nothing.
+fn value_carries(value: &str, term: &str) -> bool {
+    if term.is_empty() {
+        return true;
+    }
+    words(value)
+        .into_iter()
+        .any(|word| crate::state::fold_name(word).starts_with(term))
+}
+
+/// Every searchable value of `asset`, each with how prominently a hit in it counts
+/// ([`NAME_WEIGHT`]): the asset's own identity and description, the asset type it is an
+/// instance of, the glossary terms it carries and the metadata its forms and attachments
+/// hold.
+///
+/// The forms are the ones the asset's own writes stored. The catalog's own form on an asset
+/// ([`crate::state::CATALOG_RESOURCE_FORM_NAME`]) carries the asset's name and description
+/// and nothing else, both of which are searched as the asset's own members, so searching it
+/// again would only count one hit twice.
+fn searchable_fields(asset: &AssetEntry) -> Vec<(u32, &str)> {
+    let mut fields: Vec<(u32, &str)> = vec![
+        (NAME_WEIGHT, asset.name.as_str()),
+        (ID_WEIGHT, asset.id.as_str()),
+        (METADATA_WEIGHT, asset.asset_type_id.as_str()),
+    ];
+    fields.extend(
+        asset
+            .description
+            .as_deref()
+            .map(|description| (DESCRIPTION_WEIGHT, description)),
+    );
+    fields.extend(
+        asset
+            .glossary_terms
+            .iter()
+            .map(|term| (METADATA_WEIGHT, term.as_str())),
+    );
+    for (form_name, form) in &asset.forms {
+        fields.push((METADATA_WEIGHT, form_name.as_str()));
+        fields.extend(
+            form.form_type_id
+                .as_deref()
+                .map(|form_type| (METADATA_WEIGHT, form_type)),
+        );
+        fields.extend(
+            form.content
+                .as_deref()
+                .map(|content| (METADATA_WEIGHT, content)),
+        );
+    }
+    for (attachment_name, attachment) in &asset.attachments {
+        fields.push((METADATA_WEIGHT, attachment_name.as_str()));
+        fields.push((METADATA_WEIGHT, attachment.form_type_id.as_str()));
+        fields.push((METADATA_WEIGHT, attachment.content.as_str()));
+    }
+    fields
+}
+
+/// How the search orders its hits, which is also what one page's continuation token resumes.
+#[derive(Debug)]
+enum Ranking {
+    /// A request naming no `Sort`: relevance-ranked, the most relevant hit first.
+    Relevance,
+    /// A request naming one: by that attribute of the asset, in the order it asked for.
+    Attribute {
+        attribute: Attribute,
+        descending: bool,
+    },
+}
+
+impl Ranking {
+    /// Whether the hits are reported in the reverse of the order their keys sort in.
+    fn descending(&self) -> bool {
+        match self {
+            Self::Relevance => false,
+            Self::Attribute { descending, .. } => *descending,
+        }
+    }
+
+    /// What part of a page token's scope this ordering is: a token names a position in ONE
+    /// order, so one minted while ordering by an attribute can never resume a
+    /// relevance-ranked search, or one ordered the other way.
+    fn scope(&self) -> String {
+        match self {
+            Self::Relevance => "Relevance".to_string(),
+            Self::Attribute {
+                attribute,
+                descending,
+            } => format!("{attribute:?}:{descending}"),
+        }
+    }
+
+    /// The ordering key of one hit: the value it is ordered by (an asset carrying none comes
+    /// last), then the asset's identifier, which is unique — so every search has one total
+    /// order to page over.
+    fn key(&self, asset: &AssetEntry, relevance: u64) -> String {
+        let ordered = match self {
+            // The most relevant hit comes FIRST, so the key is the complement of the score:
+            // ascending order over it is descending order of relevance.
+            Self::Relevance => Some(format!("{:020}", u64::MAX - relevance)),
+            Self::Attribute { attribute, .. } => attribute.ordering_value(asset),
+        };
+        let (presence, value) = match ordered {
+            Some(value) => ('0', value),
+            None => ('1', String::new()),
+        };
+        format!("{presence}{value}{KEY_SEPARATOR}{}", asset.id)
+    }
+}
+
+/// `at` as milliseconds since the epoch, the one scale every instant comparison here uses.
+fn system_time_millis(at: SystemTime) -> i64 {
+    match at.duration_since(UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_millis()).unwrap_or(i64::MAX),
+        Err(before) => {
+            let millis = i64::try_from(before.duration().as_millis()).unwrap_or(i64::MAX);
+            -millis
+        }
+    }
+}
+
+/// The same scale for a timestamp a request supplied as text.
+fn date_time_millis(at: &::aws_smithy_types::DateTime) -> i64 {
+    at.secs()
+        .saturating_mul(1_000)
+        .saturating_add(i64::from(at.subsec_nanos() / 1_000_000))
+}
+
+/// A filter value read as an instant: epoch seconds (whole or fractional) or an RFC 3339
+/// date-time — the two spellings this service's timestamps travel in. `None` means the text
+/// is neither, so the comparison cannot be evaluated and the request is refused.
+fn parse_timestamp(value: &str) -> Option<i64> {
+    use ::aws_smithy_types::date_time::Format;
+    [Format::EpochSeconds, Format::DateTime]
+        .into_iter()
+        .find_map(|format| ::aws_smithy_types::DateTime::from_str(value, format).ok())
+        .map(|at| date_time_millis(&at))
+}
+
+/// `millis` rendered so that lexicographic order over the rendering is the order of the
+/// instants themselves, for every `i64`: the value is biased past zero and zero-padded, so no
+/// comparison of ordering keys has to parse a number back out.
+fn ordered_millis(millis: i64) -> String {
+    let biased = i128::from(millis) - i128::from(i64::MIN);
+    format!("{biased:020}")
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -111,6 +655,192 @@ pub type SearchAssetsError = crate::scaffolded::Scaffolded<SearchAssetsErrorMode
 impl From<SearchAssetsErrorModeled> for SearchAssetsError {
     fn from(modeled: SearchAssetsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// Refuse the request as invalid, with this operation's own modelled client error.
+fn invalid_input(message: String) -> SearchAssetsError {
+    SearchAssetsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// The sentence this search refuses a filter or a sort naming an attribute no asset carries
+/// with: a comparison against an attribute the catalog holds nothing for selects nothing to
+/// compare, so it is refused rather than answered with an empty page the service never
+/// searched for.
+fn attribute_not_searchable(attribute: &str) -> String {
+    format!("Attribute {attribute} is not a searchable attribute of an asset")
+}
+
+/// Read one `FilterClause` into the form the search evaluates, refusing a clause it cannot
+/// evaluate and a tree past the bounds this search walks ([`MAX_FILTER_CLAUSES`],
+/// [`MAX_FILTER_DEPTH`]). `budget` is the clauses left to read, counted over the whole tree.
+fn read_clause(
+    clause: &SearchFilterClause,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<Filter, SearchAssetsError> {
+    if depth > MAX_FILTER_DEPTH {
+        return Err(invalid_input(format!(
+            "FilterClause nests deeper than the {MAX_FILTER_DEPTH} levels this catalog \
+             evaluates"
+        )));
+    }
+    let Some(left) = budget.checked_sub(1) else {
+        return Err(invalid_input(format!(
+            "FilterClause carries more than the {MAX_FILTER_CLAUSES} filters this catalog \
+             evaluates"
+        )));
+    };
+    *budget = left;
+    match clause {
+        SearchFilterClause::AndAllFilters(clauses) => Ok(Filter::All(read_clauses(
+            clauses, depth, budget,
+        )?)),
+        SearchFilterClause::OrAnyFilters(clauses) => Ok(Filter::Any(read_clauses(
+            clauses, depth, budget,
+        )?)),
+        SearchFilterClause::AttributeFilter(filter) => read_attribute_filter(filter),
+        SearchFilterClause::MapFilter(filter) => read_map_filter(filter),
+    }
+}
+
+/// Read every clause of one nested list, each one level deeper than the clause holding it.
+fn read_clauses(
+    clauses: &[SearchFilterClause],
+    depth: usize,
+    budget: &mut usize,
+) -> Result<Vec<Filter>, SearchAssetsError> {
+    clauses
+        .iter()
+        .map(|clause| read_clause(clause, depth.saturating_add(1), budget))
+        .collect()
+}
+
+/// Read one `AttributeFilter`: the attribute it names, the operator it compares by and the
+/// value it compares against, each refused where it names something this search cannot
+/// evaluate.
+fn read_attribute_filter(filter: &SearchAttributeFilter) -> Result<Filter, SearchAssetsError> {
+    let Some(attribute) = Attribute::named(&filter.attribute) else {
+        return Err(invalid_input(attribute_not_searchable(&filter.attribute)));
+    };
+    // `notExists` compares nothing: it asks whether the asset carries any value for the
+    // attribute at all, which every attribute — a map among them — can answer, and which
+    // needs no `Value` beside it.
+    if filter.operator == "notExists" {
+        return Ok(Filter::Compare {
+            subject: Subject::Attribute(attribute),
+            test: Test::NotExists,
+        });
+    }
+    let order = match filter.operator.as_str() {
+        "equals" => Order::Equals,
+        "greaterThan" => Order::GreaterThan,
+        "greaterThanOrEquals" => Order::GreaterThanOrEquals,
+        "lessThan" => Order::LessThan,
+        "lessThanOrEquals" => Order::LessThanOrEquals,
+        // An operator outside the enum the member targets is refused with the catalog's own
+        // sentence naming the value the request sent, in the spelling the model declares the
+        // values in.
+        other => {
+            return Err(invalid_input(format!(
+                "Operator {other} is not one of equals, greaterThan, greaterThanOrEquals, \
+                 lessThan, lessThanOrEquals, notExists"
+            )))
+        }
+    };
+    // A map attribute holds one value per KEY, so an attribute filter has no value of it to
+    // compare: such a comparison is made by a `MapFilter`, which names the key.
+    if attribute.is_map() {
+        return Err(invalid_input(format!(
+            "Attribute {} holds a map of values, so it is compared by a MapFilter naming the \
+             key to compare and not by an AttributeFilter",
+            filter.attribute
+        )));
+    }
+    let Some(value) = filter.value.as_ref() else {
+        return Err(invalid_input(format!(
+            "Value is required on an AttributeFilter whose Operator is {}",
+            filter.operator
+        )));
+    };
+    let test = if attribute.is_instant() {
+        let millis = match value {
+            // The timestamps of this service travel as epoch seconds, so a long compared
+            // against one is read on that scale.
+            SearchFilterValue::LongValue(seconds) => seconds.saturating_mul(1_000),
+            SearchFilterValue::StringValue(text) => parse_timestamp(text).ok_or_else(|| {
+                invalid_input(format!(
+                    "Value {text} is not a timestamp, which the attribute {} is compared \
+                     against",
+                    filter.attribute
+                ))
+            })?,
+        };
+        Test::Instant { order, millis }
+    } else {
+        match value {
+            SearchFilterValue::StringValue(text) => Test::Text {
+                order,
+                wanted: text.clone(),
+            },
+            // The attribute holds text, so there is no comparison of it to a number: the
+            // request is refused rather than answered from a rendering of the number the
+            // catalog never stored.
+            SearchFilterValue::LongValue(_) => {
+                return Err(invalid_input(format!(
+                    "Value is a LongValue, which the attribute {} is not compared against: it \
+                     holds text",
+                    filter.attribute
+                )))
+            }
+        }
+    };
+    Ok(Filter::Compare {
+        subject: Subject::Attribute(attribute),
+        test,
+    })
+}
+
+/// Read one `MapFilter`: it names a map attribute, the key of the entry to compare and the
+/// value that entry has to carry. The filter models no operator, so it is an EQUALITY test on
+/// the entry the key names.
+fn read_map_filter(filter: &SearchMapFilter) -> Result<Filter, SearchAssetsError> {
+    let Some(attribute) = Attribute::named(&filter.attribute) else {
+        return Err(invalid_input(attribute_not_searchable(&filter.attribute)));
+    };
+    if !attribute.is_map() {
+        return Err(invalid_input(format!(
+            "Attribute {} holds a single value, so it is compared by an AttributeFilter and \
+             not by a MapFilter",
+            filter.attribute
+        )));
+    }
+    let SearchMapFilterValue::StringValue(wanted) = &filter.value;
+    Ok(Filter::Compare {
+        subject: Subject::MapEntry {
+            attribute,
+            key: filter.key.clone(),
+        },
+        test: Test::Text {
+            order: Order::Equals,
+            wanted: wanted.clone(),
+        },
+    })
+}
+
+/// The modelled search result item for one stored asset: every member read off the record, so
+/// a hit reports what a `GetAsset` of the same identifier reports.
+fn result_item(asset: &AssetEntry) -> SearchResultItem {
+    SearchResultItem {
+        id: Some(asset.id.clone()),
+        asset_name: Some(asset.name.clone()),
+        asset_description: asset.description.clone(),
+        updated_at: Some(crate::state::to_date_time(asset.updated_at)),
+        asset_type_id: Some(asset.asset_type_id.clone()),
     }
 }
 
@@ -150,18 +880,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchAssets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchAssetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchAssets"))
+        let _ = ctx;
+
+        // "At least one of searchText or filterClause must be provided"
+        // (`SearchAssetsRequest$SearchText`): a request carrying neither names no search at
+        // all, so it is refused rather than answered with every asset this account holds.
+        if input.search_text.is_none() && input.filter_clause.is_none() {
+            return Err(invalid_input(SEARCH_NAMES_NOTHING.to_string()));
+        }
+
+        // The whole request is read, and refused, BEFORE anything is read out of the store,
+        // so a request this search cannot evaluate is answered the same way whatever the
+        // catalog happens to hold.
+        let query = match input.search_text.as_deref() {
+            Some(text) => Some(TextQuery::parse(text)?),
+            None => None,
+        };
+        let filter = match input.filter_clause.as_ref() {
+            Some(clause) => {
+                let mut budget = MAX_FILTER_CLAUSES;
+                Some(read_clause(clause, 1, &mut budget)?)
+            }
+            None => None,
+        };
+        let ranking = match input.sort.as_ref() {
+            // "Returns matching assets with relevance-ranked results": a request that names
+            // no sort criterion is answered in that order.
+            None => Ranking::Relevance,
+            Some(sort) => {
+                let Some(attribute) = Attribute::named(&sort.attribute) else {
+                    return Err(invalid_input(attribute_not_searchable(&sort.attribute)));
+                };
+                if !attribute.is_orderable() {
+                    return Err(invalid_input(format!(
+                        "Attribute {} holds a map of values, so the results cannot be sorted \
+                         by it",
+                        sort.attribute
+                    )));
+                }
+                // "The sort order. Valid values are ASCENDING and DESCENDING"
+                // (`SearchSort$Order`); a request naming none asks for the ascending order
+                // the attribute's own values are in.
+                let descending = match sort.order.as_deref() {
+                    None | Some("ASCENDING") => false,
+                    Some("DESCENDING") => true,
+                    Some(other) => {
+                        return Err(invalid_input(format!(
+                            "Order {other} is not one of ASCENDING, DESCENDING"
+                        )))
+                    }
+                };
+                Ranking::Attribute {
+                    attribute,
+                    descending,
+                }
+            }
+        };
+        // "The maximum number of results to return in the response" (`MaxResults`, range
+        // 1..100). Absent, the page is the largest that range admits; the clamp re-states the
+        // range here so the page size is never 0 even if the boundary validator ever stops
+        // enforcing it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(SearchAssetsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue asset store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // Read-only: the stored assets are projected out and nothing is written, so a search
+        // changes nothing a later caller sees.
+        let store = state.lock();
+        let mut matching: Vec<(String, &AssetEntry)> = Vec::new();
+        for asset in store.assets.values() {
+            // A request that names no `SearchText` selects on its filter alone, so every
+            // asset is equally relevant to it.
+            let relevance = match query.as_ref() {
+                Some(query) => match query.relevance(&searchable_fields(asset)) {
+                    Some(relevance) => relevance,
+                    None => continue,
+                },
+                None => 0,
+            };
+            if filter.as_ref().is_some_and(|filter| !filter.matches(asset)) {
+                continue;
+            }
+            matching.push((ranking.key(asset, relevance), asset));
+        }
+        // The key ends in the asset's identifier, which is unique, so the sort is a total
+        // order and reversing the ascending order is exactly the descending one.
+        matching.sort_by(|left, right| left.0.cmp(&right.0));
+        if ranking.descending() {
+            matching.reverse();
+        }
+
+        // The cursor inside the token names the last hit of the previous page, so this page
+        // resumes at the first asset ordered strictly after it — which stays correct across
+        // assets stored or deleted between two calls. The token is OPAQUE and bound to THIS
+        // ordering (`crate::state::pagination`), so a value this store did not mint for it —
+        // a forged cursor, one minted by another process, or one minted for another ordering
+        // — names no position and is refused rather than resolved against a key that happens
+        // to sort somewhere.
+        let token_scope = crate::state::listing_scope(Self::NAME, &[&ranking.scope()]);
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) =
+                    crate::state::decode_page_token(&store.page_token_key, &token_scope, token)
+                else {
+                    return Err(invalid_input(
+                        crate::state::messages::INVALID_PAGINATION_TOKEN.to_string(),
+                    ));
+                };
+                matching.partition_point(|(key, _)| {
+                    if ranking.descending() {
+                        key.as_str() >= cursor.as_str()
+                    } else {
+                        key.as_str() <= cursor.as_str()
+                    }
+                })
+            }
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose can
+        // never index outside the set.
+        let page: Vec<&(String, &AssetEntry)> =
+            matching.iter().skip(start).take(page_size).collect();
+        let end = start.saturating_add(page.len());
+        let items: Vec<SearchResultItem> = page.iter().map(|(_, asset)| result_item(asset)).collect();
+        // The token names the last hit of the page, taken from the page itself so there is no
+        // index arithmetic to underflow on an empty page, and minted for this ordering so
+        // only this store can resolve it. "A continuation token, present if the current
+        // segment is not the last" (`SearchAssetsResponse$NextToken`), so the last page
+        // carries none.
+        let next_token = if end < matching.len() {
+            page.last().map(|(key, _)| {
+                crate::state::encode_page_token(&store.page_token_key, &token_scope, key)
+            })
+        } else {
+            None
+        };
+
+        // `Items` is reported even when the search matched nothing, so a client can tell "no
+        // hit" from "not reported".
+        Ok(SearchAssetsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }
