@@ -8,9 +8,12 @@
 //! and payment option earn — the same ladder the offering it was bought from is
 //! priced by, so a plan's rate for a line item is that offering's rate for it.
 //!
-//! A plan that this store has never sold is a 404 `ResourceNotFoundException`:
-//! the operation reports the rates of a specific, EXISTING plan, so there is no
-//! rate card to compute for an id no purchase minted.
+//! A plan this store has never sold prices nothing: the rate card is resolved
+//! as a SEARCH over the rates this account holds rather than as a lookup of a
+//! resource, so an id no purchase minted comes back as an EMPTY result set on a
+//! 200 — the answer the recorded corpus carries for it — and the modelled 404
+//! `ResourceNotFoundException` is left for the operations that address a plan
+//! as a resource.
 //!
 //! Every supplied filter narrows the card — a filter names either a line item's
 //! own billing dimension or one of the properties it is priced along — and
