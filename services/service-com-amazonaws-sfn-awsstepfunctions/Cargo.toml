@@ -121,6 +121,13 @@ emulator-core-build-support = { workspace = true }
 # Declares one module per `tests/all/<name>.rs`, so this crate's single integration-test
 # target (`tests/all/main.rs`) picks a new suite up as a new file.
 automod = { workspace = true }
+# The two services a `Task` state's AWS SDK integration calls in
+# `tests/all/aws_sdk_service_resolution.rs`, neither of which an optimized integration
+# names: mounted beside Step Functions on the one engine the test router builds, so the
+# Regions a task lists and the api a task creates are AWS Account Management's and Amazon
+# API Gateway V2's own records.
+service-com-amazonaws-account-account = { workspace = true }
+service-com-amazonaws-apigatewayv2-apigatewayv2 = { workspace = true }
 # The REST-protocol service a `Task` state's AWS SDK integration calls in
 # `tests/all/backup_task_integration.rs`: mounted beside Step Functions on the one
 # engine the test router builds, so the backup job a task starts is stored by AWS

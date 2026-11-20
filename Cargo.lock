@@ -20475,6 +20475,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_json_path",
+ "service-com-amazonaws-account-account",
+ "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "service-com-amazonaws-backup-cryocontrollerusermanager",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",

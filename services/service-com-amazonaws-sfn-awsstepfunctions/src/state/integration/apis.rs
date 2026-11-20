@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The wire facts of every service a `Task` state's integration call is made to, as one
-//! table ([`APIS`]): the facts of those services' own models, which this crate cannot
-//! read, so each entry states where it was read from.
+//! table ([`APIS`]) beside the services the AWS SDK family alone names ([`AWS_SDK_APIS`]):
+//! the facts of those services' own models, which this crate cannot read, so each entry
+//! states where it was read from.
 //!
 //! Kept in a file of its own because it is one concern and one list: the readings over it
 //! — which family named a service, which operation of it is called, and how a request to
@@ -25,6 +26,8 @@ use super::*;
 /// mounted here but has no entry yet is one no call is made for, and [`read`] says
 /// exactly that rather than claiming anything about its protocol.
 pub const APIS: &[Api] = &[
+    // Each entry below is a service an OPTIMIZED integration names; a service reached
+    // through the AWS SDK family alone is carried in [`AWS_SDK_APIS`] instead.
     // `services/service-com-amazonaws-athena-amazonathena/smithy-model/
     // com-amazonaws-athena-amazonathena.json`: awsJson1_1, sigv4Name `athena`,
     // endpointPrefix `athena`, sdkId `Athena`, service shape `AmazonAthena`.
@@ -419,4 +422,25 @@ pub const APIS: &[Api] = &[
         // there is no second name to ask for.
         query_compatible: false,
     },
+];
+
+/// The services a `Task` state's integration call is made to through the AWS SDK
+/// integration family ALONE.
+///
+/// AWS publishes an OPTIMIZED integration for some services and not for others, and a
+/// service it publishes none for is named by the family's own token and by nothing else:
+/// `arn:aws:states:::<its namespace>:<action>` names no `Task` state's work, so its entry
+/// is kept out of [`APIS`] — the table the optimized family is looked up in — and carried
+/// here. Each entry's wire facts are stated beside the operations it is called for, in a
+/// file of that service's own, for the reason [`APIS`] is one list: those facts are the
+/// invoked model's, which this crate cannot read.
+///
+/// Amazon S3 is not here: the set of its operations a call is made for is narrower than
+/// the operations its bindings carry ([`S3_SDK_OPERATIONS`]), so [`read`] reaches its
+/// entry through that reading rather than through this table.
+pub(super) static AWS_SDK_APIS: &[&Api] = &[
+    &cloudfront::CLOUDFRONT_API,
+    &account::ACCOUNT_API,
+    &apigatewayv2::APIGATEWAYV2_API,
+    &rds::RDS_API,
 ];

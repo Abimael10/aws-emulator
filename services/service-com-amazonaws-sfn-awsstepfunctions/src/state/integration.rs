@@ -23,8 +23,9 @@
 //! integration) names a service — by its ARN namespace in the first family, by the
 //! name the AWS SDKs give it in the second ([`Api::sdk_token`]) — and one of that
 //! service's API operations by its name in lowerCamel. The call is made when that
-//! service has an
-//! [`APIS`] entry, which carries how a request to it is bound to HTTP ([`Wire`]).
+//! service has an entry stating its wire facts — an [`APIS`] one for a service an
+//! optimized integration names, and an [`AWS_SDK_APIS`] one for a service only the AWS
+//! SDK family names — which carries how a request to it is bound to HTTP ([`Wire`]).
 //! For an `awsJson1_0` or `awsJson1_1` service the request BODY is the operation's
 //! input document, which is exactly what a payload template builds, so one entry
 //! covers every operation that service models: the operation name is derived from the
@@ -807,33 +808,80 @@ pub struct Rest {
 
 /// The REST bindings of the Lambda operations a `Task` state's integration calls.
 ///
-/// `smithy_query(query="operation",operation="Invoke",model_path="services/
+/// `smithy_query(query="operation",operation="Invoke,CreateCodeSigningConfig,
+/// GetCodeSigningConfig,ListCodeSigningConfigs",model_path="services/
 /// service-com-amazonaws-lambda-awsgirapiservice/smithy-model/
-/// com-amazonaws-lambda-awsgirapiservice.json")`: `http` POST
+/// com-amazonaws-lambda-awsgirapiservice.json")`: `Invoke` is `http` POST
 /// `/2015-03-31/functions/{FunctionName}/invocations`, `FunctionName` an `httpLabel`,
 /// `Payload` the `httpPayload`, `InvocationType`, `LogType` and `ClientContext`
 /// `httpHeader`s, `Qualifier` an `httpQuery`; the output's `StatusCode` is its
 /// `httpResponseCode`, `Payload` its `httpPayload`, and `ExecutedVersion`,
-/// `FunctionError` and `LogResult` its headers.
-const LAMBDA_REST: &[Rest] = &[Rest {
-    operation: "Invoke",
-    method: "POST",
-    uri: "/2015-03-31/functions/{FunctionName}/invocations",
-    request_body: Body::Member("Payload"),
-    headers: &[
-        ("InvocationType", "X-Amz-Invocation-Type"),
-        ("LogType", "X-Amz-Log-Type"),
-        ("ClientContext", "X-Amz-Client-Context"),
-    ],
-    query: &[("Qualifier", "Qualifier")],
-    response_body: Body::Member("Payload"),
-    response_status: "StatusCode",
-    response_headers: &[
-        ("ExecutedVersion", "X-Amz-Executed-Version"),
-        ("FunctionError", "X-Amz-Function-Error"),
-        ("LogResult", "X-Amz-Log-Result"),
-    ],
-}];
+/// `FunctionError` and `LogResult` its headers. The three code-signing operations bind no
+/// payload member and no output member to the status or to a header: the write is POST
+/// `/2020-04-22/code-signing-configs` (code 201) with every member in the body, the read
+/// is GET `/2020-04-22/code-signing-configs/{CodeSigningConfigArn}` over that one
+/// `httpLabel`, and the listing is GET `/2020-04-22/code-signing-configs` with `Marker`
+/// and `MaxItems` `httpQuery` members — so each answer's body IS the operation's own
+/// output document.
+const LAMBDA_REST: &[Rest] = &[
+    Rest {
+        operation: "Invoke",
+        method: "POST",
+        uri: "/2015-03-31/functions/{FunctionName}/invocations",
+        request_body: Body::Member("Payload"),
+        headers: &[
+            ("InvocationType", "X-Amz-Invocation-Type"),
+            ("LogType", "X-Amz-Log-Type"),
+            ("ClientContext", "X-Amz-Client-Context"),
+        ],
+        query: &[("Qualifier", "Qualifier")],
+        response_body: Body::Member("Payload"),
+        response_status: "StatusCode",
+        response_headers: &[
+            ("ExecutedVersion", "X-Amz-Executed-Version"),
+            ("FunctionError", "X-Amz-Function-Error"),
+            ("LogResult", "X-Amz-Log-Result"),
+        ],
+    },
+    Rest {
+        operation: "CreateCodeSigningConfig",
+        method: "POST",
+        uri: "/2020-04-22/code-signing-configs",
+        request_body: Body::Document,
+        headers: &[],
+        query: &[],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+    Rest {
+        operation: "GetCodeSigningConfig",
+        method: "GET",
+        uri: "/2020-04-22/code-signing-configs/{CodeSigningConfigArn}",
+        request_body: Body::Empty,
+        headers: &[],
+        query: &[],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+    Rest {
+        operation: LIST_CODE_SIGNING_CONFIGS_OPERATION,
+        method: "GET",
+        uri: "/2020-04-22/code-signing-configs",
+        request_body: Body::Empty,
+        headers: &[],
+        query: &[("Marker", "Marker"), ("MaxItems", "MaxItems")],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+];
+
+/// The Lambda operation that lists the account's code signing configurations, as that
+/// model spells it: an operation whose published permission names no resource type, which
+/// is what its [`TARGET_RESOURCES`] entry states.
+const LIST_CODE_SIGNING_CONFIGS_OPERATION: &str = "ListCodeSigningConfigs";
 
 /// The REST bindings of the AWS Backup operations a `Task` state's integration calls.
 ///
@@ -1441,7 +1489,9 @@ pub struct TargetResource {
     /// which is the usual case ([`access_request`]).
     pub action: Option<&'static str>,
     /// The member of the integration's request that names the resource the call acts
-    /// on, named in the integration's own PascalCase.
+    /// on, named in the integration's own PascalCase; EMPTY for an entry whose naming
+    /// reads no member at all, because the action names no resource type
+    /// ([`TargetNaming::EveryResource`]).
     pub member: &'static str,
     /// The resource that member names when the request OMITS it, for an operation
     /// that documents a default for it; `None` where it documents none, and a request
@@ -1530,7 +1580,21 @@ pub enum TargetNaming {
     /// com-amazonaws-lambda-awsgirapiservice.json")`). Each names the same function,
     /// whose ARN is what `lambda:InvokeFunction` is taken on.
     FunctionName,
+    /// NO member carries it: the permission the invoked operation publishes names no
+    /// resource TYPE at all, so the action is taken on every resource and the access
+    /// request is over `*` ([`EVERY_RESOURCE`]).
+    ///
+    /// That is what an account-level operation publishes — a listing of what the account
+    /// holds is about no one resource — and it is a fact of the invoked action rather
+    /// than of the request, which is why such an entry reads nothing out of the request
+    /// and carries no member ([`TargetResource::member`]).
+    EveryResource,
 }
+
+/// The resource an access request is over for an action whose published permission names
+/// no resource type: every resource, which is also the only resource such a grant can be
+/// written for.
+pub const EVERY_RESOURCE: &str = "*";
 
 impl TargetNaming {
     /// The ARN of the resource `named` names, as read in the Region `region` the call
@@ -1595,6 +1659,10 @@ impl TargetNaming {
                     )
                 })
             }
+            // No resource is named, because the action names no resource type: the
+            // access request is over every resource, whichever Region the call is made
+            // in.
+            Self::EveryResource => Some(EVERY_RESOURCE.to_string()),
         }
     }
 
@@ -1612,7 +1680,11 @@ impl TargetNaming {
     fn addressed_region(self, named: &str) -> Option<String> {
         match self {
             Self::QueueUrl => endpoint_region(named),
-            Self::Arn | Self::Named { .. } | Self::Global { .. } | Self::FunctionName => None,
+            Self::Arn
+            | Self::Named { .. }
+            | Self::Global { .. }
+            | Self::FunctionName
+            | Self::EveryResource => None,
         }
     }
 }
@@ -1900,6 +1972,44 @@ pub const TARGET_RESOURCES: &[TargetResource] = &[
         named: cloudfront::CLOUDFRONT_DISTRIBUTION,
         denied: Some(CLOUDFRONT_ACCESS_DENIED),
     },
+    // The ACCOUNT-LEVEL listings this emulator calls: each reports what the account
+    // holds rather than acting on one resource, and the permission each publishes names
+    // no resource type at all — "Actions defined by AWS Account Management", "…by Amazon
+    // EventBridge" and "…by AWS Lambda" (IAM Service Authorization Reference) each list
+    // these three with no resource type — so each is taken on every resource
+    // ([`TargetNaming::EveryResource`]) and no member of the request names one. A role
+    // that may make such a call therefore carries the action over `*`, which is the only
+    // resource such a grant can be written for.
+    //
+    // `ListRegions` MODELS the refusal of an unauthorized call — `AccessDeniedException`,
+    // HTTP 403 — so that is the error a denied listing reaches the state as
+    // ([`account::ACCOUNT_ACCESS_DENIED`]); the other two model no access error at all,
+    // so a refusal of either is reported under its service's base SDK exception
+    // ([`Api::base_error`]).
+    TargetResource {
+        integration: "account:listRegions",
+        action: None,
+        member: "",
+        default: None,
+        named: TargetNaming::EveryResource,
+        denied: Some(account::ACCOUNT_ACCESS_DENIED),
+    },
+    TargetResource {
+        integration: "events:listApiDestinations",
+        action: None,
+        member: "",
+        default: None,
+        named: TargetNaming::EveryResource,
+        denied: None,
+    },
+    TargetResource {
+        integration: "lambda:listCodeSigningConfigs",
+        action: None,
+        member: "",
+        default: None,
+        named: TargetNaming::EveryResource,
+        denied: None,
+    },
     // `arn:aws:states:::aws-sdk:rds:stopDBInstance` — and the start and the reboot of a
     // DB instance beside it — act on the INSTANCE their `DBInstanceIdentifier` names,
     // which is the resource `rds:StopDBInstance` and its sibling actions are taken on
@@ -2008,6 +2118,11 @@ impl TargetResource {
     /// resource the STARTING request named, which those calls do not carry
     /// ([`RunAJob::acts_on_named`]).
     pub fn named_in(&self, request: &Value) -> Option<String> {
+        // An action that names no resource type is taken on every resource, so there is
+        // no member to read and nothing in the request can change what it is taken on.
+        if self.named == TargetNaming::EveryResource {
+            return Some(EVERY_RESOURCE.to_string());
+        }
         match [MemberCase::Pascal, MemberCase::LowerCamel]
             .into_iter()
             .find_map(|case| request.get(case.spell(self.member)))
@@ -2715,14 +2830,14 @@ pub fn read(resource: &str) -> Result<Call, String> {
 
 /// The service `service` names — read as the SDK's own token for it where `aws_sdk`, and
 /// as its ARN namespace otherwise — among the services [`APIS`] states the wire facts of,
-/// and the two reached through the AWS SDK family ALONE beside them.
+/// and those reached through the AWS SDK family ALONE beside them ([`AWS_SDK_APIS`]).
 ///
-/// Amazon S3 and Amazon CloudFront publish no OPTIMIZED integration of their own, so
-/// `arn:aws:states:::s3:<action>` and `arn:aws:states:::cloudfront:<action>` name no
-/// `Task` state's work: their wire facts are stated apart from [`APIS`] — the table the
-/// optimized family is looked up in — and are reached here for the family's own token
-/// alone. S3's `Resource` of that form is a `Map` state's `ItemReader` and `ResultWriter`
-/// instead, which read and write their dataset through [`dataset_call`].
+/// A service AWS publishes no OPTIMIZED integration for is named by the family's own
+/// token and by nothing else, so `arn:aws:states:::<its namespace>:<action>` names no
+/// `Task` state's work: those services' wire facts are stated apart from [`APIS`] — the
+/// table the optimized family is looked up in — and are reached here. Amazon S3's
+/// `Resource` of that form is a `Map` state's `ItemReader` and `ResultWriter` instead,
+/// which read and write their dataset through [`dataset_call`].
 ///
 /// `action` is the action the `Resource` named, for the one service whose set of CALLED
 /// operations is narrower than the operations its bindings carry; `shown` is the
@@ -2746,16 +2861,19 @@ fn sdk_or_optimized_api(
         }
         return Ok(&S3_API);
     }
-    // CloudFront is called for the operations its own bindings carry, which the REST
-    // reading below holds every operation of a REST service to ([`read`]).
-    if aws_sdk && service == cloudfront::CLOUDFRONT_API.sdk_token() {
-        return Ok(&cloudfront::CLOUDFRONT_API);
-    }
-    // Amazon RDS publishes no optimized integration either, and its FORM protocol binds
-    // every operation it models the same way, so the family's own token reaches each of
-    // them ([`rds::RDS_API`]).
-    if aws_sdk && service == rds::RDS_API.sdk_token() {
-        return Ok(&rds::RDS_API);
+    // Every other service reached through the AWS SDK family alone is looked up in the
+    // table of those services, under that family's own token for it. Each is called for
+    // the operations its own bindings carry, which the REST reading below holds every
+    // operation of a REST service to ([`read`]); an AWS JSON or FORM service in it binds
+    // every operation it models the same way, so the token reaches each of them.
+    if aws_sdk {
+        if let Some(api) = AWS_SDK_APIS
+            .iter()
+            .copied()
+            .find(|api| api.sdk_token() == service)
+        {
+            return Ok(api);
+        }
     }
     APIS.iter()
         .find(|api| match aws_sdk {
@@ -4326,6 +4444,14 @@ pub use apis::*;
 /// Amazon CloudFront's own wire facts, reached through the AWS SDK integration family
 /// alone.
 mod cloudfront;
+
+/// AWS Account Management's own wire facts, reached through the AWS SDK integration
+/// family alone.
+mod account;
+
+/// Amazon API Gateway V2's own wire facts, reached through the AWS SDK integration family
+/// alone.
+mod apigatewayv2;
 
 /// Amazon RDS's own wire facts, reached through the AWS SDK integration family alone.
 mod rds;

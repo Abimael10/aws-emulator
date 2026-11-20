@@ -62,7 +62,7 @@ type InstantRow = (&'static str, &'static [&'static str], Value, Value);
 #[test]
 fn a_resource_names_the_call_its_action_does() {
     // (case, the Resource, the signing name and operation it names, parks at a job)
-    let rows: [ResourceRow; 34] = [
+    let rows: [ResourceRow; 41] = [
         (
             "the optimized DynamoDB integration",
             "arn:aws:states:::dynamodb:putItem",
@@ -109,6 +109,50 @@ fn a_resource_names_the_call_its_action_does() {
             "an EventBridge action",
             "arn:aws:states:::events:putEvents",
             Some(("events", "PutEvents")),
+            false,
+        ),
+        // A service the AWS SDK family alone names: no optimized integration exists for
+        // it, so only that family's own token reaches its operations.
+        (
+            "an AWS SDK integration with AWS Account Management",
+            "arn:aws:states:::aws-sdk:account:listRegions",
+            Some(("account", "ListRegions")),
+            false,
+        ),
+        (
+            "another operation of that same service",
+            "arn:aws:states:::aws-sdk:account:getRegionOptStatus",
+            Some(("account", "GetRegionOptStatus")),
+            false,
+        ),
+        (
+            "the optimized form of a service only the AWS SDK family names",
+            "arn:aws:states:::account:listRegions",
+            None,
+            false,
+        ),
+        (
+            "an AWS SDK integration whose service's SDK name is not its signing name",
+            "arn:aws:states:::aws-sdk:apigatewayv2:getApis",
+            Some(("apigateway", "GetApis")),
+            false,
+        ),
+        (
+            "a write of that same service",
+            "arn:aws:states:::aws-sdk:apigatewayv2:createApi",
+            Some(("apigateway", "CreateApi")),
+            false,
+        ),
+        (
+            "the EventBridge listing a fan-out workflow names",
+            "arn:aws:states:::aws-sdk:eventbridge:listApiDestinations",
+            Some(("events", "ListApiDestinations")),
+            false,
+        ),
+        (
+            "a Lambda listing whose REST binding is carried",
+            "arn:aws:states:::aws-sdk:lambda:listCodeSigningConfigs",
+            Some(("lambda", "ListCodeSigningConfigs")),
             false,
         ),
         (
@@ -324,7 +368,11 @@ fn a_resource_names_the_call_its_action_does() {
 /// discoverable against something.
 #[test]
 fn both_names_of_every_called_service_are_the_same_letters() {
-    for api in APIS.iter().chain(std::iter::once(&S3_API)) {
+    for api in APIS
+        .iter()
+        .chain(std::iter::once(&S3_API))
+        .chain(AWS_SDK_APIS.iter().copied())
+    {
         let case = api.namespace;
         // The AWS SDK family's `Resource` names the service by its SDK id lower-cased
         // ([`Api::sdk_token`]), so the name its errors carry is that same token with the
