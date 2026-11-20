@@ -193,9 +193,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        // WHERE this account's IoT data plane answers, which is the domain an
-        // AWS-managed configuration configures (it names none of its own).
-        let data_endpoint = crate::state::account_data_endpoint(&*self.engine, ctx);
 
         // `Tag$Key` is `@required` and keys a resource's tag set, so the last value given
         // for a key is the one the resource carries, and how MANY tags one request may
@@ -421,14 +418,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             crate::state::domain_configurations::DOMAIN_TYPE_AWS_MANAGED
         };
-        // WHICH domain the configuration configures: the one the request named, or — for
-        // the AWS-managed kind, which names none — the account's own data endpoint, the
-        // domain a device dials that endpoint under. The service resolves that one
-        // itself, so the record carries it and every reader reports it.
-        let domain_name = match input.domain_name {
-            Some(domain_name) => Some(domain_name),
-            None => data_endpoint,
-        };
+        // WHICH domain the configuration configures: the one the request named, which is
+        // the configuration's own setting and so is what the record carries. The
+        // AWS-managed kind names none — the domain it configures is the account's own data
+        // endpoint, which is that endpoint's fact rather than this configuration's, so
+        // every reader resolves it where the endpoint is published
+        // (`RegisteredDomainConfiguration::with_configured_domain`).
+        let domain_name = input.domain_name;
         let domain_configuration_arn = crate::state::created_domain_configuration_arn(
             &region,
             &input.domain_configuration_name,

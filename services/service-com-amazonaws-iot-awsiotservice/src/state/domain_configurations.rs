@@ -661,6 +661,24 @@ impl RegisteredDomainConfiguration {
         settled
     }
 
+    /// This record with the domain it configures filled in: a configuration of the
+    /// AWS-managed domain names no domain of the caller's own, so the domain it configures
+    /// is wherever the account's data endpoint answers — `data_endpoint`, as
+    /// [`account_data_endpoint`] reads it.
+    ///
+    /// Resolved when the record is REPORTED rather than frozen when it was created, for
+    /// the same reason a reserved configuration's domain is ([`ReservedDomainConfigurations::resolve`]):
+    /// which address the account's endpoint is published at is the endpoint's own fact and
+    /// not this configuration's, so a reader of the configuration and `DescribeEndpoint`
+    /// answer with one address however long ago the configuration was created. A
+    /// configuration that names a domain of its own carries that name and is left alone.
+    pub fn with_configured_domain(mut self, data_endpoint: Option<&str>) -> Self {
+        if self.domain_name.is_none() && self.domain_type == DOMAIN_TYPE_AWS_MANAGED {
+            self.domain_name = data_endpoint.map(str::to_string);
+        }
+        self
+    }
+
     /// The record as one entry of the `DomainConfigurationSummary` list a LISTING hands
     /// back: the subset of members that shape declares, projected from the same stored
     /// record a single-configuration reader projects, so the two cannot drift.
@@ -739,6 +757,7 @@ impl super::ComAmazonawsIotAwsiotserviceState {
             .domain_configurations
             .values()
             .map(|configuration| configuration.as_of(now))
+            .map(|configuration| configuration.with_configured_domain(data_endpoint))
             .map(|configuration| ListedDomainConfiguration {
                 position: format!(
                     "{CREATED_POSITION_PREFIX}{}",
@@ -763,6 +782,7 @@ impl super::ComAmazonawsIotAwsiotserviceState {
         self.domain_configurations
             .get(domain_configuration_name)
             .map(|configuration| configuration.as_of(now))
+            .map(|configuration| configuration.with_configured_domain(data_endpoint))
             .or_else(|| {
                 self.reserved_domain_configurations
                     .resolve(domain_configuration_name, region, data_endpoint)

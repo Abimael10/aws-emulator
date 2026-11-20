@@ -338,3 +338,111 @@ async fn an_update_replaces_the_settings_it_carries() {
         );
     }
 }
+
+/// RULE: the domain a configuration of the AWS-managed domain configures is the address
+/// the account's own data endpoint is PUBLISHED at — the one `DescribeEndpoint` answers
+/// with — whenever that configuration was created, while one naming a domain of its own
+/// keeps that name.
+#[tokio::test]
+async fn an_aws_managed_configuration_configures_wherever_the_account_endpoint_answers() {
+    let emulator = Emulator::new();
+    let (certificate_pem, private_key_pem) = minted_certificate();
+    let held = emulator
+        .import_certificate("endpoint order", &certificate_pem, &private_key_pem)
+        .await;
+    let trusted = trusted_validation_certificate(&emulator, "endpoint order").await;
+
+    // Created BEFORE anything asked the account where its endpoint answers: one
+    // configuration of the AWS-managed domain, and one naming a domain of its own.
+    let early_managed = "managed-before-the-endpoint";
+    let early_custom = "custom-before-the-endpoint";
+    let own_domain = "early.iot.example.com";
+    for (name, body) in [
+        (early_managed, json!({})),
+        (
+            early_custom,
+            json!({
+                "domainName": own_domain,
+                "serverCertificateArns": [held.clone()],
+                "validationCertificateArn": trusted.clone(),
+            }),
+        ),
+    ] {
+        let created = emulator.create_configuration(name, &body).await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {name} created before the endpoint: expected 200, got {} body {}",
+            created.status,
+            created.text()
+        );
+    }
+
+    // `DescribeEndpoint` is the call that creates the account's endpoint and publishes
+    // the address a device dials it at.
+    let account_endpoint = emulator.account_data_endpoint().await;
+
+    // And one of the AWS-managed kind created AFTER that call.
+    let late_managed = "managed-after-the-endpoint";
+    let created_late = emulator.create_configuration(late_managed, &json!({})).await;
+    assert_eq!(
+        created_late.status,
+        200,
+        "case {late_managed} created after the endpoint: expected 200, got {} body {}",
+        created_late.status,
+        created_late.text()
+    );
+
+    // The rows differ along when the configuration was created relative to that call, and
+    // along whether it names a domain of its own at all.
+    let rows: Vec<(&str, &str, String, &str)> = vec![
+        (
+            "an AWS-managed configuration created before the endpoint was published",
+            early_managed,
+            account_endpoint.clone(),
+            "AWS_MANAGED",
+        ),
+        (
+            "an AWS-managed configuration created after it",
+            late_managed,
+            account_endpoint.clone(),
+            "AWS_MANAGED",
+        ),
+        (
+            "a configuration naming a domain of its own",
+            early_custom,
+            own_domain.to_string(),
+            "CUSTOMER_MANAGED",
+        ),
+    ];
+
+    for (case, name, expected_domain, expected_type) in rows {
+        let read = emulator.describe_configuration(name).await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {case}: expected the read to answer 200, got {} body {}",
+            read.status,
+            read.text()
+        );
+        let described = read.json();
+        assert_eq!(
+            described["domainName"],
+            json!(expected_domain),
+            "case {case}: expected the domain {expected_domain}, got {described}"
+        );
+        assert_eq!(
+            described["domainType"],
+            json!(expected_type),
+            "case {case}: expected a {expected_type} domain, got {described}"
+        );
+    }
+
+    // Asking again reports the same address: the published endpoint is one value, so the
+    // domain a configuration names does not move under a caller that reads it twice.
+    assert_eq!(
+        emulator.account_data_endpoint().await,
+        account_endpoint,
+        "case \"the account endpoint read twice\": expected the one published address"
+    );
+}

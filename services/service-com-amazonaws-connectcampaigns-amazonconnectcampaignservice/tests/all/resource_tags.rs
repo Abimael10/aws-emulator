@@ -10,7 +10,9 @@
 //! the campaign (the tag listing and `DescribeCampaign`) reports one map. An ARN whose
 //! resource path is not a campaign of this service is refused before any lookup, and a
 //! campaign ARN the store holds nothing under is refused as a miss; both refusals store
-//! nothing.
+//! nothing. Every write is scoped to the one resource its ARN names, so two campaigns —
+//! siblings under one Connect instance or campaigns of different instances — hold
+//! separate maps even when they carry the same key.
 
 use std::collections::BTreeMap;
 
@@ -38,12 +40,12 @@ const VALUE_MAX: usize = 256;
 /// `smithy_query(query="shape", shape="TagKey")`).
 const KEY_MAX: usize = 128;
 
-/// A `CreateCampaign` body for `INSTANCE`, carrying `tags` when the case wants a
+/// A `CreateCampaign` body for `instance`, carrying `tags` when the case wants a
 /// campaign born with some.
-fn create_body(name: &str, tags: Option<Value>) -> Value {
+fn create_body(instance: &str, name: &str, tags: Option<Value>) -> Value {
     let mut body = json!({
         "name": name,
-        "connectInstanceId": INSTANCE,
+        "connectInstanceId": instance,
         "dialerConfig": {"progressiveDialerConfig": {"bandwidthAllocation": 0.25}},
         "outboundCallConfig": {"connectContactFlowId": "flow-tag-1"},
     });
@@ -53,20 +55,38 @@ fn create_body(name: &str, tags: Option<Value>) -> Value {
     body
 }
 
-/// Register `INSTANCE` with the account and create one campaign, handing back the ARN
-/// the create minted for it — which is what every call of this suite addresses.
-async fn a_stored_campaign(router: &Harness, name: &str, tags: Option<Value>) -> String {
-    router.register_connect_instance(REGION, INSTANCE);
-    let created = call(router, REGION, "PUT", "/campaigns", &create_body(name, tags)).await;
+/// Register `instance` with the account and create one campaign under it, handing back
+/// the ARN the create minted for it — the one fixture step every call of this suite
+/// addresses a resource through.
+async fn a_stored_campaign_in(
+    router: &Harness,
+    instance: &str,
+    name: &str,
+    tags: Option<Value>,
+) -> String {
+    router.register_connect_instance(REGION, instance);
+    let created = call(
+        router,
+        REGION,
+        "PUT",
+        "/campaigns",
+        &create_body(instance, name, tags),
+    )
+    .await;
     assert_eq!(
         created.status, 200,
-        "case \"create the campaign to tag\": expected HTTP 200, got {} {}",
+        "case \"create {name} under {instance}\": expected HTTP 200, got {} {}",
         created.status, created.body
     );
     created.body["arn"]
         .as_str()
-        .unwrap_or_else(|| panic!("case \"create the campaign to tag\": no arn in {}", created.body))
+        .unwrap_or_else(|| panic!("case \"create {name}\": no arn in {}", created.body))
         .to_string()
+}
+
+/// [`a_stored_campaign_in`] under the instance most of this suite's cases use.
+async fn a_stored_campaign(router: &Harness, name: &str, tags: Option<Value>) -> String {
+    a_stored_campaign_in(router, INSTANCE, name, tags).await
 }
 
 /// The campaign id an ARN this service minted ends with.
@@ -737,4 +757,147 @@ async fn untagging_removes_only_the_keys_it_names_and_an_absent_key_is_a_no_op()
         BTreeMap::from([("env".to_string(), "prod".to_string())]),
         "case \"tag an untagged resource again\": expected the new pair, got {listed:?}"
     );
+}
+
+/// A second Connect instance, so a case can hold campaigns under more than one parent
+/// and show that a tag write is scoped to the resource rather than to its instance.
+const OTHER_INSTANCE: &str = "tag-instance-other";
+
+/// What one row of the scoping table asks of the one resource it addresses.
+enum Scoped {
+    /// `TagResource` carrying this map.
+    Tag(Value),
+    /// `UntagResource` naming these keys.
+    Untag(Vec<&'static str>),
+}
+
+/// One row of the scoping table: which of the resources under test the call addresses,
+/// what it asks of it, and the map EVERY resource under test holds afterwards.
+struct ScopeRow {
+    case: &'static str,
+    target: usize,
+    asked: Scoped,
+    expected: [Vec<(&'static str, &'static str)>; 3],
+}
+
+#[tokio::test]
+async fn a_tag_write_lands_on_exactly_the_resource_its_arn_names() {
+    let router = router();
+
+    // Three resources: two campaigns under one Connect instance and a third under
+    // another, so a row can show that neither sharing a parent nor sharing a tag key
+    // joins two tag maps.
+    let arns = [
+        a_stored_campaign_in(&router, INSTANCE, "scope-a", None).await,
+        a_stored_campaign_in(&router, INSTANCE, "scope-b", None).await,
+        a_stored_campaign_in(&router, OTHER_INSTANCE, "scope-c", None).await,
+    ];
+
+    // Rows differ along which resource the call addresses, whether it adds or removes,
+    // and whether the key it names is one another resource also carries.
+    let rows: Vec<ScopeRow> = vec![
+        ScopeRow {
+            case: "tagging the first campaign",
+            target: 0,
+            asked: Scoped::Tag(tag_map([("env", "dev"), ("owner", "a")])),
+            expected: [
+                vec![("env", "dev"), ("owner", "a")],
+                Vec::new(),
+                Vec::new(),
+            ],
+        },
+        ScopeRow {
+            case: "a sibling under the same instance taking its own value for that key",
+            target: 1,
+            asked: Scoped::Tag(tag_map([("env", "prod")])),
+            expected: [
+                vec![("env", "dev"), ("owner", "a")],
+                vec![("env", "prod")],
+                Vec::new(),
+            ],
+        },
+        ScopeRow {
+            case: "a campaign under another instance taking the same keys",
+            target: 2,
+            asked: Scoped::Tag(tag_map([("env", "test"), ("owner", "c")])),
+            expected: [
+                vec![("env", "dev"), ("owner", "a")],
+                vec![("env", "prod")],
+                vec![("env", "test"), ("owner", "c")],
+            ],
+        },
+        ScopeRow {
+            case: "the same map again on the first campaign",
+            target: 0,
+            asked: Scoped::Tag(tag_map([("env", "dev"), ("owner", "a")])),
+            expected: [
+                vec![("env", "dev"), ("owner", "a")],
+                vec![("env", "prod")],
+                vec![("env", "test"), ("owner", "c")],
+            ],
+        },
+        ScopeRow {
+            case: "removing a key the other two also carry from the second campaign",
+            target: 1,
+            asked: Scoped::Untag(vec!["env"]),
+            expected: [
+                vec![("env", "dev"), ("owner", "a")],
+                Vec::new(),
+                vec![("env", "test"), ("owner", "c")],
+            ],
+        },
+        ScopeRow {
+            case: "removing one carried and one absent key from the third campaign",
+            target: 2,
+            asked: Scoped::Untag(vec!["owner", "absent"]),
+            expected: [
+                vec![("env", "dev"), ("owner", "a")],
+                Vec::new(),
+                vec![("env", "test")],
+            ],
+        },
+        ScopeRow {
+            case: "re-valuing one key of the first campaign",
+            target: 0,
+            asked: Scoped::Tag(tag_map([("owner", "a2")])),
+            expected: [
+                vec![("env", "dev"), ("owner", "a2")],
+                Vec::new(),
+                vec![("env", "test")],
+            ],
+        },
+    ];
+
+    for row in rows {
+        let target = &arns[row.target];
+        let answer = match &row.asked {
+            Scoped::Tag(sent) => tag(&router, target, sent).await,
+            Scoped::Untag(keys) => untag(&router, target, keys).await,
+        };
+        assert_eq!(
+            answer.status, 200,
+            "case {:?}: expected HTTP 200 from the addressed resource, got {} {}",
+            row.case, answer.status, answer.body
+        );
+
+        for (index, arn) in arns.iter().enumerate() {
+            let expected: BTreeMap<String, String> = row.expected[index]
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            let listed = listed_tags(&router, arn, row.case).await;
+            assert_eq!(
+                listed, expected,
+                "case {:?}: expected campaign {index} to hold its own map, got {listed:?}",
+                row.case
+            );
+            let described = described_tags(&router, arn, row.case).await;
+            assert_eq!(
+                described, expected,
+                "case {:?}: expected the describe of campaign {index} to report the same \
+                 map, got {described:?}",
+                row.case
+            );
+        }
+    }
 }
