@@ -447,15 +447,87 @@ pub struct PolicyResource {
     pub target: PolicyTarget,
 }
 
-/// How an ARN that is not one this surface addresses at all is refused: AWS's sentence
-/// for a resource-policy `ResourceArn` naming something other than a table or a stream —
-/// an index, a backup, another service's resource — echoing the value the request sent.
+impl PolicyResource {
+    /// The stream LABEL this ARN carries, for a resource that addresses a stream: the part
+    /// after `/stream/`, which is what names one stream of a table among the stream records
+    /// that table has published ("the `latestStreamLabel`" a table reports). `None` for a
+    /// resource that addresses the table itself.
+    pub fn stream_label(&self) -> Option<&str> {
+        match self.target {
+            PolicyTarget::Table => None,
+            PolicyTarget::Stream => self.arn.split_once("/stream/").map(|(_, label)| label),
+        }
+    }
+
+    /// How this surface refuses the resource this ARN addresses when the endpoint holds
+    /// none of it.
+    ///
+    /// The refusal names the resource the REQUEST addressed, which for a stream ARN is the
+    /// stream: a policy read or write of a stream reports that stream as missing — by the
+    /// label the ARN carries, and the table it would belong to — rather than reporting the
+    /// table, whose own absence the caller did not ask about
+    /// ([`stream_not_found_message`]). A table ARN reports the table, as every name-addressed
+    /// control-plane refusal of this service does.
+    pub fn not_found(&self) -> RequestError {
+        match self.stream_label() {
+            Some(label) => {
+                RequestError::NotFound(stream_not_found_message(label, &self.table))
+            }
+            None => not_found(&self.table),
+        }
+    }
+}
+
+/// How a resource-policy call refuses a STREAM the endpoint holds none of: the
+/// `ResourceNotFoundException` sentence AWS words it with, naming the stream by the label
+/// the ARN carries and the table that stream would belong to.
+///
+/// Fixed text `Requested resource not found: Stream: ` and ` not found for Table: `; the
+/// two variable parts are read off the `ResourceArn` the request sent.
+pub fn stream_not_found_message(label: &str, table: &str) -> String {
+    format!("Requested resource not found: Stream: {label} not found for Table: {table}")
+}
+
+/// How an ARN this surface cannot read a DynamoDB resource out of AT ALL is refused:
+/// AWS's sentence for a `ResourceArn` that is no DynamoDB resource ARN — another service's
+/// resource, or a resource field spelled in a form this service mints none of — echoing
+/// the value the request sent, exactly as it was sent.
+///
+/// The whole sentence up to the ARN is fixed text: it states that the value is not a
+/// DynamoDB resource ARN and names no resource type at all, which is the one thing that
+/// can be said about a value no resource could be read from. An ARN that DOES name a
+/// DynamoDB resource and names the wrong ONE is a different refusal
+/// ([`only_table_or_stream_message`]).
+pub fn not_a_dynamodb_resource_arn_message(resource_arn: &str) -> String {
+    format!(
+        "One or more parameter values were invalid: Provided Arn is not a DynamoDB resource \
+         arn: {resource_arn}"
+    )
+}
+
+/// How an ARN naming a DynamoDB resource a policy does not attach to — an index, a backup,
+/// an import or an export of a table — is refused: AWS's sentence for that resource type,
+/// which names the two resources this surface does address and echoes the value sent.
 pub fn only_table_or_stream_message(resource_arn: &str) -> String {
     format!(
         "One or more parameter values were invalid: Invalid resource arn provided, only table \
          or stream is accepted. Provided resource arn: {resource_arn}"
     )
 }
+
+/// The sub-resources of a table this service mints ARNs for, each as the segment that
+/// names it in the resource field — `…:table/<name>/<segment>/<id>`.
+///
+/// An ARN whose sub-resource segment is one of these DOES name a DynamoDB resource, so a
+/// resource-policy request carrying one is refused for the resource it names
+/// ([`only_table_or_stream_message`]); a resource field in any other form names no
+/// DynamoDB resource at all ([`not_a_dynamodb_resource_arn_message`]). `stream` is the one
+/// of them a policy attaches to ("the resource, which can be a table or stream" — the
+/// `PutResourcePolicy` doc); the others are this service's own resources, each addressed
+/// by an ARN its own operations mint (`DescribeBackup$BackupArn`,
+/// `DescribeImport$ImportArn`, `DescribeExport$ExportArn`, and an index's ARN, which
+/// `DescribeContributorInsights` reports).
+const TABLE_SUB_RESOURCES: [&str; 5] = ["stream", "index", "backup", "import", "export"];
 
 /// How an ARN of the right SHAPE that does not address a resource of this endpoint —
 /// another region, account or partition — is refused: AWS's sentence for an ARN that is
@@ -467,14 +539,18 @@ pub fn invalid_policy_resource_arn_message(resource_arn: &str) -> String {
 /// Resolve a `*ResourcePolicy` call's `ResourceArn` to the resource it names, in the
 /// scope the request itself is made in.
 ///
-/// The one place an ARN is classified for the resource-policy surface, in the same two
-/// parts the tagging surface is classified in ([`resolve_resource_arn`]) and with this
-/// surface's own two sentences:
+/// The one place an ARN is classified for the resource-policy surface, in the same parts
+/// the tagging surface is classified in ([`resolve_resource_arn`]) and with this
+/// surface's own sentences:
 ///
-/// * SHAPE — the value must be an ARN of this service naming a TABLE
-///   (`…:table/<name>`) or that table's STREAM (`…:table/<name>/stream/<label>`), which
-///   are the two resources a policy attaches to; anything else, an index ARN included,
-///   is [`only_table_or_stream_message`];
+/// * SHAPE — the value must be an ARN of this service from which a DynamoDB resource can be
+///   read at all: `…:table/<name>`, optionally followed by one of the sub-resource segments
+///   this service mints ([`TABLE_SUB_RESOURCES`]). A value no resource could be read from
+///   is [`not_a_dynamodb_resource_arn_message`];
+/// * RESOURCE — of the resources that CAN be read, a policy attaches to a TABLE
+///   (`…:table/<name>`) or that table's STREAM (`…:table/<name>/stream/<label>`); any other
+///   one of them — an index, a backup, an import, an export — is
+///   [`only_table_or_stream_message`];
 /// * SCOPE — the ARN must address a resource of the endpoint the request reached: the
 ///   same partition, account and REGION this request is signed for. Anything else is
 ///   [`invalid_policy_resource_arn_message`] — an out-of-scope ARN is not "absent here",
@@ -488,6 +564,8 @@ pub fn resolve_policy_resource_arn(
 ) -> Result<PolicyResource, RequestError> {
     let out_of_scope =
         || RequestError::Validation(invalid_policy_resource_arn_message(resource_arn));
+    let unreadable =
+        || RequestError::Validation(not_a_dynamodb_resource_arn_message(resource_arn));
     let unsupported = || RequestError::Validation(only_table_or_stream_message(resource_arn));
     // A value that is not an ARN at all is refused by THAT rule, whichever ARN-addressed
     // surface it was sent to ([`invalid_resource_arn`]): a caller that sent a bare
@@ -508,19 +586,29 @@ pub fn resolve_policy_resource_arn(
         return Err(out_of_scope());
     }
     if service != "dynamodb" {
-        return Err(unsupported());
+        return Err(unreadable());
     }
-    let path = resource.strip_prefix("table/").ok_or_else(unsupported)?;
+    let path = resource.strip_prefix("table/").ok_or_else(unreadable)?;
     let (name, target) = match path.split_once('/') {
         None => (path, PolicyTarget::Table),
         Some((name, sub)) => match sub.strip_prefix("stream/") {
             // A stream label is minted by this service, so what it has to be is
             // non-empty; which stream it names is the lookup's question, not the shape's.
             Some(label) if !label.is_empty() => (name, PolicyTarget::Stream),
-            _ => return Err(unsupported()),
+            // Any other sub-resource of a table: one this service mints ARNs for names a
+            // DynamoDB resource a policy does not attach to, and anything else names no
+            // DynamoDB resource at all ([`TABLE_SUB_RESOURCES`]).
+            _ => {
+                let segment = sub.split('/').next().unwrap_or_default();
+                return Err(if TABLE_SUB_RESOURCES.contains(&segment) {
+                    unsupported()
+                } else {
+                    unreadable()
+                });
+            }
         },
     };
-    let table = resolve_table_name(name).map_err(|_| unsupported())?;
+    let table = resolve_table_name(name).map_err(|_| unreadable())?;
     // The scope half of the rule, decided over the TABLE ARN this endpoint would mint:
     // the stream suffix is this service's own and is already read above.
     let scoped = match target {

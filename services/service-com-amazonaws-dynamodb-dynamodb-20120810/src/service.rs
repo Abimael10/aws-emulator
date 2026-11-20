@@ -734,6 +734,13 @@ tokio::task_local! {
     /// back by [`validation_envelope`]: they are the bounds the validating walk never got
     /// to, and they are worded and counted exactly as that walk's own violations are.
     static SERVED_READABLE_BODY: Option<request_constraints::ReadableBody>;
+
+    /// The clause the `TransactItems` of the request this task is serving earns for
+    /// carrying more elements than the model admits, with the rejected list rendered from
+    /// the request ([`request_constraints::transact_items_cap_clause`]), set around the same
+    /// run and read back by [`validation_envelope`] in place of the walk's own clause about
+    /// that member.
+    static SERVED_TRANSACT_ITEMS_CAP_CLAUSE: Option<String>;
 }
 
 /// The form the operation this task is serving states its clauses in.
@@ -801,6 +808,16 @@ fn served_body_violations() -> Vec<Violation> {
                 .map(request_constraints::ReadableBody::violations)
                 .unwrap_or_default()
         })
+        .unwrap_or_default()
+}
+
+/// The clause the `TransactItems` of the request this task is serving earns for carrying
+/// more elements than the model admits. None at all is a refusal raised outside an
+/// operation's run, where there is no request to have read a list off — and the walk's own
+/// clause is what such a refusal states.
+fn served_transact_items_cap_clause() -> Option<String> {
+    SERVED_TRANSACT_ITEMS_CAP_CLAUSE
+        .try_with(Clone::clone)
         .unwrap_or_default()
 }
 
@@ -916,6 +933,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
             // which is the elapsed time its latency series reports
             // ([`request_latency_metrics`]).
             let started = ::std::time::Instant::now();
+            // The clause a transactional list past its cap earns, read off the request
+            // while it is still in hand ([`request_constraints::transact_items_cap_clause`]).
+            let transact_items_cap = {
+                let protocol = svc.definition().wire_protocol(req);
+                request_constraints::transact_items_cap_clause(operation, protocol.protocol(), req)
+            };
             let answered = SERVED_CLAUSE_FORM
                 .scope(
                     clause_form(operation),
@@ -931,9 +954,14 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                                         request_constraints::service_checked_clauses(
                                             operation, req,
                                         ),
-                                        SERVED_READABLE_BODY.scope(
-                                            request_constraints::readable_body(operation, req),
-                                            op.run(svc, req, ctx),
+                                        SERVED_TRANSACT_ITEMS_CAP_CLAUSE.scope(
+                                            transact_items_cap,
+                                            SERVED_READABLE_BODY.scope(
+                                                request_constraints::readable_body(
+                                                    operation, req,
+                                                ),
+                                                op.run(svc, req, ctx),
+                                            ),
                                         ),
                                     ),
                                 ),
@@ -1063,22 +1091,25 @@ fn region_refusal<Eng: Send + Sync + 'static>(
 ///
 /// A COLLECTION member past its cap is a clause like any other: in the item-request
 /// form the member and the bound, with nothing echoed. Some recorded AWS refusals of a
-/// capped collection — the transactional `TransactItems` lists — instead echo the
-/// rejected list as the service's OWN object rendering of it
+/// capped collection — the transactional `TransactItems` lists past their maximum — instead
+/// echo the rejected list as the service's OWN object rendering of it
 /// (`[TransactGetItem(get=Get(key={pk=AttributeValue(s=k0, n=null, …,
 /// iNT=null, dECIMALSET=null, …)}, …, workloadProfileName=null)), …]`), over
 /// fields this service's model does not declare:
 /// `smithy_query(query="shape", shape="com.amazonaws.dynamodb#AttributeValue")`
 /// gives `S N B SS NS BS M L NULL BOOL` and no `iNT`/`dECIMALSET`, and `Get`
-/// and `Put` carry no `workloadProfileName`. Those clauses are NOT rendered here, for a
-/// reason about this seam rather than about the rendering: the framework hands it a count
-/// (`<n> items`) rather than the collection, so there is nothing to render FROM — while
-/// the one member whose refusal this service does quote is reported by the HANDLER, which
-/// has the request in hand (`crate::state::rendered_batch_write_request_items`, the frame
-/// those fields belong to). Two recorded refusals of the SAME violation class (a
-/// `BatchGetItem` key list past the same 100 cap) state the no-value form this function
-/// builds, so a clause raised here states what it has: the member and the bound it broke.
-/// `tests/all/collection_cap_constraint_reports.rs` pins that over the capped
+/// and `Put` carry no `workloadProfileName`. Those clauses are not rendered BY THIS
+/// FUNCTION, for a reason about this seam rather than about the rendering: the framework
+/// hands it a count (`<n> items`) rather than the collection, so there is nothing here to
+/// render FROM. They are rendered where the REQUEST still is and substituted for this
+/// function's clause about that member
+/// (`request_constraints::transact_items_cap_clause`), exactly as the one member whose
+/// refusal the HANDLER quotes is rendered where that handler has the request
+/// (`crate::state::rendered_batch_write_request_items`, the frame those fields belong to).
+/// Two recorded refusals of the SAME violation class (a `BatchGetItem` key list past the
+/// same 100 cap, and a transactional list below its minimum) state the no-value form this
+/// function builds, so a clause raised here states what it has: the member and the bound it
+/// broke. `tests/all/collection_cap_constraint_reports.rs` pins that over the capped
 /// collections of the batched and transactional operations.
 fn violation_clause(violation: &Violation, form: ClauseForm, alone: bool) -> Option<String> {
     match &violation.kind {
@@ -1279,9 +1310,20 @@ fn validation_envelope(violations: &[Violation]) -> Option<String> {
     // declared bounds never reaches one — every clause of it is the validator's, in the
     // validator's own form ([`SERVICE_CHECKED_ENUMS`]).
     let alone = reported.len() == 1 && served_service_checked_clauses().is_empty();
+    // The clause about a transactional list past its cap is the one the SERVICE words, with
+    // the rejected list rendered from the request: the walk reports the violation but carries
+    // only its own summary of the collection, so the clause is substituted for that member's
+    // and every other clause of the same refusal is the walk's
+    // ([`request_constraints::transact_items_cap_clause`]).
+    let transact_items_cap = served_transact_items_cap_clause();
     let clauses: Vec<String> = in_stated_member_order(&reported)
         .into_iter()
-        .map(|violation| violation_clause(violation, served_clause_form(), alone))
+        .map(|violation| match transact_items_cap.as_ref() {
+            Some(clause) if violation.path == crate::state::TRANSACT_ITEMS_MEMBER_PATH => {
+                Some(clause.clone())
+            }
+            _ => violation_clause(violation, served_clause_form(), alone),
+        })
         .collect::<Option<Vec<_>>>()?;
     // The violations this service found by READING the request are violations of the same
     // input, so they are clauses of the same envelope and are counted with the walk's

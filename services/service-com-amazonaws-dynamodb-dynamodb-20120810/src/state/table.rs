@@ -354,10 +354,10 @@ impl Table {
         if names_it {
             return Ok(());
         }
-        Err(RequestError::NotFound(format!(
-            "Requested resource not found: Stream: {} not found",
-            resource.arn
-        )))
+        // The resource the request addressed is the stream, so that is what the refusal
+        // names ([`PolicyResource::not_found`]) — by the label the ARN carries and the
+        // table it would belong to.
+        Err(resource.not_found())
     }
 
     /// The role `attribute` plays in a key schema of this table — its own, or one of

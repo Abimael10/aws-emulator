@@ -170,15 +170,6 @@ fn transact_gets(table: &str, count: usize) -> Vec<Value> {
         .collect()
 }
 
-/// `count` `TransactWriteItems` entries for that table.
-fn transact_puts(table: &str, count: usize) -> Vec<Value> {
-    (0..count)
-        .map(|index| {
-            json!({"Put": {"TableName": table, "Item": {"Artist": {"S": format!("a{index}")}}}})
-        })
-        .collect()
-}
-
 /// Nothing an emulator-internal figure could reach a caller through: a
 /// configured ceiling, a byte total, or the emulator naming itself.
 const INTERNAL_DETAIL: [&str; 6] = [
@@ -263,19 +254,22 @@ async fn a_constraint_violation_is_stated_in_the_validation_envelope() {
                 .to_string(),
         ),
         (
-            "a transaction one past the 100-item cap",
+            // The over-cap form of the same member QUOTES the rejected list, which
+            // `tests/all/refusal_messages_echo_the_requests_own_values.rs` pins; the empty
+            // list is the end of the bound whose clause echoes nothing.
+            "an empty transaction, one below the member's minimum",
             "TransactGetItems",
-            json!({"TransactItems": transact_gets("Music", 101)}),
+            json!({"TransactItems": []}),
             "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
-             Member must have length less than or equal to 100"
+             Member must have length greater than or equal to 1"
                 .to_string(),
         ),
         (
-            "a write transaction one past the same cap",
+            "an empty write transaction, one below the same minimum",
             "TransactWriteItems",
-            json!({"TransactItems": transact_puts("Music", 101)}),
+            json!({"TransactItems": []}),
             "1 validation error detected: Value at 'TransactItems' failed to satisfy constraint: \
-             Member must have length less than or equal to 100"
+             Member must have length greater than or equal to 1"
                 .to_string(),
         ),
         (

@@ -735,6 +735,11 @@ pub fn constraint_clause(path: &str, echoed: Option<&str>, requirement: &str) ->
 /// of what it sent, and a clause interpolates it as it stands. The two refusal paths — the
 /// walk's clauses and the clauses this service words itself — are held to the same ceiling,
 /// so one request cannot be refused with two differently sized echoes of one value.
+///
+/// Where AWS's clause quotes the WHOLE value a longer member carried, the elision that walk
+/// writes past this ceiling is undone around the operation instead, by the tree's shared
+/// wrapper for that rule (`service_common::quoted_refusals`, wired in
+/// `crate::service::management_events`).
 pub const MAX_ECHOED_CLAUSE_VALUE: usize = 256;
 
 /// `value` as a clause of this service quotes it: elided at [`MAX_ECHOED_CLAUSE_VALUE`],

@@ -26,7 +26,8 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dynamodb-dynamodb-20120
 /// arms — mirrors what that macro emits for this union, member for member; only
 /// [`EMPTY_ATTRIBUTE_VALUE_MESSAGE`] and [`AMBIGUOUS_ATTRIBUTE_VALUE_MESSAGE`] replace
 /// its two `SerdeError::custom` texts, and the read carries the nesting bound its own
-/// recursion needs ([`MAX_ATTRIBUTE_VALUE_READ_DEPTH`]).
+/// recursion needs ([`MAX_ATTRIBUTE_VALUE_READ_DEPTH`]) and this service's own refusal of
+/// a `null` listed as a SET member ([`null_set_member_message`]).
 ///
 /// The cost of the copy: this declaration no longer tracks the model automatically, so
 /// a model change to `AttributeValue` (a renamed, added or `@jsonName`d member) has to
@@ -59,6 +60,30 @@ pub const EMPTY_ATTRIBUTE_VALUE_MESSAGE: &str =
 /// constraint, stated for the other way to break it.
 pub const AMBIGUOUS_ATTRIBUTE_VALUE_MESSAGE: &str = "Supplied AttributeValue has more than one \
      datatypes set, must contain exactly one of the supported datatypes";
+
+/// Why a SET a request carries a `null` MEMBER in is refused: AWS's fixed sentence for
+/// that parameter-value defect, one per set type.
+///
+/// A `null` INSIDE a collection states no member's absence — no member of the model stands
+/// at that position for it to be about — so it is not a defect of the body the request was
+/// carried in but a value the caller listed as a set member and DynamoDB admits no set
+/// member of: the parameter-value class ("One or more parameter values were invalid: …")
+/// every other rule about a value a request carried is stated in. Each of the three set
+/// members the model declares (`smithy_query(query="shape",
+/// shape="com.amazonaws.dynamodb#AttributeValue")` gives `SS` as a String Set, `NS` as a
+/// Number Set and `BS` as a Binary Set) carries its OWN sentence, exactly as that class's
+/// empty-set clauses do (`crate::state::check_collection_rules` words those), so the three
+/// are written out here rather than generated from one template. None of them carries any
+/// part of the request: they name neither the attribute nor the position in the set.
+const STRING_SET_NULL_MEMBER_CLAUSE: &str = "An string set may not have a null string as a member";
+const NUMBER_SET_NULL_MEMBER_CLAUSE: &str = "Numeric sets may not contain null";
+const BINARY_SET_NULL_MEMBER_CLAUSE: &str = "Binary sets may not contain null or empty values";
+
+/// One of those sentences as the whole refusal: the parameter-value class in front of the
+/// clause for the set type that carried the `null`.
+fn null_set_member_message(clause: &str) -> String {
+    format!("One or more parameter values were invalid: {clause}")
+}
 
 /// Why a value nesting past the levels DynamoDB supports is refused: AWS's fixed clause
 /// for that quota, which every surface that holds a value to it states
@@ -324,6 +349,17 @@ impl AttributeValue {
                 ::std::option::Option::Some(3) => {
                     let mut members: Vec<String> = Vec::new();
                     deserializer.read_list(&Self::M_SS, &mut |element| {
+                        // A `null` where a MEMBER stands is the parameter-value refusal
+                        // this service words for it ([`null_set_member_message`]), raised
+                        // before the member is read: the reader's own complaint about the
+                        // class it found names neither the parameter nor the set.
+                        if element.is_null() {
+                            return ::std::result::Result::Err(
+                                ::aws_smithy_schema::serde::SerdeError::custom(
+                                    null_set_member_message(STRING_SET_NULL_MEMBER_CLAUSE),
+                                ),
+                            );
+                        }
                         members.push(element.read_string(&Self::M_SS)?);
                         Ok(())
                     })?;
@@ -332,6 +368,13 @@ impl AttributeValue {
                 ::std::option::Option::Some(4) => {
                     let mut members: Vec<String> = Vec::new();
                     deserializer.read_list(&Self::M_NS, &mut |element| {
+                        if element.is_null() {
+                            return ::std::result::Result::Err(
+                                ::aws_smithy_schema::serde::SerdeError::custom(
+                                    null_set_member_message(NUMBER_SET_NULL_MEMBER_CLAUSE),
+                                ),
+                            );
+                        }
                         members.push(element.read_string(&Self::M_NS)?);
                         Ok(())
                     })?;
@@ -340,6 +383,13 @@ impl AttributeValue {
                 ::std::option::Option::Some(5) => {
                     let mut members: Vec<Vec<u8>> = Vec::new();
                     deserializer.read_list(&Self::M_BS, &mut |element| {
+                        if element.is_null() {
+                            return ::std::result::Result::Err(
+                                ::aws_smithy_schema::serde::SerdeError::custom(
+                                    null_set_member_message(BINARY_SET_NULL_MEMBER_CLAUSE),
+                                ),
+                            );
+                        }
                         members.push(element.read_blob(&Self::M_BS)?.into_inner());
                         Ok(())
                     })?;

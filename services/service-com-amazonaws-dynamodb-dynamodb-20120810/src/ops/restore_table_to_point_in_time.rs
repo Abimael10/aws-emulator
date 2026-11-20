@@ -273,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let source = store
             .table(&region, &source_name)
-            .map_err(|error| lift(&source_name, error))?;
+            .map_err(|error| lift(addressed_source(&input, &source_name), error))?;
         // A caller the policies in force do not let restore this table is refused before
         // anything is written, so no restored table is left behind.
         if let Some(denial) = crate::state::authorization::control_denial(
@@ -604,12 +604,14 @@ fn sse_unresolved(fault: crate::state::SseFault) -> RestoreTableToPointInTimeErr
 /// table with the name TableName does not currently exist within the subscriber's account
 /// or the subscriber is operating in the wrong Amazon Web Services Region" — which is the
 /// miss this operation models, rather than the control plane's `ResourceNotFoundException`,
-/// which it does not.
-fn lift(source: &str, error: crate::state::RequestError) -> RestoreTableToPointInTimeError {
+/// which it does not. The message echoes the value the request ADDRESSED the source by,
+/// exactly as it was sent ([`addressed_source`]), rather than anything this service read
+/// out of it.
+fn lift(addressed: &str, error: crate::state::RequestError) -> RestoreTableToPointInTimeError {
     match error {
         crate::state::RequestError::NotFound(_) => {
             RestoreTableToPointInTimeErrorModeled::TableNotFoundException(TableNotFoundException {
-                message: Some(crate::state::table_not_found_message(source)),
+                message: Some(crate::state::table_not_found_message(addressed)),
             })
             .into()
         }
@@ -617,6 +619,21 @@ fn lift(source: &str, error: crate::state::RequestError) -> RestoreTableToPointI
             crate::scaffolded::Scaffolded::validation(message)
         }
     }
+}
+
+/// The value this request ADDRESSED its source table by, as a refusal echoes it: the ARN
+/// where the request addressed the table by ARN ("The DynamoDB table that will be restored.
+/// This value is an Amazon Resource Name (ARN)" — `$SourceTableArn`), and otherwise the
+/// table the NAME member resolved to ("Name of the source table that is being restored" —
+/// `$SourceTableName`, which carries either documented form of the table).
+///
+/// An ARN-addressed request therefore reads its own ARN back, exactly as the other
+/// ARN-addressed operation of this surface does
+/// (`crate::ops::export_table_to_point_in_time`), and a name-addressed one reads the table
+/// the name resolved to, exactly as the `TableName`-addressed operations do
+/// (`crate::ops::create_backup`).
+fn addressed_source<'r>(input: &'r RestoreTableToPointInTimeInput, resolved: &'r str) -> &'r str {
+    input.source_table_arn.as_deref().unwrap_or(resolved)
 }
 
 /// The source table this restore reads, from the two members that can name it: "The

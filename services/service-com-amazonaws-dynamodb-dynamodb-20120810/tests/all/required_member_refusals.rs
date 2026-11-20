@@ -774,9 +774,17 @@ async fn a_resource_arn_that_is_not_an_arn_is_refused_by_that_rule() {
             "an ARN of another service",
             format!("arn:aws:sqs:{REGION}:{ACCOUNT}:Addressed"),
             format!(
+                "One or more parameter values were invalid: Provided Arn is not a DynamoDB \
+                 resource arn: arn:aws:sqs:{REGION}:{ACCOUNT}:Addressed"
+            ),
+        ),
+        (
+            "an index of a table of this endpoint",
+            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Addressed/index/by-rank"),
+            format!(
                 "One or more parameter values were invalid: Invalid resource arn provided, only \
-                 table or stream is accepted. Provided resource arn: arn:aws:sqs:{REGION}:\
-                 {ACCOUNT}:Addressed"
+                 table or stream is accepted. Provided resource arn: arn:aws:dynamodb:{REGION}:\
+                 {ACCOUNT}:table/Addressed/index/by-rank"
             ),
         ),
         (
@@ -830,8 +838,8 @@ async fn a_resource_arn_that_is_not_an_arn_is_refused_by_that_rule() {
                 (code.as_str(), stated.as_str()),
                 (
                     "ResourceNotFoundException",
-                    format!("Requested resource not found: Stream: {stream_arn} not found")
-                        .as_str()
+                    "Requested resource not found: Stream: 2026-01-01 not found for Table: \
+                     Addressed"
                 ),
                 "case a stream sub-resource ARN ({operation}): expected the stream not-found, \
                  got {code} with {stated:?}"

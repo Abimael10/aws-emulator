@@ -196,8 +196,10 @@ fn store_unavailable() -> DescribeContinuousBackupsError {
 /// source table with the name TableName does not currently exist within the
 /// subscriber's account or the subscriber is operating in the wrong Amazon Web Services
 /// Region" — which is the miss this operation models, rather than the control plane's
-/// `ResourceNotFoundException`, which it does not. The message is built from the
-/// request: the table it asked for.
+/// `ResourceNotFoundException`, which it does not. The message names the TABLE the
+/// request's `TableName` resolved to, for the reason `crate::ops::create_backup`'s does:
+/// that member carries either documented form of the table, so the refusal is about the
+/// table the value resolves to and not about the form it was sent in.
 fn lift(table_name: &str, error: crate::state::RequestError) -> DescribeContinuousBackupsError {
     match error {
         crate::state::RequestError::NotFound(_) => {

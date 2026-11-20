@@ -15,7 +15,7 @@ use super::*;
 // The shape of one `BatchGetItem` `RequestItems` entry, which the rendering of that
 // member walks ([`rendered_batch_get_request_items`]); `super` reaches only the shapes it
 // names itself.
-use crate::ops::types::{KeysAndAttributes, WriteRequest};
+use crate::ops::types::{KeysAndAttributes, TransactGetItem, TransactWriteItem, WriteRequest};
 
 /// How many put-or-delete operations one `BatchWriteItem` may carry: "up to 25 item
 /// put or delete operations" (the `BatchWriteItem` doc), which is also the length the
@@ -236,13 +236,17 @@ pub fn rendered_batch_write_request_items(
     out.into_text()
 }
 
-/// How much of a refused map a clause echoes at most.
+/// How much of a refused collection a clause echoes at most.
 ///
-/// CHOSEN by this emulator: the map is the caller's, and the rendering writes a field
-/// frame per attribute value in it, so a message that carried all of it would grow faster
-/// than the request that asked for it. The ceiling is far above the refusals this member
-/// earns in practice — a batch at the documented 25 operations of a few attributes each
-/// renders a few kilobytes — so what it bounds is the amplification and not the clause.
+/// A clause of AWS's request validator quotes the value the request carried, so the ceiling
+/// is not a wording choice: it is the bound that keeps one request from amplifying into a
+/// response of its own choosing. The map, its tables, its write requests, its items'
+/// attributes and the nesting inside them are all the caller's, and the rendering writes a
+/// field frame per attribute value in it, so a message carrying all of a very large one
+/// would grow faster than the request that asked for it. It is far above what the refusals
+/// of these members earn in practice — a batch at the documented 25 operations of a few
+/// attributes each renders a few kilobytes — so what it bounds is the amplification and not
+/// the clause.
 const MAX_RENDERED_VALUE_BYTES: usize = 64 * 1024;
 
 /// The bytes one rendering is written into, holding at most
@@ -593,6 +597,224 @@ const CORAL_ATTRIBUTE_VALUE_FIELDS: &[&str] = &[
 /// is the only encoding this walk holds at a time.
 fn push_coral_blob(out: &mut BoundedText, bytes: &[u8]) {
     out.push(&::aws_smithy_types::base64::encode(bytes));
+}
+
+/// A `TransactGetItems`' `TransactItems` list as the refusal of that member quotes it.
+///
+/// The same OBJECT rendering [`rendered_batch_write_request_items`] states a refused
+/// structure value in, over this operation's own request objects —
+/// `[TransactGetItem(get=Get(key={<attribute>=AttributeValue(…)}, tableName=<table>,
+/// projectionExpression=null, expressionAttributeNames=null, workloadProfileName=null))]`
+/// — which is the form the recorded refusals of this member carry. Every value in it comes
+/// from the request; the field names and their order are the model's own
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#Get")` gives
+/// `Key TableName ProjectionExpression ExpressionAttributeNames`) plus the one field the
+/// service's own request object carries beside them ([`TRAILING_REQUEST_FIELDS`]).
+///
+/// Bounded exactly as that rendering is: every byte goes through one [`BoundedText`], so
+/// what the clause quotes is clamped before it is produced rather than clipped afterwards.
+pub fn rendered_transact_get_items(items: &[TransactGetItem]) -> String {
+    let mut out = BoundedText::default();
+    out.push("[");
+    for (at, item) in items.iter().enumerate() {
+        if !out.has_room() {
+            break;
+        }
+        if at > 0 {
+            out.push(", ");
+        }
+        out.push("TransactGetItem(get=Get(key=");
+        push_coral_item(&mut out, &item.get.key);
+        push_rendered_text(&mut out, "tableName", Some(&item.get.table_name));
+        push_rendered_text(
+            &mut out,
+            "projectionExpression",
+            item.get.projection_expression.as_deref(),
+        );
+        push_rendered_name_map(
+            &mut out,
+            "expressionAttributeNames",
+            item.get.expression_attribute_names.as_ref(),
+        );
+        push_trailing_fields(&mut out);
+        out.push("))");
+    }
+    out.push("]");
+    out.into_text()
+}
+
+/// A `TransactWriteItems`' `TransactItems` list as the refusal of that member quotes it.
+///
+/// The same rendering as [`rendered_transact_get_items`], over this operation's own
+/// elements: `[TransactWriteItem(conditionCheck=null, put=Put(item={…},
+/// tableName=<table>, conditionExpression=null, expressionAttributeNames=null,
+/// expressionAttributeValues=null, returnValuesOnConditionCheckFailure=null,
+/// workloadProfileName=null), delete=null, update=null)]`. The four actions and the
+/// members of each are the model's own and in its order
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#TransactWriteItem")` gives
+/// `ConditionCheck Put Delete Update`, and each action's own members are read off its
+/// shape), and an action the request did not state renders as the unset field it is.
+pub fn rendered_transact_write_items(items: &[TransactWriteItem]) -> String {
+    let mut out = BoundedText::default();
+    out.push("[");
+    for (at, item) in items.iter().enumerate() {
+        if !out.has_room() {
+            break;
+        }
+        if at > 0 {
+            out.push(", ");
+        }
+        out.push("TransactWriteItem(conditionCheck=");
+        match item.condition_check.as_ref() {
+            Some(check) => {
+                out.push("ConditionCheck(key=");
+                push_coral_item(&mut out, &check.key);
+                push_rendered_text(&mut out, "tableName", Some(&check.table_name));
+                push_action_tail(
+                    &mut out,
+                    Some(&check.condition_expression),
+                    check.expression_attribute_names.as_ref(),
+                    check.expression_attribute_values.as_ref(),
+                    check.return_values_on_condition_check_failure.as_deref(),
+                );
+            }
+            None => out.push(NULL_FIELD),
+        }
+        out.push(", put=");
+        match item.put.as_ref() {
+            Some(put) => {
+                out.push("Put(item=");
+                push_coral_item(&mut out, &put.item);
+                push_rendered_text(&mut out, "tableName", Some(&put.table_name));
+                push_action_tail(
+                    &mut out,
+                    put.condition_expression.as_deref(),
+                    put.expression_attribute_names.as_ref(),
+                    put.expression_attribute_values.as_ref(),
+                    put.return_values_on_condition_check_failure.as_deref(),
+                );
+            }
+            None => out.push(NULL_FIELD),
+        }
+        out.push(", delete=");
+        match item.delete.as_ref() {
+            Some(delete) => {
+                out.push("Delete(key=");
+                push_coral_item(&mut out, &delete.key);
+                push_rendered_text(&mut out, "tableName", Some(&delete.table_name));
+                push_action_tail(
+                    &mut out,
+                    delete.condition_expression.as_deref(),
+                    delete.expression_attribute_names.as_ref(),
+                    delete.expression_attribute_values.as_ref(),
+                    delete.return_values_on_condition_check_failure.as_deref(),
+                );
+            }
+            None => out.push(NULL_FIELD),
+        }
+        out.push(", update=");
+        match item.update.as_ref() {
+            Some(update) => {
+                out.push("Update(key=");
+                push_coral_item(&mut out, &update.key);
+                push_rendered_text(&mut out, "updateExpression", Some(&update.update_expression));
+                push_rendered_text(&mut out, "tableName", Some(&update.table_name));
+                push_action_tail(
+                    &mut out,
+                    update.condition_expression.as_deref(),
+                    update.expression_attribute_names.as_ref(),
+                    update.expression_attribute_values.as_ref(),
+                    update.return_values_on_condition_check_failure.as_deref(),
+                );
+            }
+            None => out.push(NULL_FIELD),
+        }
+        out.push(")");
+    }
+    out.push("]");
+    out.into_text()
+}
+
+/// The members every action of a transactional write carries BEYOND the item or key it
+/// addresses and the table it names, in the order the model declares them, and the
+/// service's own trailing field after them — the frame closed.
+fn push_action_tail(
+    out: &mut BoundedText,
+    condition_expression: Option<&str>,
+    names: Option<&std::collections::HashMap<String, String>>,
+    values: Option<&Item>,
+    return_values: Option<&str>,
+) {
+    push_rendered_text(out, "conditionExpression", condition_expression);
+    push_rendered_name_map(out, "expressionAttributeNames", names);
+    push_rendered_value_map(out, "expressionAttributeValues", values);
+    push_rendered_text(out, "returnValuesOnConditionCheckFailure", return_values);
+    push_trailing_fields(out);
+    out.push(")");
+}
+
+/// One field of such a frame carrying TEXT: `, <field>=<the text the request sent>`, and
+/// the unset field for a member the request left out.
+fn push_rendered_text(out: &mut BoundedText, field: &str, value: Option<&str>) {
+    out.push(", ");
+    out.push(field);
+    out.push("=");
+    match value {
+        Some(text) => out.push(text),
+        None => out.push(NULL_FIELD),
+    }
+}
+
+/// One field carrying a SUBSTITUTION TABLE: the object form a map takes, its entries in
+/// NAME order for the reason an item's attributes are ([`push_coral_item`]).
+fn push_rendered_name_map(
+    out: &mut BoundedText,
+    field: &str,
+    entries: Option<&std::collections::HashMap<String, String>>,
+) {
+    out.push(", ");
+    out.push(field);
+    out.push("=");
+    let Some(entries) = entries else {
+        out.push(NULL_FIELD);
+        return;
+    };
+    out.push("{");
+    for (at, (name, value)) in entries
+        .iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .enumerate()
+    {
+        if !out.has_room() {
+            break;
+        }
+        if at > 0 {
+            out.push(", ");
+        }
+        out.push(name);
+        out.push("=");
+        out.push(value);
+    }
+    out.push("}");
+}
+
+/// One field carrying a table of ATTRIBUTE VALUES: the same object form, each value in the
+/// attribute-value frame every value of this rendering is written in.
+fn push_rendered_value_map(out: &mut BoundedText, field: &str, entries: Option<&Item>) {
+    out.push(", ");
+    out.push(field);
+    out.push("=");
+    match entries {
+        Some(entries) => push_coral_item(out, entries),
+        None => out.push(NULL_FIELD),
+    }
+}
+
+/// The service's own trailing field of a request object: `, workloadProfileName=null`.
+fn push_trailing_fields(out: &mut BoundedText) {
+    out.push(", ");
+    out.push(TRAILING_REQUEST_FIELDS);
 }
 
 /// A `BatchGetItem`'s `RequestItems` map as the request carried it: the JSON rendering of

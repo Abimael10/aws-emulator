@@ -44,6 +44,7 @@ use service_common::audited_operation::{AuditedService, AuditedTable, CallKind};
 use service_common::management_events::{
     AuditedResource, ManagementEventLog, RecordedSession, ServedApiCall, SessionAuditDirectory,
 };
+use service_common::quoted_refusals::QuotedRefusals;
 use smithy_server_runtime::{OperationContext, OperationRoutingTable, PreDispatchProtocol};
 
 /// This service's model-derived half, routing through the AUDITED operations — the shared
@@ -236,6 +237,37 @@ macro_rules! data_plane {
     }};
 }
 
+/// Serve one operation audited AND behind the wrapper that restores the value half of a
+/// constraint clause ([`QuotedRefusals`]), as a call of the stated kind.
+///
+/// WHICH operations: the ones whose whole selector is a member the model declares LONGER
+/// than the ceiling the framework's own walk elides an echoed value at — an ARN
+/// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#ResourceArnString")` gives
+/// `@length` 1..1283, where that walk elides past 256 bytes). AWS's clause quotes the value
+/// the request carried however long it was, so a refusal of such a member read back the
+/// walk's `<prefix>... [<n> bytes]` instead of the ARN the caller has to correct. The shared
+/// wrapper re-reads the request through the framework's OWN deserializer and walk and hands
+/// the violations to this service's own wording, so only that value half changes.
+///
+/// The audited call stays INSIDE the wrapper ([`AuditedTable::serve_behind`]), so a record
+/// still reports the operation's own input and outcome.
+macro_rules! quoting_refused_values {
+    (
+        $table:expr, $engine:expr,
+        $( $module:ident :: $operation:ident => $kind:ident ),* $(,)?
+    ) => {{
+        $(
+            $table.serve_behind(
+                crate::ops::$module::$operation::new(::std::sync::Arc::clone($engine)),
+                CallKind::$kind,
+                |audited, _| {
+                    QuotedRefusals::over::<crate::ops::$module::$operation<Eng>>(audited)
+                },
+            );
+        )*
+    }};
+}
+
 /// Every modelled operation of this service, each constructed from the shared engine and
 /// served behind the audit recorder.
 ///
@@ -266,7 +298,6 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
         create_global_table::CreateGlobalTable => mutates,
         create_table::CreateTable => mutates,
         delete_backup::DeleteBackup => mutates,
-        delete_resource_policy::DeleteResourcePolicy => mutates,
         delete_table::DeleteTable => mutates,
         describe_backup::DescribeBackup => reports,
         describe_continuous_backups::DescribeContinuousBackups => reports,
@@ -284,7 +315,6 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
         disable_kinesis_streaming_destination::DisableKinesisStreamingDestination => mutates,
         enable_kinesis_streaming_destination::EnableKinesisStreamingDestination => mutates,
         export_table_to_point_in_time::ExportTableToPointInTime => mutates,
-        get_resource_policy::GetResourcePolicy => reports,
         import_table::ImportTable => mutates,
         list_backups::ListBackups => reports,
         list_bulk_operations::ListBulkOperations => reports,
@@ -293,12 +323,8 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
         list_global_tables::ListGlobalTables => reports,
         list_imports::ListImports => reports,
         list_tables::ListTables => reports,
-        list_tags_of_resource::ListTagsOfResource => reports,
-        put_resource_policy::PutResourcePolicy => mutates,
         restore_table_from_backup::RestoreTableFromBackup => mutates,
         restore_table_to_point_in_time::RestoreTableToPointInTime => mutates,
-        tag_resource::TagResource => mutates,
-        untag_resource::UntagResource => mutates,
         update_continuous_backups::UpdateContinuousBackups => mutates,
         update_contributor_insights::UpdateContributorInsights => mutates,
         update_global_table::UpdateGlobalTable => mutates,
@@ -307,6 +333,18 @@ pub fn audited_table<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> Operation
         update_table::UpdateTable => mutates,
         update_table_replica_auto_scaling::UpdateTableReplicaAutoScaling => mutates,
         update_time_to_live::UpdateTimeToLive => mutates,
+    );
+    // The ARN-ADDRESSED surfaces, whose whole selector is a member the model declares
+    // longer than the framework's own echo ceiling: their refusals quote the value the
+    // request carried ([`quoting_refused_values`]).
+    quoting_refused_values!(
+        table, engine,
+        delete_resource_policy::DeleteResourcePolicy => Mutating,
+        get_resource_policy::GetResourcePolicy => Reporting,
+        list_tags_of_resource::ListTagsOfResource => Reporting,
+        put_resource_policy::PutResourcePolicy => Mutating,
+        tag_resource::TagResource => Mutating,
+        untag_resource::UntagResource => Mutating,
     );
     // This service's DATA plane: the calls on the items a table holds, which CloudTrail
     // records as data events of that table rather than as management events of the account.

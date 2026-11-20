@@ -174,8 +174,15 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
     // The two surfaces address different resources, so each words its own refusal: the
     // TAGGING surface takes a table ARN and nothing deeper, while the resource-POLICY
     // surface takes "a table or stream" (the `PutResourcePolicy` doc) and says which of
-    // the two rules the value broke — it is not the resource kind this surface accepts, or
-    // it is not a resource of this endpoint at all.
+    // the three rules the value broke — no DynamoDB resource can be read from it at all, it
+    // names a DynamoDB resource this surface does not attach policies to, or it is not a
+    // resource of this endpoint.
+    let unreadable = |arn: &str| {
+        format!(
+            "One or more parameter values were invalid: Provided Arn is not a DynamoDB \
+             resource arn: {arn}"
+        )
+    };
     let unsupported = |arn: &str| {
         format!(
             "One or more parameter values were invalid: Invalid resource arn provided, only \
@@ -191,14 +198,14 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
         },
         {
             let arn = format!("arn:aws:sqs:{REGION}:{ACCOUNT}:scoped-table");
-            ("an ARN of another service", arn.clone(), unsupported(&arn))
+            ("an ARN of another service", arn.clone(), unreadable(&arn))
         },
         {
             let arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:backup/scoped-table");
             (
                 "an ARN naming another resource type",
                 arn.clone(),
-                unsupported(&arn),
+                unreadable(&arn),
             )
         },
         {
@@ -206,7 +213,7 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
             (
                 "an ARN with no resource type",
                 arn.clone(),
-                unsupported(&arn),
+                unreadable(&arn),
             )
         },
         {
@@ -214,11 +221,16 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
             ("an index sub-resource ARN", arn.clone(), unsupported(&arn))
         },
         {
+            let arn =
+                format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table/backup/01-abcdef12");
+            ("a backup sub-resource ARN", arn.clone(), unsupported(&arn))
+        },
+        {
             let arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table/");
             (
                 "a trailing slash after the table name",
                 arn.clone(),
-                unsupported(&arn),
+                unreadable(&arn),
             )
         },
         {
@@ -226,7 +238,7 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
             (
                 "a table name below the documented minimum length",
                 arn.clone(),
-                unsupported(&arn),
+                unreadable(&arn),
             )
         },
         {
@@ -234,7 +246,7 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
             (
                 "a table name outside the documented pattern",
                 arn.clone(),
-                unsupported(&arn),
+                unreadable(&arn),
             )
         },
         {
@@ -332,8 +344,10 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
         );
         assert_eq!(
             message(&answered),
-            format!("Requested resource not found: Stream: {stream_arn} not found"),
-            "case a stream sub-resource ARN on {operation}: the refusal names the stream, got {}",
+            "Requested resource not found: Stream: 2026-01-01T00:00:00.000 not found for \
+             Table: scoped-table",
+            "case a stream sub-resource ARN on {operation}: the refusal names the stream by its \
+             label and the table it would belong to, got {}",
             message(&answered)
         );
     }

@@ -88,13 +88,19 @@ pub fn backup_path_acts_on(status: TableStatus) -> bool {
 
 /// How a backup-path operation refuses a table it has none of: the sentence
 /// `TableNotFoundException` carries, whose fixed text is `Table not found: ` and whose
-/// variable part is the table the request named.
+/// variable part is the value the request ADDRESSED the table by — the table's ARN where
+/// the member the request addressed it by IS an ARN
+/// (`ExportTableToPointInTime$TableArn`, `RestoreTableToPointInTime$SourceTableArn`),
+/// echoed exactly as it was sent, and otherwise the table the `TableName` member resolved
+/// to, that member carrying either documented form of the table. A caller reads back the
+/// value it addressed the table by, which is what lets it correlate the refusal with its
+/// own request.
 ///
 /// One wording for every operation that models that error, so a table the backup path
 /// cannot address is refused in the same words whether it was never there, has gone, or
 /// has not finished being created.
-pub fn table_not_found_message(table_name: &str) -> String {
-    format!("Table not found: {table_name}")
+pub fn table_not_found_message(addressed: &str) -> String {
+    format!("Table not found: {addressed}")
 }
 
 /// Whether a stored `BackupType` is one a request's `BackupTypeFilter` selects.

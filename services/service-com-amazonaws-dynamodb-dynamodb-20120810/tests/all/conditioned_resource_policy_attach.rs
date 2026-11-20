@@ -461,8 +461,10 @@ async fn the_resource_policy_surface_names_the_missing_table_by_name() {
         }
     }
 
-    // A STREAM ARN of a table that is not there is the same miss: the table is what is
-    // absent, so it is what the refusal names.
+    // A STREAM ARN is a different resource of the same table, and the refusal names the
+    // resource the REQUEST addressed: the stream, by the label the ARN carries and the
+    // table it would belong to — whether or not that table is there, because a stream of a
+    // table the endpoint does not hold is not there either.
     let arn = format!("{}/stream/2026-01-01T00:00:00.000", table_arn("Missing"));
     let (status, body) = call(&router, "GetResourcePolicy", &json!({"ResourceArn": arn})).await;
     assert_eq!(
@@ -473,8 +475,9 @@ async fn the_resource_policy_surface_names_the_missing_table_by_name() {
     );
     assert_eq!(
         message(&body),
-        "Requested resource not found: Table: Missing not found",
-        "case a stream ARN of an absent table: expected the absent table to be named, got {:?}",
+        "Requested resource not found: Stream: 2026-01-01T00:00:00.000 not found for Table: \
+         Missing",
+        "case a stream ARN of an absent table: expected the addressed stream to be named, got {:?}",
         message(&body)
     );
 }

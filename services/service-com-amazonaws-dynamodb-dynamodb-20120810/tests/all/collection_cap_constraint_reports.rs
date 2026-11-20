@@ -21,9 +21,9 @@
 //! bound that was broken (the `@length` maximum and the `@length` minimum), the
 //! published bound's value (100 and 25), the member's depth in the request (a
 //! top-level member and a list nested under a map entry the CALLER keyed), the
-//! shape of the elements (a `Get`, a `Put`, a `Delete`, a mix of two actions),
-//! and how far past the bound the request went (one past it, and half again as
-//! many) — each bound tested AT the bound and one past it.
+//! shape of the elements (a `Get`, a `Put`, a `Delete`), and how far past the
+//! bound the request went (one past it, and half again as many) — each bound
+//! tested AT the bound and one past it.
 //!
 //! Every bound named in a row comes from the Smithy model, through
 //! `smithy_query(query="shape", shape="…")`: `TransactGetItemList` and
@@ -36,6 +36,12 @@
 //! `BatchWriteItem` names the map of the same name by the lowerCamel path the request
 //! validator builds, so both are pinned here side by side (see "Which form a constraint
 //! clause takes" in `src/service.rs`).
+//!
+//! The transactional lists past their MAXIMUM are the one capped collection whose recorded
+//! refusal QUOTES the rejected list, at the validator's own member path, so they are pinned
+//! in `tests/all/refusal_messages_echo_the_requests_own_values.rs` instead; what stays here
+//! is the same members' EMPTY case, whose refusal echoes nothing, and the bound they are
+//! not refused at.
 
 use serde_json::{json, Value};
 
@@ -75,27 +81,6 @@ fn transact_gets(count: usize) -> Vec<Value> {
 fn transact_puts(count: usize) -> Vec<Value> {
     (0..count)
         .map(|index| json!({"Put": {"TableName": TABLE, "Item": key(index)}}))
-        .collect()
-}
-
-/// `count` `TransactWriteItems` entries, each a `Delete` of a distinct key.
-fn transact_deletes(count: usize) -> Vec<Value> {
-    (0..count)
-        .map(|index| json!({"Delete": {"TableName": TABLE, "Key": key(index)}}))
-        .collect()
-}
-
-/// `count` `TransactWriteItems` entries alternating `Put` and `Delete`, so the
-/// clause cannot depend on which action the elements carry.
-fn transact_mixed(count: usize) -> Vec<Value> {
-    (0..count)
-        .map(|index| {
-            if index % 2 == 0 {
-                json!({"Put": {"TableName": TABLE, "Item": key(index)}})
-            } else {
-                json!({"Delete": {"TableName": TABLE, "Key": key(index)}})
-            }
-        })
         .collect()
 }
 
@@ -160,40 +145,10 @@ async fn a_collection_outside_its_modelled_length_bound_is_reported_against_that
     // refusal must carry.
     let cases: Vec<(&str, &str, Value, String)> = vec![
         (
-            "a transactional read one past the 100-item cap",
-            "TransactGetItems",
-            json!({"TransactItems": transact_gets(101)}),
-            report("TransactItems", &at_most(100)),
-        ),
-        (
-            "a transactional read half again past the same cap states the same bound",
-            "TransactGetItems",
-            json!({"TransactItems": transact_gets(150)}),
-            report("TransactItems", &at_most(100)),
-        ),
-        (
             "an empty transactional read, one below the same member's minimum",
             "TransactGetItems",
             json!({"TransactItems": []}),
             report("TransactItems", &at_least(1)),
-        ),
-        (
-            "a transactional write of puts one past the 100-item cap",
-            "TransactWriteItems",
-            json!({"TransactItems": transact_puts(101)}),
-            report("TransactItems", &at_most(100)),
-        ),
-        (
-            "a transactional write of deletes one past the same cap",
-            "TransactWriteItems",
-            json!({"TransactItems": transact_deletes(101)}),
-            report("TransactItems", &at_most(100)),
-        ),
-        (
-            "a transactional write mixing two actions, half again past the cap",
-            "TransactWriteItems",
-            json!({"TransactItems": transact_mixed(150)}),
-            report("TransactItems", &at_most(100)),
         ),
         (
             "an empty transactional write, one below the same member's minimum",

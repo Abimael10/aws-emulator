@@ -34,6 +34,7 @@ use serde_json::Value;
 
 use aws_smithy_runtime_api::http::Request as RtRequest;
 use aws_smithy_schema_server::constraints::{EnumTrait, LengthTrait, Violation, ViolationKind};
+use smithy_server_runtime::{DeserializableStruct, ServerHttpProtocol};
 
 /// The operation whose elements must each state one of a set of members the model leaves
 /// all four optional, and the member list they arrive in.
@@ -127,6 +128,103 @@ fn transact_items_clauses(document: &Value) -> Vec<String> {
         return vec![crate::state::transact_item_states_no_action_clause()];
     }
     Vec::new()
+}
+
+// =============================================================================
+// THE TRANSACTIONAL LIST PAST ITS CAP
+//
+// A `TransactItems` list carrying more elements than the model admits is a violation the
+// validating WALK reports — so the request is refused before the handler that has the
+// decoded list in hand runs — and AWS's recorded refusal of it states the REJECTED LIST:
+// `Value '[TransactGetItem(get=Get(key={pk=AttributeValue(s=…, n=null, …)}, …))]' at
+// 'transactItems' failed to satisfy constraint: …`, the same object rendering a refused
+// `BatchWriteItem` request map is quoted in. That walk hands
+// [`super::EmulatedService::override_refusal`] its own summary of the collection (`<n>
+// items`) rather than the collection, so there is nothing there to render from.
+//
+// The list is therefore read HERE, where the request still is: decoded by the framework's
+// OWN deserializer for the served operation's input — the same protocol, the same input
+// schema and the same generated reader the dispatch that follows uses, so this layer
+// cannot disagree with it — and rendered by the one renderer this crate states that form
+// with (`crate::state::rendered_transact_get_items` and
+// `crate::state::rendered_transact_write_items`). The BOUND is read off the same generated
+// input schema the walk reads it off, never off a second transcription of the model.
+//
+// Only a list past the MAXIMUM is stated this way, which is the class the recorded
+// refusals carry. A list below the member's minimum is the empty list, whose recorded
+// refusal states the member and the bound alone, so it keeps the walk's own clause
+// (`tests/all/collection_cap_constraint_reports.rs` pins the two side by side).
+// =============================================================================
+
+/// The other operation whose `TransactItems` list is quoted back that way.
+const TRANSACT_GET_ITEMS: &str = "TransactGetItems";
+
+/// The clause the served operation's `TransactItems` earns for carrying more elements than
+/// the model admits, with the rejected list rendered from the request itself.
+///
+/// `None` for every other operation, for a body no input can be read from, and for a list
+/// inside its declared bound — including an empty one, which keeps the walk's clause.
+pub fn transact_items_cap_clause(
+    operation: &str,
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Option<String> {
+    let (rendered, requirement) = match operation {
+        TRANSACT_GET_ITEMS => {
+            let schema = crate::ops::types::TRANSACT_GET_ITEMS_INPUT_SCHEMA;
+            let input: crate::ops::types::TransactGetItemsInput = decoded(protocol, req, schema)?;
+            let requirement = past_declared_maximum(schema, input.transact_items.len())?;
+            (
+                crate::state::rendered_transact_get_items(&input.transact_items),
+                requirement,
+            )
+        }
+        TRANSACT_WRITE_ITEMS => {
+            let schema = crate::ops::types::TRANSACT_WRITE_ITEMS_INPUT_SCHEMA;
+            let input: crate::ops::types::TransactWriteItemsInput = decoded(protocol, req, schema)?;
+            let requirement = past_declared_maximum(schema, input.transact_items.len())?;
+            (
+                crate::state::rendered_transact_write_items(&input.transact_items),
+                requirement,
+            )
+        }
+        _ => return None,
+    };
+    Some(crate::state::constraint_clause(
+        crate::state::TRANSACT_ITEMS_MEMBER_PATH,
+        Some(&rendered),
+        &requirement,
+    ))
+}
+
+/// `req`'s body read as the input `schema` declares, by the framework's own deserializer
+/// for it — `None` for a body no input can be read from, which is a refusal of its own
+/// (`super::request_layer`).
+fn decoded<I: DeserializableStruct>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    schema: &'static ::aws_smithy_schema::Schema,
+) -> Option<I> {
+    let mut deserializer = protocol.deserialize_input(req, schema).ok()?;
+    I::deserialize(&mut *deserializer).ok()
+}
+
+/// The requirement phrase for the `@length` MAXIMUM the `TransactItems` member of `input`
+/// declares, when `elements` is past it — read off the generated schema the validating
+/// walk reads it off. `None` when the member declares no maximum, and when the list is
+/// inside it.
+fn past_declared_maximum(
+    input: &'static ::aws_smithy_schema::Schema,
+    elements: usize,
+) -> Option<String> {
+    let member = input
+        .members()
+        .iter()
+        .find(|member| member.member_name() == Some(TRANSACT_ITEMS_MEMBER))?;
+    let declared = declared_trait::<LengthTrait>(member.traits()?, &LengthTrait::TRAIT_ID)?;
+    let max = declared.max?;
+    let length = i64::try_from(elements).unwrap_or(i64::MAX);
+    (length > max).then(|| crate::state::max_length_requirement(usize::try_from(max).unwrap_or(0)))
 }
 
 // =============================================================================
