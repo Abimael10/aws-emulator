@@ -533,7 +533,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tracing_configuration: input.tracing_configuration,
             encryption_configuration,
             revision_id: None,
-            description: input.version_description,
+            // A `versionDescription` describes the version this create publishes, not
+            // the state machine: it is kept on the record only for the idempotency
+            // fingerprint and is handed to the publish below.
+            version_description: input.version_description,
             tags,
             publish,
             published_version_arn,
@@ -562,7 +565,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let description = candidate.description.clone();
+        let description = candidate.version_description.clone();
         store.insert_state_machine(candidate);
 
         let version_arn = if publish {

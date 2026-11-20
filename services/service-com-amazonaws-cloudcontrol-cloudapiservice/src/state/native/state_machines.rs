@@ -245,7 +245,8 @@ impl NativeResourceProvider for StateMachineProvider {
             encryption_configuration: None,
             // A state machine nothing has updated is at no revision yet.
             revision_id: None,
-            description: None,
+            // No version is published here, so there is no version description.
+            version_description: None,
             tags: desired.tags.clone(),
             // A version is published by a call of its own, which this create does not make.
             publish: false,

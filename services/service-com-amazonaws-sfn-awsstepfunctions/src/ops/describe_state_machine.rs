@@ -371,7 +371,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )),
             label: None,
             revision_id: machine.revision_id.clone(),
-            description: machine.description.clone(),
+            // `description` is a `VersionDescription` — "the description of the state
+            // machine version" — and no operation of this API gives a state machine a
+            // description of its own: the text a publish carried (`versionDescription`
+            // on a create or an update, `description` on
+            // `PublishStateMachineVersion`) belongs to the immutable version snapshot
+            // alone, so the unqualified ARN reports no description.
+            description: None,
             encryption_configuration: Some(crate::state::reported_encryption_configuration(
                 machine.encryption_configuration.as_ref(),
             )),

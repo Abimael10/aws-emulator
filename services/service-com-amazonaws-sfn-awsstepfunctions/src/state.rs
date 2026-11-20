@@ -821,7 +821,13 @@ pub struct StateMachine {
     pub tracing_configuration: Option<TracingConfiguration>,
     pub encryption_configuration: Option<EncryptionConfiguration>,
     pub revision_id: Option<String>,
-    pub description: Option<String>,
+    /// The `versionDescription` the create that minted this state machine carried,
+    /// which describes the VERSION that create published and not the state machine:
+    /// this API has no member that gives a state machine a description of its own, so
+    /// nothing reports this for the unqualified ARN — it is kept only because
+    /// `CreateStateMachine`'s idempotency check compares it (see
+    /// [`configuration_fingerprint`]), and the version record carries its own copy.
+    pub version_description: Option<String>,
     pub tags: Vec<Tag>,
     /// Whether the create that minted this state machine asked to publish a
     /// version. `CreateStateMachine`'s idempotency check reads `publish`, so the
@@ -865,7 +871,7 @@ impl StateMachine {
             self.tracing_configuration.as_ref(),
             self.encryption_configuration.as_ref(),
             self.publish,
-            self.description.as_deref(),
+            self.version_description.as_deref(),
         )
     }
 
@@ -882,7 +888,7 @@ impl StateMachine {
             + self.status.len()
             + self.published_version_arn.as_ref().map_or(0, String::len)
             + self.revision_id.as_ref().map_or(0, String::len)
-            + self.description.as_ref().map_or(0, String::len)
+            + self.version_description.as_ref().map_or(0, String::len)
             + tags_bytes(&self.tags)
     }
 }
