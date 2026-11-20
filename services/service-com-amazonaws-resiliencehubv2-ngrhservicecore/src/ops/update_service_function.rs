@@ -180,15 +180,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the create applies. Renaming a function to the name it already has is not a
         // conflict with itself.
         if let Some(name) = input.name.as_deref() {
-            if let Some(existing) = service
+            if service
                 .service_function_named(name)
-                .filter(|existing| existing.service_function_id != input.service_function_id)
+                .is_some_and(|existing| existing.service_function_id != input.service_function_id)
             {
                 return Err(UpdateServiceFunctionErrorModeled::ConflictException(
                     ConflictException {
-                        message: format!(
-                            "A service function named {name} already exists in service {}: {}",
-                            input.service_arn, existing.service_function_id
+                        message: crate::state::name_already_exists_message(
+                            crate::state::SERVICE_FUNCTION_RESOURCE_TYPE,
+                            name,
                         ),
                     },
                 )

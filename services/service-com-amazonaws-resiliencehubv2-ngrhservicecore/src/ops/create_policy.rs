@@ -165,28 +165,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
+        // The creation parameters of THIS request, which are what a `clientToken` compares
+        // a repeat against.
+        let requested = crate::state::PolicyCreateRequest::new(
+            input.name,
+            input.description,
+            input.availability_slo,
+            input.multi_az,
+            input.multi_region,
+            input.data_recovery,
+            input.sharing_enabled,
+            input.kms_key_id,
+            input.tags,
+        );
         let mut store = state.lock();
 
-        // `clientToken` is an @idempotencyToken: a repeat of the same call returns the
-        // policy the first one created rather than creating a second one.
-        if let Some(policy) = input
+        // `clientToken` is an @idempotencyToken: it makes a RETRY of this create safe, so a
+        // repeat of the same call answers the policy the first one created rather than
+        // creating a second one. A token already used for a DIFFERENT create is not a
+        // retry — the caller would be asking one token to stand for two distinct policies —
+        // so it is refused with the conflict this operation models instead of answering a
+        // policy that is not the one asked for, and nothing is written for the refused call.
+        if let Some(consumed) = input
             .client_token
             .as_deref()
             .and_then(|token| store.policy_idempotency.get(token))
             .cloned()
-            .and_then(|policy_arn| store.policy_view(&policy_arn))
         {
-            return Ok(CreatePolicyOutput { policy });
+            if consumed.request != requested {
+                return Err(CreatePolicyErrorModeled::ConflictException(ConflictException {
+                    message: crate::state::two_requests_one_token_message(
+                        input.client_token.as_deref().unwrap_or_default(),
+                    ),
+                })
+                .into());
+            }
+            if let Some(policy) = store.policy_view(&consumed.policy_arn) {
+                return Ok(CreatePolicyOutput { policy });
+            }
         }
 
         // A policy name identifies one policy within the account — `EntityName` is
         // "Resource name (used in ARN — no spaces allowed)" — so a second policy under a
         // name already taken is a conflict, not a second policy.
-        if let Some(existing) = store.policy_named(&input.name) {
+        if store.policy_named(&requested.name).is_some() {
             return Err(CreatePolicyErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "A resilience policy named {} already exists in this account: {}",
-                    input.name, existing.policy_arn
+                message: crate::state::name_already_exists_message(
+                    crate::state::POLICY_RESOURCE_TYPE,
+                    &requested.name,
                 ),
             })
             .into());
@@ -196,10 +222,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entry carrying caller-supplied payload, so a caller that repeats this call
         // would otherwise grow the process's memory without limit. At the ceiling the
         // create is refused with the quota error this operation models. The two secondary
-        // indexes are bounded by the same ceiling — `policy_names` holds exactly one
-        // entry per stored policy and `policy_idempotency` at most one (a replayed token
-        // returns above instead of inserting).
-        if store.policies.len() >= crate::state::MAX_POLICIES {
+        // indexes are capped by the SAME ceiling HERE rather than assumed to follow the
+        // policies: `policy_names` holds exactly one entry per stored policy, a token
+        // already in `policy_idempotency` either replays or is refused above instead of
+        // inserting, and `DeletePolicy` drops the name and the tokens that named the
+        // record it removed — and if either index ever did outgrow the policies, the
+        // create is refused rather than growing it further.
+        if store.policies.len() >= crate::state::MAX_POLICIES
+            || store.policy_names.len() >= crate::state::MAX_POLICIES
+            || store.policy_idempotency.len() >= crate::state::MAX_POLICIES
+        {
             return Err(CreatePolicyErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
@@ -217,18 +249,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let sequence = store.next_sequence();
         let record = crate::state::PolicyRecord {
             policy_arn: policy_arn.clone(),
-            name: input.name,
-            description: input.description,
+            name: requested.name.clone(),
+            description: requested.description.clone(),
             // Every target block is optional in the model and is stored exactly as the
             // caller set it: a policy that sets none has no targets, not zeroed ones.
-            availability_slo: input.availability_slo,
-            multi_az: input.multi_az,
-            multi_region: input.multi_region,
-            data_recovery: input.data_recovery,
+            availability_slo: requested.availability_slo.clone(),
+            multi_az: requested.multi_az.clone(),
+            multi_region: requested.multi_region.clone(),
+            data_recovery: requested.data_recovery.clone(),
             // Omitted means cross-account sharing is off for the new policy.
-            sharing_enabled: input.sharing_enabled.unwrap_or(false),
-            kms_key_id: input.kms_key_id,
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            sharing_enabled: requested.sharing_enabled.unwrap_or(false),
+            kms_key_id: requested.kms_key_id.clone(),
+            tags: requested.tags.clone(),
             created_at: now,
             updated_at: now,
             sequence,
@@ -238,7 +270,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .policy_names
             .insert(record.name.clone(), policy_arn.clone());
         if let Some(token) = input.client_token {
-            store.policy_idempotency.insert(token, policy_arn.clone());
+            store.policy_idempotency.insert(
+                token,
+                crate::state::PolicyIdempotencyRecord {
+                    policy_arn: policy_arn.clone(),
+                    request: requested,
+                },
+            );
         }
         // `associatedServiceCount` is counted from the services that reference this ARN —
         // zero for a just-minted one — through the same projection every later read

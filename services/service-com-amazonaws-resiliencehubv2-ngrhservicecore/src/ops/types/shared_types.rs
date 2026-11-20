@@ -100,13 +100,16 @@ pub struct EksLabelSelectorRequirement {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.resiliencehubv2#AvailabilitySlo")]
-#[derive(Debug, Clone, Default)]
+// `PartialEq` because a `clientToken` remembers the creation parameters it was accepted
+// with, and a policy's target blocks are part of them: comparing them is what tells a true
+// retry from a token offered for a second, different create.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AvailabilitySlo {
     pub target: Option<f64>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.resiliencehubv2#MultiAzTargets")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MultiAzTargets {
     pub rto_in_minutes: Option<i32>,
     pub rpo_in_minutes: Option<i32>,
@@ -114,7 +117,7 @@ pub struct MultiAzTargets {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.resiliencehubv2#MultiRegionTargets")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MultiRegionTargets {
     pub rto_in_minutes: Option<i32>,
     pub rpo_in_minutes: Option<i32>,
@@ -122,7 +125,7 @@ pub struct MultiRegionTargets {
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.resiliencehubv2#DataRecoveryTargets")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DataRecoveryTargets {
     pub time_between_backups_in_minutes: Option<i32>,
 }

@@ -8,8 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
-# `validation_message`: the bracketed constraint report this service states for a value
-# outside a member's `@pattern`, shared with the V1 endpoint of the same service.
+# `validation_message`: the bracketed schema-finding report this service states for a
+# request value one of the rules its request schema declares refused, over the sentences
+# every service stating that layer's findings shares.
 service-common = { path = "../common" }
 # The account's IAM records, read through the IAM service's own state struct in the SAME
 # shared engine: `permissionModel.invokerRoleName` names a role this service has to be able

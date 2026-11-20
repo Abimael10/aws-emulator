@@ -2,18 +2,19 @@
 
 //! How this service WORDS a request the framework refused before any handler ran.
 //!
-//! A value the modelled `@pattern` of the member it was sent for does not admit is
-//! refused with this service's own constraint report — the bracketed list the
-//! regular-expression layer in front of it states, one entry per violated member, naming
-//! the expression the value had to match and the value that did not match it — and not
-//! with the common AWS framework form that counts the violations and names the member
-//! path.
+//! A request value one of the rules its schema declares refused is reported as the
+//! validator's own REPORT — the bracketed list a JSON-schema layer states, one finding per
+//! rule the request broke, worded for the CLASS of rule (a regular expression, a length
+//! bound, a numeric range, an enumerated set, a choice of alternatives), each naming the
+//! requirement from the MODEL and the value from the REQUEST — and not the common AWS
+//! framework form that counts the violations and names the member path.
 //!
 //! The suites are TABLES: a row is one input of the class the rule covers — the operation,
-//! the member, the form of the expression, the form of the value, how many members broke
-//! their pattern — and the recorded `CreateSystem` case is ONE of them. The last suite is
-//! the other half of the rule: every OTHER constraint class keeps the framework's own
-//! wording, so one rule is never reported in two voices.
+//! the member, the rule it broke, the form of the value, how many rules one request broke —
+//! and the recorded `CreateSystem`, `CreateAssertion`, `CreatePolicy` and
+//! `CreateInputSource` cases are each ONE of them. The last suite is the other half of the
+//! rule: the two violations this layer states no finding about keep the framework's own
+//! wording, so one refusal is never reported half in one voice and half in the other.
 //!
 //! Every case drives the real wire path (`MultiServiceRouter::dispatch`), so the refusal
 //! is rendered by the same seam a client reaches.
@@ -328,7 +329,8 @@ async fn two_members_outside_their_patterns_are_reported_as_one_bracketed_list()
     );
 }
 
-/// One row of the declining table: a request breaking a constraint of some other class.
+/// One row of the declining table: a request breaking a constraint this layer states no
+/// finding for.
 struct OtherClassCase {
     label: &'static str,
     method: &'static str,
@@ -336,34 +338,17 @@ struct OtherClassCase {
     body: Option<Value>,
 }
 
-/// RULE: only the `@pattern` class is reported that way. A request breaking any other
-/// modelled constraint — a `@length` bound, a `@range` bound, an enumerated value set, an
-/// absent `@required` member — keeps the framework's own wording, which is what this
-/// service's handler-side refusals state too, so one rule is never reported in two voices.
-///
-/// A refusal MIXING a pattern violation with another class keeps that wording whole as
-/// well: a message half in one voice and half in the other is worse than one consistent
-/// voice.
+/// RULE: a refusal holding one violation this layer states no finding ABOUT keeps the
+/// framework's own wording, whole — a message half in one voice and half in the other is
+/// worse than one consistent voice. Those are: a `@required` member the request left out
+/// (a JSON Schema states the missing properties as the SCHEMA spells them, which the
+/// refusal seam cannot build), and a MAP below its modelled entry minimum, which no
+/// sentence of that layer states.
 #[tokio::test]
-async fn a_violation_of_another_constraint_keeps_the_framework_wording() {
+async fn a_violation_this_layer_has_no_finding_for_keeps_the_framework_wording() {
     let router = emulator();
-    // One character past `EntityDescription`'s `@length` maximum of 500, and holding
-    // nothing the name pattern would also object to.
-    let too_long_description = "d".repeat(501);
 
     let cases = vec![
-        OtherClassCase {
-            label: "a name shorter than its modelled length minimum (also outside its pattern)",
-            method: "POST",
-            uri: "/v2/create-system",
-            body: Some(json!({"name": "a"})),
-        },
-        OtherClassCase {
-            label: "a description past its modelled length maximum",
-            method: "POST",
-            uri: "/v2/create-system",
-            body: Some(json!({"name": "a-well-formed-name", "description": too_long_description})),
-        },
         OtherClassCase {
             label: "a required member the request left out",
             method: "POST",
@@ -371,22 +356,16 @@ async fn a_violation_of_another_constraint_keeps_the_framework_wording() {
             body: Some(json!({"description": "no name at all"})),
         },
         OtherClassCase {
-            label: "maxResults below its modelled range",
-            method: "GET",
-            uri: "/v2/list-services?maxResults=0",
-            body: None,
+            label: "a second required member the request left out",
+            method: "POST",
+            uri: "/v2/create-assertion",
+            body: Some(json!({"serviceArn": WELL_FORMED_ARN})),
         },
         OtherClassCase {
-            label: "maxResults above its modelled range",
-            method: "GET",
-            uri: "/v2/list-services?maxResults=101",
-            body: None,
-        },
-        OtherClassCase {
-            label: "assessmentStatus outside its modelled value set",
-            method: "GET",
-            uri: "/v2/list-services?assessmentStatus=NOT_A_STATUS",
-            body: None,
+            label: "a map below its modelled entry minimum",
+            method: "POST",
+            uri: "/v2/create-system",
+            body: Some(json!({"name": "a-well-formed-name", "tags": {}})),
         },
     ];
 
@@ -410,6 +389,396 @@ async fn a_violation_of_another_constraint_keeps_the_framework_wording() {
             case.label
         );
     }
+}
+
+/// The finding for a string shorter than the `@length` minimum of the member it was sent
+/// for: the string, its length, and that minimum.
+fn too_short(value: &str, length: usize, min: i64) -> String {
+    format!("string \"{value}\" is too short (length: {length}, required minimum: {min})")
+}
+
+/// The finding for a string longer than that member's `@length` maximum.
+fn too_long(value: &str, length: usize, max: i64) -> String {
+    format!("string \"{value}\" is too long (length: {length}, maximum allowed: {max})")
+}
+
+/// The finding for a MAP carrying more entries than its `@length` maximum admits: the
+/// entry count the request carried and that maximum. A map is the request's own JSON
+/// OBJECT, so its ceiling is reported as a property count and no value is quoted.
+fn too_many_properties(found: usize, max: i64) -> String {
+    format!("object has too many properties (found {found} but schema requires at most {max})")
+}
+
+/// The finding for a number above the `@range` maximum of the member it was sent for.
+fn above_maximum(value: &str, max: &str) -> String {
+    format!("numeric instance is greater than the required maximum (maximum: {max}, found: {value})")
+}
+
+/// The finding for a number below that member's `@range` minimum.
+fn below_minimum(value: &str, min: &str) -> String {
+    format!("numeric instance is lower than the required minimum (minimum: {min}, found: {value})")
+}
+
+/// The finding for a value outside the set an enumerated type declares: the value, then
+/// every value the type admits, in the order the model declares them.
+fn not_in_enum(value: &str, permitted: &[&str]) -> String {
+    let quoted: Vec<String> = permitted
+        .iter()
+        .map(|admitted| format!("\"{admitted}\""))
+        .collect();
+    format!(
+        "instance value (\"{value}\") not found in enum (possible values: [{}])",
+        quoted.join(",")
+    )
+}
+
+/// The finding the validator states about ITSELF for a property whose declared type carries
+/// a `format` attribute it implements no check for.
+fn unsupported_format(attribute: &str) -> String {
+    format!("format attribute \"{attribute}\" not supported")
+}
+
+/// The finding for an instance validated against a CHOICE of schemas that matched other
+/// than exactly one of them.
+fn matched_schemas(matched: usize, alternatives: usize) -> String {
+    format!("instance failed to match exactly one schema (matched {matched} out of {alternatives})")
+}
+
+/// How many alternatives the service's published schema offers for `ResourceConfiguration`,
+/// as the recorded refusal of a `resourceConfiguration` that provided no field reports it —
+/// seven, where the model lists five members.
+const RESOURCE_CONFIGURATION_ALTERNATIVES: usize = 7;
+
+/// The values `AssessmentStatus` admits, in the order the model declares them.
+///
+/// SOURCE: `smithy_query(query="shape", shape="AssessmentStatus")`.
+const ASSESSMENT_STATUS_VALUES: [&str; 5] = [
+    "NOT_STARTED",
+    "PENDING",
+    "IN_PROGRESS",
+    "FAILED",
+    "SUCCESS",
+];
+
+/// One row of the report table: a request breaking one or more rules of its schema, and the
+/// findings the report is to list, in order.
+struct ReportCase {
+    label: &'static str,
+    method: &'static str,
+    uri: &'static str,
+    body: Option<Value>,
+    findings: Vec<String>,
+}
+
+/// Drive every row of a report table and assert the whole report.
+async fn assert_reports(router: &MultiServiceRouter, cases: Vec<ReportCase>) {
+    for case in cases {
+        let (status, body) = call(router, case.method, case.uri, case.body.clone()).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected 400, got {status} and {body:?}",
+            case.label
+        );
+        let code = error_code(&body);
+        assert_eq!(
+            code, "ValidationException",
+            "case {:?}: expected ValidationException, got {code:?}",
+            case.label
+        );
+        let expected = report(&case.findings);
+        let actual = message(&body);
+        assert_eq!(
+            actual, expected,
+            "case {:?}: expected {expected:?}, got {actual:?}",
+            case.label
+        );
+    }
+}
+
+/// RULE: a string outside the `@length` bounds of the member it was sent for is reported as
+/// that layer's finding for its class — the string, the length it had and the bound it
+/// broke — and a value breaking its member's `@length` AND its `@pattern` is reported as
+/// both findings inside the one bracketed list. A MAP outside its own `@length` is the
+/// request's JSON object, so its ceiling is reported as a property count.
+///
+/// The rows span the bound that was broken (minimum, maximum), the member (a body member, a
+/// query parameter, a map), and whether the value broke one rule or two.
+#[tokio::test]
+async fn a_string_outside_its_modelled_length_is_reported_as_the_schema_finding() {
+    let router = emulator();
+    // `TagMap` is `len 1..50` (`smithy_query(query="shape", shape="TagMap")`), so one entry
+    // past its maximum is a map outside its length.
+    let too_many_tags: Value = (0..51)
+        .map(|index| (format!("key-{index}"), Value::from("v")))
+        .collect::<serde_json::Map<String, Value>>()
+        .into();
+
+    let cases = vec![
+        ReportCase {
+            // `AssertionText` is `len 1..1000` and carries no `@pattern`, so an empty text
+            // breaks exactly one rule.
+            label: "CreateAssertion text at zero length",
+            method: "POST",
+            uri: "/v2/create-assertion",
+            body: Some(json!({"serviceArn": WELL_FORMED_ARN, "text": ""})),
+            findings: vec![too_short("", 0, 1)],
+        },
+        ReportCase {
+            label: "CreateSystem name one character below EntityName's minimum",
+            method: "POST",
+            uri: "/v2/create-system",
+            body: Some(json!({"name": "a"})),
+            findings: vec![too_short("a", 1, 2), entry(ENTITY_NAME_PATTERN, "a")],
+        },
+        ReportCase {
+            label: "ListServices accountId one digit past AccountId's maximum",
+            method: "GET",
+            uri: "/v2/list-services?accountId=0123456789012",
+            body: None,
+            findings: vec![
+                too_long("0123456789012", 13, 12),
+                entry(ACCOUNT_ID_PATTERN, "0123456789012"),
+            ],
+        },
+        ReportCase {
+            label: "ListServices ouId below OuId's minimum",
+            method: "GET",
+            uri: "/v2/list-services?ouId=ou-abcd",
+            body: None,
+            findings: vec![too_short("ou-abcd", 7, 16), entry(OU_ID_PATTERN, "ou-abcd")],
+        },
+        ReportCase {
+            label: "CreateSystem tags one entry past TagMap's maximum",
+            method: "POST",
+            uri: "/v2/create-system",
+            body: Some(json!({"name": "a-well-formed-name", "tags": too_many_tags})),
+            findings: vec![too_many_properties(51, 50)],
+        },
+    ];
+
+    assert_reports(&router, cases).await;
+}
+
+/// RULE: a number outside the `@range` of the member it was sent for is reported as the
+/// finding for its class — the bound the model declares and the value the request carried —
+/// beside, for a member of the request BODY, the finding the validator states about the
+/// `format` attribute that member's declared type carries and it implements no check for: a
+/// fractional member's ahead of the value's finding, an integral member's after it.
+///
+/// The rows span the bound (minimum, maximum), the member's declared type (a `double` and
+/// an `integer`, which owe different attributes in different positions) and where the
+/// request carries it (a body property, which owes a `format` finding, and a query
+/// parameter, which is no property of the body schema and owes none).
+#[tokio::test]
+async fn a_number_outside_its_modelled_range_is_reported_as_the_schema_finding() {
+    let router = emulator();
+
+    let cases = vec![
+        ReportCase {
+            label: "CreatePolicy availabilitySlo.target above AvailabilitySlo's maximum",
+            method: "POST",
+            uri: "/v2/create-policy",
+            body: Some(json!({"name": "slo-too-high", "availabilitySlo": {"target": 100.5}})),
+            findings: vec![unsupported_format("double"), above_maximum("100.5", "100")],
+        },
+        ReportCase {
+            label: "CreatePolicy availabilitySlo.target below AvailabilitySlo's minimum",
+            method: "POST",
+            uri: "/v2/create-policy",
+            body: Some(json!({"name": "slo-too-low", "availabilitySlo": {"target": -0.5}})),
+            findings: vec![unsupported_format("double"), below_minimum("-0.5", "0")],
+        },
+        ReportCase {
+            label: "CreatePolicy multiAz.rtoInMinutes below its minimum",
+            method: "POST",
+            uri: "/v2/create-policy",
+            body: Some(json!({"name": "rto-negative", "multiAz": {"rtoInMinutes": -1}})),
+            findings: vec![below_minimum("-1", "0"), unsupported_format("int32")],
+        },
+        ReportCase {
+            label: "CreatePolicy multiRegion.rpoInMinutes below its minimum",
+            method: "POST",
+            uri: "/v2/create-policy",
+            body: Some(json!({"name": "rpo-negative", "multiRegion": {"rpoInMinutes": -5}})),
+            findings: vec![below_minimum("-5", "0"), unsupported_format("int32")],
+        },
+        ReportCase {
+            label: "CreatePolicy dataRecovery.timeBetweenBackupsInMinutes below its minimum",
+            method: "POST",
+            uri: "/v2/create-policy",
+            body: Some(json!({
+                "name": "backups-negative",
+                "dataRecovery": {"timeBetweenBackupsInMinutes": -1},
+            })),
+            findings: vec![below_minimum("-1", "0"), unsupported_format("int32")],
+        },
+        ReportCase {
+            label: "ListServices maxResults below MaxResults' minimum",
+            method: "GET",
+            uri: "/v2/list-services?maxResults=0",
+            body: None,
+            findings: vec![below_minimum("0", "1")],
+        },
+        ReportCase {
+            label: "ListServices maxResults above MaxResults' maximum",
+            method: "GET",
+            uri: "/v2/list-services?maxResults=101",
+            body: None,
+            findings: vec![above_maximum("101", "100")],
+        },
+    ];
+
+    assert_reports(&router, cases).await;
+
+    // Each published bound is INSIDE the range, so a value AT it is served rather than
+    // reported: `AvailabilitySlo$target` is `@range` 0..100, the minute targets are
+    // `@range` 0.., and `MaxResults` is 1..100.
+    for (case, method, uri, body) in [
+        (
+            "the availability SLO target at its minimum",
+            "POST",
+            "/v2/create-policy",
+            Some(json!({"name": "slo-at-minimum", "availabilitySlo": {"target": 0}})),
+        ),
+        (
+            "the availability SLO target at its maximum",
+            "POST",
+            "/v2/create-policy",
+            Some(json!({"name": "slo-at-maximum", "availabilitySlo": {"target": 100}})),
+        ),
+        (
+            "the minute targets at their minimum",
+            "POST",
+            "/v2/create-policy",
+            Some(json!({
+                "name": "minutes-at-minimum",
+                "multiAz": {"rtoInMinutes": 0, "rpoInMinutes": 0},
+                "dataRecovery": {"timeBetweenBackupsInMinutes": 0},
+            })),
+        ),
+        (
+            "maxResults at its minimum",
+            "GET",
+            "/v2/list-services?maxResults=1",
+            None,
+        ),
+        (
+            "maxResults at its maximum",
+            "GET",
+            "/v2/list-services?maxResults=100",
+            None,
+        ),
+    ] {
+        let (status, body) = call(&router, method, uri, body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a value at a published bound must be served, got {status} and \
+             {body:?}"
+        );
+    }
+}
+
+/// RULE: a value outside the set an enumerated type declares is reported as that layer's
+/// finding for its class: the value the request carried, then every value the type admits.
+#[tokio::test]
+async fn a_value_outside_an_enumerated_set_is_reported_as_the_schema_finding() {
+    let router = emulator();
+    // Rows differ along the form of the rejected value: a value of the right shape that is
+    // not in the set, one differing only in case from a value that is, and the empty
+    // string.
+    let cases = vec![
+        ReportCase {
+            label: "ListServices assessmentStatus outside its modelled value set",
+            method: "GET",
+            uri: "/v2/list-services?assessmentStatus=NOT_A_STATUS",
+            body: None,
+            findings: vec![not_in_enum("NOT_A_STATUS", &ASSESSMENT_STATUS_VALUES)],
+        },
+        ReportCase {
+            label: "ListServices assessmentStatus in the wrong case",
+            method: "GET",
+            uri: "/v2/list-services?assessmentStatus=success",
+            body: None,
+            findings: vec![not_in_enum("success", &ASSESSMENT_STATUS_VALUES)],
+        },
+        ReportCase {
+            label: "ListServices assessmentStatus empty",
+            method: "GET",
+            uri: "/v2/list-services?assessmentStatus=",
+            body: None,
+            findings: vec![not_in_enum("", &ASSESSMENT_STATUS_VALUES)],
+        },
+    ];
+
+    assert_reports(&router, cases).await;
+}
+
+/// RULE: a union body that provides other than exactly one of the alternatives its schema
+/// publishes is reported as the CHOICE's own finding — how many alternatives the submitted
+/// object matched, out of how many the schema offers — and never as an internal shape name.
+///
+/// The rows span how many alternatives the body matched: none (an empty object, and one
+/// carrying a field the union does not declare) and two.
+#[tokio::test]
+async fn a_union_outside_exactly_one_alternative_is_reported_as_the_choice_finding() {
+    let router = emulator();
+
+    let cases = vec![
+        ReportCase {
+            label: "CreateInputSource resourceConfiguration with no field",
+            method: "POST",
+            uri: "/v2/create-input-source",
+            body: Some(json!({
+                "serviceArn": WELL_FORMED_ARN,
+                "resourceConfiguration": {},
+            })),
+            findings: vec![matched_schemas(0, RESOURCE_CONFIGURATION_ALTERNATIVES)],
+        },
+        ReportCase {
+            label: "CreateInputSource resourceConfiguration with an undeclared field",
+            method: "POST",
+            uri: "/v2/create-input-source",
+            body: Some(json!({
+                "serviceArn": WELL_FORMED_ARN,
+                "resourceConfiguration": {"notAnAlternative": "x"},
+            })),
+            findings: vec![matched_schemas(0, RESOURCE_CONFIGURATION_ALTERNATIVES)],
+        },
+        ReportCase {
+            label: "CreateInputSource resourceConfiguration with two fields",
+            method: "POST",
+            uri: "/v2/create-input-source",
+            body: Some(json!({
+                "serviceArn": WELL_FORMED_ARN,
+                "resourceConfiguration": {
+                    "cfnStackArn": WELL_FORMED_ARN,
+                    "designFileS3Url": "s3://bucket/design.json",
+                },
+            })),
+            findings: vec![matched_schemas(2, RESOURCE_CONFIGURATION_ALTERNATIVES)],
+        },
+    ];
+
+    assert_reports(&router, cases).await;
+
+    // A body providing EXACTLY one alternative satisfies the choice and reaches the
+    // handler, which refuses the `serviceArn` nothing is stored under — so the finding
+    // above reports the choice rather than refusing every configuration.
+    let (status, body) = call(
+        &router,
+        "POST",
+        "/v2/create-input-source",
+        Some(json!({
+            "serviceArn": WELL_FORMED_ARN,
+            "resourceConfiguration": {"cfnStackArn": WELL_FORMED_ARN},
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 404,
+        "case \"one alternative, for a service that is not stored\": expected the handler's \
+         404, got {status} and {body:?}"
+    );
 }
 
 /// RULE: wording a refusal changes nothing about the store — a create refused for a value

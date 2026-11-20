@@ -49,6 +49,8 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+mod schema_findings;
+
 /// The wire error code this service refuses an invalid request with — the client-input
 /// error its model declares for every one of its operations (`ValidationException`,
 /// `@error("client")`, `@httpError(400)`), which is also the code the framework's own
@@ -253,15 +255,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // reword it.
         //
         // This service does not state a constraint violation in the common AWS framework
-        // form that counts the errors and names the member: a value the model's own
-        // regular expression for the member it was sent for does not admit is reported as
-        // a bracketed constraint report, one entry per violated member, naming the
-        // expression and the value — whichever operation and whichever member carried it.
-        // The report is the shared one (`service_common::validation_message`), which the V1
-        // endpoint of this same service states too, so the two cannot drift. It answers
-        // `None` for a refusal holding a violation of any OTHER modelled constraint, so
-        // those keep the framework's wording rather than reading half in one voice and
-        // half in the other.
+        // form that counts the errors and names the member: it validates a request against
+        // the operation's modelled input as a SCHEMA and reports what that validation found
+        // as the validator's own bracketed report, one finding per rule the request broke,
+        // worded for the CLASS of rule — whichever operation and whichever member carried
+        // the value. `schema_findings` owns that report, over the shared sentences
+        // (`service_common::validation_message`) every service stating this layer's findings
+        // builds them from, so the two cannot drift. It answers `None` for a refusal holding
+        // a violation that layer states no finding for, so such a refusal keeps the
+        // framework's wording whole rather than reading half in one voice and half in the
+        // other.
         //
         // The CODE is restated with the message, because a message without its matching
         // code is worse than leaving both alone.
@@ -269,7 +272,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // An authentication refusal is the framework's 403 to word, not ours.
             return None;
         };
-        let message = service_common::validation_message::pattern_constraint_report(violations)?;
+        let message = schema_findings::constraint_report(violations)?;
         Some(Refused {
             code: VALIDATION_EXCEPTION_CODE.to_string(),
             message,

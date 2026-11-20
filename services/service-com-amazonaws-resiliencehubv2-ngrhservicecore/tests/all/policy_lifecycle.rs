@@ -9,9 +9,10 @@
 //! the Region the request is signed for, `associatedServiceCount` counted from the
 //! services that reference the ARN, and `createdAt` / `updatedAt` from the create
 //! instant — so a later `GetPolicy` of that ARN answers the same projection, a replayed
-//! `clientToken` answers the policy the first call created, a name already taken is
-//! refused `ConflictException`, and an ARN naming no stored policy is refused
-//! `ResourceNotFoundException`.
+//! `clientToken` answers the policy the first call created while one offered for a
+//! DIFFERENT create is refused `ConflictException` and writes nothing, a name already
+//! taken is refused `ConflictException` naming the type and the requested name alone, and
+//! an ARN naming no stored policy is refused `ResourceNotFoundException`.
 //!
 //! Every suite drives the real wire path (`MultiServiceRouter::dispatch`), so the
 //! modelled constraints, the restJson1 (de)serializers and the HTTP status codes are
@@ -529,17 +530,9 @@ async fn a_replayed_client_token_answers_the_first_policy() {
         let (status, body) = create_policy(&router, first_body.clone()).await;
         let first = policy_of(&case, status, &body);
 
-        // The same token with a DIFFERENT payload is still a replay of the first call:
-        // it answers the stored policy and creates no second one.
-        let (replay_status, replay_body) = create_policy(
-            &router,
-            json!({
-                "name": format!("Replayed-{index}-other"),
-                "multiAz": {"rtoInMinutes": 99},
-                "clientToken": token,
-            }),
-        )
-        .await;
+        // The SAME call again under the same token is a retry: it answers the stored
+        // policy and creates no second one.
+        let (replay_status, replay_body) = create_policy(&router, first_body.clone()).await;
         let replayed = policy_of(&case, replay_status, &replay_body);
         assert_eq!(
             replayed, first,
@@ -562,6 +555,118 @@ async fn a_replayed_client_token_answers_the_first_policy() {
             policy_arn_of(&case, &other),
             policy_arn_of(&case, &first),
             "case {case:?}: a fresh clientToken must create a new policy"
+        );
+    }
+}
+
+/// The message AWS words a reused `clientToken` refusal with: fixed text around the token
+/// the REQUEST supplied, and nothing else.
+fn token_conflict_message(client_token: &str) -> String {
+    format!(
+        "Got two different request with the same token: {client_token}, please use a \
+         different token"
+    )
+}
+
+/// The message AWS words a taken-name refusal with: the resource type, fixed text, and the
+/// name the REQUEST supplied — and no ARN.
+fn name_conflict_message(name: &str) -> String {
+    format!("{POLICY_RESOURCE_TYPE} with name already exists: {name}")
+}
+
+/// RULE: an `@idempotencyToken` stands for ONE create, so a token offered for creation
+/// parameters other than the ones it was accepted with is refused 409
+/// `ConflictException` — and the refused call writes nothing, so the policy the token
+/// first created is still the one a later read and a later true retry answer.
+#[tokio::test]
+async fn a_client_token_offered_for_different_parameters_is_refused() {
+    let router = emulator();
+    // Rows differ along WHICH member of the create differs from the accepted request:
+    // the name, a nested target value, a target block the first call did not set, the
+    // sharing flag, the description, and the tags. Each is one parameter of the same
+    // create, so each is a different request wearing the same token.
+    let accepted = json!({
+        "name": "Token-Owner",
+        "description": "the accepted request",
+        "availabilitySlo": {"target": 99.9},
+        "multiAz": {"rtoInMinutes": 10},
+        "sharingEnabled": false,
+        "tags": {"team": "payments"},
+    });
+    let differing: Vec<(&str, Value)> = vec![
+        ("another name", json!({"name": "Token-Thief"})),
+        (
+            "another availability SLO target",
+            json!({"availabilitySlo": {"target": 99.95}}),
+        ),
+        (
+            "another multi-AZ RTO",
+            json!({"multiAz": {"rtoInMinutes": 11}}),
+        ),
+        (
+            "a target block the accepted request did not set",
+            json!({"dataRecovery": {"timeBetweenBackupsInMinutes": 15}}),
+        ),
+        ("the sharing flag flipped", json!({"sharingEnabled": true})),
+        ("the description dropped", json!({"description": null})),
+        ("another tag value", json!({"tags": {"team": "search"}})),
+    ];
+
+    for (index, (case, change)) in differing.into_iter().enumerate() {
+        let token = format!("tok-{index}");
+        let mut first_body = accepted.clone();
+        // Each row's accepted create takes a name of its own: a name is unique within the
+        // account, so one name across the rows would meet the duplicate-name conflict
+        // instead of the token one under test.
+        first_body["name"] = json!(format!("Token-Owner-{index}"));
+        first_body["clientToken"] = json!(token);
+        let (status, body) = create_policy(&router, first_body.clone()).await;
+        let first = policy_of(case, status, &body);
+        let policy_arn = policy_arn_of(case, &first);
+
+        let mut second_body = first_body.clone();
+        for (member, value) in change.as_object().expect("each change is an object") {
+            if value.is_null() {
+                second_body
+                    .as_object_mut()
+                    .expect("the body is an object")
+                    .remove(member);
+            } else {
+                second_body[member] = value.clone();
+            }
+        }
+        let (conflict_status, conflict) = create_policy(&router, second_body).await;
+        assert_eq!(
+            conflict_status, 409,
+            "case {case:?}: expected HTTP 409 for a token offered for another create, got \
+             {conflict_status} {conflict:?}"
+        );
+        assert_eq!(
+            error_code(&conflict),
+            "ConflictException",
+            "case {case:?}: expected ConflictException, got {conflict:?}"
+        );
+        assert_eq!(
+            conflict["message"].as_str(),
+            Some(token_conflict_message(&token).as_str()),
+            "case {case:?}: expected {:?}, got {:?}",
+            token_conflict_message(&token),
+            conflict["message"]
+        );
+
+        // The refusal wrote nothing: the policy the token created is unchanged, and the
+        // accepted request still replays to it.
+        let (read_status, read_body) = get_policy(&router, &policy_arn).await;
+        let read = policy_of(case, read_status, &read_body);
+        assert_eq!(
+            read, first,
+            "case {case:?}: the refused call must leave the stored policy untouched"
+        );
+        let (retry_status, retry_body) = create_policy(&router, first_body).await;
+        let retried = policy_of(case, retry_status, &retry_body);
+        assert_eq!(
+            retried, first,
+            "case {case:?}: a true retry must still answer the policy the token created"
         );
     }
 }
@@ -599,10 +704,16 @@ async fn a_name_already_taken_is_refused_as_a_conflict() {
             "case {name:?}: expected ConflictException, got {conflict:?}"
         );
         let message = conflict["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message,
+            name_conflict_message(&name),
+            "case {name:?}: expected {:?}, got {message:?}",
+            name_conflict_message(&name)
+        );
         assert!(
-            message.contains(&name) && message.contains(&policy_arn),
-            "case {name:?}: expected the refusal to name the policy and the ARN already \
-             holding the name, got {message:?}"
+            !message.contains(&policy_arn),
+            "case {name:?}: the refusal must not disclose the existing policy's ARN, got \
+             {message:?}"
         );
     }
 }

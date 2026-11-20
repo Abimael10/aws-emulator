@@ -8,11 +8,16 @@
 //! `ConflictException`, and a `clientToken` index for idempotent replay) — the same
 //! shape the `Service` side of the store uses.
 //!
+//! The `clientToken` index keeps a [`PolicyIdempotencyRecord`]: the creation parameters the
+//! token was first accepted with, beside the ARN it created, because `CreatePolicy` replays
+//! a token only for the request it already served and refuses the same token carrying
+//! different parameters (see [`PolicyCreateRequest`]).
+//!
 //! Every `Policy` body this crate returns is projected from a record here through
 //! [`PolicyRecord::to_policy`], so `CreatePolicy` and `GetPolicy` cannot drift from one
 //! another or from what was stored.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -39,8 +44,8 @@ pub const POLICY_RESOURCE: &str = "policy";
 /// `CreatePolicy` refuses a create that would pass it with the
 /// `ServiceQuotaExceededException` (HTTP 402) its model declares. The two secondary
 /// indexes are bounded by the same ceiling: `policy_names` holds exactly one entry per
-/// stored policy, and `policy_idempotency` at most one (a replayed token returns the
-/// stored policy instead of inserting a second one).
+/// stored policy, and `policy_idempotency` at most one (a token already in it either
+/// replays the stored policy or is refused, never inserting a second entry).
 pub const MAX_POLICIES: usize = super::MAX_SERVICES;
 
 /// `PolicyValueSource`'s value for a value that came from a policy in the reading
@@ -164,6 +169,69 @@ impl PolicyRecord {
                 .map(minutes),
         }
     }
+}
+
+/// The creation parameters one `CreatePolicy` call carried, as a `clientToken` remembers
+/// them.
+///
+/// Everything the request says about the policy to create, and nothing else: the token
+/// itself is not part of it, and neither is anything the service derives (the ARN, the
+/// timestamps, the associated-service count). Two requests are the SAME create when these
+/// compare equal, which is what decides whether a repeated token replays the first call or
+/// is refused — the same reading the `System` side of this store takes of its own token
+/// index ([`super::SystemCreateRequest`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyCreateRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub availability_slo: Option<AvailabilitySlo>,
+    pub multi_az: Option<MultiAzTargets>,
+    pub multi_region: Option<MultiRegionTargets>,
+    pub data_recovery: Option<DataRecoveryTargets>,
+    /// Compared as the request SET it, not as it was stored: a request that omits the flag
+    /// asks for the service's default, which is not the same request as one that states a
+    /// value.
+    pub sharing_enabled: Option<bool>,
+    pub kms_key_id: Option<String>,
+    /// Ordered, so two requests carrying the same tags compare equal whatever order the map
+    /// arrived in.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl PolicyCreateRequest {
+    /// The creation parameters of a `CreatePolicy` request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        description: Option<String>,
+        availability_slo: Option<AvailabilitySlo>,
+        multi_az: Option<MultiAzTargets>,
+        multi_region: Option<MultiRegionTargets>,
+        data_recovery: Option<DataRecoveryTargets>,
+        sharing_enabled: Option<bool>,
+        kms_key_id: Option<String>,
+        tags: Option<HashMap<String, String>>,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            availability_slo,
+            multi_az,
+            multi_region,
+            data_recovery,
+            sharing_enabled,
+            kms_key_id,
+            tags: tags.unwrap_or_default().into_iter().collect(),
+        }
+    }
+}
+
+/// What a consumed `CreatePolicy` `clientToken` remembers: which policy it created, and the
+/// request it created it for.
+#[derive(Debug, Clone)]
+pub struct PolicyIdempotencyRecord {
+    pub policy_arn: String,
+    pub request: PolicyCreateRequest,
 }
 
 impl ComAmazonawsResiliencehubv2NgrhservicecoreState {

@@ -186,14 +186,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A function's name identifies it within its service: a second function under a
-        // name already taken there is a conflict, not a second function.
-        if let Some(existing) = service.service_function_named(&input.name) {
+        // name already taken there is a conflict, not a second function. The refusal names
+        // the resource type and the name the REQUEST supplied, and nothing else (see
+        // [`crate::state::name_already_exists_message`]).
+        if service.service_function_named(&input.name).is_some() {
             return Err(CreateServiceFunctionErrorModeled::ConflictException(
                 ConflictException {
-                    message: format!(
-                        "A service function named {} already exists in service \
-                         {service_arn}: {}",
-                        input.name, existing.service_function_id
+                    message: crate::state::name_already_exists_message(
+                        crate::state::SERVICE_FUNCTION_RESOURCE_TYPE,
+                        &input.name,
                     ),
                 },
             )
@@ -204,9 +205,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service's record by one entry carrying caller-supplied payload, so a caller that
         // repeats this call would otherwise grow the process's memory without limit. At
         // the ceiling the create is refused with the quota error this operation models.
-        // The idempotency index is bounded by the same ceiling — a replayed token returns
-        // above instead of inserting.
-        if service.service_functions.len() >= crate::state::MAX_SERVICE_FUNCTIONS_PER_SERVICE {
+        // The idempotency index is capped by the SAME ceiling HERE rather than assumed to
+        // follow the functions: a replayed token returns above instead of inserting, and
+        // `DeleteServiceFunction` drops the tokens that named the function it removed, so
+        // the index cannot outgrow the functions — and if it ever did, the create is
+        // refused rather than growing it further. The same cap the input-source side of
+        // this store applies to its own token index.
+        if service.service_functions.len() >= crate::state::MAX_SERVICE_FUNCTIONS_PER_SERVICE
+            || service.service_function_idempotency.len()
+                >= crate::state::MAX_SERVICE_FUNCTIONS_PER_SERVICE
+        {
             return Err(
                 CreateServiceFunctionErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {

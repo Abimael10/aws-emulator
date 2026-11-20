@@ -237,12 +237,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A service name is unique within the account: a second service under a name
-        // already taken is a conflict, not a second service.
-        if let Some(existing) = store.service_names.get(&input.name) {
+        // already taken is a conflict, not a second service. The refusal names the
+        // resource type and the name the REQUEST supplied, and nothing else — the
+        // existing resource's ARN is no part of it (see
+        // [`crate::state::name_already_exists_message`]).
+        if store.service_names.contains_key(&input.name) {
             return Err(CreateServiceErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "A service named {} already exists in this account: {existing}",
-                    input.name
+                message: crate::state::name_already_exists_message(
+                    crate::state::SERVICE_RESOURCE_TYPE,
+                    &input.name,
                 ),
             })
             .into());

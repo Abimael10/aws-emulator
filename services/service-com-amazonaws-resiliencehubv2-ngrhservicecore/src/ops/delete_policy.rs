@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.policy_names.remove(&record.name);
         store
             .policy_idempotency
-            .retain(|_, arn| arn != &record.policy_arn);
+            .retain(|_, consumed| consumed.policy_arn != record.policy_arn);
 
         Ok(DeletePolicyOutput {
             policy_arn: record.policy_arn,

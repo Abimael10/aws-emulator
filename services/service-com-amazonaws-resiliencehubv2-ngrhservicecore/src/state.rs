@@ -92,8 +92,8 @@ pub use user_journeys::{
 };
 pub(crate) use tagging::tag_map_view;
 pub use policies::{
-    mint_policy_arn, PolicyRecord, MAX_POLICIES, POLICY_RESOURCE, POLICY_VALUE_SOURCE_CROSS_ACCOUNT,
-    POLICY_VALUE_SOURCE_SELF,
+    mint_policy_arn, PolicyCreateRequest, PolicyIdempotencyRecord, PolicyRecord, MAX_POLICIES,
+    POLICY_RESOURCE, POLICY_VALUE_SOURCE_CROSS_ACCOUNT, POLICY_VALUE_SOURCE_SELF,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -515,10 +515,10 @@ pub struct ComAmazonawsResiliencehubv2NgrhservicecoreState {
     /// `name` -> `policyArn`, so `CreatePolicy` can refuse a duplicate name with
     /// `ConflictException` without scanning every record.
     pub policy_names: BTreeMap<String, String>,
-    /// `clientToken` -> `policyArn`, so a replayed `CreatePolicy`
-    /// `@idempotencyToken` returns the policy the first call created instead of
-    /// creating a second one.
-    pub policy_idempotency: BTreeMap<String, String>,
+    /// `clientToken` -> what that token created, so a repeat of the `CreatePolicy` call it
+    /// was first used for answers the policy that call created, and the same token carrying
+    /// DIFFERENT creation parameters is refused rather than served.
+    pub policy_idempotency: BTreeMap<String, PolicyIdempotencyRecord>,
     /// Every created system, keyed by its ARN. See [`systems`].
     pub systems: BTreeMap<String, SystemRecord>,
     /// `name` -> `systemArn`, so `CreateSystem` can refuse a duplicate name with

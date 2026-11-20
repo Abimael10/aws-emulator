@@ -432,7 +432,9 @@ async fn replaying_a_client_token_returns_the_first_service() {
 }
 
 /// RULE: a service name is unique per account — a second create under a taken name is a
-/// 409 `ConflictException`, whatever the rest of the request looks like.
+/// 409 `ConflictException` whose message names the resource type and the name the REQUEST
+/// supplied, and nothing else (no ARN of the service already holding it), whatever the rest
+/// of the request looks like.
 #[tokio::test]
 async fn a_duplicate_name_conflicts() {
     let router = emulator();
@@ -440,6 +442,10 @@ async fn a_duplicate_name_conflicts() {
     for name in cases {
         let (status, first) = create(&router, minimal(name)).await;
         assert_eq!(status, 200, "case {name}: first create got {first:?}");
+        let service_arn = first["service"]["serviceArn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
 
         // Same name, different everything else.
         let mut second = minimal(name);
@@ -451,6 +457,17 @@ async fn a_duplicate_name_conflicts() {
             error_code(&body),
             "ConflictException",
             "case {name}: expected ConflictException, got {body:?}"
+        );
+        let expected = format!("Service with name already exists: {name}");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message, expected,
+            "case {name}: expected {expected:?}, got {message:?}"
+        );
+        assert!(
+            !service_arn.is_empty() && !message.contains(&service_arn),
+            "case {name}: the refusal must not disclose the existing service's ARN, got \
+             {message:?}"
         );
     }
 }

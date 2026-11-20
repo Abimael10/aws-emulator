@@ -26,7 +26,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_resiliencehubv2_ngrhservicecore::state::{
-    MAX_RESULTS_MAX, MAX_RESULTS_MIN, SERVICE_FUNCTION_SOURCE_USER,
+    MAX_RESULTS_MAX, MAX_RESULTS_MIN, MAX_SERVICE_FUNCTIONS_PER_SERVICE,
+    SERVICE_FUNCTION_SOURCE_USER,
 };
 use service_com_amazonaws_resiliencehubv2_ngrhservicecore::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -37,6 +38,7 @@ const CREATE_SERVICE_FUNCTION: &str = "/v2/create-service-function";
 const CREATE_SERVICE_FUNCTION_RESOURCES: &str = "/v2/create-service-function-resources";
 const CREATE_INPUT_SOURCE: &str = "/v2/create-input-source";
 const DELETE_SERVICE: &str = "/v2/delete-service";
+const DELETE_SERVICE_FUNCTION: &str = "/v2/delete-function";
 const LIST_SERVICE_FUNCTIONS: &str = "/v2/list-functions";
 
 /// A SigV4 `Authorization` header whose credential scope names this service's signing
@@ -524,6 +526,15 @@ async fn a_function_name_is_taken_only_within_its_own_service() {
                 "ConflictException",
                 "case {name:?}/{repeat}: expected ConflictException, got {refused:?}"
             );
+            // The refusal names the resource type and the name the REQUEST supplied, and
+            // nothing else — neither the parent service's ARN nor the id of the function
+            // already holding the name.
+            let expected = format!("ServiceFunction with name already exists: {name}");
+            let message = refused["message"].as_str().unwrap_or_default();
+            assert_eq!(
+                message, expected,
+                "case {name:?}/{repeat}: expected {expected:?}, got {message:?}"
+            );
         }
 
         // The same name in ANOTHER service is a different function: the name is scoped to
@@ -608,6 +619,61 @@ async fn a_replayed_client_token_returns_the_function_the_first_call_created() {
         functions.len(),
         tokens.len(),
         "a replay must not store a second function, got {functions:?}"
+    );
+}
+
+/// RULE: the `clientToken` index of a service is bounded by the same ceiling as the
+/// functions themselves — a delete takes the tokens that named the function it removed with
+/// it — so repeating create-then-delete under a FRESH token each time never fills the store
+/// the ceiling protects, however many times it is repeated.
+#[tokio::test]
+async fn a_create_delete_cycle_under_fresh_tokens_never_fills_the_store() {
+    let router = emulator();
+    let service_arn = create_service(&router, "Cycled").await;
+
+    // One more cycle than the per-service ceiling: if a consumed token outlived the
+    // function it created, the index would stand at the ceiling by now and this create
+    // would be refused `ServiceQuotaExceededException` instead of served.
+    for cycle in 0..=MAX_SERVICE_FUNCTIONS_PER_SERVICE {
+        let (status, created) = create_function(
+            &router,
+            json!({
+                "serviceArn": service_arn,
+                "name": "Cycled-Function",
+                "criticality": CRITICALITY_VALUES[cycle % CRITICALITY_VALUES.len()],
+                "clientToken": format!("cycle-{cycle}"),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case cycle {cycle}: expected the create to be served, got {status} {created:?}"
+        );
+        let service_function_id = created["serviceFunction"]["serviceFunctionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case cycle {cycle}: no serviceFunctionId in {created:?}"))
+            .to_string();
+        let (status, deleted) = call(
+            &router,
+            "POST",
+            DELETE_SERVICE_FUNCTION,
+            Some(json!({
+                "serviceArn": service_arn,
+                "serviceFunctionId": service_function_id,
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case cycle {cycle}: expected the delete to be served, got {status} {deleted:?}"
+        );
+    }
+
+    let (status, body) = list_functions(&router, &format!("serviceArn={service_arn}")).await;
+    let functions = listed("after the cycles", status, &body);
+    assert!(
+        functions.is_empty(),
+        "case after the cycles: expected no function left, got {functions:?}"
     );
 }
 

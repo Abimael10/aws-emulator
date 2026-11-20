@@ -52,7 +52,9 @@
 //! [`pattern_mismatch`],
 //! [`string_too_long`], [`string_too_short`], [`numeric_above_maximum`],
 //! [`numeric_below_minimum`] and [`enum_value_not_found`] are the SENTENCES that layer states
-//! for the constraint classes it reports on a member it read from the request BODY, and
+//! for the constraint classes it reports on a member it read from the request BODY,
+//! [`instance_matched_not_exactly_one_schema`] the one it states for a member validated
+//! against a CHOICE of schemas that matches other than exactly one of them, and
 //! [`format_attribute_not_supported`] the one it states about ITSELF for a `format`
 //! attribute it implements no check for. A service whose front door words
 //! those findings itself — because it has to tell a body member from one bound to the URI,
@@ -562,6 +564,28 @@ pub fn array_too_long(found: usize, max: i64) -> String {
 #[must_use]
 pub fn array_contains_duplicates() -> String {
     "array must not contain duplicate elements".to_string()
+}
+
+/// The finding that layer states for an instance validated against a CHOICE of schemas —
+/// the alternatives of a union, or the forms one document member admits — that does not
+/// match exactly one of them: how many alternatives the instance DID match, and how many
+/// the schema offers.
+///
+/// A choice states its OWN outcome and never the sub-constraint one alternative failed, so
+/// the finding carries neither the value the instance held nor the members an alternative
+/// admits. `alternatives` is the count the service's PUBLISHED schema declares for that
+/// choice, which the member list of the model need not agree with (a schema may publish one
+/// alternative per FORM a member admits), so it is passed in rather than counted here.
+///
+/// `services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921/src/state.rs`
+/// carries its own inlined copy of this sentence, for the policy document it validates,
+/// written before this module had it; it is to be migrated onto this one rather than copied
+/// again.
+#[must_use]
+pub fn instance_matched_not_exactly_one_schema(matched: usize, alternatives: usize) -> String {
+    format!(
+        "instance failed to match exactly one schema (matched {matched} out of {alternatives})"
+    )
 }
 
 /// The finding that layer states about ITSELF for a schema declaring a `format` attribute

@@ -19,7 +19,29 @@ pub struct CreateInputSourceInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(union_for = "com.amazonaws.resiliencehubv2#ResourceConfiguration")]
+/// The resource configuration an input source discovers from: "Resource configuration for an
+/// input source. Provide exactly one field." (`ResourceConfiguration`'s own documentation).
+///
+/// Written out rather than carrying `#[smithy_macros::smithy(union_for = ...)]` for ONE
+/// reason: the wording of the refusal a body that provides other than exactly one field
+/// gets. The generated codec refuses a body that sets NONE with `union '<Shape>' had no
+/// member set` — an internal Smithy shape name, in wording no validator of this service
+/// states — and silently takes the LAST of two members a body sets, answering 200 for a
+/// configuration the caller did not send. This service validates a request against its
+/// published schema, where a union is a CHOICE of alternatives, and reports the choice's own
+/// outcome: how many alternatives the instance matched, out of how many the schema offers
+/// ([`exactly_one_alternative_message`]).
+///
+/// Everything else below — the member schemas, their indices, the write and read arms —
+/// mirrors what that macro emits for this union, member for member; constraint traits are
+/// absent here exactly as they are absent from the macro's union members, so no rule this
+/// service enforces today is dropped. The cost of the copy: this declaration no longer
+/// tracks the model automatically, so a model change to `ResourceConfiguration` (a renamed,
+/// added or `@jsonName`d member) has to be carried here by hand — and the alternative COUNT
+/// below with it. The seam that would avoid it is in the vendored codegen
+/// (`vendor/smithy-macros`), which is read-only here, and this service's `override_refusal`
+/// seam cannot reach the failure either: a codec `SerdeError::custom` is not one the
+/// framework describes structurally.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ResourceConfiguration {
@@ -30,10 +52,201 @@ pub enum ResourceConfiguration {
     designFileS3Url(String),
 }
 
+/// The namespace every shape in this file belongs to, as the hand-written member schemas
+/// below name it.
+const NAMESPACE: &str = "com.amazonaws.resiliencehubv2";
+
+/// How many alternatives the service's PUBLISHED schema offers for this union.
+///
+/// RECORDED, not counted: the choice's finding states the count the published schema
+/// declares, and a recorded refusal of a `resourceConfiguration` that set no field reports
+/// seven where the model lists five members — a schema may publish one alternative per FORM
+/// a member admits (the two `S3Url` members each admit an `https://` and an `s3://` form),
+/// which the member list does not record. So the number comes from the recording rather than
+/// from `SCHEMA.members().len()`, and a recording that shows another count is what should
+/// correct it.
+const PUBLISHED_ALTERNATIVES: usize = 7;
+
+/// One member schema of [`ResourceConfiguration`], named and indexed as the model orders it.
+macro_rules! resource_configuration_member {
+    ($name:literal, $ty:ident, $index:literal) => {
+        ::aws_smithy_schema::Schema::new_member(
+            ::aws_smithy_schema::ShapeId::from_static(
+                concat!("com.amazonaws.resiliencehubv2#ResourceConfiguration$", $name),
+                NAMESPACE,
+                $name,
+            ),
+            ::aws_smithy_schema::ShapeType::$ty,
+            $name,
+            $index,
+        )
+    };
+}
+
+impl ResourceConfiguration {
+    pub const M_RESOURCE_TAGS: ::aws_smithy_schema::Schema =
+        resource_configuration_member!("resourceTags", List, 0);
+    pub const M_CFN_STACK_ARN: ::aws_smithy_schema::Schema =
+        resource_configuration_member!("cfnStackArn", String, 1);
+    pub const M_TF_STATE_FILE_URL: ::aws_smithy_schema::Schema =
+        resource_configuration_member!("tfStateFileUrl", String, 2);
+    pub const M_EKS: ::aws_smithy_schema::Schema =
+        resource_configuration_member!("eks", Structure, 3);
+    pub const M_DESIGN_FILE_S3_URL: ::aws_smithy_schema::Schema =
+        resource_configuration_member!("designFileS3Url", String, 4);
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.resiliencehubv2#ResourceConfiguration",
+            NAMESPACE,
+            "ResourceConfiguration",
+        ),
+        ::aws_smithy_schema::ShapeType::Union,
+        &[
+            &Self::M_RESOURCE_TAGS,
+            &Self::M_CFN_STACK_ARN,
+            &Self::M_TF_STATE_FILE_URL,
+            &Self::M_EKS,
+            &Self::M_DESIGN_FILE_S3_URL,
+        ],
+    );
+}
+
+pub static RESOURCE_CONFIGURATION_SCHEMA: &::aws_smithy_schema::Schema =
+    &ResourceConfiguration::SCHEMA;
+
+/// Why a `resourceConfiguration` that provides other than exactly one field is refused: the
+/// validator's own report for a CHOICE of schemas, holding how many of the alternatives the
+/// submitted object matched and how many the published schema offers.
+///
+/// The sentence and the bracketed list are the shared ones every finding of this layer is
+/// built from (`service_common::validation_message`), so this refusal cannot word the choice
+/// differently from the findings `crate::service` states for a value a later walk refuses.
+/// `matched` is counted from the REQUEST — the alternatives the body actually set, none of
+/// them for an empty object — and the alternative count is the schema's
+/// ([`PUBLISHED_ALTERNATIVES`]).
+pub fn exactly_one_alternative_message(matched: usize) -> String {
+    ::service_common::validation_message::bracketed_findings(&[
+        ::service_common::validation_message::instance_matched_not_exactly_one_schema(
+            matched,
+            PUBLISHED_ALTERNATIVES,
+        ),
+    ])
+}
+
+/// One `ResourceTagList`, read element by element; a failure inside an element is reported
+/// against that element's position, as the generated readers report it.
+fn read_resource_tags(
+    d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    member: &::aws_smithy_schema::Schema,
+) -> ::std::result::Result<Vec<ResourceTag>, ::aws_smithy_schema::serde::SerdeError> {
+    let mut items: Vec<ResourceTag> = Vec::new();
+    let mut position = 0usize;
+    d.read_list(member, &mut |dl| {
+        position += 1;
+        items.push(
+            <ResourceTag as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(dl)?,
+        );
+        Ok(())
+    })
+    .map_err(|e| ::aws_smithy_schema_server::within_list_element(e, position))?;
+    Ok(items)
+}
+
+/// One `ResourceTagList` on the wire: each element written against the tag's own schema, as
+/// the generated writers write a list of structures.
+fn write_resource_tags(
+    s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    member: &::aws_smithy_schema::Schema,
+    items: &[ResourceTag],
+) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+    s.write_list(member, &|sl| {
+        for item in items.iter() {
+            sl.write_struct(&ResourceTag::SCHEMA, item)?;
+        }
+        Ok(())
+    })
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ResourceConfiguration {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        match self {
+            Self::resourceTags(v) => write_resource_tags(s, &Self::M_RESOURCE_TAGS, v)?,
+            Self::cfnStackArn(v) => s.write_string(&Self::M_CFN_STACK_ARN, v.as_str())?,
+            Self::tfStateFileUrl(v) => s.write_string(&Self::M_TF_STATE_FILE_URL, v.as_str())?,
+            Self::Eks(v) => s.write_struct(&Self::M_EKS, v)?,
+            Self::designFileS3Url(v) => s.write_string(&Self::M_DESIGN_FILE_S3_URL, v.as_str())?,
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ResourceConfiguration {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        // How many of the union's alternatives this body matched, counted across the WHOLE
+        // object rather than refused at the second one: the finding states the count, so a
+        // body setting two alternatives is reported as having matched two.
+        let mut matched = 0usize;
+        let mut set: ::std::option::Option<Self> = ::std::option::Option::None;
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                ::std::option::Option::Some(0) => {
+                    matched += 1;
+                    set = ::std::option::Option::Some(Self::resourceTags(read_resource_tags(
+                        d,
+                        &Self::M_RESOURCE_TAGS,
+                    )?));
+                }
+                ::std::option::Option::Some(1) => {
+                    matched += 1;
+                    set = ::std::option::Option::Some(Self::cfnStackArn(
+                        d.read_string(&Self::M_CFN_STACK_ARN)?,
+                    ));
+                }
+                ::std::option::Option::Some(2) => {
+                    matched += 1;
+                    set = ::std::option::Option::Some(Self::tfStateFileUrl(
+                        d.read_string(&Self::M_TF_STATE_FILE_URL)?,
+                    ));
+                }
+                ::std::option::Option::Some(3) => {
+                    matched += 1;
+                    set = ::std::option::Option::Some(Self::Eks(
+                        <EksSource as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?,
+                    ));
+                }
+                ::std::option::Option::Some(4) => {
+                    matched += 1;
+                    set = ::std::option::Option::Some(Self::designFileS3Url(
+                        d.read_string(&Self::M_DESIGN_FILE_S3_URL)?,
+                    ));
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        // A union carries EXACTLY one alternative: none and two are both outside the
+        // choice, and both are the choice's own finding rather than a value the caller
+        // never sent.
+        match set {
+            ::std::option::Option::Some(configuration) if matched == 1 => {
+                ::std::result::Result::Ok(configuration)
+            }
+            _ => ::std::result::Result::Err(::aws_smithy_schema::serde::SerdeError::custom(
+                exactly_one_alternative_message(matched),
+            )),
+        }
+    }
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.resiliencehubv2#CreateInputSourceResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct CreateInputSourceOutput {
     pub service_arn: String,
     pub input_source_id: String,
 }
-
