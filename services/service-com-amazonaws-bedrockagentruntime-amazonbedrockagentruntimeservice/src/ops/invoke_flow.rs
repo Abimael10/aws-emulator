@@ -380,7 +380,9 @@ impl<Eng: Send + Sync + 'static> InvokeFlow<Eng> {
             flows::FlowRefusal::StoreUnavailable => {
                 InStream::Internal("the flow store is unavailable".to_string())
             }
-            flows::FlowRefusal::NotFound => InStream::NotFound(flows::not_found_message()),
+            flows::FlowRefusal::NotFound(resource) => {
+                InStream::NotFound(flows::not_found_message(resource))
+            }
             flows::FlowRefusal::InputNodeUnavailable(node) => InStream::DependencyFailed(node),
             flows::FlowRefusal::Unservable(message) => InStream::Invalid(message),
         })?;

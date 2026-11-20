@@ -202,14 +202,13 @@ pub fn execution_name_from_identifier<'a>(
 /// The modelled `ResourceNotFoundException` (HTTP 404) an execution-scoped operation answers
 /// when its `executionIdentifier` names no execution of the alias it addressed.
 ///
-/// Fixed text for this class, as AWS words it: the sentence names the TYPE of resource that
-/// could not be resolved and nothing else — neither the identifier the caller submitted nor
-/// the flow or alias it was addressed through, either of which may be the reason nothing
-/// resolved.
+/// Fixed text for this class, as AWS words it, stated through the ONE frame this plane's flow
+/// surface words every unresolved resource with ([`super::flow_resource_not_found`]): the
+/// sentence names the TYPE of resource that could not be resolved and nothing else — neither
+/// the identifier the caller submitted nor the flow or alias it was addressed through, either
+/// of which may be the reason nothing resolved.
 pub fn execution_not_found() -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!("Resource not found, type: {EXECUTION_RESOURCE_TYPE}")),
-    }
+    super::flow_resource_not_found(EXECUTION_RESOURCE_TYPE)
 }
 
 /// The resource type [`execution_not_found`] names, spelled as the model spells the resource

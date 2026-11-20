@@ -499,6 +499,35 @@ pub fn taggable_resource_not_found() -> ResourceNotFoundException {
     }
 }
 
+/// The `ResourceNotFoundException` message the FLOW surface of this plane states when a
+/// resource the request's PATH addresses could not be resolved.
+///
+/// Fixed text for this class, as AWS words it for the flow routes: the sentence names the
+/// TYPE of the resource whose lookup failed and nothing else — not the identifier the caller
+/// submitted, and not the parent it was addressed through, since either of them may be the
+/// reason nothing resolved. `resource_type` is spelled the way the models spell the resource
+/// itself: `Flow`, `FlowAlias` and `FlowVersion` as the build-time plane names them
+/// (`GetFlow`, `GetFlowAlias`, `GetFlowVersion`), and `FlowExecution` as this plane does
+/// (`GetFlowExecution`).
+///
+/// ONE frame for every flow-surface lookup — the flow, the alias, the version the alias
+/// routes to and the execution of one — so a client matches one rule rather than one sentence
+/// per operation, whichever of them did the lookup and whether the failure is answered as an
+/// HTTP error (`StartFlowExecution`, `GetFlowExecution`, `StopFlowExecution`) or delivered
+/// inside an event stream (`InvokeFlow`).
+pub fn flow_resource_not_found_message(resource_type: &str) -> String {
+    format!("Resource not found, type: {resource_type}")
+}
+
+/// The modelled `ResourceNotFoundException` (HTTP 404) carrying
+/// [`flow_resource_not_found_message`], for an operation that refuses the call outright; one
+/// that delivers the same failure inside its stream carries that message on its own event.
+pub fn flow_resource_not_found(resource_type: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(flow_resource_not_found_message(resource_type)),
+    }
+}
+
 /// The modelled `ConflictException` (HTTP 409) a WRITE to a session answers when that
 /// session is no longer `ACTIVE`.
 ///

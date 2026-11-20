@@ -22,6 +22,11 @@
 //! * a flow that IS prepared runs its own stored definition: the request's document enters
 //!   at the flow's input node and leaves at the output nodes that node is connected to, one
 //!   `flowOutputEvent` each, then the `flowCompletionEvent`;
+//! * a request to the FLOW routes naming a resource nothing resolves — the flow its path
+//!   addresses, the alias of that flow, the version that alias routes to, or an execution of
+//!   one — is a not-found whose message names the TYPE of resource whose lookup failed,
+//!   whichever operation did the lookup and whether it travels as an HTTP error or inside the
+//!   stream;
 //! * a leg of either request this emulator cannot compute is refused rather than ignored;
 //! * a flow EXECUTION is a resource of this plane: a start persists one, a read hands back
 //!   what the start wrote, the run finishes on the clock at the status it came to, and only
@@ -57,6 +62,27 @@ const DRAFT_ALIAS: &str = "TSTALIASID";
 /// build-time plane holds nothing for. Entirely fixed: it names neither half of the pair.
 const RESOURCE_NOT_FOUND: &str = "Failed to retrieve resource because it doesn't exist. \
                                   Retry the request with a different resource identifier.";
+
+/// The sentence the FLOW surface of this plane states for a resource a request addressed and
+/// nothing resolved: the fixed frame, closing in the TYPE of the resource whose lookup
+/// failed. Spelled here rather than read from the crate, so the test pins the wire text.
+fn flow_resource_not_found(resource_type: &str) -> String {
+    format!("Resource not found, type: {resource_type}")
+}
+
+/// The four resource types a request to the flow surface addresses, each spelled the way the
+/// models spell the resource itself: the build-time plane's `GetFlow`, `GetFlowAlias` and
+/// `GetFlowVersion`, and this plane's own `GetFlowExecution`.
+const FLOW: &str = "Flow";
+
+/// See [`FLOW`]: the alias of a flow, which the `flowAliasIdentifier` label addresses.
+const FLOW_ALIAS: &str = "FlowAlias";
+
+/// See [`FLOW`]: the version an alias's `routingConfiguration` routes to.
+const FLOW_VERSION: &str = "FlowVersion";
+
+/// See [`FLOW`]: one asynchronous execution of a flow, this plane's own resource.
+const FLOW_EXECUTION: &str = "FlowExecution";
 
 /// A `sessionId` every modelled constraint on the label admits.
 const SESSION: &str = "probe-session-01";
@@ -978,36 +1004,42 @@ async fn a_flow_the_plane_does_not_hold_is_delivered_inside_the_stream() {
         .create_flow("other-flow", passthrough_definition())
         .await;
 
-    // (case, flowIdentifier, flowAliasIdentifier) — every value satisfies its own pattern.
-    let rows: Vec<(&str, String, String)> = vec![
+    // (case, flowIdentifier, flowAliasIdentifier, the resource type the lookup failed on) —
+    // every value satisfies its own pattern.
+    let rows: Vec<(&str, String, String, &str)> = vec![
         (
             "a bare flow id the plane never minted",
             "FLOW123456".to_string(),
             held_alias.clone(),
+            FLOW,
         ),
         (
             "a flow ARN naming a flow the plane never minted",
             format!("arn:aws:bedrock:{REGION}:000000000000:flow/FLOW123456"),
             held_alias.clone(),
+            FLOW,
         ),
         (
             "a flow the plane holds, an alias it does not carry",
             held_flow.clone(),
             "ALIAS12345".to_string(),
+            FLOW_ALIAS,
         ),
         (
             "a flow the plane holds, addressed by its ARN, with an unknown alias",
             held_arn.clone(),
             "ALIAS12345".to_string(),
+            FLOW_ALIAS,
         ),
         (
             "an alias ARN naming another flow than the path does",
             other_flow.clone(),
             held_alias_arn.clone(),
+            FLOW_ALIAS,
         ),
     ];
 
-    for (case, flow, alias) in rows {
+    for (case, flow, alias, resource_type) in rows {
         let reply = emulator
             .invoke_flow(
                 &label(&flow),
@@ -1040,8 +1072,9 @@ async fn a_flow_the_plane_does_not_hold_is_delivered_inside_the_stream() {
         );
         assert_eq!(
             frames[0].payload["message"].as_str(),
-            Some(RESOURCE_NOT_FOUND),
-            "case {case:?}: expected this plane's fixed not-found text, got {:?}",
+            Some(flow_resource_not_found(resource_type).as_str()),
+            "case {case:?}: expected the not-found text naming the {resource_type} the \
+             lookup failed on, got {:?}",
             frames[0].payload
         );
     }
@@ -1720,8 +1753,11 @@ fn label(identifier: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// The fixed text this plane states when the EXECUTION a request addresses is one it holds
-/// nothing for: the type of resource that did not resolve, and nothing else.
-const EXECUTION_NOT_FOUND: &str = "Resource not found, type: FlowExecution";
+/// nothing for: the frame the whole flow surface words an unresolved resource with, closing
+/// in the type of resource that did not resolve.
+fn execution_not_found() -> String {
+    flow_resource_not_found(FLOW_EXECUTION)
+}
 
 impl Emulator {
     /// One `StartFlowExecution` call over the modelled URI, entering the flow at `node` with
@@ -2667,7 +2703,7 @@ async fn a_flow_execution_nothing_started_is_not_found() {
                 (
                     404,
                     "ResourceNotFoundException".to_string(),
-                    EXECUTION_NOT_FOUND.to_string()
+                    execution_not_found()
                 ),
                 "case {case:?}: expected {operation} to state the not-found of an execution, \
                  got {}",
@@ -2696,7 +2732,7 @@ async fn a_start_of_a_flow_that_cannot_run_persists_nothing() {
         status: u16,
         code: &'static str,
         /// The whole message, where this plane states fixed text for the class.
-        message: Option<&'static str>,
+        message: Option<String>,
     }
 
     let rows = [
@@ -2718,17 +2754,18 @@ async fn a_start_of_a_flow_that_cannot_run_persists_nothing() {
             code: "DependencyFailedException",
             message: Some(
                 "There was an issue with a dependency. Check the resource configurations and \
-                 retry the request.",
+                 retry the request."
+                    .to_string(),
             ),
         },
         Row {
-            case: "a flow and alias the build-time plane holds nothing for",
+            case: "a flow the build-time plane holds nothing for",
             prepared: true,
             unheld: Some(("ABCDEFGHIJ", "ZYXWVUTSRQ")),
             node: "FlowInput",
             status: 404,
             code: "ResourceNotFoundException",
-            message: Some(RESOURCE_NOT_FOUND),
+            message: Some(flow_resource_not_found(FLOW)),
         },
     ];
 
@@ -2768,7 +2805,7 @@ async fn a_start_of_a_flow_that_cannot_run_persists_nothing() {
             "case {case:?}: expected the modelled {} of this class, got {refused}",
             row.code
         );
-        match row.message {
+        match row.message.as_deref() {
             Some(stated) => assert_eq!(
                 reply.message(case),
                 stated,
@@ -2790,6 +2827,156 @@ async fn a_start_of_a_flow_that_cannot_run_persists_nothing() {
             reply.json(case)
         );
     }
+}
+
+/// RULE: when a request to the flow surface addresses a resource nothing resolves, the
+/// refusal names the TYPE of resource whose lookup failed — the flow the path addresses, the
+/// alias of that flow, or the version that alias routes to — because the status (404) and the
+/// error code (`ResourceNotFoundException`) are identical for all of them, so the message is
+/// the only place a caller can read which link of the chain was missing from.
+///
+/// The table spans what the rule generalises over: which link of the chain does not resolve,
+/// the FORM each identifier is submitted in (a bare id, the resource's own ARN), and the
+/// place an ARN names.
+#[tokio::test]
+async fn a_start_names_the_type_of_the_resource_that_did_not_resolve() {
+    let emulator = Emulator::new();
+    let setup = "the chain a start resolves";
+    let (held_flow, held_arn, held_alias, held_alias_arn) = emulator
+        .executable_flow(setup, "resolvable-flow", passthrough_definition())
+        .await;
+    // A second flow, so an alias ARN can name a flow other than the one in the path.
+    let (other_flow, _) = emulator
+        .create_flow("other-resolvable-flow", passthrough_definition())
+        .await;
+
+    // A flow whose alias routes to a NUMBERED version that the plane packaging it no longer
+    // holds. The build-time plane refuses to alias a version it does not hold, so the version
+    // is taken out of its store once the alias names it — this is the one link of the chain
+    // its own API cannot leave missing, and the runtime surface still has to say which link
+    // it was.
+    let (versioned_flow, _) = emulator
+        .create_flow("published-resolvable-flow", passthrough_definition())
+        .await;
+    emulator.prepare_flow(setup, &versioned_flow).await;
+    let published = emulator.create_flow_version(setup, &versioned_flow).await;
+    let (versioned_alias, _) = emulator
+        .create_named_flow_alias(setup, &versioned_flow, "routes-to-a-gone-version", &published)
+        .await;
+    {
+        let number: u32 = published
+            .parse()
+            .unwrap_or_else(|error| panic!("setup: {published:?} is a NumericalVersion: {error}"));
+        let state = agent_state::service_state(&*emulator.engine)
+            .expect("the Bedrock Agent store is on this engine");
+        let mut store = state.lock();
+        assert!(
+            store
+                .flow_versions
+                .remove(&(versioned_flow.clone(), number))
+                .is_some(),
+            "setup: the cut version must be in the build-time store before it is taken away"
+        );
+    }
+
+    // (case, flowIdentifier, flowAliasIdentifier, the resource type the lookup failed on)
+    let rows: Vec<(&str, String, String, &str)> = vec![
+        (
+            "a bare flow id the plane never minted",
+            "ABCDEFGHIJ".to_string(),
+            held_alias.clone(),
+            FLOW,
+        ),
+        (
+            "a flow ARN naming a flow the plane never minted",
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:flow/ABCDEFGHIJ"),
+            held_alias.clone(),
+            FLOW,
+        ),
+        (
+            "a flow ARN of another account, for a flow this one holds",
+            format!("arn:aws:bedrock:{REGION}:210987654321:flow/{held_flow}"),
+            held_alias.clone(),
+            FLOW,
+        ),
+        (
+            "a flow the plane holds, an alias it does not carry",
+            held_flow.clone(),
+            "ZYXWVUTSRQ".to_string(),
+            FLOW_ALIAS,
+        ),
+        (
+            "the flow by its own ARN, with an alias it does not carry",
+            held_arn.clone(),
+            "ZYXWVUTSRQ".to_string(),
+            FLOW_ALIAS,
+        ),
+        (
+            "an alias ARN naming another flow than the path does",
+            other_flow.clone(),
+            held_alias_arn.clone(),
+            FLOW_ALIAS,
+        ),
+        (
+            "an alias ARN of another account, for an alias this one holds",
+            held_flow.clone(),
+            format!(
+                "arn:aws:bedrock:{REGION}:210987654321:flow/{held_flow}/alias/{held_alias}"
+            ),
+            FLOW_ALIAS,
+        ),
+        (
+            "an alias routing to a version the plane that packages it no longer holds",
+            versioned_flow.clone(),
+            versioned_alias.clone(),
+            FLOW_VERSION,
+        ),
+    ];
+
+    for (case, flow, alias, resource_type) in rows {
+        let reply = emulator
+            .start_flow_execution(
+                &flow,
+                &alias,
+                "FlowInput",
+                json!({ "data": "the run that never starts" }),
+                None,
+            )
+            .await;
+        assert_eq!(
+            (reply.status, reply.error_code(case), reply.message(case)),
+            (
+                404,
+                "ResourceNotFoundException".to_string(),
+                flow_resource_not_found(resource_type)
+            ),
+            "case {case:?} ({flow}, {alias}): expected the not-found naming the \
+             {resource_type} the lookup failed on, got {}",
+            reply.json(case)
+        );
+    }
+
+    // The positive control: the same start on the chain that DOES resolve is served, which is
+    // what proves the refusals above are about the resource that went missing and not about
+    // the surface refusing every start.
+    let reply = emulator
+        .start_flow_execution(
+            &held_flow,
+            &held_alias,
+            "FlowInput",
+            json!({ "data": "the run that starts" }),
+            Some("resolvable-run"),
+        )
+        .await;
+    assert_eq!(
+        (reply.status, reply.json(setup)["executionArn"].as_str()),
+        (
+            200,
+            Some(execution_arn(&held_flow, &held_alias, "resolvable-run").as_str())
+        ),
+        "case {setup:?}: expected the start of the resolvable chain to be served, got {}",
+        reply.json(setup)
+    );
 }
 
 /// A flow whose input node leads to a node kind nothing in this emulator performs the work

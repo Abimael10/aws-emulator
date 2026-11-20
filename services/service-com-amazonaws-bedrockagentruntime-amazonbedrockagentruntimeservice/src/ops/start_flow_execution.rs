@@ -196,11 +196,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(|refusal| match refusal {
             flows::FlowRefusal::StoreUnavailable => internal("the flow store is unavailable"),
-            flows::FlowRefusal::NotFound => {
+            flows::FlowRefusal::NotFound(resource) => {
                 StartFlowExecutionErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(flows::not_found_message()),
-                    },
+                    crate::state::flow_resource_not_found(resource.as_wire()),
                 )
                 .into()
             }

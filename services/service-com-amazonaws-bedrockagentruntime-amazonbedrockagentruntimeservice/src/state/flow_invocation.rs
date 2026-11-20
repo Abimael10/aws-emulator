@@ -17,6 +17,11 @@
 //! * a flow that is not PREPARED runs nothing: preparation is what turns a definition into
 //!   something invocable, and its status is the build-time plane's.
 //!
+//! The flow, the alias and the version are three separate resources, and a request naming one
+//! this plane does not hold is a not-found for THAT resource: the refusal names the type of
+//! the resource the resolution failed on ([`FlowResourceType`]), which is the only place a
+//! caller can read it from, since the status and the error code are the same for all three.
+//!
 //! NO LANGUAGE MODEL, LAMBDA FUNCTION OR OTHER EXTERNAL WORKER RUNS IN THIS EMULATOR, so
 //! the walk computes exactly the nodes it can and REFUSES the rest rather than inventing a
 //! value for them: the request's document enters at the flow's input node and reaches the
@@ -53,8 +58,9 @@ pub enum FlowRefusal {
     /// flow — reported as a server error, never as a not-found.
     StoreUnavailable,
     /// The Bedrock Agent plane holds no flow of that identifier, no such alias on it, or
-    /// no version the alias routes to.
-    NotFound,
+    /// no version the alias routes to. The value is the TYPE of resource the resolution
+    /// failed on, which is what the refusal names.
+    NotFound(FlowResourceType),
     /// The flow exists and the request is well formed, but this service cannot run it: the
     /// string is the sentence the refusal states, naming what about the flow or the request
     /// it could not compute.
@@ -64,6 +70,39 @@ pub enum FlowRefusal {
     /// input node, and the flow's real input node is then left with no input. The string is
     /// the name of what the input addressed, which is the dependency the failure is about.
     InputNodeUnavailable(String),
+}
+
+/// Which resource of the flow surface a resolution failed on.
+///
+/// A request to this surface addresses a chain of resources — the flow its path names, the
+/// alias of that flow, and the version that alias routes to — and every one of them is a
+/// separate resource of the Bedrock Agent plane, answered 404 on its own. The refusal names
+/// which one did not resolve, because the status and the error code are identical for all
+/// three, so the message is the only place a caller can read it from.
+///
+/// Each variant is spelled the way the build-time model spells the resource itself
+/// (`smithy_query(query="operation",operation="GetFlow,GetFlowAlias,GetFlowVersion")`), which
+/// is the spelling this plane's own execution resource already uses
+/// ([`super::flow_execution::execution_not_found`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowResourceType {
+    /// The flow the `flowIdentifier` names.
+    Flow,
+    /// The alias of that flow the `flowAliasIdentifier` names.
+    FlowAlias,
+    /// The version that alias routes to.
+    FlowVersion,
+}
+
+impl FlowResourceType {
+    /// The resource type as the refusal names it.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Flow => "Flow",
+            Self::FlowAlias => "FlowAlias",
+            Self::FlowVersion => "FlowVersion",
+        }
+    }
 }
 
 /// One value a flow invocation delivers: the output node it left the flow at, and the
@@ -198,17 +237,19 @@ pub fn run_resolved<Eng: Send + Sync + 'static>(
 
     let flow_id = flow_id.as_str();
     let Some(flow) = store.flows.get(flow_id) else {
-        return Err(FlowRefusal::NotFound);
+        return Err(FlowRefusal::NotFound(FlowResourceType::Flow));
     };
     let Some(alias) = store.flow_alias_of(flow_id, &alias_id) else {
-        return Err(FlowRefusal::NotFound);
+        return Err(FlowRefusal::NotFound(FlowResourceType::FlowAlias));
     };
+    // The alias resolved, so what is missing is the VERSION it routes to: an alias carrying
+    // no routing entry names none.
     let Some(routed) = alias
         .routing_configuration
         .first()
         .and_then(|item| item.flow_version.clone())
     else {
-        return Err(FlowRefusal::NotFound);
+        return Err(FlowRefusal::NotFound(FlowResourceType::FlowVersion));
     };
 
     // The definition the alias routes to, and the status of the thing that packages it.
@@ -220,7 +261,7 @@ pub fn run_resolved<Eng: Send + Sync + 'static>(
             .ok()
             .and_then(|number| store.flow_versions.get(&(flow_id.to_string(), number)))
         else {
-            return Err(FlowRefusal::NotFound);
+            return Err(FlowRefusal::NotFound(FlowResourceType::FlowVersion));
         };
         (version.definition.as_ref(), version.status.as_wire())
     };
@@ -269,27 +310,32 @@ pub fn placement<Eng: Send + Sync + 'static>(
 ) -> Result<FlowPlacement, FlowRefusal> {
     let caller = crate::state::caller(engine, ctx);
     let account = crate::state::caller_account(&caller).unwrap_or_default();
+    // A principal of another account names no flow of this place, so the resolution fails on
+    // the first resource the path addresses: the flow.
     if account != ::engine::emulator_account_id() {
-        return Err(FlowRefusal::NotFound);
+        return Err(FlowRefusal::NotFound(FlowResourceType::Flow));
     }
     let region = crate::state::request_region(ctx);
-    if !names_this_place(flow_identifier, &account, &region)
-        || !names_this_place(flow_alias_identifier, &account, &region)
-    {
-        return Err(FlowRefusal::NotFound);
+    // Each identifier is resolved on its own, so an ARN of another place fails on the
+    // resource THAT identifier addresses rather than on whichever the chain starts with.
+    if !names_this_place(flow_identifier, &account, &region) {
+        return Err(FlowRefusal::NotFound(FlowResourceType::Flow));
+    }
+    if !names_this_place(flow_alias_identifier, &account, &region) {
+        return Err(FlowRefusal::NotFound(FlowResourceType::FlowAlias));
     }
     let Some(flow_id) = agent_state::flow_id_from_identifier(flow_identifier) else {
-        return Err(FlowRefusal::NotFound);
+        return Err(FlowRefusal::NotFound(FlowResourceType::Flow));
     };
     let Some((aliased_flow, alias_id)) =
         agent_state::flow_alias_from_identifier(flow_alias_identifier)
     else {
-        return Err(FlowRefusal::NotFound);
+        return Err(FlowRefusal::NotFound(FlowResourceType::FlowAlias));
     };
     // An alias ARN carries the flow it belongs to: one naming another flow addresses a
     // resource the flow in the path does not hold.
     if aliased_flow.is_some_and(|named| named != flow_id) {
-        return Err(FlowRefusal::NotFound);
+        return Err(FlowRefusal::NotFound(FlowResourceType::FlowAlias));
     }
     Ok(FlowPlacement {
         flow_id: flow_id.to_string(),
@@ -410,21 +456,18 @@ fn unservable_node(name: &str, node_type: &str) -> String {
     )
 }
 
-/// The message a flow invocation delivers inside its stream when the flow, the alias or
-/// the version the alias routes to is one the Bedrock Agent plane does not hold.
+/// The message this surface states when the flow, the alias or the version the alias routes
+/// to is one the Bedrock Agent plane does not hold — answered as the HTTP error of its
+/// modelled class by an operation that refuses the call, and delivered inside the stream by
+/// one that has already begun answering.
 ///
-/// Fixed text for this error class: the refusal names neither the flow nor the alias,
-/// because any one of them may be the missing resource and the service does not disclose
-/// which.
-pub fn not_found_message() -> String {
-    FLOW_RESOURCE_NOT_FOUND.to_string()
+/// Fixed text for this error class, stated through the ONE frame this plane's flow surface
+/// words every unresolved resource with ([`crate::state::flow_resource_not_found_message`]):
+/// the sentence names the TYPE of resource the resolution failed on
+/// ([`FlowResourceType`]) and no identifier at all.
+pub fn not_found_message(resource: FlowResourceType) -> String {
+    crate::state::flow_resource_not_found_message(resource.as_wire())
 }
-
-/// The sentence [`not_found_message`] answers with, as AWS words a missing resource on this
-/// plane (the same sentence its agent invocation surface states).
-const FLOW_RESOURCE_NOT_FOUND: &str = "Failed to retrieve resource because it doesn't \
-                                       exist. Retry the request with a different resource \
-                                       identifier.";
 
 /// The message a flow invocation delivers inside its stream when the input it carries does
 /// not address the flow's own input node ([`FlowRefusal::InputNodeUnavailable`]).
