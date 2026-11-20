@@ -84,7 +84,10 @@ pub fn announced_instance_address(
         None => (
             // An instance in a cluster inherits the cluster's endpoint shard label; only
             // its own DNS label differs.
-            format!("{identifier}.{endpoint_token}.{region}.neptune.amazonaws.com"),
+            format!(
+                "{identifier}.{endpoint_token}.{region}.{}",
+                super::ENDPOINT_DOMAIN
+            ),
             requested_port.unwrap_or(cluster_port),
         ),
     }
@@ -92,7 +95,10 @@ pub fn announced_instance_address(
 
 /// One of a cluster's AWS-shaped endpoint host names: the identifier, the shard label the
 /// cluster minted behind `role` (`cluster-` for the writer, `cluster-ro-` for the reader),
-/// and the region's Neptune DNS suffix.
+/// and the region's DNS suffix under this engine's endpoint domain.
 fn cluster_dns_name(identifier: &str, endpoint_token: &str, region: &str, role: &str) -> String {
-    format!("{identifier}.{role}{endpoint_token}.{region}.neptune.amazonaws.com")
+    format!(
+        "{identifier}.{role}{endpoint_token}.{region}.{}",
+        super::ENDPOINT_DOMAIN
+    )
 }

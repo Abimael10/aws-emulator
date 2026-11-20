@@ -280,6 +280,11 @@ pub mod rds_event_categories;
 /// The event source types the one `rds` front door accepts, and the sentence it refuses a
 /// `SourceType` outside them with — one set for the three service views it serves.
 pub mod rds_event_source_types;
+/// The Route 53 hosted zone a Region's database endpoints live in, per Region and per the
+/// DNS domain the control plane that owns the engine publishes them under — one table of
+/// published ids, and one mint for a pair none is cited for, for both front doors that
+/// report the member.
+pub mod rds_family_hosted_zones;
 
 /// The directory of which resources of the other services reference an ACM certificate,
 /// written by the service that owns the referencing resource and read by ACM.
@@ -831,6 +836,32 @@ pub fn stable_hex_id(parts: &[&str]) -> String {
     digest.finalize()[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// `width` characters of an id drawn from the digits-and-uppercase alphabet AWS's
+/// server-assigned ids are written in, derived from the SHA-256 digest of `seed`.
+///
+/// For an id a service MINTS and then puts on the wire in that alphabet — a hosted zone id,
+/// an EC2-style resource suffix. Deterministic in the seed and in nothing else, so the id a
+/// seed mints is the same on every read, in every build and in every service that mints from
+/// the same seed; truncated like that it is an OPAQUE id, not an unguessable one, so nothing
+/// may authenticate on it. `width` is bounded by the digest's 32 bytes.
+///
+/// Here, once, because two services minting one value from one seed have to agree on the
+/// alphabet and the digest: a second copy of the mapping drifts into minting a different id
+/// for the same seed. The digest is the maintained `sha2` crate's, as [`stable_hex_id`]'s is.
+#[must_use]
+pub fn minted_base36(seed: &str, width: usize) -> String {
+    use sha2::{Digest, Sha256};
+
+    /// The digits and uppercase letters AWS writes a server-assigned id in.
+    const DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+    Sha256::digest(seed.as_bytes())
+        .iter()
+        .take(width)
+        .map(|byte| char::from(DIGITS[usize::from(*byte) % DIGITS.len()]))
         .collect()
 }
 

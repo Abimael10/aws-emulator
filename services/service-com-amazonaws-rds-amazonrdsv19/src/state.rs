@@ -3556,54 +3556,24 @@ fn wire_timestamp_of(instant: SystemTime) -> ::aws_smithy_types::DateTime {
 /// same id, which is the invariance the member promises ("The ID that Amazon Route 53
 /// assigns when you create a hosted zone").
 ///
-/// Where this emulator can cite the id AWS allocated it reports that; for every other
-/// region and domain the id is MINTED from the two, in the published `Z`-prefixed form. A
-/// client comparing it against AWS's own id for that region will see a different label;
-/// what it gets is an id with the member's form, per-region-and-domain invariance and
-/// stability across reads — which is what a client resolving an endpoint through this
-/// member needs. Reporting nothing instead says the endpoint sits in no hosted zone at
-/// all, which is not true of any endpoint this service reports. Extend the table as
-/// published ids are cited.
+/// The published ids, and the form of one minted for a pair none is cited for, live in
+/// `service_common::rds_family_hosted_zones` — the graph control plane's own front door
+/// reports the member for the same engine, and one zone per region and domain holds however
+/// a caller reached the control plane, so both doors read one table and one mint rather than
+/// a copy each. Published ids are cited there.
 pub fn hosted_zone_id(region: &str, endpoint_domain: &str) -> String {
-    /// The published hosted zone ids this emulator carries, as
-    /// `(region, endpoint domain, hosted zone id)`, from the "Amazon Relational Database
-    /// Service (Amazon RDS)" and "Amazon Neptune" rows of "Service endpoints and quotas …
-    /// hosted zone IDs" (Amazon Route 53 Developer Guide, "Values that you specify when you
-    /// create alias resource record sets"). One row per region AND domain, because the
-    /// control plane that owns the engine publishes its own zone for the region.
-    const PUBLISHED: &[(&str, &str, &str)] = &[
-        ("us-east-1", RDS_ENDPOINT_DOMAIN, "Z2R2ITUGPM61AM"),
-        ("us-west-2", RDS_ENDPOINT_DOMAIN, "Z1PVIF0B656C1W"),
-        ("us-west-2", NEPTUNE_ENDPOINT_DOMAIN, "Z22EZDAJT6W257"),
-    ];
-
-    PUBLISHED
-        .iter()
-        .find(|(name, domain, _)| *name == region && *domain == endpoint_domain)
-        .map(|(_, _, published)| (*published).to_string())
-        .unwrap_or_else(|| {
-            format!(
-                "Z{}",
-                minted_base36(&format!("hosted-zone/{endpoint_domain}/{region}"), 13)
-            )
-        })
+    ::service_common::rds_family_hosted_zones::hosted_zone_id(region, endpoint_domain)
 }
 
 /// `width` characters drawn from the digits-and-uppercase alphabet AWS's server-assigned
 /// ids are written in, derived from the SHA-256 digest of `seed`.
 ///
 /// Deterministic in the seed and in nothing else, so a value minted for one seed is the
-/// same every time any read asks for it. The digest is the maintained `sha2` crate's, as
-/// [`mint_uuid_token`]'s is.
+/// same every time any read asks for it — and the ONE mapping of a digest onto that
+/// alphabet, `service_common::minted_base36`, which the hosted zone of a region is minted
+/// through as well, so two services minting from one seed cannot answer different ids.
 fn minted_base36(seed: &str, width: usize) -> String {
-    use ::sha2::{Digest, Sha256};
-
-    const DIGITS: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    Sha256::digest(seed.as_bytes())
-        .iter()
-        .take(width)
-        .map(|byte| char::from(DIGITS[usize::from(*byte) % DIGITS.len()]))
-        .collect()
+    ::service_common::minted_base36(seed, width)
 }
 
 /// `width` lowercase hexadecimal characters of the SHA-256 digest of `seed` — the alphabet
@@ -3728,11 +3698,19 @@ pub fn endpoint_domain(engine: &str) -> &'static str {
 }
 
 /// The DNS domain this front door's own endpoints sit in; see [`endpoint_domain`].
-pub const RDS_ENDPOINT_DOMAIN: &str = "rds.amazonaws.com";
+///
+/// The three domains are stated ONCE, in the module both front doors read a Region's hosted
+/// zone out of (`service_common::rds_family_hosted_zones`), because that table is keyed by
+/// the domain: a second copy of one of these strings that drifted would stop matching the
+/// published row for a Region.
+pub const RDS_ENDPOINT_DOMAIN: &str =
+    ::service_common::rds_family_hosted_zones::RDS_ENDPOINT_DOMAIN;
 /// The DNS domain the Amazon DocumentDB control plane's endpoints sit in.
-pub const DOCDB_ENDPOINT_DOMAIN: &str = "docdb.amazonaws.com";
+pub const DOCDB_ENDPOINT_DOMAIN: &str =
+    ::service_common::rds_family_hosted_zones::DOCDB_ENDPOINT_DOMAIN;
 /// The DNS domain the Amazon Neptune control plane's endpoints sit in.
-pub const NEPTUNE_ENDPOINT_DOMAIN: &str = "neptune.amazonaws.com";
+pub const NEPTUNE_ENDPOINT_DOMAIN: &str =
+    ::service_common::rds_family_hosted_zones::NEPTUNE_ENDPOINT_DOMAIN;
 
 
 /// The daily backup window an instance gets when the request names none.

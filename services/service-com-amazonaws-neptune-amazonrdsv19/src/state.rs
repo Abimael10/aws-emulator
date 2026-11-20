@@ -76,6 +76,15 @@ pub const STANDARD_STORAGE_TYPE: &str = "standard";
 /// The region an ARN or endpoint uses when the request carries no SigV4 credential scope.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
+/// The DNS domain this engine's control plane publishes its endpoints under: the suffix of
+/// every cluster and instance host name, and half of the key a region's hosted zone is read
+/// by ([`hosted_zone_id`]).
+///
+/// Stated once, in the module both front doors that serve this engine read a region's hosted
+/// zone out of, because that table is keyed by the domain.
+pub const ENDPOINT_DOMAIN: &str =
+    ::service_common::rds_family_hosted_zones::NEPTUNE_ENDPOINT_DOMAIN;
+
 /// Status of a resource the service is still provisioning.
 pub const STATUS_CREATING: &str = "creating";
 /// Status of a provisioned, usable resource.
@@ -498,21 +507,20 @@ pub fn mint_endpoint_token(identifier: &str, created: SystemTime) -> String {
     mint_token(&seed, DNS_LABEL_ALPHABET, 12)
 }
 
-/// The Route 53 hosted zone the region's RDS endpoints live in. One zone per region, so
-/// every cluster in a region reports the same id — as AWS does.
+/// The Route 53 hosted zone the region's endpoints of this engine live in. One zone per
+/// region and per the DNS domain of the control plane that owns the engine
+/// ([`ENDPOINT_DOMAIN`]), so every cluster and every instance in a region reports the same
+/// id — as AWS does.
 ///
-/// The value is MINTED from the region rather than looked up: AWS's per-region zone ids
-/// are published in the Route 53 / RDS documentation but are not in this service's Smithy
-/// model, and the member's contract (`DBCluster$HostedZoneId`, `Endpoint$HostedZoneId`:
-/// "the ID that Amazon Route 53 assigns when you create a hosted zone") is a stable,
-/// `Z`-prefixed, per-region id. A client comparing it against AWS's own published id for
-/// a region will see a different label; it keeps the format, the per-region invariance and
-/// the stability the member promises.
+/// The published ids, and the form of one minted for a region none is cited for, live in
+/// `service_common::rds_family_hosted_zones`: the member is "the ID that Amazon Route 53
+/// assigns when you create a hosted zone" (`DBCluster$HostedZoneId`,
+/// `Endpoint$HostedZoneId`), a client builds a Route 53 alias or DNS-failover record from
+/// it, and the shared Query front door that serves this engine's clusters under its signing
+/// name reports the same member — so both doors read ONE table and ONE mint rather than a
+/// copy each, and answer one id per region whether or not a published one is cited for it.
 pub fn hosted_zone_id(region: &str) -> String {
-    format!(
-        "Z{}",
-        mint_token(&format!("hosted-zone/{region}"), RESOURCE_ID_ALPHABET, 13)
-    )
+    ::service_common::rds_family_hosted_zones::hosted_zone_id(region, ENDPOINT_DOMAIN)
 }
 
 /// The parameter-group family a Neptune engine version belongs to: the version's major
