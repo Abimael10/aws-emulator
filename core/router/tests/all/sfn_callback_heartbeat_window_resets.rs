@@ -26,6 +26,13 @@
 //! The two rows differ in the one thing the rule turns on: whether the worker reports
 //! progress inside the window at all. Both do the same amount of work, which is more than
 //! one window's worth.
+//!
+//! A worker that reports progress does so as soon as it HOLDS the token, before any of its
+//! work: the window the hand-over opened therefore covers only the span this emulator
+//! itself takes to get the worker running — a package to unpack, an interpreter to start,
+//! an SDK client to build — and the spans the rule turns on are measured from a report the
+//! worker made itself, each of them well inside the window. So neither row's outcome is
+//! decided by how fast the host is.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -80,12 +87,13 @@ const EVENT_TASK_TIMED_OUT: &str = "TaskTimedOut";
 
 /// The window both rows' `Task` states declare as `HeartbeatSeconds`, and the two spans
 /// the worker works: one heartbeat inside the window, and work on either side of it adding
-/// up to more than one window.
-const HEARTBEAT_SECONDS: u64 = 5;
+/// up to more than one window. Each span is a good deal shorter than the window it is
+/// inside, so a loaded host cannot decide a row.
+const HEARTBEAT_SECONDS: u64 = 10;
 /// See [`HEARTBEAT_SECONDS`].
-const WORKS_BEFORE_SECONDS: f64 = 3.0;
+const WORKS_BEFORE_SECONDS: f64 = 6.0;
 /// See [`HEARTBEAT_SECONDS`].
-const WORKS_AFTER_SECONDS: f64 = 3.0;
+const WORKS_AFTER_SECONDS: f64 = 5.0;
 
 /// One invocation's own allowance, as the function's `Timeout`: well past the longest a row
 /// works, because what is under test is which bound closes the task and not how fast an
@@ -105,8 +113,13 @@ fn settlement_output() -> Value {
     json!({ "approved": true, "by": "the worker holding the token" })
 }
 
-/// The worker both rows invoke: it is handed a task token, works, reports progress on that
-/// token where its event asks it to, works again and then settles the task.
+/// The worker both rows invoke: it is handed a task token, reports progress on it at once
+/// where its event asks it to, works, reports progress again, works again and then settles
+/// the task.
+///
+/// The report it makes BEFORE working is what a worker does first — it holds the token, so
+/// it is alive — and it is what leaves both of its working spans measured from an instant
+/// this handler's own clock saw.
 ///
 /// Whatever this service refuses it CATCHES and reports instead of raising, so the row
 /// whose task a lapsed window closed still runs its handler to the end.
@@ -121,25 +134,31 @@ from botocore.exceptions import ClientError
 def handler(event, context):
     states = boto3.client("stepfunctions")
     token = event["token"]
-    beat = None
-    time.sleep(event["before"])
-    if event["heartbeats"]:
+    beats = []
+
+    def report():
         try:
             states.send_task_heartbeat(taskToken=token)
-            beat = "answered"
+            beats.append("answered")
         except ClientError as refused:
-            beat = refused.response["Error"]["Code"]
+            beats.append(refused.response["Error"]["Code"])
+
+    if event["heartbeats"]:
+        report()
+    time.sleep(event["before"])
+    if event["heartbeats"]:
+        report()
     time.sleep(event["after"])
     try:
         states.send_task_success(
             taskToken=token,
             output=json.dumps(event["output"]),
         )
-        return {"settled": True, "beat": beat}
+        return {"settled": True, "beats": beats}
     except ClientError as refused:
         return {
             "settled": False,
-            "beat": beat,
+            "beats": beats,
             "code": refused.response["Error"]["Code"],
         }
 "#;

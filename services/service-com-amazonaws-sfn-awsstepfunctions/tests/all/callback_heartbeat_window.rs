@@ -23,13 +23,21 @@
 //! while this service is still waiting for that invocation to answer, which is the window
 //! this suite is about.
 //!
+//! A worker reports progress as soon as it HOLDS the token, before it does any of the work
+//! the token was handed over for: the window the hand-over opens therefore covers only the
+//! span this emulator itself takes to get the worker running — an archive to unpack, an
+//! interpreter to start, an SDK client to build — and every span the rule turns on is one
+//! the worker's own clock measures from a report of progress it made itself. So no row's
+//! outcome is decided by how fast the host is.
+//!
 //! The rows differ along what the rule generalises over: HOW MANY heartbeats the worker
-//! sends (none, one, several), the length of the window they are sent inside (two, three,
-//! four seconds), how much work the row does after the last of them (less than a window,
-//! more than one), and whether the state also declares the `TimeoutSeconds` that bounds
-//! the task's whole duration. Every row asserts both halves — the status and error this
-//! service reports, and whether the history carries the timeout event — so a window that
-//! is never reset and a window that is never enforced both fail here.
+//! sends (none, one report of progress, one and then more), the length of the window they
+//! are sent inside (two, six, eight and ten seconds), how much work the row does after the
+//! last of them (less than a window, more than one), and whether the state also declares the
+//! `TimeoutSeconds` that bounds the task's whole duration. Every row asserts both halves —
+//! the status and error this service reports, and whether the history carries the timeout
+//! event — so a window that is never reset and a window that is never enforced both fail
+//! here.
 //!
 //! The harness is `lambda_task_control_flow`'s `Chain` (Step Functions and Lambda over one
 //! engine); `tests/all/main.rs` declares every suite of this target, so it is reached
@@ -66,9 +74,13 @@ const FUNCTION_TIMEOUT_SECONDS: u64 = 60;
 /// execution's own output says how many of them this service answered.
 const BEAT: &str = "beat";
 
-/// The worker every row invokes: it is handed a task token, works the spans its event
-/// names, reports progress on that token after each of them, works once more and then
-/// settles the task with the heartbeats it got answered.
+/// The worker every row invokes: it is handed a task token, reports progress on it at once
+/// where its event asks it to, works the spans its event names, reports progress after each
+/// of them, works once more and then settles the task with the heartbeats it got answered.
+///
+/// The report it makes BEFORE working is what a worker does first — it holds the token, so
+/// it is alive — and it is what leaves every later span of the row measured from an instant
+/// this handler's own clock saw.
 ///
 /// Whatever this service refuses it CATCHES and reports instead of raising, so a row whose
 /// task a bound closed still runs its handler to the end rather than failing the
@@ -85,13 +97,19 @@ def handler(event, context):
     states = boto3.client("stepfunctions")
     token = event["token"]
     reported = []
-    for pause in event["beats"]:
-        time.sleep(pause)
+
+    def report():
         try:
             states.send_task_heartbeat(taskToken=token)
             reported.append("beat")
         except botocore.exceptions.ClientError as refused:
             reported.append(refused.response["Error"]["Code"])
+
+    if event["reports_at_once"]:
+        report()
+    for pause in event["beats"]:
+        time.sleep(pause)
+        report()
     time.sleep(event["then"])
     try:
         states.send_task_success(
@@ -126,32 +144,49 @@ struct Row {
     /// `TimeoutSeconds` where the row declares one, which bounds the task's whole duration
     /// however often it is heartbeated.
     timeout_seconds: Option<u64>,
-    /// The span the worker works before each heartbeat it sends, in seconds.
+    /// Whether the worker reports progress AS SOON AS it holds the token, before doing any
+    /// of the work — so the window the hand-over opened has to cover nothing but this
+    /// emulator's own start-up of the invocation, and every span below is measured from a
+    /// report the worker made itself.
+    reports_at_once: bool,
+    /// The span the worker works before each further heartbeat it sends, in seconds.
     beats: &'static [f64],
     /// And the span it works after the last of them, before settling the task.
     then: f64,
     ends: Ends,
 }
 
+impl Row {
+    /// How many heartbeats of this row's worker this service must answer: the one it makes
+    /// on holding the token, where it makes one, and one after each span in [`Self::beats`].
+    fn heartbeats(&self) -> usize {
+        usize::from(self.reports_at_once) + self.beats.len()
+    }
+}
+
 const ROWS: &[Row] = &[
-    // The case the rule is stated about: one report of progress inside the window, with
-    // the work on either side of it adding up to more than one window.
+    // The case the rule is stated about: one further report of progress inside the window,
+    // with the work on either side of it adding up to more than one window. Each of those
+    // two spans is a good deal shorter than the window it is inside, so a host that runs
+    // the worker slowly cannot decide the row.
     Row {
         case: "one heartbeat inside the window, with the work around it outlasting it",
-        heartbeat_seconds: 4,
+        heartbeat_seconds: 8,
         timeout_seconds: None,
-        beats: &[2.0],
-        then: 3.0,
+        reports_at_once: true,
+        beats: &[5.0],
+        then: 4.0,
         ends: Ends::Settled,
     },
-    // Several windows' worth of work, kept alive by a heartbeat inside each of them: the
-    // member bounds idle time, so it caps the task's duration at nothing.
+    // Two windows' worth of work, kept alive by heartbeats three times a window: the member
+    // bounds idle time, so it caps the task's duration at nothing.
     Row {
         case: "heartbeats kept up over several windows' worth of work",
-        heartbeat_seconds: 3,
+        heartbeat_seconds: 6,
         timeout_seconds: None,
-        beats: &[1.5, 1.5, 1.5],
-        then: 1.5,
+        reports_at_once: true,
+        beats: &[2.0, 2.0, 2.0, 2.0, 2.0],
+        then: 2.0,
         ends: Ends::Settled,
     },
     // The other side of the same rule: a window nothing reported progress inside closes
@@ -160,26 +195,34 @@ const ROWS: &[Row] = &[
         case: "a worker that never heartbeats at all",
         heartbeat_seconds: 2,
         timeout_seconds: None,
+        reports_at_once: false,
         beats: &[],
         then: 5.0,
         ends: Ends::TimedOut,
     },
     // A heartbeat starts the window again and no more than that: a worker that stops
-    // reporting progress is closed one window after its last heartbeat.
+    // reporting progress is closed one window after its last heartbeat, however long the
+    // work it is still doing runs. The window is well past this emulator's own start-up of
+    // the worker, and that this service really ANSWERS a report made on holding the token is
+    // what the settled rows above assert.
     Row {
         case: "a worker that heartbeats once and then goes quiet for longer than the window",
-        heartbeat_seconds: 2,
+        heartbeat_seconds: 6,
         timeout_seconds: None,
-        beats: &[1.0],
-        then: 5.0,
+        reports_at_once: true,
+        beats: &[],
+        then: 10.0,
         ends: Ends::TimedOut,
     },
     // And the member that DOES bound the whole duration: heartbeats inside the window keep
-    // the heartbeat clock open, and the task's own `TimeoutSeconds` closes it anyway.
+    // the heartbeat clock open, and the task's own `TimeoutSeconds` closes it anyway. The
+    // window is far longer than that bound here, so the bound that fires can only be the
+    // whole-duration one.
     Row {
         case: "heartbeats inside the window past the task's own TimeoutSeconds",
-        heartbeat_seconds: 2,
+        heartbeat_seconds: 10,
         timeout_seconds: Some(3),
+        reports_at_once: true,
         beats: &[1.0, 1.0, 1.0, 1.0, 1.0],
         then: 0.0,
         ends: Ends::TimedOut,
@@ -197,6 +240,7 @@ fn definition(row: &Row, function_arn: &str) -> Value {
             "FunctionName": function_arn,
             "Payload": {
                 "token.$": "$$.Task.Token",
+                "reports_at_once": row.reports_at_once,
                 "beats": row.beats,
                 "then": row.then,
             },
@@ -277,7 +321,8 @@ async fn a_heartbeat_inside_the_window_keeps_a_callback_task_alive() {
                             .unwrap_or_else(|why| panic!("case {case:?}: the output is JSON: {why}"))
                     })
                     .unwrap_or_else(|| panic!("case {case:?}: expected an output in {settled}"));
-                let answered: Vec<String> = row.beats.iter().map(|_| BEAT.to_string()).collect();
+                let answered: Vec<String> =
+                    (0..row.heartbeats()).map(|_| BEAT.to_string()).collect();
                 assert_eq!(
                     carried,
                     json!({ "beats": answered }),

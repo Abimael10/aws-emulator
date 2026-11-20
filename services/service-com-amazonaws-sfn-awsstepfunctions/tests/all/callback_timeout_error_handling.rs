@@ -68,12 +68,16 @@ const POLL: Duration = Duration::from_millis(25);
 
 /// Step Functions and Amazon SQS over ONE engine, so the call that hands a token out is
 /// served by the same store the test reads the tokens back from.
-struct Emulator {
+///
+/// `pub(crate)` because a sibling suite whose rule is about the same hand-over reaches it
+/// through this harness rather than opening a second seam onto the two wire protocols
+/// ([`crate::callback_heartbeat_window_holder`]).
+pub(crate) struct Emulator {
     router: MultiServiceRouter,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
@@ -141,13 +145,18 @@ impl Emulator {
 
     /// The status and the error class one Step Functions call was REFUSED with.
     async fn sfn_refusal(&self, operation: &str, body: &Value) -> (u16, String) {
-        let (status, parsed) = self
-            .answered("states", "AWSStepFunctions", operation, body)
-            .await;
+        let (status, parsed) = self.sfn_answered(operation, body).await;
         (status, error_code(&parsed))
     }
 
-    async fn sfn(&self, operation: &str, body: &Value) -> Value {
+    /// The status and the parsed body one Step Functions call was answered with, whatever
+    /// that status is: for a caller that asserts on the status itself.
+    pub(crate) async fn sfn_answered(&self, operation: &str, body: &Value) -> (u16, Value) {
+        self.answered("states", "AWSStepFunctions", operation, body)
+            .await
+    }
+
+    pub(crate) async fn sfn(&self, operation: &str, body: &Value) -> Value {
         self.rpc("states", "AWSStepFunctions", operation, body).await
     }
 
@@ -157,7 +166,7 @@ impl Emulator {
 
     /// The url of a queue a row's callback tasks hand their tokens to. One per row, so
     /// one row's attempts are never counted in another's.
-    async fn queue(&self, name: &str) -> String {
+    pub(crate) async fn queue(&self, name: &str) -> String {
         let created = self
             .sqs("CreateQueue", &json!({ "QueueName": name }))
             .await;
@@ -165,7 +174,7 @@ impl Emulator {
     }
 
     /// Create a state machine and start one execution of it, reporting its ARN.
-    async fn started(&self, name: &str, definition: &Value) -> String {
+    pub(crate) async fn started(&self, name: &str, definition: &Value) -> String {
         let created = self
             .sfn(
                 "CreateStateMachine",
@@ -187,7 +196,7 @@ impl Emulator {
     }
 
     /// The execution `execution_arn`, once it has left `RUNNING`.
-    async fn settled(&self, execution_arn: &str, case: &str) -> Value {
+    pub(crate) async fn settled(&self, execution_arn: &str, case: &str) -> Value {
         let began = Instant::now();
         loop {
             let described = self
@@ -208,7 +217,7 @@ impl Emulator {
     }
 
     /// The event types the history of `execution_arn` carries, with the details of each.
-    async fn history(&self, execution_arn: &str) -> Vec<Value> {
+    pub(crate) async fn history(&self, execution_arn: &str) -> Vec<Value> {
         let answered = self
             .sfn(
                 "GetExecutionHistory",
@@ -225,7 +234,7 @@ impl Emulator {
     /// The bodies the queue at `url` holds, looked at again until `wanted` of them have
     /// arrived or `PATIENCE` runs out. How many really arrived is the caller's own
     /// assertion.
-    async fn bodies(&self, url: &str, wanted: usize) -> Vec<String> {
+    pub(crate) async fn bodies(&self, url: &str, wanted: usize) -> Vec<String> {
         let began = Instant::now();
         let mut collected: Vec<String> = Vec::new();
         loop {
@@ -295,7 +304,7 @@ fn catch(errors: &[&str]) -> Value {
 }
 
 /// How many events of `event_type` the history holds.
-fn count_of(events: &[Value], event_type: &str) -> usize {
+pub(crate) fn count_of(events: &[Value], event_type: &str) -> usize {
     events
         .iter()
         .filter(|event| event.get("type").and_then(Value::as_str) == Some(event_type))
