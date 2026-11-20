@@ -38,6 +38,19 @@
 //! the owner does not hold then becomes a per-resource failure rather than an
 //! entry in this crate's own store, the fixtures of every test that used such an
 //! ARN as an unowned one.
+//!
+//! The two halves can also be linked SEPARATELY, because they answer two
+//! different questions. [`visit`] answers "may this API write a tag to the ARN
+//! this request names", so a namespace it serves changes which ARNs a WRITE is
+//! accepted for — and which become that per-resource failure.
+//! [`tagged_resources`] answers "which tagged resources does the account hold",
+//! which is what a reporting read — and every resource query resolved against
+//! this projection — selects out of. A service listed in the projection ALONE
+//! therefore has its own tag sets REPORTED (a resource tagged through that
+//! service's API is discoverable here, and one it no longer holds is gone from
+//! the projection) while an ARN in its namespace stays [`Resolution::Unowned`]
+//! for a write, which keeps [`crate::state`]'s own store the tag home for the
+//! ARNs this API is asked to tag directly. Amazon EC2 is linked that way.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -48,6 +61,7 @@ use std::time::SystemTime;
 use service_com_amazonaws_apigateway_backplanecontrolservice as owner_apigateway;
 use service_com_amazonaws_connecthealth_connecthealth as owner_connecthealth;
 use service_com_amazonaws_dynamodb_dynamodb_20120810 as owner_dynamodb;
+use service_com_amazonaws_ec2_amazonec2 as owner_ec2;
 use service_com_amazonaws_ecs_amazonec2containerservicev20141113 as owner_ecs;
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10 as owner_elb;
 use service_com_amazonaws_eventbridge_awsevents as owner_events;
@@ -477,6 +491,40 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
         // projection reports are the ones of the serving Region.
         for topic in state.lock().topics_in_region(region) {
             record(topic.arn.clone(), pairs(&topic.tags));
+        }
+    }
+    if let Some(state) = owner_ec2::state::service_state(engine) {
+        let mut state = state.lock();
+        // Like the owners above, what the CLOCK already owes is materialised
+        // before the projection is read: a resource that service would already
+        // have dropped was owed its removal at this instant whether or not
+        // anybody called, so it is not reported as one the account still holds.
+        state.materialize_due_transitions();
+        // EVERY kind of resource that service holds tags for, read off the one
+        // report it answers its own tag reader with — so a resource tagged at
+        // creation or through `CreateTags` is in this projection at once, and a
+        // kind that service gains is projected with it. Each row is keyed by the
+        // ARN that service mints for the resource: the `ec2` namespace, the
+        // serving Region, the account, and the `<type>/<id>` pair its own tag
+        // report names it by.
+        let mut held: BTreeMap<String, Tags> = BTreeMap::new();
+        for described in state.tag_descriptions() {
+            let (Some(resource_id), Some(resource_type), Some(key)) =
+                (described.resource_id, described.resource_type, described.key)
+            else {
+                continue;
+            };
+            let arn = ::engine::emulator_arn(
+                "ec2",
+                region,
+                &format!("{resource_type}/{resource_id}"),
+            );
+            held.entry(arn)
+                .or_default()
+                .insert(key, described.value.unwrap_or_default());
+        }
+        for (arn, tags) in held {
+            record(arn, tags);
         }
     }
     if let Some(state) = owner_sfn::state::service_state(engine) {

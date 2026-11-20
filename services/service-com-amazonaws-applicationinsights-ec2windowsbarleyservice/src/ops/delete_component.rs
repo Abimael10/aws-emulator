@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteComponent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteComponent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: ungroups a custom component of the application in
+//! [`crate::state`] — the component is removed, and every EC2 instance it
+//! grouped reverts to its standalone status, as its own DEFAULT component again.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteComponent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "When you ungroup custom components, all applicable monitors that are set up
+//! for the component are removed and the instances revert to their standalone
+//! status": the component's own monitoring goes with the component, and each
+//! instance it held becomes a component of the application once more, covering
+//! that instance and the volumes attached to it ([`crate::state::ec2`]) — the
+//! same standalone component onboarding would give it.
+//!
+//! Only a CUSTOM component can be ungrouped: a standalone component stands for a
+//! resource of the application's resource group rather than for a grouping a
+//! caller made, so this operation holds none of its own and answers the
+//! missing-custom-component refusal for it.
+//!
+//! What comes back is what was GROUPED, not what the group resolves to now: the
+//! documented outcome of this call is unconditional ("the instances revert to
+//! their standalone status"), the resources in a custom component are the ones a
+//! `CreateComponent` call put there, and an emulator with no Resource Groups to
+//! ask would otherwise lose them rather than revert them. A resource whose
+//! membership of the group has ended stops being a component of the application
+//! the next time the application onboards it, which is where that fact belongs.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +155,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteComponent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteComponentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteComponent"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteComponentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no state".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The resources the component holds, read before anything is changed:
+        // they are the ones that revert to standalone status, and whether this
+        // component is one this operation ungroups at all is decided here.
+        let grouped = {
+            let store = state.lock();
+            let Some(application) = store.applications.get(&input.resource_group_name) else {
+                return Err(DeleteComponentErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::APPLICATION_MISSING_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            };
+            // A standalone component is not a custom component, so what a caller
+            // naming one gets is the refusal for a custom component of that name.
+            let custom = application
+                .components
+                .get(&input.component_name)
+                .filter(|component| component.origin == crate::state::ComponentOrigin::Custom);
+            let Some(component) = custom else {
+                return Err(DeleteComponentErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::component_missing_message(
+                            &input.component_name,
+                            &input.resource_group_name,
+                        )),
+                    },
+                )
+                .into());
+            };
+            component.resource_list.clone()
+        };
+
+        // Which volumes those instances carry NOW: a reverted standalone
+        // component covers its instance and the storage that instance runs on,
+        // and which volumes those are is Amazon EC2's to answer — so it is asked
+        // again rather than read back off the component being removed.
+        let region = crate::state::request_region(ctx);
+        let attachments = crate::state::ec2::attached_volumes(ctx, &region).await;
+
+        let mut store = state.lock();
+        let Some(application) = store.applications.get_mut(&input.resource_group_name) else {
+            return Err(DeleteComponentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::APPLICATION_MISSING_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        // Re-read under THIS lock before anything is removed: reading the
+        // attachments released the store, so what this call ungroups is the
+        // component that is STILL there and still a custom one. A caller that got
+        // in between has already removed it, and this call answers that it holds
+        // no such custom component rather than removing whatever now carries the
+        // name.
+        let still_custom = application
+            .components
+            .get(&input.component_name)
+            .is_some_and(|component| component.origin == crate::state::ComponentOrigin::Custom);
+        if !still_custom {
+            return Err(DeleteComponentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::component_missing_message(
+                        &input.component_name,
+                        &input.resource_group_name,
+                    )),
+                },
+            )
+            .into());
+        }
+        application.components.remove(&input.component_name);
+        // The instances revert to their standalone status: each is a DEFAULT
+        // component of the application again, named by its own ARN. A volume the
+        // ungrouped component also held is part of its instance, so it comes back
+        // inside that instance's component rather than as one of its own, and a
+        // resource another component has since taken over is left where it is.
+        for resource_arn in grouped
+            .iter()
+            .filter(|resource_arn| crate::state::is_ec2_instance(resource_arn))
+        {
+            if application.components.contains_key(resource_arn) {
+                continue;
+            }
+            if application.components.len() >= crate::state::COMPONENT_QUOTA {
+                break;
+            }
+            application.components.insert(
+                resource_arn.clone(),
+                crate::state::discovered_component(
+                    resource_arn,
+                    None,
+                    crate::state::ec2::with_attached_volumes(resource_arn, &attachments),
+                ),
+            );
+        }
+
+        Ok(DeleteComponentOutput {})
     }
 }

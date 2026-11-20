@@ -35,6 +35,11 @@ const INSTANCE_ARN: &str = "arn:aws:ec2:us-east-1:000000000000:instance/i-012345
 /// A second one, so a row can group more than one instance.
 const OTHER_INSTANCE_ARN: &str = "arn:aws:ec2:us-east-1:000000000000:instance/i-00000000000000002";
 
+/// A third one, for the row that groups two instances: a resource one component
+/// already groups is not grouped into a second, so that row names instances no
+/// earlier row has taken.
+const THIRD_INSTANCE_ARN: &str = "arn:aws:ec2:us-east-1:000000000000:instance/i-00000000000000003";
+
 /// The account every emulated resource is owned by, as the vendored runtime defines it.
 fn account_id() -> &'static str {
     engine::emulator_account_id()
@@ -238,7 +243,7 @@ async fn a_custom_component_groups_only_ec2_instances() {
         ("one instance", &[INSTANCE_ARN], true),
         (
             "two instances",
-            &[INSTANCE_ARN, OTHER_INSTANCE_ARN],
+            &[OTHER_INSTANCE_ARN, THIRD_INSTANCE_ARN],
             true,
         ),
         (
@@ -338,6 +343,136 @@ async fn a_custom_component_groups_only_ec2_instances() {
             );
         }
     }
+}
+
+/// A resource one custom component of an application holds is NOT grouped into a
+/// second: the create is refused, naming the resource the request asked for, and
+/// ungrouping the component that holds it makes the resource groupable again.
+///
+/// The rows differ along what the rule generalises over: which position in the
+/// request's `ResourceList` the already-grouped resource sits in, how many
+/// resources the request names, and whether the resource was taken by a component
+/// of one instance or of several.
+#[tokio::test]
+async fn a_resource_another_component_groups_is_refused_and_released_by_ungrouping() {
+    let router = router();
+    create_application(&router, "exclusive-rg").await;
+    let (status, body) = call(
+        &router,
+        "CreateComponent",
+        json!({
+            "ResourceGroupName": "exclusive-rg",
+            "ComponentName": "web-tier",
+            "ResourceList": [INSTANCE_ARN, OTHER_INSTANCE_ARN],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "setup: CreateComponent: {body:?}");
+
+    // Each row names one resource that component already holds, in a different
+    // position of a list of a different length.
+    let rows: &[(&str, &[&str], &str)] = &[
+        ("the grouped resource alone", &[INSTANCE_ARN], INSTANCE_ARN),
+        (
+            "the grouped resource first, a free one after",
+            &[OTHER_INSTANCE_ARN, THIRD_INSTANCE_ARN],
+            OTHER_INSTANCE_ARN,
+        ),
+        (
+            "a free resource first, a grouped one after",
+            &[THIRD_INSTANCE_ARN, INSTANCE_ARN],
+            INSTANCE_ARN,
+        ),
+    ];
+    for (index, (case, resources, refused_resource)) in rows.iter().enumerate() {
+        let component = format!("second-tier-{index}");
+        let (status, body) = call(
+            &router,
+            "CreateComponent",
+            json!({
+                "ResourceGroupName": "exclusive-rg",
+                "ComponentName": &component,
+                "ResourceList": resources,
+            }),
+        )
+        .await;
+        assert_refused(
+            case,
+            status,
+            &body,
+            "ValidationException",
+            &format!("Component {refused_resource} is grouped in another component."),
+        );
+        // The refused create stored nothing, so the free resource in the row is
+        // still free and the component it would have made does not exist.
+        let (read_status, read) = call(
+            &router,
+            "DescribeComponent",
+            json!({ "ResourceGroupName": "exclusive-rg", "ComponentName": &component }),
+        )
+        .await;
+        assert_eq!(
+            read_status, 400,
+            "case {case:?}: a refused create must store nothing, got {read:?}"
+        );
+    }
+
+    // Ungrouping the component that holds them gives both resources back: each is
+    // a standalone component of the application again, and groupable once more.
+    let (status, body) = call(
+        &router,
+        "DeleteComponent",
+        json!({ "ResourceGroupName": "exclusive-rg", "ComponentName": "web-tier" }),
+    )
+    .await;
+    assert_eq!(status, 200, "DeleteComponent: got body {body:?}");
+    for arn in [INSTANCE_ARN, OTHER_INSTANCE_ARN] {
+        let (status, body) = call(
+            &router,
+            "DescribeComponent",
+            json!({ "ResourceGroupName": "exclusive-rg", "ComponentName": arn }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {arn:?}: an ungrouped instance is a standalone component again, got {body:?}"
+        );
+        assert_eq!(
+            body["ResourceList"],
+            json!([arn]),
+            "case {arn:?}: that component stands for its own resource, got {body:?}"
+        );
+    }
+    let (status, body) = call(
+        &router,
+        "CreateComponent",
+        json!({
+            "ResourceGroupName": "exclusive-rg",
+            "ComponentName": "regrouped",
+            "ResourceList": [INSTANCE_ARN, OTHER_INSTANCE_ARN],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a released resource must be groupable again, got {body:?}"
+    );
+
+    // Only a CUSTOM component is ungrouped: a name the application holds no
+    // custom component for is refused with that component's own refusal.
+    let (status, body) = call(
+        &router,
+        "DeleteComponent",
+        json!({ "ResourceGroupName": "exclusive-rg", "ComponentName": "no-such-tier" }),
+    )
+    .await;
+    assert_refused(
+        "ungrouping a name the application does not hold",
+        status,
+        &body,
+        "ResourceNotFoundException",
+        "Custom component no-such-tier does not exist for exclusive-rg",
+    );
 }
 
 /// An operation addressing a component of an application that EXISTS is refused, naming

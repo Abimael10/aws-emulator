@@ -44,6 +44,13 @@ service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = tru
 # edit ONE set, which is why a table tagged through DynamoDB's own API is discoverable
 # through `GetResources`.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# Amazon EC2 holds the tag sets of the account's instances, volumes, VPCs and the
+# rest of its taggable resources, so those are rows of the projection a reporting
+# read — and every resource query resolved against it — selects out of. Projection
+# only: the namespace is not linked into the WRITE path, so this crate's own store
+# stays the tag home for an `ec2` ARN a caller asks THIS API to tag. See
+# `src/state/owners.rs`.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
 # A general purpose S3 bucket carries the tag set this API reads and writes for the `s3`
 # namespace: `PutBucketTagging`/`DeleteBucketTagging` there and `TagResources`/
@@ -79,9 +86,6 @@ percent-encoding = "2.3"
 # and ECS resolves that reference against this service's records, so the propagation suite
 # creates the group through its OWN API before creating the provider it tags.
 service-com-amazonaws-autoscaling-autoscaling-2011-01-01 = { workspace = true }
-# Amazon EC2 holds the account's launch templates, which an Auto Scaling group launches its
-# instances from: the group that suite creates needs its launch template in that store first.
-service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

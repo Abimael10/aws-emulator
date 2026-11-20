@@ -9,12 +9,13 @@
 //! SAME `ApplicationInfo` for one stored application instead of three
 //! hand-assembled ones that can drift.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{ApplicationComponent, ApplicationInfo, Tag};
 
+pub mod ec2;
 pub mod resource_groups;
 
 /// The region a request is attributed to when it carries no SigV4 credential
@@ -56,6 +57,16 @@ pub fn component_missing_message(component_name: &str, resource_group_name: &str
 /// What Application Insights answers a request that would group anything other
 /// than EC2 instances into a custom component.
 pub const ONLY_EC2_INSTANCES_MESSAGE: &str = "Only EC2 Instance can be grouped.";
+
+/// What Application Insights answers a request that would group a resource one
+/// custom component of the application already holds: the ARN the request named,
+/// in the sentence's one variable place.
+///
+/// A resource belongs to ONE component of an application, so the second request
+/// to group it is refused rather than moving it or copying it.
+pub fn resource_already_grouped_message(resource_arn: &str) -> String {
+    format!("Component {resource_arn} is grouped in another component.")
+}
 
 /// What Application Insights answers a request whose `AccountId` names an account
 /// other than the caller's: the caller's account and the one it asked for.
@@ -262,6 +273,30 @@ impl Application {
         self.components.values().any(|component| component.monitor)
     }
 
+    /// The first resource of `resources` that a CUSTOM component of this
+    /// application already covers, or `None` when none of them is grouped yet.
+    ///
+    /// A resource of the application's resource group belongs to ONE component —
+    /// its own standalone one or a custom one — so a resource a custom component
+    /// already holds cannot be grouped into a second: that is the refusal
+    /// [`resource_already_grouped_message`] words. A DISCOVERED component is not
+    /// an obstacle, because grouping its resource is exactly what takes that
+    /// standalone component away ([`Self::ungroup_discovered`]).
+    pub fn grouped_in_another_component(&self, resources: &[String]) -> Option<String> {
+        resources
+            .iter()
+            .find(|resource_arn| {
+                self.components.values().any(|component| {
+                    component.origin == ComponentOrigin::Custom
+                        && component
+                            .resource_list
+                            .iter()
+                            .any(|held| held == *resource_arn)
+                })
+            })
+            .cloned()
+    }
+
     /// Drop the DEFAULT components standing for `resources`, because a custom
     /// component now groups them.
     ///
@@ -402,34 +437,60 @@ pub const MAX_COMPONENT_NAME: usize = 1011;
 /// resources its resource group resolves to.
 ///
 /// One component per resource, keyed and named by that resource's own ARN,
-/// grouping that one resource, in the `DEFAULT` tier and UNMONITORED — a
+/// covering that resource and the volumes attached to it
+/// ([`ec2::with_attached_volumes`]), in the `DEFAULT` tier and UNMONITORED — a
 /// component is monitored once a configuration says so. Bounded by
 /// [`COMPONENT_QUOTA`], the same ceiling `CreateComponent` holds one
 /// application's components to.
+///
+/// A resource that is PART OF another onboarded resource is not a component of
+/// its own: a volume attached to an onboarded instance is covered by that
+/// instance's component ([`ec2::attached_volumes`] is what says which), so a
+/// group that resolves to both reports one component, not two. Every other
+/// resource the group resolves to is onboarded whatever its type, because which
+/// resources the application covers is the group's answer and not this service's.
 pub fn onboarded_components(
     members: &[resource_groups::GroupMember],
+    attachments: &BTreeMap<String, Vec<String>>,
 ) -> BTreeMap<String, Component> {
+    // The volumes the instances of this membership already carry: each is part of
+    // its instance's component, so it is not onboarded as one of its own.
+    let covered: BTreeSet<&String> = members
+        .iter()
+        .filter_map(|member| attachments.get(&member.resource_arn))
+        .flatten()
+        .collect();
     members
         .iter()
         .filter(|member| {
-            !member.resource_arn.is_empty() && member.resource_arn.len() <= MAX_COMPONENT_NAME
+            !member.resource_arn.is_empty()
+                && member.resource_arn.len() <= MAX_COMPONENT_NAME
+                && !covered.contains(&member.resource_arn)
         })
         .take(COMPONENT_QUOTA)
         .map(|member| {
             (
                 member.resource_arn.clone(),
-                discovered_component(&member.resource_arn, member.resource_type.as_deref()),
+                discovered_component(
+                    &member.resource_arn,
+                    member.resource_type.as_deref(),
+                    ec2::with_attached_volumes(&member.resource_arn, attachments),
+                ),
             )
         })
         .collect()
 }
 
 /// The DEFAULT component one resource of the application's resource group is
-/// onboarded as.
-fn discovered_component(resource_arn: &str, resource_type: Option<&str>) -> Component {
+/// onboarded as, covering `resources` — that resource and whatever is part of it.
+pub fn discovered_component(
+    resource_arn: &str,
+    resource_type: Option<&str>,
+    resources: Vec<String>,
+) -> Component {
     Component {
         component_name: resource_arn.to_string(),
-        resource_list: vec![resource_arn.to_string()],
+        resource_list: resources,
         resource_type: component_resource_type(resource_type, resource_arn),
         os_type: None,
         tier: TIER_DEFAULT.to_string(),

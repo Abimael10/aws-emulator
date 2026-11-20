@@ -241,6 +241,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let members =
             crate::state::resource_groups::group_resources(ctx, &region, &resource_group_name)
                 .await;
+        // Which volumes the instances of that membership carry: a volume attached
+        // to an onboarded instance is part of that instance's component rather
+        // than a component of its own, and which volumes those are is Amazon
+        // EC2's to answer, so it is read from there over the same callback.
+        let attachments = crate::state::ec2::attached_volumes(ctx, &region).await;
         let now = ::std::time::SystemTime::now();
 
         // `AutoCreate` and `AutoConfigEnabled` ask for the RECOMMENDED
@@ -291,7 +296,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 discovery_type: Some(discovery_type.to_string()),
                 remarks: None,
                 tags: input.tags.unwrap_or_default(),
-                components: crate::state::onboarded_components(&members),
+                components: crate::state::onboarded_components(&members, &attachments),
                 // Onboarding is owed by the clock from here, so the application
                 // this call reports is still `CREATING`.
                 onboarded_at: now + crate::state::ONBOARDING_SPAN,

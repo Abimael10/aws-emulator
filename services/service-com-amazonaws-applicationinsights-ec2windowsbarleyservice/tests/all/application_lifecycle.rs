@@ -377,10 +377,14 @@ async fn component_resource_type_is_derived_from_the_grouped_arns() {
             Some("AWS::EC2::Instance"),
         ),
         (
+            // Two instances of their own: a resource one component already
+            // groups cannot be grouped into a second
+            // (`admission_checks.rs`), so each row names instances no other
+            // row has taken.
             "two-instances",
             &[
-                "arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0",
                 "arn:aws:ec2:us-east-1:000000000000:instance/i-00000000000000002",
+                "arn:aws:ec2:us-east-1:000000000000:instance/i-00000000000000003",
             ],
             Some("AWS::EC2::Instance"),
         ),
@@ -512,14 +516,16 @@ async fn paging_components_visits_every_component_once() {
     assert_eq!(status, 200, "CreateApplication: got body {body:?}");
 
     let names: Vec<String> = (0..5).map(|n| format!("component-{n}")).collect();
-    for name in &names {
+    for (number, name) in names.iter().enumerate() {
+        // One instance per component: a resource one component groups is not
+        // grouped into a second (`admission_checks.rs`).
         let (status, body) = call(
             &router,
             "CreateComponent",
             json!({
                 "ResourceGroupName": "paged-rg",
                 "ComponentName": name,
-                "ResourceList": ["arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0"],
+                "ResourceList": [instance_arn(number)],
             }),
         )
         .await;
@@ -865,13 +871,16 @@ async fn store_quotas_are_enforced_at_their_boundary() {
         assert_eq!(status, 200, "CreateApplication: got body {body:?}");
 
         for n in 0..COMPONENT_QUOTA {
+            // One instance per component: a resource one component groups is not
+            // grouped into a second (`admission_checks.rs`), so each create
+            // inside the quota names an instance of its own.
             let (status, body) = call(
                 &router,
                 "CreateComponent",
                 json!({
                     "ResourceGroupName": "component-quota-rg",
                     "ComponentName": format!("component-{n:04}"),
-                    "ResourceList": [arn],
+                    "ResourceList": [instance_arn(n)],
                 }),
             )
             .await;
@@ -886,7 +895,7 @@ async fn store_quotas_are_enforced_at_their_boundary() {
             json!({
                 "ResourceGroupName": "component-quota-rg",
                 "ComponentName": "one-too-many",
-                "ResourceList": [arn],
+                "ResourceList": [instance_arn(COMPONENT_QUOTA)],
             }),
         )
         .await;
@@ -968,10 +977,17 @@ async fn components_are_keyed_per_application() {
         assert_eq!(status, 200, "creating {group}: got body {body:?}");
     }
 
-    let arn = "arn:aws:ec2:us-east-1:000000000000:instance/i-0123456789abcdef0";
     // Component names differing in form: plain, dotted, underscored, plus-signed
-    // — every one inside the `^[\d\w\-_\.+]*$` pattern the model declares.
-    for name in ["web", "web.tier", "web_tier", "web+tier", "3"] {
+    // — every one inside the `^[\d\w\-_\.+]*$` pattern the model declares. Each
+    // name groups an instance of its OWN, because a resource one component of an
+    // application groups is not grouped into a second (`admission_checks.rs`);
+    // the two applications group the same instances, which is what makes the
+    // point that their components are keyed per application.
+    for (number, name) in ["web", "web.tier", "web_tier", "web+tier", "3"]
+        .into_iter()
+        .enumerate()
+    {
+        let arn = instance_arn(number);
         // The same name creates once per application, and is in use the second
         // time within one application.
         for group in ["left-rg", "right-rg"] {
@@ -1059,8 +1075,9 @@ async fn components_are_keyed_per_application() {
 }
 
 /// An EC2 instance ARN, the one resource a custom component may group, numbered
-/// so a row can group several distinct instances.
-fn instance_arn(number: u8) -> String {
+/// so a row can group several DISTINCT instances — one per component, because a
+/// resource one component of an application groups is not grouped into a second.
+fn instance_arn(number: usize) -> String {
     format!(
         "arn:aws:ec2:us-east-1:{}:instance/i-{number:017x}",
         account_id()
@@ -1091,7 +1108,7 @@ async fn application_with_components(
             json!({
                 "ResourceGroupName": group,
                 "ComponentName": component,
-                "ResourceList": [instance_arn(u8::try_from(number).unwrap_or_default())],
+                "ResourceList": [instance_arn(number)],
             }),
         )
         .await;

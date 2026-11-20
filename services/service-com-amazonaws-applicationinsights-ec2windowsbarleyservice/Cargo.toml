@@ -36,6 +36,11 @@ base64 = "0.22"
 # rather than assuming the group exists. Only the generated client is needed —
 # the emulator supplies the transport.
 aws-sdk-resourcegroups = { version = "1", default-features = false }
+# Reads the account's EBS volume ATTACHMENTS over the same in-process callback:
+# a component covers an instance and the storage it runs on, and which volumes
+# an instance holds is Amazon EC2's to answer. Only the generated client is
+# needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

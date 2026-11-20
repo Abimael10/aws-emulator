@@ -6,7 +6,13 @@
 //! `ListComponents` report it from there.
 //!
 //! A custom component groups standalone EC2 instances, so a resource list naming
-//! anything else is refused rather than stored.
+//! anything else is refused rather than stored. A resource one custom component
+//! already holds is refused as well: a resource of the application belongs to ONE
+//! component.
+//!
+//! The stored component covers the resources the request grouped AND the volumes
+//! attached to them ([`crate::state::ec2`]), because a component covers its
+//! instances and the storage they run on.
 //!
 //! A resource the application onboarded as a DEFAULT (standalone) component stops
 //! being one once this call groups it: a resource belongs to one component of the
@@ -145,7 +151,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateComponentErrorModeled::InternalServerException(
                 InternalServerException {
@@ -183,7 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ResourceList` is stored verbatim and carries no modelled length bound,
         // so the emulator's own bound is what stops one request growing the store
-        // without end.
+        // without end. The volumes the stored list is widened with below are each
+        // part of one of these resources, so the bound is stated once, here, over
+        // what the request asked to group.
         if input.resource_list.len() > crate::state::COMPONENT_RESOURCE_QUOTA {
             return Err(CreateComponentErrorModeled::ValidationException(ValidationException {
                 message: Some(format!(
@@ -193,6 +200,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
             .into());
+        }
+
+        // Which volumes the instances this call groups carry: a component covers
+        // its instances and the storage they run on, and which volumes those are
+        // is Amazon EC2's to answer, so it is read from there before the store is
+        // locked.
+        let region = crate::state::request_region(ctx);
+        let attachments = crate::state::ec2::attached_volumes(ctx, &region).await;
+        let mut resource_list = input.resource_list.clone();
+        for resource_arn in &input.resource_list {
+            for volume in attachments.get(resource_arn).into_iter().flatten() {
+                if !resource_list.iter().any(|held| held == volume) {
+                    resource_list.push(volume.clone());
+                }
+            }
         }
 
         let mut store = state.lock();
@@ -215,6 +237,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A resource belongs to ONE component of the application: one a custom
+        // component already holds is not grouped into a second, and the refusal
+        // names the resource the request asked for.
+        if let Some(grouped) = application.grouped_in_another_component(&input.resource_list) {
+            ::tracing::debug!(
+                resource = %grouped,
+                "a resource a custom component already holds cannot be grouped again"
+            );
+            return Err(CreateComponentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::resource_already_grouped_message(&grouped)),
+                },
+            )
+            .into());
+        }
         // The emulator's own bound on how many components one application holds.
         if application.components.len() >= crate::state::COMPONENT_QUOTA {
             return Err(CreateComponentErrorModeled::ValidationException(ValidationException {
@@ -230,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.component_name.clone(),
             crate::state::Component {
                 component_name: input.component_name,
-                resource_list: input.resource_list.clone(),
+                resource_list,
                 resource_type,
                 os_type: None,
                 tier: crate::state::TIER_DEFAULT.to_string(),
