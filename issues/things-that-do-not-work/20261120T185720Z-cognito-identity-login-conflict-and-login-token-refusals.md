@@ -1,0 +1,74 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: cogid-merge-idp-proven-identity-login-conflicts
+Issue-Step: task#13
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: cogid-merge-idp-proven-identity-login-conflicts cogid-creds-developer-authenticated-credentials-envelope
+Issue-Shape-Id: com.amazonaws.cognitoidentity#AWSCognitoIdentityService
+Issue-Key: cognito-identity|GetOpenIdTokenForDeveloperIdentity|4xx->2xx|$.__type
+Issue-Key: cognito-identity|GetOpenIdTokenForDeveloperIdentity|4xx->2xx|$.message
+Issue-Key: cognito-identity|GetOpenIdTokenForDeveloperIdentity|4xx->2xx|$headers.x-amzn-errortype
+Issue-Key: cognito-identity|GetOpenIdTokenForDeveloperIdentity|4xx->2xx|status
+Issue-Key: cognito-identity|GetCredentialsForIdentity|4xx->4xx|$.__type
+Issue-Key: cognito-identity|GetCredentialsForIdentity|4xx->4xx|$.message
+Issue-Related: 20261116T235533Z-cognito-identity-getcredentialsforidentity-applies-the-customrolearn-eligibility-rule--r3.md
+Issue-Commit: 597db9eebaefdf1df0a6fca4ca797f56db8217fd
+
+# cognito-identity: login-conflict and login-token refusals on the developer-identity vending path are missing or mis-classified
+
+> _Note: this issue was identified against the code base at commit `597db9eebaefdf1df0a6fca4ca797f56db8217fd`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetOpenIdTokenForDeveloperIdentity
+
+## Description
+Two net-new root causes in the cognito-identity service, both on the path that validates the Logins map before a token or credential is vended. Each must be closed before submitting. The shared fault is that the login-validation stage of this path either does not run at all (Cause 1) or runs after a later eligibility rule and therefore reports the wrong refusal (Cause 2), so a request AWS refuses is either accepted outright or refused as the wrong error class.
+
+=== Cause 1 of 2: GetOpenIdTokenForDeveloperIdentity accepts a developer login that is already linked elsewhere and mints a token, instead of refusing ResourceConflictException "Cannot link these logins." ===
+AWS: a GetOpenIdTokenForDeveloperIdentity call that would link a login to an identity when that login (or the identity's existing public-provider login) is already proven to a different identity is a link conflict and is refused, not satisfied. The response is an awsJson1_1 error: HTTP 400 with body member `__type` = `ResourceConflictException`, response header `x-amzn-errortype` carrying the same class (awsJson1_1 states the error class in both the body and the header, so the class must be right in both), and body member `message` = `Cannot link these logins.` That message is entirely FIXED text: no identity id, pool id, provider name, user identifier or other request/state value is interpolated into it. Smithy (com.amazonaws.cognitoidentity#AWSCognitoIdentityService, awsJson1_1): GetOpenIdTokenForDeveloperIdentity models ResourceConflictException (client, @httpError 409) whose own documentation is "Thrown when a user tries to use a login which is already linked to another account" — i.e. exactly this condition — alongside NotAuthorizedException (403), DeveloperUserAlreadyRegisteredException (400), InvalidParameterException (400), ResourceNotFoundException (404) and TooManyRequestsException (429); input members IdentityPoolId (required, @length 1..55, @pattern ^[\w-]+:[0-9a-f-]+$), IdentityId (same constraints), Logins (required, LoginsMap @length 0..10), PrincipalTags (@length 0..50), TokenDuration (@range 1..86400). The model does not fix the HTTP status for this refusal and the recorded AWS status is 400 rather than ResourceConflictException's modeled 409 — that status, and the message text, are recorded behavior only.
+Emulator: HTTP 200 with a normal success envelope. No `__type`, no `message` and no `x-amzn-errortype` header are emitted at all — the conflicting link is accepted and an OpenID token is minted for it.
+Why: this is over-permissive, which is the worse direction. A client relying on AWS's behavior uses this refusal as the authoritative test that a developer-provider user is not already bound to another identity; on the emulator the call succeeds, so two identities end up sharing a login that AWS would never have allowed to link, and the application's identity-to-user invariant is silently broken. A negative test that asserts the conflict refusal cannot pass at all, and the downstream steps of the same flow then observe merged/duplicated identity state that a real account would never produce.
+Fix: the developer-identity link/conflict check in the GetOpenIdTokenForDeveloperIdentity handler — before minting a token, resolve every Logins entry against the pool's existing identity-to-login bindings and raise ResourceConflictException with AWS's fixed message when the link would attach a login already proven to another identity. The `x-amzn-errortype` header follows from the chosen error class in the awsJson1_1 error serializer, so it needs no separate change once the class is raised.
+Traces: cogid-merge-idp-proven-identity-login-conflicts#task#13 (representative of this cause, the whole cluster).
+Related open issues that the replay report does NOT record as owning this replay key, and that do not cover it: '20261114T065108Z-cognito-identity-9-net-new-root-causes-developer.md' Cause 1 reports the OPPOSITE mis-classification (an ownership mismatch answered ResourceConflictException "Cannot merge these identities." where AWS wants NotAuthorizedException) and is grounded in behavioral check ids, not this fixture step; '20261113T131245Z-cognito-identity-developer-identity-ownership-refusals-are-mis.md' covers LookupDeveloperIdentity ownership refusals; '20261029T230931Z-cognito-identity-identity-merge-and-login-list-state.md' covers the merge/login-list state this fixture's later steps also diverge on. None of them carries a refusal that never arrives for this operation.
+
+=== Cause 2 of 2: GetCredentialsForIdentity applies the CustomRoleArn eligibility rule before validating the Logins token, so a non-Cognito login token is refused InvalidParameterException instead of NotAuthorizedException ===
+AWS: when a GetCredentialsForIdentity request is wrong in both ways — a Logins entry whose value is not a Cognito-issued OpenID token, together with a CustomRoleArn the pool's role configuration does not permit — the login token is validated FIRST, so the refusal is the token refusal. The response is HTTP 400 with body `__type` = `NotAuthorizedException`, header `x-amzn-errortype: NotAuthorizedException:` and body `message` = `Invalid login token. Not a Cognito token.` That message is entirely fixed text with no variable parts: no provider name, ARN, identity id or member name is interpolated. Smithy: GetCredentialsForIdentity models NotAuthorizedException (client, @httpError 403, doc "Thrown when a user is not authorized to access the requested resource") and InvalidParameterException (client, @httpError 400, doc "Thrown for missing or bad input parameter(s)"), plus ExternalServiceException (400), InvalidIdentityPoolConfigurationException (400), ResourceConflictException (409), ResourceNotFoundException (404), TooManyRequestsException (429), InternalErrorException (500); input IdentityId required (@length 1..55, @pattern ^[\w-]+:[0-9a-f-]+$), Logins LoginsMap (@length 0..10), CustomRoleArn ARNString (@length 20..2048). The model does not express the ordering between the token check and the CustomRoleArn eligibility check, and the recorded AWS status is 400 rather than NotAuthorizedException's modeled 403 — ordering and status are recorded behavior only.
+Emulator: HTTP 400 (so the status itself is not the divergence) but `__type` = `InvalidParameterException`, header `x-amzn-errortype: InvalidParameterException:` and `message` = `Only SAML providers and providers with RoleMappings support custom role ARN.` That is the generic custom-role-ARN eligibility refusal — correct wording for a request whose ONLY fault is an ineligible role ARN, but it fires here before the login token is ever inspected.
+Why: a client branching on the error class takes the wrong branch. NotAuthorizedException means "re-authenticate: this federated login token is stale, forged or from another issuer", and application code reacts by refreshing the login and retrying; InvalidParameterException with this message means "stop sending CustomRoleArn". So a caller holding a non-Cognito or expired token either retries the same bad token forever or strips a CustomRoleArn that was never the problem, and never learns its login needs refreshing.
+Fix: the input-validation ordering and error selection in the GetCredentialsForIdentity handler — validate each Logins entry's token (issuer, shape, pool binding) BEFORE applying the CustomRoleArn eligibility rule, and raise NotAuthorizedException with AWS's fixed message for a non-Cognito token.
+Traces: cogid-creds-developer-authenticated-credentials-envelope#task#7 (representative of this cause, the whole cluster).
+Related open issue that the replay report does NOT record as owning this replay key: '20261116T235533Z-cognito-identity-getcredentialsforidentity-applies-the-customrolearn-eligibility-rule--r3.md' describes this same validation-ordering fault, but the replay report returns this cluster with an EMPTY owned_by (its recorded key does not join this run's cluster key `service=cognito-identity|GetCredentialsForIdentity|status=400->400|keys=$.__type,$.message,$headers.x-amzn-errortype`, and the cluster has also narrowed from two members to one), so it is reported unowned and re-filed here with the current key set. '20261030T212445Z-cognito-identity-developer-identity-token-and-credential-refusals.md' describes neighbouring symptoms on the same path.
+
+## Evidence
+Replay of trace set simparity-wire-aws-v1 against the emulator built from this checkout: emulator_up true (/__admin/health answered 200), 57 fixtures replayed, 498 steps, 461 passed, 37 mismatched, 0 errored, 0 blocked, score 92.6%, 11 divergence clusters. Nine of the eleven clusters are already owned by open issues or blocked by a stub and are skipped; the two clusters below came back with an empty owned_by and no stub_path.
+
+Cause 1 — cluster divergence_key `service=cognito-identity|GetOpenIdTokenForDeveloperIdentity|status=400->200|keys=$.__type,$.message,$headers.x-amzn-errortype,status`, verdict mismatch, affected_count 1:
+- status: expected 400, got 200.
+- $.__type: missing — expected 'ResourceConflictException', got None.
+- $.message: missing — expected 'Cannot link these logins.' (fixed text, no variable parts), got None.
+- $headers.x-amzn-errortype: missing — expected the ResourceConflictException error-type header, got None.
+Failing step: cogid-merge-idp-proven-identity-login-conflicts#task#13.
+
+Cause 2 — cluster divergence_key `service=cognito-identity|GetCredentialsForIdentity|status=400->400|keys=$.__type,$.message,$headers.x-amzn-errortype`, verdict mismatch, affected_count 1:
+- status: expected 400, actual 400 (no status divergence).
+- $.__type: expected 'NotAuthorizedException', got 'InvalidParameterException'.
+- $.message: expected 'Invalid login token. Not a Cognito token.' (fixed text, no variable parts), got 'Only SAML providers and providers with RoleMappings support custom role ARN.'
+- $headers.x-amzn-errortype: expected the NotAuthorizedException error-type header ('NotAuthorizedException:'), got 'InvalidParameterException:'.
+Failing step: cogid-creds-developer-authenticated-credentials-envelope#task#7.
+
+Smithy (services/service-com-amazonaws-cognitoidentity-awscognitoidentityservice/smithy-model/com-amazonaws-cognitoidentity-awscognitoidentityservice.json): GetOpenIdTokenForDeveloperIdentity errors = DeveloperUserAlreadyRegisteredException(400), InternalErrorException(500), InvalidParameterException(400), NotAuthorizedException(403), ResourceConflictException(409), ResourceNotFoundException(404), TooManyRequestsException(429); ResourceConflictException = client error, @httpError 409, single `message` member, doc "Thrown when a user tries to use a login which is already linked to another account". GetCredentialsForIdentity errors = ExternalServiceException(400), InternalErrorException(500), InvalidIdentityPoolConfigurationException(400), InvalidParameterException(400), NotAuthorizedException(403), ResourceConflictException(409), ResourceNotFoundException(404), TooManyRequestsException(429); NotAuthorizedException = client error, @httpError 403, doc "Thrown when a user is not authorized to access the requested resource"; InvalidParameterException = client error, @httpError 400, doc "Thrown for missing or bad input parameter(s)". Recorded wire status for both refusals is 400.
+
+## Steps to Reproduce
+Cause 1 (GetOpenIdTokenForDeveloperIdentity link conflict never refused):
+1. CreateIdentityPool with AllowUnauthenticatedIdentities and a developer provider name, and register a public (IdP) provider login against one identity so that login is proven to it (the fixture's earlier steps do this via GetId / GetOpenIdToken / GetOpenIdTokenForDeveloperIdentity).
+2. Call GetOpenIdTokenForDeveloperIdentity for a request that would link a login already proven to a DIFFERENT identity in the same pool (IdentityPoolId plus an IdentityId and a Logins map whose entry is held by another identity).
+3. AWS answers HTTP 400 with __type 'ResourceConflictException', the x-amzn-errortype header carrying that class, and message 'Cannot link these logins.'; the emulator answers HTTP 200 with a success envelope and no error members at all.
+4. Replay to confirm: fixture cogid-merge-idp-proven-identity-login-conflicts step task#13. Compare HTTP status, body __type, body message and the x-amzn-errortype header against the recorded response.
+
+Cause 2 (GetCredentialsForIdentity validation ordering):
+1. Create an identity pool and obtain an identity id, then obtain a developer-authenticated identity (the fixture's earlier steps do this).
+2. Call GetCredentialsForIdentity with that IdentityId, a Logins map whose single entry's value is NOT a Cognito-issued OpenID token, and a CustomRoleArn the pool's role configuration does not permit (no SAML provider and no RoleMappings entry for that provider).
+3. AWS answers HTTP 400 with __type 'NotAuthorizedException', header 'x-amzn-errortype: NotAuthorizedException:' and message 'Invalid login token. Not a Cognito token.'; the emulator answers HTTP 400 with __type 'InvalidParameterException', header 'x-amzn-errortype: InvalidParameterException:' and message 'Only SAML providers and providers with RoleMappings support custom role ARN.'
+4. Replay to confirm: fixture cogid-creds-developer-authenticated-credentials-envelope step task#7.
