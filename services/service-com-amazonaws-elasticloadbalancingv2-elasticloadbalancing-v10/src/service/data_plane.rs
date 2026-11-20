@@ -1691,6 +1691,12 @@ enum Performed {
 
 /// The load balancer a request was passed on to, and the port the registration says it
 /// receives traffic on — which is what selects the listener of ITS that answers.
+///
+/// How FAR such a chain is followed is the walk's, not this value's: [`serve`] keeps every
+/// load balancer the request has already been served against and answers
+/// [`TARGET_UNREACHABLE_STATUS`] for a hop that leads back to one of them, and
+/// [`MAX_PASSED_ON_HOPS`] caps the walk however long a chain of distinct load balancers a
+/// caller configures — so one request can re-enter listener resolution only that many times.
 #[derive(Debug)]
 struct PassedOn {
     load_balancer_arn: String,
@@ -2035,6 +2041,22 @@ fn forward(
         // ITS own listener rather than anything invented here. The port is the one the
         // registration says the target receives traffic on, which is the listener of its that
         // takes the connection.
+        //
+        // A registration naming the load balancer whose own listener took this request leads
+        // straight back to this listener, so it is answered here rather than handed on: a
+        // configuration that leads back to a load balancer already serving the request
+        // answers nothing. The same condition over SEVERAL load balancers, and the length of
+        // the chain itself, are what the walk that takes each hop refuses
+        // ([`serve`]'s `walked` and [`MAX_PASSED_ON_HOPS`]), so no chain is followed without
+        // bound whichever hop closes it.
+        if target.id == listener.load_balancer_arn {
+            tracing::warn!(
+                load_balancer = %listener.load_balancer_arn,
+                "the target group's target names the load balancer serving this request, so \
+                 the chain leads nowhere and the request is not passed on"
+            );
+            return Performed::Answered(Served::status(TARGET_UNREACHABLE_STATUS));
+        }
         if store.load_balancers.contains_key(&target.id) {
             return Performed::PassedOn(Box::new(PassedOn {
                 load_balancer_arn: target.id.clone(),
@@ -2070,6 +2092,19 @@ fn forward(
         // "the port on which the target is listening" (`TargetDescription$Port`), which is
         // the target group's own port for a registration that names none.
         port: target.port.or(group.port),
+        // The security groups GOVERNING that address, as the scheduler running the workload
+        // declared them, and the load balancer the connection comes FROM: what decides
+        // whether the connection a `forward` makes can arrive at all
+        // ([`crate::state::target_reachability`]). Read HERE, under the guard that already
+        // holds the records, and evaluated where the hand-off is made.
+        guarded_by: crate::state::GuardingGroups::clone(&target.guarded_by),
+        connected_from: store
+            .load_balancers
+            .get(&listener.load_balancer_arn)
+            .map(crate::state::target_reachability::ConnectionSource::of_load_balancer)
+            // A load balancer this store no longer holds says nothing about where the
+            // connection comes from, which decides nothing either way.
+            .unwrap_or_default(),
         // The pin that answer hands back, for a client that does not hold it already: it
         // accompanies the response the TARGET produced, as a `lambda` target's does.
         set_cookie: (distribution.sticky && pinned.is_none()).then(|| {

@@ -42,6 +42,13 @@
 //! body is invented for it: the load balancer's own error page is not a document this emulator
 //! holds, exactly as the sibling statuses this plane answers carry none
 //! ([`super::data_plane`]).
+//!
+//! And so is a registration the security groups governing it admit NO connection to from this
+//! load balancer on that port: the connection a `forward` opens is the same connection a health
+//! check of the registration opens, so the same firewall decides it
+//! ([`crate::state::target_reachability`]) — a request to a target nothing admits reaches no
+//! server at all, whatever stands behind the registration, so what the client is answered is
+//! the load balancer's own status and never the target's response.
 
 use super::data_plane::{DataPlaneRequest, Served, TARGET_UNREACHABLE_STATUS};
 
@@ -64,6 +71,14 @@ pub(super) struct Forwarded {
     /// listening" — which is the target's own port when it carries one and the target group's
     /// otherwise.
     pub(super) port: Option<i32>,
+    /// The security groups GOVERNING the address this registration names, as the scheduler
+    /// running the workload behind it declared them (`crate::state::GuardingGroups`), and
+    /// empty for a registration nothing declares them for — whose groups are the ones the
+    /// account's own inventory reports for the resource it names.
+    pub(super) guarded_by: crate::state::GuardingGroups,
+    /// The load balancer the connection comes FROM, as an inbound rule of those groups can
+    /// name it ([`crate::state::target_reachability::ConnectionSource`]).
+    pub(super) connected_from: crate::state::target_reachability::ConnectionSource,
     /// The `Set-Cookie` field the answer carries, where the forward action pins the client to
     /// the target group this request was distributed to
     /// ([`super::target_group_selection`]). The load balancer's own, so it accompanies the
@@ -72,8 +87,10 @@ pub(super) struct Forwarded {
 }
 
 /// Serve one request with the workload the target `forwarded` names runs, and answer what that
-/// server answered — or the load balancer's own [`TARGET_UNREACHABLE_STATUS`] when this
-/// emulator has no server behind the registration on that port.
+/// server answered — or the load balancer's own [`TARGET_UNREACHABLE_STATUS`] where the
+/// connection cannot be made at all: no security group governing the registration admits it
+/// from this load balancer, or this emulator has no server behind the registration on that
+/// port.
 ///
 /// Every answer records what the load balancer OBSERVED while producing it, which is what its
 /// own access log carries for the request ([`super::access_logs`]): the `forward` it performed,
@@ -109,6 +126,29 @@ fn proxied<Eng: Send + Sync + 'static>(
         );
         return Served::status(TARGET_UNREACHABLE_STATUS);
     };
+    // Whether this connection can ARRIVE: the security groups governing what the registration
+    // names admit it only where an inbound rule of one of them covers this port and names this
+    // load balancer ([`crate::state::target_reachability`]). Read before anything behind the
+    // target is asked, because a connection nothing admits is answered by nothing — the same
+    // reading that fails every health check of such a registration
+    // (`crate::state::host_counts`).
+    if crate::state::target_reachability::connection_is_blocked(
+        engine,
+        &forwarded.target_type,
+        &forwarded.target_id,
+        port,
+        &forwarded.guarded_by,
+        &forwarded.connected_from,
+    ) {
+        ::tracing::warn!(
+            target = %forwarded.target_id,
+            port,
+            "no security group governing the target admits a connection from this load \
+             balancer on the port its registration receives traffic on, so the connection to \
+             it cannot be made"
+        );
+        return Served::status(TARGET_UNREACHABLE_STATUS);
+    }
     // How long the TARGET took, which the access-log record reports for a connection that was
     // made at all.
     let started = ::std::time::Instant::now();

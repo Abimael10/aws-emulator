@@ -125,6 +125,10 @@ pub use host_counts::{check_registrations, drive_host_count_metrics, HostCountPu
 /// hands a client's request to it and for the health check of the registration.
 pub mod target_servers;
 
+/// Whether the load balancer may open the CONNECTION a `forward` to a registered target
+/// makes — the same firewall its health check of that registration is admitted by.
+pub mod target_reachability;
+
 /// The load balancer's OWN network interfaces, which live in the inventory EC2 holds.
 pub mod service_interfaces;
 

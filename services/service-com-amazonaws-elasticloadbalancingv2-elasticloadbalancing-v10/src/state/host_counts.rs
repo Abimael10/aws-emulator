@@ -1442,7 +1442,11 @@ fn health_check_is_blocked(target: &Checked, held: &Inventory) -> bool {
 }
 
 /// The `GroupId` of every security group one network interface is associated with.
-fn interface_group_ids(interface: &ec2_types::NetworkInterface) -> Vec<String> {
+///
+/// `pub(super)` because the FORWARD of a client's request reads the same interfaces to decide
+/// whether the connection it makes is admitted ([`super::target_reachability`]): one reading of
+/// an interface's groups, so the check and the forward cannot drift.
+pub(super) fn interface_group_ids(interface: &ec2_types::NetworkInterface) -> Vec<String> {
     interface
         .groups
         .iter()
@@ -1452,7 +1456,9 @@ fn interface_group_ids(interface: &ec2_types::NetworkInterface) -> Vec<String> {
 }
 
 /// Every private IPv4 and IPv6 address one network interface holds.
-fn interface_addresses_of(interface: &ec2_types::NetworkInterface) -> Vec<String> {
+///
+/// `pub(super)` for the same reason [`interface_group_ids`] is.
+pub(super) fn interface_addresses_of(interface: &ec2_types::NetworkInterface) -> Vec<String> {
     let private = interface
         .private_ip_addresses
         .iter()
