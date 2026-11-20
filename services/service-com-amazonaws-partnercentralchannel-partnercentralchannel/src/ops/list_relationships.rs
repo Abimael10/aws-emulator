@@ -174,8 +174,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     identifier,
                     crate::state::PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX,
                 ) else {
-                    return Err(refusal(
-                        "programManagementAccountIdentifiers",
+                    return Err(format_refusal(
+                        "programManagementAccountIdentifiers.member",
                         format!(
                             "Value '{identifier}' at \
                              'programManagementAccountIdentifiers.member' failed to satisfy \
@@ -192,25 +192,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a value set, so a value outside one is refused rather than ignored.
         if let Some(sort) = input.sort.as_ref() {
             if !LIST_RELATIONSHIPS_SORT_NAME_VALUES.contains(&sort.sort_by.as_str()) {
-                return Err(refusal(
+                return Err(enum_refusal(
                     "sort.sortBy",
-                    format!(
-                        "Value '{}' at 'sort.sortBy' failed to satisfy constraint: Member must \
-                         satisfy enum value set: [{}]",
-                        sort.sort_by,
-                        LIST_RELATIONSHIPS_SORT_NAME_VALUES.join(", ")
-                    ),
+                    &sort.sort_by,
+                    LIST_RELATIONSHIPS_SORT_NAME_VALUES,
                 ));
             }
             if !SORT_ORDER_VALUES.contains(&sort.sort_order.as_str()) {
-                return Err(refusal(
+                return Err(enum_refusal(
                     "sort.sortOrder",
-                    format!(
-                        "Value '{}' at 'sort.sortOrder' failed to satisfy constraint: Member must \
-                         satisfy enum value set: [{}]",
-                        sort.sort_order,
-                        SORT_ORDER_VALUES.join(", ")
-                    ),
+                    &sort.sort_order,
+                    SORT_ORDER_VALUES,
                 ));
             }
         }
@@ -236,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(refusal(
+                    return Err(format_refusal(
                         "nextToken",
                         format!(
                             "Value '{token}' at 'nextToken' failed to satisfy constraint: Member \
@@ -245,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ));
                 };
                 if cursor.filter_fingerprint != filter_fingerprint {
-                    return Err(refusal(
+                    return Err(format_refusal(
                         "nextToken",
                         "Value at 'nextToken' failed to satisfy constraint: Member must be a \
                          token returned for the same filters and sort"
@@ -271,6 +263,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a reporting operation may make: materialise what the
         // clock already owed.
         guard.advance_clock();
+
+        // The entitlement gate, after the request's form and before any lookup.
+        if let Some(denied) = guard.entitlement_refusal() {
+            return Err(ListRelationshipsErrorModeled::AccessDeniedException(denied).into());
+        }
 
         let mut matching: Vec<&crate::state::Relationship> = guard
             .relationships
@@ -320,10 +317,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Refuse `member` with the modelled `ValidationException` (HTTP 400).
-fn refusal(member: &str, message: String) -> ListRelationshipsError {
-    ListRelationshipsErrorModeled::ValidationException(crate::state::validation_exception(
-        member, message,
+/// Refuse `member` with the modelled `ValidationException` (HTTP 400) because
+/// `value` is outside the model's own value set for it.
+fn enum_refusal(member: &str, value: &str, values: &[&str]) -> ListRelationshipsError {
+    ListRelationshipsErrorModeled::ValidationException(crate::state::enum_validation_exception(
+        member, value, values,
     ))
+    .into()
+}
+
+/// Refuse `member` with the modelled `ValidationException` (HTTP 400) because the
+/// FORM of its value is wrong.
+fn format_refusal(member: &str, message: String) -> ListRelationshipsError {
+    ListRelationshipsErrorModeled::ValidationException(
+        crate::state::format_validation_exception(member, message),
+    )
     .into()
 }

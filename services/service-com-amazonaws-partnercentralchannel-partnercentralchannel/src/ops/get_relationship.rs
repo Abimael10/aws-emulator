@@ -164,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::RELATIONSHIP_ID_PREFIX,
         ) else {
             return Err(GetRelationshipErrorModeled::ValidationException(
-                crate::state::validation_exception(
+                crate::state::format_validation_exception(
                     "identifier",
                     format!(
                         "Value '{}' at 'identifier' failed to satisfy constraint: Member must be \
@@ -180,7 +180,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX,
         ) else {
             return Err(GetRelationshipErrorModeled::ValidationException(
-                crate::state::validation_exception(
+                crate::state::format_validation_exception(
                     "programManagementAccountIdentifier",
                     format!(
                         "Value '{}' at 'programManagementAccountIdentifier' failed to satisfy \
@@ -197,6 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock already owed, which was due at this instant whether or not
         // anybody called.
         guard.advance_clock();
+
+        // The entitlement gate, after the request's form and before any lookup.
+        if let Some(denied) = guard.entitlement_refusal() {
+            return Err(GetRelationshipErrorModeled::AccessDeniedException(denied).into());
+        }
 
         // A relationship is addressed by (catalog, parent account, id), so a
         // record that does not sit under exactly those is not found.

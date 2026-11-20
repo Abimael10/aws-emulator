@@ -10,6 +10,52 @@ Issue-Commit: 8dd4ff80cd36ae979d1a78db550805b7fd844998
 
 > _Note: this issue was identified against the code base at commit `8dd4ff80cd36ae979d1a78db550805b7fd844998`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+## Resolution
+
+The program-management-account plane now answers the way this issue describes, and one residual
+half of the single cause is DECLINED as a vendor-level gap.
+
+Fixed:
+* `ListProgramManagementAccounts` and `DeleteProgramManagementAccount` were 501 stubs — neither
+  operation existed. Both are implemented in
+  `services/service-com-amazonaws-partnercentralchannel-partnercentralchannel/src/ops/`, computing
+  every answer from `src/state.rs`: the list always serializes `items` (the empty list when the
+  catalog and filters select nothing), pages it behind an opaque `nextToken`, and the delete removes
+  exactly the account its `identifier` addresses (bare id or ARN), which the list then no longer
+  reports.
+* The partner-entitlement gate the issue describes is implemented in `src/state.rs`
+  (`entitlement_refusal`) and applied by every operation of this service that AWS gates on an
+  active AWS Partner benefit, after the modelled shape constraints and before any resource lookup.
+  An un-entitled caller is refused the modelled `AccessDeniedException` (HTTP 403) with the fixed
+  partner-benefit sentence, identically on a repeat; a malformed request is still a
+  `ValidationException` (HTTP 400); an entitled caller reaches the lookup and gets
+  `ResourceNotFoundException` (404) for a well-formed identifier no account answers to.
+  `ListChannelHandshakes` stays outside the gate, as the recordings show.
+* Pinned by `tests/all/program_management_account_plane.rs`.
+
+Declined (vendor-level), the same blocker the already-closed
+`20261022T004906Z-partnercentral-channel-listchannelhandshakes-returns-404-and-awsjson1-1.md`
+recorded: the recorded requests for this service are **SigV4A**-signed
+(`Authorization: AWS4-ECDSA-P256-SHA256`), and with request authentication on the emulator refuses
+them `403 AccessDenied "Sign the request with the emulator credentials"` BEFORE any handler runs, so
+the replay key still diverges for that reason alone. The only registered authenticator is
+`SigV4Authenticator` (`vendor/server/src/request_authentication.rs`), whose `recognizes` accepts
+`AWS4-HMAC-SHA256` only; `authenticator_for` in
+`vendor/smithy-server-runtime/src/multi_service_router.rs` refuses a request no authenticator
+recognizes, and `MultiServiceRouter::new` registers no other. There is no service-level seam to add
+one and `vendor/` is read-only here. Closing it needs a SigV4A authenticator in the core library
+(`AWS4-ECDSA-P256-SHA256`, `X-Amz-Region-Set`, `*` region scope) registered beside the SigV4 one,
+which would serve every `aws.auth#sigv4a` service rather than this one. With authentication off, the
+same requests are served exactly as above.
+
+Also vendor-level: the framework's own constraint walk (which refuses a modelled `@pattern`,
+`@length`, `@range` or enum violation before a handler runs) renders its refusal in a pre-dispatch
+envelope that carries only `__type` and `message`, so it cannot emit the modelled `fieldList`. For
+those violations the count sentence and the offending member and rule are stated in `message`
+(`1 validation error detected: Value … at 'identifier' failed to satisfy constraint: …`). A rule
+this service applies itself answers with the modelled shape: `message` = `1 validation error
+detected.`, `reason` = `REQUEST_VALIDATION_FAILED`, and a one-entry `fieldList`.
+
 ## Operation
 ListProgramManagementAccounts
 

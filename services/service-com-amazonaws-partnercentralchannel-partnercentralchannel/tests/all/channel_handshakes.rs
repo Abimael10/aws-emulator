@@ -16,17 +16,29 @@
 //! so a response that is not computed from persisted state fails here.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_partnercentralchannel_partnercentralchannel::EmulatedService;
+use service_com_amazonaws_partnercentralchannel_partnercentralchannel::{
+    ComAmazonawsPartnercentralchannelPartnercentralchannelState, EmulatedService,
+};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
-/// A router with one freshly-engined copy of this service mounted.
+/// A router with one freshly-engined copy of this service mounted, for a caller
+/// that holds an active AWS Partner benefit.
 fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Deterministic regardless of the process-wide default: these cases are about
     // the service's behaviour, not about SigV4.
     router.set_request_authentication(false);
+    // `CreateChannelHandshake` is gated on the calling account holding an active AWS
+    // Partner benefit, which no modelled operation grants — it is recorded here, by an
+    // in-process caller holding the shared engine, standing in for an entitled partner
+    // account. These cases are about the handshake family, not about the gate, whose
+    // own table is in `program_management_account_plane.rs`.
+    engine
+        .state::<ComAmazonawsPartnercentralchannelPartnercentralchannelState>()
+        .lock()
+        .grant_partner_entitlement(engine::emulator_account_id());
     router.register_service(EmulatedService::new(engine));
     router
 }

@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::resolve_identifier(&input.identifier, crate::state::RELATIONSHIP_ID_PREFIX)
                 .map(str::to_string)
         else {
-            return Err(refusal(
+            return Err(format_refusal(
                 "identifier",
                 format!(
                     "Value '{}' at 'identifier' failed to satisfy constraint: Member must be a \
@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map(str::to_string)
         else {
-            return Err(refusal(
+            return Err(format_refusal(
                 "programManagementAccountIdentifier",
                 format!(
                     "Value '{}' at 'programManagementAccountIdentifier' failed to satisfy \
@@ -197,6 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         guard.advance_clock();
+
+        // The entitlement gate, after the request's form and before any lookup.
+        if let Some(denied) = guard.entitlement_refusal() {
+            return Err(UpdateRelationshipErrorModeled::AccessDeniedException(denied).into());
+        }
 
         // Addressed by (catalog, parent account, id), the same way the read is.
         let addressed = guard.relationships.get(&id).is_some_and(|relationship| {
@@ -274,10 +279,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Refuse `member` with the modelled `ValidationException` (HTTP 400).
-fn refusal(member: &str, message: String) -> UpdateRelationshipError {
-    UpdateRelationshipErrorModeled::ValidationException(crate::state::validation_exception(
-        member, message,
-    ))
+/// Refuse `member` with the modelled `ValidationException` (HTTP 400) because the
+/// FORM of its value is wrong.
+fn format_refusal(member: &str, message: String) -> UpdateRelationshipError {
+    UpdateRelationshipErrorModeled::ValidationException(
+        crate::state::format_validation_exception(member, message),
+    )
     .into()
 }

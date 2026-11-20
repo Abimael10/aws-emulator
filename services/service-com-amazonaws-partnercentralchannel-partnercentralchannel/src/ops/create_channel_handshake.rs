@@ -189,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(resource) =
             crate::state::resolve_associated_resource(&input.associated_resource_identifier)
         else {
-            return Err(refusal(
+            return Err(format_refusal(
                 "associatedResourceIdentifier",
                 format!(
                     "Value '{}' at 'associatedResourceIdentifier' failed to satisfy constraint: \
@@ -262,7 +262,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::PROGRAM_MANAGEMENT_ACCOUNT_ID_PREFIX,
                 );
                 let Some(id) = resolved else {
-                    return Err(refusal(
+                    return Err(format_refusal(
                         member,
                         format!(
                             "Value '{identifier}' at '{member}' failed to satisfy constraint: \
@@ -282,6 +282,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         guard.advance_clock();
+
+        // The entitlement gate, after the request's form and before the ledger
+        // and the lookup: a refused request spends no client token.
+        if let Some(denied) = guard.entitlement_refusal() {
+            return Err(CreateChannelHandshakeErrorModeled::AccessDeniedException(denied).into());
+        }
 
         match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
             crate::state::TokenOutcome::Fresh => {}
@@ -523,6 +529,14 @@ fn refusal(member: &str, message: String) -> CreateChannelHandshakeError {
     CreateChannelHandshakeErrorModeled::ValidationException(crate::state::validation_exception(
         member, message,
     ))
+    .into()
+}
+
+/// Refuse `member` because the FORM of its value is wrong.
+fn format_refusal(member: &str, message: String) -> CreateChannelHandshakeError {
+    CreateChannelHandshakeErrorModeled::ValidationException(
+        crate::state::format_validation_exception(member, message),
+    )
     .into()
 }
 

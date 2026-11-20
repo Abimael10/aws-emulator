@@ -15,14 +15,15 @@
 //! their own output shapes from what they read back out of here, never from the
 //! request that created the record.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    ChannelHandshakeSummary, HandshakeDetail, RelationshipDetail, RelationshipSummary, SupportPlan,
-    Tag, ValidationException, ValidationExceptionField,
+    AccessDeniedException, ChannelHandshakeSummary, HandshakeDetail, ProgramManagementAccountSummary,
+    RelationshipDetail, RelationshipSummary, SupportPlan, Tag, ValidationException,
+    ValidationExceptionField,
 };
 
 /// The ARN namespace this service stamps on every ARN, from the model's
@@ -117,6 +118,19 @@ pub const CHANNEL_HANDSHAKE_RESOURCE_TYPE: &str = "ChannelHandshake";
 /// The `ValidationExceptionReason` a malformed request carries, from the model's
 /// value set `BUSINESS_VALIDATION_FAILED | REQUEST_VALIDATION_FAILED`.
 pub const REQUEST_VALIDATION_FAILED: &str = "REQUEST_VALIDATION_FAILED";
+
+/// What this service answers a caller whose account holds no active AWS Partner
+/// benefit: the entitlement gate's refusal, carried by the modelled
+/// `AccessDeniedException` (HTTP 403, the status its `@httpError` declares).
+///
+/// The gate is an account-level authorization stage rather than a per-request
+/// computation, so the sentence is fixed and interpolates nothing: it names no
+/// resource, no principal and no action. It is the sentence the real API answers
+/// this class with; the model documents the shape only as "insufficient
+/// permissions".
+pub const PARTNER_ENTITLEMENT_REQUIRED: &str = "This action requires an active AWS Partner \
+     benefit. Register as an AWS Partner if you haven't already, or contact AWS Partner Central \
+     Support.";
 
 /// How many client tokens the idempotency ledger remembers. Reached only by
 /// distinct caller-supplied tokens; the oldest entry is evicted to make room, so
@@ -224,21 +238,58 @@ pub fn resolve_associated_resource(identifier: &str) -> Option<AssociatedResourc
     })
 }
 
-/// A `ValidationException` (HTTP 400) naming the member that was refused and why.
-/// Built here so every handler refuses a request this service's own rules reject
-/// in the same shape: the message, the modelled `reason`, and a one-entry
-/// `fieldList`.
-pub fn validation_exception(member: &str, message: impl Into<String>) -> ValidationException {
-    let message = message.into();
+/// The `code` a `ValidationExceptionField` carries, naming the class of rule the
+/// value broke. The model types the member as a plain required `String` and
+/// documents no value set, so these are the names this service family's refusals
+/// are recorded with: a value whose FORM is wrong (a pattern, an id, an ARN, an
+/// opaque token) is `INVALID_STRING_FORMAT`, one outside a model value set is
+/// `INVALID_ENUM_VALUE`, and anything else unusable is `INVALID_VALUE`.
+pub const INVALID_VALUE: &str = "INVALID_VALUE";
+pub const INVALID_STRING_FORMAT: &str = "INVALID_STRING_FORMAT";
+pub const INVALID_ENUM_VALUE: &str = "INVALID_ENUM_VALUE";
+
+/// The wrapper sentence a `ValidationException`'s `message` states: how many
+/// member violations the refusal reports, and nothing else. The per-member detail
+/// — which member, and which rule it broke — is the `fieldList`'s job, so the
+/// count is the whole message. Fixed text but for the count, which is taken from
+/// the `fieldList` it wraps.
+fn validation_error_count_message(violations: usize) -> String {
+    let plural = if violations == 1 { "" } else { "s" };
+    format!("{violations} validation error{plural} detected.")
+}
+
+/// A `ValidationException` (HTTP 400) naming the member that was refused, the
+/// class of rule it broke and the rule itself. Built here so every handler
+/// refuses a request this service's own rules reject in the same shape: the
+/// counted message, the modelled `reason`, and a one-entry `fieldList`.
+pub fn field_validation_exception(
+    member: &str,
+    code: &str,
+    clause: impl Into<String>,
+) -> ValidationException {
+    let field = ValidationExceptionField {
+        name: member.to_string(),
+        code: code.to_string(),
+        message: clause.into(),
+    };
     ValidationException {
-        message: message.clone(),
+        message: validation_error_count_message(1),
         reason: REQUEST_VALIDATION_FAILED.to_string(),
-        field_list: Some(vec![ValidationExceptionField {
-            name: member.to_string(),
-            code: "InvalidValue".to_string(),
-            message,
-        }]),
+        field_list: Some(vec![field]),
     }
+}
+
+/// A `ValidationException` (HTTP 400) refusing `member` for a rule that is not
+/// about its form or its value set: [`INVALID_VALUE`].
+pub fn validation_exception(member: &str, message: impl Into<String>) -> ValidationException {
+    field_validation_exception(member, INVALID_VALUE, message)
+}
+
+/// A `ValidationException` (HTTP 400) refusing `member` because the FORM of the
+/// value is wrong — it is not the id, ARN, pattern or opaque token the member
+/// accepts: [`INVALID_STRING_FORMAT`].
+pub fn format_validation_exception(member: &str, message: impl Into<String>) -> ValidationException {
+    field_validation_exception(member, INVALID_STRING_FORMAT, message)
 }
 
 /// A `ValidationException` (HTTP 400) refusing `member` because `value` is
@@ -249,8 +300,9 @@ pub fn enum_validation_exception(
     value: &str,
     values: &[&str],
 ) -> ValidationException {
-    validation_exception(
+    field_validation_exception(
         member,
+        INVALID_ENUM_VALUE,
         format!(
             "Value '{value}' at '{member}' failed to satisfy constraint: Member must satisfy \
              enum value set: [{}]",
@@ -279,6 +331,28 @@ pub struct ProgramManagementAccount {
     /// Stored rather than slept for: [`PartnerCentralChannelState::advance_clock`]
     /// materialises it the next time any handler touches the store.
     pub active_at: SystemTime,
+}
+
+impl ProgramManagementAccount {
+    /// This account as the `ProgramManagementAccountSummary`
+    /// `ListProgramManagementAccounts` returns. Every member the summary shape
+    /// declares is reported, each from the stored record, so a list page says
+    /// the same thing about an account as the create that minted it.
+    pub fn to_summary(&self) -> ProgramManagementAccountSummary {
+        ProgramManagementAccountSummary {
+            id: Some(self.id.clone()),
+            revision: Some(self.revision.to_string()),
+            catalog: Some(self.catalog.clone()),
+            program: Some(self.program.clone()),
+            display_name: Some(self.display_name.clone()),
+            account_id: Some(self.account_id.clone()),
+            arn: Some(self.arn.clone()),
+            created_at: Some(self.created_at),
+            updated_at: Some(self.updated_at),
+            start_date: Some(self.start_date),
+            status: Some(self.status.clone()),
+        }
+    }
 }
 
 /// A relationship as stored, the child of exactly one program management account.
@@ -614,6 +688,15 @@ pub struct ComAmazonawsPartnercentralchannelPartnercentralchannelState {
     /// Monotonic counter mixed into a minted id, so two resources created in the
     /// same nanosecond still get different ids.
     id_sequence: u64,
+    /// The AWS accounts that hold an active AWS Partner benefit — the whole input
+    /// to the entitlement gate ([`Self::entitlement_refusal`]).
+    ///
+    /// EMPTY at state init, and deliberately so: holding a partner benefit is a
+    /// property of an account that this API cannot establish — it models no
+    /// partner registration — so no account is entitled until something outside
+    /// the API records one. Seeding an entitled account here would make the gate
+    /// unobservable.
+    partner_accounts: BTreeSet<String>,
 }
 
 impl ComAmazonawsPartnercentralchannelPartnercentralchannelState {
@@ -635,6 +718,39 @@ impl ComAmazonawsPartnercentralchannelPartnercentralchannelState {
                 account.status = STATUS_ACTIVE.to_string();
             }
         }
+    }
+
+    /// Whether `account` holds an active AWS Partner benefit, which is what the
+    /// entitlement gate admits a request on.
+    pub fn has_active_partner_benefit(&self, account: &str) -> bool {
+        self.partner_accounts.contains(account)
+    }
+
+    /// Record an active AWS Partner benefit for `account`, so the gate admits its
+    /// requests. `true` when this call is what recorded it.
+    ///
+    /// No modelled operation reaches this: the API has none that registers a
+    /// partner, so the entitlement arrives from outside the API — which in this
+    /// emulator means an in-process caller holding the shared engine (a test
+    /// standing in for an entitled partner account). Nothing on the wire can
+    /// grant itself the entitlement.
+    pub fn grant_partner_entitlement(&mut self, account: &str) -> bool {
+        self.partner_accounts.insert(account.to_string())
+    }
+
+    /// The entitlement gate: `Some(..)` when the one account this emulator
+    /// presents holds no active AWS Partner benefit, so the request is refused
+    /// with the modelled `AccessDeniedException` rather than served.
+    ///
+    /// A handler applies this AFTER the modelled shape constraints — so a
+    /// malformed request is a `ValidationException` whether the caller is
+    /// entitled or not — and BEFORE any resource lookup, so an un-entitled caller
+    /// never learns whether a resource exists.
+    pub fn entitlement_refusal(&self) -> Option<AccessDeniedException> {
+        (!self.has_active_partner_benefit(&caller_account_id())).then(|| AccessDeniedException {
+            message: PARTNER_ENTITLEMENT_REQUIRED.to_string(),
+            reason: None,
+        })
     }
 
     /// A fresh id of `prefix`'s kind, matching the model's `^<prefix>[a-z0-9]{13}$`:
@@ -740,6 +856,41 @@ impl ComAmazonawsPartnercentralchannelPartnercentralchannelState {
                 self.idempotency.remove(&oldest);
             }
         }
+    }
+}
+
+/// The equality filters `ListProgramManagementAccounts` accepts: each is `None`
+/// when the request omitted it (no constraint) and `Some(values)` otherwise.
+/// Built by the handler and carried here so the matching rule and the token
+/// fingerprint read the same thing.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProgramManagementAccountFilters {
+    pub catalog: String,
+    pub account_ids: Option<Vec<String>>,
+    pub display_names: Option<Vec<String>>,
+    pub programs: Option<Vec<String>>,
+    pub statuses: Option<Vec<String>>,
+}
+
+impl ProgramManagementAccountFilters {
+    /// Does `account` satisfy every filter?
+    ///
+    /// The catalog scopes the list (an account lives in exactly one catalog), and
+    /// each remaining filter matches when the account's corresponding field
+    /// equals any of that filter's values; several filters are ANDed. An omitted
+    /// filter constrains nothing.
+    pub fn matches(&self, account: &ProgramManagementAccount) -> bool {
+        fn any_equals(values: &Option<Vec<String>>, field: &str) -> bool {
+            values
+                .as_ref()
+                .is_none_or(|values| values.iter().any(|value| value == field))
+        }
+
+        account.catalog == self.catalog
+            && any_equals(&self.account_ids, &account.account_id)
+            && any_equals(&self.display_names, &account.display_name)
+            && any_equals(&self.programs, &account.program)
+            && any_equals(&self.statuses, &account.status)
     }
 }
 

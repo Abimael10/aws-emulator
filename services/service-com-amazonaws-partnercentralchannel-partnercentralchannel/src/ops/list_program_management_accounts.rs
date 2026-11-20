@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProgramManagementAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProgramManagementAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a pure READ — it pages over the program management accounts in
+//! [`crate::state`], honouring the equality filters, the optional sort and
+//! `maxResults`, and hands out an opaque `nextToken` that resumes the same scan.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProgramManagementAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is staged the way the real API answers: the modelled shape
+//! constraints first (the centralized walk, then this handler's own re-checks of
+//! the value sets it filters on), then the caller's AWS Partner entitlement
+//! ([`crate::state::ComAmazonawsPartnercentralchannelPartnercentralchannelState::entitlement_refusal`]),
+//! and only then the store itself — so a malformed request is a
+//! `ValidationException` whatever the caller holds, and an un-entitled caller
+//! learns nothing about which accounts exist.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +162,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProgramManagementAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProgramManagementAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProgramManagementAccounts"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListProgramManagementAccountsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the service is not mounted on a state-bearing engine".into(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `programs` and `statuses` are modelled as lists of the `Program` and
+        // `ProgramManagementAccountStatus` enums, so the boundary refuses a value
+        // outside either set before this runs — but a client that sends an
+        // unmodelled-but-well-formed string must still be refused rather than
+        // silently matching nothing.
+        for (member, values, allowed) in [
+            ("programs", input.programs.as_ref(), PROGRAM_VALUES),
+            (
+                "statuses",
+                input.statuses.as_ref(),
+                PROGRAM_MANAGEMENT_ACCOUNT_STATUS_VALUES,
+            ),
+        ] {
+            for value in values.into_iter().flatten() {
+                if !allowed.contains(&value.as_str()) {
+                    return Err(enum_refusal(&format!("{member}.member"), value, allowed));
+                }
+            }
+        }
+
+        // `sort` is optional; when present the model fixes both of its members to
+        // a value set, so a value outside one is refused rather than ignored.
+        if let Some(sort) = input.sort.as_ref() {
+            if !LIST_PROGRAM_MANAGEMENT_ACCOUNTS_SORT_NAME_VALUES.contains(&sort.sort_by.as_str()) {
+                return Err(enum_refusal(
+                    "sort.sortBy",
+                    &sort.sort_by,
+                    LIST_PROGRAM_MANAGEMENT_ACCOUNTS_SORT_NAME_VALUES,
+                ));
+            }
+            if !SORT_ORDER_VALUES.contains(&sort.sort_order.as_str()) {
+                return Err(enum_refusal(
+                    "sort.sortOrder",
+                    &sort.sort_order,
+                    SORT_ORDER_VALUES,
+                ));
+            }
+        }
+
+        let filters = crate::state::ProgramManagementAccountFilters {
+            catalog: input.catalog.clone(),
+            account_ids: input.account_ids.clone(),
+            display_names: input.display_names.clone(),
+            programs: input.programs.clone(),
+            statuses: input.statuses.clone(),
+        };
+        let descending = input
+            .sort
+            .as_ref()
+            .is_some_and(|sort| sort.sort_order == "Descending");
+        let sorted = input.sort.is_some();
+
+        // The page token carries the filters and the sort it was taken with, so
+        // resuming a walk with different ones is refused rather than answered
+        // with a page of a different result set.
+        let filter_fingerprint = crate::state::fingerprint(&(&filters, sorted, descending));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = crate::state::decode_page_token(token) else {
+                    return Err(format_refusal(
+                        "nextToken",
+                        format!(
+                            "Value '{token}' at 'nextToken' failed to satisfy constraint: Member \
+                             must be a token returned by a previous \
+                             ListProgramManagementAccounts call"
+                        ),
+                    ));
+                };
+                if cursor.filter_fingerprint != filter_fingerprint {
+                    return Err(format_refusal(
+                        "nextToken",
+                        "Value at 'nextToken' failed to satisfy constraint: Member must be a \
+                         token returned for the same filters and sort"
+                            .to_string(),
+                    ));
+                }
+                cursor.offset
+            }
+        };
+
+        // `maxResults` is modelled `@default: 20` with `@range(min: 1, max: 100)`,
+        // so the boundary normally fills it in. Clamped to at least one here as
+        // well: a zero page would return nothing while still carrying a token
+        // whose offset never advances, so a walk would never terminate.
+        let max_results = if input.max_results == 0 {
+            crate::state::DEFAULT_MAX_RESULTS
+        } else {
+            input.max_results
+        };
+        let page_size = usize::try_from(max_results).unwrap_or(1).max(1);
+
+        let mut guard = state.lock();
+        // The only write a reporting operation may make: materialise what the
+        // clock already owed.
+        guard.advance_clock();
+
+        // The entitlement gate, after the request's form and before any lookup.
+        if let Some(denied) = guard.entitlement_refusal() {
+            return Err(
+                ListProgramManagementAccountsErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
+
+        let mut matching: Vec<&crate::state::ProgramManagementAccount> = guard
+            .program_management_accounts
+            .iter_in_order()
+            .filter(|account| filters.matches(account))
+            .collect();
+        if sorted {
+            // The model's only `ListProgramManagementAccountsSortName` is
+            // `UpdatedAt`. The sort is stable, so accounts sharing an `updatedAt`
+            // keep their creation order and a page boundary never duplicates or
+            // skips one.
+            matching.sort_by(|left, right| {
+                let key = |account: &crate::state::ProgramManagementAccount| {
+                    (account.updated_at.secs(), account.updated_at.subsec_nanos())
+                };
+                if descending {
+                    key(right).cmp(&key(left))
+                } else {
+                    key(left).cmp(&key(right))
+                }
+            });
+        }
+
+        // One extra record is taken: its presence is what says another page
+        // exists, and the token resumes exactly where this page stopped.
+        let window: Vec<ProgramManagementAccountSummary> = matching
+            .into_iter()
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .map(crate::state::ProgramManagementAccount::to_summary)
+            .collect();
+        let has_more = window.len() > page_size;
+        let items: Vec<ProgramManagementAccountSummary> =
+            window.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: offset + items.len(),
+                filter_fingerprint,
+            })
+        });
+
+        Ok(ListProgramManagementAccountsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
+}
+
+/// Refuse `member` with the modelled `ValidationException` (HTTP 400) because the
+/// FORM of its value is wrong.
+fn format_refusal(member: &str, message: String) -> ListProgramManagementAccountsError {
+    ListProgramManagementAccountsErrorModeled::ValidationException(
+        crate::state::format_validation_exception(member, message),
+    )
+    .into()
+}
+
+/// Refuse `member` with the modelled `ValidationException` (HTTP 400) because
+/// `value` is outside the model's own value set for it.
+fn enum_refusal(
+    member: &str,
+    value: &str,
+    values: &[&str],
+) -> ListProgramManagementAccountsError {
+    ListProgramManagementAccountsErrorModeled::ValidationException(
+        crate::state::enum_validation_exception(member, value, values),
+    )
+    .into()
 }

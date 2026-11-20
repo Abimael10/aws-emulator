@@ -211,8 +211,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut resolved = Vec::with_capacity(identifiers.len());
             for identifier in identifiers {
                 let Some(resource) = crate::state::resolve_associated_resource(identifier) else {
-                    return Err(refusal(
-                        "associatedResourceIdentifiers",
+                    return Err(format_refusal(
+                        "associatedResourceIdentifiers.member",
                         format!(
                             "Value '{identifier}' at 'associatedResourceIdentifiers.member' \
                              failed to satisfy constraint: Member must be a program management \
@@ -345,7 +345,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => 0,
             Some(token) => {
                 let Some(cursor) = crate::state::decode_page_token(token) else {
-                    return Err(refusal(
+                    return Err(format_refusal(
                         "nextToken",
                         format!(
                             "Value '{token}' at 'nextToken' failed to satisfy constraint: Member \
@@ -354,7 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ));
                 };
                 if cursor.filter_fingerprint != filter_fingerprint {
-                    return Err(refusal(
+                    return Err(format_refusal(
                         "nextToken",
                         "Value at 'nextToken' failed to satisfy constraint: Member must be a \
                          token returned for the same filters and sort"
@@ -380,6 +380,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a reporting operation may make: materialise what the
         // clock already owed.
         guard.advance_clock();
+
+        // NO entitlement gate here, unlike every other operation of this service:
+        // this list is how a prospective partner sees the invitations addressed to
+        // it, so it is reachable by an account that holds no AWS Partner benefit
+        // yet.
 
         let mut matching: Vec<&crate::state::ChannelHandshake> = guard
             .channel_handshakes
@@ -461,6 +466,14 @@ fn refusal(member: &str, message: String) -> ListChannelHandshakesError {
     ListChannelHandshakesErrorModeled::ValidationException(crate::state::validation_exception(
         member, message,
     ))
+    .into()
+}
+
+/// Refuse `member` because the FORM of its value is wrong.
+fn format_refusal(member: &str, message: String) -> ListChannelHandshakesError {
+    ListChannelHandshakesErrorModeled::ValidationException(
+        crate::state::format_validation_exception(member, message),
+    )
     .into()
 }
 

@@ -201,6 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock();
 
+        // The entitlement gate, after the request's form and before the ledger
+        // and the lookup: a refused request spends no client token.
+        if let Some(denied) = guard.entitlement_refusal() {
+            return Err(
+                CreateProgramManagementAccountErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
+
         match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
             crate::state::TokenOutcome::Fresh => {}
             // A retry of the same create: answer with the account the first call
