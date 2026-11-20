@@ -46,20 +46,20 @@ const REGION: &str = "us-west-2";
 const AMI: &str = "ami-0123456789abcdef0";
 
 /// The namespace an instance's own metrics are published under.
-const NAMESPACE: &str = "AWS/EC2";
+pub(crate) const NAMESPACE: &str = "AWS/EC2";
 
 /// The one dimension they are dimensioned on.
-const INSTANCE_ID_DIMENSION: &str = "InstanceId";
+pub(crate) const INSTANCE_ID_DIMENSION: &str = "InstanceId";
 
 /// The shortest period any of these series is published at, in seconds.
-const MINUTE: i64 = 60;
+pub(crate) const MINUTE: i64 = 60;
 
 /// The period the guest measurements of an instance with BASIC monitoring are published at.
-const FIVE_MINUTES: i64 = 300;
+pub(crate) const FIVE_MINUTES: i64 = 300;
 
 /// How many minutes of the sampler's clock one simulated span covers: wide enough to hold
 /// several 5-minute periods and so to tell the two cadences apart.
-const SPAN_MINUTES: i64 = 10;
+pub(crate) const SPAN_MINUTES: i64 = 10;
 
 /// How far into a minute each simulated sample is taken, in seconds: NOT on a period boundary,
 /// so a datapoint stamped with the boundary can only have been stamped with the period's start
@@ -185,7 +185,7 @@ const METRIC_ROWS: &[MetricRow] = &[
 ];
 
 /// A `(key, value)` request parameter.
-fn p(key: &str, value: impl Into<String>) -> (String, String) {
+pub(crate) fn p(key: &str, value: impl Into<String>) -> (String, String) {
     (key.to_string(), value.into())
 }
 
@@ -193,7 +193,7 @@ fn p(key: &str, value: impl Into<String>) -> (String, String) {
 /// mounts them: the series an instance publishes land in the metric store CloudWatch itself
 /// serves its readers from. The engine is handed back too, so a case can advance the sampler's
 /// own clock.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -203,7 +203,7 @@ fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
 }
 
 /// One EC2 call that must be served, as its XML body.
-async fn ec2_ok(
+pub(crate) async fn ec2_ok(
     router: &MultiServiceRouter,
     case: &str,
     action: &str,
@@ -218,7 +218,7 @@ async fn ec2_ok(
 }
 
 /// One Amazon CloudWatch call that must be served, as its JSON payload.
-async fn cloudwatch_ok(
+pub(crate) async fn cloudwatch_ok(
     router: &MultiServiceRouter,
     case: &str,
     operation: &str,
@@ -260,7 +260,7 @@ async fn cloudwatch_ok(
 }
 
 /// Launch `count` instances and answer their ids, in launch order.
-async fn launch(router: &MultiServiceRouter, case: &str, count: usize) -> Vec<String> {
+pub(crate) async fn launch(router: &MultiServiceRouter, case: &str, count: usize) -> Vec<String> {
     let body = ec2_ok(
         router,
         case,
@@ -317,7 +317,7 @@ async fn reported_states(
 /// Look again until the instance `instance_id` names reports `state` and `monitoring`, or
 /// [`POLL_DEADLINE`] has passed — waiting for the CONDITION the clock owes rather than for a
 /// span of time.
-async fn poll_until_reported(
+pub(crate) async fn poll_until_reported(
     router: &MultiServiceRouter,
     case: &str,
     instance_id: &str,
@@ -415,7 +415,7 @@ fn window_start(at: i64, period: i64) -> i64 {
 /// sample is the publish the running emulator makes on its own, asked for at an instant of this
 /// suite's choosing: that is what lets one test cover ten periods of two cadences without
 /// waiting ten minutes for them.
-fn sample_the_span(engine: &engine::InMemoryEngine, base: i64) {
+pub(crate) fn sample_the_span(engine: &engine::InMemoryEngine, base: i64) {
     for minute in 0..SPAN_MINUTES {
         let at = UNIX_EPOCH
             + Duration::from_secs(
@@ -443,7 +443,7 @@ fn expected_periods(base: i64, period: i64) -> Vec<i64> {
 /// wall clock, so each span is laid over a whole number of periods of both cadences, and one
 /// phase's periods never overlap another's or one the service's own clock publishes into on the
 /// wall clock meanwhile.
-fn span_base(phase: i64) -> i64 {
+pub(crate) fn span_base(phase: i64) -> i64 {
     window_start(now_secs(), FIVE_MINUTES) + FIVE_MINUTES + phase * SPAN_MINUTES * MINUTE
 }
 

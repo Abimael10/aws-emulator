@@ -39,17 +39,21 @@ const MINUTE: f64 = 60.0;
 /// The namespace every series of this suite is published under.
 const NAMESPACE: &str = "MyApp/StorageResolution";
 
-/// A minute-aligned instant ten minutes in the past: recent enough to sit inside every retention
-/// tier, and aligned so the documented start-time rounding ("Start time less than 15 days ago -
-/// Round down to the nearest whole minute", `GetMetricDataInput$StartTime`) leaves a request's
-/// start exactly where it put it.
+/// An instant ten minutes in the past, on a boundary of every period the rows read: recent enough
+/// to sit inside every retention tier, and on the clock boundary of the widest of those periods so
+/// that a read's own window grid begins exactly where this base is rather than one window earlier
+/// ("Start time less than 15 days ago - Round down to the nearest whole minute",
+/// `GetMetricDataInput$StartTime`).
 fn base_time() -> f64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after the epoch")
         .as_secs_f64();
-    (now / MINUTE).floor() * MINUTE - 10.0 * MINUTE
+    (now / WIDEST_PERIOD).floor() * WIDEST_PERIOD - 10.0 * MINUTE
 }
+
+/// The widest `Period` any row reads, in seconds: the grid [`base_time`] sits on.
+const WIDEST_PERIOD: f64 = 300.0;
 
 /// The offsets, in seconds from the minute-aligned base, that every row publishes one
 /// observation at: two inside the first minute and one inside the second, so a read can tell a

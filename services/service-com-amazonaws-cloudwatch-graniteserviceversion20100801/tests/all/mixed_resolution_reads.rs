@@ -48,16 +48,20 @@ const HIGH_RESOLUTION_OFFSET: f64 = 37.0;
 /// of that minute, so the two datapoints are distinct instants of one minute.
 const REGULAR_RESOLUTION_OFFSET: f64 = 11.0;
 
-/// A minute-aligned instant ten minutes in the past: recent enough to sit inside every retention
-/// tier ("Data points with a period of less than 60 seconds are available for 3 hours"), and
-/// aligned so the documented start-time rounding leaves a request's start where it put it.
+/// An instant ten minutes in the past, on a boundary of every period the rows read: recent
+/// enough to sit inside every retention tier ("Data points with a period of less than 60 seconds
+/// are available for 3 hours"), and on the clock boundary of the widest of those periods so that
+/// a read's own window grid begins exactly where this base is rather than one window earlier.
 fn base_minute() -> f64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after the epoch")
         .as_secs_f64();
-    (now / MINUTE).floor() * MINUTE - 10.0 * MINUTE
+    (now / WIDEST_PERIOD).floor() * WIDEST_PERIOD - 10.0 * MINUTE
 }
+
+/// The widest `Period` any row reads, in seconds: the grid [`base_minute`] sits on.
+const WIDEST_PERIOD: f64 = 300.0;
 
 /// Publish the mixed series: one datapoint at each storage resolution, inside one minute.
 async fn publish(router: &MultiServiceRouter, base: f64) {

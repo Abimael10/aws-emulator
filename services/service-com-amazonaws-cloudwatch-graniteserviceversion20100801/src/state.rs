@@ -1263,6 +1263,30 @@ pub fn rounded_start(requested_start: f64, period: i32, now: f64) -> f64 {
     (requested_start / interval).floor() * interval
 }
 
+/// The start of the FIRST window a read lays over the range a request named: the start of the
+/// `period`-long clock window that the request's rounded start time falls INSIDE.
+///
+/// A read is of whole PERIODS. Each datapoint it answers aggregates one `period`-long window and
+/// is stamped with that window's own start ("The time stamp used for the data point",
+/// `Datapoint$Timestamp`), so the window the range opens in is read WHOLE rather than cut off at
+/// an instant in the middle of it: the datapoint of that period is answered even though the
+/// period began before the instant the caller named, and — because a window is stamped with its
+/// own start — every stamp a read answers with is the start of a clock window of that period.
+///
+/// The documented rounding of the requested start is applied first and unchanged
+/// ([`rounded_start`]: the whole minute, the 5-minute or the 1-hour clock interval the age of the
+/// range puts it on, and its own division of a minute for a sub-minute period). It decides the
+/// instant the range opens at; this is the window that instant falls inside. For a sub-minute
+/// period the two coincide, which is the case the model spells out: a query "at 15:07:17 for the
+/// previous 5 minutes of data, using a period of 5 seconds" receives "data timestamped between
+/// 15:02:15 and 15:07:15" (`GetMetricStatisticsInput$StartTime`) — each stamp the start of one of
+/// that period's own clock windows, the first of them before the instant the query named.
+pub fn first_window_start(requested_start: f64, period: i32, now: f64) -> f64 {
+    let rounded = rounded_start(requested_start, period, now);
+    let interval = f64::from(period.max(1));
+    (rounded / interval).floor() * interval
+}
+
 /// One series ONE write stored datapoints into: its identity, and the unit each of those
 /// datapoints carried.
 ///

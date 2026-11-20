@@ -301,24 +301,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_value(crate::state::range_order_message()));
         }
         let period = f64::from(input.period);
-        // How many data points the REQUEST asks for: the range the caller named, over the
-        // period the caller named. Measured from the requested start time and not from the
-        // rounded one below, because the cap is about what was requested.
-        let requested_datapoints = ((end - requested_start) / period).ceil();
+        // The one clock this read is answered against: the windows it lays, the tier a span is
+        // still readable at, and the datapoints inside it are all judged at the same instant.
+        let now = crate::state::now_secs();
+        // "CloudWatch rounds the specified time stamp" (`GetMetricStatisticsInput$StartTime`):
+        // the range opens at the ROUNDED start time rather than at the requested instant, and a
+        // read is of whole PERIODS — so the first window is the clock window of this period that
+        // the rounded start falls inside, read whole rather than cut off at an instant in the
+        // middle of it ([`crate::state::first_window_start`]).
+        let start = crate::state::first_window_start(requested_start, input.period, now);
+        // How many data points this call asks for: one per window it lays over the range, which
+        // is what the cap is on ("The maximum number of data points returned from a single call
+        // is 1,440") and what the refusal names.
+        let requested_datapoints = ((end - start) / period).ceil();
         if requested_datapoints > MAX_DATAPOINTS {
             return Err(invalid_combination(crate::state::datapoint_cap_exceeded(
                 requested_datapoints,
                 MAX_DATAPOINTS,
             )));
         }
-        // The one clock this read is answered against: the windows it lays, the tier a span is
-        // still readable at, and the datapoints inside it are all judged at the same instant.
-        let now = crate::state::now_secs();
-        // "CloudWatch rounds the specified time stamp" (`GetMetricStatisticsInput$StartTime`):
-        // the first window begins at the rounded start time, not at the requested instant, so
-        // a request whose start is not on a period boundary is answered at the boundaries
-        // CloudWatch lays — by the one rule every read of a series shares.
-        let start = crate::state::rounded_start(requested_start, input.period, now);
 
         // A metric's identity includes its dimension set, so only the series published with
         // exactly these dimensions answers this request.
@@ -343,10 +344,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &[][..]
             };
 
-        // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and
-        // anchored at the ROUNDED start time, folded by the one shared helper every reader of
-        // a series uses ([`crate::state::windows_by_unit`]) — which also decides, by the one
-        // retention rule, what a read at this period can still see.
+        // `StartTime` inclusive, `EndTime` exclusive; windows are `Period` seconds wide and laid
+        // from the FIRST of them — the clock window the rounded start falls inside — folded by
+        // the one shared helper every reader of a series uses
+        // ([`crate::state::windows_by_unit`]), which also decides, by the one retention rule,
+        // what a read at this period can still see.
         let buckets = crate::state::windows_by_unit(
             series,
             start,
