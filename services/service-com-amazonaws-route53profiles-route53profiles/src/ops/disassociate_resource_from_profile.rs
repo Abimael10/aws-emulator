@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateResourceFromProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateResourceFromProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateResourceFromProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the stored association between a Profile and a DNS resource
+//! and reports the record as it stood at removal, so the association's id names
+//! nothing from here on.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateResourceFromProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateResourceFromProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing here is derived from the request's region: a resource association
+        // reports no ARN of its own, and the resource's ARN comes from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateResourceFromProfileErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some(crate::state::NO_STORE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // The path names the (Profile, resource) pair rather than the association id,
+        // so the stored association is resolved through the pair it holds. A pair that
+        // is not associated — which is what a retry of a call that already succeeded
+        // names, and what an ARN naming a resource no Profile can hold is — resolves to
+        // nothing, and the refusal names both values the request gave, since either
+        // half of the pair can be the reason it does.
+        let not_associated = || {
+            DisassociateResourceFromProfileErrorModeled::ResourceNotFoundException(
+                crate::state::profile_resource_pair_not_found(
+                    &input.profile_id,
+                    &input.resource_arn,
+                ),
+            )
+        };
+        let association_id = store
+            .resource_association_for_pair(&input.profile_id, &input.resource_arn)
+            .map(|association| association.id.clone())
+            .ok_or_else(not_associated)?;
+
+        // Remove it, then report the record as it stood at removal: the association is
+        // gone from the store, so it is reported in the phase of being removed and
+        // `ModificationTime` is the instant it was removed. A resource association
+        // carries no ARN of its own, so no tag entry hangs off one to drop with it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateResourceFromProfile"))
+        // The lookup above and this removal happen under the SAME lock, so the id
+        // cannot stop naming the record in between; a store that no longer holds it is
+        // answered with the same refusal rather than by panicking.
+        let Some(mut removed) = store.profile_resource_associations.remove(&association_id) else {
+            return Err(not_associated().into());
+        };
+        removed.status = crate::state::resource_association_status(
+            crate::state::AssociationPhase::BeingRemoved,
+        )
+        .to_string();
+        removed.status_message = Some(crate::state::resource_association_status_message(
+            crate::state::AssociationPhase::BeingRemoved,
+            &removed.resource_type,
+        ));
+        removed.modification_time = ::std::time::SystemTime::now();
+        // Nothing is owed a record that no longer exists.
+        removed.owed_settle = None;
+        Ok(DisassociateResourceFromProfileOutput {
+            profile_resource_association: Some(crate::state::profile_resource_association_shape(
+                &removed,
+            )),
+        })
     }
 }

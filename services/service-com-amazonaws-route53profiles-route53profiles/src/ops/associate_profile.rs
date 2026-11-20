@@ -248,18 +248,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             owner_id: ::engine::emulator_account_id().to_string(),
             profile_id: input.profile_id,
             resource_id: input.resource_id,
-            // The association exists the moment it is recorded, so it is reported in
-            // the terminal `COMPLETE` status with no pending transition owed.
-            status: crate::state::STATUS_COMPLETE.to_string(),
-            status_message: None,
+            // The VPC association exists the moment it is recorded — AWS hands it
+            // back in the terminal status with no transition owed — so what this
+            // stores is the created association every read reports.
+            status: crate::state::profile_association_status(
+                crate::state::AssociationPhase::Settled,
+            )
+            .to_string(),
+            status_message: Some(crate::state::profile_association_status_message(
+                crate::state::AssociationPhase::Settled,
+            )),
             creation_time: now,
             modification_time: now,
         };
         store.record_tags(&arn, input.tags.unwrap_or_default());
-        // Insert, then report from the record now in the store.
+        // Insert, then report from the record now in the store — in the phase THIS
+        // call performed, the creation of the association it just accepted.
         let stored = store.profile_associations.entry(id).or_insert(association);
         Ok(AssociateProfileOutput {
-            profile_association: Some(crate::state::profile_association_shape(stored)),
+            profile_association: Some(
+                stored.shape_in_phase(crate::state::AssociationPhase::BeingApplied),
+            ),
         })
     }
 }

@@ -265,14 +265,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             owner_id: ::engine::emulator_account_id().to_string(),
             profile_id: input.profile_id,
             resource_arn: input.resource_arn,
+            // Both the status and its sentence name the phase the association is in
+            // and the kind of resource being applied, read off the record's own
+            // `ResourceType`.
+            status: crate::state::resource_association_status(
+                crate::state::AssociationPhase::BeingApplied,
+            )
+            .to_string(),
+            status_message: Some(crate::state::resource_association_status_message(
+                crate::state::AssociationPhase::BeingApplied,
+                &resource_type,
+            )),
             resource_type,
             resource_properties: input.resource_properties,
             creation_time: now,
             modification_time: now,
             // The resource still has to reach every VPC the Profile is associated
-            // with, so the association is reported `CREATING` until the move to
-            // `COMPLETE` the clock owes falls due.
-            settled_at: Some(started + crate::state::ASSOCIATION_SETTLE_DELAY),
+            // with, so the association is reported as being applied until the move to
+            // its settled phase the clock owes falls due.
+            owed_settle: Some(crate::state::OwedTransition::settle_after(started, now)),
         };
         // Insert, then report from the record now in the store.
         let stored = store
@@ -281,7 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_insert(association);
         Ok(AssociateResourceToProfileOutput {
             profile_resource_association: Some(crate::state::profile_resource_association_shape(
-                stored, started,
+                stored,
             )),
         })
     }

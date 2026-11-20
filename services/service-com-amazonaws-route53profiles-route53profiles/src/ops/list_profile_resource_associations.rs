@@ -192,7 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // of the same clock reading.
         let now = ::std::time::Instant::now();
 
-        let store = state.lock();
+        let mut store = state.lock();
+        // Materialise every move the clock had already made due, so a page reports
+        // each association in the phase it had reached rather than the one it was
+        // recorded in.
+        store.settle_due_associations(now);
         // The Profile is a required path label, so a Profile this account does not
         // hold is an id that names nothing rather than an empty listing.
         if !store.profiles.contains_key(&input.profile_id) {
@@ -239,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             profile_resource_associations: Some(
                 page.into_iter()
                     .map(|association| {
-                        crate::state::profile_resource_association_shape(association, now)
+                        crate::state::profile_resource_association_shape(association)
                     })
                     .collect(),
             ),

@@ -41,9 +41,11 @@ const PROFILE_RESOURCE_ASSOCIATION_ID_PREFIX: &str = "rpr";
 /// building — a member of [`crate::ops::types::PROFILE_STATUS_VALUES`].
 pub const STATUS_COMPLETE: &str = "COMPLETE";
 
-/// `ProfileStatus` of a resource association that is still being added to the
-/// Profile — a member of [`crate::ops::types::PROFILE_STATUS_VALUES`].
-pub const STATUS_CREATING: &str = "CREATING";
+/// `ProfileStatus` of an association whose resource is still being applied to the
+/// Profile: adding a DNS resource CHANGES the Profile the resource is being added
+/// to, so that is the status the association carries until the change has been
+/// applied — a member of [`crate::ops::types::PROFILE_STATUS_VALUES`].
+pub const STATUS_UPDATING: &str = "UPDATING";
 
 /// `ProfileStatus` of a Profile or association that has just been removed.
 pub const STATUS_DELETING: &str = "DELETING";
@@ -92,21 +94,56 @@ pub struct ProfileAssociation {
     pub resource_id: String,
     /// `Status`, one of [`crate::ops::types::PROFILE_STATUS_VALUES`].
     pub status: String,
+    /// `StatusMessage` — the sentence belonging to the lifecycle phase this record
+    /// is in ([`profile_association_status_message`]).
     pub status_message: Option<String>,
     pub creation_time: SystemTime,
     pub modification_time: SystemTime,
 }
 
-/// How long a resource association reports [`STATUS_CREATING`] before the move to
-/// [`STATUS_COMPLETE`] the clock owes falls due.
+/// How long a resource association is reported in the phase it is created in before
+/// the move to its settled phase the clock owes falls due.
 ///
-/// AWS answers `AssociateResourceToProfile` with a resource association that is
-/// still being built and reaches `COMPLETE` on its own later; an emulator must not
-/// make a caller wait as long as AWS does, so the transition is owed after this
-/// span instead. It is deliberately not zero, so a caller reading straight after
-/// the associate still observes the transient status, exactly as it would against
-/// AWS.
+/// AWS answers `AssociateResourceToProfile` with an association that is still being
+/// applied to the Profile and settles it on its own later; an emulator must not make
+/// a caller wait as long as AWS does, so the transition is owed after this span
+/// instead. It is deliberately not zero, so a caller reading straight after the
+/// associate still observes the transient phase, exactly as it would against AWS.
 pub const ASSOCIATION_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// A change to a record the CLOCK owes, rather than a caller: the move an
+/// association makes on its own once the work the associate call started has had
+/// time to finish.
+///
+/// Both halves of one reading of the clock are kept, because they answer different
+/// questions: [`Self::due`] is the monotonic instant the move falls due at, which is
+/// what a later call compares against, and [`Self::at`] is the wall-clock instant to
+/// report as the record's `ModificationTime` once it has — the instant the record
+/// CHANGED, not the instant some caller happened to notice, so every caller is told
+/// the same one.
+#[derive(Debug, Clone, Copy)]
+pub struct OwedTransition {
+    /// The monotonic instant the move falls due at.
+    pub due: Instant,
+    /// The wall-clock instant that same moment is, for `ModificationTime`.
+    pub at: SystemTime,
+}
+
+impl OwedTransition {
+    /// The move owed [`ASSOCIATION_SETTLE_DELAY`] after a call served at `started`
+    /// (monotonic) / `at` (wall clock).
+    pub fn settle_after(started: Instant, at: SystemTime) -> Self {
+        Self {
+            due: started + ASSOCIATION_SETTLE_DELAY,
+            at: at + ASSOCIATION_SETTLE_DELAY,
+        }
+    }
+
+    /// Whether the clock has already made this move due as of `now`.
+    pub fn is_due(&self, now: Instant) -> bool {
+        now >= self.due
+    }
+}
 
 /// A persisted association between a Profile and a DNS resource: every member the
 /// `ProfileResourceAssociation` shape reports.
@@ -126,23 +163,92 @@ pub struct ProfileResourceAssociation {
     /// `ResourceProperties`, the JSON document the request carried, echoed back
     /// unchanged; `None` when the request named none.
     pub resource_properties: Option<String>,
+    /// `Status`, one of [`crate::ops::types::PROFILE_STATUS_VALUES`].
+    pub status: String,
+    /// `StatusMessage` — the sentence belonging to this record's lifecycle phase and
+    /// to the kind of resource it holds
+    /// ([`resource_association_status_message`]).
+    pub status_message: Option<String>,
     pub creation_time: SystemTime,
     pub modification_time: SystemTime,
-    /// The instant at which the move from [`STATUS_CREATING`] to
-    /// [`STATUS_COMPLETE`] is owed, or `None` for an association with no
-    /// transition in flight.
-    pub settled_at: Option<Instant>,
+    /// The end of this association's application to the Profile, which the clock
+    /// owes it, or `None` once that has been applied to the record
+    /// ([`OwedTransition`]).
+    pub owed_settle: Option<OwedTransition>,
 }
 
 impl ProfileResourceAssociation {
-    /// This association's `Status` as of `now`: [`STATUS_CREATING`] until the
-    /// transition the clock owes falls due, [`STATUS_COMPLETE`] after it.
-    pub fn status_at(&self, now: Instant) -> &'static str {
-        match self.settled_at {
-            Some(due) if now < due => STATUS_CREATING,
-            _ => STATUS_COMPLETE,
+    /// This association's `Status` as of `now`: the stored one, with the move to
+    /// [`STATUS_COMPLETE`] the clock owes applied when it has already fallen due.
+    ///
+    /// The answer a read of this record gives at that instant, for a caller holding
+    /// only a shared borrow of the store — a data plane asking which resources a
+    /// Profile has actually pushed, which has no call of its own to materialise the
+    /// move with.
+    pub fn status_at(&self, now: Instant) -> &str {
+        if self.owed_settle.is_some_and(|owed| owed.is_due(now)) {
+            STATUS_COMPLETE
+        } else {
+            &self.status
         }
     }
+
+    /// Apply the move to [`STATUS_COMPLETE`] the clock owes this record, if it has
+    /// already fallen due as of `now`.
+    ///
+    /// Writes nothing before the due instant and nothing after the move has been
+    /// applied, so this only ever materialises a change the clock had already made
+    /// due — the record a later caller reads is the one this call leaves behind.
+    fn settle_if_due(&mut self, now: Instant) {
+        let Some(owed) = self.owed_settle.filter(|owed| owed.is_due(now)) else {
+            return;
+        };
+        self.status = STATUS_COMPLETE.to_string();
+        self.status_message = Some(resource_association_status_message(
+            AssociationPhase::Settled,
+            &self.resource_type,
+        ));
+        // The record changed when the move fell DUE, so that instant is its
+        // modification time whoever reads it and whenever they do.
+        self.modification_time = owed.at;
+        self.owed_settle = None;
+    }
+}
+
+impl ProfileAssociation {
+    /// This association as the wire shape, reported in `phase`: the stored record
+    /// with the `Status` and `StatusMessage` of the lifecycle step being reported.
+    ///
+    /// The lifecycle CALLS report the step they just performed — the model documents
+    /// their output member as information about that call, including its status —
+    /// where a read reports the stored record.
+    pub fn shape_in_phase(
+        &self,
+        phase: AssociationPhase,
+    ) -> crate::ops::types::ProfileAssociation {
+        crate::ops::types::ProfileAssociation {
+            status: Some(profile_association_status(phase).to_string()),
+            status_message: Some(profile_association_status_message(phase)),
+            ..profile_association_shape(self)
+        }
+    }
+}
+
+/// Where an association stands in its lifecycle: the phase its `StatusMessage`
+/// states, which is what carries the association from the call that asked for it to
+/// the record every read reports and on to its removal.
+///
+/// The phase is NOT the wire `Status`: AWS reports a VPC association `COMPLETE` from
+/// the moment it is recorded while the associate response still words its message as
+/// a creation in progress, so the two are reported together but are not one value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssociationPhase {
+    /// The association is being applied — the phase the associate call reports.
+    BeingApplied,
+    /// The association has been applied and is in force.
+    Settled,
+    /// The association is being removed — the phase the disassociate call reports.
+    BeingRemoved,
 }
 
 /// The `StatusMessage` reported beside a Profile's `Status`: every status this
@@ -161,32 +267,122 @@ pub fn profile_status_message(status: &str) -> Option<String> {
     }
 }
 
-/// The `StatusMessage` reported beside a resource association's `Status`: every
-/// status this emulator reports carries the sentence AWS attaches to it.
-pub fn resource_association_status_message(status: &str) -> Option<String> {
-    match status {
-        STATUS_CREATING => Some("Creating the Profile resource association".to_string()),
-        STATUS_COMPLETE => Some("Completed creation of Profile resource association".to_string()),
-        _ => None,
+/// The `ProfileStatus` a Profile-to-DNS-resource association is reported in while
+/// it is in `phase`.
+///
+/// Applying a DNS resource to a Profile is reported as an UPDATE of the Profile the
+/// resource is being added to, not as the creation of something separate, so that is
+/// the status such an association carries until it is in force.
+pub fn resource_association_status(phase: AssociationPhase) -> &'static str {
+    match phase {
+        AssociationPhase::BeingApplied => STATUS_UPDATING,
+        AssociationPhase::Settled => STATUS_COMPLETE,
+        AssociationPhase::BeingRemoved => STATUS_DELETING,
     }
 }
 
-/// The resources a Route 53 Profile can hold, as the `<service>` and
-/// resource-type segments of the resource's ARN
-/// (`arn:<partition>:<service>:<region>:<account>:<type>/<id>`).
+/// The `StatusMessage` reported beside a Profile-to-DNS-resource association's
+/// `Status`: the sentence AWS words that lifecycle phase in, which NAMES the kind of
+/// resource the association holds, so a client watching one kind of resource being
+/// attached reads prose about that kind.
+///
+/// `resource_type` is the record's own `ResourceType`; the kind is named as
+/// [`resource_kind_phrase`] spells it. The sentences for an association being
+/// applied and for one that has settled are the wording AWS answers those steps
+/// with; the removal sentence is that same template on the step this service's own
+/// delete path reports, worded after the Profile's own removal sentence
+/// ([`profile_status_message`]).
+pub fn resource_association_status_message(phase: AssociationPhase, resource_type: &str) -> String {
+    let kind = resource_kind_phrase(resource_type);
+    match phase {
+        AssociationPhase::BeingApplied => format!("Updating the Profile to {kind} association"),
+        AssociationPhase::Settled => {
+            format!("Completed creation of Profile to {kind} association")
+        }
+        AssociationPhase::BeingRemoved => format!("Deleting the Profile to {kind} association"),
+    }
+}
+
+/// The `ProfileStatus` a Profile-to-VPC association is reported in while it is in
+/// `phase`.
+///
+/// Such an association exists the moment it is recorded — AWS reports it in the
+/// terminal [`STATUS_COMPLETE`] from the associate response onwards — so only its
+/// removal moves the status; which lifecycle step is being reported is what its
+/// `StatusMessage` states.
+pub fn profile_association_status(phase: AssociationPhase) -> &'static str {
+    match phase {
+        AssociationPhase::BeingApplied | AssociationPhase::Settled => STATUS_COMPLETE,
+        AssociationPhase::BeingRemoved => STATUS_DELETING,
+    }
+}
+
+/// The `StatusMessage` reported beside a Profile-to-VPC association's `Status`: the
+/// sentence AWS words that lifecycle step in — the creation the associate call
+/// started, the created association every read reports, and the removal the
+/// disassociate call performed.
+///
+/// One association kind, so nothing varies but the step — the same shape as the
+/// sentences [`profile_status_message`] reports for the Profile itself, whose
+/// removal sentence is what the removal step here is worded after.
+pub fn profile_association_status_message(phase: AssociationPhase) -> String {
+    match phase {
+        AssociationPhase::BeingApplied => "Creating Profile Association".to_string(),
+        AssociationPhase::Settled => "Created Profile Association".to_string(),
+        AssociationPhase::BeingRemoved => "Deleting Profile Association".to_string(),
+    }
+}
+
+/// The resources a Route 53 Profile can hold: the `<service>` and resource-type
+/// segments of the resource's ARN
+/// (`arn:<partition>:<service>:<region>:<account>:<type>/<id>`), with the words AWS
+/// names that kind of resource by in prose.
 ///
 /// A Profile carries DNS configuration only: a private hosted zone, a Resolver
 /// rule, a DNS Firewall rule group, a Resolver query-logging or DNSSEC-validation
 /// configuration, and an interface VPC endpoint. Any other ARN names a resource
 /// the service cannot associate, whatever else is well-formed about it.
-const ASSOCIABLE_ARN_SEGMENTS: [(&str, &str); 6] = [
-    ("route53", "hostedzone"),
-    ("route53resolver", "resolver-rule"),
-    ("route53resolver", "firewall-rule-group"),
-    ("route53resolver", "resolver-query-log-config"),
-    ("route53resolver", "resolver-dnssec-config"),
-    ("ec2", "vpc-endpoint"),
+///
+/// The prose names are the ones the model's own documentation of these resources
+/// uses — `ProfileResourceAssociation$ResourceType` ("Resource type, such as a
+/// private hosted zone, or DNS Firewall rule group") and, for the Resolver
+/// resources, the resource each ARN segment names — so a message naming the kind
+/// names it in the service's own words rather than in the wire's upper-snake
+/// spelling.
+const ASSOCIABLE_ARN_SEGMENTS: [(&str, &str, &str); 6] = [
+    ("route53", "hostedzone", "private hosted zone"),
+    ("route53resolver", "resolver-rule", "Resolver rule"),
+    (
+        "route53resolver",
+        "firewall-rule-group",
+        "DNS Firewall rule group",
+    ),
+    (
+        "route53resolver",
+        "resolver-query-log-config",
+        "Resolver query logging configuration",
+    ),
+    (
+        "route53resolver",
+        "resolver-dnssec-config",
+        "Resolver DNSSEC validation configuration",
+    ),
+    ("ec2", "vpc-endpoint", "VPC endpoint"),
 ];
+
+/// The words a `StatusMessage` names the resource of type `resource_type` by, from
+/// [`ASSOCIABLE_ARN_SEGMENTS`].
+///
+/// A type outside that table is named by its own words — the wire spelling read as
+/// the words it is made of — so every association reports a sentence about the kind
+/// of resource it holds whatever is associated.
+pub fn resource_kind_phrase(resource_type: &str) -> String {
+    ASSOCIABLE_ARN_SEGMENTS
+        .iter()
+        .find(|(_, segment, _)| resource_type_of_segment(segment) == resource_type)
+        .map(|(_, _, kind)| (*kind).to_string())
+        .unwrap_or_else(|| resource_type.to_ascii_lowercase().replace('_', " "))
+}
 
 /// The `ResourceType` of the resource `resource_arn` names, or `None` when a
 /// Profile cannot hold that resource.
@@ -211,8 +407,15 @@ pub fn resource_type_of_arn(resource_arn: &str) -> Option<String> {
     }
     ASSOCIABLE_ARN_SEGMENTS
         .iter()
-        .any(|(owner, associable)| *owner == service && *associable == segment)
-        .then(|| segment.to_ascii_uppercase().replace('-', "_"))
+        .any(|(owner, associable, _)| *owner == service && *associable == segment)
+        .then(|| resource_type_of_segment(segment))
+}
+
+/// The `ResourceType` the wire reports for the resource an ARN's resource-type
+/// `segment` names: that segment in the upper-snake spelling the wire uses
+/// (`firewall-rule-group` -> `FIREWALL_RULE_GROUP`).
+fn resource_type_of_segment(segment: &str) -> String {
+    segment.to_ascii_uppercase().replace('-', "_")
 }
 
 /// The most Profiles this emulator stores for one account.
@@ -286,6 +489,19 @@ pub struct ComAmazonawsRoute53profilesRoute53profilesState {
 }
 
 impl ComAmazonawsRoute53profilesRoute53profilesState {
+    /// Apply every resource-association move the clock has ALREADY made due as of
+    /// `now`, so each record reports the phase it had reached at that reading.
+    ///
+    /// Called by the operations that report a resource association. It changes
+    /// nothing a caller did not already own: a move is applied only once its stored
+    /// due instant has passed, which it would have whether or not anybody called,
+    /// and the record it leaves behind is what every later caller reads.
+    pub fn settle_due_associations(&mut self, now: Instant) {
+        for association in self.profile_resource_associations.values_mut() {
+            association.settle_if_due(now);
+        }
+    }
+
     /// Mint a fresh, unused Profile `Id`.
     pub fn mint_profile_id(&mut self) -> String {
         self.mint_id(PROFILE_ID_PREFIX)
@@ -613,16 +829,31 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
         .unwrap_or_else(|| DEFAULT_REGION.to_string())
 }
 
-/// A stored instant as the modelled `Rfc3339Timestamp` the wire carries.
+/// How many SUBSECOND digits a timestamp this service reports carries.
 ///
-/// Built from whole seconds plus sub-second nanoseconds so a stored instant keeps
-/// the resolution `SystemTime::now()` gave it; going through an `f64` of epoch
-/// seconds would quantise it to roughly a quarter of a microsecond.
+/// restJson1 writes a timestamp with no `@timestampFormat` as epoch seconds, and every
+/// timestamp this service's recorded responses carry has at most three fractional
+/// digits — millisecond resolution. The model types the member and says nothing about
+/// precision, so this is the resolution the service reports at rather than a modelled
+/// constraint: a client comparing one response with another, or decoding these numbers
+/// at millisecond resolution, sees a number shaped the way the service shapes it.
+const SUBSECOND_DIGITS: u32 = 3;
+
+/// A stored instant as the modelled `Rfc3339Timestamp` the wire carries, at the
+/// resolution this service reports one at ([`SUBSECOND_DIGITS`]).
+///
+/// The ONE encoder for every timestamp this service reports, so no shape's
+/// projection can report an instant in a different form from another's.
+///
+/// Truncated rather than rounded, so the reported instant never moves ahead of the
+/// one the clock read: a value is reported at the start of the millisecond it fell
+/// in.
 pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let scale = 10_u32.pow(9 - SUBSECOND_DIGITS);
     ::aws_smithy_types::DateTime::from_secs_and_nanos(
         i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
-        since_epoch.subsec_nanos(),
+        (since_epoch.subsec_nanos() / scale) * scale,
     )
 }
 
@@ -672,12 +903,10 @@ pub fn profile_association_shape(
 }
 
 /// The stored resource association as the wire `ProfileResourceAssociation`
-/// shape, member for member, with its `Status` and `StatusMessage` as of `now`.
+/// shape, member for member.
 pub fn profile_resource_association_shape(
     association: &ProfileResourceAssociation,
-    now: Instant,
 ) -> crate::ops::types::ProfileResourceAssociation {
-    let status = association.status_at(now);
     crate::ops::types::ProfileResourceAssociation {
         id: Some(association.id.clone()),
         name: Some(association.name.clone()),
@@ -686,8 +915,8 @@ pub fn profile_resource_association_shape(
         resource_arn: Some(association.resource_arn.clone()),
         resource_type: Some(association.resource_type.clone()),
         resource_properties: association.resource_properties.clone(),
-        status: Some(status.to_string()),
-        status_message: resource_association_status_message(status),
+        status: Some(association.status.clone()),
+        status_message: association.status_message.clone(),
         creation_time: Some(timestamp(association.creation_time)),
         modification_time: Some(timestamp(association.modification_time)),
     }

@@ -12,9 +12,15 @@
 //!   resource a Profile can hold, reports `ResourceType` as that ARN's own
 //!   resource-type segment in the upper-snake spelling the wire uses, and echoes
 //!   `Name`, `ProfileId`, `ResourceArn` and `ResourceProperties` back unchanged;
-//! * the association is reported `CREATING` until the move to `COMPLETE` the clock
-//!   owes falls due, each status with the sentence that belongs to it, and
+//! * the association is reported as an UPDATE of the Profile until the move to
+//!   `COMPLETE` the clock owes falls due, each phase with the sentence that belongs
+//!   to it — which NAMES the kind of resource associated — and
 //!   `GetProfileResourceAssociation` reports the same record;
+//! * both lifecycle timestamps are carried as epoch-seconds numbers at millisecond
+//!   resolution, and `ModificationTime` advances past `CreationTime` when the record
+//!   changes;
+//! * `DisassociateResourceFromProfile` removes the association, reports it in the
+//!   phase of being removed, and leaves its id naming nothing;
 //! * a DNS Firewall rule group's `priority` is accepted inside the documented
 //!   range and refused outside it, with nothing persisted for a refused request;
 //! * an ARN naming any other kind of resource is refused;
@@ -35,9 +41,12 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_route53profiles_route53profiles::state::{
-    service_state, MAX_FIREWALL_PRIORITY, MIN_FIREWALL_PRIORITY,
+    service_state, OwedTransition, ASSOCIATION_SETTLE_DELAY, MAX_FIREWALL_PRIORITY,
+    MIN_FIREWALL_PRIORITY,
 };
 use service_com_amazonaws_route53profiles_route53profiles::EmulatedService;
+
+use super::harness::{assert_timestamp_form, path_label};
 
 /// This service's sigv4 signing name, from the model (`OPERATIONS.md`, "Wire protocol").
 const SIGNING_NAME: &str = "route53profiles";
@@ -203,6 +212,31 @@ impl Emulator {
             .await
     }
 
+    /// `DisassociateResourceFromProfile`: the Profile id and the resource ARN are
+    /// both path labels, so the ARN is percent-encoded as one segment, exactly as an
+    /// SDK sends it.
+    async fn disassociate(&self, profile_id: &str, resource_arn: &str) -> Reply {
+        self.call(
+            "DELETE",
+            &format!(
+                "/profileresourceassociation/profileid/{profile_id}/resourcearn/{}",
+                path_label(resource_arn)
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// `ListProfileResourceAssociations` for one Profile, unfiltered.
+    async fn list_associations(&self, profile_id: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/profileresourceassociations/profileid/{profile_id}"),
+            None,
+        )
+        .await
+    }
+
     /// How many resource associations the store holds, so a refused request can be
     /// shown to have persisted nothing.
     fn stored_associations(&self) -> usize {
@@ -213,8 +247,10 @@ impl Emulator {
             .len()
     }
 
-    /// Bring the clock-owed move to `COMPLETE` forward instead of waiting for it:
-    /// the due instant is what the reported status is a function of.
+    /// Bring the clock-owed move to the settled phase forward instead of waiting for
+    /// it: the stored due instant is what the reported phase is a function of, and
+    /// the wall-clock instant kept beside it is the one the move was owed at, so the
+    /// record reports exactly what waiting would have reported.
     fn settle(&self, id: &str) {
         let state = service_state(&*self.engine).expect("the service's store is mounted");
         let mut store = state.lock();
@@ -222,42 +258,72 @@ impl Emulator {
             .profile_resource_associations
             .get_mut(id)
             .unwrap_or_else(|| panic!("association {id} is not in the store"));
-        association.settled_at = Some(Instant::now());
+        association.owed_settle = Some(OwedTransition {
+            due: Instant::now(),
+            at: association.creation_time + ASSOCIATION_SETTLE_DELAY,
+        });
     }
 }
 
-/// The resources a Profile can hold, as `(ResourceArn, ResourceType)`: one row per
-/// kind named by `ProfileResourceAssociation$ResourceType`'s documentation ("a
-/// private hosted zone, or DNS Firewall rule group") and the Resolver resources a
-/// Profile carries beside them. The `ResourceType` is the ARN's own resource-type
-/// segment, upper-snake.
-fn associable_resources() -> Vec<(String, &'static str)> {
+/// The resources a Profile can hold, as `(ResourceArn, ResourceType, kind phrase)`:
+/// one row per kind named by `ProfileResourceAssociation$ResourceType`'s
+/// documentation ("a private hosted zone, or DNS Firewall rule group") and the
+/// Resolver resources a Profile carries beside them. The `ResourceType` is the ARN's
+/// own resource-type segment, upper-snake; the kind phrase is how AWS names that kind
+/// of resource in prose, which is what an association's `StatusMessage` names it by.
+///
+/// The sentences are TRANSCRIBED in [`being_applied_message`] and
+/// [`settled_message`] from this column, so the suite states them independently of
+/// the code that renders them.
+fn associable_resources() -> Vec<(String, &'static str, &'static str)> {
     vec![
         (
             "arn:aws:route53:::hostedzone/Z04567891011ABCDEFGHI".to_string(),
             "HOSTEDZONE",
+            "private hosted zone",
         ),
         (
             format!("arn:aws:route53resolver:{REGION}:{ACCOUNT_ID}:resolver-rule/rslvr-rr-9f8e7d6c5b4a3210"),
             "RESOLVER_RULE",
+            "Resolver rule",
         ),
         (
             format!("arn:aws:route53resolver:{REGION}:{ACCOUNT_ID}:firewall-rule-group/rslvr-frg-0123456789abcdef"),
             "FIREWALL_RULE_GROUP",
+            "DNS Firewall rule group",
         ),
         (
             format!("arn:aws:route53resolver:{REGION}:{ACCOUNT_ID}:resolver-query-log-config/rslvr-rqlc-abcdef0123456789"),
             "RESOLVER_QUERY_LOG_CONFIG",
+            "Resolver query logging configuration",
         ),
         (
             format!("arn:aws:route53resolver:{REGION}:{ACCOUNT_ID}:resolver-dnssec-config/rslvr-ds-fedcba9876543210"),
             "RESOLVER_DNSSEC_CONFIG",
+            "Resolver DNSSEC validation configuration",
         ),
         (
             format!("arn:aws:ec2:{REGION}:{ACCOUNT_ID}:vpc-endpoint/vpce-0a1b2c3d4e5f60718"),
             "VPC_ENDPOINT",
+            "VPC endpoint",
         ),
     ]
+}
+
+/// The sentence reported while the association of a `kind` of resource is still
+/// being applied to the Profile.
+fn being_applied_message(kind: &str) -> String {
+    format!("Updating the Profile to {kind} association")
+}
+
+/// The sentence reported once that association is in force.
+fn settled_message(kind: &str) -> String {
+    format!("Completed creation of Profile to {kind} association")
+}
+
+/// The sentence reported for an association that is being removed.
+fn being_removed_message(kind: &str) -> String {
+    format!("Deleting the Profile to {kind} association")
 }
 
 /// Whether `id` is `rpr-` followed by 16 lowercase hex digits — the id shape this
@@ -290,7 +356,7 @@ async fn an_associated_resource_is_persisted_and_read_back_whole() {
     {
         let profile_id = em.profile(&format!("roundtrip{index}")).await;
 
-        for (resource_arn, resource_type) in associable_resources() {
+        for (resource_arn, resource_type, kind) in associable_resources() {
             // Only a DNS Firewall rule group's properties carry a priority.
             let properties = properties.filter(|_| resource_type == "FIREWALL_RULE_GROUP");
             let case = format!("arn={resource_arn} name={name:?} properties={properties:?}");
@@ -344,20 +410,24 @@ async fn an_associated_resource_is_persisted_and_read_back_whole() {
                 "case {case}: ResourceProperties must be echoed, got {:?}",
                 created.association()
             );
-            // The resource still has to reach the Profile's VPCs, so the association
-            // is reported in the transient status first.
+            // Applying the resource CHANGES the Profile it is being added to, so the
+            // association is reported as an update of the Profile first, with the
+            // sentence that names this kind of resource.
             assert_eq!(
                 created.field("Status"),
-                "CREATING",
-                "case {case}: a just-created association is CREATING, got {:?}",
+                "UPDATING",
+                "case {case}: an association still being applied is UPDATING, got {:?}",
                 created.association()
             );
             assert_eq!(
                 created.field("StatusMessage"),
-                "Creating the Profile resource association",
+                being_applied_message(kind),
                 "case {case}: unexpected StatusMessage in {:?}",
                 created.association()
             );
+            for member in ["CreationTime", "ModificationTime"] {
+                assert_timestamp_form(&case, member, &created.association()[member]);
+            }
             assert_eq!(
                 created.association()["CreationTime"],
                 created.association()["ModificationTime"],
@@ -380,7 +450,8 @@ async fn an_associated_resource_is_persisted_and_read_back_whole() {
             );
 
             // Once the transition the clock owed falls due, every later read reports
-            // the settled status — and keeps reporting it.
+            // the settled phase — and keeps reporting it, with `ModificationTime`
+            // advanced to the instant the move was owed at.
             em.settle(&id);
             for read in 0..2 {
                 let settled = em.get_association(&id).await;
@@ -392,7 +463,7 @@ async fn an_associated_resource_is_persisted_and_read_back_whole() {
                 );
                 assert_eq!(
                     settled.field("StatusMessage"),
-                    "Completed creation of Profile resource association",
+                    settled_message(kind),
                     "case {case}: unexpected settled StatusMessage in {:?}",
                     settled.association()
                 );
@@ -402,8 +473,140 @@ async fn an_associated_resource_is_persisted_and_read_back_whole() {
                     "case {case}: a read must report the association asked for, got {:?}",
                     settled.association()
                 );
+                for member in ["CreationTime", "ModificationTime"] {
+                    assert_timestamp_form(&case, member, &settled.association()[member]);
+                }
+                assert_eq!(
+                    settled.association()["CreationTime"],
+                    created.association()["CreationTime"],
+                    "case {case}: read {read} must report the creation instant unchanged, \
+                     got {:?}",
+                    settled.association()
+                );
+                let created_at = settled.association()["CreationTime"]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("case {case}: CreationTime is no number"));
+                let modified_at = settled.association()["ModificationTime"]
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("case {case}: ModificationTime is no number"));
+                assert!(
+                    modified_at > created_at,
+                    "case {case}: read {read} must report the record as modified when it \
+                     settled, got CreationTime {created_at} and ModificationTime {modified_at}"
+                );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn a_disassociated_resource_association_is_reported_removed_and_then_names_nothing() {
+    let em = Emulator::new();
+
+    for (index, (resource_arn, _resource_type, kind)) in
+        associable_resources().into_iter().enumerate()
+    {
+        // Two associations of the same Profile: the one this case removes, and a
+        // second one that must be untouched by the removal.
+        let profile_id = em.profile(&format!("teardown{index}")).await;
+        let kept_arn = format!("arn:aws:route53:::hostedzone/Z{index:0>20}");
+        let case = format!("arn={resource_arn}");
+
+        let created = em.associate(&profile_id, &resource_arn, "removed", None).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: associate expected 200, got {} / {:?}",
+            created.status, created.body
+        );
+        let id = created.field("Id");
+        let kept = em.associate(&profile_id, &kept_arn, "kept", None).await;
+        assert_eq!(
+            kept.status, 200,
+            "case {case}: the control associate expected 200, got {} / {:?}",
+            kept.status, kept.body
+        );
+        let kept_id = kept.field("Id");
+
+        // The removal reports the record as it stood when it was removed: the phase
+        // of being removed, with the sentence that names this kind of resource, and a
+        // modification instant no earlier than the creation one.
+        let removed = em.disassociate(&profile_id, &resource_arn).await;
+        assert_eq!(
+            removed.status, 200,
+            "case {case}: disassociate expected 200, got {} / {:?}",
+            removed.status, removed.body
+        );
+        assert_eq!(
+            removed.field("Id"),
+            id,
+            "case {case}: the removal must report the association removed, got {:?}",
+            removed.association()
+        );
+        assert_eq!(
+            removed.field("Status"),
+            "DELETING",
+            "case {case}: a removed association is DELETING, got {:?}",
+            removed.association()
+        );
+        assert_eq!(
+            removed.field("StatusMessage"),
+            being_removed_message(kind),
+            "case {case}: unexpected removal StatusMessage in {:?}",
+            removed.association()
+        );
+        for member in ["CreationTime", "ModificationTime"] {
+            assert_timestamp_form(&case, member, &removed.association()[member]);
+        }
+
+        // The id now names nothing, on every read and however often it is polled.
+        for attempt in 0..3 {
+            let gone = em.get_association(&id).await;
+            assert_eq!(
+                gone.status, 400,
+                "case {case}: read {attempt} of a removed association expected 400, got {} / {:?}",
+                gone.status, gone.body
+            );
+            assert_eq!(
+                gone.error.as_deref(),
+                Some("ResourceNotFoundException"),
+                "case {case}: read {attempt} expected ResourceNotFoundException, got {:?}",
+                gone.body
+            );
+            assert_eq!(
+                gone.message(),
+                format!("[RSLVR-05007] Can't find the resource with ID \"{id}\"."),
+                "case {case}: read {attempt} reported an unexpected refusal message"
+            );
+        }
+
+        // Removing the same pair again names nothing either, and the association the
+        // request did not name is still readable and still listed.
+        let repeat = em.disassociate(&profile_id, &resource_arn).await;
+        assert_eq!(
+            repeat.error.as_deref(),
+            Some("ResourceNotFoundException"),
+            "case {case}: a repeat of the removal expected ResourceNotFoundException, got {:?}",
+            repeat.body
+        );
+        let control = em.get_association(&kept_id).await;
+        assert_eq!(
+            control.status, 200,
+            "case {case}: the association that was not removed must still read back, got {} / {:?}",
+            control.status, control.body
+        );
+        let listed = em.list_associations(&profile_id).await;
+        let ids: Vec<String> = listed
+            .body["ProfileResourceAssociations"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case}: no ProfileResourceAssociations in {:?}", listed.body))
+            .iter()
+            .map(|association| association["Id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![kept_id.clone()],
+            "case {case}: the Profile must list only the association that was not removed"
+        );
     }
 }
 

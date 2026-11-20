@@ -180,17 +180,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // Remove it, then report the record as it stood at removal: the association is
-        // gone from the store, so `Status` is `DELETING` and `ModificationTime` is the
-        // instant it was removed.
+        // gone from the store, so `ModificationTime` is the instant it was removed and
+        // the phase reported is the removal THIS call performed.
         let mut removed = store
             .profile_associations
             .remove(&association_id)
             .expect("the id just resolved from the stored pair");
         store.tags.remove(&removed.arn);
-        removed.status = crate::state::STATUS_DELETING.to_string();
         removed.modification_time = ::std::time::SystemTime::now();
         Ok(DisassociateProfileOutput {
-            profile_association: Some(crate::state::profile_association_shape(&removed)),
+            profile_association: Some(
+                removed.shape_in_phase(crate::state::AssociationPhase::BeingRemoved),
+            ),
         })
     }
 }

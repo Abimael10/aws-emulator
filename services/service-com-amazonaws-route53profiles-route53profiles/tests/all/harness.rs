@@ -300,6 +300,32 @@ impl Emulator {
     }
 }
 
+/// How many fractional digits the JSON number `value` carries, or `None` when it is
+/// no plain decimal number at all.
+///
+/// A lifecycle timestamp of this service is carried as epoch seconds (restJson1's
+/// form for a timestamp the model gives no `@timestampFormat`), and the service
+/// reports one at millisecond resolution, so this is what a suite checks the WIRE
+/// FORM of such a member with rather than its per-run value.
+pub(crate) fn timestamp_fraction_digits(value: &Value) -> Option<usize> {
+    let text = value.as_number()?.to_string();
+    if text.contains('e') || text.contains('E') {
+        return None;
+    }
+    Some(text.split_once('.').map_or(0, |(_, fraction)| fraction.len()))
+}
+
+/// Asserts that `value` is carried the way this service carries a lifecycle
+/// timestamp: a decimal JSON number whose fraction is at most millisecond-wide.
+pub(crate) fn assert_timestamp_form(case: &str, member: &str, value: &Value) {
+    let digits = timestamp_fraction_digits(value);
+    assert!(
+        digits.is_some_and(|digits| digits <= 3),
+        "case {case}: {member} must be carried as an epoch-seconds number at \
+         millisecond resolution, got {value}"
+    );
+}
+
 /// The characters RFC 3986 calls unreserved: never percent-encoded by an SDK, and
 /// the only ones left alone by [`path_label`] and [`query_value`].
 fn is_unreserved(byte: u8) -> bool {
@@ -309,7 +335,7 @@ fn is_unreserved(byte: u8) -> bool {
 /// A value bound to a non-greedy `@httpLabel`, as one path segment: every character
 /// outside the unreserved set is percent-encoded, the `/` inside an ARN included —
 /// exactly what an SDK sends, so the label is one segment rather than several.
-fn path_label(value: &str) -> String {
+pub(crate) fn path_label(value: &str) -> String {
     value
         .bytes()
         .map(|byte| {

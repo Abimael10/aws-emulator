@@ -24,6 +24,11 @@
 //!   refuses a (ProfileId, ResourceId) pair that is already associated, refuses a
 //!   `ResourceId` another Profile already holds as having spent that VPC's one
 //!   Profile association, and refuses a `ProfileId` that names nothing;
+//! * an association's `StatusMessage` states the lifecycle step the response is
+//!   about — the creation the associate call performed, the created association
+//!   every read reports, the removal the disassociate call performed — and both its
+//!   lifecycle timestamps are carried as epoch-seconds numbers at millisecond
+//!   resolution;
 //! * `DisassociateProfile` removes the association and reports it `DELETING`;
 //! * `DeleteProfile` refuses with `ConflictException` while the Profile still has
 //!   associations, and otherwise removes it and reports it `DELETING`;
@@ -43,7 +48,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use super::harness::{Emulator, ACCOUNT_ID};
+use super::harness::{assert_timestamp_form, Emulator, ACCOUNT_ID};
 
 /// The names in this table are the classes the modelled `Name` shape accepts —
 /// `@length(0..64)` with pattern `^(?!^[0-9]+$)([a-zA-Z0-9\-_' ']+)$`: a single
@@ -144,6 +149,11 @@ async fn a_created_profile_is_persisted_and_read_back_whole() {
                     !profile["CreationTime"].is_null(),
                     "case {case}: CreationTime must be reported, got {profile:?}"
                 );
+                // Every lifecycle timestamp of this service is carried the same way,
+                // whichever shape reports it.
+                for member in ["CreationTime", "ModificationTime"] {
+                    assert_timestamp_form(&case, member, &profile[member]);
+                }
 
                 // The read-back is the same record, member for member.
                 let fetched = em.get_profile(&id).await;
@@ -529,11 +539,19 @@ async fn the_association_lifecycle_is_persisted_and_reversible() {
             "case {case}: a created association is COMPLETE, got {association:?}"
         );
 
-        // Readable back whole, and listable under either filter.
+        // Readable back whole, and listable under either filter. The read reports the
+        // STORED record, whose `StatusMessage` states the created association, where
+        // the associate response states the creation that call performed — so the
+        // record every read and listing projects is compared against that one.
+        let stored = {
+            let mut stored = association.clone();
+            stored["StatusMessage"] = json!("Created Profile Association");
+            stored
+        };
         let fetched = em.get_association(&association_id).await;
         assert_eq!(
             *fetched.member("ProfileAssociation"),
-            association,
+            stored,
             "case {case}: GetProfileAssociation must report the created record, got {:?}",
             fetched.body
         );
@@ -544,7 +562,7 @@ async fn the_association_lifecycle_is_persisted_and_reversible() {
         ] {
             let listed = em.list_associations(&query).await;
             assert!(
-                listed.list("ProfileAssociations").contains(&association),
+                listed.list("ProfileAssociations").contains(&stored),
                 "case {case}: {query} must report the association, got {:?}",
                 listed.body
             );
@@ -580,7 +598,7 @@ async fn the_association_lifecycle_is_persisted_and_reversible() {
             *em.get_association(&association_id)
                 .await
                 .member("ProfileAssociation"),
-            association,
+            stored,
             "case {case}: a refused association must not have changed the stored one"
         );
         assert!(
@@ -674,6 +692,143 @@ async fn the_association_lifecycle_is_persisted_and_reversible() {
         "a deleted Profile must no longer be listed, got {:?}",
         listed.body
     );
+}
+
+#[tokio::test]
+async fn a_vpc_associations_status_message_states_the_lifecycle_step_being_reported() {
+    // The rule over a SET of associations: a VPC association exists the moment it is
+    // recorded, so its `Status` is the terminal one from the associate response
+    // onwards, and its `StatusMessage` states the lifecycle step the response is
+    // about — the creation the associate call performed, the created association
+    // every read reports, and the removal the disassociate call performed. The three
+    // sentences are transcribed here, so this suite states them independently of the
+    // code that renders them.
+    let em = Emulator::new();
+    let profile_id = em
+        .create_named("assoc-phases")
+        .await
+        .nested_string("Profile", "Id");
+
+    // The rows differ in the name's character classes and in the VPC id's length, so
+    // the pair is read off records differing in more than their id.
+    for (name, resource_id) in [
+        ("a", "vpc-1"),
+        ("phase-assoc", "vpc-0a1b2c3d4e5f60718"),
+        ("My_Assoc 1", "vpc-00000000000000001"),
+        ("o'brien", "vpc-0f1e2d3c"),
+    ] {
+        let case = format!("name={name:?} resource={resource_id}");
+
+        let created = em.associate(&profile_id, resource_id, name).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: AssociateProfile expected 200, got {} / {:?}",
+            created.status, created.body
+        );
+        let association_id = created.nested_string("ProfileAssociation", "Id");
+        assert_eq!(
+            created.nested_string("ProfileAssociation", "Status"),
+            "COMPLETE",
+            "case {case}: a recorded association is COMPLETE, got {:?}",
+            created.body
+        );
+        assert_eq!(
+            created.nested_string("ProfileAssociation", "StatusMessage"),
+            "Creating Profile Association",
+            "case {case}: unexpected StatusMessage in {:?}",
+            created.body
+        );
+        for member in ["CreationTime", "ModificationTime"] {
+            assert_timestamp_form(&case, member, &created.member("ProfileAssociation")[member]);
+        }
+        let created_at = association_instant(&case, &created, "CreationTime");
+        assert_eq!(
+            created_at,
+            association_instant(&case, &created, "ModificationTime"),
+            "case {case}: an association nothing has changed was modified when created, got {:?}",
+            created.body
+        );
+
+        // Every read reports the stored record — the created association — and keeps
+        // reporting the same thing, with the creation instant it was recorded at.
+        for read in 0..2 {
+            let fetched = em.get_association(&association_id).await;
+            assert_eq!(
+                fetched.nested_string("ProfileAssociation", "Status"),
+                "COMPLETE",
+                "case {case}: read {read} must report COMPLETE, got {:?}",
+                fetched.body
+            );
+            assert_eq!(
+                fetched.nested_string("ProfileAssociation", "StatusMessage"),
+                "Created Profile Association",
+                "case {case}: read {read} reported an unexpected StatusMessage in {:?}",
+                fetched.body
+            );
+            for member in ["CreationTime", "ModificationTime"] {
+                assert_timestamp_form(&case, member, &fetched.member("ProfileAssociation")[member]);
+            }
+            assert_eq!(
+                association_instant(&case, &fetched, "CreationTime"),
+                created_at,
+                "case {case}: read {read} must report the creation instant unchanged, got {:?}",
+                fetched.body
+            );
+        }
+
+        // A listing projects the same record as the read.
+        let listed = em
+            .list_associations(&format!("?resourceId={resource_id}"))
+            .await;
+        assert_eq!(
+            listed.list("ProfileAssociations").len(),
+            1,
+            "case {case}: the VPC must be listed once, got {:?}",
+            listed.body
+        );
+        assert_eq!(
+            listed.list("ProfileAssociations")[0]["StatusMessage"],
+            json!("Created Profile Association"),
+            "case {case}: a listed association must report the same sentence as the read, \
+             got {:?}",
+            listed.body
+        );
+
+        // The removal reports the step it performed, with a modification instant no
+        // earlier than the creation one.
+        let removed = em.disassociate(&profile_id, resource_id).await;
+        assert_eq!(
+            removed.nested_string("ProfileAssociation", "Status"),
+            "DELETING",
+            "case {case}: a removed association is DELETING, got {:?}",
+            removed.body
+        );
+        assert_eq!(
+            removed.nested_string("ProfileAssociation", "StatusMessage"),
+            "Deleting Profile Association",
+            "case {case}: unexpected removal StatusMessage in {:?}",
+            removed.body
+        );
+        assert!(
+            association_instant(&case, &removed, "ModificationTime") >= created_at,
+            "case {case}: the removal must report when the record last changed, got {:?}",
+            removed.body
+        );
+    }
+}
+
+/// One timestamp member of the `ProfileAssociation` a reply reports, as the epoch
+/// seconds the wire carries. Panics with the whole body when the member is absent or
+/// is no number.
+fn association_instant(case: &str, reply: &super::harness::Reply, member: &str) -> f64 {
+    reply.member("ProfileAssociation")[member]
+        .as_f64()
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case}: ProfileAssociation.{member} is no number in {:?}",
+                reply.body
+            )
+        })
 }
 
 #[tokio::test]

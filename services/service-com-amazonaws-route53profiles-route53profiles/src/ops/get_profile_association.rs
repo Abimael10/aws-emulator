@@ -142,7 +142,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `@readonly`: this reports the stored association and writes nothing.
+        // `@readonly`: this reports the stored association and writes nothing. A VPC
+        // association is recorded in its terminal status, so there is no move the
+        // clock owes one to materialise here.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(

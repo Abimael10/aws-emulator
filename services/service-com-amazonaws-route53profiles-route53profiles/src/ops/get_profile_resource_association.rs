@@ -145,10 +145,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `@readonly`: this reports the stored association and writes nothing. The
-        // status it reports is a function of the stored due instant, so a caller
-        // reading twice across that instant sees the move the clock owed, and a caller
-        // reading twice before it sees the same thing both times.
+        // `@readonly`: this reports the stored association and makes no change of its
+        // own. The one write it does is to materialise the move to the settled phase
+        // the clock had ALREADY made due, so a caller reading twice across that
+        // instant sees the move the clock owed, a caller reading twice before it sees
+        // the same thing both times, and every later caller reads the same record.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -160,7 +161,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-        let store = state.lock();
+        let mut store = state.lock();
+        store.settle_due_associations(::std::time::Instant::now());
         let association = store
             .profile_resource_associations
             .get(&input.profile_resource_association_id)
@@ -174,7 +176,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetProfileResourceAssociationOutput {
             profile_resource_association: Some(crate::state::profile_resource_association_shape(
                 association,
-                ::std::time::Instant::now(),
             )),
         })
     }
