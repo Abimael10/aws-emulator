@@ -277,6 +277,10 @@ impl ControlPanelRecord {
             routing_control_count: Some(routing_control_count),
             status: Some(status_at(self.deploy_due).to_string()),
             owner: Some(self.owner.clone()),
+            // The wire publishes a control panel's ARN under the generic member name as
+            // well as the typed one, holding the same value — the one stored ARN fills
+            // both, so the two can never disagree.
+            arn: Some(self.arn.clone()),
         }
     }
 }
@@ -296,7 +300,20 @@ pub struct RoutingControlRecord {
     /// models no `Tags` member, so a created one starts untagged.
     pub tags: BTreeMap<String, String>,
     pub deploy_due: Instant,
+    /// The sequence number of the Route 53 health check state that backs this routing
+    /// control, which the wire reports beside the control's modelled members.
+    ///
+    /// A control's own number, starting at [`FIRST_HEALTH_CHECK_SEQUENCE_NUMBER`] when it
+    /// is created and advanced by [`Self::set_name`] whenever the control's configuration
+    /// is deployed again — the only change a client of this API can make to it. The model
+    /// declares no such member, so what a caller may rely on is that it is there, that it
+    /// is a number, and that reading the control twice reports the same one; the span
+    /// between two numbers is this emulator's own choice.
+    pub health_check_sequence_number: i64,
 }
+
+/// The sequence number a routing control's backing health check starts at.
+pub const FIRST_HEALTH_CHECK_SEQUENCE_NUMBER: i64 = 1;
 
 impl RoutingControlRecord {
     /// Move the routing control onto `name` — the only thing an update changes — making
@@ -310,9 +327,14 @@ impl RoutingControlRecord {
         }
         self.name = name;
         self.deploy_due = deploy_due();
+        // Deploying the changed configuration advances the backing health check's
+        // sequence number with it, so a client ordering health-check updates off that
+        // number sees the new configuration as the later one.
+        self.health_check_sequence_number = self.health_check_sequence_number.saturating_add(1);
     }
 
-    /// This record as the modelled `RoutingControl` shape.
+    /// This record as the `RoutingControl` shape the wire carries: the modelled members
+    /// plus the health-check sequence number the endpoint reports beside them.
     pub fn to_routing_control(&self) -> RoutingControl {
         RoutingControl {
             control_panel_arn: Some(self.control_panel_arn.clone()),
@@ -320,6 +342,7 @@ impl RoutingControlRecord {
             routing_control_arn: Some(self.arn.clone()),
             status: Some(status_at(self.deploy_due).to_string()),
             owner: Some(self.owner.clone()),
+            route53_health_check_sequence_number: Some(self.health_check_sequence_number),
         }
     }
 }
@@ -456,6 +479,10 @@ impl SafetyRuleRecord {
             status: status_at(self.deploy_due).to_string(),
             wait_period_ms: self.wait_period_ms,
             owner: Some(self.owner.clone()),
+            // The wire publishes a safety rule's ARN under the generic member name as
+            // well as the typed one, holding the same value — the one stored ARN fills
+            // both, so the two can never disagree.
+            arn: Some(self.arn.clone()),
         })
     }
 
@@ -479,6 +506,8 @@ impl SafetyRuleRecord {
             target_controls: target_controls.clone(),
             wait_period_ms: self.wait_period_ms,
             owner: Some(self.owner.clone()),
+            // The generic ARN member, as on an assertion rule above.
+            arn: Some(self.arn.clone()),
         })
     }
 
@@ -554,11 +583,7 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
     /// Drawn from a counter the state advances (seeded from the clock on first use),
     /// never from the request, so creating the same resource twice yields two ids.
     pub fn mint_id(&mut self) -> String {
-        if self.id_seed == 0 {
-            self.id_seed = now_nanos();
-        }
-        self.id_seed = splitmix64(self.id_seed);
-        let high = self.id_seed;
+        let high = self.next_id_word();
         let low = splitmix64(high);
         let hex = format!("{high:016x}{low:016x}");
         format!(
@@ -569,6 +594,28 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
             &hex[16..20],
             &hex[20..32]
         )
+    }
+
+    /// Mint a fresh SAFETY-RULE id: sixteen lowercase hexadecimal characters.
+    ///
+    /// A safety rule's id is not written in the 8-4-4-4-12 form the other
+    /// recovery-control resources carry — AWS lays a safety-rule ARN out as
+    /// `…:controlpanel/<control panel id>/safetyrule/<sixteen hexadecimal characters>`,
+    /// so the FORM a client reads off the ARN it is handed is minted to match. The value
+    /// itself is drawn from the same counter as every other id and is never a function of
+    /// the request.
+    pub fn mint_safety_rule_id(&mut self) -> String {
+        format!("{:016x}", self.next_id_word())
+    }
+
+    /// The next 64 bits of the id stream, advancing the state's own seed (seeded from the
+    /// clock on first use) so no id is a function of the request.
+    fn next_id_word(&mut self) -> u64 {
+        if self.id_seed == 0 {
+            self.id_seed = now_nanos();
+        }
+        self.id_seed = splitmix64(self.id_seed);
+        self.id_seed
     }
 
     /// The next creation-order number.
@@ -1372,6 +1419,7 @@ mod tests {
             owner: "000000000000".to_string(),
             tags: BTreeMap::new(),
             deploy_due: Instant::now(),
+            health_check_sequence_number: FIRST_HEALTH_CHECK_SEQUENCE_NUMBER,
         }
     }
 

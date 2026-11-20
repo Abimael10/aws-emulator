@@ -11,6 +11,12 @@
 //! the model declares plus the omitted case, page sizes from 1 to past the item count,
 //! the published bounds of `MaxResults` and one step outside each, and every resource
 //! level of the hierarchy for the not-found and conflict rules.
+//!
+//! The last two suites here cover the members the endpoint puts on the wire BESIDE the
+//! ones the public model declares: the generic `Arn` member a control panel and a safety
+//! rule carry beside their typed ARN member, and the Route 53 health-check sequence
+//! number a routing control carries — each asserted over every operation that projects
+//! the resource rather than the one read that exposed it.
 
 use std::time::Duration;
 
@@ -19,8 +25,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 // The HTTP harness every suite in this target shares.
 use super::common::{
-    call, create_cluster, create_control_panel, create_routing_control, enc, error_code, router,
-    REGION,
+    call, create_cluster, create_control_panel, create_routing_control, enc, error_code,
+    panel_with_controls, router, REGION,
 };
 
 /// The account id every emulated ARN carries.
@@ -1433,6 +1439,379 @@ async fn listing_control_panels_refuses_an_unknown_scope_or_cursor() {
         assert_eq!(
             status, 200,
             "case MaxResults={max} (a published bound): expected 200, got {status}"
+        );
+    }
+}
+
+// --- the members the wire carries beside the modelled ones -----------------------------
+
+// The names of those members come from the crate itself — the shapes that carry them —
+// rather than from a second copy here, so a rename cannot leave the test asserting the
+// old name.
+use service_com_amazonaws_route53recoverycontrolconfig_route53recoverycontrolconfig::ops::types::{
+    WIRE_ARN_MEMBER as GENERIC_ARN_MEMBER,
+    WIRE_HEALTH_CHECK_SEQUENCE_MEMBER as HEALTH_CHECK_SEQUENCE_MEMBER,
+};
+
+/// One projection carries the generic ARN member, holding the resource's own ARN — the
+/// value its typed member holds.
+fn assert_generic_arn(case: &str, projection: &Value, typed_member: &str) {
+    let typed = projection[typed_member].as_str();
+    assert!(
+        typed.is_some_and(|arn| arn.starts_with(ARN_PREFIX)),
+        "case {case}: expected {typed_member} to be a recovery-control ARN, got {:?}",
+        projection[typed_member]
+    );
+    let generic = projection[GENERIC_ARN_MEMBER].as_str();
+    assert_eq!(
+        generic, typed,
+        "case {case}: expected {GENERIC_ARN_MEMBER} to equal {typed_member} ({typed:?}), got \
+         {generic:?}"
+    );
+}
+
+/// A routing control's health-check sequence number, as a positive integer.
+fn sequence_number(case: &str, projection: &Value) -> i64 {
+    let raw = &projection[HEALTH_CHECK_SEQUENCE_MEMBER];
+    let number = raw.as_i64();
+    assert!(
+        number.is_some_and(|n| n >= 1),
+        "case {case}: expected {HEALTH_CHECK_SEQUENCE_MEMBER} to be a positive number, got \
+         {raw:?} in {projection:?}"
+    );
+    number.unwrap_or_default()
+}
+
+/// RULE: the endpoint reports a control panel's and a safety rule's ARN under the generic
+/// member name as well as under the typed member (`ControlPanelArn` / `SafetyRuleArn`),
+/// and the two hold the same value — in every operation that projects the resource:
+/// create, describe, list and update.
+///
+/// Neither shape declares the generic member in the public model
+/// (`smithy_query(query="shape",shape="ControlPanel")`, `shape="AssertionRule"` and
+/// `shape="GatingRule"` list no `Arn`), so what is asserted here is the recorded wire
+/// behaviour, over every projection and both kinds of safety rule rather than the one
+/// read that exposed it.
+#[tokio::test]
+async fn control_panel_and_safety_rule_projections_carry_the_generic_arn_member() {
+    let router = router();
+
+    let cluster = create_cluster(&router, json!({ "ClusterName": "generic-arn-cluster" })).await;
+    let cluster_arn = cluster["ClusterArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let created = create_control_panel(
+        &router,
+        json!({ "ClusterArn": cluster_arn, "ControlPanelName": "generic-arn-panel" }),
+    )
+    .await;
+    assert_generic_arn("CreateControlPanel", &created, "ControlPanelArn");
+    let panel_arn = created["ControlPanelArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // Both panels of the cluster — the one just created and the default panel the cluster
+    // was created with — through the list page and through a read of each.
+    let (status, _, panels) =
+        list_control_panels_page(&router, Some(&cluster_arn), None, None).await;
+    assert_eq!(status, 200, "case ListControlPanels: expected 200, got {status}");
+    assert_eq!(
+        panels.len(),
+        2,
+        "case ListControlPanels: a cluster holds its default panel and the created one, got \
+         {panels:?}"
+    );
+    for panel in &panels {
+        let name = panel["Name"].as_str().unwrap_or_default().to_string();
+        assert_generic_arn(&format!("ListControlPanels {name}"), panel, "ControlPanelArn");
+        let arn = panel["ControlPanelArn"].as_str().unwrap_or_default();
+        let (status, body) =
+            call(&router, "GET", &format!("/controlpanel/{}", enc(arn)), None).await;
+        assert_eq!(
+            status, 200,
+            "case DescribeControlPanel {name}: expected 200, got {status} {body:?}"
+        );
+        assert_generic_arn(
+            &format!("DescribeControlPanel {name}"),
+            &body["ControlPanel"],
+            "ControlPanelArn",
+        );
+    }
+
+    let (status, updated) = call(
+        &router,
+        "PUT",
+        "/controlpanel",
+        Some(json!({
+            "ControlPanelArn": panel_arn,
+            "ControlPanelName": "generic-arn-panel-renamed"
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case UpdateControlPanel: expected 200, got {status} {updated:?}"
+    );
+    assert_generic_arn(
+        "UpdateControlPanel",
+        &updated["ControlPanel"],
+        "ControlPanelArn",
+    );
+
+    // Safety rules, of both kinds: created, read back, listed and updated.
+    let (rules_panel, controls) = panel_with_controls(&router, "generic-arn", 2).await;
+    let config = json!({ "Inverted": false, "Threshold": 1, "Type": "ATLEAST" });
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "AssertionRule",
+            "ASSERTION",
+            json!({
+                "AssertionRule": {
+                    "AssertedControls": [controls[0].clone()],
+                    "ControlPanelArn": rules_panel,
+                    "Name": "generic-arn-assertion",
+                    "RuleConfig": config,
+                    "WaitPeriodMs": 5000
+                }
+            }),
+        ),
+        (
+            "GatingRule",
+            "GATING",
+            json!({
+                "GatingRule": {
+                    "ControlPanelArn": rules_panel,
+                    "GatingControls": [controls[0].clone()],
+                    "Name": "generic-arn-gating",
+                    "RuleConfig": config,
+                    "TargetControls": [controls[1].clone()],
+                    "WaitPeriodMs": 5000
+                }
+            }),
+        ),
+    ];
+
+    let mut rule_arns: Vec<(&str, &str, String)> = Vec::new();
+    for (member, listed_member, body) in &rows {
+        let (status, answer) = call(&router, "POST", "/safetyrule", Some(body.clone())).await;
+        assert_eq!(
+            status, 200,
+            "case CreateSafetyRule {member}: expected 200, got {status} {answer:?}"
+        );
+        assert_generic_arn(
+            &format!("CreateSafetyRule {member}"),
+            &answer[*member],
+            "SafetyRuleArn",
+        );
+        let arn = answer[*member]["SafetyRuleArn"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        // A safety rule's own id is sixteen hexadecimal characters, not the 8-4-4-4-12
+        // form the other recovery-control resources carry: AWS lays the ARN out as
+        // `…/controlpanel/<panel id>/safetyrule/<sixteen hexadecimal characters>`.
+        let id = arn.rsplit_once('/').map_or("", |(_, id)| id);
+        assert!(
+            id.len() == 16 && id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),
+            "case CreateSafetyRule {member}: expected a sixteen-character lowercase \
+             hexadecimal rule id, got {id:?} in {arn:?}"
+        );
+        rule_arns.push((*member, *listed_member, arn));
+    }
+
+    for (member, _listed, arn) in &rule_arns {
+        let (status, body) =
+            call(&router, "GET", &format!("/safetyrule/{}", enc(arn)), None).await;
+        assert_eq!(
+            status, 200,
+            "case DescribeSafetyRule {member}: expected 200, got {status} {body:?}"
+        );
+        assert_generic_arn(
+            &format!("DescribeSafetyRule {member}"),
+            &body[*member],
+            "SafetyRuleArn",
+        );
+
+        // The member an update carries the change under is the rule's own kind plus
+        // `Update`, so the key is built rather than written out per kind.
+        let mut update = serde_json::Map::new();
+        update.insert(
+            format!("{member}Update"),
+            json!({
+                "Name": format!("{member}-renamed"),
+                "SafetyRuleArn": arn,
+                "WaitPeriodMs": 7500
+            }),
+        );
+        let (status, updated) =
+            call(&router, "PUT", "/safetyrule", Some(Value::Object(update))).await;
+        assert_eq!(
+            status, 200,
+            "case UpdateSafetyRule {member}: expected 200, got {status} {updated:?}"
+        );
+        assert_generic_arn(
+            &format!("UpdateSafetyRule {member}"),
+            &updated[*member],
+            "SafetyRuleArn",
+        );
+    }
+
+    let (status, body) = call(
+        &router,
+        "GET",
+        &format!("/controlpanel/{}/safetyrules", enc(&rules_panel)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case ListSafetyRules: expected 200, got {status} {body:?}"
+    );
+    let listed = body["SafetyRules"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        listed.len(),
+        rule_arns.len(),
+        "case ListSafetyRules: expected every created rule, got {listed:?}"
+    );
+    for rule in &listed {
+        let (_, listed_member, _) = rule_arns
+            .iter()
+            .find(|(_, listed_member, _)| rule[*listed_member].is_object())
+            .expect("a listed rule fills the member of its own kind");
+        assert_generic_arn(
+            &format!("ListSafetyRules {listed_member}"),
+            &rule[*listed_member],
+            "SafetyRuleArn",
+        );
+    }
+}
+
+/// RULE: a routing control reports the sequence number of the Route 53 health check state
+/// that backs it, on every projection of the control — create, describe, list and update.
+/// It is a positive number, each control carries its own, reading the control again
+/// reports the same one, and it advances only when the control's configuration is
+/// deployed again.
+///
+/// The model declares no such member (`smithy_query(query="shape",
+/// shape="RoutingControl")` lists five), so what a client may rely on is that it is
+/// there, that it is a number and that it is stable across reads — which is what the rows
+/// below span: several controls, every operation that projects one, a rename and a
+/// request that renames nothing.
+#[tokio::test]
+async fn a_routing_control_reports_its_health_check_sequence_number() {
+    let router = router();
+    let (panel_arn, controls) = panel_with_controls(&router, "sequence", 3).await;
+
+    // Created: every control reports a number of its own, and reading one does not move
+    // it.
+    let mut created: Vec<(String, i64)> = Vec::new();
+    for arn in &controls {
+        let (status, body) =
+            call(&router, "GET", &format!("/routingcontrol/{}", enc(arn)), None).await;
+        assert_eq!(
+            status, 200,
+            "case DescribeRoutingControl {arn}: expected 200, got {status} {body:?}"
+        );
+        let number = sequence_number(
+            &format!("DescribeRoutingControl {arn}"),
+            &body["RoutingControl"],
+        );
+        // A read reports the stored number, so reading again reports the same one.
+        let (_, again) =
+            call(&router, "GET", &format!("/routingcontrol/{}", enc(arn)), None).await;
+        assert_eq!(
+            sequence_number("the same control read twice", &again["RoutingControl"]),
+            number,
+            "case {arn}: a read must not move the sequence number"
+        );
+        created.push((arn.clone(), number));
+    }
+
+    // The list projection carries it too, for every control of the panel.
+    let (status, body) = call(
+        &router,
+        "GET",
+        &format!("/controlpanel/{}/routingcontrols", enc(&panel_arn)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case ListRoutingControls: expected 200, got {status} {body:?}"
+    );
+    let listed = body["RoutingControls"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        listed.len(),
+        controls.len(),
+        "case ListRoutingControls: expected every control, got {listed:?}"
+    );
+    for control in &listed {
+        let arn = control["RoutingControlArn"].as_str().unwrap_or_default();
+        let stored = created
+            .iter()
+            .find(|(created_arn, _)| created_arn == arn)
+            .map(|(_, number)| *number)
+            .unwrap_or_default();
+        assert_eq!(
+            sequence_number(&format!("ListRoutingControls {arn}"), control),
+            stored,
+            "case {arn}: the listed number is the stored one"
+        );
+    }
+
+    // A rename deploys the control again, which advances the number with it; a request
+    // naming the name the control already carries changes nothing, so it does not.
+    let (arn, before) = created[0].clone();
+    let rows: &[(&str, &str, bool)] = &[
+        ("renamed", "sequence-control-renamed", true),
+        ("renamed to the same name", "sequence-control-renamed", false),
+    ];
+    let mut expected = before;
+    for (case, name, advances) in rows {
+        let (status, updated) = call(
+            &router,
+            "PUT",
+            "/routingcontrol",
+            Some(json!({ "RoutingControlArn": arn, "RoutingControlName": name })),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected UpdateRoutingControl 200, got {status} {updated:?}"
+        );
+        if *advances {
+            expected += 1;
+        }
+        assert_eq!(
+            sequence_number(case, &updated["RoutingControl"]),
+            expected,
+            "case {case}: expected the sequence number to {}",
+            if *advances { "advance" } else { "stay" }
+        );
+        let (_, read) =
+            call(&router, "GET", &format!("/routingcontrol/{}", enc(&arn)), None).await;
+        assert_eq!(
+            sequence_number(&format!("{case}, read back"), &read["RoutingControl"]),
+            expected,
+            "case {case}: a later read answers the stored number"
+        );
+    }
+
+    // The other controls were not touched, so their numbers did not move.
+    for (other_arn, number) in &created[1..] {
+        let (_, read) = call(
+            &router,
+            "GET",
+            &format!("/routingcontrol/{}", enc(other_arn)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            sequence_number(&format!("untouched {other_arn}"), &read["RoutingControl"]),
+            *number,
+            "case {other_arn}: deploying another control does not move this one's number"
         );
     }
 }

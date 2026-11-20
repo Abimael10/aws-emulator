@@ -71,7 +71,81 @@ pub struct ValidationException {
     pub message: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.route53recoverycontrolconfig#ControlPanel")]
+#[smithy_macros::smithy(shape = "com.amazonaws.route53recoverycontrolconfig#RuleConfig")]
+#[derive(Debug, Clone, Default)]
+pub struct RuleConfig {
+    pub inverted: bool,
+    pub threshold: i32,
+    pub r#type: String,
+}
+
+// The four resource projections below — `ControlPanel`, `RoutingControl`, `AssertionRule`
+// and `GatingRule` — have their schemas and codecs written out by hand instead of derived
+// with `#[smithy_macros::smithy(shape = ...)]`.
+//
+// WHY: the Recovery Control Configuration endpoint puts a member on each of them that the
+// public model does not declare (`smithy_query(query="shape",shape="ControlPanel")` and
+// the three others list no such member), and the derive can emit only the members the
+// shape declares — it refuses a field that corresponds to none. The undeclared members
+// are:
+//
+// * `ControlPanel$Arn`, `AssertionRule$Arn`, `GatingRule$Arn` — the resource's own ARN
+//   under the generic name, beside the typed `ControlPanelArn`/`SafetyRuleArn` member
+//   that holds the same value.
+// * `RoutingControl$Route53HealthCheckSequenceNumber` — the sequence number of the Route
+//   53 health check state that backs the routing control.
+//
+// Everything else mirrors the derive exactly: one member schema per member with the
+// model's member order and `member_index` values, the model's shape ids, and the
+// write/read call per member kind — a list of scalars writes and reads each element
+// against the LIST MEMBER's schema, as the derive does, and only a list of structures
+// would use the element shape's own. The undeclared member comes last, so the declared
+// members keep the indices the derive gave them. Constraint traits are deliberately NOT
+// carried: they are read only by the request-path validating walk, and none of these four
+// shapes appears in any operation input (the create takes `NewAssertionRule` /
+// `NewGatingRule`), so there is nothing here for that walk to enforce.
+//
+// This block is a WORKAROUND and should be deleted once the derive can carry a member the
+// wire has and the model does not. The core-library change that would fix it for every
+// service is filed as
+// `issues/things-that-do-not-work/20261113T090000Z-scaffold-codegen-cannot-emit-a-wire-only-member.md`.
+//
+// The `tests` module at the end of this file pins each block against the shipped model:
+// a member the model declares and a block here dropped, renamed or re-indexed fails
+// there rather than silently changing the wire. The members themselves are asserted on
+// the wire by `tests/all/recovery_control_lifecycle.rs`.
+
+/// The namespace every shape of this service lives in, and therefore the namespace of
+/// every member schema written out below.
+const NAMESPACE: &str = "com.amazonaws.route53recoverycontrolconfig";
+
+/// One member schema of a hand-written structure in this module, at `index` in that
+/// structure's member list.
+///
+/// Shared by every hand-written block here (see the note above for why they are
+/// hand-written): each member lives in the one namespace, so only the member's own shape
+/// id, wire name, kind and position differ.
+const fn member_schema(
+    shape_id: &'static str,
+    name: &'static str,
+    shape_type: ::aws_smithy_schema::ShapeType,
+    index: usize,
+) -> ::aws_smithy_schema::Schema {
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(shape_id, NAMESPACE, name),
+        shape_type,
+        name,
+        index,
+    )
+}
+
+/// The generic ARN member name the wire carries beside a resource's typed ARN member.
+pub const WIRE_ARN_MEMBER: &str = "Arn";
+
+/// The member name a routing control's Route 53 health-check sequence number travels
+/// under.
+pub const WIRE_HEALTH_CHECK_SEQUENCE_MEMBER: &str = "Route53HealthCheckSequenceNumber";
+
 #[derive(Debug, Clone, Default)]
 pub struct ControlPanel {
     pub cluster_arn: Option<String>,
@@ -81,9 +155,140 @@ pub struct ControlPanel {
     pub routing_control_count: Option<i32>,
     pub status: Option<String>,
     pub owner: Option<String>,
+    /// The control panel's own ARN under the generic name the wire also publishes it
+    /// under: the same value as [`control_panel_arn`](Self::control_panel_arn).
+    pub arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.route53recoverycontrolconfig#RoutingControl")]
+impl ControlPanel {
+    const M_CLUSTER_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#ControlPanel$ClusterArn",
+        "ClusterArn",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_CONTROL_PANEL_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#ControlPanel$ControlPanelArn",
+        "ControlPanelArn",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    const M_DEFAULT_CONTROL_PANEL: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#ControlPanel$DefaultControlPanel",
+        "DefaultControlPanel",
+        ::aws_smithy_schema::ShapeType::Boolean,
+        2,
+    );
+    const M_NAME: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#ControlPanel$Name",
+        "Name",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    const M_ROUTING_CONTROL_COUNT: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#ControlPanel$RoutingControlCount",
+        "RoutingControlCount",
+        ::aws_smithy_schema::ShapeType::Integer,
+        4,
+    );
+    const M_STATUS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#ControlPanel$Status",
+        "Status",
+        ::aws_smithy_schema::ShapeType::String,
+        5,
+    );
+    const M_OWNER: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#ControlPanel$Owner",
+        "Owner",
+        ::aws_smithy_schema::ShapeType::String,
+        6,
+    );
+    /// The member the model does not declare; see the note above this block.
+    const M_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#ControlPanel$Arn",
+        WIRE_ARN_MEMBER,
+        ::aws_smithy_schema::ShapeType::String,
+        7,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.route53recoverycontrolconfig#ControlPanel",
+            "com.amazonaws.route53recoverycontrolconfig",
+            "ControlPanel",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_CLUSTER_ARN,
+            &Self::M_CONTROL_PANEL_ARN,
+            &Self::M_DEFAULT_CONTROL_PANEL,
+            &Self::M_NAME,
+            &Self::M_ROUTING_CONTROL_COUNT,
+            &Self::M_STATUS,
+            &Self::M_OWNER,
+            &Self::M_ARN,
+        ],
+    );
+}
+
+pub static CONTROL_PANEL_SCHEMA: &::aws_smithy_schema::Schema = &ControlPanel::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for ControlPanel {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.cluster_arn.as_ref() {
+            s.write_string(&Self::M_CLUSTER_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.control_panel_arn.as_ref() {
+            s.write_string(&Self::M_CONTROL_PANEL_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.default_control_panel.as_ref() {
+            s.write_boolean(&Self::M_DEFAULT_CONTROL_PANEL, *v)?;
+        }
+        if let Some(v) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.routing_control_count.as_ref() {
+            s.write_integer(&Self::M_ROUTING_CONTROL_COUNT, *v)?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.owner.as_ref() {
+            s.write_string(&Self::M_OWNER, v.as_str())?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for ControlPanel {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.cluster_arn = Some(d.read_string(member)?),
+                Some(1) => out.control_panel_arn = Some(d.read_string(member)?),
+                Some(2) => out.default_control_panel = Some(d.read_boolean(member)?),
+                Some(3) => out.name = Some(d.read_string(member)?),
+                Some(4) => out.routing_control_count = Some(d.read_integer(member)?),
+                Some(5) => out.status = Some(d.read_string(member)?),
+                Some(6) => out.owner = Some(d.read_string(member)?),
+                Some(7) => out.arn = Some(d.read_string(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RoutingControl {
     pub control_panel_arn: Option<String>,
@@ -91,17 +296,121 @@ pub struct RoutingControl {
     pub routing_control_arn: Option<String>,
     pub status: Option<String>,
     pub owner: Option<String>,
+    /// The sequence number of the Route 53 health check state that backs this routing
+    /// control, which a client reads to order the health-check updates it makes from the
+    /// control's state.
+    pub route53_health_check_sequence_number: Option<i64>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.route53recoverycontrolconfig#RuleConfig")]
-#[derive(Debug, Clone, Default)]
-pub struct RuleConfig {
-    pub inverted: bool,
-    pub threshold: i32,
-    pub r#type: String,
+impl RoutingControl {
+    const M_CONTROL_PANEL_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#RoutingControl$ControlPanelArn",
+        "ControlPanelArn",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_NAME: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#RoutingControl$Name",
+        "Name",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    const M_ROUTING_CONTROL_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#RoutingControl$RoutingControlArn",
+        "RoutingControlArn",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    const M_STATUS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#RoutingControl$Status",
+        "Status",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    const M_OWNER: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#RoutingControl$Owner",
+        "Owner",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+    /// The member the model does not declare; see the note above this block.
+    const M_ROUTE53_HEALTH_CHECK_SEQUENCE_NUMBER: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#RoutingControl$Route53HealthCheckSequenceNumber",
+        WIRE_HEALTH_CHECK_SEQUENCE_MEMBER,
+        ::aws_smithy_schema::ShapeType::Long,
+        5,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.route53recoverycontrolconfig#RoutingControl",
+            "com.amazonaws.route53recoverycontrolconfig",
+            "RoutingControl",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_CONTROL_PANEL_ARN,
+            &Self::M_NAME,
+            &Self::M_ROUTING_CONTROL_ARN,
+            &Self::M_STATUS,
+            &Self::M_OWNER,
+            &Self::M_ROUTE53_HEALTH_CHECK_SEQUENCE_NUMBER,
+        ],
+    );
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.route53recoverycontrolconfig#AssertionRule")]
+pub static ROUTING_CONTROL_SCHEMA: &::aws_smithy_schema::Schema = &RoutingControl::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for RoutingControl {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(v) = self.control_panel_arn.as_ref() {
+            s.write_string(&Self::M_CONTROL_PANEL_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, v.as_str())?;
+        }
+        if let Some(v) = self.routing_control_arn.as_ref() {
+            s.write_string(&Self::M_ROUTING_CONTROL_ARN, v.as_str())?;
+        }
+        if let Some(v) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, v.as_str())?;
+        }
+        if let Some(v) = self.owner.as_ref() {
+            s.write_string(&Self::M_OWNER, v.as_str())?;
+        }
+        if let Some(v) = self.route53_health_check_sequence_number.as_ref() {
+            s.write_long(&Self::M_ROUTE53_HEALTH_CHECK_SEQUENCE_NUMBER, *v)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for RoutingControl {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.control_panel_arn = Some(d.read_string(member)?),
+                Some(1) => out.name = Some(d.read_string(member)?),
+                Some(2) => out.routing_control_arn = Some(d.read_string(member)?),
+                Some(3) => out.status = Some(d.read_string(member)?),
+                Some(4) => out.owner = Some(d.read_string(member)?),
+                Some(5) => {
+                    out.route53_health_check_sequence_number = Some(d.read_long(member)?)
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AssertionRule {
     pub asserted_controls: Vec<String>,
@@ -112,9 +421,152 @@ pub struct AssertionRule {
     pub status: String,
     pub wait_period_ms: i32,
     pub owner: Option<String>,
+    /// The rule's own ARN under the generic name the wire also publishes it under: the
+    /// same value as [`safety_rule_arn`](Self::safety_rule_arn).
+    pub arn: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.route53recoverycontrolconfig#GatingRule")]
+impl AssertionRule {
+    const M_ASSERTED_CONTROLS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#AssertionRule$AssertedControls",
+        "AssertedControls",
+        ::aws_smithy_schema::ShapeType::List,
+        0,
+    );
+    const M_CONTROL_PANEL_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#AssertionRule$ControlPanelArn",
+        "ControlPanelArn",
+        ::aws_smithy_schema::ShapeType::String,
+        1,
+    );
+    const M_NAME: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#AssertionRule$Name",
+        "Name",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    const M_RULE_CONFIG: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#AssertionRule$RuleConfig",
+        "RuleConfig",
+        ::aws_smithy_schema::ShapeType::Structure,
+        3,
+    );
+    const M_SAFETY_RULE_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#AssertionRule$SafetyRuleArn",
+        "SafetyRuleArn",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+    const M_STATUS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#AssertionRule$Status",
+        "Status",
+        ::aws_smithy_schema::ShapeType::String,
+        5,
+    );
+    const M_WAIT_PERIOD_MS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#AssertionRule$WaitPeriodMs",
+        "WaitPeriodMs",
+        ::aws_smithy_schema::ShapeType::Integer,
+        6,
+    );
+    const M_OWNER: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#AssertionRule$Owner",
+        "Owner",
+        ::aws_smithy_schema::ShapeType::String,
+        7,
+    );
+    /// The member the model does not declare; see the note above this block.
+    const M_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#AssertionRule$Arn",
+        WIRE_ARN_MEMBER,
+        ::aws_smithy_schema::ShapeType::String,
+        8,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.route53recoverycontrolconfig#AssertionRule",
+            "com.amazonaws.route53recoverycontrolconfig",
+            "AssertionRule",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ASSERTED_CONTROLS,
+            &Self::M_CONTROL_PANEL_ARN,
+            &Self::M_NAME,
+            &Self::M_RULE_CONFIG,
+            &Self::M_SAFETY_RULE_ARN,
+            &Self::M_STATUS,
+            &Self::M_WAIT_PERIOD_MS,
+            &Self::M_OWNER,
+            &Self::M_ARN,
+        ],
+    );
+}
+
+pub static ASSERTION_RULE_SCHEMA: &::aws_smithy_schema::Schema = &AssertionRule::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for AssertionRule {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_list(&Self::M_ASSERTED_CONTROLS, &|sl| {
+            for control in self.asserted_controls.iter() {
+                sl.write_string(&Self::M_ASSERTED_CONTROLS, control.as_str())?;
+            }
+            Ok(())
+        })?;
+        s.write_string(&Self::M_CONTROL_PANEL_ARN, self.control_panel_arn.as_str())?;
+        s.write_string(&Self::M_NAME, self.name.as_str())?;
+        s.write_struct(&Self::M_RULE_CONFIG, &self.rule_config)?;
+        s.write_string(&Self::M_SAFETY_RULE_ARN, self.safety_rule_arn.as_str())?;
+        s.write_string(&Self::M_STATUS, self.status.as_str())?;
+        s.write_integer(&Self::M_WAIT_PERIOD_MS, self.wait_period_ms)?;
+        if let Some(v) = self.owner.as_ref() {
+            s.write_string(&Self::M_OWNER, v.as_str())?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for AssertionRule {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => {
+                    let mut controls: Vec<String> = Vec::new();
+                    d.read_list(member, &mut |dl| {
+                        controls.push(dl.read_string(member)?);
+                        Ok(())
+                    })?;
+                    out.asserted_controls = controls;
+                }
+                Some(1) => out.control_panel_arn = d.read_string(member)?,
+                Some(2) => out.name = d.read_string(member)?,
+                Some(3) => {
+                    out.rule_config =
+                        <RuleConfig as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?
+                }
+                Some(4) => out.safety_rule_arn = d.read_string(member)?,
+                Some(5) => out.status = d.read_string(member)?,
+                Some(6) => out.wait_period_ms = d.read_integer(member)?,
+                Some(7) => out.owner = Some(d.read_string(member)?),
+                Some(8) => out.arn = Some(d.read_string(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GatingRule {
     pub control_panel_arn: String,
@@ -126,6 +578,171 @@ pub struct GatingRule {
     pub target_controls: Vec<String>,
     pub wait_period_ms: i32,
     pub owner: Option<String>,
+    /// The rule's own ARN under the generic name the wire also publishes it under: the
+    /// same value as [`safety_rule_arn`](Self::safety_rule_arn).
+    pub arn: Option<String>,
+}
+
+impl GatingRule {
+    const M_CONTROL_PANEL_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#GatingRule$ControlPanelArn",
+        "ControlPanelArn",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    const M_GATING_CONTROLS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#GatingRule$GatingControls",
+        "GatingControls",
+        ::aws_smithy_schema::ShapeType::List,
+        1,
+    );
+    const M_NAME: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#GatingRule$Name",
+        "Name",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    const M_RULE_CONFIG: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#GatingRule$RuleConfig",
+        "RuleConfig",
+        ::aws_smithy_schema::ShapeType::Structure,
+        3,
+    );
+    const M_SAFETY_RULE_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#GatingRule$SafetyRuleArn",
+        "SafetyRuleArn",
+        ::aws_smithy_schema::ShapeType::String,
+        4,
+    );
+    const M_STATUS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#GatingRule$Status",
+        "Status",
+        ::aws_smithy_schema::ShapeType::String,
+        5,
+    );
+    const M_TARGET_CONTROLS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#GatingRule$TargetControls",
+        "TargetControls",
+        ::aws_smithy_schema::ShapeType::List,
+        6,
+    );
+    const M_WAIT_PERIOD_MS: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#GatingRule$WaitPeriodMs",
+        "WaitPeriodMs",
+        ::aws_smithy_schema::ShapeType::Integer,
+        7,
+    );
+    const M_OWNER: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#GatingRule$Owner",
+        "Owner",
+        ::aws_smithy_schema::ShapeType::String,
+        8,
+    );
+    /// The member the model does not declare; see the note above this block.
+    const M_ARN: ::aws_smithy_schema::Schema = member_schema(
+        "com.amazonaws.route53recoverycontrolconfig#GatingRule$Arn",
+        WIRE_ARN_MEMBER,
+        ::aws_smithy_schema::ShapeType::String,
+        9,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.route53recoverycontrolconfig#GatingRule",
+            "com.amazonaws.route53recoverycontrolconfig",
+            "GatingRule",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_CONTROL_PANEL_ARN,
+            &Self::M_GATING_CONTROLS,
+            &Self::M_NAME,
+            &Self::M_RULE_CONFIG,
+            &Self::M_SAFETY_RULE_ARN,
+            &Self::M_STATUS,
+            &Self::M_TARGET_CONTROLS,
+            &Self::M_WAIT_PERIOD_MS,
+            &Self::M_OWNER,
+            &Self::M_ARN,
+        ],
+    );
+}
+
+pub static GATING_RULE_SCHEMA: &::aws_smithy_schema::Schema = &GatingRule::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GatingRule {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        s.write_string(&Self::M_CONTROL_PANEL_ARN, self.control_panel_arn.as_str())?;
+        s.write_list(&Self::M_GATING_CONTROLS, &|sl| {
+            for control in self.gating_controls.iter() {
+                sl.write_string(&Self::M_GATING_CONTROLS, control.as_str())?;
+            }
+            Ok(())
+        })?;
+        s.write_string(&Self::M_NAME, self.name.as_str())?;
+        s.write_struct(&Self::M_RULE_CONFIG, &self.rule_config)?;
+        s.write_string(&Self::M_SAFETY_RULE_ARN, self.safety_rule_arn.as_str())?;
+        s.write_string(&Self::M_STATUS, self.status.as_str())?;
+        s.write_list(&Self::M_TARGET_CONTROLS, &|sl| {
+            for control in self.target_controls.iter() {
+                sl.write_string(&Self::M_TARGET_CONTROLS, control.as_str())?;
+            }
+            Ok(())
+        })?;
+        s.write_integer(&Self::M_WAIT_PERIOD_MS, self.wait_period_ms)?;
+        if let Some(v) = self.owner.as_ref() {
+            s.write_string(&Self::M_OWNER, v.as_str())?;
+        }
+        if let Some(v) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, v.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for GatingRule {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.control_panel_arn = d.read_string(member)?,
+                Some(1) => {
+                    let mut controls: Vec<String> = Vec::new();
+                    d.read_list(member, &mut |dl| {
+                        controls.push(dl.read_string(member)?);
+                        Ok(())
+                    })?;
+                    out.gating_controls = controls;
+                }
+                Some(2) => out.name = d.read_string(member)?,
+                Some(3) => {
+                    out.rule_config =
+                        <RuleConfig as ::aws_smithy_schema_server::DeserializableStruct>::deserialize(d)?
+                }
+                Some(4) => out.safety_rule_arn = d.read_string(member)?,
+                Some(5) => out.status = d.read_string(member)?,
+                Some(6) => {
+                    let mut controls: Vec<String> = Vec::new();
+                    d.read_list(member, &mut |dl| {
+                        controls.push(dl.read_string(member)?);
+                        Ok(())
+                    })?;
+                    out.target_controls = controls;
+                }
+                Some(7) => out.wait_period_ms = d.read_integer(member)?,
+                Some(8) => out.owner = Some(d.read_string(member)?),
+                Some(9) => out.arn = Some(d.read_string(member)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
 }
 
 /// The values `NetworkType` accepts on the wire.
@@ -138,5 +755,94 @@ pub const RULE_TYPE_VALUES: &[&str] = &["AND", "ATLEAST", "OR"];
 
 /// The values `Status` accepts on the wire.
 pub const STATUS_VALUES: &[&str] = &["DEPLOYED", "PENDING", "PENDING_DELETION"];
+
+#[cfg(test)]
+mod tests {
+    //! The four hand-written schemas above, pinned against the shipped model.
+    //!
+    //! Hand-written means they can drift from it, so this is what the derive's own
+    //! member walk did for them: a member the model declares and a block here dropped or
+    //! renamed, and an index that is not the member's position, fail here rather than
+    //! silently changing the wire.
+
+    use super::*;
+
+    /// This service's Smithy model, as it ships beside this crate. Read at test time
+    /// rather than embedded: it is JSON that no non-test build needs.
+    const MODEL_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/smithy-model/com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig.json"
+    );
+
+    /// The members the MODEL declares for `shape`, sorted — read from the model itself, so
+    /// no second hand-kept list of them can go stale.
+    fn modelled_members(shape: &str) -> Vec<String> {
+        let model = std::fs::read_to_string(MODEL_PATH)
+            .expect("the model that generated this crate ships beside it");
+        let model: serde_json::Value =
+            serde_json::from_str(&model).expect("the model that generated this crate is JSON");
+        let mut names: Vec<String> = model["shapes"][format!("{NAMESPACE}#{shape}")]["members"]
+            .as_object()
+            .unwrap_or_else(|| panic!("the model declares {shape} with members"))
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Each hand-written schema carries exactly the members the model declares, plus the
+    /// one member the wire carries that the model does not, last; and every member's
+    /// index is its own position, which is what the codecs match a wire key by.
+    #[test]
+    fn each_hand_written_schema_carries_the_modelled_members_plus_the_wire_only_one() {
+        let cases: [(&str, &::aws_smithy_schema::Schema, &str); 4] = [
+            ("ControlPanel", &ControlPanel::SCHEMA, WIRE_ARN_MEMBER),
+            (
+                "RoutingControl",
+                &RoutingControl::SCHEMA,
+                WIRE_HEALTH_CHECK_SEQUENCE_MEMBER,
+            ),
+            ("AssertionRule", &AssertionRule::SCHEMA, WIRE_ARN_MEMBER),
+            ("GatingRule", &GatingRule::SCHEMA, WIRE_ARN_MEMBER),
+        ];
+
+        for (shape, schema, wire_only) in cases {
+            let members = schema.members();
+            let names: Vec<String> = members
+                .iter()
+                .map(|member| member.member_name().unwrap_or("<unnamed>").to_string())
+                .collect();
+            assert_eq!(
+                names.last().map(String::as_str),
+                Some(wire_only),
+                "case {shape}: the member the model does not declare is carried last, so the \
+                 declared members keep the indices the derive gave them; got {names:?}"
+            );
+            let mut declared = names[..names.len() - 1].to_vec();
+            declared.sort();
+            assert_eq!(
+                declared,
+                modelled_members(shape),
+                "case {shape}: the schema must carry exactly the model's members beside the \
+                 wire-only one, got {names:?}"
+            );
+            assert_eq!(
+                names.iter().filter(|name| *name == wire_only).count(),
+                1,
+                "case {shape}: the wire-only member is carried once, got {names:?}"
+            );
+            for (position, member) in members.iter().enumerate() {
+                let name = member.member_name().unwrap_or("<unnamed>");
+                assert_eq!(
+                    member.member_index(),
+                    Some(position),
+                    "case {shape}.{name}: member_index must equal the member's position, got {:?}",
+                    member.member_index()
+                );
+            }
+        }
+    }
+}
 
 

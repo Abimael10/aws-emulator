@@ -317,6 +317,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // starts untagged; `TagResource` is what fills this set.
                 tags: std::collections::BTreeMap::new(),
                 deploy_due: crate::state::deploy_due(),
+                // The backing health check of a freshly created control is at its first
+                // sequence number; a later deployment of the control advances it.
+                health_check_sequence_number:
+                    crate::state::FIRST_HEALTH_CHECK_SEQUENCE_NUMBER,
             },
         );
 

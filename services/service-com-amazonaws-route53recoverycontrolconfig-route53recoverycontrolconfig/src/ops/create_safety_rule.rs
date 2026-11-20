@@ -300,8 +300,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // AWS nests a safety rule's ARN inside its control panel's, so the panel ARN is
-        // the prefix of the safety-rule ARN.
-        let rule_id = guard.mint_id();
+        // the prefix of the safety-rule ARN, and the rule's own id is the flat
+        // hexadecimal form AWS mints for a safety rule.
+        let rule_id = guard.mint_safety_rule_id();
         let safety_rule_arn = format!("{panel_arn}/safetyrule/{rule_id}");
         let seq = guard.next_seq();
 
