@@ -28,6 +28,10 @@
 //! 7. A caller that addressed one of AWS's own hostnames is announced the port this
 //!    emulator is SERVED on, and only an emulator served on no port at all announces the
 //!    hostname AWS itself publishes, having no own address to announce in its place.
+//! 8. EVERY operation that puts an origin endpoint on the wire — the create, the read, each
+//!    element of the listing and the update — announces the playback URLs under the origin
+//!    the CREATING request reached, whichever address the call itself reached, and each
+//!    endpoint keeps a playback path of its own below that origin.
 //!
 //! Every suite dials the published URL two ways — as published, and at the emulator's own
 //! endpoint with the published PATH, which is what a client that resolves no AWS hostname
@@ -1695,6 +1699,292 @@ async fn an_endpoint_created_on_an_aws_hostname_is_announced_the_port_the_emulat
                 "case {case:?}: the published URL serves the ingested playlist, got {:?}",
                 answer.text()
             );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE 8 — EVERY projection of an origin endpoint announces the one own origin,
+//          and each endpoint keeps a playback path of its own
+// ---------------------------------------------------------------------------
+
+/// One endpoint a row of RULE 8 publishes: the channel it packages, its own id, the single
+/// packaging member every write of it sends, the endpoint-level `manifestName` those writes
+/// carry (`None` omits it), the tail its published `url` must end in after its effective
+/// manifest name, and what that URL answers for a channel pushed one HLS playlist.
+struct Published {
+    case: &'static str,
+    channel: &'static str,
+    id: &'static str,
+    manifest_name: Option<&'static str>,
+    package_member: &'static str,
+    package: Value,
+    /// Appended to the effective manifest name to form the last path segment(s). The
+    /// manifest each packager emits, per `state::PackagingKind::manifest_path`: HLS and
+    /// CMAF an `.m3u8` playlist, DASH an `.mpd`, Microsoft Smooth an `.ism/Manifest`; a
+    /// CMAF endpoint's own playlist sits one level below its name.
+    manifest_suffix: &'static str,
+    served: u16,
+}
+
+/// The endpoints each addressing of RULE 8 publishes: every packaging format the service
+/// takes, named and unnamed, with and without child manifests, over two channels — so the
+/// rows differ along the packaging format, the manifest tail, whether a `manifestName` was
+/// sent, how many URLs the endpoint publishes, and which channel is packaged.
+fn published_endpoints() -> Vec<Published> {
+    vec![
+        Published {
+            case: "hls, no manifestName",
+            channel: "projected-a",
+            id: "projected-hls",
+            manifest_name: None,
+            package_member: "hlsPackage",
+            package: json!({}),
+            manifest_suffix: ".m3u8",
+            served: 200,
+        },
+        Published {
+            case: "cmaf with two children, a manifestName of its own",
+            channel: "projected-a",
+            id: "projected-cmaf",
+            manifest_name: Some("stream"),
+            package_member: "cmafPackage",
+            package: json!({ "hlsManifests": [{ "id": "a" }, { "id": "b", "manifestName": "master" }] }),
+            manifest_suffix: "/index.m3u8",
+            served: 200,
+        },
+        Published {
+            case: "dash, a manifestName of its own",
+            channel: "projected-a",
+            id: "projected-dash",
+            manifest_name: Some("live"),
+            package_member: "dashPackage",
+            package: json!({}),
+            manifest_suffix: ".mpd",
+            // The channel was pushed an HLS playlist and nothing of this format.
+            served: 404,
+        },
+        Published {
+            case: "microsoft smooth, no manifestName",
+            channel: "projected-a",
+            id: "projected-mss",
+            manifest_name: None,
+            package_member: "mssPackage",
+            package: json!({}),
+            manifest_suffix: ".ism/Manifest",
+            served: 404,
+        },
+        // The same packaging as the first row, on ANOTHER channel: the announced origin is
+        // the same one, and the playback path below it is this endpoint's own.
+        Published {
+            case: "hls on a second channel",
+            channel: "projected-b",
+            id: "projected-hls-second-channel",
+            manifest_name: Some("stream"),
+            package_member: "hlsPackage",
+            package: json!({}),
+            manifest_suffix: ".m3u8",
+            served: 200,
+        },
+    ]
+}
+
+/// The element of a `ListOriginEndpoints` body that reports `id`.
+fn listed_endpoint(case: &str, listed: &Value, id: &str) -> Value {
+    listed
+        .get("originEndpoints")
+        .and_then(Value::as_array)
+        .and_then(|endpoints| {
+            endpoints
+                .iter()
+                .find(|endpoint| endpoint.get("id").and_then(Value::as_str) == Some(id))
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: ListOriginEndpoints must report {id}, got {listed}")
+        })
+}
+
+/// RULE — a playback URL an origin endpoint publishes is announced under the origin the
+/// request that CREATED it reached, and EVERY operation that puts the endpoint on the wire
+/// — the create, `DescribeOriginEndpoint`, each element of `ListOriginEndpoints` and
+/// `UpdateOriginEndpoint` — reports that same URL, whichever address the reading or writing
+/// call itself reached; below that origin each endpoint keeps the egress path, its own
+/// 32-hex label and the manifest its packaging serves, so no two endpoints are served at one
+/// playback path.
+///
+/// The rows differ along what the rule generalises over: the shape of the emulator's own
+/// address the create reached it at and where the request carried it ([`OWN_ENDPOINTS`]), the
+/// packaging format and so the manifest the URL ends in, whether the endpoint names a
+/// `manifestName`, how many URLs it publishes, and which of two channels it packages. The
+/// reads and the update of every row reach a DIFFERENT own address than the create, because
+/// the announcement is the creating request's and not the reading one's.
+#[tokio::test]
+async fn every_projection_of_an_endpoint_announces_the_origin_its_create_reached() {
+    let manifest = b"#EXTM3U\n#EXT-X-VERSION:3\n";
+
+    for (index, reached) in OWN_ENDPOINTS.iter().enumerate() {
+        let router = emulator();
+        let announced = announced_origin(reached.announced);
+        // Every call after the create reaches the NEXT own address of the table.
+        let other = &OWN_ENDPOINTS[(index + 1) % OWN_ENDPOINTS.len()];
+
+        for channel in ["projected-a", "projected-b"] {
+            let ingests = channel_with_ingest(&router, channel).await;
+            let ingest = ingests.first().cloned().expect("an ingest endpoint");
+            let pushed = push(&router, &ingest, "index.m3u8", manifest, &ingest.password).await;
+            assert_eq!(
+                pushed.status,
+                200,
+                "case {:?}: the setup push to {channel} must be accepted, got {} {}",
+                reached.case,
+                pushed.status,
+                pushed.text()
+            );
+        }
+
+        // The endpoint label every row was announced under, to compare them pairwise below.
+        let mut labels: Vec<(&'static str, String)> = Vec::new();
+
+        for row in published_endpoints() {
+            let case = format!("{} / {}", reached.case, row.case);
+
+            let mut request = json!({ "channelId": row.channel, "id": row.id });
+            request[row.package_member] = row.package.clone();
+            if let Some(name) = row.manifest_name {
+                request["manifestName"] = json!(name);
+            }
+            let (status, created) = control_addressed(
+                &router,
+                "POST",
+                "/origin_endpoints",
+                Some(&request),
+                reached.authority,
+                reached.host_header,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: CreateOriginEndpoint expected 200, got {status} {created}"
+            );
+
+            // Announced under the origin the create reached, and nothing off this process.
+            let published = published_urls(&created);
+            let url = published.first().cloned().unwrap_or_else(|| {
+                panic!("case {case:?}: the create must publish a playback URL, got {created}")
+            });
+            for one in &published {
+                assert_playback_url(&case, one, &announced);
+            }
+
+            // The whole form of the endpoint's own URL: that origin, the egress path, this
+            // endpoint's own label, then the manifest its packaging serves under its
+            // effective manifest name.
+            let effective = row.manifest_name.unwrap_or(state::DEFAULT_MANIFEST_NAME);
+            let tail = format!("/{effective}{}", row.manifest_suffix);
+            let under = format!("{announced}/out/v1/");
+            let label = url
+                .strip_prefix(&under)
+                .and_then(|rest| rest.strip_suffix(&tail))
+                .unwrap_or_default();
+            assert!(
+                is_path_label(label),
+                "case {case:?}: expected {under:?} plus a 32-hex endpoint label and {tail:?}, \
+                 got {url:?}"
+            );
+            labels.push((row.id, label.to_string()));
+
+            // The three other projections, each reaching ANOTHER own address of this
+            // emulator, re-report every URL the create published.
+            let path = format!("/origin_endpoints/{}", row.id);
+            let (status, described) = control_addressed(
+                &router,
+                "GET",
+                &path,
+                None,
+                other.authority,
+                other.host_header,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: DescribeOriginEndpoint expected 200, got {status} {described}"
+            );
+            let (status, listed) = control_addressed(
+                &router,
+                "GET",
+                &format!("/origin_endpoints?channelId={}", row.channel),
+                None,
+                other.authority,
+                other.host_header,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: ListOriginEndpoints expected 200, got {status} {listed}"
+            );
+            let element = listed_endpoint(&case, &listed, row.id);
+            let mut rewrite = json!({ "description": "re-read" });
+            rewrite[row.package_member] = row.package.clone();
+            if let Some(name) = row.manifest_name {
+                rewrite["manifestName"] = json!(name);
+            }
+            let (status, updated) = control_addressed(
+                &router,
+                "PUT",
+                &path,
+                Some(&rewrite),
+                other.authority,
+                other.host_header,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: UpdateOriginEndpoint expected 200, got {status} {updated}"
+            );
+            for (projection, body) in [
+                ("DescribeOriginEndpoint", described),
+                ("ListOriginEndpoints", element),
+                ("UpdateOriginEndpoint", updated),
+            ] {
+                assert_eq!(
+                    published_urls(&body),
+                    published,
+                    "case {case:?}: {projection} must re-report the URLs the create published, \
+                     expected {published:?}, got {body}"
+                );
+            }
+
+            // The promise the announced origin makes: dialed AS PUBLISHED, it is this
+            // emulator's playback plane that answers for this endpoint.
+            let answer = plane(&router, "GET", &url, &[], b"").await;
+            assert_eq!(
+                answer.status, row.served,
+                "case {case:?}: expected {} at the published URL {url:?}, got {} {}",
+                row.served,
+                answer.status,
+                answer.text()
+            );
+            if row.served == 200 {
+                assert_eq!(
+                    answer.body, manifest,
+                    "case {case:?}: the published URL serves the ingested playlist, got {:?}",
+                    answer.text()
+                );
+            }
+        }
+
+        // Each endpoint keeps a playback path of its own, so one endpoint's URL never
+        // resolves another's content.
+        for (position, (id, label)) in labels.iter().enumerate() {
+            for (other_id, other_label) in labels.iter().skip(position + 1) {
+                assert_ne!(
+                    label, other_label,
+                    "case {:?}: {id} and {other_id} must be announced under playback paths of \
+                     their own, both got {label:?}",
+                    reached.case
+                );
+            }
         }
     }
 }
