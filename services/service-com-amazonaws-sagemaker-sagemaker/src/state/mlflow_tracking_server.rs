@@ -109,16 +109,23 @@ impl MlflowTrackingServer {
     }
 }
 
+/// The fixed text of [`missing_tracking_server_message`], as recorded SageMaker responses
+/// word a tracking server the account does not hold: the subject is the resource kind
+/// spelled in title case, the sentence addresses it BY ARN, and it closes with the colon
+/// and one space the ARN follows — no quotes around the ARN and no trailing period.
+const TRACKING_SERVER_NOT_FOUND_PREFIX: &str =
+    "Tracking Server with the following ARN does not exist: ";
+
 /// How this service states that the account holds no MLflow tracking server under the
-/// name a request named: the name RESOLVED TO ITS ARN, quoted, the way
-/// `DescribeMlflowTrackingServer`'s recorded refusal words it.
+/// name a request named: [`TRACKING_SERVER_NOT_FOUND_PREFIX`] followed by the name
+/// RESOLVED TO ITS ARN.
 ///
 /// One function for every operation addressed by `TrackingServerName`, so the read and
 /// the presign cannot drift on how a missing server is worded. The sentence's only
 /// variable part is the ARN the request's name and Region resolve to.
 pub fn missing_tracking_server_message(region: &str, name: &str) -> String {
     let arn = resource_arn(region, TRACKING_SERVER_KIND, name);
-    format!("Could not find mlflow tracking server \"{arn}\".")
+    format!("{TRACKING_SERVER_NOT_FOUND_PREFIX}{arn}")
 }
 
 impl ComAmazonawsSagemakerSagemakerState {

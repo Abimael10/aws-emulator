@@ -501,8 +501,8 @@ async fn presigning_a_name_no_server_was_created_under_is_refused_with_resource_
         assert_eq!(
             message(&parsed),
             format!(
-                "Could not find mlflow tracking server \
-                 \"arn:aws:sagemaker:{region}:{ACCOUNT}:mlflow-tracking-server/{name}\"."
+                "Tracking Server with the following ARN does not exist: \
+                 arn:aws:sagemaker:{region}:{ACCOUNT}:mlflow-tracking-server/{name}"
             ),
             "case {case:?}: the refusal must name the ARN the request resolves to, got {:?}",
             message(&parsed)
