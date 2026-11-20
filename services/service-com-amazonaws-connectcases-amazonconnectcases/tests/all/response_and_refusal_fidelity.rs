@@ -1081,7 +1081,10 @@ async fn a_reserved_system_field_is_reported_under_its_display_name() {
 
     // Two entries of the catalog pinned as literals — the one the issue cited
     // and one it did not — so a wrong catalog entry fails here.
-    for (field_id, name, field_type) in [("title", "Title", "Text"), ("status", "Status", "Text")] {
+    for (field_id, name, field_type) in [
+        ("title", "Title", "Text"),
+        ("status", "Status", "SingleSelect"),
+    ] {
         assert!(
             RESERVED_SYSTEM_FIELDS.contains(&(field_id, name, field_type)),
             "case \"the reserved catalog\": {field_id} must be reserved as a {field_type} field \

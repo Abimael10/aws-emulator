@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateField
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateField`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateField::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the properties a request carries onto the stored field in
+//! [`crate::state`], so the next read reports them. It is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +147,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateField` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFieldErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateField"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFieldErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let domain = store
+            .domain_mut(&input.domain_id)
+            .map_err(UpdateFieldErrorModeled::ResourceNotFoundException)?;
+
+        // The field has to EXIST before anything else is judged about the
+        // request: a reference the domain holds no record for at all is the
+        // modelled 404, and only a record it does hold can be refused as
+        // deleted or as a rename onto a taken name.
+        let Some(record) = domain.field_record(&input.field_id) else {
+            return Err(UpdateFieldErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::ResourceKind::Field, &input.field_id),
+            )
+            .into());
+        };
+
+        // A field whose record is a tombstone is refused as a bad request rather
+        // than as a missing one: "You cannot update a deleted field by calling
+        // UpdateField; it throws a ValidationException"
+        // (`smithy_query(query="doc",shape="DeleteField")`). The same reading
+        // `BatchPutFieldOptions` applies to its own deleted-field refusal.
+        if record.deleted {
+            return Err(UpdateFieldErrorModeled::ValidationException(
+                crate::state::deleted_fields(&[input.field_id]),
+            )
+            .into());
+        }
+
+        // A field name identifies the field to a human within its domain, so a
+        // rename onto a name another live field already holds — including a
+        // reserved System field's own name — is refused, exactly as the create
+        // path refuses it. Renaming a field to the name it already has is not a
+        // conflict with itself.
+        if let Some(name) = input.name.as_deref() {
+            if domain.fields.values().any(|field| {
+                !field.deleted && field.name == name && field.field_id != input.field_id
+            }) {
+                return Err(UpdateFieldErrorModeled::ConflictException(
+                    crate::state::name_conflict(crate::state::ResourceKind::Field, name),
+                )
+                .into());
+            }
+        }
+
+        let field = domain
+            .field_mut(&input.field_id)
+            .map_err(UpdateFieldErrorModeled::ResourceNotFoundException)?;
+
+        // Only the members the request carries are written: an absent member
+        // asks for no change to the property it names, so its stored value is
+        // preserved — the same reading `UpdateTemplate` applies to its own
+        // optional members. The write is durable, so every later read of this
+        // field (`BatchGetField`, `ListFields`, and the field a case's value is
+        // type-checked against) reports what this call stored.
+        let mut changed = false;
+        if let Some(name) = input.name {
+            changed |= field.name != name;
+            field.name = name;
+        }
+        if let Some(description) = input.description {
+            changed |= field.description.as_deref() != Some(description.as_str());
+            field.description = Some(description);
+        }
+        if let Some(attributes) = input.attributes {
+            // Compared like the members above, so re-sending the attributes a
+            // field already holds is the same request twice and leaves no
+            // trace. The union declares one variant (`text`), so a held value
+            // of that variant is compared member by member and anything else
+            // counts as a change.
+            let unchanged = match (field.attributes.as_ref(), &attributes) {
+                (Some(FieldAttributes::Text(held)), FieldAttributes::Text(asked)) => {
+                    held.is_multiline == asked.is_multiline
+                }
+                _ => false,
+            };
+            changed |= !unchanged;
+            field.attributes = Some(attributes);
+        }
+        // `lastModifiedTime` is "Timestamp at which the resource was created or
+        // last modified", so it moves only when this call modified something.
+        if changed {
+            field.last_modified_time = now;
+        }
+        let field_id = field.field_id.clone();
+        drop(store);
+
+        // The audit record for a state-changing call: who asked, what it
+        // touched and what came of it. Never a credential — only the access key
+        // id the caller presented.
+        ::tracing::info!(
+            target: "emulator::audit",
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            domain_id = %input.domain_id,
+            field_id = %field_id,
+            outcome = if changed { "updated" } else { "unchanged" },
+            "field updated"
+        );
+
+        // The documented success: HTTP 200 with an empty body.
+        Ok(UpdateFieldOutput {})
     }
 }

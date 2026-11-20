@@ -276,6 +276,87 @@ pub async fn fields_of_every_type(
     created
 }
 
+/// `BatchGetField` over `ids`, as its `(fields, errors)` lists.
+pub async fn batch_get_fields(
+    emulator: &Emulator,
+    case: &str,
+    domain_id: &str,
+    ids: &[String],
+) -> (Vec<Value>, Vec<Value>) {
+    let requested: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
+    let response = emulator
+        .ok(
+            case,
+            "POST",
+            &format!("/domains/{domain_id}/fields-batch"),
+            json!({ "fields": requested }),
+        )
+        .await;
+    let fields = response
+        .get("fields")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: BatchGetField reported no fields: {response:?}"))
+        .clone();
+    let errors = response
+        .get("errors")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    (fields, errors)
+}
+
+/// The one field `BatchGetField` reports for `field_id`, which must resolve.
+pub async fn read_field(emulator: &Emulator, case: &str, domain_id: &str, field_id: &str) -> Value {
+    let ids = vec![field_id.to_string()];
+    let (fields, errors) = batch_get_fields(emulator, case, domain_id, &ids).await;
+    assert!(
+        errors.is_empty(),
+        "case {case:?}: BatchGetField must still retrieve {field_id}, got errors {errors:?}"
+    );
+    assert_eq!(
+        fields.len(),
+        1,
+        "case {case:?}: expected exactly one field back for {field_id}, got {fields:?}"
+    );
+    fields[0].clone()
+}
+
+/// Every field summary `ListFields` reports for `domain_id`, following its
+/// pages to exhaustion so the answer is every live field and not only the first
+/// page. `nextToken` is an `@httpQuery` member of this operation, so the cursor
+/// travels in the query string rather than in the body.
+pub async fn listed_fields(emulator: &Emulator, case: &str, domain_id: &str) -> Vec<Value> {
+    let mut listed: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let query = match &token {
+            Some(token) => format!("?nextToken={token}"),
+            None => String::new(),
+        };
+        let answer = emulator
+            .ok(
+                case,
+                "POST",
+                &format!("/domains/{domain_id}/fields-list{query}"),
+                json!({}),
+            )
+            .await;
+        let page = answer
+            .get("fields")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: ListFields reported no fields: {answer:?}"))
+            .clone();
+        listed.extend(page);
+        token = answer
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if token.is_none() {
+            return listed;
+        }
+    }
+}
+
 /// Create a template requiring `field_ids`, returning its id.
 pub async fn template(
     emulator: &Emulator,

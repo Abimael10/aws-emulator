@@ -208,10 +208,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // a whole call would fail with: see
                     // `state::BATCH_ITEM_NOT_FOUND_CODE`.
                     error_code: crate::state::BATCH_ITEM_NOT_FOUND_CODE.to_string(),
-                    message: Some(format!(
-                        "Field {} was not found in domain {}",
-                        requested.id, input.domain_id
-                    )),
+                    // Fixed text, interpolating nothing: the id that failed is
+                    // reported through the entry's own `id` member above (see
+                    // `state::BATCH_ITEM_NOT_FOUND_MESSAGE`).
+                    message: Some(crate::state::BATCH_ITEM_NOT_FOUND_MESSAGE.to_string()),
                 }),
             }
         }

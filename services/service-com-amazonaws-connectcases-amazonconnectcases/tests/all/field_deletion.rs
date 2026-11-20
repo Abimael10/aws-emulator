@@ -48,8 +48,8 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::harness::{
-    domain, field_value_variants, fields_of_every_type, get_case_fields, string_at, template,
-    Emulator,
+    domain, field_value_variants, fields_of_every_type, get_case_fields, listed_fields, read_field,
+    string_at, template, Emulator,
 };
 use crate::layout_lifecycle::{create_layout, get_layout, top_panel, top_panel_reported};
 
@@ -66,83 +66,14 @@ async fn delete_field(emulator: &Emulator, case: &str, domain_id: &str, field_id
         .await
 }
 
-/// `BatchGetField` over `ids`, as its `(fields, errors)` lists.
-async fn batch_get(
-    emulator: &Emulator,
-    case: &str,
-    domain_id: &str,
-    ids: &[String],
-) -> (Vec<Value>, Vec<Value>) {
-    let requested: Vec<Value> = ids.iter().map(|id| json!({ "id": id })).collect();
-    let response = emulator
-        .ok(
-            case,
-            "POST",
-            &format!("/domains/{domain_id}/fields-batch"),
-            json!({ "fields": requested }),
-        )
-        .await;
-    let fields = response
-        .get("fields")
-        .and_then(Value::as_array)
-        .unwrap_or_else(|| panic!("case {case:?}: BatchGetField reported no fields: {response:?}"))
-        .clone();
-    let errors = response
-        .get("errors")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    (fields, errors)
-}
-
-/// The one field `BatchGetField` reports for `field_id`.
-async fn read_field(emulator: &Emulator, case: &str, domain_id: &str, field_id: &str) -> Value {
-    let ids = vec![field_id.to_string()];
-    let (fields, errors) = batch_get(emulator, case, domain_id, &ids).await;
-    assert!(
-        errors.is_empty(),
-        "case {case:?}: BatchGetField must still retrieve {field_id}, got errors {errors:?}"
-    );
-    assert_eq!(
-        fields.len(),
-        1,
-        "case {case:?}: expected exactly one field back for {field_id}, got {fields:?}"
-    );
-    fields[0].clone()
-}
-
-/// The field ids `ListFields` reports for `domain_id`, following its pages to
-/// exhaustion so the answer is every live field and not only the first page.
+/// The field ids `ListFields` reports for `domain_id`, as the shared
+/// page-following reader lists them.
 async fn listed_field_ids(emulator: &Emulator, case: &str, domain_id: &str) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    let mut token: Option<String> = None;
-    loop {
-        let query = match &token {
-            Some(token) => format!("?nextToken={token}"),
-            None => String::new(),
-        };
-        let answer = emulator
-            .ok(
-                case,
-                "POST",
-                &format!("/domains/{domain_id}/fields-list{query}"),
-                json!({}),
-            )
-            .await;
-        let page = answer
-            .get("fields")
-            .and_then(Value::as_array)
-            .unwrap_or_else(|| panic!("case {case:?}: ListFields reported no fields: {answer:?}"))
-            .clone();
-        ids.extend(page.iter().map(|field| string_at(field, "fieldId", case)));
-        token = answer
-            .get("nextToken")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        if token.is_none() {
-            return ids;
-        }
-    }
+    listed_fields(emulator, case, domain_id)
+        .await
+        .iter()
+        .map(|field| string_at(field, "fieldId", case))
+        .collect()
 }
 
 /// `CreateField`, returning the id it minted.

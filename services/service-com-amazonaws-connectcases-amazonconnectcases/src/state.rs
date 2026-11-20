@@ -111,34 +111,43 @@ pub const FIELD_NAMESPACE_SYSTEM: &str = "System";
 /// `FieldNamespace` only names the two namespaces
 /// (`smithy_query(query="shape",shape="FieldNamespace")` = `Custom | System`).
 /// The ids, display names and types below are the service's own reserved
-/// vocabulary, as the Amazon Connect Administrator Guide's "Cases fields" tables
-/// list them and as the recorded traffic shows them: the ids are reserved words,
-/// verbatim, not minted per domain, and each one's `FieldType` is a value of
-/// `FIELD_TYPE_VALUES` so a value written against it is type-checked like any
-/// other field's.
+/// vocabulary, as the recorded traffic of a newly created domain lists them:
+/// the ids are reserved words, verbatim, not minted per domain, and each one's
+/// `FieldType` is a value of `FIELD_TYPE_VALUES` so a value written against it
+/// is type-checked like any other field's.
 ///
 /// The second column is the field's NAME, which the model keeps distinct from
 /// its id: `FieldSummary.name` is its own required member, "Name of the field"
 /// (`smithy_query(query="shape",shape="FieldSummary")`), typed `FieldName`
 /// (`@length 1..100`, pattern `^.*[\S]$`). It is the service's display name for
-/// the field — the guide's own wording for it, which is how a client that only
-/// knows the display name resolves the id it has to send — so it is not the
-/// reserved word the id is.
+/// the field, which is how a client that only knows the display name resolves
+/// the id it has to send — so it is not the reserved word the id is, and it is
+/// the API's own wording for the field rather than the sentence-cased wording a
+/// console or a guide renders it with: every word is capitalised and the service
+/// writes an instant as `Date/Time`.
 ///
-/// Two of them — `created_datetime` and `last_updated_datetime` — are instants
-/// the real service maintains itself. Neither the model nor the recorded traffic
-/// says whether it refuses, ignores or accepts a caller's write to them, so they
-/// are provisioned as the ordinary `DateTime` fields they are typed as and the
-/// question is left to a recording that settles it.
+/// The instants and identities in the set — the `*_datetime` fields, `case_id`,
+/// `created_by` and `last_updated_user` — are values the real service maintains
+/// itself. Neither the model nor the recorded traffic says whether it refuses,
+/// ignores or accepts a caller's write to them, so they are provisioned as the
+/// ordinary fields of their declared type that they are, and the question is
+/// left to a recording that settles it.
 pub const RESERVED_SYSTEM_FIELDS: &[(&str, &str, &str)] = &[
-    ("assigned_queue", "Assigned queue", "Text"),
-    ("assigned_user", "Assigned user", "User"),
-    ("case_reason", "Case reason", "SingleSelect"),
-    ("created_datetime", "Date/time created", "DateTime"),
-    ("customer_id", "Customer", "Text"),
-    ("last_updated_datetime", "Date/time last updated", "DateTime"),
-    ("reference_number", "Reference number", "Text"),
-    ("status", "Status", "Text"),
+    ("assigned_queue", "Assigned Queue", "Text"),
+    ("assigned_user", "Assigned User", "Text"),
+    ("case_id", "Case Id", "Text"),
+    ("case_reason", "Case Reason", "SingleSelect"),
+    ("created_by", "Created By", "User"),
+    ("created_datetime", "Date/Time Opened", "DateTime"),
+    ("customer_id", "Customer Id", "Text"),
+    ("last_closed_datetime", "Date/Time Last Closed", "DateTime"),
+    ("last_reopened_datetime", "Date/Time Last Reopened", "DateTime"),
+    ("last_updated_user", "Last Updated User", "User"),
+    ("last_updated_datetime", "Date/Time Updated", "DateTime"),
+    ("next_sla_breach_datetime", "Next SLA Breach Date/Time", "DateTime"),
+    ("reference_id", "Reference Id", "Text"),
+    ("reference_number", "Reference Number", "Text"),
+    ("status", "Status", "SingleSelect"),
     ("summary", "Summary", "Text"),
     ("title", "Title", "Text"),
 ];
@@ -1846,6 +1855,17 @@ pub fn not_configurable_in_a_layout<'a, I: IntoIterator<Item = &'a str>>(ids: I)
 /// exception shape: `ResourceNotFoundException` is how a WHOLE call fails,
 /// while one unresolvable item is `ResourceNotFound`.
 pub const BATCH_ITEM_NOT_FOUND_CODE: &str = "ResourceNotFound";
+
+/// The per-item error MESSAGE a batch read reports for an id it cannot resolve.
+///
+/// Entirely fixed text, with no variable part: the entry already carries the id
+/// that failed in its own required `id` member
+/// (`smithy_query(query="shape",shape="FieldError")`), which is where a client
+/// reads it from, so the sentence interpolates neither the id nor the container
+/// it was looked for in. That is also what keeps the sentence a constant a
+/// client can match on, unlike the generated one it would be if the ids a
+/// request carried leaked into it.
+pub const BATCH_ITEM_NOT_FOUND_MESSAGE: &str = "This resource cannot be found";
 
 /// The kind of resource a refusal is about: the kinds this service addresses
 /// within a container, plus the container itself. Taking the kind as a value
