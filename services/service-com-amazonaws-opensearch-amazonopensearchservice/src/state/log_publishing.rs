@@ -116,6 +116,19 @@ const INDEX_SLOWLOG_LOGGER: &str = "index.indexing.slowlog.index";
 /// The level an application-log line for a change the cluster applied is stated at.
 const APPLICATION_LEVEL: &str = "INFO";
 
+/// The CAUSE the cluster's own line states for an index created by a call that ASKED for
+/// one: the create came from the cluster's index API.
+pub const CAUSE_API: &str = "api";
+
+/// The cause it states for an index the cluster created for a document WRITE that named an
+/// index it did not hold yet.
+///
+/// A write is applied as an action of the cluster's bulk layer whichever route it arrived on
+/// — one document on its own, a partial update, or an item of a bulk stream — so the
+/// implicit create every write path goes through is stated with the one cause that layer
+/// gives it.
+pub const CAUSE_AUTO_WRITE: &str = "auto(bulk api)";
+
 /// How much of the operation's own source one slow-log record states: the engine's
 /// documented `index.indexing.slowlog.source` default, which logs the first 1000
 /// characters of it.
@@ -189,6 +202,9 @@ pub enum IndexChange {
     /// An index the cluster did not hold was created, with the shard layout its settings
     /// give it.
     Created {
+        /// WHY the cluster created it: a call that asked for the index ([`CAUSE_API`]), or a
+        /// write that named one it did not hold ([`CAUSE_AUTO_WRITE`]).
+        cause: &'static str,
         /// `index.number_of_shards` of the created index.
         shards: i64,
         /// `index.number_of_replicas` of it.
@@ -217,8 +233,12 @@ impl IndexChange {
     /// What the line says about `index`, as the engine's own line words it.
     fn stated(&self, index: &str) -> String {
         match self {
-            Self::Created { shards, replicas } => {
-                format!("[{index}] creating index, cause [api], shards [{shards}]/[{replicas}]")
+            Self::Created {
+                cause,
+                shards,
+                replicas,
+            } => {
+                format!("[{index}] creating index, cause [{cause}], shards [{shards}]/[{replicas}]")
             }
             Self::SettingsUpdated { settings } => {
                 format!("[{index}] updating index settings [{}]", settings.join(", "))

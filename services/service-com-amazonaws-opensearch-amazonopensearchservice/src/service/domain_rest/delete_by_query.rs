@@ -127,6 +127,11 @@ fn delete_by_query(
             break;
         }
     }
+    // The documents were selected by a QUERY over the indexes the path names, so each of
+    // them was READ: the domain's search slow log has a record of that read where the
+    // index's own threshold makes it slow, exactly as it has one for a `_search` over the
+    // same documents ([`super::record_searched`]).
+    super::record_searched(domain, request, index_name);
     ok(&json!({
         "took": request.took().as_millis(),
         // A delete that stopped with documents it had not reached is one that did not

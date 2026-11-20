@@ -3092,7 +3092,11 @@ fn create_index(domain: &mut Domain, request: &Request<'_>, index_name: &str) ->
         domain,
         &[state::log_publishing::Served::Applied {
             index: index_name,
-            change: state::log_publishing::IndexChange::Created { shards, replicas },
+            change: state::log_publishing::IndexChange::Created {
+                cause: state::log_publishing::CAUSE_API,
+                shards,
+                replicas,
+            },
         }],
     );
     ok(&json!({
@@ -3369,6 +3373,10 @@ fn document_write(
         principal_arn: request.principal,
         now,
     };
+    // Whether the write will CREATE the index it names, read before it is applied: the
+    // cluster's application log states an index it created for a write
+    // ([`write_records::record_written`]), and afterwards the index is there either way.
+    let auto_created = !domain.indexes.contains_key(index_name);
     // The write goes through the ONE data-plane write path, which owns the auto-created
     // index and the mapping rules — so a document written over the wire and one written by a
     // producer land under one set of cluster rules. The IAM decision about this request was
@@ -3382,14 +3390,16 @@ fn document_write(
             let created = written.version == 1;
             // The write really happened, and how long it took is what the index's own
             // indexing slow-log threshold is compared against.
-            request.record_served(
+            record_written(
                 domain,
-                &[state::log_publishing::Served::Indexed {
-                    index: &indexed.index_name,
+                request,
+                Written {
+                    index_name: &indexed.index_name,
                     id: &indexed.document_id,
                     took: request.took(),
                     source: ::std::str::from_utf8(request.body).unwrap_or_default(),
-                }],
+                    auto_created,
+                },
             );
             rendered(
                 if created { 201 } else { 200 },
@@ -4812,5 +4822,10 @@ use ism::*;
 /// The NODES APIs: the cluster's nodes, and the statistics of one.
 mod nodes;
 use nodes::*;
+
+/// The records a DOCUMENT WRITE produces for the domain's log publishing, whichever route
+/// performed it.
+mod write_records;
+use write_records::{record_written, Written};
 
 use selection::*;

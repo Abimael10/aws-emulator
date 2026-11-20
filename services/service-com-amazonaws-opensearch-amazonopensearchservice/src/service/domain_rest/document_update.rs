@@ -28,11 +28,12 @@ use std::time::SystemTime;
 use aws_smithy_runtime_api::http::Response as RtResponse;
 use serde_json::{json, Map, Value};
 
-use crate::state::{fgac, ingest, log_publishing, Domain};
+use crate::state::{fgac, ingest, Domain};
 
 use super::{
-    guarded, rendered, refused, requested_revision, unreadable_write, write_conflict,
-    write_index, write_shards, written_document, wrong_method, Creates, Refusal, Request,
+    guarded, record_written, rendered, refused, requested_revision, unreadable_write,
+    write_conflict, write_index, write_shards, written_document, wrong_method, Creates, Refusal,
+    Request, Written,
 };
 
 /// The member a partial update carries the fields to merge in: "doc: the partial document
@@ -255,6 +256,9 @@ fn update(
         principal_arn: request.principal,
         now,
     };
+    // Whether the merged document will CREATE the index it names, read before it is
+    // applied, for the reason every write route reads it ([`super::write_records`]).
+    let auto_created = !domain.indexes.contains_key(index_name);
     // The merged document goes through the ONE data-plane write path, which owns the
     // mapping rules and the revision numbering, so an updated document is judged by the
     // same cluster rules a written one is.
@@ -263,14 +267,16 @@ fn update(
             let Some(written) = written_document(domain, &indexed) else {
                 return unreadable_write(&indexed).response();
             };
-            request.record_served(
+            record_written(
                 domain,
-                &[log_publishing::Served::Indexed {
-                    index: &indexed.index_name,
+                request,
+                Written {
+                    index_name: &indexed.index_name,
                     id: &indexed.document_id,
                     took: request.took(),
                     source: ::std::str::from_utf8(&document).unwrap_or_default(),
-                }],
+                    auto_created,
+                },
             );
             rendered(
                 if created { 201 } else { 200 },

@@ -16,6 +16,12 @@
 //! refused exactly as one written on its own, and a bulk load is not a second way into an
 //! index with rules of its own. The IAM decision is the request's, taken once at this
 //! plane's front door against the resource the bulk path addresses.
+//!
+//! Each item the stream APPLIES produces the records the domain's log publishing has of a
+//! document write, exactly as the single-document routes do ([`super::write_records`]): a
+//! bulk load is where a client's documents arrive, so a slow-log group that stayed empty
+//! for it would stay empty for the load the index's threshold was set for. The duration one
+//! record states is that ITEM's own write, since each item is a write of its own.
 
 use std::time::{Instant, SystemTime};
 
@@ -25,8 +31,8 @@ use serde_json::{json, Map, Value};
 use crate::state::{fgac, ingest, Domain};
 
 use super::{
-    apply_pipeline, document_update, error, guarded, ok, wrong_method, write_conflict, Creates,
-    Refusal, Request,
+    apply_pipeline, document_update, error, guarded, ok, record_written, wrong_method,
+    write_conflict, Creates, Refusal, Request, Written,
 };
 
 /// The actions a bulk stream may name, each the name of the member its metadata is carried
@@ -335,8 +341,15 @@ fn index(
         principal_arn: request.principal,
         now,
     };
+    // Whether this item will CREATE the index it names, read before it is applied, for the
+    // reason every write route reads it ([`super::write_records`]).
+    let auto_created = !domain.indexes.contains_key(index_name);
+    // How long this ITEM's write takes is what the index's own indexing slow-log threshold
+    // is compared against: each item is a write of its own, so each is timed on its own.
+    let started = Instant::now();
     match ingest::index_into(domain, &write) {
         Ok(indexed) => {
+            let took = started.elapsed();
             let Some(written) = super::written_document(domain, &indexed) else {
                 return failure(
                     action,
@@ -344,6 +357,17 @@ fn index(
                     &super::unreadable_write(&indexed),
                 );
             };
+            record_written(
+                domain,
+                request,
+                Written {
+                    index_name: &indexed.index_name,
+                    id: &indexed.document_id,
+                    took,
+                    source: ::std::str::from_utf8(&document).unwrap_or_default(),
+                    auto_created,
+                },
+            );
             let created = written.version == 1;
             Item {
                 reported: json!({
