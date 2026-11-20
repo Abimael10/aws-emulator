@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Writes the group's new description to the group `(AwsAccountId, Namespace,
+//! GroupName)` addresses, so the read that follows reports it, and answers with the
+//! group as stored.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The description is the one thing this operation changes, and the model makes it
+//! optional: a request that submits one replaces what the group carried, and one that
+//! submits none asks for no change to it. A name the namespace holds no group under is
+//! refused with the modelled `ResourceNotFoundException` rather than reported as
+//! updated.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +161,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGroup"))
+        // Everything the update writes comes from the request; `ctx` carries nothing it
+        // needs.
+        let _ = ctx;
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateGroupErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let key = (input.aws_account_id, input.namespace, input.group_name);
+        let mut store = state.lock();
+        let Some(record) = store.groups.get_mut(&key) else {
+            return Err(UpdateGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    // The same miss every group handler reports, rendered by the one
+                    // shared helper.
+                    message: Some(crate::state::group_not_found_message(
+                        &key.0, &key.1, &key.2,
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // The description the request submitted is what the group carries from now on;
+        // a request that submits none says nothing about it, so what was saved stays
+        // saved. Nothing else about a group is an input here: its name and the namespace
+        // it belongs to are its identity, and the `PrincipalId` and ARN that name that
+        // identity cannot change while it does not.
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+
+        // The response reports the group as stored, so a caller sees exactly what the
+        // next read will answer with.
+        Ok(UpdateGroupOutput {
+            group: Some(record.to_group()),
+            request_id: Some(request_id),
+            // `Status` is this response's `@httpResponseCode` member, so it IS the
+            // call's HTTP status: the group carries the new description by the time this
+            // response is written.
+            status: 200,
+        })
     }
 }

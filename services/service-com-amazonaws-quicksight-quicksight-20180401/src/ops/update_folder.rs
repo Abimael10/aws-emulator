@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateFolder
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateFolder`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Writes the folder's new display name to the folder `(AwsAccountId, FolderId)`
+//! addresses, so the read that follows reports it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateFolder::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `Name` is the one thing this operation changes and the model makes it required, so
+//! an accepted update always writes it, and the folder's `LastUpdatedTime` moves to the
+//! instant of this call. An id the account holds no folder under is refused with the
+//! modelled `ResourceNotFoundException` rather than reported as updated.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +163,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateFolder` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateFolderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateFolder"))
+        // `ctx` carries the region a refusal's ARN is scoped to.
+        let region = crate::state::request_region(ctx.parts());
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateFolderErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // The update is what last addressed this folder, so the folder was last updated
+        // at the instant of this call.
+        let updated_time = crate::state::now_timestamp(std::time::SystemTime::now());
+
+        let key = (input.aws_account_id, input.folder_id);
+        let mut store = state.lock();
+        let Some(record) = store.folders.get_mut(&key) else {
+            return Err(UpdateFolderErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::folder_not_found_message(
+                        &region, &key.0, &key.1,
+                    )),
+                    // `ExceptionResourceType` declares no member for a folder, so this
+                    // refusal reports none rather than an unmodelled value.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // What the request submitted is what the folder carries from now on: the name
+        // the update named, and this call's instant as the folder's last update. Nothing
+        // else about the folder is an input here — its type and sharing model are fixed
+        // when it is created, and its permissions and tags have their own operations.
+        record.name = Some(input.name);
+        record.last_updated_time = updated_time;
+
+        Ok(UpdateFolderOutput {
+            arn: Some(record.arn.clone()),
+            folder_id: Some(record.folder_id.clone()),
+            request_id: Some(request_id),
+            // `Status` is this response's `@httpResponseCode` member, so it IS the
+            // call's HTTP status: the folder carries the new name by the time this
+            // response is written.
+            status: 200,
+        })
     }
 }

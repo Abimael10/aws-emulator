@@ -7,9 +7,9 @@
 //! A group belongs to one namespace, so the namespace must exist for the create to
 //! have somewhere to put it, and a name that namespace already holds is refused with
 //! the modelled `ResourceExistsException` rather than overwriting the group holding
-//! it. The group's `PrincipalId` is the service's own handle on it: the request names
-//! only the group's name, so the create mints the id and every later read reports
-//! that same one.
+//! it. The group's `PrincipalId` is the group's own identity rather than a handle the
+//! service invents: it is the namespace and the name the request carries, the resource
+//! part of the group's ARN, so every later read of the group reports that same value.
 //!
 //! ## Shape of an operation
 //!
@@ -190,6 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.namespace,
             &input.group_name,
         );
+        // The group's principal id is the group's identity inside its namespace, which
+        // this request carries: the create derives it rather than minting a handle of
+        // its own, so every later read of this group reports the same value.
+        let principal_id = crate::state::group_principal_id(&input.namespace, &input.group_name);
 
         let mut store = state.lock();
 
@@ -273,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn,
             group_name: input.group_name,
             description: input.description,
-            principal_id: crate::state::next_group_principal_id(),
+            principal_id,
         };
         // The response reports the group that was just stored, so a caller sees exactly
         // what the next read will answer with.

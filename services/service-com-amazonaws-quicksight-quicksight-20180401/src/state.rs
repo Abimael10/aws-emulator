@@ -655,8 +655,9 @@ pub struct GroupRecord {
     /// The description the create submitted, if any. `GroupDescription` is optional,
     /// so a group created without one reports none rather than an empty string.
     pub description: Option<String>,
-    /// The service's own handle on this group, minted when it was created and stable
-    /// for as long as the group exists.
+    /// The identity QuickSight knows this group by: [`group_principal_id`] of the
+    /// namespace the group belongs to and the name it is known by there, so it names
+    /// the group it belongs to and is the same for every read of that group.
     pub principal_id: String,
 }
 
@@ -1640,8 +1641,20 @@ pub fn group_arn(
     quicksight_arn(
         region,
         aws_account_id,
-        &format!("group/{namespace}/{group_name}"),
+        &group_principal_id(namespace, group_name),
     )
+}
+
+/// The `PrincipalId` of a group: `group/<Namespace>/<GroupName>`.
+///
+/// A group's principal id is not a handle the service invents for it — it is the group
+/// itself, named the way QuickSight names the group resource: the namespace the group
+/// belongs to and the name it is known by there, which is the resource part of the
+/// group's own ARN ([`group_arn`] builds that ARN around this). So it is the same value
+/// for every read of one group, and a client can recover the namespace and the name
+/// from it.
+pub fn group_principal_id(namespace: &str, group_name: &str) -> String {
+    format!("group/{namespace}/{group_name}")
 }
 
 /// The ARN of an IAM policy assignment: `arn:aws:quicksight::<account>:assignment/<AssignmentName>`.
@@ -1733,12 +1746,6 @@ fn uuid_shaped(n: u64) -> String {
 
 /// The `RequestId` to report for one response.
 pub fn next_request_id() -> String {
-    uuid_shaped(next_minted_id())
-}
-
-/// The `PrincipalId` of a newly created group: the service's own handle on the group,
-/// which the request does not name, so the create mints it.
-pub fn next_group_principal_id() -> String {
     uuid_shaped(next_minted_id())
 }
 

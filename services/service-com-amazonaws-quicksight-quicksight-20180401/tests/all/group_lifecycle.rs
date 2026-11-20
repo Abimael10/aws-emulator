@@ -9,12 +9,17 @@
 //! The rule under test: a QuickSight group is identified by
 //! `(AwsAccountId, Namespace, GroupName)` and belongs to a namespace the account holds;
 //! `CreateGroup` persists it, answers HTTP 201 for the group it created and reports that
-//! group — its ARN, its name, the description it was given and the `PrincipalId` the
-//! service minted for it — and `DescribeGroup` answers from that same record. A name the
-//! namespace already holds is refused as an existing resource, and a namespace the
-//! account does not hold is not found. So the rows below vary what the rule generalises
-//! over (the group name's form and length, whether a description is submitted and how
-//! long it is, the namespace, and the account) rather than re-running one recorded call.
+//! group — its ARN, its name, the description it was given and the `PrincipalId` that
+//! names it inside its namespace — and `DescribeGroup` answers from that same record. A
+//! name the namespace already holds is refused as an existing resource, and a namespace
+//! the account does not hold is not found. So the rows below vary what the rule
+//! generalises over (the group name's form and length, whether a description is
+//! submitted and how long it is, the namespace, and the account) rather than re-running
+//! one recorded call.
+//!
+//! The update cases further down are the same rule read through a write that is not the
+//! create: an accepted `UpdateGroup` writes the `Description` it submitted to that
+//! stored record, so the next `DescribeGroup` reports it.
 //!
 //! The membership cases at the end of this suite are about a group's MEMBERS — the
 //! users it holds — which are reached through the group they belong to, so they are
@@ -110,6 +115,28 @@ async fn describe_group(
                 group_label(group_name)
             ),
             None,
+        )
+        .await
+}
+
+/// `UpdateGroup`:
+/// `PUT /accounts/{AwsAccountId}/namespaces/{Namespace}/groups/{GroupName}`.
+/// Source: smithy_query(query="operation", operation="UpdateGroup").
+async fn update_group(
+    harness: &Harness,
+    account: &str,
+    namespace: &str,
+    group_name: &str,
+    body: Value,
+) -> (u16, Value) {
+    harness
+        .call(
+            "PUT",
+            &format!(
+                "/accounts/{account}/namespaces/{namespace}/groups/{}",
+                group_label(group_name)
+            ),
+            Some(body),
         )
         .await
 }
@@ -427,14 +454,26 @@ async fn group_identity_is_the_account_the_namespace_and_the_name() {
         );
     }
 
-    // Each of the three is a group of its own, so no two share a handle.
-    for (left, right) in [(0usize, 1usize), (0, 2), (1, 2)] {
-        assert_ne!(
-            principal_ids[left], principal_ids[right],
-            "case {:?}/{:?}: two distinct groups must not share a PrincipalId",
-            places[left].0, places[right].0
-        );
-    }
+    // Each of the three is a group of its own, and a principal id names the group
+    // inside its NAMESPACE: the two in different namespaces are named differently, and
+    // the two addressing the same namespace of different accounts are named the same —
+    // what carries the account is the ARN, asserted above.
+    assert_ne!(
+        principal_ids[0], principal_ids[1],
+        "case {:?}/{:?}: two namespaces name their groups differently",
+        places[0].0, places[1].0
+    );
+    assert_ne!(
+        principal_ids[1], principal_ids[2],
+        "case {:?}/{:?}: two namespaces name their groups differently",
+        places[1].0, places[2].0
+    );
+    assert_eq!(
+        principal_ids[0], principal_ids[2],
+        "case {:?}/{:?}: one name in one namespace is one principal id, whichever \
+         account holds it",
+        places[0].0, places[2].0
+    );
 
     // A name no group in that namespace is held under is not found.
     for (case, account, namespace, group_name) in [
@@ -1845,4 +1884,360 @@ async fn removing_a_group_from_a_role_takes_it_out_of_the_listing() {
         vec![kept.to_string()],
         "the membership of another namespace must survive the deletion: {body}"
     );
+}
+
+/// The descriptions the update rows submit, one per row of [`rows`], so the table varies
+/// what the read-your-write rule generalises over: the shortest and the longest
+/// `GroupDescription` the model admits (len 1..512), a non-ASCII one, one holding
+/// punctuation and separators, and a plain re-description.
+/// Source: smithy_query(query="operation", operation="UpdateGroup") — `Description`
+/// targets `GroupDescription`, len 1..512.
+fn updated_descriptions() -> Vec<(&'static str, String)> {
+    vec![
+        ("plain", "Sales team, reorganised".to_string()),
+        ("shortest", "d".to_string()),
+        ("longest", "u".repeat(512)),
+        ("non-ascii", "Équipe des ventes — Café".to_string()),
+        ("punctuated", "sales/eu-west-2: readers (2026)".to_string()),
+    ]
+}
+
+#[tokio::test]
+async fn update_group_persists_the_new_description_and_describe_reports_it() {
+    let harness = Harness::new();
+    create_custom_namespace(&harness, ACCOUNT).await;
+    let descriptions = updated_descriptions();
+
+    for (index, row) in rows().into_iter().enumerate() {
+        let case = row.case;
+        let group_name = row.group_name.as_str();
+        let namespace = row.namespace;
+
+        let (status, body) = create_group(&harness, row.account, namespace, row.body()).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: create expected 201, got {status} with body {body}"
+        );
+        let arn = body["Group"]["Arn"].clone();
+        let principal_id = body["Group"]["PrincipalId"].clone();
+
+        // Two updates in a row, each submitting another description: whatever the
+        // latest accepted update submitted is what the group carries.
+        for step in ["first-update", "second-update"] {
+            let (label, description) = &descriptions[if step == "first-update" {
+                index % descriptions.len()
+            } else {
+                (index + 1) % descriptions.len()
+            }];
+            let (status, body) = update_group(
+                &harness,
+                row.account,
+                namespace,
+                group_name,
+                json!({ "Description": description }),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}/{step}/{label}: update expected 200, got {status} with {body}"
+            );
+            let updated = &body["Group"];
+            assert_eq!(
+                updated["Description"],
+                json!(description),
+                "case {case:?}/{step}/{label}: the update must report the description it \
+                 was given: {body}"
+            );
+            assert_eq!(
+                updated["GroupName"],
+                json!(group_name),
+                "case {case:?}/{step}/{label}: the update must report the group it \
+                 addressed: {body}"
+            );
+            assert_eq!(
+                updated["Arn"], arn,
+                "case {case:?}/{step}/{label}: an update must not change the group's \
+                 Arn: {body}"
+            );
+            assert_eq!(
+                updated["PrincipalId"], principal_id,
+                "case {case:?}/{step}/{label}: an update must not change the group's \
+                 PrincipalId: {body}"
+            );
+            assert!(
+                body["RequestId"]
+                    .as_str()
+                    .is_some_and(|request_id| !request_id.is_empty()),
+                "case {case:?}/{step}/{label}: the update reported no RequestId: {body}"
+            );
+
+            // The read that follows answers from the record the update wrote, and twice
+            // over: a read changes nothing.
+            for attempt in ["first-read", "second-read"] {
+                let (status, body) =
+                    describe_group(&harness, row.account, namespace, group_name).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}/{step}/{label}/{attempt}: describe expected 200, got \
+                     {status} with {body}"
+                );
+                assert_eq!(
+                    body["Group"]["Description"],
+                    json!(description),
+                    "case {case:?}/{step}/{label}/{attempt}: describe must report the \
+                     Description the update submitted, not the one the create did: {body}"
+                );
+                assert_eq!(
+                    body["Group"]["PrincipalId"], principal_id,
+                    "case {case:?}/{step}/{label}/{attempt}: the PrincipalId must not \
+                     change: {body}"
+                );
+            }
+
+            // And the stored record is what those reads answered from.
+            {
+                let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+                let store = state.lock();
+                let record = store
+                    .group(row.account, namespace, group_name)
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}/{step}/{label}: the group is not stored")
+                    });
+                assert_eq!(
+                    record.description.as_deref(),
+                    Some(description.as_str()),
+                    "case {case:?}/{step}/{label}: the submitted Description did not \
+                     reach the stored record"
+                );
+            }
+        }
+
+        // `Description` is optional, so an update that submits none says nothing about
+        // the description: the one the last update wrote stays.
+        let (_, kept) = &descriptions[(index + 1) % descriptions.len()];
+        let (status, body) =
+            update_group(&harness, row.account, namespace, group_name, json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: an update submitting no Description expected 200, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["Group"]["Description"],
+            json!(kept),
+            "case {case:?}: an update that names no Description must leave the one the \
+             group carries: {body}"
+        );
+        let (status, body) = describe_group(&harness, row.account, namespace, group_name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describe expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Group"]["Description"],
+            json!(kept),
+            "case {case:?}: describe must still report the description the last update \
+             wrote: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_group_touches_only_the_group_it_addresses() {
+    let harness = Harness::new();
+    create_custom_namespace(&harness, ACCOUNT).await;
+    let shared = "Shared Group";
+
+    // The same name in three places, as the identity case above: two namespaces of one
+    // account, and another account's default namespace.
+    let places = [
+        ("same-account-default-namespace", ACCOUNT, DEFAULT_NAMESPACE),
+        ("same-account-custom-namespace", ACCOUNT, CUSTOM_NAMESPACE),
+        ("other-account", OTHER_ACCOUNT, DEFAULT_NAMESPACE),
+    ];
+    for (case, account, namespace) in places {
+        let (status, body) = create_group(
+            &harness,
+            account,
+            namespace,
+            json!({ "GroupName": shared, "Description": case }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: create expected 201, got {status} with {body}"
+        );
+    }
+
+    let (case, account, namespace) = places[1];
+    let (status, body) = update_group(
+        &harness,
+        account,
+        namespace,
+        shared,
+        json!({ "Description": "only this one" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the update expected 200, got {status} with {body}"
+    );
+
+    for (index, (case, account, namespace)) in places.iter().enumerate() {
+        let expected = if index == 1 { "only this one" } else { *case };
+        let (status, body) = describe_group(&harness, account, namespace, shared).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describe expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Group"]["Description"],
+            json!(expected),
+            "case {case:?}: an update addresses the group of one namespace of one \
+             account: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn updating_a_group_name_no_namespace_holds_is_not_found() {
+    let harness = Harness::new();
+    create_custom_namespace(&harness, ACCOUNT).await;
+    let (status, body) = create_group(
+        &harness,
+        ACCOUNT,
+        DEFAULT_NAMESPACE,
+        json!({ "GroupName": "Sales", "Description": "Sales team" }),
+    )
+    .await;
+    assert_eq!(status, 201, "the create expected 201, got {status} with {body}");
+
+    // A name no group is held under, a name held only in another namespace, a name held
+    // only in another account, and an account that holds nothing at all.
+    for (case, account, namespace, group_name) in [
+        ("unused-name", ACCOUNT, DEFAULT_NAMESPACE, "No Such Group"),
+        (
+            "name-used-in-another-namespace-only",
+            ACCOUNT,
+            CUSTOM_NAMESPACE,
+            "Sales",
+        ),
+        ("other-account", OTHER_ACCOUNT, DEFAULT_NAMESPACE, "Sales"),
+        ("account-with-nothing", "123456789012", DEFAULT_NAMESPACE, "Sales"),
+    ] {
+        let (status, body) = update_group(
+            &harness,
+            account,
+            namespace,
+            group_name,
+            json!({ "Description": "new description" }),
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: updating a group that does not exist expected 404, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("ResourceNotFoundException"),
+            "case {case:?}: a name no group is held under is not found: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(format!(
+                "Group {group_name} not found in namespace {namespace} in account {account}."
+            )),
+            "case {case:?}: the refusal must name the group, its namespace and its \
+             account: {body}"
+        );
+
+        // A refused update creates nothing.
+        let (status, body) = describe_group(&harness, account, namespace, group_name).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a refused update must persist nothing, got {status} with \
+             {body}"
+        );
+    }
+
+    // And the group the namespace does hold is untouched by the refusals.
+    let (status, body) = describe_group(&harness, ACCOUNT, DEFAULT_NAMESPACE, "Sales").await;
+    assert_eq!(status, 200, "describe expected 200, got {status} with {body}");
+    assert_eq!(
+        body["Group"]["Description"],
+        json!("Sales team"),
+        "a refused update must not change the group it did not reach: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_group_principal_id_is_the_namespace_and_the_name_it_is_known_by() {
+    // The rule: a group's `PrincipalId` is not a handle the service mints but the group
+    // itself — the namespace it belongs to and the name it is known by there, which is
+    // the resource part of the group's own ARN — so the same value comes back from every
+    // read of that group, and the namespace and the name can be recovered from it.
+    let harness = Harness::new();
+    create_custom_namespace(&harness, ACCOUNT).await;
+
+    for row in rows() {
+        let case = row.case;
+        let group_name = row.group_name.as_str();
+        let namespace = row.namespace;
+        let expected = format!("group/{namespace}/{group_name}");
+        let expected_arn = group_arn(row.account, namespace, group_name);
+
+        let (status, body) = create_group(&harness, row.account, namespace, row.body()).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: create expected 201, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Group"]["PrincipalId"],
+            json!(expected),
+            "case {case:?}: the create must report the group's own identity as its \
+             PrincipalId: {body}"
+        );
+        assert_eq!(
+            body["Group"]["Arn"],
+            json!(expected_arn),
+            "case {case:?}: and that identity is the resource part of the group's ARN: \
+             {body}"
+        );
+        assert!(
+            expected_arn.ends_with(&format!(":{expected}")),
+            "case {case:?}: the ARN {expected_arn} must end in the principal id \
+             {expected}"
+        );
+
+        // Every read of the group reports that same value, and so does a write.
+        let (status, body) = describe_group(&harness, row.account, namespace, group_name).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describe expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Group"]["PrincipalId"],
+            json!(expected),
+            "case {case:?}: describe must report the same PrincipalId the create did: \
+             {body}"
+        );
+        let (status, body) = update_group(
+            &harness,
+            row.account,
+            namespace,
+            group_name,
+            json!({ "Description": "re-described" }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: update expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Group"]["PrincipalId"],
+            json!(expected),
+            "case {case:?}: an update must report the same PrincipalId too: {body}"
+        );
+    }
 }

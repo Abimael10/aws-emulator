@@ -2,8 +2,8 @@
 
 //! @op DescribeGroup
 //! Reports the group `(AwsAccountId, Namespace, GroupName)` addresses, from the record
-//! `CreateGroup` stored — its ARN, its name, the description it was created with and
-//! the `PrincipalId` minted for it.
+//! the group's writes left behind — its ARN, its name, the description it currently
+//! carries and its `PrincipalId`.
 //!
 //! A name no group in that namespace is held under is refused with the modelled
 //! `ResourceNotFoundException`. This is a report on stored state: it writes nothing.

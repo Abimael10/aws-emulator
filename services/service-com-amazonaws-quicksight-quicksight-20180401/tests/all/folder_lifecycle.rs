@@ -15,6 +15,11 @@
 //! the rule generalises over (the id's form, whether a name is given and how long it is,
 //! the folder type, the sharing model, the tags and permissions submitted, the nesting
 //! depth and the account) rather than re-running one recorded call.
+//!
+//! The update cases at the end of the suite are the same rule read through a write that
+//! is not the create: an accepted `UpdateFolder` writes the `Name` it submitted to that
+//! stored record, so the next `DescribeFolder` reports it and nothing else about the
+//! folder moves.
 
 use serde_json::{json, Value};
 
@@ -56,6 +61,68 @@ async fn describe_folder(harness: &Harness, account: &str, folder_id: &str) -> (
             None,
         )
         .await
+}
+
+/// `UpdateFolder`: `PUT /accounts/{AwsAccountId}/folders/{FolderId}`.
+/// Source: smithy_query(query="operation", operation="UpdateFolder").
+async fn update_folder(
+    harness: &Harness,
+    account: &str,
+    folder_id: &str,
+    body: Value,
+) -> (u16, Value) {
+    harness
+        .call(
+            "PUT",
+            &format!("/accounts/{account}/folders/{folder_id}"),
+            Some(body),
+        )
+        .await
+}
+
+/// Wait until the clock the handlers read is strictly past `reported_time` (a
+/// `CreatedTime` or `LastUpdatedTime` a read reported, in epoch seconds), so an update
+/// made after this call has a strictly later instant available to record.
+///
+/// The condition is polled rather than waited out: the service's timestamps are
+/// millisecond-resolution, so this returns as soon as the millisecond ticks over, and the
+/// deadline is only there so a stopped clock fails the case instead of hanging.
+fn wait_for_clock_past(case: &str, reported_time: f64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while service_clock_seconds() <= reported_time {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the clock never moved past {reported_time}"
+        );
+        std::hint::spin_loop();
+    }
+}
+
+/// The instant the handlers would record now, in the units a read reports it in: epoch
+/// seconds with the millisecond resolution `CreatedTime` and `LastUpdatedTime` carry.
+fn service_clock_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as f64
+        / 1000.0
+}
+
+/// The names the update rows submit, one per row of [`rows`], so the table varies what
+/// the read-your-write rule generalises over: the shortest and the longest `FolderName`
+/// the model admits (len 1..200), a non-ASCII one, one holding punctuation and
+/// separators, and a plain rename.
+/// Source: smithy_query(query="operation", operation="UpdateFolder") — `Name` targets
+/// `FolderName`, len 1..200.
+fn updated_names() -> Vec<(&'static str, String)> {
+    vec![
+        ("plain-rename", "Reports (renamed)".to_string()),
+        ("shortest-name", "n".to_string()),
+        ("longest-name", "r".repeat(200)),
+        ("non-ascii-name", "Rapports Café".to_string()),
+        ("punctuated-name", "finance/eu-west-2: readers".to_string()),
+        ("digits-and-spaces", "Q1 2026 draft".to_string()),
+    ]
 }
 
 /// One row of the create-then-read table.
@@ -573,5 +640,319 @@ async fn a_parent_folder_arn_naming_no_folder_is_not_found() {
         body["Folder"]["FolderPath"],
         json!([]),
         "a root-level folder reports the empty ancestor path: {body}"
+    );
+}
+
+#[tokio::test]
+async fn update_folder_persists_the_new_name_and_describe_reports_it() {
+    let harness = Harness::new();
+    let names = updated_names();
+
+    for (index, row) in rows().into_iter().enumerate() {
+        let case = row.case;
+        let folder_id = row.folder_id.as_str();
+        let arn = folder_arn(row.account, folder_id);
+
+        let (status, body) = create_folder(&harness, row.account, folder_id, row.body()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: create expected 200, got {status} with body {body}"
+        );
+        let (status, body) = describe_folder(&harness, row.account, folder_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describe expected 200, got {status} with body {body}"
+        );
+        let created_time = body["Folder"]["CreatedTime"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("case {case:?}: describe reported no CreatedTime: {body}"));
+
+        // Two updates in a row, each naming the folder something else: whatever the
+        // latest accepted update submitted is what the folder is called. `previous_time`
+        // is the instant the folder was last written at before each update, so each one
+        // must move `LastUpdatedTime` strictly past it.
+        let mut previous_time = created_time;
+        for step in ["first-update", "second-update"] {
+            let (label, name) = &names[if step == "first-update" {
+                index % names.len()
+            } else {
+                (index + 1) % names.len()
+            }];
+            // With the clock strictly past the folder's last write, an update that does
+            // not touch `LastUpdatedTime` cannot pass the assertion below.
+            wait_for_clock_past(case, previous_time);
+            let (status, body) = update_folder(
+                &harness,
+                row.account,
+                folder_id,
+                json!({ "Name": name }),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}/{step}/{label}: update expected 200, got {status} with {body}"
+            );
+            assert_eq!(
+                body["Arn"],
+                json!(arn),
+                "case {case:?}/{step}/{label}: the update must report the folder's Arn: {body}"
+            );
+            assert_eq!(
+                body["FolderId"],
+                json!(folder_id),
+                "case {case:?}/{step}/{label}: the update must report the FolderId it \
+                 addressed: {body}"
+            );
+            assert!(
+                body["RequestId"]
+                    .as_str()
+                    .is_some_and(|request_id| !request_id.is_empty()),
+                "case {case:?}/{step}/{label}: the update reported no RequestId: {body}"
+            );
+
+            // The read that follows answers from the record the update wrote, and twice
+            // over: a read changes nothing.
+            for attempt in ["first-read", "second-read"] {
+                let (status, body) = describe_folder(&harness, row.account, folder_id).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}/{step}/{label}/{attempt}: describe expected 200, got \
+                     {status} with {body}"
+                );
+                let reported = &body["Folder"];
+                assert_eq!(
+                    reported["Name"],
+                    json!(name),
+                    "case {case:?}/{step}/{label}/{attempt}: describe must report the \
+                     Name the update submitted, not the one the folder was created \
+                     with: {body}"
+                );
+                // The update names the folder and nothing else, so the rest of the
+                // record is the one the create left.
+                assert_eq!(
+                    reported["Arn"],
+                    json!(arn),
+                    "case {case:?}/{step}/{label}/{attempt}: an update must not change \
+                     the folder's Arn: {body}"
+                );
+                assert_eq!(
+                    reported["FolderType"],
+                    json!(row.expected_folder_type),
+                    "case {case:?}/{step}/{label}/{attempt}: an update must not change \
+                     the FolderType: {body}"
+                );
+                assert_eq!(
+                    reported["SharingModel"],
+                    json!(row.expected_sharing_model),
+                    "case {case:?}/{step}/{label}/{attempt}: an update must not change \
+                     the SharingModel: {body}"
+                );
+                assert_eq!(
+                    reported["CreatedTime"].as_f64(),
+                    Some(created_time),
+                    "case {case:?}/{step}/{label}/{attempt}: an update must not change \
+                     the CreatedTime: {body}"
+                );
+                let last_updated_time = reported["LastUpdatedTime"].as_f64().unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}/{step}/{label}/{attempt}: describe reported no \
+                         LastUpdatedTime: {body}"
+                    )
+                });
+                assert!(
+                    last_updated_time > previous_time,
+                    "case {case:?}/{step}/{label}/{attempt}: the update is what last \
+                     addressed the folder, so LastUpdatedTime must be past the folder's \
+                     previous write at {previous_time}, got {last_updated_time}"
+                );
+                assert!(
+                    last_updated_time >= created_time,
+                    "case {case:?}/{step}/{label}/{attempt}: LastUpdatedTime must not be \
+                     before CreatedTime {created_time}, got {last_updated_time}"
+                );
+            }
+
+            // And the stored record is what those reads answered from: both the name the
+            // update submitted and the instant it recorded.
+            let stored_time = {
+                let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+                let store = state.lock();
+                let record = store.folder(row.account, folder_id).unwrap_or_else(|| {
+                    panic!("case {case:?}/{step}/{label}: the folder is not stored")
+                });
+                assert_eq!(
+                    record.name.as_deref(),
+                    Some(name.as_str()),
+                    "case {case:?}/{step}/{label}: the submitted Name did not reach the \
+                     stored record"
+                );
+                let stored_time = record.last_updated_time.as_secs_f64();
+                assert!(
+                    stored_time > previous_time,
+                    "case {case:?}/{step}/{label}: the update must write the instant it \
+                     ran at to the stored record, past the folder's previous write at \
+                     {previous_time}, got {stored_time}"
+                );
+                stored_time
+            };
+            // The next update has to move the instant past this one.
+            previous_time = stored_time;
+        }
+    }
+}
+
+#[tokio::test]
+async fn update_folder_touches_only_the_folder_it_addresses() {
+    let harness = Harness::new();
+    let shared = "shared-folder-id";
+    let other_id = "untouched";
+
+    // Three folders: the one the update addresses, a second one in the same account,
+    // and one of the same id in another account.
+    for (case, account, folder_id) in [
+        ("addressed", ACCOUNT, shared),
+        ("same-account-other-id", ACCOUNT, other_id),
+        ("other-account-same-id", OTHER_ACCOUNT, shared),
+    ] {
+        let (status, body) =
+            create_folder(&harness, account, folder_id, json!({ "Name": "Created" })).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: create expected 200, got {status} with {body}"
+        );
+    }
+
+    let (status, body) = update_folder(
+        &harness,
+        ACCOUNT,
+        shared,
+        json!({ "Name": "Only this one" }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the update expected 200, got {status} with {body}"
+    );
+
+    for (case, account, folder_id, expected_name) in [
+        ("addressed", ACCOUNT, shared, "Only this one"),
+        ("same-account-other-id", ACCOUNT, other_id, "Created"),
+        ("other-account-same-id", OTHER_ACCOUNT, shared, "Created"),
+    ] {
+        let (status, body) = describe_folder(&harness, account, folder_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describe expected 200, got {status} with {body}"
+        );
+        assert_eq!(
+            body["Folder"]["Name"],
+            json!(expected_name),
+            "case {case:?}: an update addresses one folder of one account: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn updating_a_nested_folder_leaves_its_ancestor_path_alone() {
+    let harness = Harness::new();
+
+    let (status, body) = create_folder(&harness, ACCOUNT, "parent", json!({ "Name": "Parent" })).await;
+    assert_eq!(
+        status, 200,
+        "the parent create expected 200, got {status} with {body}"
+    );
+    let parent_arn = folder_arn(ACCOUNT, "parent");
+    let (status, body) = create_folder(
+        &harness,
+        ACCOUNT,
+        "child",
+        json!({ "Name": "Child", "ParentFolderArn": parent_arn }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the child create expected 200, got {status} with {body}"
+    );
+
+    let (status, body) = update_folder(&harness, ACCOUNT, "child", json!({ "Name": "Renamed" })).await;
+    assert_eq!(
+        status, 200,
+        "the child update expected 200, got {status} with {body}"
+    );
+
+    let (status, body) = describe_folder(&harness, ACCOUNT, "child").await;
+    assert_eq!(status, 200, "describe expected 200, got {status} with {body}");
+    assert_eq!(
+        body["Folder"]["Name"],
+        json!("Renamed"),
+        "the renamed child must report the Name the update submitted: {body}"
+    );
+    assert_eq!(
+        body["Folder"]["FolderPath"],
+        json!([parent_arn]),
+        "renaming a folder must not move it: its ancestor path is still the folder \
+         above it: {body}"
+    );
+    let (status, body) = describe_folder(&harness, ACCOUNT, "parent").await;
+    assert_eq!(status, 200, "describe expected 200, got {status} with {body}");
+    assert_eq!(
+        body["Folder"]["Name"],
+        json!("Parent"),
+        "renaming the child must not rename the parent: {body}"
+    );
+}
+
+#[tokio::test]
+async fn updating_a_folder_id_no_folder_is_held_under_is_not_found() {
+    let harness = Harness::new();
+
+    let (status, body) = create_folder(&harness, ACCOUNT, "exists", json!({ "Name": "Exists" })).await;
+    assert_eq!(status, 200, "the create expected 200, got {status} with {body}");
+
+    // An unknown id of an account that holds folders, the id of another account's
+    // folder, and an id of an account that holds none.
+    for (case, account, folder_id) in [
+        ("unknown-id", ACCOUNT, "never-created"),
+        ("other-account", OTHER_ACCOUNT, "exists"),
+        ("account-with-nothing", "123456789012", "exists"),
+    ] {
+        let (status, body) =
+            update_folder(&harness, account, folder_id, json!({ "Name": "New name" })).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: updating a folder that does not exist expected 404, got \
+             {status} with {body}"
+        );
+        assert_eq!(
+            body["__type"],
+            json!("ResourceNotFoundException"),
+            "case {case:?}: an id no folder is held under is not found: {body}"
+        );
+        assert_eq!(
+            body["Message"],
+            json!(format!(
+                "Folder {} is not found",
+                folder_arn(account, folder_id)
+            )),
+            "case {case:?}: the refusal must name the folder that was not found by its \
+             ARN: {body}"
+        );
+
+        // A refused update creates nothing.
+        let (status, body) = describe_folder(&harness, account, folder_id).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a refused update must persist nothing, got {status} with \
+             {body}"
+        );
+    }
+
+    // And the folder the account does hold is untouched by the refusals.
+    let (status, body) = describe_folder(&harness, ACCOUNT, "exists").await;
+    assert_eq!(status, 200, "describe expected 200, got {status} with {body}");
+    assert_eq!(
+        body["Folder"]["Name"],
+        json!("Exists"),
+        "a refused update must not change another folder: {body}"
     );
 }
