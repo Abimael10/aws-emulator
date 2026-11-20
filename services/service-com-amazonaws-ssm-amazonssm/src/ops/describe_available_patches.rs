@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAvailablePatches
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAvailablePatches`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! List the patches Patch Manager publishes as available to be put in a patch baseline —
+//! the catalogue read of this service's patch slice. This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAvailablePatches::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Lists all patches eligible to be included in a patch baseline": the patches published
+//! for the operating systems this operation supports — "currently, DescribeAvailablePatches
+//! supports only the Amazon Linux 1, Amazon Linux 2, and Windows Server operating systems"
+//! ([`crate::state::available_patches`]) — narrowed to those meeting EVERY filter the
+//! request carries and served a page at a time, where the token is the patch the next page
+//! starts at. Which of those catalogues is walked is said by the request's own `PRODUCT`
+//! key, because "when specifying filters for Linux patches, you must specify a key-pair for
+//! PRODUCT", so a request naming no product is about the Windows patches. Nothing is
+//! written: the catalogue is Patch Manager's own, the same for every caller.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +153,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAvailablePatches` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAvailablePatchesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAvailablePatches"))
+        use crate::state::available_patches::{available_patch_filters, available_patch_page_size};
+        use crate::state::patch_catalog::PublishedPatch;
+        use crate::state::INVALID_NEXT_TOKEN;
+
+        // The `Filters` list's length, each filter value's length and the `MaxResults`
+        // range are MODELLED constraints the centralized walk has already refused anything
+        // outside of. What is read here is which of the published patches the request's own
+        // criteria select.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAvailablePatchesErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the published patch catalogue is unavailable".to_string()),
+            })
+        })?;
+
+        // A filter narrows the read by a property of a patch, so it has to name the key it
+        // searches on and a value to search for, and the key has to be one of this read's
+        // own ([`crate::state::available_patches::AVAILABLE_PATCH_FILTER_KEYS`]) — the
+        // filter shape is shared by several patch reads, each accepting its own keys.
+        let filters = available_patch_filters(input.filters.as_deref().unwrap_or_default())
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+        let page_size = available_patch_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // "Lists all patches eligible to be included in a patch baseline": the patches
+        // Patch Manager publishes for the operating systems this operation supports,
+        // narrowed to those meeting EVERY filter the request carries. A READ — nothing is
+        // written, so a later caller is reported the same catalogue.
+        let matching = state
+            .lock()
+            .available_patches(&filters, ::std::time::SystemTime::now());
+
+        // "The token for the next set of items to return. (You received this token from a
+        // previous call.)": a page hands out the id of the patch the next page starts at,
+        // so a token naming no patch of this result is not a page of it to resume. This
+        // operation models no `InvalidNextToken`, so such a token is refused as the invalid
+        // request it is rather than answered with an arbitrary page.
+        let start = match input.next_token.as_deref() {
+            None | Some("") => 0,
+            Some(token) => matching
+                .iter()
+                .position(|patch| patch.id == token)
+                .ok_or_else(|| crate::scaffolded::Scaffolded::validation(INVALID_NEXT_TOKEN))?,
+        };
+        // `start` is a position in `matching`, so the page is a suffix of it; `get` keeps
+        // that in-bounds without indexing on a value the request steers.
+        let page: &[PublishedPatch] = matching.get(start..).unwrap_or_default();
+        let patches = page
+            .iter()
+            .take(page_size)
+            .map(PublishedPatch::to_patch)
+            .collect();
+        // A patch is still waiting past this page: hand the caller the id it resumes at.
+        // "If there are no additional items to return, the string is empty" — reported as
+        // no token at all, which is how this protocol spells an absent member.
+        let next_token = page.get(page_size).map(|patch| patch.id.clone());
+
+        Ok(DescribeAvailablePatchesOutput {
+            patches: Some(patches),
+            next_token,
+        })
     }
 }

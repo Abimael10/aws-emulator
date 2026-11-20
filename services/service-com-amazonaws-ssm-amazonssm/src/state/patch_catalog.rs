@@ -32,8 +32,9 @@ use sha2::{Digest, Sha256};
 use super::maintenance_windows::calendar_instant;
 use super::patch_baselines::{PatchBaselineRecord, DEFAULT_APPROVED_PATCHES_COMPLIANCE_LEVEL};
 use super::patch_properties::{
-    PATCH_SET_OPERATING_SYSTEM, PROPERTY_CLASSIFICATION, PROPERTY_MSRC_SEVERITY, PROPERTY_PRIORITY,
-    PROPERTY_PRODUCT, PROPERTY_PRODUCT_FAMILY, PROPERTY_SEVERITY, PUBLISHED_PATCH_METADATA,
+    PublishedPatchGroup, PATCH_SET_OPERATING_SYSTEM, PROPERTY_CLASSIFICATION,
+    PROPERTY_MSRC_SEVERITY, PROPERTY_PRIORITY, PROPERTY_PRODUCT, PROPERTY_PRODUCT_FAMILY,
+    PROPERTY_SEVERITY, PUBLISHED_PATCH_METADATA,
 };
 use crate::ops::types::{EffectivePatch, Patch, PatchFilterGroup, PatchStatus};
 
@@ -64,6 +65,56 @@ pub const FILTER_KEY_PATCH_SET: &str = "PATCH_SET";
 /// `KB123456` | `KB4516046`" (`DescribeAvailablePatches$Filters`), so for a Windows patch
 /// the value is its Microsoft Knowledge Base id. Another modelled `PatchFilterKey` value.
 pub const FILTER_KEY_PATCH_ID: &str = "PATCH_ID";
+
+/// The filter key whose values name the package a Linux patch updates: "`NAME` Sample
+/// values: `kernel-headers` | `samba-python` | `php`"
+/// (`smithy_query(query="doc", shape="DescribeAvailablePatchesRequest", member="Filters")`).
+pub const FILTER_KEY_NAME: &str = "NAME";
+
+/// The filter key whose values are the epoch of that package: "`EPOCH` Sample values: `0` |
+/// `1`" (same doc).
+pub const FILTER_KEY_EPOCH: &str = "EPOCH";
+
+/// The filter key whose values are its version: "`VERSION` Sample values: `78.6.1` |
+/// `4.10.16`" (same doc).
+pub const FILTER_KEY_VERSION: &str = "VERSION";
+
+/// The filter key whose values are its release: "`RELEASE` Sample values: `9.56.amzn1` |
+/// `1.amzn2`" (same doc).
+pub const FILTER_KEY_RELEASE: &str = "RELEASE";
+
+/// The filter key whose values are the architecture it is built for: "`ARCH` Sample values:
+/// `i686` | `x86_64`" (same doc).
+pub const FILTER_KEY_ARCH: &str = "ARCH";
+
+/// The filter key whose values are the repository it is published in: "`REPOSITORY` Sample
+/// values: `Core` | `Updates`" (same doc).
+pub const FILTER_KEY_REPOSITORY: &str = "REPOSITORY";
+
+/// The filter key whose values name the advisory a Linux patch is published through:
+/// "`ADVISORY_ID` Sample values: `ALAS-2018-1058` | `ALAS2-2021-1594`" (same doc).
+pub const FILTER_KEY_ADVISORY_ID: &str = "ADVISORY_ID";
+
+/// The filter key whose values name a vulnerability that advisory addresses: "`CVE_ID`
+/// Sample values: `CVE-2018-3615` | `CVE-2020-1472`" (same doc).
+pub const FILTER_KEY_CVE_ID: &str = "CVE_ID";
+
+/// The filter key whose values name a bug it closes: "`BUGZILLA_ID` Sample values:
+/// `1463241`" (same doc).
+pub const FILTER_KEY_BUGZILLA_ID: &str = "BUGZILLA_ID";
+
+/// The epoch the packages this catalogue publishes carry: "the epoch of the patch"
+/// (`Patch$Epoch`) is modelled with a default of `0`, and the catalogue publishes no
+/// package whose vendor has had to raise it, so every published package carries that
+/// default — which is what an `EPOCH` filter searches against.
+pub const PUBLISHED_PACKAGE_EPOCH: &str = "0";
+
+/// The classification a patch published through a SECURITY advisory carries, one of the
+/// update kinds an RPM-based distribution publishes
+/// ([`super::patch_properties::PUBLISHED_PATCH_METADATA`]). It is what gives a patch an
+/// advisory id and the vulnerability and bug ids that advisory addresses: the other update
+/// kinds are not published through a security advisory at all.
+pub const SECURITY_CLASSIFICATION: &str = "Security";
 
 /// The filter value that "matches all values" of its key (`PatchFilter`: "The filter
 /// values can be exact values for the patch property given as a key, or a wildcard (*),
@@ -199,6 +250,29 @@ pub struct PublishedPatch {
     /// The patch set this patch belongs to, which is what a `PATCH_SET` filter selects
     /// on ([`super::patch_properties::PATCH_SET_OS`] or `PATCH_SET_APPLICATION`).
     pub patch_set: &'static str,
+    /// "The name of the patch. Applies to Linux-based managed nodes only" (`Patch$Name`):
+    /// the package this patch updates, where the operating system's published metadata
+    /// holds packages at all, and `None` for a patch that is no package (a Windows update,
+    /// a macOS software update).
+    pub name: Option<String>,
+    /// "The version number of the patch" (`Patch$Version`), for a patch that is a package.
+    pub version: Option<String>,
+    /// "The particular release of a patch" (`Patch$Release`), for the same.
+    pub release: Option<String>,
+    /// "The architecture of the patch" (`Patch$Arch`), for the same.
+    pub arch: Option<String>,
+    /// "The source patch repository for the operating system and version"
+    /// (`Patch$Repository`), for the same.
+    pub repository: Option<String>,
+    /// "The Advisory ID of the patch" (`Patch$AdvisoryIds`): the advisory this patch is
+    /// published through, which the distribution publishes for its security fixes
+    /// ([`SECURITY_CLASSIFICATION`]), so empty for every other patch.
+    pub advisory_ids: Vec<String>,
+    /// "The Common Vulnerabilities and Exposures (CVE) ID of the patch" (`Patch$CVEIds`):
+    /// the vulnerabilities that advisory addresses.
+    pub cve_ids: Vec<String>,
+    /// "The Bugzilla ID of the patch" (`Patch$BugzillaIds`): the bugs it closes.
+    pub bugzilla_ids: Vec<String>,
 }
 
 impl PublishedPatch {
@@ -217,6 +291,14 @@ impl PublishedPatch {
             msrc_severity: self.msrc_severity.clone(),
             severity: self.severity.clone(),
             language: self.language.clone(),
+            name: self.name.clone(),
+            version: self.version.clone(),
+            release: self.release.clone(),
+            arch: self.arch.clone(),
+            repository: self.repository.clone(),
+            advisory_ids: (!self.advisory_ids.is_empty()).then(|| self.advisory_ids.clone()),
+            cve_ids: (!self.cve_ids.is_empty()).then(|| self.cve_ids.clone()),
+            bugzilla_ids: (!self.bugzilla_ids.is_empty()).then(|| self.bugzilla_ids.clone()),
             ..Patch::default()
         }
     }
@@ -237,8 +319,29 @@ impl PublishedPatch {
             PROPERTY_MSRC_SEVERITY => self.msrc_severity.as_deref(),
             PROPERTY_SEVERITY => self.severity.as_deref(),
             PROPERTY_PRIORITY => self.priority.as_deref(),
+            FILTER_KEY_NAME => self.name.as_deref(),
+            // A package carries the epoch the catalogue publishes for its packages; a
+            // patch that is no package carries none.
+            FILTER_KEY_EPOCH => self.name.as_deref().map(|_| PUBLISHED_PACKAGE_EPOCH),
+            FILTER_KEY_VERSION => self.version.as_deref(),
+            FILTER_KEY_RELEASE => self.release.as_deref(),
+            FILTER_KEY_ARCH => self.arch.as_deref(),
+            FILTER_KEY_REPOSITORY => self.repository.as_deref(),
             _ => None,
         }
+    }
+
+    /// Every value this patch carries for the property `key` names: more than one for the
+    /// properties the model gives a LIST (`Patch$AdvisoryIds`, `Patch$CVEIds`,
+    /// `Patch$BugzillaIds`) and at most one for every other ([`Self::property`]).
+    fn properties(&self, key: &str) -> Vec<&str> {
+        let listed: &[String] = match key {
+            FILTER_KEY_ADVISORY_ID => &self.advisory_ids,
+            FILTER_KEY_CVE_ID => &self.cve_ids,
+            FILTER_KEY_BUGZILLA_ID => &self.bugzilla_ids,
+            _ => return self.property(key).into_iter().collect(),
+        };
+        listed.iter().map(String::as_str).collect()
     }
 
     /// Whether `value`, from a baseline's explicitly approved or explicitly rejected
@@ -261,14 +364,28 @@ impl PublishedPatch {
     /// patch when any of its values is the patch's value for that key, or is the wildcard
     /// that "matches all values".
     pub fn matches(&self, group: &PatchFilterGroup) -> bool {
-        group.patch_filters.iter().all(|filter| {
-            let Some(held) = self.property(&filter.key) else {
-                return false;
-            };
-            filter
-                .values
-                .iter()
-                .any(|value| value == FILTER_VALUE_WILDCARD || value == held)
+        group
+            .patch_filters
+            .iter()
+            .all(|filter| self.matches_filter(&filter.key, &filter.values))
+    }
+
+    /// Whether this patch meets ONE filter: the key it searches on and the values it
+    /// accepts for it.
+    ///
+    /// "A patch filter consists of a key and a set of values" (`PatchFilter`), so a patch
+    /// meets a filter when any of its values is the value this patch carries for that key,
+    /// or is the wildcard that "matches all values" — and a key this patch carries no
+    /// value for selects it not at all. The one place a filter is matched against a patch,
+    /// whether it comes from a baseline's filter group or from the `Filters` of a
+    /// catalogue read ([`super::available_patches`]).
+    pub fn matches_filter(&self, key: &str, values: &[String]) -> bool {
+        let held = self.properties(key);
+        if held.is_empty() {
+            return false;
+        }
+        values.iter().any(|value| {
+            value == FILTER_VALUE_WILDCARD || held.iter().any(|carried| value == carried)
         })
     }
 }
@@ -330,18 +447,7 @@ pub fn published_patches(operating_system: &str, at: SystemTime) -> Vec<Publishe
     {
         for product in group.products {
             for release in &releases {
-                patches.push(published_patch(
-                    operating_system,
-                    group.patch_set,
-                    group.product_family,
-                    product,
-                    rotated(group.classifications, ordinal + release.month_ordinal),
-                    rotated(group.msrc_severities, ordinal + release.month_ordinal),
-                    rotated(group.severities, ordinal + 3 * release.month_ordinal),
-                    rotated(group.priorities, ordinal + release.month_ordinal),
-                    release,
-                    ordinal,
-                ));
+                patches.push(published_patch(group, product, release, ordinal));
             }
             ordinal += 1;
         }
@@ -588,19 +694,22 @@ fn rotated(values: &'static [&'static str], position: u64) -> Option<&'static st
 }
 
 /// One published patch: the patch of one product in one monthly release.
-#[allow(clippy::too_many_arguments)]
+///
+/// Every property it carries is the value `group`'s published metadata holds for it at this
+/// patch's position in that group's rotation, so the catalogue invents no property value
+/// and a later read reports the patch an earlier read reported.
 fn published_patch(
-    operating_system: &str,
-    patch_set: &'static str,
-    product_family: &'static str,
+    group: &PublishedPatchGroup,
     product: &'static str,
-    classification: Option<&'static str>,
-    msrc_severity: Option<&'static str>,
-    severity: Option<&'static str>,
-    priority: Option<&'static str>,
     release: &MonthlyRelease,
     ordinal: u64,
 ) -> PublishedPatch {
+    let operating_system = group.operating_system;
+    // This patch's position in the rotation through the values its group publishes: the
+    // product's own ordinal moved on by the release, so each product has its own sequence
+    // and each release moves every product on.
+    let position = ordinal + release.month_ordinal;
+    let classification = rotated(group.classifications, position);
     let windows = operating_system == PATCH_SET_OPERATING_SYSTEM;
     // "The Microsoft Knowledge Base ID of the patch. Applies to Windows patches only":
     // one id per product per release, which is what makes it unique within the catalogue.
@@ -621,21 +730,85 @@ fn published_patch(
     if let Some(kb) = kb_number.as_deref() {
         let _ = write!(title, " ({kb})");
     }
+    // The package this patch updates, where the operating system publishes its patches as
+    // packages: its name, version, release, architecture and repository are the package
+    // properties "Applies to Linux-based managed nodes only" names.
+    let package = rotated(group.packages, position);
+    // A patch published through a security advisory carries that advisory and what it
+    // addresses; another update kind is not published through one.
+    let advisory = (classification == Some(SECURITY_CLASSIFICATION)
+        && !group.advisory_prefix.is_empty())
+        .then(|| advisory_id(group.advisory_prefix, release, position));
     PublishedPatch {
         id,
         kb_number,
         title,
         release_date: release.at,
         vendor: windows.then(|| WINDOWS_VENDOR.to_string()),
-        product_family: (!product_family.is_empty()).then(|| product_family.to_string()),
+        product_family: (!group.product_family.is_empty())
+            .then(|| group.product_family.to_string()),
         product: product.to_string(),
         classification: classification.map(str::to_string),
-        msrc_severity: msrc_severity.map(str::to_string),
-        severity: severity.map(str::to_string),
-        priority: priority.map(str::to_string),
+        msrc_severity: rotated(group.msrc_severities, position).map(str::to_string),
+        severity: rotated(group.severities, ordinal + 3 * release.month_ordinal)
+            .map(str::to_string),
+        priority: rotated(group.priorities, position).map(str::to_string),
         language: windows.then(|| LANGUAGE_NEUTRAL.to_string()),
-        patch_set,
+        patch_set: group.patch_set,
+        name: package.map(str::to_string),
+        version: package.map(|_| package_version(position)),
+        release: package
+            .filter(|_| !group.release_tag.is_empty())
+            .map(|_| package_release(group.release_tag, release)),
+        arch: rotated(group.architectures, position).map(str::to_string),
+        repository: rotated(group.repositories, position).map(str::to_string),
+        cve_ids: advisory
+            .iter()
+            .map(|_| vulnerability_id(release, position))
+            .collect(),
+        bugzilla_ids: advisory.iter().map(|_| bug_id(position)).collect(),
+        advisory_ids: advisory.into_iter().collect(),
     }
+}
+
+/// The version of a published package: "the version number of the patch. For example, in
+/// `example-pkg-1.710.10-2.7.abcd.x86_64`, the version number is indicated by `-1`"
+/// (`Patch$Version`) — three dot-separated numbers, as the filter's own sample values are
+/// (`VERSION` Sample values: `78.6.1` | `4.10.16`), derived from the patch's position in
+/// the catalogue so it is stable across reads.
+fn package_version(position: u64) -> String {
+    format!("{}.{}.{}", position % 7 + 1, position % 13, position % 97)
+}
+
+/// The release of a published package: "in `pkg-example-EE-20180914-2.2.amzn1.noarch`, the
+/// release is `2.amzn1`" (`Patch$Release`) — a release number and the distribution's own
+/// tag ([`PublishedPatchGroup::release_tag`]), as the filter's sample values are (`RELEASE`
+/// Sample values: `9.56.amzn1` | `1.amzn2`).
+fn package_release(release_tag: &str, release: &MonthlyRelease) -> String {
+    format!("{}.{release_tag}", release.month)
+}
+
+/// The advisory a security patch is published through: the distribution's own advisory
+/// prefix, the year of the release and a sequence number, as the filter's sample values are
+/// (`ADVISORY_ID` Sample values: `ALAS-2018-1058` | `ALAS2-2021-1594`).
+///
+/// Minted from the patch's own position in the catalogue, the way the Knowledge Base id of
+/// a Windows patch is, so it is stable across reads and unique within a year's advisories.
+fn advisory_id(prefix: &str, release: &MonthlyRelease, position: u64) -> String {
+    format!("{prefix}-{}-{:04}", release.year, 1_000 + position % 9_000)
+}
+
+/// A vulnerability that advisory addresses, in the form the filter's sample values carry
+/// (`CVE_ID` Sample values: `CVE-2018-3615` | `CVE-2020-1472`), minted from the same
+/// position.
+fn vulnerability_id(release: &MonthlyRelease, position: u64) -> String {
+    format!("CVE-{}-{:04}", release.year, 1_000 + position * 7 % 9_000)
+}
+
+/// A bug it closes, in the form the filter's sample value carries (`BUGZILLA_ID` Sample
+/// values: `1463241`), minted from the same position.
+fn bug_id(position: u64) -> String {
+    format!("{}", 1_400_000 + position * 13 % 100_000)
 }
 
 /// The catalogue's own id for the patch of `product` in one release: "The ID of the

@@ -149,6 +149,33 @@ const RPM_SEVERITIES: &[&str] = &["Critical", "Important", "Low", "Moderate"];
 /// middle level `Medium` where a Red Hat advisory names it `Moderate`.
 const AMAZON_LINUX_SEVERITIES: &[&str] = &["Critical", "Important", "Low", "Medium"];
 
+/// The packages the Amazon Linux patches update, in the form the patch filter docs publish
+/// their names (`DescribeAvailablePatches$Filters`: "`NAME` Sample values: `kernel-headers`
+/// | `samba-python` | `php`").
+///
+/// A Linux patch is a package update, so the package properties — its name, version,
+/// release, architecture and repository — are the catalogue's own published data for it the
+/// way a product and a classification are, and are what the Linux filter keys of an
+/// available-patch read search on.
+const AMAZON_LINUX_PACKAGES: &[&str] = &[
+    "glibc",
+    "kernel",
+    "kernel-headers",
+    "openssl",
+    "php",
+    "python3",
+    "samba-python",
+];
+
+/// The architectures those packages are built for: "`ARCH` Sample values: `i686` |
+/// `x86_64`" (same doc), beside the one a package carrying no compiled code is published
+/// for.
+const AMAZON_LINUX_ARCHITECTURES: &[&str] = &["i686", "noarch", "x86_64"];
+
+/// The repositories they are published in: "`REPOSITORY` Sample values: `Core` |
+/// `Updates`" (same doc).
+const AMAZON_LINUX_REPOSITORIES: &[&str] = &["Core", "Updates"];
+
 /// The classifications a SUSE patch carries — the categories `zypper` publishes for a
 /// SUSE Linux Enterprise repository.
 const SUSE_CLASSIFICATIONS: &[&str] = &[
@@ -203,6 +230,24 @@ pub struct PublishedPatchGroup {
     pub priorities: &'static [&'static str],
     /// The severity levels those patches carry.
     pub severities: &'static [&'static str],
+    /// The packages those patches update, where the distribution publishes its patches as
+    /// packages, and nothing for an operating system whose patches are not packages at all
+    /// (a Windows update, a macOS software update).
+    pub packages: &'static [&'static str],
+    /// The architectures those packages are built for.
+    pub architectures: &'static [&'static str],
+    /// The repositories those packages are published in.
+    pub repositories: &'static [&'static str],
+    /// The tag a package RELEASE of this distribution carries: "in
+    /// `pkg-example-EE-20180914-2.2.amzn1.noarch`, the release is `2.amzn1`"
+    /// (`Patch$Release`), so the tag there is `amzn1`. `""` where the published metadata
+    /// holds none.
+    pub release_tag: &'static str,
+    /// The prefix of the advisory a security patch of this distribution addresses:
+    /// "`ADVISORY_ID` Sample values: `ALAS-2018-1058` | `ALAS2-2021-1594`"
+    /// (`DescribeAvailablePatches$Filters`), so the prefix there is `ALAS` and `ALAS2`.
+    /// `""` where the published metadata holds none.
+    pub advisory_prefix: &'static str,
 }
 
 /// The published metadata of an RPM-based distribution, whose valid properties are
@@ -222,6 +267,43 @@ const fn rpm_linux(
         msrc_severities: NO_VALUES,
         priorities: NO_VALUES,
         severities,
+        packages: NO_VALUES,
+        architectures: NO_VALUES,
+        repositories: NO_VALUES,
+        release_tag: "",
+        advisory_prefix: "",
+    }
+}
+
+/// The published metadata of an Amazon Linux distribution, which is an RPM-based one whose
+/// PACKAGES the catalogue publishes too ([`AMAZON_LINUX_PACKAGES`]).
+///
+/// The Amazon Linux catalogues are the Linux patches an available-patch read reports
+/// ("currently, DescribeAvailablePatches supports only the Amazon Linux 1, Amazon Linux 2,
+/// and Windows Server operating systems"), and the patch filter docs publish their package
+/// properties by sample value, so this is where the package-level metadata of this
+/// catalogue is held. Another distribution's patches are published as the advisory-level
+/// properties `DescribePatchProperties` reports and no more.
+const fn amazon_linux(
+    operating_system: &'static str,
+    products: &'static [&'static str],
+    release_tag: &'static str,
+    advisory_prefix: &'static str,
+) -> PublishedPatchGroup {
+    PublishedPatchGroup {
+        operating_system,
+        patch_set: PATCH_SET_OS,
+        product_family: "",
+        products,
+        classifications: RPM_CLASSIFICATIONS,
+        msrc_severities: NO_VALUES,
+        priorities: NO_VALUES,
+        severities: AMAZON_LINUX_SEVERITIES,
+        packages: AMAZON_LINUX_PACKAGES,
+        architectures: AMAZON_LINUX_ARCHITECTURES,
+        repositories: AMAZON_LINUX_REPOSITORIES,
+        release_tag,
+        advisory_prefix,
     }
 }
 
@@ -240,6 +322,11 @@ const fn debian_linux(
         msrc_severities: NO_VALUES,
         priorities: DEBIAN_PRIORITIES,
         severities: NO_VALUES,
+        packages: NO_VALUES,
+        architectures: NO_VALUES,
+        repositories: NO_VALUES,
+        release_tag: "",
+        advisory_prefix: "",
     }
 }
 
@@ -259,6 +346,11 @@ const fn windows(
         msrc_severities: WINDOWS_MSRC_SEVERITIES,
         priorities: NO_VALUES,
         severities: NO_VALUES,
+        packages: NO_VALUES,
+        architectures: NO_VALUES,
+        repositories: NO_VALUES,
+        release_tag: "",
+        advisory_prefix: "",
     }
 }
 
@@ -274,17 +366,20 @@ pub const PUBLISHED_PATCH_METADATA: &[PublishedPatchGroup] = &[
         RPM_CLASSIFICATIONS,
         RPM_SEVERITIES,
     ),
-    rpm_linux(
+    // The two Amazon Linux families carry the package tags their own patch filter sample
+    // values publish (`RELEASE` Sample values: `9.56.amzn1` | `1.amzn2`; `ADVISORY_ID`
+    // Sample values: `ALAS-2018-1058` | `ALAS2-2021-1594`).
+    amazon_linux(
         "AMAZON_LINUX",
         &["AmazonLinux2017.09", "AmazonLinux2018.03"],
-        RPM_CLASSIFICATIONS,
-        AMAZON_LINUX_SEVERITIES,
+        "amzn1",
+        "ALAS",
     ),
-    rpm_linux(
+    amazon_linux(
         "AMAZON_LINUX_2",
         &["AmazonLinux2", "AmazonLinux2.0"],
-        RPM_CLASSIFICATIONS,
-        AMAZON_LINUX_SEVERITIES,
+        "amzn2",
+        "ALAS2",
     ),
     rpm_linux(
         "AMAZON_LINUX_2022",
@@ -314,6 +409,11 @@ pub const PUBLISHED_PATCH_METADATA: &[PublishedPatchGroup] = &[
         msrc_severities: NO_VALUES,
         priorities: NO_VALUES,
         severities: NO_VALUES,
+        packages: NO_VALUES,
+        architectures: NO_VALUES,
+        repositories: NO_VALUES,
+        release_tag: "",
+        advisory_prefix: "",
     },
     rpm_linux(
         "ORACLE_LINUX",

@@ -128,7 +128,10 @@
 //! metadata describes are the same catalogue one patch at a time ([`patch_catalog`]): one
 //! patch per published product per monthly release, which is what
 //! `DescribeEffectivePatchesForPatchBaseline` pairs with the approval state a baseline's
-//! own stored filters, rules and patch lists give each of them.
+//! own stored filters, rules and patch lists give each of them. The same catalogue is what
+//! `DescribeAvailablePatches` reports the patches "eligible to be included in a patch
+//! baseline" from ([`available_patches`]), narrowed by the patch properties its own filters
+//! search on ([`ComAmazonawsSsmAmazonssmState::available_patches`]).
 //!
 //! Then the **resource data sync configurations** ([`resource_data_syncs`]), keyed by
 //! `(region, sync name)`: `CreateResourceDataSync` persists one,
@@ -330,6 +333,10 @@ pub mod patch_properties;
 /// them one patch baseline makes effective, with the approval state that baseline gives
 /// each of them.
 pub mod patch_catalog;
+
+/// Which of the published patches are AVAILABLE to be put in a patch baseline — the
+/// catalogues an available-patch read walks and the filters it narrows them by.
+pub mod available_patches;
 
 /// The inventory TYPES Systems Manager publishes — the catalog a schema read reports — and
 /// the naming rule a type name has to satisfy to name an inventory type at all.
