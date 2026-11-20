@@ -57,6 +57,10 @@ mod ip_set_addresses;
 /// The managed PRODUCTS this service publishes: both vendor families of managed
 /// rule group, and what one of them is reported as.
 mod managed_products;
+/// What a save that configures MONETIZATION has to satisfy: where the feature is
+/// available, which rules may take its action, and the setting those payments settle
+/// against.
+mod monetization;
 /// The caller-supplied regular expressions a save carries, and the refusal one that
 /// is not something that matches draws.
 mod patterns;
@@ -75,6 +79,7 @@ pub use description::*;
 pub use identifier_refusals::*;
 pub use ip_set_addresses::*;
 pub use managed_products::*;
+pub use monetization::*;
 pub use patterns::*;
 pub use rule_set::*;
 pub use scope::*;

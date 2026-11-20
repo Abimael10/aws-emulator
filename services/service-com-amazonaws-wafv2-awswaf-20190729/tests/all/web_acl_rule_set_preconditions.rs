@@ -28,6 +28,11 @@
 //! * a `RateBasedStatement` is accepted only as a rule's own top-level `Statement`,
 //!   never nested ("you can use any statement that can be nested",
 //!   `NotStatement$Statement`, which a rate-based statement is not);
+//! * the MONETIZATION settings of the document, which `MonetizeAction` states in one
+//!   place: the action is "available only for web ACLs associated with Amazon
+//!   CloudFront distributions", "you must configure a `MonetizationConfig` on the web
+//!   ACL or rule group before adding rules that use this action", and "you cannot use
+//!   the Monetize action for rate-based rules";
 //! * a `RateBasedStatement$EvaluationWindowSec` names one of the four settings the
 //!   member enumerates;
 //! * `PreParseTextTransformations` are applied only to a `FieldToMatch` they are
@@ -1712,5 +1717,667 @@ async fn pre_parse_text_transformations_are_charged_web_acl_capacity_units() {
             Some(*expected),
             "case {case:?}: the stored web ACL must report {expected} WCU, got {got}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The MONETIZATION settings of a saved document
+// ---------------------------------------------------------------------------
+
+/// The one namespace monetization is served in: the `Monetize` action "is available
+/// only for web ACLs associated with Amazon CloudFront distributions"
+/// (`smithy_query(query="shape",shape="MonetizeAction")`), which is the CLOUDFRONT
+/// scope. Written out here rather than imported, so the table pins the namespace and
+/// not merely its reuse; [`SCOPE`] is the regional namespace the rows that are about
+/// the scope use.
+const MONETIZED_SCOPE: &str = "CLOUDFRONT";
+
+/// The `ErrorReason` WAF carries for a value the setting it was written in does not
+/// support. See [`FIELD_RULE`].
+const VALUE_NOT_SUPPORTED_REASON: &str = "The parameter value isn't supported.";
+
+/// The `ParameterExceptionField` value naming a rule's `Action` (`RULE_ACTION`, as the
+/// enum spells it). See [`FIELD_RULE`].
+const FIELD_RULE_ACTION: &str = "RULE_ACTION";
+
+/// The sentence WAF answers a monetization setting asked for in the regional
+/// namespace with.
+const MONETIZATION_NOT_AVAILABLE: &str = "Monetization is not available for regional \
+     resources. Use CloudFront scope to configure monetization.";
+
+/// How the configuration-required refusal names the two kinds of resource the setting
+/// lives on, as the model spells each shape.
+const RESOURCE_WEB_ACL: &str = "WebACL";
+const RESOURCE_RULE_GROUP: &str = "RuleGroup";
+
+/// The sentence WAF answers a document whose rules take the `Monetize` action and that
+/// carries no `MonetizationConfig` with, for the kind of resource being saved.
+fn config_required_message(resource_kind: &str) -> String {
+    format!(
+        "MonetizeAction requires MonetizationConfig to be configured on the \
+         {resource_kind}. Provide a MonetizationConfig with payment network details."
+    )
+}
+
+/// A well-formed `MonetizationConfig`: one production payment network with a wallet
+/// address and a price per request, settled in the one cryptocurrency the model
+/// declares (`smithy_query(query="shape",shape="Currency")` → `USDC`), in the matching
+/// production currency mode.
+fn monetization_config() -> Value {
+    json!({
+        "CryptoConfig": {
+            "PaymentNetworks": [{
+                "Chain": "BASE",
+                "WalletAddress": "0x00000000000000000000000000000000000000a1",
+                "Prices": [{ "Amount": "0.01", "Currency": "USDC" }],
+            }]
+        },
+        "CurrencyMode": "REAL",
+    })
+}
+
+/// A `Monetize` rule action, carrying `PriceMultiplier` only when `multiplier` is
+/// `Some` — so an absent member is really absent on the wire.
+fn monetize_action(multiplier: Option<&str>) -> Value {
+    match multiplier {
+        Some(multiplier) => json!({ "Monetize": { "PriceMultiplier": multiplier } }),
+        None => json!({ "Monetize": {} }),
+    }
+}
+
+/// The `Parameter` a refusal about that action carries: the action as the request wrote
+/// it, with the literal `null` where it named no multiplier.
+fn monetize_parameter(multiplier: Option<&str>) -> String {
+    format!(
+        "MonetizeAction(priceMultiplier={})",
+        multiplier.unwrap_or("null")
+    )
+}
+
+/// A rule taking the `Monetize` action over a statement that is not rate-based.
+fn monetizing_rule(name: &str, priority: i64, multiplier: Option<&str>) -> Value {
+    acting_rule(name, priority, sqli_statement(), monetize_action(multiplier))
+}
+
+/// A rate-based rule taking `action`.
+fn rate_based_rule(name: &str, action: Value) -> Value {
+    acting_rule(name, 0, rate_based_statement(None), action)
+}
+
+/// What a save must answer one row of the monetization table.
+enum Monetization {
+    /// Stored: the document satisfies every monetization precondition.
+    Accepted,
+    /// The document's rules take the action and it carries no configuration: the
+    /// invalid-parameter refusal naming the kind of resource the setting belongs on.
+    ConfigRequired,
+    /// A rate-based rule takes the action: the invalid-parameter refusal naming the
+    /// rule's action setting, with the action rendered as the `Parameter`.
+    RateBasedAction(String),
+    /// Monetization was asked for in a namespace that does not serve it: the
+    /// invalid-OPERATION refusal.
+    NotAvailableInScope,
+}
+
+/// One row: the document a save carries, the namespace it is saved in, and what WAF
+/// answers it.
+struct MonetizationRow {
+    case: &'static str,
+    scope: &'static str,
+    rules: Value,
+    /// `MonetizationConfig`, present only where the row supplies one.
+    config: Option<Value>,
+    outcome: Monetization,
+    /// `true` for a row only a web ACL can carry — a rule running another rule group,
+    /// which a rule group's own rules may not do.
+    web_acl_only: bool,
+}
+
+impl MonetizationRow {
+    /// A row in the monetized namespace carrying no configuration.
+    fn of(case: &'static str, rules: Value, outcome: Monetization) -> Self {
+        Self {
+            case,
+            scope: MONETIZED_SCOPE,
+            rules,
+            config: None,
+            outcome,
+            web_acl_only: false,
+        }
+    }
+
+    fn configured(mut self) -> Self {
+        self.config = Some(monetization_config());
+        self
+    }
+
+    fn in_scope(mut self, scope: &'static str) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    fn web_acl_only(mut self) -> Self {
+        self.web_acl_only = true;
+        self
+    }
+}
+
+/// Every row of the monetization table, over the CLOUDFRONT-scoped rule group
+/// `group_arn` for the row that overrides one of its rules.
+///
+/// The rows differ along what the rule generalises over: WHICH precondition is at
+/// fault, where the `Monetize` action is written (a rule's own action, a later rule's,
+/// and the action an override puts in a referenced group's place), whether it carries a
+/// `PriceMultiplier` and at which end of the published 1..100 range, the namespace the
+/// document is saved in, and which of the two settings asked for monetization. Beside
+/// each refused row sits an accepted one differing from it in the one thing that rule
+/// is about.
+fn monetization_rows(group_arn: &str) -> Vec<MonetizationRow> {
+    vec![
+        // The configuration a document whose rules take the action must carry.
+        MonetizationRow::of(
+            "a Monetize rule and no MonetizationConfig",
+            json!([monetizing_rule("monetizes", 0, None)]),
+            Monetization::ConfigRequired,
+        ),
+        MonetizationRow::of(
+            "a Monetize rule carrying a PriceMultiplier, and no MonetizationConfig",
+            json!([monetizing_rule("monetizes", 0, Some("50"))]),
+            Monetization::ConfigRequired,
+        ),
+        MonetizationRow::of(
+            "the SECOND rule of the list takes the Monetize action, and no \
+             MonetizationConfig",
+            json!([
+                blocking_rule("blocks", 0, xss_statement()),
+                monetizing_rule("monetizes", 1, None),
+            ]),
+            Monetization::ConfigRequired,
+        ),
+        MonetizationRow::of(
+            "an override puts the Monetize action in a referenced group's place, and no \
+             MonetizationConfig",
+            json!([group_running_rule(
+                "runs-group",
+                0,
+                json!({
+                    "RuleGroupReferenceStatement": {
+                        "ARN": group_arn,
+                        "RuleActionOverrides": [{
+                            "Name": DECLARED_RULE,
+                            "ActionToUse": monetize_action(None),
+                        }],
+                    }
+                })
+            )]),
+            Monetization::ConfigRequired,
+        )
+        .web_acl_only(),
+        // The action a rate-based rule may not take, with the configuration present so
+        // the row differs from the accepted ones only in the statement under the
+        // action.
+        MonetizationRow::of(
+            "a rate-based rule taking the Monetize action",
+            json!([rate_based_rule("rate-monetizes", monetize_action(None))]),
+            Monetization::RateBasedAction(monetize_parameter(None)),
+        )
+        .configured(),
+        MonetizationRow::of(
+            "a rate-based rule taking the Monetize action at the lowest multiplier",
+            json!([rate_based_rule("rate-monetizes", monetize_action(Some("1")))]),
+            Monetization::RateBasedAction(monetize_parameter(Some("1"))),
+        )
+        .configured(),
+        MonetizationRow::of(
+            "a rate-based rule taking the Monetize action at the highest multiplier",
+            json!([rate_based_rule("rate-monetizes", monetize_action(Some("100")))]),
+            Monetization::RateBasedAction(monetize_parameter(Some("100"))),
+        )
+        .configured(),
+        MonetizationRow::of(
+            "a rate-based rule taking the Monetize action, among rules that may take it",
+            json!([
+                monetizing_rule("monetizes", 1, Some("25")),
+                rate_based_rule("rate-monetizes", monetize_action(Some("25"))),
+            ]),
+            Monetization::RateBasedAction(monetize_parameter(Some("25"))),
+        )
+        .configured(),
+        // The namespace monetization is served in, asked for by each setting.
+        MonetizationRow::of(
+            "a Monetize rule and a MonetizationConfig in the regional namespace",
+            json!([monetizing_rule("monetizes", 0, None)]),
+            Monetization::NotAvailableInScope,
+        )
+        .configured()
+        .in_scope(SCOPE),
+        MonetizationRow::of(
+            "a MonetizationConfig alone in the regional namespace",
+            json!([blocking_rule("blocks", 0, sqli_statement())]),
+            Monetization::NotAvailableInScope,
+        )
+        .configured()
+        .in_scope(SCOPE),
+        MonetizationRow::of(
+            "a Monetize rule alone in the regional namespace",
+            json!([monetizing_rule("monetizes", 0, None)]),
+            Monetization::NotAvailableInScope,
+        )
+        .in_scope(SCOPE),
+        // And the documents WAF stores: each differs from a refused row above in the
+        // one thing that rule is about.
+        MonetizationRow::of(
+            "a Monetize rule with a MonetizationConfig",
+            json!([monetizing_rule("monetizes", 0, None)]),
+            Monetization::Accepted,
+        )
+        .configured(),
+        MonetizationRow::of(
+            "a Monetize rule carrying a PriceMultiplier, with a MonetizationConfig",
+            json!([monetizing_rule("monetizes", 0, Some("100"))]),
+            Monetization::Accepted,
+        )
+        .configured(),
+        MonetizationRow::of(
+            "a rate-based rule taking a terminating action other than Monetize",
+            // The window is written out, because a statement that names none is stored
+            // with the one the member documents and would not read back verbatim.
+            json!([acting_rule(
+                "rate-blocks",
+                0,
+                rate_based_statement(Some(DEFAULT_WINDOW_SEC)),
+                json!({ "Block": {} })
+            )]),
+            Monetization::Accepted,
+        )
+        .configured(),
+        MonetizationRow::of(
+            "a MonetizationConfig on a document no rule of which monetizes",
+            json!([blocking_rule("blocks", 0, sqli_statement())]),
+            Monetization::Accepted,
+        )
+        .configured(),
+        MonetizationRow::of(
+            "neither setting, in the regional namespace",
+            json!([blocking_rule("blocks", 0, sqli_statement())]),
+            Monetization::Accepted,
+        )
+        .in_scope(SCOPE),
+        MonetizationRow::of(
+            "an override putting the Monetize action in a referenced group's place, \
+             with a MonetizationConfig",
+            json!([group_running_rule(
+                "runs-group",
+                0,
+                json!({
+                    "RuleGroupReferenceStatement": {
+                        "ARN": group_arn,
+                        "RuleActionOverrides": [{
+                            "Name": DECLARED_RULE,
+                            "ActionToUse": monetize_action(Some("2")),
+                        }],
+                    }
+                })
+            )]),
+            Monetization::Accepted,
+        )
+        .configured()
+        .web_acl_only(),
+    ]
+}
+
+/// Assert that a save of `row` answering `(status, body)` answered what the row
+/// expects, for a resource of kind `resource_kind`.
+fn assert_monetization(status: u16, body: &Value, row: &MonetizationRow, resource_kind: &str) {
+    let case = row.case;
+    match &row.outcome {
+        Monetization::Accepted => {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the document satisfies every monetization precondition, \
+                 so it is stored; got status {status} and body {body}"
+            );
+            assert!(
+                !body["Summary"].is_null(),
+                "case {case:?}: an accepted save answers a populated Summary, got {body}"
+            );
+        }
+        Monetization::ConfigRequired => {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: the save must be refused, got status {status} and body \
+                 {body}"
+            );
+            assert_eq!(
+                error_code(body),
+                "WAFInvalidParameterException",
+                "case {case:?}: a missing MonetizationConfig is an invalid parameter, \
+                 got {body}"
+            );
+            assert_eq!(
+                body["message"].as_str().unwrap_or_default(),
+                config_required_message(resource_kind),
+                "case {case:?}: expected the configuration-required sentence for a \
+                 {resource_kind}, got {body}"
+            );
+            assert_eq!(
+                (
+                    body["Field"].as_str(),
+                    body["Parameter"].as_str(),
+                    body["Reason"].as_str()
+                ),
+                (None, None, None),
+                "case {case:?}: the setting the request left out has no value to \
+                 report, so the refusal names no field, parameter or reason; got {body}"
+            );
+        }
+        Monetization::RateBasedAction(parameter) => {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: the save must be refused, got status {status} and body \
+                 {body}"
+            );
+            assert_eq!(
+                error_code(body),
+                "WAFInvalidParameterException",
+                "case {case:?}: an action a rate-based rule may not take is an invalid \
+                 parameter, got {body}"
+            );
+            assert_eq!(
+                (
+                    body["Field"].as_str(),
+                    body["Parameter"].as_str(),
+                    body["Reason"].as_str()
+                ),
+                (
+                    Some(FIELD_RULE_ACTION),
+                    Some(parameter.as_str()),
+                    Some(VALUE_NOT_SUPPORTED_REASON)
+                ),
+                "case {case:?}: expected the refusal to name field {FIELD_RULE_ACTION:?} \
+                 and parameter {parameter:?}, got {body}"
+            );
+            assert_eq!(
+                body["message"].as_str().unwrap_or_default(),
+                format!(
+                    "Error reason: {VALUE_NOT_SUPPORTED_REASON}, field: \
+                     {FIELD_RULE_ACTION}, parameter: {parameter}"
+                ),
+                "case {case:?}: the message must be composed from the three members, \
+                 got {body}"
+            );
+        }
+        Monetization::NotAvailableInScope => {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: the save must be refused, got status {status} and body \
+                 {body}"
+            );
+            assert_eq!(
+                error_code(body),
+                "WAFInvalidOperationException",
+                "case {case:?}: monetization outside the namespace that serves it is an \
+                 invalid operation, got {body}"
+            );
+            assert_eq!(
+                body["Message"].as_str().unwrap_or_default(),
+                MONETIZATION_NOT_AVAILABLE,
+                "case {case:?}: expected the unavailable-in-this-scope sentence, got \
+                 {body}"
+            );
+        }
+    }
+}
+
+/// A rule group of `scope` declaring exactly [`DECLARED_RULE`], for the rows that
+/// override one of its rules.
+async fn declaring_group_in(waf: &Waf, scope: &str, name: &str) -> String {
+    let (_id, arn, _lock) = create_rule_group(
+        waf,
+        scope,
+        name,
+        100,
+        json!([blocking_rule(DECLARED_RULE, 0, byte_match_statement())]),
+    )
+    .await;
+    arn
+}
+
+/// The names a listing of `operation`'s resource kind reports for `scope`.
+async fn names_in_scope(waf: &Waf, operation: &str, member: &str, scope: &str) -> Vec<String> {
+    let listed = waf.ok(operation, json!({ "Scope": scope })).await;
+    listed[member]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(|summary| summary["Name"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// `CreateWebACL` judges every monetization precondition of the document it is asked
+/// to store: it refuses a `Monetize` rule with no `MonetizationConfig`, a rate-based
+/// rule taking that action, and either setting under the namespace that does not serve
+/// monetization — each with the modelled exception and sentence that refusal carries —
+/// and it STORES the configurations WAF accepts, which read back verbatim. A refused
+/// create leaves no web ACL behind.
+#[tokio::test]
+async fn create_web_acl_judges_the_monetization_settings_of_the_document() {
+    let waf = Waf::new();
+    let group_arn = declaring_group_in(&waf, MONETIZED_SCOPE, "monetize-group").await;
+
+    for (index, row) in monetization_rows(&group_arn).iter().enumerate() {
+        let case = row.case;
+        let name = format!("monetize-acl-{index}");
+        let mut request = json!({
+            "Name": &name,
+            "Scope": row.scope,
+            "DefaultAction": { "Allow": {} },
+            "VisibilityConfig": visibility(&name),
+            "Rules": row.rules,
+        });
+        if let Some(config) = &row.config {
+            request["MonetizationConfig"] = config.clone();
+        }
+        let (status, body) = waf.call("CreateWebACL", request).await;
+        assert_monetization(status, &body, row, RESOURCE_WEB_ACL);
+
+        let stored = names_in_scope(&waf, "ListWebACLs", "WebACLs", row.scope)
+            .await
+            .contains(&name);
+        let accepted = matches!(row.outcome, Monetization::Accepted);
+        assert_eq!(
+            stored, accepted,
+            "case {case:?}: expected the name to be stored: {accepted}, got stored: \
+             {stored}"
+        );
+        if !accepted {
+            continue;
+        }
+        let id = body["Summary"]["Id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Summary.Id, got {body}"))
+            .to_string();
+        let got = waf
+            .ok(
+                "GetWebACL",
+                json!({ "Name": &name, "Scope": row.scope, "Id": &id }),
+            )
+            .await;
+        assert_eq!(
+            got["WebACL"]["Rules"], row.rules,
+            "case {case:?}: an accepted rule set must read back verbatim, got {got}"
+        );
+        assert_eq!(
+            got["WebACL"].get("MonetizationConfig").cloned(),
+            row.config.clone(),
+            "case {case:?}: the stored MonetizationConfig must be the one the save \
+             carried, got {got}"
+        );
+    }
+}
+
+/// `CreateRuleGroup` makes the same judgements about the same document: the setting
+/// lives on both kinds of resource ("you must configure a `MonetizationConfig` on the
+/// web ACL or rule group", `MonetizeAction`), and the configuration-required sentence
+/// names the kind being saved.
+#[tokio::test]
+async fn create_rule_group_judges_the_same_monetization_settings() {
+    let waf = Waf::new();
+    let group_arn = declaring_group_in(&waf, MONETIZED_SCOPE, "monetize-ref-group").await;
+
+    for (index, row) in monetization_rows(&group_arn)
+        .iter()
+        .filter(|row| !row.web_acl_only)
+        .enumerate()
+    {
+        let case = row.case;
+        let name = format!("monetize-group-{index}");
+        let mut request = json!({
+            "Name": &name,
+            "Scope": row.scope,
+            "Capacity": 1_000,
+            "VisibilityConfig": visibility(&name),
+            "Rules": row.rules,
+        });
+        if let Some(config) = &row.config {
+            request["MonetizationConfig"] = config.clone();
+        }
+        let (status, body) = waf.call("CreateRuleGroup", request).await;
+        assert_monetization(status, &body, row, RESOURCE_RULE_GROUP);
+
+        let stored = names_in_scope(&waf, "ListRuleGroups", "RuleGroups", row.scope)
+            .await
+            .contains(&name);
+        let accepted = matches!(row.outcome, Monetization::Accepted);
+        assert_eq!(
+            stored, accepted,
+            "case {case:?}: expected the name to be stored: {accepted}, got stored: \
+             {stored}"
+        );
+        if !accepted {
+            continue;
+        }
+        let id = body["Summary"]["Id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Summary.Id, got {body}"))
+            .to_string();
+        let got = waf
+            .ok(
+                "GetRuleGroup",
+                json!({ "Name": &name, "Scope": row.scope, "Id": &id }),
+            )
+            .await;
+        assert_eq!(
+            got["RuleGroup"].get("MonetizationConfig").cloned(),
+            row.config.clone(),
+            "case {case:?}: the stored MonetizationConfig must be the one the save \
+             carried, got {got}"
+        );
+    }
+}
+
+/// An UPDATE is a save too, so it makes the same judgements before it writes: a
+/// refused update leaves the stored document and its `LockToken` exactly as they were,
+/// for a web ACL and for a rule group alike.
+#[tokio::test]
+async fn an_update_makes_the_same_monetization_judgements_and_writes_nothing() {
+    let waf = Waf::new();
+    let group_arn = declaring_group_in(&waf, MONETIZED_SCOPE, "monetize-update-group").await;
+    let kept = blocking_rule("kept", 7, sqli_statement());
+
+    // One stored document of each kind, in each namespace the rows save into, none of
+    // them monetizing: what a refused update must leave untouched.
+    let mut held: Vec<(&str, &str, String, String, String)> = Vec::new();
+    for scope in [MONETIZED_SCOPE, SCOPE] {
+        let acl_name = format!("monetize-update-acl-{}", scope.to_lowercase());
+        let created = waf
+            .ok(
+                "CreateWebACL",
+                json!({
+                    "Name": &acl_name,
+                    "Scope": scope,
+                    "DefaultAction": { "Allow": {} },
+                    "VisibilityConfig": visibility(&acl_name),
+                    "Rules": [kept.clone()],
+                }),
+            )
+            .await;
+        held.push((
+            "WebACL",
+            scope,
+            acl_name,
+            created["Summary"]["Id"]
+                .as_str()
+                .expect("Summary.Id")
+                .to_string(),
+            created["Summary"]["LockToken"]
+                .as_str()
+                .expect("Summary.LockToken")
+                .to_string(),
+        ));
+        let group_name = format!("monetize-update-rg-{}", scope.to_lowercase());
+        let (id, _arn, lock) =
+            create_rule_group(&waf, scope, &group_name, 1_000, json!([kept.clone()])).await;
+        held.push(("RuleGroup", scope, group_name, id, lock));
+    }
+
+    for row in monetization_rows(&group_arn)
+        .iter()
+        .filter(|row| !matches!(row.outcome, Monetization::Accepted))
+    {
+        let case = row.case;
+        for (kind, scope, name, id, lock) in &held {
+            if *scope != row.scope || (row.web_acl_only && *kind != RESOURCE_WEB_ACL) {
+                continue;
+            }
+            let (operation, reader, member) = if *kind == RESOURCE_WEB_ACL {
+                ("UpdateWebACL", "GetWebACL", "WebACL")
+            } else {
+                ("UpdateRuleGroup", "GetRuleGroup", "RuleGroup")
+            };
+            let mut request = json!({
+                "Name": name,
+                "Scope": scope,
+                "Id": id,
+                "LockToken": lock,
+                "VisibilityConfig": visibility(name),
+                "Rules": row.rules,
+            });
+            if *kind == RESOURCE_WEB_ACL {
+                request["DefaultAction"] = json!({ "Allow": {} });
+            } else {
+                request["Capacity"] = json!(1_000);
+            }
+            if let Some(config) = &row.config {
+                request["MonetizationConfig"] = config.clone();
+            }
+            let (status, body) = waf.call(operation, request).await;
+            assert_monetization(status, &body, row, kind);
+
+            let got = waf
+                .ok(
+                    reader,
+                    json!({ "Name": name, "Scope": scope, "Id": id }),
+                )
+                .await;
+            assert_eq!(
+                got["LockToken"].as_str(),
+                Some(lock.as_str()),
+                "case {case:?}: a refused {operation} must not rotate the LockToken, \
+                 got {got}"
+            );
+            assert_eq!(
+                got[member]["Rules"][0]["Name"].as_str(),
+                Some("kept"),
+                "case {case:?}: a refused {operation} must leave the stored rules, got \
+                 {got}"
+            );
+            assert!(
+                got[member].get("MonetizationConfig").is_none(),
+                "case {case:?}: a refused {operation} must store no MonetizationConfig, \
+                 got {got}"
+            );
+        }
     }
 }

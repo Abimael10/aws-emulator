@@ -280,6 +280,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateRuleGroupErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
+        // Every precondition the monetization settings put on the document being
+        // written: the namespace the feature is available in, the rules that may take
+        // its action, and the configuration those payments settle against. The same
+        // judgements the web ACL save path makes, because the setting lives on both
+        // kinds of resource — and all of them are made before anything is written, so
+        // a refused create leaves no rule group behind.
+        if let Some(refusal) = crate::state::monetization_save_refusal(
+            &input.scope,
+            input.rules.as_deref().unwrap_or_default(),
+            input.monetization_config.as_ref(),
+            crate::state::MONETIZED_RESOURCE_RULE_GROUP,
+        ) {
+            return Err(refusal
+                .refuse(
+                    CreateRuleGroupErrorModeled::WAFInvalidOperationException,
+                    CreateRuleGroupErrorModeled::WAFInvalidParameterException,
+                )
+                .into());
+        }
+
         // A `ChallengeConfig` is "available at the web ACL level and in each rule",
         // and for the Challenge action the immunity time has a floor of its own,
         // above the modelled one that applies to a CAPTCHA immunity: a save carrying

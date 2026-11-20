@@ -385,6 +385,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateWebACLErrorModeled::WAFInvalidParameterException(refusal).into());
         }
 
+        // Every precondition the monetization settings put on the document being
+        // written: the namespace the feature is available in, the rules that may take
+        // its action, and the configuration those payments settle against. The same
+        // judgements the create path makes, because a save is a save however the rules
+        // got there — and all of them are made before anything is written, so a
+        // refused update leaves the stored web ACL and its lock token as they were.
+        if let Some(refusal) = crate::state::monetization_save_refusal(
+            &input.scope,
+            input.rules.as_deref().unwrap_or_default(),
+            input.monetization_config.as_ref(),
+            crate::state::MONETIZED_RESOURCE_WEB_ACL,
+        ) {
+            return Err(refusal
+                .refuse(
+                    UpdateWebACLErrorModeled::WAFInvalidOperationException,
+                    UpdateWebACLErrorModeled::WAFInvalidParameterException,
+                )
+                .into());
+        }
+
         // A `ManagedRuleGroupStatement$Version` is resolved when the rule is saved,
         // so a new rule tree pinning a version the publishing vendor has retired is
         // refused with the modelled `WAFExpiredManagedRuleGroupVersionException`,
