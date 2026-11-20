@@ -6,10 +6,11 @@
 //! The rule: a stop is taken on exactly the rollout the ARN names while that rollout is
 //! still ONGOING, and where it leaves the service is the stop type's — `ROLLBACK` runs the
 //! service revision the rollout before it released again, any other stop ends the rollout
-//! where it stands; a request that names a rollout nothing recorded is refused, and so is
-//! one that names a rollout which reached an end nobody asked for, while a second request
-//! for a stop a caller already asked for is answered with the stop already in effect and
-//! changes nothing. The state it reads and writes is the service deployment in
+//! where it stands; an ARN outside the form this service mints is refused for its SYNTAX, a
+//! well-formed one that names a rollout nothing recorded is refused as that rollout not
+//! existing, and so is one that names a rollout which reached an end nobody asked for, while
+//! a second request for a stop a caller already asked for is answered with the stop already
+//! in effect and changes nothing. The state it reads and writes is the service deployment in
 //! [`crate::state`]; the stop itself is a span the clock settles
 //! (`state::ServiceDeploymentRecord::stop_due_at`).
 //!
@@ -172,6 +173,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let deployment_arn = input.service_deployment_arn.trim().to_string();
+        // The SHAPE of the ARN is settled before any state is consulted: a value outside
+        // the form this service mints ([`crate::state::is_service_deployment_arn`]) names
+        // no rollout at all, so it is refused for its syntax — the same reading its sibling
+        // calls make, so one ARN cannot be malformed for one of them and merely absent for
+        // another.
+        if !crate::state::is_service_deployment_arn(&deployment_arn) {
+            return Err(
+                StopServiceDeploymentErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::invalid_service_deployment_arn_message()),
+                    },
+                )
+                .into(),
+            );
+        }
         // "How you want Amazon ECS to stop the service. The valid values are ROLLBACK" —
         // the stop type a request that names none is stopped with.
         let stop_type = input
@@ -198,14 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "The ARN of the stopped service deployment."
                 service_deployment_arn: Some(deployment_arn),
             }),
+            // A well-formed ARN this store holds no rollout under names a rollout that is
+            // not there — the client-side condition `ClientException` states — and the
+            // sentence this call words it with names the ARN the caller sent, so an
+            // operator can see which rollout was meant.
             Err(crate::state::ServiceDeploymentStopRefusal::NoSuchDeployment) => Err(
-                StopServiceDeploymentErrorModeled::ServiceDeploymentNotFoundException(
-                    ServiceDeploymentNotFoundException {
-                        message: Some(crate::state::service_deployment_not_found_message(
-                            &deployment_arn,
-                        )),
-                    },
-                )
+                StopServiceDeploymentErrorModeled::ClientException(ClientException {
+                    message: Some(crate::state::service_deployment_not_found_to_stop_message(
+                        &deployment_arn,
+                    )),
+                })
                 .into(),
             ),
             Err(crate::state::ServiceDeploymentStopRefusal::NotOngoing) => Err(

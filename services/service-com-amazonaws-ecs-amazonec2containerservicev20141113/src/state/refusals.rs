@@ -1383,15 +1383,25 @@ pub(super) fn no_previous_revision_reason(service_arn: &str) -> String {
     )
 }
 
-/// The `ServiceDeploymentNotFoundException` message for an ARN that names no stored
-/// rollout, from that error's own doc: "The service deploy ARN that you specified in the
-/// `ContinueServiceDeployment` doesn't exist. You can use `ListServiceDeployments` to
-/// retrieve the service deployment ARNs."
-pub fn service_deployment_not_found_message(arn: &str) -> String {
-    format!(
-        "The service deployment ARN {arn} that you specified doesn't exist. You can use \
-         ListServiceDeployments to retrieve the service deployment ARNs."
-    )
+/// `ClientException$message` for a well-formed `serviceDeploymentArn` that names no stored
+/// rollout, as the call that ACTS on a paused rollout states the condition: one fixed
+/// sentence, naming neither the ARN nor the service the request carried.
+///
+/// Amazon ECS states this condition per operation (`ClientException`: "These errors are
+/// usually caused by a client action ... it might be specifying an identifier that isn't
+/// valid"), so the call that STOPS a rollout words the same condition its own way
+/// ([`service_deployment_not_found_to_stop_message`]). Both are reached only once the ARN's
+/// own FORM is accepted ([`is_service_deployment_arn`]), which is what tells a
+/// mis-assembled ARN apart from a rollout that is not there.
+pub const SERVICE_DEPLOYMENT_DOES_NOT_EXIST_MESSAGE: &str =
+    "The service deployment does not exist.";
+
+/// `ClientException$message` for a well-formed `serviceDeploymentArn` that names no stored
+/// rollout, as the call that STOPS one states the condition, BUILT FROM THE REQUEST: the
+/// fixed text names the resource class and the absence, and the only variable part is the
+/// ARN the caller sent.
+pub fn service_deployment_not_found_to_stop_message(arn: &str) -> String {
+    format!("Service deployment: {arn}, not found")
 }
 
 /// The `InvalidParameterException` message for a hook action asked for where no such hook

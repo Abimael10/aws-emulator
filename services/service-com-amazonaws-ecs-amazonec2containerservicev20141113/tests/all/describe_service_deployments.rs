@@ -70,6 +70,18 @@ fn deployment_arn(cluster: &str, service_name: &str, id: &str) -> String {
     )
 }
 
+/// A deployment-id token of the same WIDTH as `minted` that no rollout was minted under:
+/// the width is part of a service-deployment ARN's shape, so a well-formed ARN naming
+/// nothing stored differs from the minted one in its digits and not in its length. The
+/// counter that mints them starts above zero, so a token of leading zeros names no rollout.
+fn unminted_id(sequence: usize, minted: &str) -> String {
+    let token = format!("{sequence}");
+    format!(
+        "{}{token}",
+        "0".repeat(minted.len().saturating_sub(token.len()))
+    )
+}
+
 /// A timestamp member, as the epoch seconds an `awsJson1_1` body renders it as.
 fn seconds(deployment: &Value, member: &str, case: &str) -> f64 {
     deployment[member]
@@ -509,11 +521,11 @@ async fn an_arn_that_names_no_stored_deployment_is_a_missing_failure() {    let 
 
     // Rows: the ARNs the request names, the failure ARNs expected back IN THE REQUEST'S
     // ORDER, and the deployment ARNs expected back beside them.
-    let rows: [FailureRow; 7] = [
+    let rows: [FailureRow; 6] = [
         FailureRow {
             name: "an id nothing minted",
-            named: vec![deployment_arn(CLUSTER, "web", &"9".repeat(19))],
-            failed: vec![deployment_arn(CLUSTER, "web", &"9".repeat(19))],
+            named: vec![deployment_arn(CLUSTER, "web", &"9".repeat(stored_id.len()))],
+            failed: vec![deployment_arn(CLUSTER, "web", &"9".repeat(stored_id.len()))],
             described: Vec::new(),
         },
         FailureRow {
@@ -529,15 +541,16 @@ async fn an_arn_that_names_no_stored_deployment_is_a_missing_failure() {    let 
             described: Vec::new(),
         },
         FailureRow {
-            name: "a value that is not an ARN at all",
-            named: vec!["not-an-arn".to_string()],
-            failed: vec!["not-an-arn".to_string()],
-            described: Vec::new(),
-        },
-        FailureRow {
             name: "the stored deployment beside an unknown ARN",
-            named: vec![stored.clone(), deployment_arn(CLUSTER, "web", "0")],
-            failed: vec![deployment_arn(CLUSTER, "web", "0")],
+            named: vec![
+                stored.clone(),
+                deployment_arn(CLUSTER, "web", &"0".repeat(stored_id.len())),
+            ],
+            failed: vec![deployment_arn(
+                CLUSTER,
+                "web",
+                &"0".repeat(stored_id.len()),
+            )],
             described: vec![stored.clone()],
         },
         FailureRow {
@@ -549,10 +562,10 @@ async fn an_arn_that_names_no_stored_deployment_is_a_missing_failure() {    let 
         FailureRow {
             name: "twenty unknown ARNs, the most one request may name",
             named: (900..920)
-                .map(|index| deployment_arn(CLUSTER, "web", &format!("{index:019}")))
+                .map(|index| deployment_arn(CLUSTER, "web", &unminted_id(index, &stored_id)))
                 .collect(),
             failed: (900..920)
-                .map(|index| deployment_arn(CLUSTER, "web", &format!("{index:019}")))
+                .map(|index| deployment_arn(CLUSTER, "web", &unminted_id(index, &stored_id)))
                 .collect(),
             described: Vec::new(),
         },
@@ -590,6 +603,26 @@ async fn an_arn_that_names_no_stored_deployment_is_a_missing_failure() {    let 
         );
     }
 
+    // A value outside the FORM this service mints is no identity to look up at all, so it
+    // is refused for its SYNTAX rather than reported as a failure of its own entry — before
+    // the cluster an ARN of that form would name is resolved.
+    let case = "a value that is not an ARN at all";
+    let (code, message) = refusal(
+        &router,
+        "DescribeServiceDeployments",
+        json!({ "serviceDeploymentArns": ["not-an-arn"] }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (
+            "InvalidParameterException",
+            "The ServiceDeployment ARN is invalid."
+        ),
+        "case {case:?}: unexpected refusal {code} / {message}"
+    );
+
     // "The specified cluster wasn't found": a service-deployment ARN names the cluster
     // whose service the rollout belongs to, so an ARN under a cluster this account holds no
     // record of leaves this read nothing to report on at all.
@@ -617,7 +650,7 @@ async fn an_arn_that_names_no_stored_deployment_is_a_missing_failure() {    let 
         "DescribeServiceDeployments",
         json!({
             "serviceDeploymentArns": (900..921)
-                .map(|index| deployment_arn(CLUSTER, "web", &format!("{index:019}")))
+                .map(|index| deployment_arn(CLUSTER, "web", &unminted_id(index, &stored_id)))
                 .collect::<Vec<String>>(),
         }),
         case,

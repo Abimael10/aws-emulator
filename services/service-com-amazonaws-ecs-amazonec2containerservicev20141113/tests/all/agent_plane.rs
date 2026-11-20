@@ -397,8 +397,9 @@ async fn execute_command_resolves_the_cluster_then_the_task_then_the_container()
     }
 
     // A task that resolves to nothing IN the named cluster: the forms differ in alphabet,
-    // length and whether the reference is an id or an ARN, and one names a task that
-    // really exists — in the other cluster.
+    // length and whether the reference is an id or an ARN — the last one the short form id
+    // of a task that really runs in ANOTHER cluster, which carries no cluster of its own
+    // and so resolves inside the one the request names.
     let elsewhere = run_task(&router, OTHER_CLUSTER, "fixture").await;
     let missing_tasks = [
         ("32-character id", "b".repeat(32)),
@@ -413,7 +414,14 @@ async fn execute_command_resolves_the_cluster_then_the_task_then_the_container()
                 "c".repeat(32)
             ),
         ),
-        ("a task of another cluster, by ARN", elsewhere.clone()),
+        (
+            "short form id of a task of another cluster",
+            elsewhere
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        ),
     ];
     for (form, task) in &missing_tasks {
         let case = format!("ExecuteCommand with a {form}");
@@ -438,6 +446,32 @@ async fn execute_command_resolves_the_cluster_then_the_task_then_the_container()
             "case {case:?}: expected the task-not-found refusal, got {code} with {message:?}"
         );
     }
+
+    // A task ARN carries the cluster that holds the task, so a `task` ARN of ANOTHER
+    // cluster than the request's `cluster` names two scopes at once — which is no task at
+    // all, and is reported as the two identifiers conflicting rather than as a task that
+    // could not be found.
+    let case = "ExecuteCommand with a task ARN of another cluster";
+    let (code, message) = refusal(
+        &router,
+        "ExecuteCommand",
+        json!({
+            "cluster": CLUSTER,
+            "task": elsewhere.clone(),
+            "command": "ls",
+            "interactive": true,
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        (
+            "InvalidParameterException",
+            "Invalid identifier: cluster identifiers mismatch"
+        ),
+        "case {case:?}: expected the cross-cluster refusal, got {code} with {message:?}"
+    );
 
     // A container the task does not declare is reported on its own, before the session
     // the call would open is attempted.
@@ -511,6 +545,107 @@ async fn execute_command_resolves_the_cluster_then_the_task_then_the_container()
             "case {case:?}: expected the agent-not-running refusal, got {code} with \
              {message:?}"
         );
+    }
+}
+
+/// The sentence a request whose two cluster identifiers disagree is refused with: fixed
+/// text, naming neither of the two.
+const CLUSTER_IDENTIFIERS_MISMATCH: &str = "Invalid identifier: cluster identifiers mismatch";
+
+/// One row of the cross-cluster table: an operation that resolves a `task` reference
+/// against the cluster the request names, and the request it sends for the two.
+struct ScopeRow {
+    operation: &'static str,
+    /// `None` for the cluster leaves the member out, which only an operation whose
+    /// `cluster` is optional can do.
+    request: fn(Option<&str>, &str) -> Value,
+}
+
+/// The operations that resolve a `task` reference against a cluster the request names.
+const SCOPE_ROWS: [ScopeRow; 3] = [
+    ScopeRow {
+        operation: "ExecuteCommand",
+        request: |cluster, task| {
+            let mut request = json!({ "task": task, "command": "ls", "interactive": true });
+            if let Some(cluster) = cluster {
+                request["cluster"] = json!(cluster);
+            }
+            request
+        },
+    },
+    ScopeRow {
+        operation: "GetTaskProtection",
+        request: |cluster, task| {
+            json!({ "cluster": cluster.unwrap_or("default"), "tasks": [task] })
+        },
+    },
+    ScopeRow {
+        operation: "UpdateTaskProtection",
+        request: |cluster, task| {
+            json!({
+                "cluster": cluster.unwrap_or("default"),
+                "tasks": [task],
+                "protectionEnabled": true,
+            })
+        },
+    },
+];
+
+/// A `task` ARN carries the cluster that holds the task, so a request that names a `cluster`
+/// as well names two scopes: when they disagree the two IDENTIFIERS conflict, and that is
+/// answered before either of them is resolved — whatever the cluster the request addressed
+/// is, and for every operation that resolves a task reference against one.
+#[tokio::test]
+async fn a_task_arn_of_another_cluster_conflicts_with_the_cluster_the_request_names() {
+    let router = fixture().await;
+    let here = run_task(&router, CLUSTER, "fixture").await;
+    let short_here = here.rsplit('/').next().unwrap_or_default().to_string();
+
+    // The rows differ along the cluster the request ADDRESSES: another cluster this account
+    // holds, one it holds no record of, and — where the member is optional — no cluster at
+    // all, which assumes the documented default and so is a scope of its own.
+    let addressed: [(&str, Option<&str>); 3] = [
+        ("another cluster this account holds", Some(OTHER_CLUSTER)),
+        ("a cluster this account never created", Some("neverplane")),
+        ("no cluster at all, so the default is assumed", None),
+    ];
+
+    for row in &SCOPE_ROWS {
+        for (addressing, cluster) in &addressed {
+            // `cluster` is required on both task-protection operations, so "no cluster at
+            // all" is not a request they can send.
+            if cluster.is_none() && row.operation != "ExecuteCommand" {
+                continue;
+            }
+            let case = format!("{}: {addressing}", row.operation);
+            let (code, message) =
+                refusal(&router, row.operation, (row.request)(*cluster, &here), &case).await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                ("InvalidParameterException", CLUSTER_IDENTIFIERS_MISMATCH),
+                "case {case:?}: expected the cross-cluster refusal, got {code} with \
+                 {message:?}"
+            );
+        }
+
+        // The same request whose task reference IS inside the cluster it addresses gets
+        // past this rule — by ARN and by the short form id, which carries no cluster of its
+        // own — so the rule is about the two scopes disagreeing and not about the form.
+        for (form, reference) in [("by ARN", here.clone()), ("by short id", short_here.clone())] {
+            let case = format!("{}: a task of this cluster, {form}", row.operation);
+            let (status, body) = crate::ecs_wire::answered(
+                &router,
+                row.operation,
+                (row.request)(Some(CLUSTER), &reference),
+            )
+            .await;
+            assert_ne!(
+                body["message"].as_str(),
+                Some(CLUSTER_IDENTIFIERS_MISMATCH),
+                "case {case:?}: a reference inside the cluster is no conflict, got {status} \
+                 with {body}"
+            );
+        }
     }
 }
 

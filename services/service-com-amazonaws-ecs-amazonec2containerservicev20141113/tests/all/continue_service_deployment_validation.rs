@@ -3,15 +3,19 @@
 //! `ContinueServiceDeployment`'s INPUT VALIDATION, driven end to end over the shared wire
 //! harness in [`crate::ecs_wire`].
 //!
-//! The rule under test: each identifier the request carries is checked against the FORM
-//! Amazon ECS mints it in before any state is consulted, and a value outside that form is
-//! refused `InvalidParameterException` with the fixed sentence that states the form — the
-//! `serviceDeploymentArn` first, then the `hookId` — so a caller that passed a value which
-//! could name no deployment and no hook at all is told its request is malformed, while a
-//! well-formed value that happens to name nothing waiting earns the state refusals instead
-//! (`ServiceDeploymentNotFoundException` for a rollout nothing recorded, and the
-//! "not the hook waiting for an action" `InvalidParameterException` for a hook that is not
-//! the one waiting).
+//! The rule under test: the `serviceDeploymentArn` is checked against the FORM Amazon ECS
+//! mints it in before any state is consulted, and a value outside that form is refused
+//! `InvalidParameterException` with the fixed sentence that states the form. The rollout
+//! that ARN names is then resolved — a `hookId` names a hook OF one service deployment, so
+//! a well-formed ARN that names no stored rollout is reported as that (`ClientException`)
+//! whatever the `hookId` beside it spells — and only then is the `hookId` read, for its own
+//! form first and then against the hooks that rollout is waiting at.
+//!
+//! The same two readings of the ARN are asserted here for the SIBLING operations that
+//! address a service deployment by ARN (`DescribeServiceDeployments` and
+//! `StopServiceDeployment`), so one ARN cannot be malformed for one of them and merely
+//! absent for another — and so that a caller can tell "I built the ARN wrong" from "the
+//! deployment is gone".
 //!
 //! The docs the rows are read off:
 //!
@@ -25,9 +29,12 @@
 //! * `DeploymentLifecycleHookDetail$targetType`: "The type of action the lifecycle hook
 //!   performs, such as AWS_LAMBDA or PAUSE."
 //! * `InvalidParameterException`: "The specified parameter isn't valid."
-//! * `ServiceDeploymentNotFoundException`: "The service deploy ARN that you specified in the
-//!   ContinueServiceDeployment doesn't exist. You can use ListServiceDeployments to retrieve
-//!   the service deployment ARNs."
+//! * `ClientException`: "These errors are usually caused by a client action. ... it might be
+//!   specifying an identifier that isn't valid."
+//! * `DescribeServiceDeployments$failures`: "Any failures associated with the call ... the
+//!   reason set to MISSING."
+//! * `StopServiceDeployment$serviceDeploymentArn`: "The ARN of the service deployment that
+//!   you want to stop."
 //!
 //! Every case goes through the same front door a client uses, so nothing reaches into the
 //! state struct and a response that is not computed from persisted state cannot pass.
@@ -49,7 +56,15 @@ const CLUSTER: &str = "demo";
 const INVALID_PARAMETER: &str = "InvalidParameterException";
 
 /// The modelled error a well-formed ARN that names no stored rollout earns.
-const NOT_FOUND: &str = "ServiceDeploymentNotFoundException";
+const NOT_FOUND: &str = "ClientException";
+
+/// The whole message `ContinueServiceDeployment` carries for that condition: one fixed
+/// sentence, echoing neither the ARN nor the service the request named.
+const DOES_NOT_EXIST_MESSAGE: &str = "The service deployment does not exist.";
+
+/// The `Failure$reason` for an identifier that names nothing: "MISSING — the described
+/// resource could not be found".
+const MISSING: &str = "MISSING";
 
 /// The whole message a `hookId` outside the minted form is refused with. Fixed text: it
 /// states the format and echoes nothing the request carried.
@@ -554,9 +569,9 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
             code, NOT_FOUND,
             "case {case:?}: expected a {NOT_FOUND} for {unknown_arn}, got {code} with {message:?}"
         );
-        assert!(
-            message.contains(unknown_arn),
-            "case {case:?}: expected the refusal to name {unknown_arn}, got {message:?}"
+        assert_eq!(
+            message, DOES_NOT_EXIST_MESSAGE,
+            "case {case:?}: expected the not-found refusal for {unknown_arn}, got {message:?}"
         );
     }
 
@@ -572,5 +587,340 @@ async fn a_service_deployment_arn_outside_the_minted_form_is_refused_by_shape() 
     assert!(
         ONGOING.contains(&status.as_str()),
         "case {case:?}: expected a refused request to leave the rollout ongoing, got {status}"
+    );
+}
+
+/// A `hookId` of the minted form that belongs to no hook of any rollout, so a row about the
+/// ARN is never refused for the `hookId` instead.
+const UNMINTED_HOOK_ID: &str = "ecs-pause-00000000-0000-0000-0000-0000000000ff";
+
+/// The operations that address ONE service deployment by its ARN.
+const DEPLOYMENT_OPERATIONS: [&str; 3] = [
+    "DescribeServiceDeployments",
+    "ContinueServiceDeployment",
+    "StopServiceDeployment",
+];
+
+/// The request each of [`DEPLOYMENT_OPERATIONS`] sends for `arn`, beside the members that
+/// operation requires.
+fn deployment_request(operation: &str, arn: &str) -> Value {
+    match operation {
+        "DescribeServiceDeployments" => json!({ "serviceDeploymentArns": [arn] }),
+        "ContinueServiceDeployment" => {
+            json!({ "serviceDeploymentArn": arn, "hookId": UNMINTED_HOOK_ID })
+        }
+        _ => json!({ "serviceDeploymentArn": arn, "stopType": "ROLLBACK" }),
+    }
+}
+
+/// Every operation that takes a `serviceDeploymentArn` reads it against the SAME form, and
+/// refuses a value outside that form with the same sentence — before the cluster the ARN
+/// names, or the rollout it would name, is resolved.
+#[tokio::test]
+async fn every_operation_that_takes_a_service_deployment_arn_reads_the_same_form() {
+    let router = service();
+    let case = "setup";
+    cluster_with_capacity(&router, CLUSTER, case).await;
+    let definition = register_definition(&router, "arn-forms", case).await;
+    let stored = paused_service(&router, "arn-forms", &definition, "PRE_SCALE_UP", case).await;
+    let minted_width = stored
+        .rsplit_once('/')
+        .map(|(_, id)| id.len())
+        .unwrap_or_default();
+    assert!(
+        minted_width > 0,
+        "case {case:?}: expected the stored ARN {stored} to end in a deployment-id token"
+    );
+
+    // The rows differ along WHAT about the form is wrong: the ARN frame itself, the vendor,
+    // the resource type, the number of resource segments, the names those segments carry,
+    // and the width and the alphabet of the deployment-id token — the token's width is a
+    // bound, so it is tested one digit either side of the minted width as well as far from
+    // it.
+    let malformed: Vec<(&str, String)> = vec![
+        ("not an ARN at all", "not-an-arn".to_string()),
+        ("an empty value", String::new()),
+        (
+            "the resource field with no ARN frame",
+            format!(
+                "service-deployment/{CLUSTER}/arn-forms/{}",
+                deployment_id(minted_width)
+            ),
+        ),
+        ("another vendor's namespace", stored.replace(":ecs:", ":ec2:")),
+        (
+            "another resource type",
+            deployment_arn(&format!(
+                "service-revision/{CLUSTER}/arn-forms/{}",
+                deployment_id(minted_width)
+            )),
+        ),
+        (
+            "a resource type the segment only starts with",
+            deployment_arn(&format!(
+                "service-deployments/{CLUSTER}/arn-forms/{}",
+                deployment_id(minted_width)
+            )),
+        ),
+        (
+            "no deployment-id segment",
+            deployment_arn(&format!("service-deployment/{CLUSTER}/arn-forms")),
+        ),
+        (
+            "the cluster segment alone",
+            deployment_arn(&format!("service-deployment/{CLUSTER}")),
+        ),
+        ("a segment too many", format!("{stored}/extra")),
+        (
+            "an empty service segment",
+            deployment_arn(&format!(
+                "service-deployment/{CLUSTER}//{}",
+                deployment_id(minted_width)
+            )),
+        ),
+        (
+            "a cluster name no cluster may carry",
+            deployment_arn(&format!(
+                "service-deployment/not a cluster/arn-forms/{}",
+                deployment_id(minted_width)
+            )),
+        ),
+        (
+            "a deployment-id token one digit short",
+            deployment_arn(&format!(
+                "service-deployment/{CLUSTER}/arn-forms/{}",
+                deployment_id(minted_width - 1)
+            )),
+        ),
+        (
+            "a deployment-id token one digit long",
+            deployment_arn(&format!(
+                "service-deployment/{CLUSTER}/arn-forms/{}",
+                deployment_id(minted_width + 1)
+            )),
+        ),
+        (
+            "a deployment-id token spelled as a UUID",
+            deployment_arn(&format!(
+                "service-deployment/{CLUSTER}/arn-forms/11111111-2222-3333-4444-555555555555"
+            )),
+        ),
+        (
+            "a deployment-id token with a character outside the alphabet",
+            deployment_arn(&format!(
+                "service-deployment/{CLUSTER}/arn-forms/-{}",
+                deployment_id(minted_width - 1)
+            )),
+        ),
+    ];
+
+    for (row, bad_arn) in &malformed {
+        for operation in DEPLOYMENT_OPERATIONS {
+            let case = format!("{operation}: {row}");
+            let (code, message) =
+                refusal(&router, operation, deployment_request(operation, bad_arn), &case).await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                (INVALID_PARAMETER, INVALID_ARN_MESSAGE),
+                "case {case:?}: expected the shape refusal for {bad_arn:?}, got {code} with \
+                 {message:?}"
+            );
+        }
+    }
+
+    // The MINTED ARN gets past that rule at all three: the read answers the rollout it
+    // names, and the two calls that act on one answer the state they find it in — which is
+    // never the shape refusal.
+    let case = "the stored rollout, described";
+    let described: Vec<String> = list(
+        &ok(
+            &router,
+            "DescribeServiceDeployments",
+            deployment_request("DescribeServiceDeployments", &stored),
+            case,
+        )
+        .await,
+        "serviceDeployments",
+        case,
+    )
+    .iter()
+    .map(|deployment| string(deployment, "serviceDeploymentArn", case))
+    .collect();
+    assert_eq!(
+        described,
+        vec![stored.clone()],
+        "case {case:?}: expected the stored rollout back, got {described:?}"
+    );
+    for operation in ["ContinueServiceDeployment", "StopServiceDeployment"] {
+        let case = format!("{operation}: the stored rollout");
+        let (status, body) = crate::ecs_wire::answered(
+            &router,
+            operation,
+            deployment_request(operation, &stored),
+        )
+        .await;
+        assert_ne!(
+            body["message"].as_str(),
+            Some(INVALID_ARN_MESSAGE),
+            "case {case:?}: a minted ARN is not a shape refusal, got {status} with {body}"
+        );
+    }
+}
+
+/// A WELL-FORMED `serviceDeploymentArn` that names no stored rollout is an identity nothing
+/// holds, not a malformed value: the batch read reports it as a failure of its own entry,
+/// and each call that acts on one rollout refuses it `ClientException` with the sentence
+/// that call words the condition in.
+#[tokio::test]
+async fn a_well_formed_arn_that_names_no_rollout_is_not_a_syntax_refusal() {
+    let router = service();
+    let case = "setup";
+    cluster_with_capacity(&router, CLUSTER, case).await;
+    // A second cluster this account HOLDS, so a row can name a rollout under a cluster that
+    // exists and holds none.
+    cluster_with_capacity(&router, "elsewhere", case).await;
+    let definition = register_definition(&router, "absent-arns", case).await;
+    let stored = paused_service(&router, "absent-arns", &definition, "PRE_SCALE_UP", case).await;
+    let (_, minted_id) = stored
+        .rsplit_once('/')
+        .expect("a service-deployment ARN ends in its deployment-id token");
+
+    // The rows differ along WHICH part of the identity names nothing: the deployment id
+    // (in either spelling of the minted alphabet), the service, the cluster (one that
+    // exists), and the Region the ARN was minted in.
+    let absent: Vec<(&str, String)> = vec![
+        (
+            "a deployment id nothing was minted under",
+            deployment_arn(&format!(
+                "service-deployment/{CLUSTER}/absent-arns/{}",
+                deployment_id(minted_id.len())
+            )),
+        ),
+        (
+            "a deployment id of letters, nothing minted",
+            deployment_arn(&format!(
+                "service-deployment/{CLUSTER}/absent-arns/{}",
+                "z".repeat(minted_id.len())
+            )),
+        ),
+        (
+            "a service that was never created",
+            deployment_arn(&format!(
+                "service-deployment/{CLUSTER}/never-created/{minted_id}"
+            )),
+        ),
+        (
+            "another cluster this account holds",
+            deployment_arn(&format!(
+                "service-deployment/elsewhere/absent-arns/{minted_id}"
+            )),
+        ),
+        ("another Region", stored.replace(SIGNED_REGION, "eu-west-1")),
+    ];
+
+    for (row, absent_arn) in &absent {
+        // The batch READ answers per entry: the entry that resolved to nothing is a
+        // `MISSING` failure naming the ARN the caller sent, and nothing is described.
+        let case = format!("DescribeServiceDeployments: {row}");
+        let body = ok(
+            &router,
+            "DescribeServiceDeployments",
+            deployment_request("DescribeServiceDeployments", absent_arn),
+            &case,
+        )
+        .await;
+        let reported: Vec<(String, String)> = list(&body, "failures", &case)
+            .iter()
+            .map(|failure| {
+                (
+                    string(failure, "arn", &case),
+                    string(failure, "reason", &case),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            vec![(absent_arn.clone(), MISSING.to_string())],
+            "case {case:?}: expected one MISSING failure naming {absent_arn}, got {reported:?}"
+        );
+        assert!(
+            list(&body, "serviceDeployments", &case).is_empty(),
+            "case {case:?}: expected nothing described, got {body}"
+        );
+
+        // The call that ACTS on a paused rollout states the condition in one fixed
+        // sentence, which carries none of the request's values.
+        let case = format!("ContinueServiceDeployment: {row}");
+        let (code, message) = refusal(
+            &router,
+            "ContinueServiceDeployment",
+            deployment_request("ContinueServiceDeployment", absent_arn),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (NOT_FOUND, DOES_NOT_EXIST_MESSAGE),
+            "case {case:?}: expected the not-found refusal for {absent_arn}, got {code} with \
+             {message:?}"
+        );
+
+        // The call that STOPS one words the same condition its own way, naming the ARN the
+        // request carried.
+        let case = format!("StopServiceDeployment: {row}");
+        let (code, message) = refusal(
+            &router,
+            "StopServiceDeployment",
+            deployment_request("StopServiceDeployment", absent_arn),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                NOT_FOUND,
+                format!("Service deployment: {absent_arn}, not found").as_str()
+            ),
+            "case {case:?}: expected the not-found refusal for {absent_arn}, got {code} with \
+             {message:?}"
+        );
+
+        // A `hookId` names a hook OF one rollout, so the rollout is resolved before the
+        // hook id is read at all: the SAME refusal stands whatever the hookId spells.
+        let case = format!("ContinueServiceDeployment with a malformed hookId: {row}");
+        let (code, message) = refusal(
+            &router,
+            "ContinueServiceDeployment",
+            json!({ "serviceDeploymentArn": absent_arn, "hookId": "not-a-paused-hook" }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (NOT_FOUND, DOES_NOT_EXIST_MESSAGE),
+            "case {case:?}: expected the rollout to be resolved before the hookId, got \
+             {code} with {message:?}"
+        );
+    }
+
+    // A well-formed ARN under a cluster this account holds NO record of leaves the batch
+    // read nothing to report on at all, which is the condition it answers instead.
+    let case = "an ARN under a cluster that was never created";
+    let (code, message) = refusal(
+        &router,
+        "DescribeServiceDeployments",
+        deployment_request(
+            "DescribeServiceDeployments",
+            &deployment_arn(&format!(
+                "service-deployment/never-created/absent-arns/{minted_id}"
+            )),
+        ),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("ClusterNotFoundException", "Cluster not found."),
+        "case {case:?}: expected the missing-cluster refusal, got {code} with {message:?}"
     );
 }

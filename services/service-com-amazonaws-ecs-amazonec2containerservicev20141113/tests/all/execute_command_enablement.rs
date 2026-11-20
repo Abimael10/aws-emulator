@@ -293,13 +293,21 @@ async fn the_session_is_attempted_after_the_cluster_task_and_container() {
     // The resources the request names are resolved BEFORE the session is attempted, so a
     // request that is wrong about one of them is reported on that resource rather than on
     // the channel the session would be carried over. The rows walk the three resources in
-    // the order they are resolved.
-    let rows: [(&str, serde_json::Value, &str, &str); 3] = [
+    // the order they are resolved — and the IDENTIFIERS the request carries are read before
+    // any of them, so a task ARN naming another cluster than the request addresses is
+    // reported as the two conflicting rather than as a cluster that is missing.
+    let rows: [(&str, serde_json::Value, &str, &str); 4] = [
         (
-            "a cluster the account does not hold",
-            json!({ "cluster": "ghostexecflag", "task": enabled.clone() }),
+            "a cluster the account does not hold, named beside a task id",
+            json!({ "cluster": "ghostexecflag", "task": task_id(&enabled) }),
             "ClusterNotFoundException",
             "Cluster not found.",
+        ),
+        (
+            "a task ARN of another cluster than the request addresses",
+            json!({ "cluster": "ghostexecflag", "task": enabled.clone() }),
+            "InvalidParameterException",
+            "Invalid identifier: cluster identifiers mismatch",
         ),
         (
             "a task the cluster does not hold",

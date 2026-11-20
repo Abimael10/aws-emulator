@@ -4,9 +4,11 @@
 //! Reports the STORED service deployments the request's ARNs name — each rollout's
 //! instants, the revisions it moves the service between with their task counts counted
 //! off the task map, and the state of the failure-detection mechanisms its own deployment
-//! configuration turned on — and a `MISSING` failure for every ARN that names no stored
-//! deployment, rather than refusing the batch. A REPORTING operation (`@readonly`):
-//! nothing here changes what a later caller sees.
+//! configuration turned on — and a `MISSING` failure for every WELL-FORMED ARN that names
+//! no stored deployment, rather than refusing the batch; an ARN outside the form this
+//! service mints names nothing at all and is refused for its syntax before any of them is
+//! resolved. A REPORTING operation (`@readonly`): nothing here changes what a later caller
+//! sees.
 //!
 //! ## Shape of an operation
 //!
@@ -174,6 +176,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             "Service Deployment",
                             crate::state::MAX_DESCRIBE_SERVICE_DEPLOYMENTS,
                         )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A `serviceDeploymentArn` is an ARN this service MINTS, so its FORM is settled
+        // before anything is resolved: a value outside that form
+        // ([`crate::state::is_service_deployment_arn`]) names no rollout — and no cluster
+        // either — so it is refused for its syntax rather than read as an identity this
+        // store happens not to hold, which is the order every operation that takes one of
+        // these ARNs reads it in. A WELL-FORMED ARN that names nothing stored is the
+        // `MISSING` failure below.
+        if input
+            .service_deployment_arns
+            .iter()
+            .any(|reference| !crate::state::is_service_deployment_arn(reference.trim()))
+        {
+            return Err(
+                DescribeServiceDeploymentsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::invalid_service_deployment_arn_message()),
                     },
                 )
                 .into(),

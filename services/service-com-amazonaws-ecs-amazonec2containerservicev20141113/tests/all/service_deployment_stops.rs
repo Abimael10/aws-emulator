@@ -33,8 +33,8 @@
 //!   part of the rollback".
 //! * `ConflictException`: "The request could not be processed because of conflict in the
 //!   current state of the resource."
-//! * `ServiceDeploymentNotFoundException`: "The service deploy ARN that you specified in
-//!   the ContinueServiceDeployment doesn't exist."
+//! * `ClientException`: "These errors are usually caused by a client action. ... it might be
+//!   specifying an identifier that isn't valid."
 //!
 //! Every case goes through the same front door a client uses, so nothing reaches into the
 //! state struct and a response that is not computed from persisted state cannot pass.
@@ -439,12 +439,21 @@ async fn stops_of_a_rollout_that_is_not_ongoing_are_refused() {
         "finished",
     )
     .await;
-    tokio::time::sleep(ONE_SPAN).await;
-    assert_eq!(
-        describe_deployment(&router, &settled, "finished").await["status"],
-        json!("SUCCESSFUL"),
-        "case \"finished\": expected the rollout to have reached its steady state"
-    );
+    // The steady state a rollout reaches is one the CLOCK brings it to, so this looks
+    // again until the rollout reports it or a generous deadline passes.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let deployment = describe_deployment(&router, &settled, "finished").await;
+        if deployment["status"] == json!("SUCCESSFUL") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case \"finished\": expected the rollout to reach its steady state, got \
+             {deployment}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // A rollout a later deployment replaced, so it ended as STOPPED without a stop.
     let replaced_definition = register_definition(&router, "replaced", "replaced").await;
@@ -465,12 +474,22 @@ async fn stops_of_a_rollout_that_is_not_ongoing_are_refused() {
     )
     .await;
 
+    // An ARN of the minted FORM whose deployment-id token names no rollout: the token's
+    // width is part of that form, so a well-formed absent ARN differs from a stored one in
+    // its digits and not in its length.
+    let absent = {
+        let (prefix, id) = settled
+            .rsplit_once('/')
+            .expect("a service-deployment ARN ends in its deployment-id token");
+        format!("{prefix}/{:0width$}", 0, width = id.len())
+    };
+
     let cases: Vec<(&str, String, Option<&str>, &str, bool)> = vec![
         (
             "an ARN no rollout was ever recorded under",
-            format!("{settled}-absent"),
+            absent.clone(),
             Some("ROLLBACK"),
-            "ServiceDeploymentNotFoundException",
+            "ClientException",
             false,
         ),
         (

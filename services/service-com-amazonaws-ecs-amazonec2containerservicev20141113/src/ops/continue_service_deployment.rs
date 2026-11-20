@@ -6,11 +6,13 @@
 //! The rule: the action a request names is taken on the ONE `PAUSE` lifecycle hook the
 //! rollout the ARN names is currently waiting at, and only there — `CONTINUE` takes the
 //! rollout on to its next hooked stage, or to its end when it has none left, `ROLLBACK`
-//! puts the service back onto the revision the rollout before it released; a request whose
-//! `serviceDeploymentArn` or `hookId` is not SHAPED like one this service mints is refused
-//! for its syntax before any state is read, and one that names a rollout nothing recorded,
-//! or a hook that is not the one waiting for an action, is refused and changes nothing. The
-//! state it reads and writes is the service deployment
+//! puts the service back onto the revision the rollout before it released; a
+//! `serviceDeploymentArn` that is not SHAPED like one this service mints is refused for its
+//! syntax before any state is read, a well-formed one that names a rollout nothing recorded
+//! is refused as that rollout not existing — the hook is a hook OF that rollout, so the
+//! rollout is resolved before the `hookId` is read at all — and a `hookId` outside the
+//! minted form, or one that is not the hook waiting for an action, is refused and changes
+//! nothing. The state it reads and writes is the service deployment
 //! in [`crate::state`]; the waits themselves are the clock's
 //! (`state::ServiceDeploymentRecord`).
 //!
@@ -179,25 +181,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let deployment_arn = input.service_deployment_arn.trim().to_string();
         let hook_id = input.hook_id.trim().to_string();
-        // The SHAPE of each parameter is settled before any state is consulted, so a value
-        // that could name no deployment and no hook at all is refused for what it IS and
-        // not for what the store happens to hold. The ARN goes first: it is what says which
-        // rollout a hook would belong to.
+        // The SHAPE of the ARN is settled before any state is consulted: it is what says
+        // which rollout a hook would belong to, so a value outside the form this service
+        // mints names no rollout at all and is refused for what it IS.
         if !crate::state::is_service_deployment_arn(&deployment_arn) {
             return Err(
                 ContinueServiceDeploymentErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(crate::state::invalid_service_deployment_arn_message()),
-                    },
-                )
-                .into(),
-            );
-        }
-        if !crate::state::is_lifecycle_hook_id(&hook_id) {
-            return Err(
-                ContinueServiceDeploymentErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(crate::state::invalid_lifecycle_hook_id_message()),
                     },
                 )
                 .into(),
@@ -216,6 +207,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this call acts on is the one that is waiting as of NOW.
         guard.advance_clock(now);
 
+        // A `hookId` names a hook OF one service deployment ("You can find the hookId by
+        // calling DescribeServiceDeployments and inspecting the lifecycleHookDetails field
+        // of the service deployment"), so the rollout the ARN names is resolved BEFORE the
+        // hook id is read: a well-formed ARN that names no stored rollout is reported as
+        // that, whatever the `hookId` beside it spells.
+        if !guard.service_deployments.contains_key(&deployment_arn) {
+            return Err(
+                ContinueServiceDeploymentErrorModeled::ClientException(ClientException {
+                    message: Some(
+                        crate::state::SERVICE_DEPLOYMENT_DOES_NOT_EXIST_MESSAGE.to_string(),
+                    ),
+                })
+                .into(),
+            );
+        }
+        // The rollout IS there, so the hook id is read next — for its FORM first, which is
+        // a property of the value and so is answered before the rollout's own hooks are
+        // looked through.
+        if !crate::state::is_lifecycle_hook_id(&hook_id) {
+            return Err(
+                ContinueServiceDeploymentErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::invalid_lifecycle_hook_id_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         let acted = guard.act_on_lifecycle_hook(&deployment_arn, &hook_id, &action, now);
         // An action that ROLLS the service back puts the previous revision's task set in
         // place, so this call has placed tasks: their launch steps are taken here, with the
@@ -229,14 +249,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "The ARN of the service deployment that was continued or rolled back."
                 service_deployment_arn: Some(deployment_arn),
             }),
+            // A well-formed ARN is an identity, and one this store holds no rollout under
+            // names a rollout that is not there — the client-side condition
+            // `ClientException` states ("it might be specifying an identifier that isn't
+            // valid"), told apart from the SYNTAX refusal above so a caller can tell a
+            // mis-assembled ARN from a rollout that is gone.
             Err(crate::state::LifecycleHookRefusal::NoSuchDeployment) => Err(
-                ContinueServiceDeploymentErrorModeled::ServiceDeploymentNotFoundException(
-                    ServiceDeploymentNotFoundException {
-                        message: Some(crate::state::service_deployment_not_found_message(
-                            &deployment_arn,
-                        )),
-                    },
-                )
+                ContinueServiceDeploymentErrorModeled::ClientException(ClientException {
+                    message: Some(
+                        crate::state::SERVICE_DEPLOYMENT_DOES_NOT_EXIST_MESSAGE.to_string(),
+                    ),
+                })
                 .into(),
             ),
             Err(crate::state::LifecycleHookRefusal::NotAwaitingAction) => Err(

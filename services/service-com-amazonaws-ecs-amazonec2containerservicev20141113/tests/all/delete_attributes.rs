@@ -572,7 +572,7 @@ async fn an_unusable_request_is_refused_and_deletes_nothing() {
             "a short form id with no targetType",
             json!({ "name": "stack", "targetId": short_id(&arn) }),
             "InvalidParameterException",
-            "attributes.targetType is required when targetId is the short form id of a resource"
+            "TargetType is required when targetId is not a fully qualified ARN."
                 .to_string(),
         ),
     ];
@@ -1207,7 +1207,7 @@ async fn an_unusable_attribute_write_is_refused_and_applies_nothing() {
             "a short form id with no targetType".to_string(),
             json!([{ "name": "stack", "value": "production", "targetId": short_id(&arn) }]),
             "InvalidParameterException",
-            "attributes.targetType is required when targetId is the short form id of a resource"
+            "TargetType is required when targetId is not a fully qualified ARN."
                 .to_string(),
         ),
         (
@@ -1338,5 +1338,114 @@ async fn an_unusable_attribute_write_is_refused_and_applies_nothing() {
         applied.len(),
         CEILING,
         "case {case:?}: expected the documented bound to be accepted, got {applied:?}"
+    );
+}
+
+/// The sentence an `attributes` entry naming its target by SHORT FORM id with no
+/// `targetType` beside it is refused with: fixed text stating the member that is required
+/// and the condition that requires it, echoing nothing the request carried.
+const TARGET_TYPE_REQUIRED: &str =
+    "TargetType is required when targetId is not a fully qualified ARN.";
+
+/// `Attribute$targetType` "is required if you use the short form ID for a resource instead
+/// of the full ARN": an entry that names its target by short form id without it is refused
+/// for the MEMBER that is missing, whatever short form the id takes and whether or not the
+/// cluster holds a resource under it — while the same entry naming the target by full ARN
+/// needs no `targetType` at all.
+#[tokio::test]
+async fn an_attribute_target_named_by_short_id_requires_its_target_type() {
+    let (router, arn) = fixture("setup").await;
+
+    // The rows differ along the short FORM the id takes: the registered instance's own id,
+    // one of the same shape that is registered nowhere, a uuid-shaped id, and one that is
+    // an ARN of another vendor — none of them an ECS resource ARN, so each needs the member
+    // that says what kind of resource it names.
+    let short_forms: [(&str, String); 4] = [
+        ("the registered instance's own id", short_id(&arn).to_string()),
+        (
+            "an id of the same shape, registered nowhere",
+            "f".repeat(32),
+        ),
+        (
+            "a uuid-shaped id",
+            "00000000-0000-0000-0000-0000000000ff".to_string(),
+        ),
+        (
+            "the instance id the machine itself carries",
+            INSTANCE_ID.to_string(),
+        ),
+    ];
+
+    for operation in ["PutAttributes", "DeleteAttributes"] {
+        for (row, target_id) in &short_forms {
+            let case = format!("{operation}: {row}");
+            let mut attribute = json!({ "name": "stack", "targetId": target_id });
+            if operation == "PutAttributes" {
+                attribute["value"] = json!("production");
+            }
+            let (code, message) = refusal(
+                &router,
+                operation,
+                json!({ "cluster": CLUSTER, "attributes": [attribute] }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                (code.as_str(), message.as_str()),
+                ("InvalidParameterException", TARGET_TYPE_REQUIRED),
+                "case {case:?}: expected the targetType refusal, got {code} with {message:?}"
+            );
+        }
+
+        // The SAME id with the `targetType` the member documents beside it is resolved
+        // against the cluster instead, so the refusal above is about the missing member and
+        // not about the id.
+        let case = format!("{operation}: a short form id with its targetType");
+        let mut attribute = json!({
+            "name": "stack",
+            "targetId": "f".repeat(32),
+            "targetType": "container-instance",
+        });
+        if operation == "PutAttributes" {
+            attribute["value"] = json!("production");
+        }
+        let (code, message) = refusal(
+            &router,
+            operation,
+            json!({ "cluster": CLUSTER, "attributes": [attribute] }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (
+                "TargetNotFoundException",
+                target_not_found(&"f".repeat(32)).as_str()
+            ),
+            "case {case:?}: expected the target to be resolved, got {code} with {message:?}"
+        );
+    }
+
+    // And the full ARN needs no `targetType`: the write is answered and reads back through
+    // the listing of the attributes the instance carries.
+    let case = "a full ARN with no targetType";
+    let applied = put_attributes(
+        &router,
+        json!({
+            "cluster": CLUSTER,
+            "attributes": [{ "name": "region-tier", "value": "gold", "targetId": arn }],
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        applied,
+        vec![(arn.clone(), "region-tier".to_string(), "gold".to_string())],
+        "case {case:?}: expected the attribute the write applied, got {applied:?}"
+    );
+    let listed = custom_attributes(&router, &arn, case).await;
+    assert!(
+        listed.contains(&("region-tier".to_string(), "gold".to_string())),
+        "case {case:?}: expected the stored attribute in the listing, got {listed:?}"
     );
 }

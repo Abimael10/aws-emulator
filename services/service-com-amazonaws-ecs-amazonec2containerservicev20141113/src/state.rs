@@ -1864,9 +1864,10 @@ pub const ATTRIBUTE_TARGET_ID_REQUIRED_MESSAGE: &str =
 /// `InvalidParameterException$message` for an `Attribute` whose `targetId` is the short
 /// form id of a resource with no `targetType` beside it. `Attribute$targetType`: "This
 /// parameter is required if you use the short form ID for a resource instead of the full
-/// ARN."
+/// ARN." Amazon ECS states that rule back as one fixed sentence, naming the member that is
+/// required and the condition that requires it, and echoing nothing the request carried.
 pub const ATTRIBUTE_TARGET_TYPE_REQUIRED_MESSAGE: &str =
-    "attributes.targetType is required when targetId is the short form id of a resource";
+    "TargetType is required when targetId is not a fully qualified ARN.";
 
 /// How long `Attribute$name` and `Attribute$value` may each be: both members document
 /// "must contain between 1 and 128 characters".

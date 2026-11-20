@@ -35,7 +35,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    answered, count, create_auto_scaling_group, create_cluster, list, ok, present_count, refusal,
+    count, create_auto_scaling_group, create_cluster, list, ok, present_count, refusal,
     register_definition, service, string,
 };
 
@@ -764,20 +764,22 @@ async fn a_service_deployment_arn_ends_in_a_generated_base62_id() {
         "case {case:?}: a rollout reports the new revision and the one it replaces, got \
          {rolled}"
     );
-    let (status, body) = answered(
+    // An id outside the generated FORM is no identity to look up: the whole request is
+    // refused for its syntax rather than answered with a failure of that entry.
+    let (code, message) = refusal(
         &router,
         "DescribeServiceDeployments",
         json!({ "serviceDeploymentArns": [format!("{prefix}not-a-generated-id")] }),
+        case,
     )
     .await;
     assert_eq!(
+        (code.as_str(), message.as_str()),
         (
-            status,
-            list(&body, "serviceDeployments", case).len(),
-            list(&body, "failures", case).len(),
+            "InvalidParameterException",
+            "The ServiceDeployment ARN is invalid."
         ),
-        (200, 0, 1),
-        "case {case:?}: an id outside the generated form names no rollout, got {status} \
-         with {body}"
+        "case {case:?}: an id outside the generated form is a malformed ARN, got {code} \
+         with {message:?}"
     );
 }

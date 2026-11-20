@@ -38,8 +38,8 @@
 //!   shape="ServiceDeploymentStatus": PENDING, SUCCESSFUL, STOPPED, STOP_REQUESTED,
 //!   IN_PROGRESS, ROLLBACK_REQUESTED, ROLLBACK_IN_PROGRESS, ROLLBACK_SUCCESSFUL,
 //!   ROLLBACK_FAILED).
-//! * `ServiceDeploymentNotFoundException`: "The service deploy ARN that you specified in the
-//!   ContinueServiceDeployment doesn't exist."
+//! * `ClientException`: "These errors are usually caused by a client action. ... it might be
+//!   specifying an identifier that isn't valid."
 //!
 //! Every case goes through the same front door a client uses, so nothing reaches into the
 //! state struct and a response that is not computed from persisted state cannot pass.
@@ -666,6 +666,19 @@ async fn rollback_puts_the_service_back_on_the_previous_revision() {
     }
 }
 
+/// One row of the no-waiting-hook table: the ARN and the hook the request names, the action
+/// it asks for, the modelled error it earns, and whether that refusal names the rollout the
+/// request carried — an ARN that names no stored rollout at all is answered with the fixed
+/// sentence for that condition, which carries none of the request's values.
+struct RefusedRow {
+    case: &'static str,
+    arn: String,
+    hook_id: String,
+    action: Option<&'static str>,
+    expected: &'static str,
+    names_the_arn: bool,
+}
+
 /// Every request that names no hook waiting for an action is refused, and changes nothing.
 #[tokio::test]
 async fn requests_that_name_no_waiting_hook_are_refused() {
@@ -688,8 +701,7 @@ async fn requests_that_name_no_waiting_hook_are_refused() {
         "paused",
     )
     .await;
-    tokio::time::sleep(ONE_SPAN).await;
-    let deployment = describe_deployment(&router, &paused, "paused").await;
+    let deployment = poll_awaiting_hook(&router, &paused, "paused").await;
     let (hook, _) = awaiting_hook(&deployment, "paused");
     let waiting_hook_id = string(&hook, "hookId", "paused");
 
@@ -704,9 +716,8 @@ async fn requests_that_name_no_waiting_hook_are_refused() {
         "replaced",
     )
     .await;
-    tokio::time::sleep(ONE_SPAN).await;
     let ended_hook_id = {
-        let deployment = describe_deployment(&router, &replaced, "replaced").await;
+        let deployment = poll_awaiting_hook(&router, &replaced, "replaced").await;
         let (hook, _) = awaiting_hook(&deployment, "replaced");
         string(&hook, "hookId", "replaced")
     };
@@ -719,61 +730,77 @@ async fn requests_that_name_no_waiting_hook_are_refused() {
     )
     .await;
 
-    let cases: Vec<(&str, String, String, Option<&str>, &str)> = vec![
-        (
-            "an ARN no rollout was ever recorded under",
-            unrecorded_deployment_arn(&plain),
-            waiting_hook_id.clone(),
-            None,
-            "ServiceDeploymentNotFoundException",
-        ),
-        (
-            "a rollout that configured no lifecycle hook",
-            plain.clone(),
-            waiting_hook_id.clone(),
-            None,
-            "InvalidParameterException",
-        ),
-        (
-            "a hook id of another rollout",
-            paused.clone(),
-            ended_hook_id.clone(),
-            Some("CONTINUE"),
-            "InvalidParameterException",
-        ),
-        (
-            "a rollout that already ended",
-            replaced.clone(),
-            ended_hook_id.clone(),
-            Some("CONTINUE"),
-            "InvalidParameterException",
-        ),
-        (
-            "a ROLLBACK of the first rollout of a service",
-            paused.clone(),
-            waiting_hook_id.clone(),
-            Some("ROLLBACK"),
-            "InvalidParameterException",
-        ),
+    // Each row names the ARN and the hook the request carries; see [`RefusedRow`].
+    let cases: Vec<RefusedRow> = vec![
+        RefusedRow {
+            case: "an ARN no rollout was ever recorded under",
+            arn: unrecorded_deployment_arn(&plain),
+            hook_id: waiting_hook_id.clone(),
+            action: None,
+            expected: "ClientException",
+            names_the_arn: false,
+        },
+        RefusedRow {
+            case: "a rollout that configured no lifecycle hook",
+            arn: plain.clone(),
+            hook_id: waiting_hook_id.clone(),
+            action: None,
+            expected: "InvalidParameterException",
+            names_the_arn: true,
+        },
+        RefusedRow {
+            case: "a hook id of another rollout",
+            arn: paused.clone(),
+            hook_id: ended_hook_id.clone(),
+            action: Some("CONTINUE"),
+            expected: "InvalidParameterException",
+            names_the_arn: true,
+        },
+        RefusedRow {
+            case: "a rollout that already ended",
+            arn: replaced.clone(),
+            hook_id: ended_hook_id.clone(),
+            action: Some("CONTINUE"),
+            expected: "InvalidParameterException",
+            names_the_arn: true,
+        },
+        RefusedRow {
+            case: "a ROLLBACK of the first rollout of a service",
+            arn: paused.clone(),
+            hook_id: waiting_hook_id.clone(),
+            action: Some("ROLLBACK"),
+            expected: "InvalidParameterException",
+            names_the_arn: true,
+        },
     ];
 
-    for (case, arn, hook_id, action, expected) in cases {
+    for row in cases {
+        let case = row.case;
         let mut request = json!({
-            "serviceDeploymentArn": arn,
-            "hookId": hook_id,
+            "serviceDeploymentArn": row.arn,
+            "hookId": row.hook_id,
         });
-        if let Some(action) = action {
+        if let Some(action) = row.action {
             request["action"] = json!(action);
         }
         let (code, message) = refusal(&router, "ContinueServiceDeployment", request, case).await;
         assert_eq!(
-            code, expected,
-            "case {case:?}: expected a {expected}, got {code} with {message:?}"
+            code, row.expected,
+            "case {case:?}: expected a {}, got {code} with {message:?}",
+            row.expected
         );
-        assert!(
-            message.contains(&arn),
-            "case {case:?}: expected the refusal to name {arn}, got {message:?}"
-        );
+        if row.names_the_arn {
+            assert!(
+                message.contains(&row.arn),
+                "case {case:?}: expected the refusal to name {}, got {message:?}",
+                row.arn
+            );
+        } else {
+            assert_eq!(
+                message, "The service deployment does not exist.",
+                "case {case:?}: expected the not-found refusal, got {message:?}"
+            );
+        }
     }
 
     // Nothing the refusals touched moved: the waiting hook is still waiting, and the
@@ -808,8 +835,8 @@ async fn requests_that_name_no_waiting_hook_are_refused() {
         "after the refusals",
     )
     .await;
-    tokio::time::sleep(ONE_SPAN).await;
-    let deployment = describe_deployment(&router, &paused, "after the refusals").await;
+    let deployment = poll_deployment_status(&router, &paused, "SUCCESSFUL", "after the refusals")
+        .await;
     assert_eq!(
         deployment["status"],
         json!("SUCCESSFUL"),

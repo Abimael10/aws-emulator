@@ -13,6 +13,9 @@
 //!
 //! * a request asking for a session of any other kind than interactive is refused on the
 //!   member's own rule, before the store is read at all;
+//! * a `task` ARN naming another cluster than the request's `cluster` names two scopes at
+//!   once, which is no task at all: the two IDENTIFIERS are reported as conflicting, before
+//!   either of them is resolved;
 //! * a cluster, task or container that resolves to nothing is reported on that resource;
 //! * a container with NO running execute-command agent — a task launched without the flag,
 //!   or one whose agent is not running — earns the one `InvalidParameterException` sentence
@@ -215,13 +218,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `interactive`: "Amazon ECS only supports initiating interactive sessions, so you
         // must specify true for this value" — a request that asks for any other kind of
-        // session asks for one Amazon ECS does not open, which is a property of the REQUEST
-        // and so is read before the store is consulted at all.
+        // session asks for one Amazon ECS does not open, which is a property of ONE member
+        // and so is read first, before the identifiers are compared with each other.
         if !input.interactive {
             return Err(ExecuteCommandErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(
                         crate::state::EXECUTE_COMMAND_INTERACTIVE_ONLY_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The task has to be INSIDE the cluster the request names: a task ARN carries the
+        // cluster that holds the task (`task/<cluster>/<id>`), so a `task` of another
+        // cluster than the request's `cluster` names two scopes at once — and so names no
+        // task at all. That is a question about the two IDENTIFIERS the request carries, so
+        // it is answered before either of them is RESOLVED, exactly as the other operations
+        // that take a `task` beside a `cluster` answer it
+        // ([`crate::state::foreign_cluster_reference`]): a caller is told its identifiers
+        // conflict rather than that a cluster it never addressed is missing.
+        if crate::state::foreign_cluster_reference(
+            ::std::iter::once(input.task.as_str()),
+            crate::state::TASK_RESOURCE_TYPE,
+            &cluster_name,
+        )
+        .is_some()
+        {
+            return Err(ExecuteCommandErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::CLUSTER_IDENTIFIERS_MISMATCH_MESSAGE.to_string(),
                     ),
                 },
             )
