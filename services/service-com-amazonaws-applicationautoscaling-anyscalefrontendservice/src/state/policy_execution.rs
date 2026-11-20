@@ -212,18 +212,32 @@ struct Breach {
     /// Whether the metric was above the threshold rather than below it, which is what decides
     /// which end of a step's interval is inclusive.
     above: bool,
+    /// The LARGEST value among the datapoints the evaluation graded, where it graded any.
+    peak: Option<f64>,
 }
 
 impl Breach {
-    /// The metric value the alarm graded, which is what a target-tracking control loop
-    /// computes a capacity from: the threshold plus the difference the alarm measured.
+    /// The metric value a target-tracking control loop computes a capacity from: the largest
+    /// value the alarm's evaluation graded.
     ///
-    /// An alarm whose state was forced rather than evaluated carries no datapoint, so the
+    /// The alarm fired because every datapoint in its evaluation range breached, so the whole
+    /// of that range is the load the policy is answering — and the capacity that keeps the
+    /// metric "at, or close to, the specified target value" over ALL of it is the one the
+    /// largest of those values asks for: at the capacity the smallest asks for, the metric
+    /// would still have sat past the target for every other datapoint of the same breach. The
+    /// capacity a value asks for rises with the value in both shapes a tracked metric takes
+    /// ([`super::target_tracking_capacity`]), so the largest value is the largest capacity.
+    /// This is what makes a SATURATED resource — one whose consumed-capacity series is held
+    /// down by its own throughput once its burst allowance is spent, so the newest window
+    /// reports less load than the window the breach began in — scale out to what the breach
+    /// really asked for rather than creeping up one factor of the target per evaluation.
+    ///
+    /// An alarm whose state was forced rather than evaluated graded no datapoint, so the
     /// difference is the smallest one in the direction it breached ([`breach_of`]) and this
     /// answers the threshold itself — the metric is read as sitting exactly at the value the
     /// alarm compares against, which is the only thing such a state says.
     fn measured(&self) -> f64 {
-        self.threshold + self.difference
+        self.peak.unwrap_or(self.threshold + self.difference)
     }
 }
 
@@ -593,6 +607,11 @@ pub fn drive_scaling_clock<Eng: Send + Sync + 'static>(
     let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
         return;
     };
+    // The alarms this service DECIDES from are also ones it wrote itself, so the clock that
+    // grades them is kept running from here ([`keep_alarm_clock_running`]) — before the claim
+    // below, which is what a call made while a clock of this service is already running
+    // returns on.
+    keep_alarm_clock_running(engine, callback);
     let Some(generation) = claim_scaling_clock(&mut state.lock()) else {
         return;
     };
@@ -614,6 +633,10 @@ pub fn drive_scaling_clock<Eng: Send + Sync + 'static>(
             }
             // Every wake-up waits, which hands the runtime back between passes.
             ::tokio::time::sleep(SCALING_CLOCK_WAIT).await;
+            // Each wake-up again, because the clock that grades the alarms this pass is about
+            // to read is bounded too: for as long as this service has breaches to watch for,
+            // the store that grades them has a clock running.
+            keep_alarm_clock_running(&engine, &callback);
             settle_remote_resources(&*engine, &region, &callback).await;
         }
         if capped {
@@ -622,6 +645,32 @@ pub fn drive_scaling_clock<Eng: Send + Sync + 'static>(
         }
     });
     set_scaling_clock(&mut claimed.lock(), generation, handle);
+}
+
+/// Leave CloudWatch's own alarm clock running, so the alarms THIS service wrote there are
+/// evaluated against the datapoints that store holds.
+///
+/// A target-tracking policy's alarms are not created by a CloudWatch request: this service
+/// writes them straight into that store ([`super::apply_alarms`]), and the series they watch is
+/// published straight into the metric store by the service that owns the scaled resource. So no
+/// CloudWatch handler ever runs for such an alarm — and CloudWatch materialises an evaluation
+/// either inside a handler or on the in-process clock a handler starts. Without this, the pair a
+/// policy minted would keep the state its creation gave it for ever: a client that provisions a
+/// resource, puts a target-tracking policy on it and then drives load through the service that
+/// OWNS that resource makes no CloudWatch call at all, so nothing would grade the load and the
+/// policy would never read a breach.
+///
+/// Starting that clock is idempotent and cheap — CloudWatch holds at most one, and its claim is
+/// what a second starter returns on — and it is CloudWatch's OWN clock, so the evaluation and
+/// the action deliveries each transition owes happen in the service that owns them, exactly as
+/// they do for an alarm a client created itself.
+fn keep_alarm_clock_running<Eng: Send + Sync + 'static>(
+    engine: &::std::sync::Arc<Eng>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+) {
+    use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwatch;
+
+    cloudwatch::state::alarm_actions::drive_alarm_clock_through(engine, callback);
 }
 
 /// Claim the single scaling clock for this store: the claim's GENERATION when the caller may
@@ -880,7 +929,7 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
             invocation_interval_secs(alarm),
             now_secs,
         );
-        let Some((threshold, difference, above)) = breach_of(alarm) else {
+        let Some(graded) = breach_of(alarm) else {
             continue;
         };
         for action in alarm.alarm_actions.iter().flatten() {
@@ -904,9 +953,10 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
                     alarm_name: alarm_name.clone(),
                     transitioned_secs,
                     invoked_secs,
-                    threshold,
-                    difference,
-                    above,
+                    threshold: graded.threshold,
+                    difference: graded.difference,
+                    above: graded.above,
+                    peak: graded.peak,
                 },
             ));
         }
@@ -923,44 +973,73 @@ fn unexecuted_breaches<Eng: Send + Sync + 'static>(
     fired
 }
 
+/// What one alarm's last evaluation graded, as a breach: the threshold it compared against, how
+/// far past it the newest value was, which side of it that was, and the largest value of the
+/// whole range.
+#[derive(Debug, Clone, Copy)]
+struct GradedBreach {
+    threshold: f64,
+    difference: f64,
+    above: bool,
+    peak: Option<f64>,
+}
+
 /// How far past its threshold the metric an alarm watches was, and whether it was ABOVE the
-/// threshold rather than below it, beside the threshold the difference is measured from.
+/// threshold rather than below it, beside the threshold the difference is measured from and the
+/// largest value the evaluation graded.
 ///
 /// The size of a breach is a measurement, so it is read from the alarm's own explanation of the
 /// state it is in — "An explanation for the alarm state, in JSON format"
 /// (`MetricAlarm$StateReasonData`), whose `recentDatapoints` are the values the evaluation
-/// graded, newest last. An alarm whose state was forced rather than evaluated reports no such
-/// datapoint: the breach is then the SMALLEST one in the direction the alarm breached, the
-/// threshold itself, which the alarm's `ComparisonOperator` names. An alarm with no static
-/// threshold at all (one that compares against an anomaly-detection band) has no difference to
-/// take, and so fires no step.
+/// graded, newest last. The NEWEST of them is what a step adjustment's interval is an interval
+/// of, and the LARGEST is the load a target-tracking capacity has to cover across the range the
+/// alarm decided on ([`Breach::measured`]). An alarm whose state was forced rather than
+/// evaluated reports no such datapoint: the breach is then the SMALLEST one in the direction the
+/// alarm breached, the threshold itself, which the alarm's `ComparisonOperator` names. An alarm
+/// with no static threshold at all (one that compares against an anomaly-detection band) has no
+/// difference to take, and so fires no step.
 fn breach_of(
     alarm: &::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::ops::types::MetricAlarm,
-) -> Option<(f64, f64, bool)> {
+) -> Option<GradedBreach> {
     let threshold = alarm.threshold?;
-    let measured = alarm
+    let graded: Vec<f64> = alarm
         .state_reason_data
         .as_deref()
         .and_then(|data| ::serde_json::from_str::<::serde_json::Value>(data).ok())
         .and_then(|document| {
-            document
-                .get("recentDatapoints")?
-                .as_array()?
-                .last()?
-                .as_f64()
-        });
-    match measured {
+            Some(
+                document
+                    .get("recentDatapoints")?
+                    .as_array()?
+                    .iter()
+                    .filter_map(::serde_json::Value::as_f64)
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
+    let peak = graded
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .reduce(f64::max);
+    match graded.last().copied() {
         // The metric itself: which side of the threshold it is on is what the measurement
         // says, whichever comparison put the alarm in ALARM.
         Some(value) => {
             let difference = value - threshold;
-            Some((threshold, difference, difference >= 0.0))
+            Some(GradedBreach {
+                threshold,
+                difference,
+                above: difference >= 0.0,
+                peak,
+            })
         }
-        None => Some((
+        None => Some(GradedBreach {
             threshold,
-            0.0,
-            breaches_above(alarm.comparison_operator.as_deref()?)?,
-        )),
+            difference: 0.0,
+            above: breaches_above(alarm.comparison_operator.as_deref()?)?,
+            peak: None,
+        }),
     }
 }
 

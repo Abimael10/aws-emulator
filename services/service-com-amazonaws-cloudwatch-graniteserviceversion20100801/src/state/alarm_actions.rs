@@ -772,6 +772,26 @@ pub fn drive_alarm_clock<Eng: Send + Sync + 'static>(
     engine: &::std::sync::Arc<Eng>,
     ctx: &smithy_server_runtime::OperationContext<'_>,
 ) {
+    // The same handle into this same emulator the request itself would have published through.
+    drive_alarm_clock_through(engine, ctx.callback());
+}
+
+/// [`drive_alarm_clock`] for a caller that holds the emulator handle WITHOUT a request context
+/// of its own.
+///
+/// Not every alarm in this store was written by a request to this service: another emulated
+/// service may write the alarms of its own integration straight into the store, and the series
+/// they watch may be published straight into the metric store by the service that owns it, so no
+/// handler of this service runs for either. Such an alarm is still one this store owes an
+/// evaluation — the evaluation is a fold over the datapoints the store holds, due at an instant
+/// of the clock, whoever wrote the alarm — and the clock is the only thing that performs it for
+/// a client that makes no call here at all. So the component that writes such an alarm leaves
+/// this clock running through this entry, exactly as a `PutMetricAlarm` leaves it running
+/// through the one above.
+pub fn drive_alarm_clock_through<Eng: Send + Sync + 'static>(
+    engine: &::std::sync::Arc<Eng>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+) {
     let Some(state) = super::service_state(&**engine) else {
         return;
     };
@@ -782,9 +802,9 @@ pub fn drive_alarm_clock<Eng: Send + Sync + 'static>(
         return;
     };
     let engine = ::std::sync::Arc::clone(engine);
-    // The same handle into this same emulator the request itself would have published
-    // through, owned by the task rather than borrowed from the request that started it.
-    let callback = ctx.callback().clone();
+    // The clock outlives the request that started it, so it OWNS the handle rather than
+    // borrowing the context it came from.
+    let callback = callback.clone();
     let claimed = ::engine::ServiceState::clone(&state);
     let handle = runtime.spawn(async move {
         // `true` only if the wake-up cap is what ended the loop; a clock that ran out of work

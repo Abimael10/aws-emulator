@@ -22,6 +22,15 @@
 //!   suspension delivers the withheld scale-out with no new metric movement, as a `Successful`
 //!   activity whose `Cause` names the alarm and the policy and whose `Description` names the
 //!   capacity that was set.
+//! * the pair a policy minted is GRADED whether or not anybody calls CloudWatch: those alarms
+//!   are written into the alarm store by this service and the series they watch is published
+//!   into the metric store by the service that owns the scaled resource, so a client that
+//!   drives load through that owning service makes no CloudWatch request at all — and the
+//!   policy still moves the capacity its target value asks for.
+//! * the capacity a breach answers with is the one the PEAK of the range its alarm graded asks
+//!   for: an alarm fires because every datapoint of its evaluation range breached, so a
+//!   capacity computed from the newest of them alone would leave the metric past the target for
+//!   the rest of the same breach.
 //!
 //! Every case goes through the front door a client uses — the table, the target, the policy,
 //! the alarm state and the read-back of the provisioned capacity are all requests. The only
@@ -76,6 +85,9 @@ enum Tracked {
     /// `DynamoDBReadCapacityUtilization`: a Sum of the units consumed over each 60-second
     /// period.
     DynamodbRead,
+    /// The same table's WRITE capacity, tracked by `DynamoDBWriteCapacityUtilization`: the
+    /// other half of the same provisioned throughput, published as its own series.
+    DynamodbWrite,
     /// An ECS service's task count, tracked by `ECSServiceAverageCPUUtilization`: an Average
     /// percentage, which is already the quantity the target value is expressed in.
     EcsCpu,
@@ -224,12 +236,13 @@ fn graded_window_stamp(period: f64, index: i64) -> f64 {
 fn target_of(row: &ExecutionRow, resource_id: &str) -> Value {
     json!({
         "ServiceNamespace": match row.tracked {
-            Tracked::DynamodbRead => "dynamodb",
+            Tracked::DynamodbRead | Tracked::DynamodbWrite => "dynamodb",
             Tracked::EcsCpu => "ecs",
         },
         "ResourceId": resource_id,
         "ScalableDimension": match row.tracked {
             Tracked::DynamodbRead => "dynamodb:table:ReadCapacityUnits",
+            Tracked::DynamodbWrite => "dynamodb:table:WriteCapacityUnits",
             Tracked::EcsCpu => "ecs:service:DesiredCount",
         },
     })
@@ -239,16 +252,26 @@ fn target_of(row: &ExecutionRow, resource_id: &str) -> Value {
 fn metric_type(tracked: Tracked) -> &'static str {
     match tracked {
         Tracked::DynamodbRead => "DynamoDBReadCapacityUtilization",
+        Tracked::DynamodbWrite => "DynamoDBWriteCapacityUtilization",
         Tracked::EcsCpu => "ECSServiceAverageCPUUtilization",
     }
 }
 
-/// Seed the series a row's policy tracks, in every window its alarms grade.
-fn seed_load(emulator: &Emulator, row: &ExecutionRow, resource: &str) {
-    let (namespace, metric, dimensions) = match row.tracked {
+/// The series a row's policy tracks, as the service that OWNS the scaled resource publishes it:
+/// its namespace, its metric name and the dimensions that identify the resource.
+fn tracked_series_of<'a>(
+    row: &ExecutionRow,
+    resource: &'a str,
+) -> (&'static str, &'static str, Vec<(&'a str, &'a str)>) {
+    match row.tracked {
         Tracked::DynamodbRead => (
             "AWS/DynamoDB",
             "ConsumedReadCapacityUnits",
+            vec![("TableName", resource)],
+        ),
+        Tracked::DynamodbWrite => (
+            "AWS/DynamoDB",
+            "ConsumedWriteCapacityUnits",
             vec![("TableName", resource)],
         ),
         Tracked::EcsCpu => (
@@ -256,7 +279,12 @@ fn seed_load(emulator: &Emulator, row: &ExecutionRow, resource: &str) {
             "CPUUtilization",
             vec![("ClusterName", "tracked"), ("ServiceName", resource)],
         ),
-    };
+    }
+}
+
+/// Seed the series a row's policy tracks, in every window its alarms grade.
+fn seed_load(emulator: &Emulator, row: &ExecutionRow, resource: &str) {
+    let (namespace, metric, dimensions) = tracked_series_of(row, resource);
     for index in 1..=SEEDED_WINDOWS {
         emulator.seed_metric_data(
             namespace,
@@ -337,7 +365,7 @@ async fn await_alarm(emulator: &Emulator, kind: &str, case: &str) -> String {
 /// The capacity the service that owns a row's resource holds for it right now.
 async fn capacity_of(emulator: &Emulator, row: &ExecutionRow, resource: &str) -> i64 {
     match row.tracked {
-        Tracked::DynamodbRead => {
+        Tracked::DynamodbRead | Tracked::DynamodbWrite => {
             let (status, body) = emulator
                 .call_dynamodb("DescribeTable", json!({"TableName": resource}))
                 .await;
@@ -346,7 +374,12 @@ async fn capacity_of(emulator: &Emulator, row: &ExecutionRow, resource: &str) ->
                 "case {:?}: expected DescribeTable to answer 200, got {status} {body:?}",
                 row.case
             );
-            body["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"]
+            let member = if row.tracked == Tracked::DynamodbRead {
+                "ReadCapacityUnits"
+            } else {
+                "WriteCapacityUnits"
+            };
+            body["Table"]["ProvisionedThroughput"][member]
                 .as_i64()
                 .unwrap_or_default()
         }
@@ -361,7 +394,19 @@ async fn await_capacity(
     resource: &str,
     expected: i64,
 ) -> i64 {
-    let deadline = Instant::now() + CLOCK_WAIT;
+    await_capacity_within(emulator, row, resource, expected, CLOCK_WAIT).await
+}
+
+/// [`await_capacity`] over the window the caller chooses, for a row that waits on a longer
+/// chain of clocks than one this suite has already stepped by hand.
+async fn await_capacity_within(
+    emulator: &Emulator,
+    row: &ExecutionRow,
+    resource: &str,
+    expected: i64,
+    within: Duration,
+) -> i64 {
+    let deadline = Instant::now() + within;
     let mut last = capacity_of(emulator, row, resource).await;
     while last != expected && Instant::now() < deadline {
         tokio::time::sleep(CLOCK_POLL).await;
@@ -385,10 +430,29 @@ async fn activities(emulator: &Emulator, target: &Value, case: &str) -> Vec<Valu
         .unwrap_or_default()
 }
 
+/// Stand up the resource a row scales, in the service that OWNS it, and answer the
+/// `ResourceId` a scalable target names it by.
+async fn given_resource(emulator: &Emulator, row: &ExecutionRow, resource: &str) -> String {
+    match row.tracked {
+        Tracked::DynamodbRead | Tracked::DynamodbWrite => {
+            emulator
+                .create_provisioned_table(resource, row.starting, row.starting)
+                .await;
+            format!("table/{resource}")
+        }
+        Tracked::EcsCpu => {
+            emulator
+                .given_ecs_service("tracked", resource, row.starting)
+                .await
+        }
+    }
+}
+
 /// The noun a scaling activity's text names a row's capacity by.
 fn capacity_noun(tracked: Tracked) -> &'static str {
     match tracked {
         Tracked::DynamodbRead => "read capacity units",
+        Tracked::DynamodbWrite => "write capacity units",
         Tracked::EcsCpu => "desired count",
     }
 }
@@ -399,19 +463,7 @@ async fn a_breach_moves_the_capacity_the_target_value_asks_for() {
         let case = row.case;
         let emulator = Emulator::empty();
         let resource = "tracked";
-        let resource_id = match row.tracked {
-            Tracked::DynamodbRead => {
-                emulator
-                    .create_provisioned_table(resource, row.starting, row.starting)
-                    .await;
-                format!("table/{resource}")
-            }
-            Tracked::EcsCpu => {
-                emulator
-                    .given_ecs_service("tracked", resource, row.starting)
-                    .await
-            }
-        };
+        let resource_id = given_resource(&emulator, row, resource).await;
         let target = target_of(row, &resource_id);
 
         let mut registration = target.clone();
@@ -690,4 +742,297 @@ async fn the_alarms_that_watch_the_provisioned_capacity_move_nothing() {
         listed.is_empty(),
         "case {case:?}: expected no scaling activity, got {listed:?}"
     );
+}
+
+/// How long a row of [`a_managed_alarm_is_graded_with_no_cloudwatch_request_at_all`] keeps
+/// looking for the capacity its load asks for.
+///
+/// That row steps NO clock by hand: the alarm the policy minted is graded by CloudWatch's own
+/// clock and the breach is performed by this service's, so the wait spans both. Generous, and a
+/// bound on a condition rather than a measurement — each clock wakes up several times a second,
+/// and nothing in the emulator sleeps for either.
+const QUIET_CLOUDWATCH_WAIT: Duration = Duration::from_secs(60);
+
+/// The rows of [`a_managed_alarm_is_graded_with_no_cloudwatch_request_at_all`].
+///
+/// They differ along what the rule generalises over: which service owns the scaled resource and
+/// so publishes the series, which half of a two-part provisioned throughput is tracked, whether
+/// the tracked metric counts units consumed over the period or already is the quantity the
+/// target names, and the target value the control loop divides by. Every row scales OUT, which
+/// is the direction a load the owning service published drives.
+const QUIET_CLOUDWATCH_CATALOG: &[ExecutionRow] = &[
+    // 300 read units consumed a minute at a 50% target is 300 / (0.5 * 60) = 10 units, and
+    // 300 is past the scale-out threshold of 0.5 * 60 * 5 = 150.
+    ExecutionRow {
+        case: "a DynamoDB read-capacity policy under published read load",
+        tracked: Tracked::DynamodbRead,
+        starting: 5,
+        min: 1,
+        max: 20,
+        target_value: 50.0,
+        measured: 300.0,
+        direction: Direction::Out,
+        capacity: 10,
+    },
+    // The other half of the same throughput, at another target: 180 write units a minute at a
+    // 30% target is 180 / (0.3 * 60) = 10 units, past the threshold of 0.3 * 60 * 5 = 90.
+    ExecutionRow {
+        case: "a DynamoDB write-capacity policy under published write load",
+        tracked: Tracked::DynamodbWrite,
+        starting: 5,
+        min: 1,
+        max: 20,
+        target_value: 30.0,
+        measured: 180.0,
+        direction: Direction::Out,
+        capacity: 10,
+    },
+    // A metric that already IS the quantity the target names: 4 tasks averaging 90% CPU
+    // against a 60% target need ceil(4 * 90 / 60) = 6 tasks.
+    ExecutionRow {
+        case: "an ECS CPU policy under published CPU load",
+        tracked: Tracked::EcsCpu,
+        starting: 4,
+        min: 1,
+        max: 20,
+        target_value: 60.0,
+        measured: 90.0,
+        direction: Direction::Out,
+        capacity: 6,
+    },
+];
+
+#[tokio::test]
+async fn a_managed_alarm_is_graded_with_no_cloudwatch_request_at_all() {
+    // The alarms a target-tracking policy owns are not created by a CloudWatch request, and the
+    // series they watch is published by the service that owns the scaled resource rather than
+    // by a client: the whole path is in-process. So a client that provisions a resource, puts a
+    // policy on it and then drives load through the OWNING service never calls CloudWatch —
+    // which is exactly what this row does. Nothing below asks CloudWatch anything: the capacity
+    // and the activity are read where a client reads them, in the owning service and in this
+    // one.
+    for row in QUIET_CLOUDWATCH_CATALOG {
+        let case = row.case;
+        let emulator = Emulator::empty();
+        let resource = "tracked";
+        let resource_id = given_resource(&emulator, row, resource).await;
+        let target = target_of(row, &resource_id);
+
+        let mut registration = target.clone();
+        registration["MinCapacity"] = json!(row.min);
+        registration["MaxCapacity"] = json!(row.max);
+        let (status, body) = emulator.call("RegisterScalableTarget", registration).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected RegisterScalableTarget to answer 200, got {status} {body:?}"
+        );
+        put_policy(&emulator, row, &target, "tracker").await;
+
+        // The load, as the service that owns the resource publishes it.
+        seed_load(&emulator, row, resource);
+
+        let moved =
+            await_capacity_within(&emulator, row, resource, row.capacity, QUIET_CLOUDWATCH_WAIT)
+                .await;
+        assert_eq!(
+            moved, row.capacity,
+            "case {case:?}: expected the published load to move the capacity to {} with no \
+             CloudWatch request made at all, got {moved} (activities {:?})",
+            row.capacity,
+            activities(&emulator, &target, case).await,
+        );
+
+        // And the movement is explained: one activity, naming the capacity it set and the
+        // policy's own scale-out alarm that caused it.
+        let listed = activities(&emulator, &target, case).await;
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {case:?}: expected exactly one scaling activity, got {listed:?}"
+        );
+        let activity = &listed[0];
+        let expected_description = format!(
+            "Setting {} to {}.",
+            capacity_noun(row.tracked),
+            row.capacity
+        );
+        assert_eq!(
+            activity["Description"],
+            json!(expected_description),
+            "case {case:?}: expected Description {expected_description:?}, got {activity:?}"
+        );
+        let cause = activity["Cause"].as_str().unwrap_or_default();
+        assert!(
+            cause.starts_with("monitor alarm TargetTracking-")
+                && cause.contains(Direction::Out.alarm_kind())
+                && cause.ends_with(" in state ALARM triggered policy tracker"),
+            "case {case:?}: expected the Cause to name the policy's own scale-out alarm, got \
+             {cause:?}"
+        );
+    }
+}
+
+/// One graded RANGE to pin: the values the tracked series took in the windows the scale-out
+/// alarm decided on, and the capacity the breach of that range must answer with.
+struct GradedRangeRow {
+    /// The resource, the registered window, the target value and the capacity expected, as
+    /// every row of this suite states them. Its `measured` is the SMALLEST of the graded values
+    /// below, which is what the windows OUTSIDE the alarm's evaluation range are seeded with,
+    /// so nothing older than the range can decide the answer.
+    row: ExecutionRow,
+    /// The values the series took in the windows the alarm grades, OLDEST first: the newest of
+    /// them lands in the newest closed window.
+    graded: &'static [f64],
+}
+
+/// The rows of [`a_breach_answers_the_peak_of_the_range_its_alarm_graded`].
+///
+/// They differ along what the rule generalises over: where in the graded range the peak sits
+/// (an older window, the newest one, or every window alike), whether the tracked metric counts
+/// units consumed over the period or already is the quantity the target names, and whether the
+/// capacity the peak asks for falls inside the registered window or past its ceiling.
+const GRADED_RANGE_CATALOG: &[GradedRangeRow] = &[
+    // A SATURATED table: the window the breach began in drained the burst allowance a
+    // provisioned table keeps, and the window after it reports only what one provisioned unit
+    // can serve. The peak asks for 300 / (0.4 * 60) = 12.5 units, taken up and clamped to the
+    // registered ceiling of 10; the newest window alone would have asked for 3.
+    GradedRangeRow {
+        row: ExecutionRow {
+            case: "a consumed-units peak in an older graded window, past the ceiling",
+            tracked: Tracked::DynamodbRead,
+            starting: 1,
+            min: 1,
+            max: 10,
+            target_value: 40.0,
+            measured: 60.0,
+            direction: Direction::Out,
+            capacity: 10,
+        },
+        graded: &[300.0, 60.0],
+    },
+    // The peak in the NEWEST window instead — a load still rising: 120 / (0.4 * 60) = 5 units.
+    GradedRangeRow {
+        row: ExecutionRow {
+            case: "a consumed-units peak in the newest graded window",
+            tracked: Tracked::DynamodbRead,
+            starting: 1,
+            min: 1,
+            max: 20,
+            target_value: 40.0,
+            measured: 60.0,
+            direction: Direction::Out,
+            capacity: 5,
+        },
+        graded: &[60.0, 120.0],
+    },
+    // A flat breach, where the peak IS the newest window: 72 / (0.4 * 60) = 3 units.
+    GradedRangeRow {
+        row: ExecutionRow {
+            case: "a flat consumed-units breach",
+            tracked: Tracked::DynamodbRead,
+            starting: 1,
+            min: 1,
+            max: 20,
+            target_value: 40.0,
+            measured: 72.0,
+            direction: Direction::Out,
+            capacity: 3,
+        },
+        graded: &[72.0, 72.0],
+    },
+    // A metric that already IS the quantity the target names, graded over three periods: the
+    // peak of 150% against a 60% target asks for 4 * 150 / 60 = 10 tasks, where the newest
+    // window alone would have asked for 5.
+    GradedRangeRow {
+        row: ExecutionRow {
+            case: "a percentage peak in an older graded window",
+            tracked: Tracked::EcsCpu,
+            starting: 4,
+            min: 1,
+            max: 20,
+            target_value: 60.0,
+            measured: 75.0,
+            direction: Direction::Out,
+            capacity: 10,
+        },
+        graded: &[150.0, 150.0, 75.0],
+    },
+];
+
+/// Seed the series `range` tracks so the windows its scale-out alarm grades take
+/// `range.graded`, newest last, and every older window takes the smallest of them.
+fn seed_graded_range(emulator: &Emulator, range: &GradedRangeRow, resource: &str) {
+    let (namespace, metric, dimensions) = tracked_series_of(&range.row, resource);
+    let floor = range
+        .graded
+        .iter()
+        .copied()
+        .reduce(f64::min)
+        .unwrap_or(range.row.measured);
+    for index in 1..=SEEDED_WINDOWS {
+        // Window 1 is the newest CLOSED one and `graded` is oldest first, so the newest graded
+        // value lands there and the oldest in the oldest window of the range.
+        let value = usize::try_from(index)
+            .ok()
+            .and_then(|from_newest| range.graded.len().checked_sub(from_newest))
+            .map_or(floor, |at| range.graded[at]);
+        emulator.seed_metric_data(
+            namespace,
+            metric,
+            &dimensions,
+            graded_window_stamp(60.0, index),
+            &[value],
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_breach_answers_the_peak_of_the_range_its_alarm_graded() {
+    // An alarm fires because EVERY datapoint of its evaluation range breached, so that whole
+    // range is the load the policy is answering: the capacity it moves to is the one at which
+    // the LARGEST of those values would have sat at the target, not the one the newest value
+    // alone asks for.
+    for range in GRADED_RANGE_CATALOG {
+        let row = &range.row;
+        let case = row.case;
+        let emulator = Emulator::empty();
+        let resource = "tracked";
+        let resource_id = given_resource(&emulator, row, resource).await;
+        let target = target_of(row, &resource_id);
+
+        let mut registration = target.clone();
+        registration["MinCapacity"] = json!(row.min);
+        registration["MaxCapacity"] = json!(row.max);
+        let (status, body) = emulator.call("RegisterScalableTarget", registration).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected RegisterScalableTarget to answer 200, got {status} {body:?}"
+        );
+        put_policy(&emulator, row, &target, "tracker").await;
+
+        seed_graded_range(&emulator, range, resource);
+        await_alarm(&emulator, Direction::Out.alarm_kind(), case).await;
+
+        let moved = await_capacity(&emulator, row, resource, row.capacity).await;
+        assert_eq!(
+            moved, row.capacity,
+            "case {case:?}: expected the peak of {:?} to move the capacity to {}, got {moved} \
+             (activities {:?})",
+            range.graded,
+            row.capacity,
+            activities(&emulator, &target, case).await,
+        );
+        let listed = activities(&emulator, &target, case).await;
+        let expected_description = format!(
+            "Setting {} to {}.",
+            capacity_noun(row.tracked),
+            row.capacity
+        );
+        assert_eq!(
+            listed.first().map(|activity| activity["Description"].clone()),
+            Some(json!(expected_description)),
+            "case {case:?}: expected the newest activity to read {expected_description:?}, got \
+             {listed:?}"
+        );
+    }
 }
