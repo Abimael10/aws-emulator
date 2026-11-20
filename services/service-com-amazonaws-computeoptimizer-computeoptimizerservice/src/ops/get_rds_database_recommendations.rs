@@ -218,6 +218,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // well-formed ARN this service holds no database recommendation for — including one
         // naming a resource of an account it does not answer for — selects nothing, and is
         // not refused.
+        // The model bounds this list's length nowhere, so the service does: a request may
+        // name at most the crate's ceiling
+        // ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]), the same bound every reader of this
+        // service applies to the identifier list it takes, so neither the answer nor the
+        // per-identifier work that builds it can be sized by the length of the list a caller
+        // sent. Refused before anything is parsed or allocated per identifier.
+        if let Some(reason) = crate::state::too_many_identifiers(
+            "resourceArns",
+            input.resource_arns.as_deref().unwrap_or_default().len(),
+        ) {
+            return Err(invalid_parameter(reason));
+        }
         let resource_arns = input.resource_arns.clone().unwrap_or_default();
         if let Some(value) = resource_arns
             .iter()

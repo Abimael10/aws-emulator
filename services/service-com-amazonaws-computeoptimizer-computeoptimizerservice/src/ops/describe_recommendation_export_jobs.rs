@@ -184,6 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // InvalidParameterValueException takes precedence over the opt-in gate below, as it
         // does in every other read operation of this service.
         let job_ids = input.job_ids.unwrap_or_default();
+        // The model bounds this list's length nowhere, so the service does: a request may
+        // name at most the crate's ceiling
+        // ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]), the same bound every reader of this
+        // service applies to the identifier list it takes, so neither the answer nor the
+        // per-identifier work that builds it can be sized by the length of the list a caller
+        // sent. Refused before anything is checked or allocated per identifier.
+        if let Some(reason) = crate::state::too_many_identifiers("jobIds", job_ids.len()) {
+            return Err(invalid_parameter(reason));
+        }
         if job_ids.iter().any(|job_id| job_id.trim().is_empty()) {
             return Err(invalid_parameter(
                 "The value supplied for parameter jobIds is not valid: a job ID must not be \

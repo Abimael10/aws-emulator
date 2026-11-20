@@ -409,7 +409,8 @@ fn requested_account_id(
 /// refused with [`INVALID_VOLUME_ARN_MESSAGE`], and one that names another account's
 /// volume with [`foreign_account`]. An ARN of ANOTHER Region names a volume this regional
 /// endpoint does not observe, so it selects nothing, exactly as an unknown volume of this
-/// Region does.
+/// Region does. A list naming more volumes than this service answers for in one request is
+/// refused outright ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]).
 fn requested_volume_ids(
     volume_arns: Option<&[String]>,
     account_id: &str,
@@ -418,6 +419,14 @@ fn requested_volume_ids(
     let Some(volume_arns) = volume_arns else {
         return Ok(None);
     };
+    // The model bounds this list's length nowhere, so the service does: a request may name at
+    // most the crate's ceiling ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]), the same bound
+    // every reader of this service applies to the identifier list it takes, so neither the
+    // answer nor the per-identifier work that builds it can be sized by the length of the list
+    // a caller sent. Refused before anything is parsed or allocated per identifier.
+    if let Some(reason) = crate::state::too_many_identifiers("volumeArns", volume_arns.len()) {
+        return Err(invalid_parameter(reason));
+    }
     let mut volume_ids = Vec::new();
     for arn in volume_arns {
         let Some(volume) = crate::state::parse_volume_arn(arn) else {

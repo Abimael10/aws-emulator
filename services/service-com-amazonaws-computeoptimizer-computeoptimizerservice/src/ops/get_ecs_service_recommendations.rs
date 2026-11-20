@@ -269,6 +269,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot report on, exactly as `accountIds` naming that account does, so it is
         // refused with the crate's cross-account message rather than reported in `errors`.
         let mut requested: Vec<crate::state::EcsServiceRef> = Vec::new();
+        // The model bounds this list's length nowhere, so the service does: a request may
+        // name at most the crate's ceiling
+        // ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]), the same bound every reader of
+        // this service applies to the identifier list it takes, so neither the answer nor
+        // the per-identifier work that builds it can be sized by the length of the list a
+        // caller sent. Refused before anything is parsed or allocated per identifier.
+        if let Some(reason) = crate::state::too_many_identifiers(
+            "serviceArns",
+            input.service_arns.as_deref().unwrap_or_default().len(),
+        ) {
+            return Err(invalid(reason));
+        }
         for arn in input.service_arns.iter().flatten() {
             let Some(reference) = crate::state::parse_ecs_service_arn(arn) else {
                 return Err(invalid(format!(

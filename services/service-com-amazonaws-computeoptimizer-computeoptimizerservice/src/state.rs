@@ -185,7 +185,11 @@ pub const MAX_REQUESTED_IDENTIFIERS: usize = MAX_PAGE_SIZE;
 
 /// Why an ARN list a request carries is too long to answer ([`MAX_REQUESTED_IDENTIFIERS`]),
 /// naming the member and the bound, or `None` when it is within it. Stated once so no two
-/// readers of this service bound their identifier list differently.
+/// readers of this service bound their identifier list differently, and applied by EVERY
+/// reader that takes a caller-supplied identifier list — `instanceArns`,
+/// `autoScalingGroupArns`, `volumeArns`, `functionArns`, `serviceArns`, the `resourceArns` of
+/// the license, idle and database readers, and `jobIds` — so one of them cannot refuse a
+/// length another answers.
 pub fn too_many_identifiers(member: &str, named: usize) -> Option<String> {
     (named > MAX_REQUESTED_IDENTIFIERS).then(|| {
         format!(

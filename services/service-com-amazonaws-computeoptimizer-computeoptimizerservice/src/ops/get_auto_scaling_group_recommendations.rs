@@ -226,6 +226,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose ACCOUNT field names another account asks about a group this service cannot
         // report on, exactly as `accountIds` naming that account does, so it is refused
         // with the crate's cross-account message rather than selecting nothing.
+        // The model bounds this list's length nowhere, so the service does: a request may
+        // name at most the crate's ceiling
+        // ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]), the same bound every reader of this
+        // service applies to the identifier list it takes, so neither the answer nor the
+        // per-identifier work that builds it can be sized by the length of the list a caller
+        // sent. Refused before anything is parsed or allocated per identifier.
+        if let Some(reason) = crate::state::too_many_identifiers(
+            "autoScalingGroupArns",
+            input.auto_scaling_group_arns.as_deref().unwrap_or_default().len(),
+        ) {
+            return Err(invalid_parameter(reason));
+        }
         let requested_arns: Vec<String> = input.auto_scaling_group_arns.clone().unwrap_or_default();
         for arn in &requested_arns {
             let parsed = crate::state::parse_resource_arn(arn).filter(|parsed| {

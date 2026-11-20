@@ -409,7 +409,9 @@ fn requested_account_id(
 /// carries, which is why the selection is by ARN RESOURCE part
 /// ([`crate::state::ObservedFunction::arn_resource`]) rather than by function name. An ARN of
 /// ANOTHER Region names a function this regional endpoint does not observe, so it selects
-/// nothing, exactly as an unknown function of this Region does.
+/// nothing, exactly as an unknown function of this Region does. A list naming more functions
+/// than this service answers for in one request is refused outright
+/// ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]).
 fn requested_functions(
     function_arns: Option<&[String]>,
     account_id: &str,
@@ -418,6 +420,15 @@ fn requested_functions(
     let Some(function_arns) = function_arns else {
         return Ok(None);
     };
+    // The model bounds this list's length nowhere, so the service does: a request may name at
+    // most the crate's ceiling ([`crate::state::MAX_REQUESTED_IDENTIFIERS`]), the same bound
+    // every reader of this service applies to the identifier list it takes, so neither the
+    // answer nor the per-identifier work that builds it can be sized by the length of the list
+    // a caller sent. Refused before anything is parsed or allocated per identifier.
+    if let Some(reason) = crate::state::too_many_identifiers("functionArns", function_arns.len())
+    {
+        return Err(invalid_parameter(reason));
+    }
     let mut selected = Vec::new();
     for arn in function_arns {
         let Some(function) = crate::state::parse_function_arn(arn) else {
