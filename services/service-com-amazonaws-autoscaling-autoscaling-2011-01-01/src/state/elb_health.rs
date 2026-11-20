@@ -56,7 +56,7 @@ use super::{
 /// [`super::EC2_INSTANCE_GONE_REASON`] and [`super::USER_HEALTH_CHECK_REASON`], which word
 /// the same step for the other checks a group's members can fail.
 pub const ELB_HEALTH_CHECK_FAILURE_REASON: &str = "an instance was taken out of service in \
-                                                   response to a ELB system health check \
+                                                   response to an ELB system health check \
                                                    failure";
 
 impl AutoScalingState {
