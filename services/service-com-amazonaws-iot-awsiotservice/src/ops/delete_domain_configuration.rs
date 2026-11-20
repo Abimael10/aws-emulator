@@ -142,14 +142,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let _ = ctx;
 
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
         // A delete states the ABSENCE of the named configuration, and the operation
         // models an empty output: a name the account holds no configuration under is
         // already in the state the caller asked for, so there is nothing to remove and
         // nothing to report — the empty success, not a refusal. (A read of the same name
         // still answers the modelled `ResourceNotFoundException`: a read has a record to
         // report and none exists.)
-        state
-            .lock()
+        let Some(configuration) = store
+            .domain_configurations
+            .get_mut(&input.domain_configuration_name)
+        else {
+            return Ok(DeleteDomainConfigurationOutput {});
+        };
+        // A status change the clock has already made due is in effect by the time this
+        // call is answered, whoever asked for it.
+        configuration.settle_status(now);
+
+        // A configuration the account still serves connections under cannot be torn out
+        // from under the devices connected through it, so it is removed only once its
+        // status says it serves nobody; one that still serves — including one whose
+        // disable is asked for but not yet in effect — is refused with the modelled
+        // `InvalidRequestException` (HTTP 400) and left exactly as it was, so the caller
+        // can wait for the disable to take effect and delete it then.
+        if !configuration.is_disabled() {
+            return Err(
+                DeleteDomainConfigurationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            crate::state::UNDELETABLE_DOMAIN_CONFIGURATION_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store
             .domain_configurations
             .remove(&input.domain_configuration_name);
         Ok(DeleteDomainConfigurationOutput {})

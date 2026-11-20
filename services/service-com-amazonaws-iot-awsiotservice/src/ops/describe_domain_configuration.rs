@@ -180,15 +180,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
+        let data_endpoint = crate::state::account_data_endpoint(ctx);
+        let now = ::std::time::SystemTime::now();
 
         // Reported from the stored record, member for member, so a reader and the create
-        // that wrote it cannot drift; a name the account holds no configuration under is
-        // the modelled `ResourceNotFoundException` (HTTP 404).
+        // that wrote it cannot drift; the configurations the SERVICE manages for the
+        // account are reported the same way, from the same view
+        // (`domain_configuration_of`), because a caller reads one no differently. A name
+        // the account holds no configuration under — neither its own nor a reserved one —
+        // is the modelled `ResourceNotFoundException` (HTTP 404).
         let described = state
             .lock()
-            .domain_configurations
-            .get(&input.domain_configuration_name)
+            .domain_configuration_of(
+                &input.domain_configuration_name,
+                &region,
+                data_endpoint.as_deref(),
+                now,
+            )
+            .as_ref()
             .map(crate::state::RegisteredDomainConfiguration::to_description);
         described.ok_or_else(|| {
             DescribeDomainConfigurationErrorModeled::ResourceNotFoundException(

@@ -149,24 +149,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
+        let data_endpoint = crate::state::account_data_endpoint(ctx);
+        let now = ::std::time::SystemTime::now();
 
         let store = state.lock();
+        // Every configuration the account holds — the ones the service manages for the
+        // account's own endpoints and then the ones a caller created — in one view, so
+        // the listing and `DescribeDomainConfiguration` report the same set.
+        let configurations =
+            store.domain_configurations_of(&region, data_endpoint.as_deref(), now);
         // `serviceType` is "The type of service delivered by the endpoint", so a request
         // naming one asks about the configurations of THAT type and a request naming none
-        // about every one the account holds. The store IS the registry keyed by name, so
-        // the listing is that order: `@paginated`, and a page boundary is only meaningful
-        // over a stable one.
-        let names: Vec<String> = store
-            .domain_configurations
-            .values()
-            .filter(|configuration| {
+        // about every one the account holds. The listing pages over each row's POSITION in
+        // that order (`@paginated`, and a page boundary is only meaningful over a stable
+        // total order), because the order is the service's and not the name's.
+        let positions: Vec<String> = configurations
+            .iter()
+            .filter(|listed| {
                 input
                     .service_type
                     .as_deref()
-                    .is_none_or(|service_type| configuration.service_type == service_type)
+                    .is_none_or(|service_type| listed.configuration.service_type == service_type)
             })
-            .map(|configuration| configuration.domain_configuration_name.clone())
+            .map(|listed| listed.position.clone())
             .collect();
 
         // One page of that order, resumed after the position the caller's own marker
@@ -204,18 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 page_size.clamp(1, crate::state::MAX_LIST_PAGE_SIZE)
             }) as usize;
         let (page, next_marker) =
-            crate::state::page_of(names, &scope, resume_after.as_deref(), page_size);
+            crate::state::page_of(positions, &scope, resume_after.as_deref(), page_size);
 
         // Each entry is projected from the stored record, so what a listing reports and
         // what `DescribeDomainConfiguration` reports cannot drift.
         Ok(ListDomainConfigurationsOutput {
             domain_configurations: Some(
-                page.into_iter()
-                    .filter_map(|name| {
-                        store
-                            .domain_configurations
-                            .get(&name)
-                            .map(crate::state::RegisteredDomainConfiguration::to_summary)
+                page.iter()
+                    .filter_map(|position| {
+                        configurations
+                            .iter()
+                            .find(|listed| &listed.position == position)
+                            .map(|listed| listed.configuration.to_summary())
                     })
                     .collect(),
             ),

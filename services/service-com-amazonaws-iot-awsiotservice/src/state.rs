@@ -1077,6 +1077,17 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// [`domain_configurations::MAX_DOMAIN_CONFIGURATIONS`] is the ceiling
     /// `CreateDomainConfiguration` refuses past.
     pub domain_configurations: BTreeMap<String, RegisteredDomainConfiguration>,
+    /// The domain configurations the SERVICE manages for this account — the settings of
+    /// the account's own endpoints, which exist without anyone creating them.
+    ///
+    /// They are not entries of
+    /// [`ComAmazonawsIotAwsiotserviceState::domain_configurations`] because no caller
+    /// writes or removes one: this record holds only WHEN the account got them, and the
+    /// configuration itself is projected per request from the catalog, the Region
+    /// addressed and the account's endpoint (see [`ReservedDomainConfigurations`]).
+    /// [`ComAmazonawsIotAwsiotserviceState::domain_configurations_of`] is the one view
+    /// over both sets that every reader and the listing read.
+    pub reserved_domain_configurations: ReservedDomainConfigurations,
     /// Every CERTIFICATE PROVIDER that exists, keyed by `certificateProviderName`.
     ///
     /// The name is the provider's identity — the model binds it as the `@httpLabel`
@@ -3526,10 +3537,17 @@ pub use thing_type_deletion::{ThingTypeDeletionRefusal, DEPRECATION_DELETION_WAI
 // `state/domain_configurations.rs`.
 pub mod domain_configurations;
 pub use domain_configurations::{
-    acm_certificates, chains_to_a_certificate_authority, domain_configuration_arn,
-    missing_acm_certificate_message, missing_domain_configuration_message,
-    RegisteredDomainConfiguration, MAX_DOMAIN_CONFIGURATIONS,
-    UNTRUSTED_VALIDATION_CERTIFICATE_MESSAGE, UNVALIDATED_SERVER_CERTIFICATE_MESSAGE,
+    account_data_endpoint, acm_certificates, chains_to_a_certificate_authority,
+    created_domain_configuration_arn, domain_configuration_arn, effective_tls_config,
+    fresh_domain_configuration_id, missing_acm_certificate_message,
+    missing_custom_authorizer_message, missing_domain_configuration_message,
+    unmodifiable_domain_configuration_message, ListedDomainConfiguration, PendingStatusChange,
+    RegisteredDomainConfiguration, ReservedDomainConfiguration, ReservedDomainConfigurations,
+    DEFAULT_APPLICATION_PROTOCOL, DEFAULT_AUTHENTICATION_TYPE, DEFAULT_SECURITY_POLICY,
+    DOMAIN_CONFIGURATION_DISABLED, DOMAIN_CONFIGURATION_STATUS_CHANGE_SPAN, DOMAIN_TYPE_ENDPOINT,
+    MAX_DOMAIN_CONFIGURATIONS, RESERVED_DOMAIN_CONFIGURATIONS,
+    UNDELETABLE_DOMAIN_CONFIGURATION_MESSAGE, UNTRUSTED_VALIDATION_CERTIFICATE_MESSAGE,
+    UNVALIDATED_SERVER_CERTIFICATE_MESSAGE,
 };
 
 // What a CERTIFICATE PROVIDER is — the record one holds and which provider holds an

@@ -193,6 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
+        // WHERE this account's IoT data plane answers, which is the domain an
+        // AWS-managed configuration configures (it names none of its own).
+        let data_endpoint = crate::state::account_data_endpoint(ctx);
 
         // `Tag$Key` is `@required` and keys a resource's tag set, so the last value given
         // for a key is the one the resource carries, and how MANY tags one request may
@@ -346,6 +349,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The authorization service a configuration names is one of this account's OWN
+        // custom authorizers — "An object that specifies the authorization service for a
+        // domain" (`CreateDomainConfiguration$authorizerConfig`) — so a configuration may
+        // only name one the account holds: a device connecting under a configuration that
+        // names an authorizer nobody created would reach no authorization service at all.
+        // A name the account holds none under is refused with the modelled
+        // `InvalidRequestException` (HTTP 400) and nothing is written.
+        if let Some(authorizer_name) = input
+            .authorizer_config
+            .as_ref()
+            .and_then(|authorizer_config| authorizer_config.default_authorizer_name.as_deref())
+            .map(str::trim)
+            .filter(|authorizer_name| !authorizer_name.is_empty())
+        {
+            if !store.authorizers.contains_key(authorizer_name) {
+                return Err(
+                    CreateDomainConfigurationErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(crate::state::missing_custom_authorizer_message(
+                                authorizer_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // The name is the configuration's identity, so a name already taken is a
         // conflict: `ResourceAlreadyExistsException` (HTTP 409).
         if let Some(existing) = store.domain_configurations.get(&input.domain_configuration_name) {
@@ -390,14 +421,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             crate::state::domain_configurations::DOMAIN_TYPE_AWS_MANAGED
         };
-        let domain_configuration_arn = crate::state::domain_configuration_arn(
+        // WHICH domain the configuration configures: the one the request named, or — for
+        // the AWS-managed kind, which names none — the account's own data endpoint, the
+        // domain a device dials that endpoint under. The service resolves that one
+        // itself, so the record carries it and every reader reports it.
+        let domain_name = match input.domain_name {
+            Some(domain_name) => Some(domain_name),
+            None => data_endpoint,
+        };
+        let domain_configuration_arn = crate::state::created_domain_configuration_arn(
             &region,
             &input.domain_configuration_name,
+            &crate::state::fresh_domain_configuration_id(),
         );
         let configuration = crate::state::RegisteredDomainConfiguration {
             domain_configuration_name: input.domain_configuration_name,
             domain_configuration_arn,
-            domain_name: input.domain_name,
+            domain_name,
             server_certificate_arns,
             validation_certificate_arn,
             authorizer_config: input.authorizer_config,
@@ -408,13 +448,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }),
             domain_type: domain_type.to_string(),
             status: crate::state::domain_configurations::DOMAIN_CONFIGURATION_ENABLED.to_string(),
-            tls_config: input.tls_config,
+            // Under which TLS policy the endpoint serves, which application protocol it
+            // speaks and which authentication type it accepts are settings the endpoint
+            // ALWAYS has: a request that pins none of them is served the service's
+            // defaults, so the defaults are what the record carries and what a reader
+            // reports — not an absent member.
+            tls_config: Some(crate::state::effective_tls_config(input.tls_config)),
             server_certificate_config: input.server_certificate_config,
-            authentication_type: input.authentication_type,
-            application_protocol: input.application_protocol,
+            authentication_type: Some(input.authentication_type.unwrap_or_else(|| {
+                crate::state::DEFAULT_AUTHENTICATION_TYPE.to_string()
+            })),
+            application_protocol: Some(input.application_protocol.unwrap_or_else(|| {
+                crate::state::DEFAULT_APPLICATION_PROTOCOL.to_string()
+            })),
             client_certificate_config: input.client_certificate_config,
             tags,
             last_status_change_date: now,
+            // A created configuration serves from the moment it exists: there is no
+            // status change owed on it.
+            pending_status: None,
         };
 
         // The response is built from the record that is about to be persisted, so what

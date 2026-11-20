@@ -26,7 +26,7 @@
 //! this service cannot present, so the create is refused and nothing is written.
 
 use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AuthorizerConfig, ClientCertificateConfig, DescribeDomainConfigurationOutput,
@@ -77,6 +77,52 @@ pub const DOMAIN_TYPE_CUSTOMER_MANAGED: &str = "CUSTOMER_MANAGED";
 /// serves.
 pub const DOMAIN_TYPE_AWS_MANAGED: &str = "AWS_MANAGED";
 
+/// The `domainType` of a configuration the SERVICE manages for the account: the
+/// settings of one of the account's own endpoints, which exists without anyone creating
+/// it ([`RESERVED_DOMAIN_CONFIGURATIONS`]).
+///
+/// `DomainType` is `ENDPOINT | AWS_MANAGED | CUSTOMER_MANAGED`
+/// (`smithy_query(query="shape",shape="DomainType")`); `ENDPOINT` is the kind that is an
+/// endpoint of the account rather than a domain a caller configured.
+pub const DOMAIN_TYPE_ENDPOINT: &str = "ENDPOINT";
+
+/// The `domainConfigurationStatus` a configuration serves no connection in, and the one
+/// a configuration has to be in before it can be deleted (see
+/// [`UNDELETABLE_DOMAIN_CONFIGURATION_MESSAGE`]).
+///
+/// The other of the two values `DomainConfigurationStatus` admits
+/// ([`crate::ops::types::DOMAIN_CONFIGURATION_STATUS_VALUES`]);
+/// `UpdateDomainConfiguration$domainConfigurationStatus` ("The status to which the
+/// domain configuration should be updated") is what moves a configuration into it.
+pub const DOMAIN_CONFIGURATION_DISABLED: &str = "DISABLED";
+
+/// The `applicationProtocol` a configuration that named none serves under.
+///
+/// `ApplicationProtocol` admits `SECURE_MQTT | MQTT_WSS | HTTPS | DEFAULT`, where
+/// `DEFAULT` is "Use a combination of port and Application Layer Protocol Negotiation
+/// (ALPN) to specify application_layer protocol" — the behaviour of an endpoint nobody
+/// pinned to one protocol, so it is the effective value of a configuration created
+/// without one rather than an absent member.
+pub const DEFAULT_APPLICATION_PROTOCOL: &str = "DEFAULT";
+
+/// The `authenticationType` a configuration that named none serves under.
+///
+/// `AuthenticationType` admits `CUSTOM_AUTH_X509 | CUSTOM_AUTH | AWS_X509 | AWS_SIGV4 |
+/// DEFAULT`, where `DEFAULT` is "Use a combination of port and Application Layer
+/// Protocol Negotiation (ALPN) to specify authentication type" — the behaviour of an
+/// endpoint nobody pinned to one authentication type, so it is the effective value of a
+/// configuration created without one.
+pub const DEFAULT_AUTHENTICATION_TYPE: &str = "DEFAULT";
+
+/// The `tlsConfig.securityPolicy` a configuration that named none serves under: the
+/// service's current default TLS security policy, the one that admits TLS 1.3 and TLS
+/// 1.2 (`TlsConfig$securityPolicy`, "The security policy for a domain configuration").
+///
+/// A domain configuration always serves under SOME security policy — TLS is how a
+/// device reaches it — so a request that pins none is served the service's default, and
+/// that is the policy a reader reports.
+pub const DEFAULT_SECURITY_POLICY: &str = "IoTSecurityPolicy_TLS13_1_2_2022_10";
+
 /// The `serverCertificateStatus` of a certificate a configuration presents.
 ///
 /// A configuration may only name a certificate that exists, so the certificate it
@@ -96,6 +142,41 @@ pub fn domain_configuration_arn(region: &str, domain_configuration_name: &str) -
         region,
         &format!("domainconfiguration/{domain_configuration_name}"),
     )
+}
+
+/// The range the short id in a created configuration's ARN comes from: four decimal
+/// digits, so an id is one of `0000`..`9999`.
+const DOMAIN_CONFIGURATION_ID_RANGE: u32 = 10_000;
+
+/// The ARN of a domain configuration a CALLER created:
+/// `arn:aws:iot:<region>:<account>:domainconfiguration/<domainConfigurationName>/<id>`.
+///
+/// The resource part NAMES the configuration — which is what makes the ARN derivable
+/// from the name by anyone writing an IAM resource statement — and carries after it the
+/// short id the service mints for the configuration, which is the form AWS reports a
+/// created configuration's ARN in. A configuration the SERVICE manages carries no such
+/// id: its ARN is its reserved name alone ([`domain_configuration_arn`]).
+pub fn created_domain_configuration_arn(
+    region: &str,
+    domain_configuration_name: &str,
+    domain_configuration_id: &str,
+) -> String {
+    domain_configuration_arn(
+        region,
+        &format!("{domain_configuration_name}/{domain_configuration_id}"),
+    )
+}
+
+/// A short id for one newly created domain configuration, minted from the same
+/// randomness every other identifier of this service is ([`super::fresh_uuid`]).
+///
+/// It is minted ONCE, when the configuration is created, and lives in the ARN the record
+/// carries, so every reader of that configuration reports the same ARN.
+pub fn fresh_domain_configuration_id() -> String {
+    let minted = super::fresh_uuid();
+    let id = u32::from_str_radix(minted.get(..8).unwrap_or_default(), 16).unwrap_or_default()
+        % DOMAIN_CONFIGURATION_ID_RANGE;
+    format!("{id:04}")
 }
 
 /// The message every operation that addresses ONE domain configuration refuses a name
@@ -150,6 +231,204 @@ pub const UNVALIDATED_SERVER_CERTIFICATE_MESSAGE: &str =
 /// this refusal with, verbatim: it states the rule and echoes nothing of the request.
 pub const UNTRUSTED_VALIDATION_CERTIFICATE_MESSAGE: &str =
     "Validation certificate must be signed by trusted CA";
+
+/// How this service refuses an `authorizerConfig` whose `defaultAuthorizerName` names
+/// no custom authorizer the account holds.
+///
+/// `AuthorizerConfig` is "An object that specifies the authorization service for a
+/// domain", and that service is one of this account's OWN custom authorizers — the
+/// records `CreateAuthorizer` writes — so a configuration may only name one the account
+/// has: a name it holds none under names no authorization service, and a device
+/// connecting under the configuration would reach none. The fixed text is the class's
+/// and the variable part is the name the request carried, after the member that names
+/// it.
+pub fn missing_custom_authorizer_message(authorizer_name: &str) -> String {
+    format!("Custom authorizer does not exist, AuthorizerName: {authorizer_name}")
+}
+
+/// How this service refuses the delete of a domain configuration the account still
+/// serves connections under.
+///
+/// A configuration in `ENABLED` status is the live endpoint settings devices connect
+/// under, and deleting it would take that endpoint out from under them in one call, so
+/// the delete is admissible only once the status says it serves nobody — the same
+/// precondition this service enforces on an authorizer
+/// ([`super::undeletable_authorizer_message`]) and on a certificate. The sentence names
+/// the status the configuration has to be moved to, because
+/// `UpdateDomainConfiguration$domainConfigurationStatus` is what gets it there.
+pub const UNDELETABLE_DOMAIN_CONFIGURATION_MESSAGE: &str =
+    "Cannot delete a domain configuration in ENABLED status. Update the domain configuration \
+     status to DISABLED and delete.";
+
+/// How this service refuses an update addressed to a domain configuration the SERVICE
+/// manages ([`RESERVED_DOMAIN_CONFIGURATIONS`]).
+///
+/// `UpdateDomainConfiguration` documents it itself — "Domain configurations for default
+/// endpoints can't be updated" — because such a configuration is the account's own
+/// endpoint rather than settings a caller supplied. The fixed text is the class's and
+/// the variable part is the reserved name the request addressed.
+pub fn unmodifiable_domain_configuration_message(domain_configuration_name: &str) -> String {
+    format!(
+        "Domain configuration {domain_configuration_name} is a default endpoint configuration \
+         and cannot be updated"
+    )
+}
+
+/// One domain configuration the SERVICE manages for every account: the settings of one
+/// of the account's own endpoints, which exists without anyone creating it.
+///
+/// These are the `ENDPOINT`-type configurations, addressable by their RESERVED names:
+/// every single-configuration reader takes a `ReservedDomainConfigurationName`, whose
+/// pattern `^[\w.:-]+$` admits the `:` such a name carries, where
+/// `CreateDomainConfiguration` and `DeleteDomainConfiguration` take a
+/// `DomainConfigurationName` (`^[\w.-]+$`) that cannot spell one — so a caller can read
+/// one and can neither mint nor remove it
+/// (`smithy_query(query="operation",operation="DescribeDomainConfiguration")`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReservedDomainConfiguration {
+    /// The reserved name the configuration is addressed by.
+    pub name: &'static str,
+    /// Which of [`crate::ops::types::SERVICE_TYPE_VALUES`] that endpoint delivers.
+    pub service_type: &'static str,
+}
+
+/// The domain configurations every account holds without creating them.
+///
+/// The account's data endpoint is ATS-signed and is the one `DescribeEndpoint`'s
+/// `endpointType` documentation recommends every client use ("`iot:Data-ATS` - Returns an
+/// ATS signed data endpoint … We strongly recommend that customers use the newer
+/// `iot:Data-ATS` endpoint type"), and beside it the account has the credentials-provider
+/// endpoint ("`iot:CredentialProvider` - Returns an IoT credentials provider API
+/// endpoint"). The settings of each — the security policy it serves TLS under, the
+/// authentication type it accepts — are read through the domain-configuration plane under
+/// that endpoint's own reserved name, so the account holds one configuration per
+/// endpoint, each of [`DOMAIN_TYPE_ENDPOINT`] type and delivering that endpoint's
+/// service, from the moment the account exists.
+///
+/// The ORDER is the order a listing reports them in: it is the service's own, which is
+/// why it is not the alphabetical one the account's own configurations are listed in.
+pub const RESERVED_DOMAIN_CONFIGURATIONS: &[ReservedDomainConfiguration] = &[
+    ReservedDomainConfiguration {
+        name: "iot:Data-ATS",
+        service_type: DEFAULT_SERVICE_TYPE,
+    },
+    ReservedDomainConfiguration {
+        name: "iot:CredentialProvider",
+        service_type: "CREDENTIAL_PROVIDER",
+    },
+];
+
+/// The domain configurations the SERVICE manages for this account, as this store holds
+/// them: the instant they came into being, which is the instant the account's store did.
+///
+/// A reserved configuration carries no setting a caller supplied — everything about it
+/// follows from the catalog entry, the account and the Region addressed — so the only
+/// thing to persist is WHEN the account got it, which is what
+/// `DescribeDomainConfiguration$lastStatusChangeDate` reports for it and what makes that
+/// value stable across reads. The record is projected per request
+/// ([`ReservedDomainConfigurations::resolve`]) rather than copied into
+/// [`super::ComAmazonawsIotAwsiotserviceState::domain_configurations`], so a read never
+/// writes and a caller can neither create over nor delete one.
+#[derive(Debug, Clone)]
+pub struct ReservedDomainConfigurations {
+    /// When the account's reserved configurations came into being.
+    since: SystemTime,
+}
+
+impl Default for ReservedDomainConfigurations {
+    fn default() -> Self {
+        Self {
+            since: SystemTime::now(),
+        }
+    }
+}
+
+impl ReservedDomainConfigurations {
+    /// The reserved configuration `domain_configuration_name` addresses, as a record a
+    /// reader projects exactly like one a caller created, or `None` for a name that is
+    /// no reserved name.
+    ///
+    /// `region` scopes the ARN to the Region the request addressed, the way every minted
+    /// ARN of this service is scoped, and `data_endpoint` is the address the account's
+    /// endpoint answers at ([`account_data_endpoint`]) — the domain a device dials it
+    /// under, which is what `domainName` is for an endpoint AWS runs.
+    pub fn resolve(
+        &self,
+        domain_configuration_name: &str,
+        region: &str,
+        data_endpoint: Option<&str>,
+    ) -> Option<RegisteredDomainConfiguration> {
+        let reserved = RESERVED_DOMAIN_CONFIGURATIONS
+            .iter()
+            .find(|reserved| reserved.name == domain_configuration_name)?;
+        Some(RegisteredDomainConfiguration {
+            domain_configuration_name: reserved.name.to_string(),
+            domain_configuration_arn: domain_configuration_arn(region, reserved.name),
+            domain_name: data_endpoint.map(str::to_string),
+            server_certificate_arns: Vec::new(),
+            validation_certificate_arn: None,
+            authorizer_config: None,
+            service_type: reserved.service_type.to_string(),
+            domain_type: DOMAIN_TYPE_ENDPOINT.to_string(),
+            status: DOMAIN_CONFIGURATION_ENABLED.to_string(),
+            tls_config: Some(effective_tls_config(None)),
+            server_certificate_config: None,
+            authentication_type: Some(DEFAULT_AUTHENTICATION_TYPE.to_string()),
+            application_protocol: Some(DEFAULT_APPLICATION_PROTOCOL.to_string()),
+            client_certificate_config: None,
+            tags: BTreeMap::new(),
+            last_status_change_date: self.since,
+            pending_status: None,
+        })
+    }
+
+    /// Every reserved configuration of this account, resolved as [`Self::resolve`]
+    /// resolves one.
+    pub fn all(
+        &self,
+        region: &str,
+        data_endpoint: Option<&str>,
+    ) -> Vec<RegisteredDomainConfiguration> {
+        RESERVED_DOMAIN_CONFIGURATIONS
+            .iter()
+            .filter_map(|reserved| self.resolve(reserved.name, region, data_endpoint))
+            .collect()
+    }
+}
+
+/// The TLS configuration a configuration serves under, given the one its request
+/// carried: the policy the request pinned, or the service's default
+/// ([`DEFAULT_SECURITY_POLICY`]) when it pinned none.
+///
+/// A domain configuration always serves TLS under some security policy, so this is the
+/// value PERSISTED on a create or an update rather than one a reader fills in: what the
+/// record holds and what every reader of it reports are one value.
+pub fn effective_tls_config(requested: Option<TlsConfig>) -> TlsConfig {
+    let security_policy = requested
+        .and_then(|tls_config| tls_config.security_policy)
+        .filter(|security_policy| !security_policy.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_SECURITY_POLICY.to_string());
+    TlsConfig {
+        security_policy: Some(security_policy),
+    }
+}
+
+/// The address this account's IoT DATA endpoint answers at, as the domain a device
+/// dials it under.
+///
+/// A configuration for an AWS-managed domain names no domain of the caller's own: the
+/// domain it configures is the account's own endpoint, so its `domainName` is the
+/// address that endpoint is published at — the one value `DescribeEndpoint` answers
+/// with, read from the same place
+/// ([`::service_common::data_plane_addressing::emulator_endpoint_authority`]), so the
+/// endpoint a client discovers and the domain a configuration names cannot drift.
+///
+/// `None` for an emulator that is served at no address at all, rather than a
+/// `domainName` naming nothing.
+pub fn account_data_endpoint(ctx: &::smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+    let endpoint = ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx);
+    (!endpoint.trim().is_empty()).then_some(endpoint)
+}
 
 /// Whether a device presented the certificate `certificate_arn` can chain it to a
 /// certificate authority its own trust store holds, as Certificate Manager's own record
@@ -267,9 +546,102 @@ pub struct RegisteredDomainConfiguration {
     /// `DescribeDomainConfiguration$lastStatusChangeDate`. The create is the first
     /// such change.
     pub last_status_change_date: SystemTime,
+    /// The status change this configuration is MOVING to and when it falls due, or
+    /// `None` for one whose status is settled.
+    ///
+    /// Asking for a status is not being in it: the endpoint has to stop serving the
+    /// connections it is serving before it is disabled, which is work the service does
+    /// after acknowledging the request ([`DOMAIN_CONFIGURATION_STATUS_CHANGE_SPAN`]). So
+    /// a caller that disables a configuration and acts in the same breath still sees the
+    /// configuration it had — and the state errors that status carries, which is what
+    /// refuses a delete that comes too early.
+    pub pending_status: Option<PendingStatusChange>,
 }
 
+/// A status change one domain configuration is MOVING to: which status, and the instant
+/// the clock makes it due.
+#[derive(Debug, Clone)]
+pub struct PendingStatusChange {
+    /// Which of [`crate::ops::types::DOMAIN_CONFIGURATION_STATUS_VALUES`] the
+    /// configuration moves to.
+    pub status: String,
+    /// When the move falls due. Nothing sleeps for it: every reader of the configuration
+    /// compares it with its own `now`.
+    pub due: SystemTime,
+}
+
+/// How long a requested `domainConfigurationStatus` change takes to come into effect.
+///
+/// A domain configuration is the live endpoint settings devices are connected under, so
+/// moving it between `ENABLED` and `DISABLED` is work on the endpoint and not a flag
+/// flip: the service acknowledges the request and the configuration changes status when
+/// that work is done. The model carries no transitional status to report meanwhile, so
+/// the configuration keeps the status it HAS until the change falls due. The span is the
+/// emulator's own — AWS publishes no figure for it — chosen like every other transition
+/// of this emulator: long enough that a caller acting in the same breath still meets the
+/// state it had, short enough that a caller polling for the new status gets there at
+/// once.
+pub const DOMAIN_CONFIGURATION_STATUS_CHANGE_SPAN: Duration = Duration::from_secs(3);
+
 impl RegisteredDomainConfiguration {
+    /// Whether this configuration serves no connection — its persisted status is
+    /// [`DOMAIN_CONFIGURATION_DISABLED`] — and so may be deleted.
+    ///
+    /// Read from the record rather than from the create request, so a configuration
+    /// created `ENABLED` and later disabled is deletable and one enabled again is not.
+    /// A disable that is asked for but not yet in effect is NOT disabled: settle the
+    /// record against the clock ([`Self::settle_status`]) before asking.
+    pub fn is_disabled(&self) -> bool {
+        self.status == DOMAIN_CONFIGURATION_DISABLED
+    }
+
+    /// Ask for the status `status`, which comes into effect
+    /// [`DOMAIN_CONFIGURATION_STATUS_CHANGE_SPAN`] after `now`.
+    ///
+    /// Asking for the status the configuration is already in, or already moving to,
+    /// changes nothing: there is no new work to do, and so no new instant to report as
+    /// the last status change.
+    pub fn request_status(&mut self, status: String, now: SystemTime) {
+        self.settle_status(now);
+        let asked_for = self
+            .pending_status
+            .as_ref()
+            .map_or(self.status.as_str(), |pending| pending.status.as_str());
+        if asked_for == status {
+            return;
+        }
+        self.pending_status = Some(PendingStatusChange {
+            due: now + DOMAIN_CONFIGURATION_STATUS_CHANGE_SPAN,
+            status,
+        });
+    }
+
+    /// Fold a status change the clock has ALREADY made due into the record: the
+    /// configuration is in that status from the instant the change fell due, which is
+    /// also when it last changed status.
+    ///
+    /// Materialises only what the clock owed at `now` — a change that was due whether or
+    /// not anybody called — so every reader sees the same status, whoever asks first.
+    pub fn settle_status(&mut self, now: SystemTime) {
+        let Some(pending) = self.pending_status.as_ref() else {
+            return;
+        };
+        if now < pending.due {
+            return;
+        }
+        self.status = pending.status.clone();
+        self.last_status_change_date = pending.due;
+        self.pending_status = None;
+    }
+
+    /// This record as of `now`: the same record with every status change the clock has
+    /// made due folded in, which is what a reader of it reports.
+    pub fn as_of(&self, now: SystemTime) -> Self {
+        let mut settled = self.clone();
+        settled.settle_status(now);
+        settled
+    }
+
     /// The record as one entry of the `DomainConfigurationSummary` list a LISTING hands
     /// back: the subset of members that shape declares, projected from the same stored
     /// record a single-configuration reader projects, so the two cannot drift.
@@ -312,4 +684,91 @@ impl RegisteredDomainConfiguration {
             client_certificate_config: self.client_certificate_config.clone(),
         }
     }
+}
+
+impl super::ComAmazonawsIotAwsiotserviceState {
+    /// Every domain configuration this account holds under `region`, in the order a
+    /// listing reports them: the ones the service manages for the account's own endpoints
+    /// ([`RESERVED_DOMAIN_CONFIGURATIONS`], in the service's own order) and then the ones
+    /// a caller CREATED, in name order — the order the store itself keeps.
+    ///
+    /// One view over both, so a reader and a listing report the same set and a reserved
+    /// configuration is not a special case any caller of this has to remember. A caller
+    /// cannot create over a reserved name — `CreateDomainConfiguration`'s
+    /// `DomainConfigurationName` cannot spell one — so the two sets do not overlap.
+    ///
+    /// Each row carries the [`ListedDomainConfiguration::position`] a page marker names
+    /// it by, because this order is not the NAME's: the service's own endpoints come
+    /// first, in the service's order, so a marker carrying a name could not say where the
+    /// page stopped.
+    pub fn domain_configurations_of(
+        &self,
+        region: &str,
+        data_endpoint: Option<&str>,
+        now: SystemTime,
+    ) -> Vec<ListedDomainConfiguration> {
+        let reserved = self
+            .reserved_domain_configurations
+            .all(region, data_endpoint)
+            .into_iter()
+            .enumerate()
+            .map(|(index, configuration)| ListedDomainConfiguration {
+                position: format!("{RESERVED_POSITION_PREFIX}{index:04}"),
+                configuration,
+            });
+        let created = self
+            .domain_configurations
+            .values()
+            .map(|configuration| configuration.as_of(now))
+            .map(|configuration| ListedDomainConfiguration {
+                position: format!(
+                    "{CREATED_POSITION_PREFIX}{}",
+                    configuration.domain_configuration_name
+                ),
+                configuration,
+            });
+        reserved.chain(created).collect()
+    }
+
+    /// The domain configuration `domain_configuration_name` addresses in `region` —
+    /// stored or reserved, as of `now` — or `None` for a name this account holds none
+    /// under, which is what every reader refuses with
+    /// [`missing_domain_configuration_message`].
+    pub fn domain_configuration_of(
+        &self,
+        domain_configuration_name: &str,
+        region: &str,
+        data_endpoint: Option<&str>,
+        now: SystemTime,
+    ) -> Option<RegisteredDomainConfiguration> {
+        self.domain_configurations
+            .get(domain_configuration_name)
+            .map(|configuration| configuration.as_of(now))
+            .or_else(|| {
+                self.reserved_domain_configurations
+                    .resolve(domain_configuration_name, region, data_endpoint)
+            })
+    }
+}
+
+/// What a page marker names a configuration the SERVICE manages by: its place in
+/// [`RESERVED_DOMAIN_CONFIGURATIONS`], under a prefix that sorts ahead of every
+/// [`CREATED_POSITION_PREFIX`] position, which is what puts those configurations first.
+const RESERVED_POSITION_PREFIX: &str = "0";
+
+/// What a page marker names a configuration a CALLER created by: its name, under a prefix
+/// that sorts after every [`RESERVED_POSITION_PREFIX`] position, so the positions of the
+/// whole listing are ascending (what [`super::page_of`] pages over) and a position stays
+/// with its row as the account's configurations come and go.
+const CREATED_POSITION_PREFIX: &str = "1";
+
+/// One row of the domain-configuration listing: the record, and the POSITION a page
+/// marker names it by.
+#[derive(Debug, Clone)]
+pub struct ListedDomainConfiguration {
+    /// Where the row is in the listing's total order — ascending across the whole
+    /// listing, so one page resumes exactly where the last ended.
+    pub position: String,
+    /// The configuration itself, projected like any other.
+    pub configuration: RegisteredDomainConfiguration,
 }

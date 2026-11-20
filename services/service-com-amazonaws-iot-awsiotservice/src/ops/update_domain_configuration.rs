@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDomainConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDomainConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDomainConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +170,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDomainConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDomainConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDomainConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDomainConfigurationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let data_endpoint = crate::state::account_data_endpoint(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // "Domain configurations for default endpoints can't be updated": a configuration
+        // the SERVICE manages is the account's own endpoint rather than settings a caller
+        // supplied, so an update addressed to one is refused with the modelled
+        // `InvalidRequestException` (HTTP 400) and nothing is written. It is resolved
+        // before the store is read, so such a name is never a not-found either: that
+        // configuration exists.
+        if store
+            .reserved_domain_configurations
+            .resolve(
+                &input.domain_configuration_name,
+                &region,
+                data_endpoint.as_deref(),
+            )
+            .is_some()
+        {
+            return Err(
+                UpdateDomainConfigurationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::unmodifiable_domain_configuration_message(
+                            &input.domain_configuration_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The authorization service an update names is resolved exactly as
+        // `CreateDomainConfiguration` resolves it: one of this account's own custom
+        // authorizers, because a device connecting under the configuration has to reach
+        // one.
+        if let Some(authorizer_name) = input
+            .authorizer_config
+            .as_ref()
+            .and_then(|authorizer_config| authorizer_config.default_authorizer_name.as_deref())
+            .map(str::trim)
+            .filter(|authorizer_name| !authorizer_name.is_empty())
+        {
+            if !store.authorizers.contains_key(authorizer_name) {
+                return Err(
+                    UpdateDomainConfigurationErrorModeled::InvalidRequestException(
+                        InvalidRequestException {
+                            message: Some(crate::state::missing_custom_authorizer_message(
+                                authorizer_name,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `removeAuthorizerConfig` "Removes the authorization configuration from a
+        // domain", so a request that both removes it and supplies one states two
+        // incompatible outcomes for the same member: it is refused rather than one of the
+        // two silently winning.
+        if input.remove_authorizer_config && input.authorizer_config.is_some() {
+            return Err(
+                UpdateDomainConfigurationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "Cannot remove the authorizer configuration and set it in the same \
+                             request"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(configuration) = store
+            .domain_configurations
+            .get_mut(&input.domain_configuration_name)
+        else {
+            return Err(
+                UpdateDomainConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_domain_configuration_message(
+                            &input.domain_configuration_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every member the request carried REPLACES the stored one and every member it
+        // left out leaves the stored one alone: "Updates values stored in the domain
+        // configuration" is an update of the values given, not a rewrite of the record.
+        // A status change the clock has already made due is folded in first, so this
+        // update acts on the configuration as it IS.
+        configuration.settle_status(now);
+        if let Some(status) = input.domain_configuration_status {
+            // Asking for a status is not being in it: the endpoint stops serving the
+            // connections it serves before it is disabled, so the configuration keeps the
+            // status it has until the change falls due, and
+            // `lastStatusChangeDate` moves when the status actually does.
+            configuration.request_status(status, now);
+        }
+        if input.remove_authorizer_config {
+            configuration.authorizer_config = None;
+        } else if input.authorizer_config.is_some() {
+            configuration.authorizer_config = input.authorizer_config;
+        }
+        if input.tls_config.is_some() {
+            // A configuration always serves TLS under some policy, so an update that
+            // carries a `tlsConfig` pinning none is served the service's default, exactly
+            // as a create that carries none is.
+            configuration.tls_config = Some(crate::state::effective_tls_config(input.tls_config));
+        }
+        if input.server_certificate_config.is_some() {
+            configuration.server_certificate_config = input.server_certificate_config;
+        }
+        if input.authentication_type.is_some() {
+            configuration.authentication_type = input.authentication_type;
+        }
+        if input.application_protocol.is_some() {
+            configuration.application_protocol = input.application_protocol;
+        }
+        if input.client_certificate_config.is_some() {
+            configuration.client_certificate_config = input.client_certificate_config;
+        }
+
+        // Reported from the record that now holds the update, so what this call answers
+        // and what the next `DescribeDomainConfiguration` reads are one value.
+        Ok(UpdateDomainConfigurationOutput {
+            domain_configuration_name: Some(configuration.domain_configuration_name.clone()),
+            domain_configuration_arn: Some(configuration.domain_configuration_arn.clone()),
+        })
     }
 }

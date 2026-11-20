@@ -48,6 +48,32 @@ use smithy_server_runtime::MultiServiceRouter;
 const ACCOUNT_ID: &str = "000000000000";
 /// The region this suite signs for; the ARN assertions read it back.
 const REGION: &str = "eu-central-1";
+/// The configurations the SERVICE manages for every account — the settings of the
+/// account's own endpoints, which no caller creates — as this service holds the catalog.
+const RESERVED: &[service_com_amazonaws_iot_awsiotservice::state::ReservedDomainConfiguration] =
+    service_com_amazonaws_iot_awsiotservice::state::RESERVED_DOMAIN_CONFIGURATIONS;
+/// How long [`Emulator::await_status`] keeps looking for the status it waits for: far
+/// longer than the transition needs, so a loaded machine cannot make a case fail.
+const AWAIT_STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long it waits between two looks, which bounds nothing the cases assert.
+const AWAIT_STATUS_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+// What the account holds for its OWN endpoints, which no caller created.
+#[path = "domain_configurations/reserved_endpoint_configurations.rs"]
+mod reserved_endpoint_configurations;
+
+// What a reader reports for the settings an endpoint always has, and the ARN a
+// configuration carries.
+#[path = "domain_configurations/effective_endpoint_settings.rs"]
+mod effective_endpoint_settings;
+
+// WHEN a configuration may be deleted.
+#[path = "domain_configurations/deletion_status_guard.rs"]
+mod deletion_status_guard;
+
+// The authorization service a configuration names.
+#[path = "domain_configurations/authorizer_resolution.rs"]
+mod authorizer_resolution;
 
 /// One emulator: the shared engine plus a router with this service and the certificate
 /// holder it resolves a server certificate against mounted on it.
@@ -101,6 +127,66 @@ impl Emulator {
     async fn delete_configuration(&self, name: &str) -> Reply {
         self.dispatch("DELETE", &format!("/domainConfigurations/{name}"), None)
             .await
+    }
+
+    async fn update_configuration(&self, name: &str, body: &Value) -> Reply {
+        self.dispatch("PUT", &format!("/domainConfigurations/{name}"), Some(body))
+            .await
+    }
+
+    /// Move one configuration into `DISABLED`, the status a delete is admissible in, and
+    /// look until that status is in EFFECT: a configuration stops serving the connections
+    /// it is serving before it is disabled, so the status the request asks for arrives a
+    /// moment after the request is acknowledged.
+    async fn disable_configuration(&self, case: &str, name: &str) {
+        let updated = self
+            .update_configuration(name, &json!({ "domainConfigurationStatus": "DISABLED" }))
+            .await;
+        assert_eq!(
+            updated.status,
+            200,
+            "case {case}: expected the disable of {name} to answer 200, got {} body {}",
+            updated.status,
+            updated.text()
+        );
+        self.await_status(case, name, "DISABLED").await;
+    }
+
+    /// Read one configuration until it reports `status`, or a generous deadline passes:
+    /// what is waited for is the CONDITION, never a fixed time.
+    async fn await_status(&self, case: &str, name: &str, status: &str) {
+        let deadline = std::time::Instant::now() + AWAIT_STATUS_DEADLINE;
+        loop {
+            let read = self.describe_configuration(name).await;
+            let reported = read.json()["domainConfigurationStatus"].clone();
+            if reported == json!(status) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {case}: {name} never reached {status}, last read {reported} body {}",
+                read.text()
+            );
+            tokio::time::sleep(AWAIT_STATUS_POLL).await;
+        }
+    }
+
+    /// The address this account's IoT data endpoint is published at, as
+    /// `DescribeEndpoint` answers it: the domain a configuration for the AWS-managed
+    /// domain configures, since it names none of its own.
+    async fn account_data_endpoint(&self) -> String {
+        let reply = self.dispatch("GET", "/endpoint", None).await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case the account endpoint: expected 200, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        reply.json()["endpointAddress"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no endpointAddress in {}", reply.text()))
+            .to_string()
     }
 
     async fn list_configurations(&self, query: &str) -> Reply {
@@ -203,6 +289,62 @@ fn minted_certificate() -> (String, String) {
     )
 }
 
+/// Create one custom authorizer through the account's own API, so a configuration
+/// naming it names a record this service holds — "An object that specifies the
+/// authorization service for a domain".
+async fn create_authorizer(emulator: &Emulator, case: &str, authorizer_name: &str) {
+    let created = emulator
+        .dispatch(
+            "POST",
+            &format!("/authorizer/{authorizer_name}"),
+            Some(&json!({
+                "authorizerFunctionArn":
+                    format!("arn:aws:lambda:{REGION}:{ACCOUNT_ID}:function:{authorizer_name}"),
+            })),
+        )
+        .await;
+    assert_eq!(
+        created.status,
+        200,
+        "case {case}: expected CreateAuthorizer to answer 200, got {} body {}",
+        created.status,
+        created.text()
+    );
+}
+
+/// Delete one custom authorizer through the account's own API.
+async fn delete_authorizer(emulator: &Emulator, case: &str, authorizer_name: &str) {
+    let deleted = emulator
+        .dispatch("DELETE", &format!("/authorizer/{authorizer_name}"), None)
+        .await;
+    assert_eq!(
+        deleted.status,
+        200,
+        "case {case}: expected DeleteAuthorizer to answer 200, got {} body {}",
+        deleted.status,
+        deleted.text()
+    );
+}
+
+/// Assert that `arn` is the ARN of the configuration `name` a CALLER created: the
+/// resource part NAMES the configuration and carries after it the short id the service
+/// mints for it, which is the form AWS reports a created configuration's ARN in.
+fn assert_created_arn(case: &str, name: &str, arn: &Value) {
+    let reported = arn
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: no domainConfigurationArn in {arn}"));
+    let prefix = format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:domainconfiguration/{name}/");
+    assert!(
+        reported.starts_with(&prefix),
+        "case {case}: expected an ARN under {prefix:?}, got {reported:?}"
+    );
+    let minted_id = &reported[prefix.len()..];
+    assert!(
+        !minted_id.is_empty() && minted_id.chars().all(|c| c.is_ascii_digit()),
+        "case {case}: expected the minted id after the name, got {reported:?}"
+    );
+}
+
 /// A dispatched response, reduced to what the assertions read.
 struct Reply {
     status: u16,
@@ -264,6 +406,12 @@ async fn a_created_domain_configuration_is_read_back_member_for_member() {
         .import_certificate("read back", &certificate_pem, &private_key_pem)
         .await;
     let trusted = trusted_validation_certificate(&emulator, "read back").await;
+    // WHERE this account's data plane answers, which is the domain a configuration for
+    // the AWS-managed domain configures.
+    let account_endpoint = emulator.account_data_endpoint().await;
+    // The authorization service one row names is one this account's own API created: a
+    // configuration may only name an authorizer the account holds.
+    create_authorizer(&emulator, "read back", "my-authorizer").await;
 
     // The rows span which optional members the request carries, and both kinds of
     // domain: one without a `domainName` (the AWS-managed domain, for which
@@ -319,14 +467,7 @@ async fn a_created_domain_configuration_is_read_back_member_for_member() {
             created.status,
             created.text()
         );
-        let expected_arn =
-            format!("arn:aws:iot:{REGION}:{ACCOUNT_ID}:domainconfiguration/{name}");
-        assert_eq!(
-            created.json()["domainConfigurationArn"],
-            json!(expected_arn),
-            "case {case}: expected the minted ARN, got {}",
-            created.text()
-        );
+        assert_created_arn(case, name, &created.json()["domainConfigurationArn"]);
 
         let read = emulator.describe_configuration(name).await;
         assert_eq!(
@@ -364,10 +505,16 @@ async fn a_created_domain_configuration_is_read_back_member_for_member() {
             json!(domain_type),
             "case {case}: expected a {domain_type} domain, got {described}"
         );
+        // A configuration naming a domain of its own carries that name; one for the
+        // AWS-managed domain configures the account's own data endpoint, so it carries
+        // the address `DescribeEndpoint` publishes that endpoint at.
         assert_eq!(
             described["domainName"],
-            body.get("domainName").cloned().unwrap_or(Value::Null),
-            "case {case}: the read must report the stored domain name, got {described}"
+            body.get("domainName")
+                .cloned()
+                .unwrap_or_else(|| json!(account_endpoint)),
+            "case {case}: the read must report the domain the configuration configures, got \
+             {described}"
         );
         let certificates = described["serverCertificates"]
             .as_array()
@@ -391,16 +538,32 @@ async fn a_created_domain_configuration_is_read_back_member_for_member() {
         }
         for member in [
             "authorizerConfig",
-            "tlsConfig",
             "serverCertificateConfig",
             "clientCertificateConfig",
-            "applicationProtocol",
-            "authenticationType",
         ] {
             assert_eq!(
                 described[member],
                 body.get(member).cloned().unwrap_or(Value::Null),
                 "case {case}: the read must report the stored {member}, got {described}"
+            );
+        }
+        // The settings an endpoint ALWAYS has are reported whether or not the request
+        // pinned them: `DEFAULT` is the `ApplicationProtocol` and the `AuthenticationType`
+        // of an endpoint pinned to neither ("Use a combination of port and Application
+        // Layer Protocol Negotiation (ALPN) to specify …"), and TLS is served under the
+        // service's default security policy.
+        for (member, effective) in [
+            ("applicationProtocol", json!("DEFAULT")),
+            ("authenticationType", json!("DEFAULT")),
+            (
+                "tlsConfig",
+                json!({ "securityPolicy": "IoTSecurityPolicy_TLS13_1_2_2022_10" }),
+            ),
+        ] {
+            assert_eq!(
+                described[member],
+                body.get(member).cloned().unwrap_or(effective.clone()),
+                "case {case}: expected {member} {effective}, got {described}"
             );
         }
         assert!(
@@ -428,8 +591,11 @@ async fn a_created_domain_configuration_is_read_back_member_for_member() {
         conflict.text()
     );
 
-    // The delete removes the configuration, after which a READ of the name is a 404:
-    // the reader has a record to report and there is none.
+    // The delete removes the configuration once it serves nobody, after which a READ of
+    // the name is a 404: the reader has a record to report and there is none.
+    emulator
+        .disable_configuration("the delete", "managed.config")
+        .await;
     assert_eq!(
         emulator.delete_configuration("managed.config").await.status,
         200,
@@ -828,11 +994,13 @@ async fn the_listing_reports_the_configurations_the_account_holds() {
         .as_array()
         .unwrap_or_else(|| panic!("no domainConfigurations in {}", listed.text()))
         .clone();
+    // Beside the four created here, the account holds the configurations the SERVICE
+    // manages for its own endpoints, which no caller created.
+    let expected_total = rows.len() + RESERVED.len();
     assert_eq!(
         summaries.len(),
-        rows.len(),
-        "case the whole listing: expected {} configurations, got {}",
-        rows.len(),
+        expected_total,
+        "case the whole listing: expected {expected_total} configurations, got {}",
         listed.text()
     );
     for summary in &summaries {
@@ -852,12 +1020,21 @@ async fn the_listing_reports_the_configurations_the_account_holds() {
     }
 
     // A listing filtered by service type reports the configurations of that type and no
-    // other.
-    for (service_type, expected) in [
+    // other — the reserved ones included, each under the type its endpoint delivers, and
+    // ahead of the account's own.
+    for (service_type, created) in [
         ("DATA", vec!["data-custom", "data-managed"]),
         ("JOBS", vec!["jobs-managed"]),
         ("CREDENTIAL_PROVIDER", vec!["credentials-managed"]),
     ] {
+        let mut expected: Vec<&str> = RESERVED
+            .iter()
+            .filter(|reserved| reserved.service_type == service_type)
+            .map(|reserved| reserved.name)
+            .collect();
+        let mut created = created;
+        created.sort_unstable();
+        expected.extend(created);
         let filtered = emulator
             .list_configurations(&format!("serviceType={service_type}"))
             .await;
@@ -908,7 +1085,7 @@ async fn the_listing_reports_the_configurations_the_account_holds() {
         }
         assert_eq!(
             seen.len(),
-            rows.len(),
+            expected_total,
             "case pageSize={page_size}: expected every configuration once, got {seen:?}"
         );
     }
@@ -1126,6 +1303,9 @@ async fn deleting_a_configuration_the_account_does_not_hold_succeeds() {
         200,
         "case the configuration to delete: expected 200"
     );
+    emulator
+        .disable_configuration("the configuration to delete", "gone.config")
+        .await;
     assert_eq!(
         emulator.delete_configuration("gone.config").await.status,
         200,
