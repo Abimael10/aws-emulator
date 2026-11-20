@@ -1604,15 +1604,24 @@ const INTERACTIVE_DEFAULTS: ApplicationDefaults = ApplicationDefaults {
     auto_scaling_enabled: false,
 };
 
-/// The defaults the service runs an application of this runtime and mode under.
+/// Whether an application of this runtime and mode is a Studio notebook rather than a
+/// Managed Service for Apache Flink application — the two kinds of application this API
+/// creates (`CreateApplication$ApplicationMode`: "Use the STREAMING mode to create a
+/// Managed Service for Apache Flink application. To create a Managed Service for Apache
+/// Flink Studio notebook, use the INTERACTIVE mode").
 ///
 /// What decides is the KIND of application rather than one spelled-out runtime value: the
 /// mode the application runs in, which for an application whose creator named none is the
 /// one its runtime implies ([`default_application_mode`]), so every Zeppelin runtime —
 /// present and future — is read as the notebook it is.
+fn is_studio_notebook(runtime_environment: &str, application_mode: &str) -> bool {
+    application_mode == APPLICATION_MODE_INTERACTIVE || is_notebook_runtime(runtime_environment)
+}
+
+/// The defaults the service runs an application of this runtime and mode under. WHICH
+/// defaults apply follows from the KIND of application ([`is_studio_notebook`]).
 fn defaults_for(runtime_environment: &str, application_mode: &str) -> ApplicationDefaults {
-    if application_mode == APPLICATION_MODE_INTERACTIVE || is_notebook_runtime(runtime_environment)
-    {
+    if is_studio_notebook(runtime_environment, application_mode) {
         INTERACTIVE_DEFAULTS
     } else {
         STREAMING_DEFAULTS
@@ -1659,12 +1668,16 @@ const DEFAULT_KEY_TYPE: &str = "AWS_OWNED_KEY";
 /// when the request said nothing about it.
 ///
 /// The rule: an application is always RUNNING under a full configuration, so every
-/// sub-configuration that applies to its runtime is described — with `ConfigurationType`
-/// `DEFAULT` and the documented default values where the request supplied none — and a
-/// sub-configuration the request marked `DEFAULT` is described with those same defaults
-/// whatever else it carried, which is what `ConfigurationType` `DEFAULT` MEANS. Only a
-/// `CUSTOM` sub-configuration reports the caller's values, and the members it left unset
-/// still report the defaults the service applies to them.
+/// sub-configuration the service APPLIES to this kind of application is described — with
+/// `ConfigurationType` `DEFAULT` and the documented default values where the request
+/// supplied none — and a sub-configuration the request marked `DEFAULT` is described with
+/// those same defaults whatever else it carried, which is what `ConfigurationType`
+/// `DEFAULT` MEANS. Only a `CUSTOM` sub-configuration reports the caller's values, and the
+/// members it left unset still report the defaults the service applies to them. A
+/// sub-configuration the service does NOT apply to this kind of application is described
+/// only when the application has one of its own, so a description reports the
+/// sub-configurations the application HAS rather than one entry per sub-configuration the
+/// model declares.
 ///
 /// WHICH defaults those are is the application's own: the two members that switch a
 /// Managed Service for Apache Flink feature on are defaulted per kind of application
@@ -1723,24 +1736,34 @@ fn complete_with_service_defaults(
     if snapshots.snapshot_mode.is_none() {
         snapshots.snapshot_mode = Some(DEFAULT_SNAPSHOT_MODE.to_string());
     }
-    if description
-        .application_system_rollback_configuration_description
-        .is_none()
-    {
-        description.application_system_rollback_configuration_description =
-            Some(ApplicationSystemRollbackConfigurationDescription {
-                rollback_enabled: DEFAULT_ROLLBACK_ENABLED,
-            });
-    }
-    if description
-        .application_encryption_configuration_description
-        .is_none()
-    {
-        description.application_encryption_configuration_description =
-            Some(ApplicationEncryptionConfigurationDescription {
-                key_id: None,
-                key_type: DEFAULT_KEY_TYPE.to_string(),
-            });
+    // The two application-level features left — rolling an application back on its own
+    // and encrypting it at rest — are features of a Managed Service for Apache Flink
+    // application (`ApplicationSystemRollbackConfiguration`: "Describes the system
+    // rollback configuration for a Managed Service for Apache Flink application"), so the
+    // service applies them, and therefore describes them, only for an application of that
+    // kind ([`is_studio_notebook`]). A Studio notebook is described with the
+    // sub-configurations it actually HAS: one its own configuration supplied is reported
+    // as given, and nothing is invented for one it never configured.
+    if !is_studio_notebook(runtime_environment, application_mode) {
+        if description
+            .application_system_rollback_configuration_description
+            .is_none()
+        {
+            description.application_system_rollback_configuration_description =
+                Some(ApplicationSystemRollbackConfigurationDescription {
+                    rollback_enabled: DEFAULT_ROLLBACK_ENABLED,
+                });
+        }
+        if description
+            .application_encryption_configuration_description
+            .is_none()
+        {
+            description.application_encryption_configuration_description =
+                Some(ApplicationEncryptionConfigurationDescription {
+                    key_id: None,
+                    key_type: DEFAULT_KEY_TYPE.to_string(),
+                });
+        }
     }
 }
 

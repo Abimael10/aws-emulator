@@ -20,22 +20,38 @@
 //! The rows span every `RuntimeEnvironment` the enum admits a create for, both ways the
 //! mode is decided (named by the request, implied by the runtime), and a configuration that
 //! switches each feature on explicitly.
+//!
+//! The same split decides WHICH sub-configurations a description carries at all: a
+//! description reports the sub-configurations the application HAS, not one entry per
+//! sub-configuration the model declares. The service completes a description with its own
+//! values for the sub-configurations it APPLIES to that kind of application, and one it does
+//! not apply to the kind is described only when the application's own create or update
+//! supplied it. System rollback and encryption at rest configure a Managed Service for
+//! Apache Flink application (`ApplicationSystemRollbackConfiguration`: "Describes the system
+//! rollback configuration for a Managed Service for Apache Flink application"), so a Studio
+//! notebook carries neither unless it was configured with one, while the sub-configurations
+//! every kind runs under are described for both kinds.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::ops::types::RUNTIME_ENVIRONMENT_VALUES;
 
-use super::harness::{call, create_body, creates_applications_on, describe, router};
+use super::harness::{
+    call, create_body, creates_applications_on, describe, router, CUSTOMER_KEY,
+};
 
 /// The `RuntimeEnvironment` family a Studio notebook runs on, as the enum spells it
 /// (`smithy_query(query="shape",shape="RuntimeEnvironment")`: `ZEPPELIN-FLINK-<major>_<minor>`).
 const NOTEBOOK_FAMILY: &str = "ZEPPELIN-";
 
-/// What the two switches must report for an application of `runtime` created with no
-/// configuration naming them: on for a Managed Service for Apache Flink application, off
-/// for a Studio notebook.
-fn features_run(runtime: &str) -> bool {
+/// Whether an application created on `runtime` is a Managed Service for Apache Flink
+/// application rather than a Studio notebook: the KIND of application, which decides both
+/// which defaults its switches run under and which sub-configurations its description
+/// carries at all. Read off the runtime here because a create's `ApplicationMode` has to be
+/// the one its runtime runs applications in — the other pairing is refused — so the Zeppelin
+/// family is exactly the interactive kind.
+fn is_flink_application(runtime: &str) -> bool {
     !runtime.starts_with(NOTEBOOK_FAMILY)
 }
 
@@ -150,7 +166,7 @@ async fn each_runtime_is_described_with_the_defaults_its_kind_of_application_run
     {
         let case = format!("{runtime} with no configuration at all");
         let name = format!("defaults-{}", runtime.to_lowercase());
-        let expected = features_run(runtime);
+        let expected = is_flink_application(runtime);
 
         let created = create_with(&router, &case, &name, runtime, None, None).await;
         assert_eq!(
@@ -406,7 +422,7 @@ async fn each_runtime_is_described_with_the_autoscaling_its_kind_of_application_
     {
         let case = format!("{runtime} with no parallelism configuration");
         let name = format!("autoscaling-{}", runtime.to_lowercase());
-        let expected = features_run(runtime);
+        let expected = is_flink_application(runtime);
 
         let created = create_with(&router, &case, &name, runtime, None, None).await;
         assert_eq!(
@@ -505,6 +521,279 @@ async fn a_request_that_names_autoscaling_is_reported_as_given() {
             auto_scaling_enabled(&described),
             Some(expected),
             "case {case:?}: expected the describe to report the stored value, got {described}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WHICH sub-configurations a description carries
+// ---------------------------------------------------------------------------
+
+/// The two description blocks whose PRESENCE is keyed on the kind of application, spelled as
+/// `ApplicationConfigurationDescription` declares them
+/// (`smithy_query(query="shape",shape="ApplicationConfigurationDescription")`).
+const ROLLBACK: &str = "ApplicationSystemRollbackConfigurationDescription";
+const ENCRYPTION: &str = "ApplicationEncryptionConfigurationDescription";
+
+/// The `ApplicationConfigurationDescription` of one `ApplicationDetail`.
+fn described_configuration(detail: &Value) -> Value {
+    detail["ApplicationConfigurationDescription"].clone()
+}
+
+/// One configuration form a create can carry: the whole `ApplicationConfiguration`, plus
+/// what it supplies for the two blocks whose presence is under test.
+struct PresenceCase {
+    form: &'static str,
+    /// The `ApplicationConfiguration` the create carries, or `None` for none at all.
+    configuration: Option<Value>,
+    /// The `ApplicationSystemRollbackConfiguration` the create supplied, if any.
+    rollback: Option<Value>,
+    /// The `ApplicationEncryptionConfiguration` the create supplied, if any.
+    encryption: Option<Value>,
+}
+
+/// The configuration forms every runtime is driven through: no `ApplicationConfiguration` at
+/// all, one carrying only sub-configurations other than the two under test, one carrying just
+/// one of them, and one carrying both — with both values `RollbackEnabled` takes and both
+/// `KeyType` values (`smithy_query(query="shape",shape="KeyType")`: AWS_OWNED_KEY |
+/// CUSTOMER_MANAGED_KEY), so what is asserted is which blocks the application HAS rather than
+/// one supplied value.
+fn presence_cases() -> Vec<PresenceCase> {
+    vec![
+        PresenceCase {
+            form: "no application configuration at all",
+            configuration: None,
+            rollback: None,
+            encryption: None,
+        },
+        PresenceCase {
+            form: "other sub-configurations only",
+            configuration: Some(json!({
+                "ApplicationSnapshotConfiguration": {"SnapshotsEnabled": true},
+                "FlinkApplicationConfiguration": {
+                    "MonitoringConfiguration": {
+                        "ConfigurationType": "CUSTOM",
+                        "LogLevel": "DEBUG",
+                        "MetricsLevel": "TASK"
+                    }
+                }
+            })),
+            rollback: None,
+            encryption: None,
+        },
+        PresenceCase {
+            form: "system rollback alone, turned off",
+            configuration: Some(json!({
+                "ApplicationSystemRollbackConfiguration": {"RollbackEnabled": false}
+            })),
+            rollback: Some(json!({"RollbackEnabled": false})),
+            encryption: None,
+        },
+        PresenceCase {
+            form: "encryption alone, under the AWS-owned key",
+            configuration: Some(json!({
+                "ApplicationEncryptionConfiguration": {"KeyType": "AWS_OWNED_KEY"}
+            })),
+            rollback: None,
+            encryption: Some(json!({"KeyType": "AWS_OWNED_KEY"})),
+        },
+        PresenceCase {
+            form: "both of them, rollback on and a key of the caller's",
+            configuration: Some(json!({
+                "ApplicationSystemRollbackConfiguration": {"RollbackEnabled": true},
+                "ApplicationEncryptionConfiguration": {
+                    "KeyType": "CUSTOMER_MANAGED_KEY",
+                    "KeyId": CUSTOMER_KEY
+                }
+            })),
+            rollback: Some(json!({"RollbackEnabled": true})),
+            encryption: Some(json!({
+                "KeyType": "CUSTOMER_MANAGED_KEY",
+                "KeyId": CUSTOMER_KEY
+            })),
+        },
+    ]
+}
+
+/// The system-rollback block an application of this kind must be described with when its
+/// configuration supplied `supplied`: the supplied one, else the service's own default for a
+/// Managed Service for Apache Flink application — it rolls one back only when asked — else
+/// nothing at all for a Studio notebook, which the service does not roll back.
+fn expected_rollback(is_flink_application: bool, supplied: Option<&Value>) -> Option<Value> {
+    supplied
+        .cloned()
+        .or_else(|| is_flink_application.then(|| json!({"RollbackEnabled": false})))
+}
+
+/// The encryption block an application of this kind must be described with when its
+/// configuration supplied `supplied`: the supplied one, else the AWS-owned key a Managed
+/// Service for Apache Flink application with no key of its own is encrypted under — reported
+/// with no `KeyId`, since the caller named none — else nothing at all for a Studio notebook.
+fn expected_encryption(is_flink_application: bool, supplied: Option<&Value>) -> Option<Value> {
+    supplied
+        .cloned()
+        .or_else(|| is_flink_application.then(|| json!({"KeyType": "AWS_OWNED_KEY"})))
+}
+
+/// A created application is described with the sub-configurations it HAS: the ones the
+/// service applies to its kind of application, plus the ones its own configuration supplied
+/// — and with no block it never had.
+#[tokio::test]
+async fn each_kind_describes_only_the_sub_configurations_it_has() {
+    let router = router();
+    for runtime in RUNTIME_ENVIRONMENT_VALUES
+        .iter()
+        .filter(|runtime| creates_applications_on(runtime))
+    {
+        let applies = is_flink_application(runtime);
+        for (index, supplied) in presence_cases().into_iter().enumerate() {
+            let case = format!("{runtime} created with {}", supplied.form);
+            let name = format!("blocks-{}-{index}", runtime.to_lowercase());
+            let created = create_with(
+                &router,
+                &case,
+                &name,
+                runtime,
+                None,
+                supplied.configuration.clone(),
+            )
+            .await;
+            let config = described_configuration(&created);
+
+            let rollback = expected_rollback(applies, supplied.rollback.as_ref());
+            assert_eq!(
+                config.get(ROLLBACK),
+                rollback.as_ref(),
+                "case {case:?}: expected {ROLLBACK} to be {rollback:?}, got {config}"
+            );
+            let encryption = expected_encryption(applies, supplied.encryption.as_ref());
+            assert_eq!(
+                config.get(ENCRYPTION),
+                encryption.as_ref(),
+                "case {case:?}: expected {ENCRYPTION} to be {encryption:?}, got {config}"
+            );
+
+            // The sub-configurations EVERY kind of application runs under are still
+            // described for both kinds, so the rule is about which blocks the application
+            // has and not about describing less for a notebook.
+            for always in [
+                "FlinkApplicationConfigurationDescription",
+                "ApplicationSnapshotConfigurationDescription",
+            ] {
+                assert!(
+                    config[always].is_object(),
+                    "case {case:?}: expected {always} to be described, got {config}"
+                );
+            }
+
+            // What a later reader sees is what was stored: a read neither invents a block
+            // nor drops one, however often it is called.
+            let described = described_configuration(&describe(&router, &name).await);
+            assert_eq!(
+                described, config,
+                "case {case:?}: expected the describe to repeat the created description, \
+                 got {described}"
+            );
+            let reread = described_configuration(&describe(&router, &name).await);
+            assert_eq!(
+                reread, described,
+                "case {case:?}: expected a second read to report the same description, \
+                 got {reread}"
+            );
+        }
+    }
+}
+
+/// A block an application did not have at create time and then CONFIGURED by an update is
+/// described from then on — on either kind of application — while one it still has not
+/// configured stays absent for a Studio notebook and keeps the service's own values for a
+/// Managed Service for Apache Flink application.
+#[tokio::test]
+async fn an_update_describes_the_block_it_configures_and_invents_no_other() {
+    let router = router();
+    for runtime in RUNTIME_ENVIRONMENT_VALUES
+        .iter()
+        .filter(|runtime| creates_applications_on(runtime))
+    {
+        let applies = is_flink_application(runtime);
+        let name = format!("configured-blocks-{}", runtime.to_lowercase());
+
+        // Nothing was configured, so a notebook has neither block and a Managed Service for
+        // Apache Flink application has both, at the service's own values.
+        let created = create_with(&router, runtime, &name, runtime, None, None).await;
+        let config = described_configuration(&created);
+        let unconfigured_rollback = expected_rollback(applies, None);
+        let unconfigured_encryption = expected_encryption(applies, None);
+        assert_eq!(
+            config.get(ROLLBACK),
+            unconfigured_rollback.as_ref(),
+            "case {runtime}/create: expected {ROLLBACK} to be {unconfigured_rollback:?}, \
+             got {config}"
+        );
+        assert_eq!(
+            config.get(ENCRYPTION),
+            unconfigured_encryption.as_ref(),
+            "case {runtime}/create: expected {ENCRYPTION} to be {unconfigured_encryption:?}, \
+             got {config}"
+        );
+
+        // An update that configures system rollback: the application HAS one from now on,
+        // so every later read describes it, whichever kind it is.
+        let (status, updated) = call(
+            &router,
+            "UpdateApplication",
+            &json!({
+                "ApplicationName": name,
+                "CurrentApplicationVersionId": 1,
+                "ApplicationConfigurationUpdate": {
+                    "ApplicationSystemRollbackConfigurationUpdate": {
+                        "RollbackEnabledUpdate": true
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {runtime}/update: expected UpdateApplication to be accepted, \
+             got {status} {updated}"
+        );
+        let config = described_configuration(&updated["ApplicationDetail"]);
+        assert_eq!(
+            config.get(ROLLBACK),
+            Some(&json!({"RollbackEnabled": true})),
+            "case {runtime}/update: expected the configured rollback to be described, \
+             got {config}"
+        );
+        assert_eq!(
+            config.get(ENCRYPTION),
+            unconfigured_encryption.as_ref(),
+            "case {runtime}/update: expected {ENCRYPTION} to be {unconfigured_encryption:?}, \
+             got {config}"
+        );
+
+        // An update about something else configures neither block: the rollback the
+        // application has keeps its value, and the block it still has not is not invented.
+        let updated = update_unrelated_configuration(&router, runtime, &name, 2).await;
+        let config = described_configuration(&updated);
+        assert_eq!(
+            config.get(ROLLBACK),
+            Some(&json!({"RollbackEnabled": true})),
+            "case {runtime}/unrelated update: expected the rollback the application has, \
+             got {config}"
+        );
+        assert_eq!(
+            config.get(ENCRYPTION),
+            unconfigured_encryption.as_ref(),
+            "case {runtime}/unrelated update: expected {ENCRYPTION} to be \
+             {unconfigured_encryption:?}, got {config}"
+        );
+
+        let described = described_configuration(&describe(&router, &name).await);
+        assert_eq!(
+            described, config,
+            "case {runtime}: expected the describe to repeat the updated description, \
+             got {described}"
         );
     }
 }

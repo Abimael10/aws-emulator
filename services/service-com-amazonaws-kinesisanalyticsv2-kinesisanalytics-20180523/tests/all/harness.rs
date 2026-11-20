@@ -19,6 +19,13 @@ use smithy_server_runtime::MultiServiceRouter;
 /// refusals name.
 pub(crate) const ACCOUNT: &str = "000000000000";
 
+/// A key of the caller's own to encrypt an application at rest under: a KMS key ARN, one of
+/// the forms `ApplicationEncryptionConfiguration$KeyId` takes ("The key ARN, key ID, alias
+/// ARN, or alias name of the KMS key used for encryption at rest"). Shared plumbing, so no
+/// two suites that configure a customer-managed key can drift on the form one takes.
+pub(crate) const CUSTOMER_KEY: &str =
+    "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555";
+
 /// Longer than the span the service gives a clock-owed status transition, so a read after
 /// this wait must see the settled status.
 pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(1_200);

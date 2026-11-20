@@ -29,7 +29,7 @@ use service_com_amazonaws_kinesisanalyticsv2_kinesisanalytics_20180523::state;
 
 use super::harness::{
     call, create, create_body, creates_applications_on, describe, error_code, error_message,
-    router, router_on,
+    router, router_on, runtime_mode, CUSTOMER_KEY,
 };
 
 // ---------------------------------------------------------------------------
@@ -692,18 +692,38 @@ async fn a_created_application_reports_the_configuration_it_runs_under() {
             Some(snapshots_enabled),
             "case {case:?}: expected the snapshot setting the application runs under, got {config}"
         );
-        assert_eq!(
-            config["ApplicationSystemRollbackConfigurationDescription"]["RollbackEnabled"]
-                .as_bool(),
-            Some(false),
-            "case {case:?}: the service rolls an application back only when asked, got {config}"
-        );
-        assert_eq!(
-            config["ApplicationEncryptionConfigurationDescription"]["KeyType"].as_str(),
-            Some("AWS_OWNED_KEY"),
-            "case {case:?}: an application with no customer key is encrypted under the \
-             AWS-owned one, got {config}"
-        );
+        // System rollback and encryption at rest are features of a Managed Service for
+        // Apache Flink application, so they are described for one of those and not for a
+        // Studio notebook, whose description carries only the sub-configurations it has
+        // (`runtime_configuration_defaults.rs` drives that rule over the kinds).
+        if mode.unwrap_or_else(|| runtime_mode(runtime)) == "INTERACTIVE" {
+            assert_eq!(
+                config.get("ApplicationSystemRollbackConfigurationDescription"),
+                None,
+                "case {case:?}: a notebook describes no system rollback it never had, \
+                 got {config}"
+            );
+            assert_eq!(
+                config.get("ApplicationEncryptionConfigurationDescription"),
+                None,
+                "case {case:?}: a notebook describes no encryption configuration it never \
+                 had, got {config}"
+            );
+        } else {
+            assert_eq!(
+                config["ApplicationSystemRollbackConfigurationDescription"]["RollbackEnabled"]
+                    .as_bool(),
+                Some(false),
+                "case {case:?}: the service rolls an application back only when asked, \
+                 got {config}"
+            );
+            assert_eq!(
+                config["ApplicationEncryptionConfigurationDescription"]["KeyType"].as_str(),
+                Some("AWS_OWNED_KEY"),
+                "case {case:?}: an application with no customer key is encrypted under the \
+                 AWS-owned one, got {config}"
+            );
+        }
     }
 }
 
@@ -717,7 +737,7 @@ async fn a_supplied_encryption_configuration_is_reported_as_given() {
     body["ApplicationConfiguration"] = json!({
         "ApplicationEncryptionConfiguration": {
             "KeyType": "CUSTOMER_MANAGED_KEY",
-            "KeyId": "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555"
+            "KeyId": CUSTOMER_KEY
         }
     });
     let (status, created) = call(&router, "CreateApplication", &body).await;
