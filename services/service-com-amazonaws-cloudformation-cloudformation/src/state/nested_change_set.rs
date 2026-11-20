@@ -543,7 +543,6 @@ fn record(
         // A nested change set is planned from the child template this request already read,
         // so there is no macro left for its creation to perform.
         pending_macros: None,
-        plan_discarded: false,
         changes,
         // Nothing here can activate a Hook, for the reason the parent change set plans none
         // ([`super::change_set_hooks`]).

@@ -24,15 +24,18 @@
 //!    request carrying both forms, neither, or half of the name form identifies no extension
 //!    and is refused with the registry's modelled `CFNRegistryException` (400). This is read
 //!    BEFORE anything is resolved, because it is a property of the request alone.
-//! 2. The VERSION an `Arn` OF THIS ACCOUNT pins past the extension it addresses: what a
-//!    publication publishes is the extension's default version, never a version the request
-//!    picked, so such an `Arn` is refused with the modelled 400 carrying
-//!    [`ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED`]. CloudFormation parses an ARN of the caller's
-//!    own account itself ([`crate::state::registry::arn_names_this_account`]), so this is read
-//!    from the ARN alone, before the caller is judged and before the registry is consulted; an
-//!    ARN whose account segment is
-//!    another account's addresses nothing of this account and is left to the account-scoped
-//!    refusal below, which is the only answer it can reach.
+//! 2. WHAT AN `Arn` ADDRESSES, read from the ARN alone — CloudFormation parses an
+//!    account-scoped registry ARN itself ([`crate::state::registry::arn_names_this_account`]),
+//!    so both of these are decided before the caller is judged and before the registry is
+//!    consulted, exactly like the request's own shape above:
+//!    * the ACCOUNT its fifth segment names, since a publication publishes an extension of the
+//!      CALLER'S account: an `Arn` carrying another account's id addresses no extension that
+//!      could be found in this one, so it is refused with the modelled 400 carrying
+//!      [`NOT_FOUND_IN_YOUR_ACCOUNT`];
+//!    * and, for an `Arn` of this account, the VERSION it pins past the extension it
+//!      addresses: what a publication publishes is the extension's default version, never a
+//!      version the request picked, so such an `Arn` is refused with the modelled 400 carrying
+//!      [`ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED`].
 //! 3. The CALLER: "to publish an extension, you must be
 //!    registered as a publisher with CloudFormation" ([`crate::state::publisher`], which
 //!    `RegisterPublisher` writes), and the publisher id that registration carries is the one
@@ -224,22 +227,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `IN_PROGRESS`.
         store.settle(now);
 
-        // The version an `Arn` of THIS account pins, read from the ARN alone: an ARN carrying
-        // the caller's own account id is one CloudFormation parses itself, and its resource
-        // portion addresses the extension — `type/<kind>/<Type-Name>` — so a further segment
-        // pins a version, and what a publication publishes is the extension's default
-        // version. An ARN of ANOTHER account addresses nothing of this account, so it is not
-        // read this far: it can only ever reach the account-scoped existence refusal below.
+        // What an `Arn` ADDRESSES, read from the ARN alone: a registry ARN of the caller's own
+        // account is one CloudFormation parses itself
+        // ([`crate::state::registry::arn_names_this_account`]), and an `Arn` whose account
+        // segment is ANOTHER account's addresses no extension of this account at all — nothing
+        // it names could be found "in your account", whoever the caller is and whatever this
+        // account's registry holds — so that is the refusal it reaches, before the caller is
+        // judged and before the registry is consulted.
+        if let Identifier::Arn { extension, .. } = identifier {
+            if !crate::state::registry::arn_names_this_account(extension) {
+                return Err(registry_exception(NOT_FOUND_IN_YOUR_ACCOUNT.to_string()));
+            }
+        }
+        // ...and for an `Arn` of this account, the VERSION it pins: its resource portion
+        // addresses the extension — `type/<kind>/<Type-Name>` — so a further segment pins a
+        // version, and what a publication publishes is the extension's default version.
         if let Identifier::Arn {
-            extension,
             version_id: Some(_),
+            ..
         } = identifier
         {
-            if crate::state::registry::arn_names_this_account(extension) {
-                return Err(registry_exception(
-                    ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED.to_string(),
-                ));
-            }
+            return Err(registry_exception(
+                ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED.to_string(),
+            ));
         }
 
         // The CALLER, judged before the registry is consulted: "to publish an extension, you

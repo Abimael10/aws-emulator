@@ -1576,16 +1576,6 @@ pub const MAX_CHANGE_SETS_PER_STACK: usize = 20;
 /// like every count here, and far above any client workflow.
 pub const MAX_CHANGE_SETS: usize = 2_000;
 
-/// The most DISCARDED change sets this service keeps.
-///
-/// Deleting a change set that has been executed discards its plan and keeps the record of
-/// that execution ([`StoredChangeSet::plan_discarded`]), so that record outlives the call
-/// that discarded it. The count of them is bounded here — oldest reclaimed first
-/// ([`ComAmazonawsCloudformationCloudformationState::reclaim_discarded_change_sets`]) — so a
-/// caller repeating create, execute and delete cannot fill the store with records nothing
-/// reads any more. Chosen, like every count here, and far above any client workflow.
-pub const MAX_DISCARDED_CHANGE_SETS_RETAINED: usize = 200;
-
 /// A resolved stack parameter: the key and the value in force on the stack.
 ///
 /// `Parameter$UsePreviousValue` is a request-time instruction, not stored state — it is
@@ -3190,37 +3180,6 @@ impl ComAmazonawsCloudformationCloudformationState {
             .collect();
         self.change_sets
             .retain(|change_set| live.contains(change_set.stack_id.as_str()));
-        self.reclaim_discarded_change_sets();
-    }
-
-    /// Drop the oldest DISCARDED change sets past
-    /// [`MAX_DISCARDED_CHANGE_SETS_RETAINED`].
-    ///
-    /// Retention, not a mutation a caller asked for: a discarded plan is over the bound the
-    /// moment the delete that pushed the count past it was answered, whether or not anybody
-    /// called. All that is left of such a record is the execution it carries
-    /// ([`StoredChangeSet::plan_discarded`]), so this is what keeps a caller that creates,
-    /// executes and discards change sets in a loop from filling the store with them. Plans
-    /// nothing discarded are never touched.
-    fn reclaim_discarded_change_sets(&mut self) {
-        let discarded = self
-            .change_sets
-            .iter()
-            .filter(|change_set| change_set.plan_discarded)
-            .count();
-        if discarded <= MAX_DISCARDED_CHANGE_SETS_RETAINED {
-            return;
-        }
-        let mut over = discarded - MAX_DISCARDED_CHANGE_SETS_RETAINED;
-        // `change_sets` is in creation order, so the oldest discarded records are the ones
-        // this walk reaches first.
-        self.change_sets.retain(|change_set| {
-            if over > 0 && change_set.plan_discarded {
-                over -= 1;
-                return false;
-            }
-            true
-        });
     }
 
     /// The change sets of one stack, in creation order: what `ListChangeSets` reports and
@@ -3231,7 +3190,7 @@ impl ComAmazonawsCloudformationCloudformationState {
     ) -> impl Iterator<Item = &'a StoredChangeSet> {
         self.change_sets
             .iter()
-            .filter(move |change_set| change_set.stack_id == stack_id && !change_set.plan_discarded)
+            .filter(move |change_set| change_set.stack_id == stack_id)
     }
 
     /// Resolve the `ChangeSetName` input member, which CloudFormation accepts as either a
@@ -3262,61 +3221,22 @@ impl ComAmazonawsCloudformationCloudformationState {
             .map(|index| &mut self.change_sets[index])
     }
 
-    /// [`Self::resolve_change_set`] for `ExecuteChangeSet`, which also addresses a change
-    /// set whose PLAN has been discarded.
+    /// [`Self::change_set_position`] among the change sets this store holds.
     ///
-    /// Deleting a change set whose execution had already been carried out discards the plan
-    /// a read reports, but the execution it performed stays the stack's history
-    /// ([`StoredChangeSet::plan_discarded`]): a call asking for that change set to be
-    /// executed again is therefore refused on the execution status it is in, where a read of
-    /// the discarded plan answers the modelled not-found.
-    ///
-    /// A LIVE change set always wins: the name of a discarded plan is free again — nothing
-    /// lists or reads it — so a caller may create another change set under it, and that new
-    /// plan is the one this call is about. The discarded record answers only where no plan of
-    /// that name is there to execute.
-    pub fn resolve_executed_change_set(
-        &self,
-        region: &str,
-        name_or_id: &str,
-        stack_name_or_id: Option<&str>,
-    ) -> Option<&StoredChangeSet> {
-        self.change_set_position_among(region, name_or_id, stack_name_or_id, false)
-            .or_else(|| {
-                self.change_set_position_among(region, name_or_id, stack_name_or_id, true)
-            })
-            .map(|index| &self.change_sets[index])
-    }
-
+    /// The LAST matching record answers, so where one name has been used again the most
+    /// recent change set under it is the one addressed.
     fn change_set_position(
         &self,
         region: &str,
         name_or_id: &str,
         stack_name_or_id: Option<&str>,
     ) -> Option<usize> {
-        self.change_set_position_among(region, name_or_id, stack_name_or_id, false)
-    }
-
-    /// [`Self::change_set_position`] among the records whose plan is there (`discarded` =
-    /// `false`) or among the records whose plan was discarded (`discarded` = `true`), which
-    /// only [`Self::resolve_executed_change_set`] asks for.
-    ///
-    /// The LAST matching record answers, so where one name has been used again the most
-    /// recent change set under it is the one addressed.
-    fn change_set_position_among(
-        &self,
-        region: &str,
-        name_or_id: &str,
-        stack_name_or_id: Option<&str>,
-        discarded: bool,
-    ) -> Option<usize> {
-        let wanted = |change_set: &StoredChangeSet| change_set.plan_discarded == discarded;
         // The change set's own ARN identifies it; a stack named beside it must be the
         // stack it belongs to, or the pair names nothing.
         if let Some(index) = self
             .change_sets
             .iter()
-            .rposition(|change_set| change_set.change_set_id == name_or_id && wanted(change_set))
+            .rposition(|change_set| change_set.change_set_id == name_or_id)
         {
             let change_set = &self.change_sets[index];
             // The change set is this Region's only where the stack it plans changes for
@@ -3332,9 +3252,7 @@ impl ComAmazonawsCloudformationCloudformationState {
         let stack_name_or_id = stack_name_or_id?;
         let stack_id = self.resolve(region, stack_name_or_id)?.stack_id.clone();
         self.change_sets.iter().rposition(|change_set| {
-            change_set.stack_id == stack_id
-                && change_set.change_set_name == name_or_id
-                && wanted(change_set)
+            change_set.stack_id == stack_id && change_set.change_set_name == name_or_id
         })
     }
 

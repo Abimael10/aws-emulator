@@ -1571,8 +1571,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             // The macros this creation still owes, which its answer settles it on.
             pending_macros: pending_macros.clone(),
-            // Nothing has executed this plan, so there is nothing of it to discard yet.
-            plan_discarded: false,
             changes,
             // The Hook invocations CloudFormation would plan while creating this change
             // set: none, because nothing here can activate a Hook or configure one to

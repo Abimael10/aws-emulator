@@ -11,8 +11,8 @@
 //! `CFNRegistryException` (400) carrying the fixed version-in-Arn sentence whatever the
 //! extension, its kind, its Region, the version's spelling, the caller's publisher
 //! registration or a `PublicVersionNumber` beside it; an `Arn` whose account segment is
-//! ANOTHER account's addresses nothing of this account, so it is never read that far and
-//! reaches only the gate on the CALLER and, past it, the account-scoped existence refusal —
+//! ANOTHER account's addresses nothing of this account at all, so it is never read that far
+//! and is refused — from the account segment alone, ahead of the gate on the CALLER — with
 //! that same modelled 400 carrying the
 //! fixed not-found-in-your-account sentence.**
 //!
@@ -23,9 +23,10 @@
 //! and three spellings of a version id the modelled `TypeVersionId`
 //! (`smithy_query(query="shape", shape="TypeVersionId")`: `@length(1..128)`, `@pattern
 //! "^[A-Za-z0-9-]+$"`) admits. Each row is run with and without a registered publisher and
-//! with and without a `PublicVersionNumber`: the version-in-Arn rows answer the same sentence
-//! across all four passes, because the ARN is read before the caller is, while the rows the
-//! ARN's own segments do not decide wait behind the publisher gate
+//! with and without a `PublicVersionNumber`: the rows the ARN's own segments settle answer the
+//! same sentence across all four passes, because the ARN is read before the caller is, while
+//! the one row those segments do not settle — an in-account ARN naming no version — waits
+//! behind the publisher gate
 //! (`publish_type_publisher_preflight.rs` is the table for that rule).
 //! The recorded trace this suite was written for is ONE row: a version ARN of THIS account
 //! naming an extension no registry holds, from an account that is not a publisher.
@@ -145,11 +146,14 @@ fn assert_registry_refusal(case: &str, status_code: u16, body: &str, message: &s
     );
 }
 
-/// One row: the `Arn` the request carries, and the sentence the refusal must word.
+/// One row: the `Arn` the request carries, the sentence the refusal must word, and whether
+/// that sentence is read from the ARN's own segments — ahead of the gate on the caller, so the
+/// row answers it whether or not the account is a publisher.
 struct ArnCase {
     case: String,
     arn: String,
     expected: &'static str,
+    read_from_the_arn: bool,
 }
 
 /// The ARNs of the seeded private records, and the names no registry holds, over every
@@ -181,31 +185,38 @@ fn arn_cases() -> Vec<ArnCase> {
                 case: format!("{what}, by an ARN of this account pinning version {version_id:?}"),
                 arn: type_version_arn(&own, version_id),
                 expected: ONLY_DEFAULT_VERSION,
+                read_from_the_arn: true,
             });
         }
         for account in OTHER_ACCOUNTS {
             let foreign = other_account_type_arn(account, region, type_kind, type_name);
             // The same ARN FORMS in another account: nothing of this account is addressed, so
-            // the version segment is never read and the existence refusal is the only answer.
+            // the version segment is never read and the existence refusal is the only answer —
+            // decided by the account segment, which is read from the ARN just as the version
+            // segment is.
             cases.push(ArnCase {
                 case: format!("{what}, by an ARN of account {account}"),
                 arn: foreign.clone(),
                 expected: NOT_FOUND_IN_YOUR_ACCOUNT,
+                read_from_the_arn: true,
             });
             cases.push(ArnCase {
                 case: format!("{what}, by an ARN of account {account} pinning a version"),
                 arn: type_version_arn(&foreign, VERSION_IDS[0]),
                 expected: NOT_FOUND_IN_YOUR_ACCOUNT,
+                read_from_the_arn: true,
             });
         }
     }
     // An ARN of THIS account carrying NO version segment, for an extension no registry holds:
-    // the version rule has nothing to read, so what the call runs into is existence.
+    // the version rule has nothing to read, so what the call runs into is the caller gate and,
+    // past it, existence.
     cases.push(ArnCase {
         case: "an extension no registry holds, by an ARN of this account naming no version"
             .to_string(),
         arn: type_arn(REGION, registry_type::RESOURCE, "No::Such::Resource"),
         expected: NOT_FOUND_IN_YOUR_ACCOUNT,
+        read_from_the_arn: false,
     });
     cases
 }
@@ -220,9 +231,9 @@ async fn which_refusal_an_arn_reaches_is_decided_by_its_account_and_version_segm
 
     // Four passes over the same rows: before this account is a publisher and after it is, each
     // with and without a version number beside the ARN. The version number is not what any of
-    // these refusals is about, and the registration is not what a version ARN of this account
-    // is refused for — while a row the ARN's segments do not settle is answered the caller
-    // refusal until the account holds one.
+    // these refusals is about, and the registration is not what an ARN the segments settle is
+    // refused for — while a row those segments do not settle is answered the caller refusal
+    // until the account holds one.
     for registered_publisher in [false, true] {
         if registered_publisher {
             register_publisher(&router).await;
@@ -235,7 +246,7 @@ async fn which_refusal_an_arn_reaches_is_decided_by_its_account_and_version_segm
                     "{} (publisher registered: {registered_publisher}, extra members: {extra:?})",
                     row.case
                 );
-                let expected = if registered_publisher || row.expected == ONLY_DEFAULT_VERSION {
+                let expected = if registered_publisher || row.read_from_the_arn {
                     row.expected.to_string()
                 } else {
                     not_a_verified_publisher()

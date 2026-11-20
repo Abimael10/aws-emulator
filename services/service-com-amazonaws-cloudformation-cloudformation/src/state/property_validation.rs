@@ -172,12 +172,15 @@ impl ConstrainedProperty {
 /// allowed values, and the API member that property is passed to
 /// ([`super::provisioner`] is where each type's mapping onto that member lives).
 pub const CONSTRAINED_PROPERTIES: &[ConstrainedProperty] = &[
-    // `AWS::SSM::Parameter`'s `Type` is `PutParameter$Type`, "the type of parameter",
-    // whose published values are the parameter types Systems Manager holds.
+    // `AWS::SSM::Parameter`'s `Type` is `PutParameter$Type`, "the type of parameter", whose
+    // published values are the two a TEMPLATE may ask for: "Allowed values: String |
+    // StringList", and "CloudFormation doesn't support creating a SecureString parameter
+    // type" — so the encrypted type Systems Manager's own API admits is not one this resource
+    // type publishes, however a parameter of it is held in Parameter Store itself.
     ConstrainedProperty {
         resource_type: "AWS::SSM::Parameter",
         property: "Type",
-        admitted: &["String", "StringList", "SecureString"],
+        admitted: &["String", "StringList"],
     },
     // ...and its `Tier` is `PutParameter$Tier`, "the parameter tier to assign to a
     // parameter".
@@ -633,6 +636,15 @@ mod tests {
                 true,
             ),
             (
+                // The encrypted parameter type Systems Manager's own API admits, which this
+                // resource type does not publish.
+                "a parameter type the owning API has but the type does not publish",
+                "AWS::SSM::Parameter",
+                "Type",
+                ::serde_json::json!({"Type": "SecureString", "Value": "x"}),
+                false,
+            ),
+            (
                 "a tier outside the published set",
                 "AWS::SSM::Parameter",
                 "Tier",
@@ -824,9 +836,7 @@ mod tests {
         let failed = failure(&resources);
         assert_eq!(
             failed.as_ref().map(|failure| failure.reason.as_str()),
-            Some(
-                failure_reason("First", "Type", &["String", "StringList", "SecureString"]).as_str()
-            ),
+            Some(failure_reason("First", "Type", &["String", "StringList"]).as_str()),
             "case \"two failing resources\": expected the first one's reason, got {failed:?}"
         );
     }

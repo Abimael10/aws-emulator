@@ -301,7 +301,15 @@ async fn an_arn_that_names_a_version_of_a_registered_extension_is_refused() {
 /// A version segment past the extension an ARN of THIS account addresses is read from the ARN
 /// before existence is, so an in-account version ARN belongs to the version-in-Arn table
 /// (`publish_type_version_in_arn.rs`) rather than here.
-fn identifiers_registered_in_no_account() -> Vec<(&'static str, Vec<(&'static str, String)>)> {
+/// One row of the not-registered table: what the request identifies, and whether the ARN's
+/// own account segment settles the answer ahead of the gate on the caller.
+struct UnregisteredIdentifier {
+    case: &'static str,
+    members: Vec<(&'static str, String)>,
+    read_from_the_arn: bool,
+}
+
+fn identifiers_registered_in_no_account() -> Vec<UnregisteredIdentifier> {
     let unheld_arn = type_arn(REGION, registry_type::RESOURCE, "No::Such::Resource");
     let other_region_arn = type_arn(
         OTHER_REGION,
@@ -312,45 +320,53 @@ fn identifiers_registered_in_no_account() -> Vec<(&'static str, Vec<(&'static st
         "arn:aws:cloudformation:{REGION}:123456789012:type/resource/Another-Account-Resource"
     );
     vec![
-        (
-            "a name no registry holds",
-            vec![
+        UnregisteredIdentifier {
+            case: "a name no registry holds",
+            members: vec![
                 ("Type", registry_type::RESOURCE.to_string()),
                 ("TypeName", "No::Such::Resource".to_string()),
             ],
-        ),
-        (
-            "the ARN of an extension no registry holds",
-            vec![("Arn", unheld_arn.clone())],
-        ),
-        (
-            // An ARN of ANOTHER account: nothing of this account is addressed, so existence
-            // in this account is all the call can be answered about.
-            "the ARN of an extension of another account",
-            vec![("Arn", other_account_arn.clone())],
-        ),
-        (
-            "a version ARN of an extension of another account",
-            vec![("Arn", type_version_arn(&other_account_arn, "00000001"))],
-        ),
-        (
-            "a name this Region's registry holds under another kind",
-            vec![
+            read_from_the_arn: false,
+        },
+        UnregisteredIdentifier {
+            case: "the ARN of an extension no registry holds",
+            members: vec![("Arn", unheld_arn.clone())],
+            read_from_the_arn: false,
+        },
+        UnregisteredIdentifier {
+            // An ARN of ANOTHER account: nothing of this account is addressed, which is read
+            // from the ARN's own account segment — before the caller is judged, so existence in
+            // this account is all the call can be answered about either way.
+            case: "the ARN of an extension of another account",
+            members: vec![("Arn", other_account_arn.clone())],
+            read_from_the_arn: true,
+        },
+        UnregisteredIdentifier {
+            case: "a version ARN of an extension of another account",
+            members: vec![("Arn", type_version_arn(&other_account_arn, "00000001"))],
+            read_from_the_arn: true,
+        },
+        UnregisteredIdentifier {
+            case: "a name this Region's registry holds under another kind",
+            members: vec![
                 ("Type", registry_type::HOOK.to_string()),
                 ("TypeName", "My::Sample::Resource".to_string()),
             ],
-        ),
-        (
-            "a record another Region's registry holds, by name",
-            vec![
+            read_from_the_arn: false,
+        },
+        UnregisteredIdentifier {
+            case: "a record another Region's registry holds, by name",
+            members: vec![
                 ("Type", registry_type::RESOURCE.to_string()),
                 ("TypeName", "Other::Region::Resource".to_string()),
             ],
-        ),
-        (
-            "a record another Region's registry holds, by ARN",
-            vec![("Arn", other_region_arn.clone())],
-        ),
+            read_from_the_arn: false,
+        },
+        UnregisteredIdentifier {
+            case: "a record another Region's registry holds, by ARN",
+            members: vec![("Arn", other_region_arn.clone())],
+            read_from_the_arn: false,
+        },
     ]
 }
 
@@ -358,7 +374,9 @@ fn identifiers_registered_in_no_account() -> Vec<(&'static str, Vec<(&'static st
 /// the caller may publish at all: an identifier that resolves nothing is refused the
 /// not-registered sentence whatever else the request carries — a version number beside it is
 /// read against a record that resolved — while an account that is not a publisher is answered
-/// the caller refusal instead, since the registry is not consulted for it at all.
+/// the caller refusal instead, since the registry is not consulted for it at all. The one
+/// exception is an identifier whose own ARN settles it: an `Arn` of ANOTHER account addresses
+/// nothing of this one, which is read from the ARN's account segment ahead of the caller gate.
 #[tokio::test]
 async fn an_identifier_registered_in_no_account_is_refused_first() {
     let (router, engine) = router_with_registry();
@@ -373,14 +391,16 @@ async fn an_identifier_registered_in_no_account_is_refused_first() {
         if registered_publisher {
             register_publisher(&router).await;
         }
-        for (case, identifier) in identifiers_registered_in_no_account() {
+        for row in identifiers_registered_in_no_account() {
             for extra in [vec![], vec![("PublicVersionNumber", "1.0.0")]] {
-                let mut members: Vec<(&str, &str)> = identifier
+                let case = row.case;
+                let mut members: Vec<(&str, &str)> = row
+                    .members
                     .iter()
                     .map(|(key, value)| (*key, value.as_str()))
                     .collect();
                 members.extend_from_slice(&extra);
-                let expected = if registered_publisher {
+                let expected = if registered_publisher || row.read_from_the_arn {
                     NOT_FOUND_IN_YOUR_ACCOUNT.to_string()
                 } else {
                     not_a_verified_publisher()

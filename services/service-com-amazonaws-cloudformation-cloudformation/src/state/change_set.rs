@@ -110,18 +110,6 @@ pub struct StoredChangeSet {
     /// settled by the answer rather than by a clock ([`private_macro::conclude`]) — bar the
     /// deadline below, which settles one whose macro never answers at all.
     pub pending_macros: Option<private_macro::PendingMacros>,
-    /// Whether `DeleteChangeSet` has DISCARDED this change set's plan after its execution
-    /// had already been carried out.
-    ///
-    /// Deleting a change set discards a plan. A change set that has been EXECUTED is no
-    /// longer only a plan: the stack took the change, so the record of that execution
-    /// survives the delete even though the plan it described does not. A discarded change
-    /// set is addressable by nothing but the refusal that tells a caller asking for it to be
-    /// executed again that it has already run
-    /// ([`ComAmazonawsCloudformationCloudformationState::resolve_executed_change_set`]);
-    /// every read answers the modelled not-found for it, and it is listed for its stack no
-    /// more.
-    pub plan_discarded: bool,
     pub changes: Vec<StoredResourceChange>,
     /// The Hook invocations planned for this change set, in the order they were planned,
     /// so `DescribeChangeSetHooks` pages over them deterministically (see
@@ -266,10 +254,22 @@ impl StoredChangeSet {
         )
     }
 
-    /// Whether this change set's execution is IN FLIGHT: the stack operation it started is
-    /// still being carried out, so its plan is being applied right now.
-    pub fn execution_in_flight(&self) -> bool {
-        self.execution_status == execution_status::EXECUTE_IN_PROGRESS
+    /// Whether this change set's `ExecutionStatus` still leaves a PLAN for `DeleteChangeSet`
+    /// to discard.
+    ///
+    /// Deleting a change set discards a plan, so what may be discarded is a change set that
+    /// still is one: `UNAVAILABLE`, which is the status of a plan CloudFormation has not
+    /// finished computing, and `AVAILABLE`, the plan nothing has acted on. Every other
+    /// `ExecutionStatus` the model declares says something has already happened to the plan —
+    /// CloudFormation is applying it, it has been applied (however that application ended), or
+    /// another execution superseded it — and a change set in one of those is a record of what
+    /// became of a plan rather than a plan, which is why the delete is refused on that very
+    /// status ([`cannot_delete_change_set`]) and the record stays exactly where it was.
+    pub fn plan_is_discardable(&self) -> bool {
+        matches!(
+            self.execution_status.as_str(),
+            execution_status::UNAVAILABLE | execution_status::AVAILABLE
+        )
     }
 
     /// The `InvalidChangeSetStatusException` message `ExecuteChangeSet` answers for this

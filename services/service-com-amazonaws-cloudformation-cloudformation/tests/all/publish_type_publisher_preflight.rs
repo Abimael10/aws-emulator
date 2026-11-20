@@ -10,9 +10,9 @@
 //! account id the request was signed under — BEFORE the registry is consulted: the refusal is
 //! the same whatever the request identifies and whether or not a record answers to it, no
 //! registration is written, and nothing about this account's registry reaches a caller the gate
-//! is shut for. The one thing read ahead of the gate is the request's own shape — which
-//! extension it identifies, and the VERSION an `Arn` of this account pins past that extension,
-//! both properties of the request alone.**
+//! is shut for. What is read ahead of the gate is the request's own shape — which extension it
+//! identifies, the ACCOUNT an `Arn` names and, for an `Arn` of this account, the VERSION it
+//! pins past that extension, all properties of the request alone.**
 //!
 //! The table spans what the rule generalises over: every way a request identifies an extension
 //! (`Type` and `TypeName`, the extension's own ARN, an ARN pinning a version, an ARN of
@@ -74,8 +74,8 @@ struct Row {
     /// The members identifying the extension, which both passes of the row carry.
     members: Vec<(&'static str, String)>,
     /// The refusal the request's own SHAPE reaches ahead of the gate, where it has one: an
-    /// `Arn` of this account pinning a version is refused from the ARN alone, so the caller's
-    /// registration never comes into it.
+    /// `Arn` of this account pinning a version, and an `Arn` naming another account, are both
+    /// refused from the ARN alone, so the caller's registration never comes into it.
     read_before_the_gate: Option<&'static str>,
     /// The kind and name of the extension a published row writes a public record for.
     published: Option<(&'static str, &'static str)>,
@@ -173,23 +173,26 @@ fn rows() -> Vec<Row> {
             served: Served::Refused(NOT_FOUND_IN_YOUR_ACCOUNT.to_string()),
         },
         Row {
+            // The ARN's own account segment is what this one is refused for, ahead of the gate:
+            // a publication publishes an extension of the CALLER'S account, and this ARN names
+            // another account's.
             case: "an ARN of ANOTHER account",
             members: arn_form(format!(
                 "arn:aws:cloudformation:{REGION}:123456789012:type/resource/My-Sample-Resource"
             )),
-            read_before_the_gate: None,
+            read_before_the_gate: Some(NOT_FOUND_IN_YOUR_ACCOUNT),
             published: None,
             served: Served::Refused(NOT_FOUND_IN_YOUR_ACCOUNT.to_string()),
         },
         Row {
             // An ARN of another account addresses nothing of this one, so its version segment
-            // is never read: the gate is what it reaches instead.
+            // is never read: the account segment settles it, ahead of the gate.
             case: "a version ARN of ANOTHER account",
             members: arn_form(format!(
                 "arn:aws:cloudformation:{REGION}:123456789012:type/resource/\
                  My-Sample-Resource/00000001"
             )),
-            read_before_the_gate: None,
+            read_before_the_gate: Some(NOT_FOUND_IN_YOUR_ACCOUNT),
             published: None,
             served: Served::Refused(NOT_FOUND_IN_YOUR_ACCOUNT.to_string()),
         },

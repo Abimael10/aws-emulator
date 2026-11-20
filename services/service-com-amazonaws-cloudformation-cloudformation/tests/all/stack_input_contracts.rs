@@ -737,12 +737,12 @@ struct PropertyCase {
 fn property_cases() -> Vec<PropertyCase> {
     vec![
         PropertyCase {
-            case: "a parameter type Systems Manager does not publish",
+            case: "a parameter type the resource type does not publish",
             logical_id: "Param",
             resource_type: "AWS::SSM::Parameter",
             properties: r#"{"Name":"validated-param","Type":"NotAType","Value":"x"}"#,
             property: "Type",
-            admitted: "String, StringList, SecureString",
+            admitted: "String, StringList",
         },
         PropertyCase {
             case: "a canned ACL Amazon S3 does not publish",

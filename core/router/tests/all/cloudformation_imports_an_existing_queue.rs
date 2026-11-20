@@ -199,6 +199,13 @@ const ADOPTED: &str = "Adopted";
 /// carries so the import acts on a stack that already has resources of its own.
 const KEPT: &str = "Kept";
 
+/// The change-set names a deploying tool uses here: the one it deploys the stack with, and the
+/// one it plans the import under. Two names rather than one, because the change set that has
+/// been EXECUTED is the record of the change the stack took — it stays addressable under its
+/// name and cannot be discarded — so the import cannot reuse it.
+const DEPLOY: &str = "deploy";
+const IMPORT: &str = "import";
+
 /// The queue url `CreateQueue` mints for `name`, which is this type's physical resource id
 /// ("Ref returns the queue URL").
 fn queue_url(name: &str) -> String {
@@ -289,7 +296,7 @@ async fn an_executed_import_adopts_the_queue_that_already_exists() {
             "CreateChangeSet",
             &[
                 ("StackName", row.stack_name),
-                ("ChangeSetName", "deploy"),
+                ("ChangeSetName", DEPLOY),
                 ("ChangeSetType", "CREATE"),
                 ("TemplateBody", &before),
             ],
@@ -308,7 +315,7 @@ async fn an_executed_import_adopts_the_queue_that_already_exists() {
             &router,
             case,
             "ExecuteChangeSet",
-            &[("StackName", row.stack_name), ("ChangeSetName", "deploy")],
+            &[("StackName", row.stack_name), ("ChangeSetName", DEPLOY)],
         )
         .await;
         tokio::time::sleep(PAST_THE_STACK_SPAN).await;
@@ -353,9 +360,11 @@ async fn an_executed_import_adopts_the_queue_that_already_exists() {
         let before_adoption = reported_attributes(&router, case, &url).await;
 
         // The IMPORT change set: the plan reports the resource as adopted under the
-        // identifier it already has. It is created under the SAME change-set name the deploy
-        // used, which is what a deploying tool reuses — so the one that deployed the stack is
-        // deleted first, exactly as that tool deletes it.
+        // identifier it already has. The change set that DEPLOYED the stack is no longer a
+        // plan a deploying tool can clear away — it is the record of what was applied, so
+        // `DeleteChangeSet` for it is refused on its execution status — and the import is
+        // planned under a name of its own, the way a tool that reuses one name has to once
+        // that name is held.
         let template = with_the_adopted_queue(&row.properties);
         // ...and the identifier the request names it by is the one the template summary
         // publishes for the type, which is where a deploying tool reads it from.
@@ -373,11 +382,31 @@ async fn an_executed_import_adopts_the_queue_that_already_exists() {
             "case {case:?}: the summary must publish the type's own identifier property, got \
              {summary}"
         );
+        let (status, body) = cloudformation(
+            &router,
+            "DeleteChangeSet",
+            &[("StackName", row.stack_name), ("ChangeSetName", DEPLOY)],
+        )
+        .await;
+        assert_eq!(
+            (
+                status,
+                first_element(&body, "Code").unwrap_or_default(),
+                first_element(&body, "Message").unwrap_or_default(),
+            ),
+            (
+                400,
+                "InvalidChangeSetStatus".to_string(),
+                "Cannot delete ChangeSet in execution status EXECUTE_COMPLETE".to_string(),
+            ),
+            "case {case:?}: the change set that deployed the stack is no longer a discardable \
+             plan, got {status} with {body}"
+        );
         cloudformation_ok(
             &router,
             case,
             "DeleteChangeSet",
-            &[("StackName", row.stack_name), ("ChangeSetName", "deploy")],
+            &[("StackName", row.stack_name), ("ChangeSetName", IMPORT)],
         )
         .await;
         cloudformation_ok(
@@ -386,7 +415,7 @@ async fn an_executed_import_adopts_the_queue_that_already_exists() {
             "CreateChangeSet",
             &[
                 ("StackName", row.stack_name),
-                ("ChangeSetName", "deploy"),
+                ("ChangeSetName", IMPORT),
                 ("ChangeSetType", "IMPORT"),
                 ("TemplateBody", &template),
                 ("ResourcesToImport.member.1.ResourceType", "AWS::SQS::Queue"),
@@ -407,7 +436,7 @@ async fn an_executed_import_adopts_the_queue_that_already_exists() {
             &router,
             case,
             "DescribeChangeSet",
-            &[("StackName", row.stack_name), ("ChangeSetName", "deploy")],
+            &[("StackName", row.stack_name), ("ChangeSetName", IMPORT)],
         )
         .await;
         assert_eq!(
@@ -429,7 +458,7 @@ async fn an_executed_import_adopts_the_queue_that_already_exists() {
             &router,
             case,
             "ExecuteChangeSet",
-            &[("StackName", row.stack_name), ("ChangeSetName", "deploy")],
+            &[("StackName", row.stack_name), ("ChangeSetName", IMPORT)],
         )
         .await;
         tokio::time::sleep(PAST_THE_STACK_SPAN).await;

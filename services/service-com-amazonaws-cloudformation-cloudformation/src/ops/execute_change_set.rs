@@ -370,12 +370,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
 
-            // A change set whose plan a `DeleteChangeSet` discarded is resolved here too: it
-            // was discarded only because it had already been EXECUTED, and that execution is
-            // what refuses this call — a client asking for an applied change to be applied
-            // again is told it has run, not that it never existed.
             let change_set = store
-                .resolve_executed_change_set(
+                .resolve_change_set(
                     &request_region,
                     &input.change_set_name,
                     input.stack_name.as_deref(),
