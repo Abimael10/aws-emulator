@@ -86,6 +86,7 @@ fn export_record(
             s3_prefix: None,
             s3_sse_algorithm: None,
             s3_sse_kms_key_id: None,
+            incremental_export_specification: None,
         },
         export_time: started_at,
         started_at,
@@ -95,6 +96,9 @@ fn export_record(
         // These records stand for exports whose task wrote its data, which is what a
         // listing reports as `COMPLETED`.
         failure: None,
+        // And for ones taken at a point in time rather than over a period, whatever the
+        // kind each row names: a listing reports the kind off the request record above.
+        incremental: None,
     }
 }
 

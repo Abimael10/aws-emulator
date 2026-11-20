@@ -12,8 +12,9 @@
 //! ([`::service_com_amazonaws_s3_amazons3::state`]) rather than reported as written.
 //!
 //! The DATA is the table's own: the items the table held at the instant the export read
-//! it, rendered in the format the request asked for. Nothing is synthesised — an export
-//! of a table holding no item writes an empty data file and a manifest that says so.
+//! it, or — for an incremental export — what changed over the period it was taken over,
+//! rendered in the format the request asked for. Nothing is synthesised — an export of a
+//! table holding no item writes an empty data file and a manifest that says so.
 //!
 //! What one export can write is bounded by what the table can hold ([`MAX_ITEMS_PER_TABLE`]
 //! and [`MAX_TABLE_SIZE_BYTES`], which admission control holds every item write to) and by
@@ -46,10 +47,10 @@ pub const EXPORT_FAILURE_WRITE_REFUSED_MESSAGE: &str =
 ///
 /// This emulator's own ceiling on the work a single call can ask for, not an AWS quota:
 /// DynamoDB states no bound on what a table may export. An export reads every item the
-/// table holds and renders it, so without a bound of its own one call's transient work
-/// would be whatever a table has been filled with ([`MAX_ITEMS_PER_TABLE`]). A request
-/// past it is refused BEFORE anything is rendered, with the modelled
-/// `LimitExceededException` and [`export_too_large_message`].
+/// table holds — or every change a period made — and renders it, so without a bound of its
+/// own one call's transient work would be whatever a table has been filled with
+/// ([`MAX_ITEMS_PER_TABLE`]). A request past it is refused BEFORE anything is rendered,
+/// with the modelled `LimitExceededException` and [`export_too_large_message`].
 pub const MAX_EXPORTED_ITEMS: i64 = 100_000;
 
 /// How many bytes of ITEM DATA one export renders, at most — the same ceiling measured
@@ -104,20 +105,20 @@ pub fn export_object_prefix(s3_prefix: Option<&str>, export_id: &str) -> String 
     }
 }
 
-/// The objects `export` writes for the items it read, in the order they are written.
+/// The objects `export` writes for the data it read, in the order they are written.
 ///
 /// The set is the one a DynamoDB export leaves in the bucket: the marker that says the
-/// task started, the data file holding the items, the manifest of data files and the
-/// summary manifest — each manifest beside the digest file that covers it, so a consumer
-/// can check what it read.
-pub fn exported_objects(export: &Export, items: &[Item]) -> Vec<ExportedObject> {
+/// task started, the data file holding the items (or, for an incremental export, the
+/// changes), the manifest of data files and the summary manifest — each manifest beside the
+/// digest file that covers it, so a consumer can check what it read.
+pub fn exported_objects(export: &Export, data: &ExportedData) -> Vec<ExportedObject> {
     let prefix = export_object_prefix(export.request.s3_prefix.as_deref(), export.export_id());
     let data_key = format!("{prefix}data/{}.json.gz", export.export_id());
-    let data = data_file_body(items);
+    let body = data_file_body(export, data);
     let files_key = format!("{prefix}manifest-files.json");
-    let files = manifest_files_document(items.len(), &data_key, &data);
+    let files = manifest_files_document(data.item_count(), &data_key, &body);
     let summary_key = format!("{prefix}manifest-summary.json");
-    let summary = manifest_summary_document(export, items.len(), &files_key);
+    let summary = manifest_summary_document(export, data.item_count(), &files_key);
     vec![
         // "_started": the marker DynamoDB writes when the task begins.
         ExportedObject {
@@ -126,7 +127,7 @@ pub fn exported_objects(export: &Export, items: &[Item]) -> Vec<ExportedObject> 
         },
         ExportedObject {
             key: data_key,
-            body: data,
+            body,
         },
         ExportedObject {
             key: format!("{files_key}.md5"),
@@ -149,14 +150,32 @@ pub fn exported_objects(export: &Export, items: &[Item]) -> Vec<ExportedObject> 
     ]
 }
 
-/// The data file an export writes: one line per item, each the item as DynamoDB JSON
-/// under the `Item` member, GZIP-compressed — the `.json.gz` object a `DYNAMODB_JSON`
-/// export leaves in the bucket.
-fn data_file_body(items: &[Item]) -> Vec<u8> {
+/// The data file an export writes: one line per record, GZIP-compressed — the `.json.gz`
+/// object a `DYNAMODB_JSON` export leaves in the bucket.
+///
+/// A FULL export writes one item per line, each under the `Item` member. An INCREMENTAL
+/// one writes one CHANGE per line ([`change_record_json`]) — the keys of the item, the
+/// images the view type it was taken in asks for, and when the change was written — because
+/// what that export reports is the effect of a period rather than the state at an instant.
+fn data_file_body(export: &Export, data: &ExportedData) -> Vec<u8> {
     let mut text = String::new();
-    for item in items {
-        text.push_str(&::serde_json::json!({ "Item": item_json(item) }).to_string());
-        text.push('\n');
+    match data {
+        ExportedData::Snapshot(items) => {
+            for item in items {
+                text.push_str(&::serde_json::json!({ "Item": item_json(item) }).to_string());
+                text.push('\n');
+            }
+        }
+        ExportedData::Changes(changes) => {
+            let old_images = export
+                .incremental
+                .as_ref()
+                .is_some_and(IncrementalExportWindow::carries_old_images);
+            for change in changes {
+                text.push_str(&change_record_json(change, old_images).to_string());
+                text.push('\n');
+            }
+        }
     }
     gzipped(text.as_bytes())
 }
@@ -195,8 +214,11 @@ fn manifest_files_document(items: usize, data_key: &str, data: &[u8]) -> String 
 /// The summary manifest: what was exported, from which table and at which point in time,
 /// where the data files are listed and how much was written — the
 /// `manifest-summary.json` object `ExportDescription$ExportManifest` names.
+///
+/// An INCREMENTAL export carries the period it was taken over and the view its records were
+/// written in beside those members, because that is what says which data the file holds.
 fn manifest_summary_document(export: &Export, items: usize, files_key: &str) -> String {
-    ::serde_json::json!({
+    let mut summary = ::serde_json::json!({
         "version": EXPORT_MANIFEST_VERSION,
         "exportArn": export.arn,
         "startTime": rendered_instant(export.started_at),
@@ -212,8 +234,14 @@ fn manifest_summary_document(export: &Export, items: usize, files_key: &str) -> 
         "billedSizeBytes": export.billed_size_bytes,
         "itemCount": items,
         "outputFormat": export.request.export_format,
-    })
-    .to_string()
+    });
+    if let Some(incremental) = &export.incremental {
+        summary["exportType"] = ::serde_json::json!(export.request.export_type);
+        summary["exportFromTime"] = ::serde_json::json!(rendered_instant(incremental.from));
+        summary["exportToTime"] = ::serde_json::json!(rendered_instant(incremental.to));
+        summary["outputView"] = ::serde_json::json!(incremental.view_type);
+    }
+    summary.to_string()
 }
 
 /// One instant as the manifest carries it: the date-time form an AWS timestamp takes in a

@@ -180,25 +180,31 @@ async fn a_client_token_replayed_with_any_changed_member_is_the_modelled_conflic
 async fn every_export_time_outside_the_window_states_the_one_fixed_sentence() {
     let router = emulator();
     let table_arn = exportable_table(&router, "Windowless").await;
-    let (earliest, latest) = restorable_window(&router, "Windowless").await;
 
-    // Rows differ in HOW the named instant falls outside the window: long before the
-    // table existed, just outside each published bound, and in the future — the three
-    // classes the model's prose names, which AWS refuses alike.
+    // Rows differ in HOW the named instant falls outside the window: further back than it
+    // reaches, just outside each published bound, and in the future — the classes the
+    // model's prose names, which AWS refuses alike.
     //
-    // `LatestRestorableDateTime` is the window's MOVING end: it advances with the clock,
-    // so the row just past it clears that bound by a margin wider than any wall clock the
-    // calls below can take, rather than landing back inside the window on a slow machine.
-    // The oldest point only ever moves forward, so a row before it stays before it.
-    let instants: [(&str, f64); 5] = [
-        ("long before the table existed", earliest - 86_400.0),
-        ("just before the oldest point", earliest - 1.0),
-        ("just past the newest point", latest + 120.0),
-        ("an hour in the future", latest + 3_600.0),
-        ("a year in the future", latest + 31_536_000.0),
+    // The window is read again for every row: it DEEPENS as the recovery catches up with
+    // the period it was given, and `LatestRestorableDateTime` is its MOVING end, which
+    // advances with the clock. So each row is placed against the window as it stands when
+    // that row is sent, and the row just past the newest point clears that bound by a
+    // margin wider than any wall clock the call can take.
+    type Instant = fn(f64, f64) -> f64;
+    let instants: [(&str, Instant); 5] = [
+        (
+            "well before the window reaches",
+            |earliest, _| earliest - 86_400.0,
+        ),
+        ("just before the oldest point", |earliest, _| earliest - 1.0),
+        ("just past the newest point", |_, latest| latest + 120.0),
+        ("an hour in the future", |_, latest| latest + 3_600.0),
+        ("a year in the future", |_, latest| latest + 31_536_000.0),
     ];
 
-    for (case, instant) in instants {
+    for (case, instant_of) in instants {
+        let (earliest, latest) = restorable_window(&router, "Windowless").await;
+        let instant = instant_of(earliest, latest);
         let (status, answered) = call(
             &router,
             "ExportTableToPointInTime",
@@ -226,6 +232,7 @@ async fn every_export_time_outside_the_window_states_the_one_fixed_sentence() {
 
     // The control: a point the window DOES hold is exported, so the rows above are
     // refused for the instant they named and not for the member being named at all.
+    let (earliest, latest) = restorable_window(&router, "Windowless").await;
     let inside = json!({
         "TableArn": table_arn,
         "S3Bucket": BUCKET,

@@ -13,10 +13,10 @@
 //!    ("This parameter is optional. If no value is provided, the value will default to
 //!    35" — `PointInTimeRecoverySpecification$RecoveryPeriodInDays`);
 //! 3. while recovery is on, the restorable window is DERIVED from the stored settings and
-//!    the clock — its newest point about five minutes behind now
+//!    the clock — its newest point behind now
 //!    ("`LatestRestorableDateTime` is typically 5 minutes before the current time") and
-//!    its oldest no further back than the configured period, nor than the instant
-//!    recovery started — and while recovery is off there is no window at all;
+//!    its oldest no further back than the configured period before recovery started — and
+//!    while recovery is off there is no window at all;
 //! 4. a period outside the modelled 1..=35 range is refused as a `ValidationException`,
 //!    and a table that does not exist as the `TableNotFoundException` both operations
 //!    model.
@@ -140,8 +140,9 @@ async fn an_enabled_table_reports_the_period_it_was_given_and_both_operations_ag
         );
 
         // The window: newest point no later than now, oldest no earlier than the
-        // configured period before now, and ordered. A window that began at this call
-        // cannot reach back before it, so both ends sit inside the call's own span.
+        // configured period before now, and ordered. A recovery this call turned on has
+        // nothing behind it yet — the depth it was given is still being caught up to — so
+        // in the answer to that call both ends sit inside the call's own span.
         let earliest = recovery(&updated)["EarliestRestorableDateTime"]
             .as_f64()
             .unwrap_or_default();
@@ -180,9 +181,12 @@ async fn an_enabled_table_reports_the_period_it_was_given_and_both_operations_ag
             (json!("ENABLED"), json!(expected)),
             "case {case}: a second read reports the same settings, got {again}"
         );
-        let oldest_allowed = epoch_now() - (expected as f64) * DAY_SECONDS;
+        // The window DEEPENS as the recovery catches up with the period it was given, so
+        // the oldest point a later read reports can sit before the call that opened the
+        // window — but never further back than that period reaches from it.
+        let oldest_allowed = before - (expected as f64) * DAY_SECONDS - 1.0;
         assert!(
-            read_earliest >= oldest_allowed && read_earliest >= before - 1.0,
+            read_earliest >= oldest_allowed,
             "case {case}: the oldest restorable point stays inside the {expected}-day \
              period, got {read_earliest} against {oldest_allowed}"
         );
@@ -278,9 +282,10 @@ async fn re_stating_an_enabled_setting_keeps_the_window_it_already_had() {
             "case {case}: the re-stated period is the one reported, got {updated}"
         );
         assert!(
-            (earliest - first_earliest).abs() < 1.0,
-            "case {case}: the window keeps the start the first enable gave it, got \
-             {earliest} against {first_earliest}"
+            earliest <= first_earliest + 1.0,
+            "case {case}: the window keeps the start the first enable gave it, so its \
+             oldest point never jumps forward past it, got {earliest} against \
+             {first_earliest}"
         );
     }
 }

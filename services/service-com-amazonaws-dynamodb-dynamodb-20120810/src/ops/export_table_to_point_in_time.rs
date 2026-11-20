@@ -10,6 +10,12 @@
 //! (`crate::state::Export`) is the export catalogue's, so `DescribeExport` and
 //! `ListExports` report the very export this started.
 //!
+//! An INCREMENTAL export is taken over a PERIOD of that window rather than at one point in
+//! time, and writes what CHANGED over it (`crate::state::resolved_incremental_window`,
+//! `crate::state::PointInTimeRecovery::changes_between`): both of the period's instants
+//! must lie inside the window and the period must span the shortest one this surface
+//! accepts, each of which is that same `InvalidExportTimeException`.
+//!
 //! The members the request STATES are held to the rules this surface keeps for them before
 //! any of that ([`crate::state::check_export_request_members`]): the idempotency token the
 //! export is asked for under must be stated, and a destination prefix it names must take
@@ -243,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything this call decides about the table is decided under the store's own
         // guard, and the guard is released at the end of this block: the rendering below
         // must run with no lock held.
-        let (description, export_arn, export_status, bucket, rendering, items) = {
+        let (description, export_arn, export_status, bucket, rendering, exported) = {
             let mut store = state.lock();
             store.apply_due_transitions(now);
             let table = store
@@ -272,13 +278,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the export the token stands for however the table has moved on since.
             if let Some(token) = input.client_token.as_deref() {
                 if let Some(started) = store.export_for_client_token(&region, token, now) {
-                    // A RECORDED export carries neither of the two members below: a
-                    // request naming one is refused before anything is recorded
-                    // ([`unsupported_capability`]), so a replay that names either one
-                    // differs from the export the token stands for by construction, and
-                    // the members the record does keep are compared on the record itself.
-                    let names_unrecorded = input.filter_specification.is_some()
-                        || input.incremental_export_specification.is_some();
+                    // No RECORDED export carries the filter criteria below: a request
+                    // naming them is refused before anything is recorded
+                    // ([`unsupported_capability`]), so a replay that names them differs
+                    // from the export the token stands for by construction, and every
+                    // member the record does keep — the incremental period among them — is
+                    // compared on the record itself.
+                    let names_unrecorded = input.filter_specification.is_some();
                     if !names_unrecorded
                         && started.table_name == name
                         && started.request == request
@@ -290,28 +296,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(export_conflict());
                 }
             }
-            // The `ExportTime` the request NAMES is held to the instants an export could be
-            // taken at at all, before the table's recovery settings are consulted: an
-            // instant in the future, one before the table existed, or one further back than
-            // the longest recovery window this service offers is outside EVERY point in
-            // time recovery window a table could have, so what is wrong with such a request
-            // is the time it asked for ([`export_time_beyond_any_window`]) rather than the
-            // table's recovery being off.
-            if export_time_beyond_any_window(input.export_time.as_ref(), table, now) {
-                return Err(invalid_export_time());
-            }
             // "The table must have point in time recovery enabled, and you can export data
             // from any time within the point in time recovery window" (this operation's
             // doc): a table whose recovery is off has no such window, so there is no point
             // in time to export from — "Point in time recovery has not yet been enabled for
-            // this source table" (`PointInTimeRecoveryUnavailableException`).
+            // this source table" (`PointInTimeRecoveryUnavailableException`). What is wrong
+            // with a request that also named an instant NO window could cover — one in the
+            // future, or one further back than the longest recovery period this service
+            // offers — is the time it asked for ([`export_time_beyond_any_window`]) rather
+            // than the table's recovery being off, so that is settled first.
             let Some((earliest, latest)) = table.point_in_time_recovery.restorable_window(now)
             else {
+                if export_time_beyond_any_window(input.export_time.as_ref(), now) {
+                    return Err(invalid_export_time());
+                }
                 return Err(recovery_unavailable(&name));
             };
             // The point in time this export reads the table at: the one the request named,
             // held inside that window, or the newest exportable one where it named none.
             let export_time = export_point(input.export_time.as_ref(), earliest, latest, now)?;
+            // The PERIOD an incremental export is taken over, resolved from what the
+            // request stated and held to the rules of that surface — the members it cannot
+            // be taken without, the window its two instants must lie inside and the
+            // shortest period it may span ([`crate::state::resolved_incremental_window`]).
+            let incremental = crate::state::resolved_incremental_window(
+                &request.export_type,
+                request.incremental_export_specification.as_ref(),
+                earliest,
+                latest,
+            )
+            .map_err(incremental_refusal)?;
             // A capability this emulator cannot write real exported data for is refused as
             // "not written yet" rather than accepted and answered with a record of the
             // export the caller did not ask for. AFTER the modelled refusals above: what
@@ -338,34 +352,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // Everything this export reports of the table is read off it HERE, at the
             // instant of the request, so the record stands on its own once the table moves
-            // on. The DATA is the table as it stood at the point in time the export is
-            // taken at, materialised from the versions the table's continuous backups kept
-            // ([`crate::state::PointInTimeRecovery::items_at`]): an item written after that
-            // instant is no part of this export, and the figures the record reports are
-            // this data's own.
-            let exported = table
-                .point_in_time_recovery
-                .items_at(&table.items, export_time);
+            // on. The DATA is the table's own, materialised from the versions its
+            // continuous backups kept: the table as it stood at the point in time a full
+            // export is taken at ([`crate::state::PointInTimeRecovery::items_at`]) — an
+            // item written after that instant is no part of it — and what changed over the
+            // period an incremental one is taken over
+            // ([`crate::state::PointInTimeRecovery::changes_between`]). The figures the
+            // record reports are this data's own.
+            let exported = match &incremental {
+                Some(window) => crate::state::ExportedData::Changes(
+                    table.point_in_time_recovery.changes_between(
+                        &table.items,
+                        window.from,
+                        window.to,
+                        |item| table.key_attributes(item),
+                    ),
+                ),
+                None => crate::state::ExportedData::Snapshot(
+                    table
+                        .point_in_time_recovery
+                        .items_at(&table.items, export_time)
+                        .into_values()
+                        .collect(),
+                ),
+            };
+            // The point in time the data this export wrote reflects: the instant a full
+            // export was taken at, and the exclusive end of the period an incremental one
+            // reports the table "just prior to".
+            let export_time = incremental
+                .as_ref()
+                .map_or(export_time, |window| window.to);
             let export = crate::state::Export::started(
                 table,
                 &exported,
                 request,
+                incremental,
                 export_time,
                 input.client_token.clone(),
                 now,
             );
-            // What ONE export renders is bounded before anything is rendered: the items it
-            // would read and the item data they hold, against this emulator's own
+            // What ONE export renders is bounded before anything is rendered: the records
+            // it would write and the item data they hold, against this emulator's own
             // per-export ceilings ([`crate::state::MAX_EXPORTED_ITEMS`],
             // [`crate::state::MAX_EXPORTED_BYTES`]). Measured on the data the task would
             // render, which is not what the record is BILLED for
             // ([`crate::state::Export::billed_size_bytes`]). A table larger than that is
             // not refused by DynamoDB, so the refusal says whose ceiling it is.
-            let rendered_bytes = exported.values().fold(0_i64, |total, item| {
-                total.saturating_add(crate::state::item_size(item))
-            });
             if export.item_count > crate::state::MAX_EXPORTED_ITEMS
-                || rendered_bytes > crate::state::MAX_EXPORTED_BYTES
+                || exported.rendered_bytes() > crate::state::MAX_EXPORTED_BYTES
             {
                 return Err(ExportTableToPointInTimeErrorModeled::LimitExceededException(
                     LimitExceededException {
@@ -374,9 +408,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            // The items this export reads, copied out HERE so the rendering below runs with
-            // no lock held: the table as it stood at the point in time above.
-            let items: Vec<crate::state::Item> = exported.into_values().collect();
             let description = export.describe(now);
             let export_arn = export.arn.clone();
             let export_status = export.status(now).to_string();
@@ -389,7 +420,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 export_status,
                 bucket,
                 rendering,
-                items,
+                // The data this export writes, copied out HERE so the rendering below runs
+                // with no lock held.
+                exported,
             )
         };
 
@@ -398,7 +431,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Rendering and compressing them is CPU-bound and sized by the table, so it runs
         // on a BLOCKING task rather than on a runtime worker a large export would starve.
         let objects = match ::tokio::task::spawn_blocking(move || {
-            crate::state::exported_objects(&rendering, &items)
+            crate::state::exported_objects(&rendering, &exported)
         })
         .await
         {
@@ -518,26 +551,57 @@ fn requested_members(
             S3_SSE_ALGORITHM_VALUES,
         )?,
         s3_sse_kms_key_id: input.s3_sse_kms_key_id.clone(),
+        // The incremental period AS STATED, so two calls that stated the same period ask
+        // for the same export; what it resolves to is settled against the table's recovery
+        // window ([`crate::state::resolved_incremental_window`]).
+        incremental_export_specification: input.incremental_export_specification.as_ref().map(
+            |stated| crate::state::RequestedIncrementalExport {
+                export_from_time: stated
+                    .export_from_time
+                    .as_ref()
+                    .and_then(|time| ::std::time::SystemTime::try_from(*time).ok()),
+                export_to_time: stated
+                    .export_to_time
+                    .as_ref()
+                    .and_then(|time| ::std::time::SystemTime::try_from(*time).ok()),
+                export_view_type: stated.export_view_type.clone(),
+            },
+        ),
     })
+}
+
+/// Lift a refusal of the incremental period into this operation's error channel.
+///
+/// A fault of the request's MEMBERS is the `ValidationException` such an input is, which
+/// this operation models no error for; a fault of the PERIOD those members named is the
+/// modelled `InvalidExportTimeException`, with the sentence that states which rule the
+/// period broke ([`crate::state::resolved_incremental_window`]).
+fn incremental_refusal(
+    refusal: crate::state::IncrementalRefusal,
+) -> ExportTableToPointInTimeError {
+    match refusal {
+        crate::state::IncrementalRefusal::Request(error) => bad_request(error),
+        crate::state::IncrementalRefusal::ExportPeriod(message) => {
+            ExportTableToPointInTimeErrorModeled::InvalidExportTimeException(
+                InvalidExportTimeException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into()
+        }
+    }
 }
 
 /// The capability this request asks for that no stored export record carries yet, if any.
 ///
-/// An INCREMENTAL export reports what changed between two points in time, and a
-/// `FilterSpecification` reports only the items a condition selects — both of which are
-/// facts about a table's data over time that this store does not keep, so neither can be
-/// reported from it. A request asking for either is refused as unimplemented rather than
-/// answered with a record of the FULL, unfiltered export it did not ask for.
+/// A `FilterSpecification` reports only the items a condition selects, which is a fact
+/// about a table's data this store does not keep and so cannot report from: a request
+/// asking for it is refused as unimplemented rather than answered with a record of the
+/// UNFILTERED export it did not ask for.
 fn unsupported_capability(
     input: &ExportTableToPointInTimeInput,
     request: &crate::state::ExportRequest,
 ) -> Option<&'static str> {
-    if request.export_type == crate::state::EXPORT_TYPE_INCREMENTAL {
-        return Some("ExportType INCREMENTAL_EXPORT");
-    }
-    if input.incremental_export_specification.is_some() {
-        return Some("IncrementalExportSpecification");
-    }
     if input.filter_specification.is_some() {
         return Some("FilterSpecification");
     }
@@ -587,23 +651,24 @@ fn export_point(
 }
 
 /// Whether the `ExportTime` this request names lies outside EVERY point in time recovery
-/// window the addressed table could have, whatever its recovery settings say.
+/// window a table could have, whatever its recovery settings say.
 ///
-/// Three instants are outside every such window: one in the FUTURE (an export is "a
-/// snapshot of the table's state at this point in time" — `$ExportTime` — and the table has
-/// not been in a future state yet), one BEFORE THE TABLE EXISTED (there was no table to
-/// snapshot), and one further back than the longest recovery period the service offers
-/// ([`MAX_RECOVERY_PERIOD_IN_DAYS`], `PointInTimeRecoverySpecification$RecoveryPeriodInDays`
-/// @range max 35 — "the number of preceding days for which continuous backups are taken and
-/// maintained"), since no window reaches further than that. Each is a fault of the TIME the
-/// request asked for rather than of the table it addressed, which is why it is settled
-/// before the table's recovery is looked at.
+/// Two instants are outside every such window: one in the FUTURE (an export is "a snapshot
+/// of the table's state at this point in time" — `$ExportTime` — and no table has been in a
+/// future state yet) and one further back than the longest recovery period the service
+/// offers ([`MAX_RECOVERY_PERIOD_IN_DAYS`],
+/// `PointInTimeRecoverySpecification$RecoveryPeriodInDays` @range max 35 — "the number of
+/// preceding days for which continuous backups are taken and maintained"), since no window
+/// reaches further than that. Each is a fault of the TIME the request asked for rather than
+/// of the table it addressed, which is why a table with NO window at all — one whose
+/// recovery is off — answers for it rather than for its recovery. A table that HAS a window
+/// holds the instant to that window instead ([`export_point`]), which is the narrower
+/// question.
 ///
 /// A request naming NO `ExportTime` names no such instant: it exports the table as it
 /// stands ([`export_point`]).
 fn export_time_beyond_any_window(
     requested: Option<&::aws_smithy_types::DateTime>,
-    table: &crate::state::Table,
     now: ::std::time::SystemTime,
 ) -> bool {
     let Some(requested) = requested else {
@@ -614,12 +679,7 @@ fn export_time_beyond_any_window(
     };
     let point = crate::state::at_nearest_timestamp_precision(point);
     let longest = ::std::time::Duration::from_secs(MAX_RECOVERY_PERIOD_IN_DAYS * 24 * 60 * 60);
-    // The table's creation instant AS IT IS REPORTED (`TableDescription$CreationDateTime`,
-    // at the millisecond precision a timestamp carries on the wire), so the earliest
-    // instant a client may name is exactly the one it read back for the table rather than
-    // the fraction of a millisecond above it.
-    let created = crate::state::at_timestamp_precision(table.creation_date_time);
-    let floor = now.checked_sub(longest).unwrap_or(now).max(created);
+    let floor = now.checked_sub(longest).unwrap_or(now);
     point > now || point < floor
 }
 

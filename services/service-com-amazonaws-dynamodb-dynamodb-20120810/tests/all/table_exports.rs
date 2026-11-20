@@ -12,8 +12,8 @@
 //!    recovery was turned on and then off again is in exactly that state;
 //! 2. an `ExportTime` must lie inside the table's recovery window, and one outside it is
 //!    refused with `InvalidExportTimeException` — an instant NO recovery window could
-//!    cover (one in the future, one from before the table existed, one further back than
-//!    the longest recovery period the service offers) is refused for the TIME whatever the
+//!    cover (one in the future, one further back than the longest recovery period the
+//!    service offers) is refused for the TIME whatever the
 //!    addressed table's recovery state is; a request that names none exports the
 //!    table as it stands at the instant of the request, so an item written a moment
 //!    before the call is in the snapshot;
@@ -308,18 +308,17 @@ async fn an_export_time_no_recovery_window_could_cover_is_refused_for_the_time()
 
     // Every instant below is measured from the table's own reported creation instant, so
     // the rows are the same whatever the clock reads: no recovery window of any table can
-    // reach an instant in the future, one from before the table existed, or one further
-    // back than the longest recovery period the service offers
+    // reach an instant in the future, nor one further back than the longest recovery
+    // period the service offers
     // (`PointInTimeRecoverySpecification$RecoveryPeriodInDays`, @range max 35).
     let created = ok(&router, "DescribeTable", json!({"TableName": "TimeRecoveryOff"})).await
         ["Table"]["CreationDateTime"]
         .as_f64()
         .expect("the table reports its creation instant");
     let day = 24.0 * 60.0 * 60.0;
-    let instants: [(&str, f64); 4] = [
+    let instants: [(&str, f64); 3] = [
         ("an instant an hour in the future", created + 60.0 * 60.0),
         ("an instant a day in the future", created + day),
-        ("an instant from before the table existed", created - 60.0),
         (
             "an instant older than the longest recovery period",
             created - 40.0 * day,
@@ -620,19 +619,32 @@ async fn a_point_in_time_outside_the_recovery_window_is_refused() {
     table_with_items(&router, "Windowed", 1).await;
     set_recovery(&router, "Windowed", true).await;
     let table_arn = state::table_arn(REGION, "Windowed");
-    let (earliest, latest) = restorable_window(&router, "Windowed").await;
 
     // Rows differ in where the named instant falls relative to the window the table
-    // reports: each published bound, inside it, and one step past each end.
-    let cases: [(&str, f64, bool); 5] = [
-        ("the oldest restorable point", earliest, true),
-        ("the newest restorable point", latest, true),
-        ("a point between the bounds", (earliest + latest) / 2.0, true),
-        ("a point before recovery began", earliest - 86_400.0, false),
-        ("a point in the future", latest + 3_600.0, false),
+    // reports: each published bound, inside it, and one step past each end. The window is
+    // read again for every row, because it DEEPENS as the recovery catches up with the
+    // period it was given and its newest point advances with the clock — so a row is
+    // placed against the window as it stands when that row is sent.
+    type Point = fn(f64, f64) -> f64;
+    let cases: [(&str, Point, bool); 5] = [
+        ("the oldest restorable point", |earliest, _| earliest, true),
+        ("the newest restorable point", |_, latest| latest, true),
+        (
+            "a point between the bounds",
+            |earliest, latest| (earliest + latest) / 2.0,
+            true,
+        ),
+        (
+            "a point older than the window reaches",
+            |earliest, _| earliest - 86_400.0,
+            false,
+        ),
+        ("a point in the future", |_, latest| latest + 3_600.0, false),
     ];
 
-    for (case, point, accepted) in cases {
+    for (case, point_of, accepted) in cases {
+        let (earliest, latest) = restorable_window(&router, "Windowed").await;
+        let point = point_of(earliest, latest);
         let mut body = export_body(&table_arn);
         body["ExportTime"] = json!(point);
         let (status, answered) = call(&router, "ExportTableToPointInTime", body.clone()).await;
@@ -932,30 +944,24 @@ async fn a_capability_no_record_carries_yet_is_refused_as_unimplemented() {
     table_with_items(&router, "Incremental", 1).await;
     set_recovery(&router, "Incremental", true).await;
     let table_arn = state::table_arn(REGION, "Incremental");
-    let (_, latest) = restorable_window(&router, "Incremental").await;
 
-    // An incremental export reports what CHANGED between two points in time, a filter
-    // only the items a condition selects, and an Ion export the items in an encoding this
-    // emulator does not write: none of the three is something it can write real data for,
-    // so each is refused as not written yet rather than answered with a record of the
-    // full, unfiltered, DynamoDB-JSON export the caller did not ask for.
-    let cases: [(&str, Value); 4] = [
-        (
-            "an incremental export",
-            json!({"ExportType": "INCREMENTAL_EXPORT", "IncrementalExportSpecification": {
-                "ExportFromTime": latest - 3_600.0,
-                "ExportToTime": latest,
-            }}),
-        ),
-        (
-            "an incremental specification on a full export",
-            json!({"IncrementalExportSpecification": {"ExportToTime": latest}}),
-        ),
+    // A filter reports only the items a condition selects and an Ion export the items in
+    // an encoding this emulator does not write: neither is something it can write real
+    // data for, so each is refused as not written yet rather than answered with a record
+    // of the unfiltered, DynamoDB-JSON export the caller did not ask for. (What an
+    // INCREMENTAL export writes is the table's own change history, so that one is served —
+    // `tests/all/incremental_table_exports.rs`.)
+    let cases: [(&str, Value); 3] = [
         (
             "a filtered export",
             json!({"FilterSpecification": {"FilterExpression": "attribute_exists(Payload)"}}),
         ),
         ("an Ion export", json!({"ExportFormat": "ION"})),
+        (
+            "an Ion export of a filtered table",
+            json!({"ExportFormat": "ION",
+                   "FilterSpecification": {"FilterExpression": "attribute_exists(Payload)"}}),
+        ),
     ];
 
     for (case, extra) in cases {

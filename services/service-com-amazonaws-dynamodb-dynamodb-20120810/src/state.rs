@@ -4728,6 +4728,13 @@ pub use import_log_groups::*;
 mod export_objects;
 pub use export_objects::*;
 
+/// What an INCREMENTAL export is taken over — the period a request asks for, resolved and
+/// held to the rules of that surface — and the change records the table's continuous
+/// backups answer it with. Re-exported below, so every caller still names them
+/// `crate::state::…`.
+mod export_changes;
+pub use export_changes::*;
+
 /// Whether the CALLING PRINCIPAL may make the Amazon S3 calls a table export or a table
 /// import performs for it, in its own file: it is one rule, read by both of the surfaces
 /// that move a table's data through that service. Re-exported below, so every caller still

@@ -50,6 +50,24 @@ pub const DEFAULT_RECOVERY_PERIOD_IN_DAYS: i32 = 35;
 /// reached.
 pub const RESTORE_WINDOW_LAG: Duration = STATUS_TRANSITION;
 
+/// How long after point-in-time recovery is turned on the restorable window spans the
+/// recovery period in force.
+///
+/// A table's window DEEPENS as its continuous backups accumulate — "you can restore your
+/// table to any point in time in the last 35 days" is what the window reaches once they
+/// have, and a recovery that has just been turned on has nothing behind it yet — so the
+/// depth a table reports is a progression the clock owes, exactly as the newest point
+/// catching up with the present is ([`RESTORE_WINDOW_LAG`]). Real continuous backups take
+/// the whole recovery period of wall clock to reach it, which is a wait no client of an
+/// emulator can sit out and is not what a caller acts on: what it acts on is that the
+/// window reaches the period its settings name, so that the windows the export and restore
+/// surfaces hold a request to — an incremental export's own period among them — are
+/// windows a client can pick. So the catch-up takes this emulator's ONE span for a
+/// clock-owed progression ([`STATUS_TRANSITION`]). The span is never zero, so a caller that
+/// turns recovery on and immediately reads the window still sees the narrow one a recovery
+/// with nothing behind it has, and the refusals that go with it.
+pub const RESTORE_WINDOW_DEPTH_DUE: Duration = STATUS_TRANSITION;
+
 /// One day, the unit `RecoveryPeriodInDays` counts the recovery window in.
 pub(super) const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -179,8 +197,29 @@ impl RecoveryJournal {
         current: &BTreeMap<ItemKey, Item>,
         point: SystemTime,
     ) -> BTreeMap<ItemKey, Item> {
+        self.items_undoing(current, |landed| landed > point)
+    }
+
+    /// `current` as it stood JUST BEFORE `point`: the writes that landed AT that instant
+    /// are undone too, which is the state an interval STARTING at `point` is measured from
+    /// and the state an interval ENDING at it exclusively ends in.
+    fn items_before(
+        &self,
+        current: &BTreeMap<ItemKey, Item>,
+        point: SystemTime,
+    ) -> BTreeMap<ItemKey, Item> {
+        self.items_undoing(current, |landed| landed >= point)
+    }
+
+    /// `current` with every version a write `undo` selects by the instant it landed put
+    /// back, newest first — the one walk both of the readings above are made with.
+    fn items_undoing(
+        &self,
+        current: &BTreeMap<ItemKey, Item>,
+        undo: impl Fn(SystemTime) -> bool,
+    ) -> BTreeMap<ItemKey, Item> {
         let mut items = current.clone();
-        for version in self.versions.iter().rev().filter(|held| held.at > point) {
+        for version in self.versions.iter().rev().filter(|held| undo(held.at)) {
             match &version.before {
                 Some(before) => items.insert(version.key.clone(), before.clone()),
                 None => items.remove(&version.key),
@@ -188,16 +227,76 @@ impl RecoveryJournal {
         }
         items
     }
+
+    /// What CHANGED between `from` (inclusive) and `to` (exclusive): one record per item a
+    /// write landed on inside that interval whose value differs across it, carrying the
+    /// images on either side.
+    ///
+    /// The images come from the two states the interval runs between
+    /// ([`Self::items_before`]), so an item written several times inside it yields ONE
+    /// record — what changed over the interval, not each write that made it — and an item
+    /// whose writes left it exactly as it was yields none, by the same comparison a feed of
+    /// item-level changes uses ([`same_item`]). The instant each record carries is the last
+    /// write inside the interval that touched that item.
+    ///
+    /// `key_attributes` names the key of a stored item the way its table's key schema does
+    /// ([`Table::key_attributes`]), which is what a record reports as the keys of the item
+    /// it is about: the journal holds a key's VALUES, and only the table knows the
+    /// attributes they are the values of.
+    fn changes_between(
+        &self,
+        current: &BTreeMap<ItemKey, Item>,
+        from: SystemTime,
+        to: SystemTime,
+        key_attributes: impl Fn(&Item) -> Item,
+    ) -> Vec<ItemChange> {
+        let mut written: BTreeMap<ItemKey, SystemTime> = BTreeMap::new();
+        for version in self
+            .versions
+            .iter()
+            .filter(|held| held.at >= from && held.at < to)
+        {
+            written
+                .entry(version.key.clone())
+                .and_modify(|at| *at = (*at).max(version.at))
+                .or_insert(version.at);
+        }
+        let before = self.items_before(current, from);
+        let after = self.items_before(current, to);
+        written
+            .into_iter()
+            .filter_map(|(key, at)| {
+                let old_image = before.get(&key).cloned();
+                let new_image = after.get(&key).cloned();
+                let changed = match (&old_image, &new_image) {
+                    (Some(old), Some(new)) => !same_item(old, new),
+                    (None, None) => false,
+                    _ => true,
+                };
+                let keys = new_image
+                    .as_ref()
+                    .or(old_image.as_ref())
+                    .map(&key_attributes)
+                    .unwrap_or_default();
+                changed.then_some(ItemChange {
+                    at,
+                    keys,
+                    old_image,
+                    new_image,
+                })
+            })
+            .collect()
+    }
 }
 
 /// A table's point-in-time recovery settings: what `UpdateContinuousBackups` writes and
 /// what both it and `DescribeContinuousBackups` report.
 ///
 /// Only the SETTINGS are stored. The restorable window is DERIVED from them at every
-/// read, because it moves with the clock rather than with any call: its newest point is
-/// one [`RESTORE_WINDOW_LAG`] behind now and its oldest the configured period behind
-/// that, bounded below by the instant recovery started — before which there is nothing
-/// to restore from.
+/// read, because it moves with the clock: its newest point is one [`RESTORE_WINDOW_LAG`]
+/// behind now, and its oldest is as old as the recovery itself until the recovery has
+/// caught up with the period in force ([`RESTORE_WINDOW_DEPTH_DUE`]) and the configured
+/// period deep once it has.
 ///
 /// What a point inside that window ANSWERS WITH is the journal beside the settings
 /// ([`RecoveryJournal`]): recovery being on is what makes an item version worth keeping,
@@ -251,9 +350,17 @@ impl PointInTimeRecovery {
     ///
     /// DERIVED at every read rather than stored, because it moves with the clock: the
     /// newest point is one [`RESTORE_WINDOW_LAG`] behind now ("LatestRestorableDateTime"
-    /// trails the present) and the oldest the configured period behind now, each held at
-    /// or after the instant recovery started — before which there is nothing to restore
-    /// from. The bounds are ordered by construction, so the window is never empty.
+    /// trails the present), so it ADVANCES, and the oldest is as old as the recovery itself
+    /// while the recovery is still catching up and the configured period deep once it has
+    /// ([`RESTORE_WINDOW_DEPTH_DUE`]), so the window WIDENS. The bounds are ordered by
+    /// construction, so the window is never empty.
+    ///
+    /// The deep bound is measured from where the newest point stood when the catch-up fell
+    /// due rather than from `now`, so it is an instant that STAYS PUT while the window's
+    /// newest point goes on advancing. That is what makes the bound one a client can act
+    /// on: a caller reads the oldest restorable point and then names it — to restore to it,
+    /// or as one end of an export period — and a bound that slid forward between the read
+    /// and the call could never be named back.
     pub fn restorable_window(&self, now: SystemTime) -> Option<(SystemTime, SystemTime)> {
         let enabled_at = self.enabled_at?;
         let latest = now
@@ -261,10 +368,20 @@ impl PointInTimeRecovery {
             .unwrap_or(now)
             .max(enabled_at);
         let period = u32::try_from(self.recovery_period_in_days).unwrap_or_default();
-        let earliest = now
-            .checked_sub(DAY * period)
-            .unwrap_or(now)
-            .clamp(enabled_at, latest);
+        // Where the newest point stood when the recovery's depth fell due, which is what
+        // the configured period is measured back from once it has.
+        let caught_up_at = enabled_at
+            .checked_add(RESTORE_WINDOW_DEPTH_DUE)
+            .unwrap_or(enabled_at);
+        let deepest_from = caught_up_at
+            .checked_sub(RESTORE_WINDOW_LAG)
+            .unwrap_or(enabled_at);
+        let earliest = if now >= caught_up_at {
+            deepest_from.checked_sub(DAY * period).unwrap_or(enabled_at)
+        } else {
+            enabled_at
+        }
+        .min(latest);
         // A window is only offered over the item versions the journal still holds: where
         // it had to drop the oldest of them, its horizon is the oldest point the table can
         // still be reproduced at, so that is where the window starts.
@@ -317,6 +434,30 @@ impl PointInTimeRecovery {
         point: SystemTime,
     ) -> BTreeMap<ItemKey, Item> {
         self.journal.items_at(current, point)
+    }
+
+    /// What CHANGED in a table that HOLDS `current` between `from` (inclusive) and `to`
+    /// (exclusive): what an INCREMENTAL export of that period writes.
+    ///
+    /// "The incremental export will reflect the table's state including and after this
+    /// point in time" (`IncrementalExportSpecification$ExportFromTime`) and "just prior to
+    /// this point in time" (`$ExportToTime`), so the period is half-open and one record
+    /// carries the item as it stood on either side of it
+    /// ([`RecoveryJournal::changes_between`]). Computed from the versions this recovery
+    /// kept, so an item nothing wrote inside the period is no part of the answer and one
+    /// written back to the value it already held is not a change.
+    /// `key_attributes` names the key of a stored item the way its table's key schema does
+    /// ([`Table::key_attributes`]) — the journal holds a key's VALUES, and only the table
+    /// knows the attributes they are the values of.
+    pub fn changes_between(
+        &self,
+        current: &BTreeMap<ItemKey, Item>,
+        from: SystemTime,
+        to: SystemTime,
+        key_attributes: impl Fn(&Item) -> Item,
+    ) -> Vec<ItemChange> {
+        self.journal
+            .changes_between(current, from, to, key_attributes)
     }
 
     /// The continuous-backups settings as the two continuous-backups operations report

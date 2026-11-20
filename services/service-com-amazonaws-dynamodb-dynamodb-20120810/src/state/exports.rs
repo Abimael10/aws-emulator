@@ -166,6 +166,11 @@ pub struct ExportRequest {
     /// "The ID of the KMS managed key used to encrypt the S3 bucket where export data
     /// will be stored" (`$S3SseKmsKeyId`).
     pub s3_sse_kms_key_id: Option<String>,
+    /// "Optional object containing the parameters specific to an incremental export"
+    /// (`$IncrementalExportSpecification`), as the request stated it
+    /// ([`RequestedIncrementalExport`]) — so two calls that state the same period ask for
+    /// the same export, and one that states a different period asks for another.
+    pub incremental_export_specification: Option<RequestedIncrementalExport>,
 }
 
 /// Why an export task did not write its data: "Status code for the result of the failed
@@ -233,12 +238,19 @@ pub struct Export {
     /// objects did not land reports `FAILED` and this reason once its span has elapsed,
     /// rather than a completion it did not achieve.
     pub failure: Option<ExportFailure>,
+    /// The period an INCREMENTAL export was taken over, as the request RESOLVED to
+    /// ([`IncrementalExportWindow`]), and `None` for a full export — which is taken at one
+    /// point in time instead. It is what the export readers report as this export's
+    /// `IncrementalExportSpecification`, and what its data was read between.
+    pub incremental: Option<IncrementalExportWindow>,
 }
 
 impl Export {
     /// The export an `ExportTableToPointInTime` at `now` starts from `table`, over
-    /// `exported` — the items that table held AT `export_time`
-    /// ([`PointInTimeRecovery::items_at`]), which are the items this export writes.
+    /// `exported` — the data the task writes: the items that table held AT `export_time`
+    /// ([`PointInTimeRecovery::items_at`]) for a full export, and what changed over the
+    /// period `incremental` names ([`PointInTimeRecovery::changes_between`]) for an
+    /// incremental one.
     ///
     /// Everything the record reports of the TABLE is read off it here, at the instant of
     /// the request — its own id, the items and item data of the point in time it is taken
@@ -246,8 +258,9 @@ impl Export {
     /// once the table moves on.
     pub fn started(
         table: &Table,
-        exported: &BTreeMap<ItemKey, Item>,
+        exported: &ExportedData,
         request: ExportRequest,
+        incremental: Option<IncrementalExportWindow>,
         export_time: SystemTime,
         client_token: Option<String>,
         now: SystemTime,
@@ -266,11 +279,12 @@ impl Export {
             export_time,
             started_at,
             completes_at: started_at + STATUS_TRANSITION,
-            item_count: i64::try_from(exported.len()).unwrap_or(i64::MAX),
+            item_count: i64::try_from(exported.item_count()).unwrap_or(i64::MAX),
             billed_size_bytes: table.reported_counters.size_bytes,
             // Nothing has been written yet, so nothing has failed yet: the caller records
             // the reason here if the write does not land.
             failure: None,
+            incremental,
         }
     }
 
@@ -405,10 +419,13 @@ impl Export {
             // Reported by the catalogue's readers only ([`Self::described`]).
             destination_type: None,
             export_type: Some(self.request.export_type.clone()),
-            // An incremental export is the only kind that carries one, and no stored
-            // record is of that kind yet (the operation refuses it as unimplemented), so
-            // there is none to report; the same holds for an export's filter criteria.
-            incremental_export_specification: None,
+            // The period an incremental export was taken over, which is the only kind of
+            // export that carries one ([`IncrementalExportWindow`]); an export's filter
+            // criteria are not written yet, so no record carries any.
+            incremental_export_specification: self
+                .incremental
+                .as_ref()
+                .map(IncrementalExportWindow::describe),
             filter_specification: None,
         }
     }
