@@ -230,20 +230,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The FARGATE and FARGATE_SPOT capacity providers are reserved and can't be
         // deleted": they are resolved rather than stored
-        // ([`crate::state::managed_capacity_provider`]), so a delete that names one names a
-        // provider of Amazon ECS's own — refused for the parameter it carried, with nothing
-        // written.
-        if crate::state::MANAGED_CAPACITY_PROVIDERS.contains(&name.as_str()) {
-            return Err(
-                DeleteCapacityProviderErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(
-                            crate::state::RESERVED_CAPACITY_PROVIDER_DELETE_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
+        // ([`crate::state::managed_capacity_provider`]), so a delete that names one asks to
+        // retire a provider of Amazon ECS's own — the client action a reserved provider
+        // cannot be modified by, refused in `ClientException` with the sentence every
+        // operation reports it with
+        // ([`crate::state::reserved_capacity_provider_refusal`]) and nothing written.
+        if let Some(message) = crate::state::reserved_capacity_provider_refusal(&name) {
+            return Err(DeleteCapacityProviderErrorModeled::ClientException(
+                ClientException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
         }
 
         // "Only capacity providers that aren't associated with a cluster can be deleted. To
@@ -261,9 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A name that resolves to no provider of this account names nothing to delete.
         // Amazon ECS answers an identifier it cannot RESOLVE in `ClientException` — "it
         // might be specifying an identifier that isn't valid" — keeping
-        // `InvalidParameterException` for a parameter value it will not accept (the
-        // reserved names above, a provider scoped to another cluster below), so a client
-        // branching on the code can tell "no such provider" from "bad request".
+        // `InvalidParameterException` for a parameter value it will not accept (a provider
+        // scoped to another cluster below), so a client branching on the code can tell "no
+        // such provider" from "bad request".
         let Some(stored) = guard.capacity_providers.get_mut(&name) else {
             return Err(DeleteCapacityProviderErrorModeled::ClientException(
                 ClientException {

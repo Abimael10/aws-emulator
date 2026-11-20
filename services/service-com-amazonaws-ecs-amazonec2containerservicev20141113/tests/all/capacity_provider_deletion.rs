@@ -52,12 +52,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// condition it waits on holds.
 const POLL_BUDGET: Duration = Duration::from_secs(60);
 
-/// The whole of the sentence a delete of one of the providers Amazon ECS manages earns,
-/// which is the operation's own documented rule.
+/// The whole of the sentence a delete of one of the providers Amazon ECS RESERVES earns:
+/// the one sentence every operation asked to modify such a provider reports, spanned over
+/// both of those operations by the `capacity_providers` suite.
 const RESERVED_REFUSAL: &str =
-    "The FARGATE and FARGATE_SPOT capacity providers are reserved and can't be deleted. \
-     You can disassociate them from a cluster using either PutClusterCapacityProviders or \
-     by deleting the cluster.";
+    "The specified capacity provider is reserved and cannot be modified by this operation. \
+     Specify a valid name or ARN and try again.";
 
 /// The sentence a name that resolves to no capacity provider of this account earns, in
 /// the class Amazon ECS answers an identifier it cannot RESOLVE in: `ClientException`
@@ -528,13 +528,13 @@ async fn a_delete_outside_the_operations_rules_is_refused_and_writes_nothing() {
         RefusalCase {
             case: "the FARGATE provider Amazon ECS manages",
             request: || json!({ "capacityProvider": "FARGATE" }),
-            code: "InvalidParameterException",
+            code: "ClientException",
             message: RESERVED_REFUSAL,
         },
         RefusalCase {
             case: "the FARGATE_SPOT provider Amazon ECS manages",
             request: || json!({ "capacityProvider": "FARGATE_SPOT" }),
-            code: "InvalidParameterException",
+            code: "ClientException",
             message: RESERVED_REFUSAL,
         },
         RefusalCase {

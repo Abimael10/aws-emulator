@@ -458,6 +458,11 @@ pub use ec2_capacity::*;
 mod capacity_provider_deletion;
 pub use capacity_provider_deletion::*;
 
+/// The capacity providers Amazon ECS RESERVES for every account, and the refusal an
+/// operation asked to modify one of them answers with.
+mod capacity_provider_reservation;
+pub use capacity_provider_reservation::*;
+
 /// The scaling configuration an Auto Scaling group capacity provider is stored with: the
 /// managed-scaling members and the managed-draining option Amazon ECS fills in for a create
 /// that names none.

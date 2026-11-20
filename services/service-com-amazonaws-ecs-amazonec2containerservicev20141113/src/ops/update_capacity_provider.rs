@@ -309,14 +309,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A capacity provider Amazon ECS reserves for every account carries no configuration
+        // of the caller's to update — it is resolved rather than stored
+        // ([`crate::state::managed_capacity_provider`]) — so an update that names one asks to
+        // modify a provider of Amazon ECS's own. That is the same client action a delete of
+        // one is refused for, in the same class and with the same sentence
+        // ([`crate::state::reserved_capacity_provider_refusal`]), and it is asked BEFORE the
+        // store is read, so a reserved provider is never reported as one the account holds
+        // none of.
+        if let Some(message) = crate::state::reserved_capacity_provider_refusal(&name) {
+            return Err(UpdateCapacityProviderErrorModeled::ClientException(
+                ClientException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A name that resolves to no LIVE provider of this account names nothing to update:
-        // the providers Amazon ECS manages for every account carry no configuration of the
-        // caller's and are resolved rather than stored, and a retired provider is a
-        // tombstone no update can bring back. Amazon ECS answers an identifier it cannot
-        // RESOLVE in `ClientException` — "it might be specifying an identifier that isn't
-        // valid" — keeping `InvalidParameterException` for a parameter value it will not
-        // accept, so a client branching on the code can tell "no such provider" from "bad
-        // request". The sentence is the one every report of this condition carries
+        // a retired provider is a tombstone no update can bring back. Amazon ECS answers an
+        // identifier it cannot RESOLVE in `ClientException` — "it might be specifying an
+        // identifier that isn't valid" — keeping `InvalidParameterException` for a parameter
+        // value it will not accept, so a client branching on the code can tell "no such
+        // provider" from "bad request". The sentence is the one every report of this
+        // condition carries
         // ([`crate::state::CAPACITY_PROVIDER_MISSING_MESSAGE`]), which a batch read reports
         // as a `Failure$reason` because it has a channel for it and this operation reports
         // as its error because it has none.

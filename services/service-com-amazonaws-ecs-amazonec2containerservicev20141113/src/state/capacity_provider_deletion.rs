@@ -39,15 +39,6 @@ pub const CAPACITY_PROVIDER_DELETE_COMPLETE: &str = "DELETE_COMPLETE";
 /// the delete it was asked for did not happen.
 pub const CAPACITY_PROVIDER_DELETE_FAILED: &str = "DELETE_FAILED";
 
-/// `InvalidParameterException$message` for a delete that names one of the capacity
-/// providers Amazon ECS manages for every account ([`MANAGED_CAPACITY_PROVIDERS`]). The
-/// operation's own doc sentence, which states the whole rule: "The FARGATE and
-/// FARGATE_SPOT capacity providers are reserved and can't be deleted."
-pub const RESERVED_CAPACITY_PROVIDER_DELETE_MESSAGE: &str =
-    "The FARGATE and FARGATE_SPOT capacity providers are reserved and can't be deleted. \
-     You can disassociate them from a cluster using either PutClusterCapacityProviders or \
-     by deleting the cluster.";
-
 /// `InvalidParameterException$message` for a delete of a CLUSTER-SCOPED capacity provider
 /// that does not name the cluster the provider is scoped to. The
 /// `DeleteCapacityProvider$cluster` doc states the whole rule in one sentence: "Managed

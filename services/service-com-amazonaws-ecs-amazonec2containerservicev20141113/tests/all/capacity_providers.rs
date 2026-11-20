@@ -1591,3 +1591,184 @@ async fn an_update_that_cannot_be_satisfied_is_refused_and_writes_nothing() {
         }
     }
 }
+
+/// The whole sentence an operation asked to MODIFY a capacity provider Amazon ECS reserves
+/// for every account is refused with: fixed text for the class, naming neither the provider
+/// the request carried nor the operation that was asked.
+const RESERVED_PROVIDER_REFUSAL: &str =
+    "The specified capacity provider is reserved and cannot be modified by this operation. \
+     Specify a valid name or ARN and try again.";
+
+/// The class that refusal is answered in: a client action Amazon ECS will not perform, as
+/// against the `InvalidParameterException` a parameter value it cannot read earns.
+const RESERVED_PROVIDER_CODE: &str = "ClientException";
+
+/// The capacity providers Amazon ECS reserves for every account — the whole catalogue, as
+/// `UpdateService$capacityProviderStrategy` publishes it ("When you use Fargate, the
+/// capacity providers are FARGATE or FARGATE_SPOT"; `smithy_query` query="doc"
+/// shape="UpdateServiceRequest" member="capacityProviderStrategy").
+const RESERVED_PROVIDERS: [&str; 2] = ["FARGATE", "FARGATE_SPOT"];
+
+/// One row of the reserved-provider table: which operation is asked, and the request it is
+/// asked with.
+struct ReservedCase {
+    case: &'static str,
+    operation: &'static str,
+    request: fn() -> Value,
+}
+
+#[tokio::test]
+async fn a_reserved_capacity_provider_cannot_be_modified() {
+    // The rule: a capacity provider Amazon ECS reserves for every account is published by
+    // the service rather than held by the caller, so an operation asked to MODIFY one — to
+    // retire it or to change its configuration — is refused with HTTP 400 and
+    // `ClientException` carrying the one fixed reserved-provider sentence, whatever else the
+    // request names, and nothing about the provider changes.
+    //
+    // The rows differ along what the rule generalises over: WHICH reserved provider is named
+    // (both of them, which is the whole catalogue, [`RESERVED_PROVIDERS`]), HOW it is named
+    // (the short name and the full ARN form a reference to a provider accepts), WHICH
+    // operation asks (the delete and the update), whether the request names a live `cluster`
+    // as well, and which class of configuration an update carries.
+    let router = service();
+    create_cluster(&router, "live", "setup").await;
+    create_auto_scaling_group(&router, "asg-unreserved", "setup").await;
+    ok(
+        &router,
+        "CreateCapacityProvider",
+        json!({
+            "name": "unreserved",
+            "autoScalingGroupProvider": { "autoScalingGroupArn": group_arn("asg-unreserved") },
+        }),
+        "setup",
+    )
+    .await;
+
+    let rows = [
+        ReservedCase {
+            case: "a delete naming FARGATE by its short name",
+            operation: "DeleteCapacityProvider",
+            request: || json!({ "capacityProvider": "FARGATE" }),
+        },
+        ReservedCase {
+            case: "a delete naming FARGATE_SPOT by its short name",
+            operation: "DeleteCapacityProvider",
+            request: || json!({ "capacityProvider": "FARGATE_SPOT" }),
+        },
+        ReservedCase {
+            case: "a delete naming FARGATE by its ARN",
+            operation: "DeleteCapacityProvider",
+            request: || json!({ "capacityProvider": capacity_provider_arn("FARGATE") }),
+        },
+        ReservedCase {
+            case: "a delete naming FARGATE_SPOT by its ARN, through a live cluster",
+            operation: "DeleteCapacityProvider",
+            request: || {
+                json!({
+                    "capacityProvider": capacity_provider_arn("FARGATE_SPOT"),
+                    "cluster": "live",
+                })
+            },
+        },
+        ReservedCase {
+            case: "a delete naming FARGATE through a live cluster",
+            operation: "DeleteCapacityProvider",
+            request: || json!({ "capacityProvider": "FARGATE", "cluster": "live" }),
+        },
+        ReservedCase {
+            case: "an update of FARGATE carrying an Auto Scaling group configuration",
+            operation: "UpdateCapacityProvider",
+            request: || {
+                json!({
+                    "name": "FARGATE",
+                    "autoScalingGroupProvider": { "managedDraining": "DISABLED" },
+                })
+            },
+        },
+        ReservedCase {
+            case: "an update of FARGATE_SPOT carrying a managed-scaling block",
+            operation: "UpdateCapacityProvider",
+            request: || {
+                json!({
+                    "name": "FARGATE_SPOT",
+                    "autoScalingGroupProvider": {
+                        "managedScaling": { "status": "ENABLED", "targetCapacity": 50 },
+                    },
+                })
+            },
+        },
+        ReservedCase {
+            case: "an update of FARGATE carrying a managed-instances configuration",
+            operation: "UpdateCapacityProvider",
+            request: || {
+                json!({ "name": "FARGATE", "managedInstancesProvider": managed_instances() })
+            },
+        },
+        ReservedCase {
+            case: "an update naming FARGATE_SPOT by its ARN, through a live cluster",
+            operation: "UpdateCapacityProvider",
+            request: || {
+                json!({
+                    "name": capacity_provider_arn("FARGATE_SPOT"),
+                    "cluster": "live",
+                    "autoScalingGroupProvider": { "managedDraining": "ENABLED" },
+                })
+            },
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let (code, message) = refusal(&router, row.operation, (row.request)(), case).await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (RESERVED_PROVIDER_CODE, RESERVED_PROVIDER_REFUSAL),
+            "case {case:?}: expected the reserved-provider refusal, got {code:?} / {message:?}"
+        );
+    }
+
+    // Every refused call left the reserved providers exactly as the account holds them: each
+    // is still reported, `ACTIVE`, with no update of any kind against it — so the refusal is
+    // the request being turned away and not a provider being retired.
+    for name in RESERVED_PROVIDERS {
+        let case = "a reserved provider the refusals did not touch";
+        let provider = describe(&router, name, false, case).await;
+        assert_eq!(
+            (string(&provider, "name", case), lifecycle(&provider, case)),
+            (name.to_string(), ("ACTIVE".to_string(), None)),
+            "case {case:?}: expected {name} ACTIVE with no update, got {provider}"
+        );
+    }
+
+    // The same two operations serve a provider the ACCOUNT holds, so the rows above are the
+    // reserved names being refused and not these operations refusing every request: the
+    // caller's own provider takes the update and is then retired.
+    let case = "the account's own provider is modified by the same operations";
+    let updated = ok(
+        &router,
+        "UpdateCapacityProvider",
+        json!({
+            "name": "unreserved",
+            "autoScalingGroupProvider": { "managedDraining": "DISABLED" },
+        }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        string(&updated["capacityProvider"], "name", case),
+        "unreserved",
+        "case {case:?}: expected the update to report the provider, got {updated}"
+    );
+    let deleted = ok(
+        &router,
+        "DeleteCapacityProvider",
+        json!({ "capacityProvider": "unreserved" }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        string(&deleted["capacityProvider"], "status", case),
+        "INACTIVE",
+        "case {case:?}: expected the delete to retire the provider, got {deleted}"
+    );
+}
