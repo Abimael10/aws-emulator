@@ -26,6 +26,7 @@ pub mod action_resource_types;
 pub mod authorization;
 pub mod credential_report;
 pub mod emulator_clock;
+pub mod entity_descriptions;
 pub mod entity_path;
 pub mod entity_references;
 pub mod identity_provider_metadata;
@@ -59,6 +60,7 @@ pub use account_summary::*;
 pub use action_resource_types::*;
 pub use credential_report::*;
 pub use emulator_clock::*;
+pub use entity_descriptions::*;
 pub use entity_path::*;
 pub use entity_references::*;
 pub use identity_provider_metadata::*;
@@ -2338,7 +2340,10 @@ pub fn insert_service_linked_role(
         create_date: now(),
         // The service that the role is linked to is the one that can assume it.
         assume_role_policy_document: Some(service_linked_role_trust_policy(service_principal)),
-        description,
+        // The one spelling a record keeps for the absence of a description
+        // ([`held_description`]), so a create that supplied none and one that supplied no
+        // text leave the same record behind.
+        description: held_description(description),
         max_session_duration: Some(DEFAULT_MAX_SESSION_DURATION_SECONDS),
         // A brand-new role carries neither a boundary nor tags, and has never been assumed,
         // so there is no last-used activity to report; only a role created from a role

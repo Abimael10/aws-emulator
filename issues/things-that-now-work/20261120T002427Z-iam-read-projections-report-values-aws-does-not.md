@@ -64,3 +64,18 @@ Cause 4 — fixture iam-service-access-analysis-and-role-template-reports step t
 3. Cause 2: replay fixture iam-policy-empty-description-regional-resource-tag-change-new-default-version-then-not-found step task#3 — CreatePolicy with no (or empty) Description, then GetPolicy on its ARN; the response contains an empty Description element where AWS omits the member.
 4. Cause 3: replay fixture iam-inline-role-policy-single-statement-object-read-back-then-deleted-twice step task#5 — PutRolePolicy with the fixture's single-statement document, then SimulatePrincipalPolicy for the matching action; read EvaluationResults/MatchedStatements/StartPosition/Column. It is one less than the 1-based column of the Statement element.
 5. Cause 4: replay fixture iam-service-access-analysis-and-role-template-reports step task#4 — GenerateServiceLastAccessedDetails then GetServiceLastAccessedDetails on the JobId; compare ServicesLastAccessed namespaces/names positionally. Entries such as application-signals, appstudio and apptest are missing and display names differ, shifting every later position.
+
+## Resolution
+
+Fixed, cause 1: the published role-template catalog (`src/state/role_templates.rs`) carries the publishing service's own text and published version id per entry — the power-user template's description sentence, the `RoleName` parameter's description and that entry's `TemplateVersionId`. Replay keys `RoleTemplateVersion.Description`, `ParametersDefinition.member[*].Description` and `TemplateVersionId` pass.
+
+Fixed, cause 2: a description carrying no text is held as none — the one spelling a record keeps for the absence of a description (`src/state/entity_descriptions.rs`, applied by every writer of a described entity) — so no reader serializes an empty `Description` element. Replay key `GetPolicy … Policy.Description` passes.
+
+Fixed, cause 3: the statement element's opening delimiter is not part of the statement inside it, so the single statement an object states begins at the character after that object's brace, exactly as a list's first statement begins after its `[` (`src/state/statement_positions.rs`). Replay key `MatchedStatements.member.StartPosition.Column` passes.
+
+Fixed, cause 4, as far as the evidence reaches: `application-cost-profiler` is a published prefix access-advisor data reports no entry for, `application-signals`, `appstudio` and `apptest` are enumerated at their ascending places, and `applicationinsights` carries the name the data publishes (`src/state/reported_services.rs`). The namespace set was then verified position by position by replaying with the report's page truncated to a prefix (`state::SERVICE_LAST_ACCESSED_PAGE_SIZE`), the method this report's predecessor used: every `ServiceNamespace` through `member[27]` matches the recording, which also established the entry at `member[26]`, the previously absent `arc-region-switch` prefix.
+
+Still open: `ServicesLastAccessed.member[*].ServiceName` and `.ServiceNamespace` past that verified prefix, at positions whose recorded values the replay withholds. The same truncation method narrows what remains, so the next report needs only these two values:
+
+* the `ServiceName` AWS reports for `arc-region-switch` — the first display name that still differs (`member[26]`); the catalog currently carries that service's published name, `AWS ARC - Region switch`, which is not the one the recording holds;
+* the first `ServiceNamespace` that still differs, which lies between `member[28]` (`arsenal`) and `member[59]` (`cloudshell`): its index, the namespace AWS reports there and the name it reports for it.

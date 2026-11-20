@@ -145,6 +145,14 @@ impl CreateCase {
         }
         params
     }
+
+    /// The `Description` the response must report for this row: the text the request
+    /// carried, and NO member where it carried none or carried no text — a description
+    /// carrying no text is no description, which is the one state a record keeps for its
+    /// absence (`state::held_description`).
+    fn reported_description(&self) -> Option<&'static str> {
+        self.description.filter(|text| !text.is_empty())
+    }
 }
 
 /// A policy ARN satisfying `arnType` (length 20..2048), used as a permissions
@@ -268,10 +276,10 @@ async fn create_persists_every_member_and_get_role_reads_it_back() {
         );
         assert_eq!(
             optional(&body, "Description").as_deref(),
-            case.description,
+            case.reported_description(),
             "case {:?}: expected Description {:?}, got {body}",
             case.name,
-            case.description
+            case.reported_description()
         );
         let (reported_document, parsed_document) = reported_policy(&body);
         assert_eq!(

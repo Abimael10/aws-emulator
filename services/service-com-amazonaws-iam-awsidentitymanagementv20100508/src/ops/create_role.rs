@@ -369,7 +369,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             assume_role_policy_document: Some(crate::state::stored_trust_policy(
                 &input.assume_role_policy_document,
             )),
-            description: input.description,
+            // A `Description` carrying no text is no description, so it is held as none —
+            // the one spelling a record keeps for its absence
+            // (`crate::state::held_description`) — and no reader of the role then reports
+            // the member at all.
+            description: crate::state::held_description(input.description),
             // "If you do not specify a value for this setting, the default value of
             // one hour is applied."
             max_session_duration: Some(

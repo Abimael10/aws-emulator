@@ -7,11 +7,14 @@
 //!
 //! The spans of the statements of ONE document are CONTIGUOUS: a statement begins where the
 //! statement before it ended, so the separator between two statements belongs to the span of
-//! the one that follows it, and the FIRST statement of a document begins at its own first
-//! character. That is what makes the span of a statement independent of how the document is
-//! written: a document laid out `},{` and one laid out `}, {` both report the statement
-//! after the separator as beginning where the one before it ended, and no position of the
-//! document is attributed to no statement.
+//! the one that follows it, and the FIRST statement of a document begins after the character
+//! that OPENS the statement element — its own first character where the element is the list
+//! `[{…}]`, and the character inside the braces where the element is the single statement an
+//! object states, since that object's brace delimits the element the way `[` does. That is
+//! what makes the span of a statement independent of how the document is written: a document
+//! laid out `},{` and one laid out `}, {` both report the statement after the separator as
+//! beginning where the one before it ended, and no position of the document is attributed to
+//! no statement.
 //!
 //! A simulation reports the statements that determined its decision
 //! (`EvaluationResult$MatchedStatements`), and each entry of that report locates the
@@ -87,10 +90,11 @@ pub struct StatementSpan {
 ///
 /// The spans TILE the statement list: the statement at index `n` begins where the statement
 /// at `n - 1` ended, which is one character past that statement's last, and the statement at
-/// index `0` begins at its own first character. So the separator a document puts between two
-/// statements — a comma, and whatever space is written around it — is part of the span of
-/// the statement that follows it, and how the document is laid out around a statement does
-/// not change where that statement is reported to begin relative to the one before it.
+/// index `0` begins after the character that opens the statement element
+/// ([`statement_byte_ranges`]). So the separator a document puts between two statements — a
+/// comma, and whatever space is written around it — is part of the span of the statement that
+/// follows it, and how the document is laid out around a statement does not change where that
+/// statement is reported to begin relative to the one before it.
 ///
 /// Empty for a document that locates nothing: one this cannot read as JSON, one whose
 /// top-level value is not an object, and one whose `Statement` element is neither an array
@@ -138,7 +142,10 @@ pub fn statement_spans_of(documents: &[String]) -> Vec<Vec<StatementSpan>> {
 }
 
 /// The `(first byte, first byte past the last)` of each statement of `document`, in
-/// document order.
+/// document order — the statement a LIST states from its own first byte, and the single
+/// statement an OBJECT states from the byte after the brace that opens it, since that brace
+/// opens the statement element rather than belonging to the statement.
+///
 ///
 /// The LAST `Statement` element wins when a document repeats the key, because that is the
 /// value a JSON reader keeps — `serde_json`, which the evaluation reads the same document
@@ -173,11 +180,25 @@ fn statement_byte_ranges(document: &str) -> Vec<(usize, usize)> {
             .take(MAX_LOCATED_STATEMENTS)
             .map(byte_range)
             .collect(),
-        single @ JsonValue::Object(_) => vec![byte_range(single)],
+        single @ JsonValue::Object(_) => {
+            let (opens, ends) = byte_range(single);
+            // The brace that opens that object DELIMITS the statement element, the way a
+            // list's `[` does, rather than being part of the statement inside it: the
+            // element is the statement list, and the one statement it carries begins after
+            // the character that opens the list — which for a list written `[{` is that
+            // statement's own `{`. So the span begins one character past the brace and
+            // still ends one character past the statement's last.
+            vec![(opens + OBJECT_STATEMENT_LIST_OPENER.len_utf8(), ends)]
+        }
         // An element that is neither states no statement, which locates nothing.
         _ => Vec::new(),
     }
 }
+
+/// The character that opens a `Statement` element stating ONE statement as an object: the
+/// statement inside it begins after this, exactly as the first statement of a list begins
+/// after the list's `[` ([`statement_byte_ranges`]).
+const OBJECT_STATEMENT_LIST_OPENER: char = '{';
 
 /// The `(first byte, first byte past the last)` one value occupies, as the reader reports
 /// it.
@@ -246,7 +267,7 @@ mod tests {
 
     /// RULE: each statement ENDS at the row and column one character past its last and
     /// BEGINS where the statement before it ended, both counted from one — the first
-    /// statement of a document at its own first character.
+    /// statement of a document after the character that opens the statement element.
     #[test]
     fn a_statement_is_located_from_its_first_character_to_past_its_last() {
         // (case, the document, the span of each of its statements)
@@ -284,7 +305,10 @@ mod tests {
             (
                 "a single statement stated as an object",
                 r#"{"Statement":{"Effect":"Allow"}}"#,
-                &[(1, 14, 1, 32)],
+                // The object's `{` is the 14th character and it OPENS the statement
+                // element, so the statement it states begins at the 15th; its `}` is the
+                // 31st, so the statement ends at the 32nd.
+                &[(1, 15, 1, 32)],
             ),
             (
                 "a document that is not JSON",

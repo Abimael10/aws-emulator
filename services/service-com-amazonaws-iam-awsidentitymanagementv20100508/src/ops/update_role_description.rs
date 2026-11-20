@@ -221,7 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        role.description = Some(input.description);
+        // The new description, held in the one spelling a record keeps for a description
+        // carrying no text at all (`crate::state::held_description`): a replacement by the
+        // empty string leaves the role undescribed, which is what every later read reports.
+        role.description = crate::state::held_description(Some(input.description));
 
         Ok(UpdateRoleDescriptionOutput {
             // The updated record, with its trust policy in the form every IAM response

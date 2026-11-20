@@ -336,7 +336,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A customer managed policy can be attached to a user, group or role —
             // that is what makes the ARN usable as a role's permissions boundary.
             is_attachable: true,
-            description: input.description,
+            // A `Description` carrying no text is no description, so it is held as none —
+            // the one spelling a record keeps for its absence
+            // (`crate::state::held_description`) — and no reader of the policy, this
+            // response included, then reports the member at all.
+            description: crate::state::held_description(input.description),
             create_date: Some(created),
             update_date: Some(created),
             // An empty `Tags` list is HELD as none, the one spelling a record keeps for

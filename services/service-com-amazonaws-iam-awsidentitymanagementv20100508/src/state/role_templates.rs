@@ -497,8 +497,8 @@ pub const PUBLISHED_ROLE_TEMPLATES: &[PublishedRoleTemplate] = &[
         template_name: "PowerUserRoleTemplate",
         major_version: 1,
         minor_version: 0,
-        template_version_id: "AVTAJ5QZWK3MTPVNHLYRB",
-        description: "Grants power-user access to the service principal that you specify. Roles that you create from this template can use the Amazon Web Services services and resources of the account, but cannot manage IAM users, groups, policies or account settings.",
+        template_version_id: "AVTAZKAPJZG4N6BGA67NU",
+        description: "Creates a role that grants PowerUser permissions to the calling AWS service, allowing it to create and manage most AWS resources on your behalf. Intended for services that require wide-ranging permissions. The trusted service is configurable via the AWSServiceName parameter.",
         role_name_pattern: "@{RoleName}",
         // A power-user role is a role of the account's own rather than a service role, so it
         // is created where every entity whose create names no path goes: the account root.
@@ -519,7 +519,7 @@ pub const PUBLISHED_ROLE_TEMPLATES: &[PublishedRoleTemplate] = &[
             PublishedTemplateParameter {
                 name: "RoleName",
                 parameter_type: "String",
-                description: "Name of the role",
+                description: "Customized name for the role",
                 // The template publishes the name the service gives the role when the
                 // request supplies none, so this parameter is one "the service uses … when
                 // you do not supply one" rather than one a caller must supply.

@@ -12,9 +12,12 @@
 //!    IAM policy" and `EndPosition` "the row and column of the end of a Statement in an IAM
 //!    policy" (`Statement$StartPosition` / `$EndPosition`, each a `Position` of `Line` and
 //!    `Column`) — so the statement ends at the row and column one character past its last
-//!    and begins where the statement before it ended, the first statement of a document at
-//!    its own first character, all counted from one, and two statements of ONE document are
-//!    told apart by them. The spans of one document therefore TILE it: the separator written
+//!    and begins where the statement before it ended, the first statement of a document
+//!    after the character that OPENS its `Statement` element — that element's own first
+//!    character where it is a list, and the character inside the braces where it is the
+//!    single statement an object states — all counted from one, and two statements of ONE
+//!    document are told apart by them. The spans of one document therefore TILE it: the
+//!    separator written
 //!    between two statements belongs to the span of the one that follows it, so how a
 //!    document spaces its separators does not move a statement's beginning relative to the
 //!    statement before it.
@@ -87,8 +90,10 @@ const SECOND_STATEMENT_SPACED: &str = r#"{"Version":"2012-10-17","Statement":[{"
 /// the 96th character — where the first statement ended — and ends at the 154th.
 const ALLOW_THEN_DENY: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:ListUsers","Resource":"*"},{"Effect":"Deny","Action":"iam:ListUsers","Resource":"*"}]}"#;
 
-/// `Statement` stated as the single statement an object carries rather than as a list: it
-/// opens at the 37th character, where the list's `[` would have been, and ends at the 95th.
+/// `Statement` stated as the single statement an object carries rather than as a list: the
+/// brace that OPENS that element is the 37th character, where the list's `[` would have
+/// been, so the statement it states begins at the 38th — the same column the minified list
+/// above puts its first statement at — and ends at the 95th.
 const SINGLE_OBJECT: &str = r#"{"Version":"2012-10-17","Statement":{"Effect":"Allow","Action":"iam:ListUsers","Resource":"*"}}"#;
 
 /// The same statement indented across lines: it opens on line 4 at column 5 and ends on
@@ -154,7 +159,7 @@ const LOCATED: &[Located] = &[
         case: "the single statement an object states",
         document: SINGLE_OBJECT,
         decision: ALLOWED,
-        start: (1, 37),
+        start: (1, 38),
         end: (1, 95),
     },
     Located {

@@ -116,13 +116,23 @@ pub const PUBLISHED_SERVICES: &[PublishedService] = &[
     PublishedService::new("appflow", "Amazon AppFlow"),
     PublishedService::unreported("appintegrations", "Amazon AppIntegrations"),
     PublishedService::new("application-autoscaling", "AWS Application Auto Scaling"),
-    PublishedService::new("application-cost-profiler", "AWS Application Cost Profiler Service"),
-    PublishedService::new("applicationinsights", "CloudWatch Application Insights"),
+    // A prefix the Service Authorization Reference still publishes, so a policy can name an
+    // action of it, for a service access-advisor data reports no entry for.
+    PublishedService::unreported("application-cost-profiler", "AWS Application Cost Profiler Service"),
+    PublishedService::new("application-signals", "Amazon CloudWatch Application Signals"),
+    PublishedService::new("applicationinsights", "Amazon CloudWatch Application Insights"),
     PublishedService::new("appmesh", "AWS App Mesh"),
     PublishedService::new("apprunner", "AWS App Runner"),
     PublishedService::new("appstream", "Amazon AppStream 2.0"),
+    PublishedService::new("appstudio", "AWS App Studio"),
     PublishedService::new("appsync", "AWS AppSync"),
+    // Mainframe Modernization is published under two prefixes, one for the service itself
+    // (`m2`) and this one for its application-testing capability, each under its own name.
+    PublishedService::new("apptest", "AWS Mainframe Modernization Application Testing"),
     PublishedService::new("aps", "Amazon Managed Service for Prometheus"),
+    // Application Recovery Controller is published under two prefixes, one per capability,
+    // each under its own name.
+    PublishedService::new("arc-region-switch", "AWS ARC - Region switch"),
     PublishedService::new("arc-zonal-shift", "AWS ARC - Zonal Shift"),
     PublishedService::new("arsenal", "Application Discovery Arsenal"),
     PublishedService::new("artifact", "AWS Artifact"),
