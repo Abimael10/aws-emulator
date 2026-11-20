@@ -285,8 +285,10 @@ fn seed_in_progress_run(emulator: &Emulator, definition_id: &str) -> (String, St
             started_at: None,
             end_at: None,
             error_reason: None,
-            endpoint: iotdeviceadvisor::state::announced_endpoint(
+            endpoint: iotdeviceadvisor::state::endpoint_for(
                 ::smithy_server_runtime::UNSERVED_URL_BASE,
+                REGION,
+                &Default::default(),
             ),
             next_transition_at: Some(now + std::time::Duration::from_secs(3600)),
         },

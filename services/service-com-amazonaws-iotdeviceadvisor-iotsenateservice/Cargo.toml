@@ -25,16 +25,16 @@ tracing = { workspace = true }
 # is served at, and of the DNS zone it may announce a host of its own in, which the endpoint
 # this service reports is rooted in.
 service-common = { path = "../common" }
-# `sha2` is declared only to keep the committed Cargo.lock valid for the `--locked` builds
-# this workspace runs: nothing in this crate reaches it since the endpoint this service
-# reports became the address this emulator answers on, which carries no derived label.
+# `sha2` derives the endpoint-id label of the host `GetEndpoint` and `StartSuiteRun` report,
+# from the account, the region and the device named (`src/state/endpoint_addressing.rs`).
 sha2 = { workspace = true }
+# `hex` renders that digest as the lower-case alphanumeric label a hostname carries.
+hex = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-hex = { workspace = true }
 # The suites that read the audit capture back share one process-wide buffer, so they
 # serialize on an async-aware lock held across awaits (`tests/all/audit_trail.rs`).
 tokio = { workspace = true, features = ["sync"] }

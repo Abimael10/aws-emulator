@@ -316,12 +316,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             |scope| scope.arn(&resource),
         );
         // The endpoint this run reports is where its PRIMARY DEVICE connects, reported
-        // the one way `GetEndpoint` reports it (`crate::state::announced_endpoint`): the
-        // address this emulator answers on, so the device is pointed back at this process.
-        // A client told this address by the start call is told the same one when it asks
-        // `GetEndpoint` where that device should connect. Resolved once, here, and
-        // persisted, so every later read of the run reports the address the start published.
-        let endpoint = crate::state::announced_endpoint(ctx.endpoint().as_str());
+        // the one way `GetEndpoint` reports it (`crate::state::announced_endpoint`): this
+        // emulator's Device Advisor hostname for that device, in the run's own scope, so the
+        // run's ARN and its endpoint name one region. A client told this host by the start
+        // call is told the same one when it asks `GetEndpoint` where that device should
+        // connect. Resolved once, here, and persisted, so every later read of the run
+        // reports the host the start published.
+        let device =
+            crate::state::DeviceIdentity::of(&input.suite_run_configuration.primary_device);
+        let endpoint = crate::state::announced_endpoint(ctx, run_region, &device);
         // Retention, so a definition run over and over cannot grow the store without
         // limit: make room for this run by dropping the oldest finished ones.
         store.prune_runs(

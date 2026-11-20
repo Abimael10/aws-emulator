@@ -137,8 +137,10 @@ impl Emulator {
                         started_at: Some(created_at),
                         end_at: Some(created_at + Duration::from_secs(1)),
                         error_reason: None,
-                        endpoint: iotdeviceadvisor::state::announced_endpoint(
+                        endpoint: iotdeviceadvisor::state::endpoint_for(
                             ::smithy_server_runtime::UNSERVED_URL_BASE,
+                            "us-east-1",
+                            &Default::default(),
                         ),
                         next_transition_at: None,
                     },
@@ -1020,17 +1022,21 @@ async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
             "case {case:?}: unexpected suiteRunArn"
         );
         let endpoint = started.string("endpoint");
-        let served = iotdeviceadvisor::state::announced_endpoint(
+        let expected = iotdeviceadvisor::state::endpoint_for(
             ::smithy_server_runtime::UNSERVED_URL_BASE,
+            "us-west-2",
+            &iotdeviceadvisor::state::DeviceIdentity {
+                thing_arn: Some(&primary_thing_arn),
+                ..Default::default()
+            },
         );
         assert_eq!(
-            endpoint, served,
-            "case {case:?}: the endpoint must be the address this emulator answers on \
-             ({served:?}), got {endpoint:?}"
+            endpoint, expected,
+            "case {case:?}: the endpoint must be this emulator's Device Advisor host for the \
+             run's primary device ({expected:?}), got {endpoint:?}"
         );
-        // The endpoint is where the device CONNECTS, so it is this emulator's own address —
-        // the one `GetEndpoint` vends over the wire for the same device, and the one it
-        // vends to a caller that names no device, since one endpoint serves them all here.
+        // The endpoint is where the device CONNECTS, so it is the host `GetEndpoint` vends
+        // over the wire for that same device — one derivation, so the two cannot drift.
         let vended = emulator
             .call(
                 "GET",
@@ -1045,18 +1051,18 @@ async fn a_suite_run_is_persisted_and_its_status_moves_on_the_clock() {
             .string("endpoint");
         assert_eq!(
             endpoint, vended,
-            "case {case:?}: the run must report the address GetEndpoint vends for its primary \
+            "case {case:?}: the run must report the host GetEndpoint vends for its primary \
              device, got {endpoint:?} and {vended:?}"
         );
         let no_device = emulator
             .call("GET", "/endpoint", "us-west-2", None)
             .await
             .string("endpoint");
-        assert_eq!(
+        assert_ne!(
             endpoint, no_device,
-            "case {case:?}: one endpoint serves every device here, so a run naming a primary \
-             device must report the address a caller naming none is answered, got \
-             {endpoint:?} and {no_device:?}"
+            "case {case:?}: a host is vended per device, so a run naming a primary device \
+             must not report the host a caller naming none is answered, got {endpoint:?} \
+             for both"
         );
 
         let run_path = format!("/suiteDefinitions/{definition_id}/suiteRuns/{run_id}");

@@ -2,10 +2,10 @@
 
 //! @op GetEndpoint
 //!
-//! Reports WHERE a device under test connects: the address THIS emulator answers on, which
-//! is the one endpoint its whole surface — and so every account, region and device under
-//! test — is served at, where AWS vends a hostname per account and per device. A pure
-//! read: the answer is the address this emulator is served at, by
+//! Reports WHERE a device under test connects: this emulator's Device Advisor hostname for
+//! the account, the region the request is signed for and the device it names — an
+//! endpoint-id label over `deviceadvisor.iot.<region>` in a zone this process answers in,
+//! inside the modelled `Endpoint` length bound. A pure read, derived by
 //! [`crate::state::announced_endpoint`], the single derivation `StartSuiteRun` also reports
 //! its run's endpoint from, so nothing is written and the endpoint a run carries for its
 //! primary device and the one this vends for that device cannot disagree.
@@ -153,10 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The endpoint this operation reports is the address THIS emulator answers on, so
-        // there is no per-endpoint record to read and none to write. A request that
-        // cannot reach this service's store at all is still the modelled server failure
-        // rather than a host answered from nowhere.
+        // The endpoint this operation reports is derived from the account, the region and
+        // the device named, so there is no per-endpoint record to read and none to write. A
+        // request that cannot reach this service's store at all is still the modelled
+        // server failure rather than a host answered from nowhere.
         if crate::state::service_state(&*self.engine).is_none() {
             return Err(GetEndpointErrorModeled::InternalServerException(
                 InternalServerException {
@@ -186,18 +186,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `authenticationMethod` says HOW the device connects, not WHICH device it is: the
         // model documents it as "the authentication method used during the device
         // connection" and couples it to none of the three identity members, each of which is
-        // "an optional parameter" on its own. It therefore takes no part in the address this
+        // "an optional parameter" on its own. It therefore takes no part in the host this
         // reports and imposes no requirement on the members the request carries — the only
         // values validated here are the device ARNs above, whose modelled length bounds and
         // enum membership the framework already enforced.
 
-        // `endpoint` is the connection target the device under test is handed and then
-        // DIALS, so what is reported is the address this emulator answers on. One endpoint
-        // serves every account, region and device here, where AWS vends a hostname per
-        // account and per device: the device named above therefore selects no other address,
-        // and the region the request signs for — which scopes the ARNs this service mints —
-        // names none either. See `crate::state::endpoint_addressing`.
-        let endpoint = crate::state::announced_endpoint(ctx.endpoint().as_str());
+        // `endpoint` is a Device Advisor hostname: the endpoint-id label AWS vends per
+        // account and per device, the plane's labels, the region the request is signed for —
+        // the same region that scopes the ARNs this service mints — and a zone this emulator
+        // answers in, so a client reads the region off it and tells this device's host from
+        // another device's and from the account-level one. See
+        // `crate::state::endpoint_addressing`.
+        let region = crate::state::request_region(ctx.parts());
+        let endpoint = crate::state::announced_endpoint(ctx, &region, &device);
         Ok(GetEndpointOutput {
             endpoint: Some(endpoint),
         })

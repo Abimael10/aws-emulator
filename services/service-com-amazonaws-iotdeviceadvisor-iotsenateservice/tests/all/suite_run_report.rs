@@ -101,8 +101,10 @@ pub(crate) fn seed_run(emulator: &Emulator, definition_id: &str, status: &str) -
             started_at: (status != "PENDING").then_some(created_at),
             end_at: terminal.then_some(created_at + Duration::from_secs(1)),
             error_reason: None,
-            endpoint: iotdeviceadvisor::state::announced_endpoint(
+            endpoint: iotdeviceadvisor::state::endpoint_for(
                 ::smithy_server_runtime::UNSERVED_URL_BASE,
+                REGION,
+                &Default::default(),
             ),
             // No transition is left owed, so the seeded status is the one the case reads.
             next_transition_at: None,

@@ -7,8 +7,7 @@
 //! the scope the PARENT's stored ARN records — its partition, region and account — and not
 //! in the scope of the request that happened to mint it, so the ARN the child reports names
 //! the one scope its parent is in, and the one ARN form that addresses the parent's scope
-//! addresses the child too. (The address the child's device connects through names no
-//! scope: it is the one address this emulator answers on.)
+//! addresses the child too.
 //!
 //! The only parent/child pair this service mints is a suite run of a suite definition (a
 //! run's resource portion is `suiterun/<suiteDefinitionId>/<suiteRunId>`, so it is not
@@ -16,7 +15,8 @@
 //! `state::parse_resource_arn` accepts), so the table below is the CROSS PRODUCT of the
 //! region a definition is created in with the region its run is started from: the same
 //! region, the service's fallback region on either side, and regions of the other published
-//! shapes.
+//! shapes. (The host the child's device connects through names the same scope: its
+//! definition's region, under a zone this emulator answers in.)
 
 use serde_json::{json, Value};
 use service_com_amazonaws_iotdeviceadvisor_iotsenateservice as iotdeviceadvisor;
@@ -151,17 +151,23 @@ async fn a_suite_run_is_minted_in_its_definitions_scope() {
                  {run_arn:?} beside definition {definition_arn:?}"
             );
 
-            // The endpoint the run reports is the address THIS emulator answers on, which is
-            // one address for every region: a run's own region is carried by its ARN, which
-            // the assertion above pins, and not by the address its device connects to.
+            // The endpoint the run reports names the scope the run is minted in — its
+            // DEFINITION's region, which the ARN assertion above pins — and the primary
+            // device the run drives, never the region the start call was signed for.
             let endpoint = started.string("endpoint");
-            let served = iotdeviceadvisor::state::announced_endpoint(
+            let thing = thing_arn(3);
+            let expected = iotdeviceadvisor::state::endpoint_for(
                 ::smithy_server_runtime::UNSERVED_URL_BASE,
+                definition_region,
+                &iotdeviceadvisor::state::DeviceIdentity {
+                    thing_arn: Some(&thing),
+                    ..Default::default()
+                },
             );
             assert_eq!(
-                endpoint, served,
-                "case {case:?}: the run's endpoint must be the address this emulator answers \
-                 on ({served:?}), got {endpoint:?}"
+                endpoint, expected,
+                "case {case:?}: the run's endpoint must be the Device Advisor host of its \
+                 definition's region for its primary device ({expected:?}), got {endpoint:?}"
             );
 
             // Round trip: the reader answers the stored ARN, read from either region.

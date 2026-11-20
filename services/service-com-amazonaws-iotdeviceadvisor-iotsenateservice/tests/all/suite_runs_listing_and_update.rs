@@ -59,8 +59,10 @@ fn seed_finished_run(
             started_at: Some(created_at),
             end_at: Some(created_at + Duration::from_secs(1)),
             error_reason: None,
-            endpoint: iotdeviceadvisor::state::announced_endpoint(
+            endpoint: iotdeviceadvisor::state::endpoint_for(
                 ::smithy_server_runtime::UNSERVED_URL_BASE,
+                REGION,
+                &Default::default(),
             ),
             next_transition_at: None,
         },

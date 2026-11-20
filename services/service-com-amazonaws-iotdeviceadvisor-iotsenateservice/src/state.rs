@@ -16,11 +16,11 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{DeviceUnderTest, SuiteDefinitionConfiguration, SuiteRunConfiguration};
 
-// WHICH address an operation that reports an endpoint reports lives in
+// WHICH host an operation that reports an endpoint reports lives in
 // `state/endpoint_addressing.rs`.
 pub mod endpoint_addressing;
 
-pub use endpoint_addressing::announced_endpoint;
+pub use endpoint_addressing::{announced_endpoint, endpoint_for};
 
 /// The region an ARN falls back to when the request carries no SigV4 scope.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -429,8 +429,9 @@ pub struct SuiteRun {
     /// Set only once the status is terminal.
     pub end_at: Option<SystemTime>,
     pub error_reason: Option<String>,
-    /// Where this run's primary device connects: the address this emulator answered on when
-    /// the run was started, as [`announced_endpoint`] reads it.
+    /// Where this run's primary device connects: the Device Advisor host this emulator
+    /// reported for that device when the run was started, as [`announced_endpoint`] derives
+    /// it.
     pub endpoint: String,
     /// The instant the next status transition becomes due, while one is owed.
     pub next_transition_at: Option<SystemTime>,
