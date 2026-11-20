@@ -10,7 +10,8 @@
 //! * the batch size the SOURCE reads is bounded by what the TARGET takes in one delivery:
 //!   the source's own `@range` goes to 10,000, while a target whose batch API accepts
 //!   fewer entries per call caps it there (Amazon SQS `SendMessageBatch` and EventBridge
-//!   `PutEvents` 10, Kinesis `PutRecords` 500), and a target that takes one call per batch
+//!   `PutEvents` 10, Kinesis `PutRecords` and Amazon Data Firehose `PutRecordBatch` 500,
+//!   CloudWatch Logs `PutLogEvents` 10,000), and a target that takes one call per batch
 //!   (Lambda, Step Functions, …) caps it not at all;
 //! * a filter pattern is an EventBridge event pattern, so text that is not a JSON object is
 //!   not a pattern at all and is refused with the parser's own diagnostic for why.
@@ -27,7 +28,9 @@
 
 use serde_json::{json, Value};
 
-use crate::pipe_lifecycle::{create, describe, minimal_body, router, Reply, PAST_SETTLE};
+use crate::pipe_lifecycle::{
+    create, describe, list, listed_names, minimal_body, router, Reply, PAST_SETTLE,
+};
 use crate::pipe_refusal_bodies::{field_list, validation_error_fields};
 use crate::pipe_update::{create_body, update};
 
@@ -38,6 +41,10 @@ const TARGET_LAMBDA: &str = "arn:aws:lambda:us-west-2:000000000000:function:hand
 const TARGET_SQS: &str = "arn:aws:sqs:us-west-2:000000000000:results";
 const TARGET_EVENT_BUS: &str = "arn:aws:events:us-west-2:000000000000:event-bus/default";
 const TARGET_KINESIS: &str = "arn:aws:kinesis:us-west-2:000000000000:stream/results";
+const TARGET_FIREHOSE: &str = "arn:aws:firehose:us-west-2:000000000000:deliverystream/records";
+const TARGET_LOG_GROUP: &str = "arn:aws:logs:us-west-2:000000000000:log-group:/aws/pipes/demo";
+const SOURCE_DYNAMODB: &str =
+    "arn:aws:dynamodb:us-west-2:000000000000:table/orders/stream/2026-01-01T00:00:00.000";
 
 /// The `FilterCriteria` a read reports, which is what the pattern rule below is about: the
 /// reported `SourceParameters` also carry the batch size the pipe polls its source with,
@@ -97,9 +104,14 @@ struct Batch {
 /// `BatchSize`, the configured size and the target's maximum, and stores nothing.
 ///
 /// The rows differ along what that rule generalises over: the target service and so the
-/// cap (10 for a queue and for an event bus, 500 for a stream, none for a function), where
-/// the batch size sits relative to it (at it, one past it, far past it), and which source's
-/// parameters carry the batch size.
+/// cap (10 for a queue and for an event bus, 500 for a stream and for a delivery stream,
+/// 10,000 for a log group, none for a function), where the batch size sits relative to it
+/// (at it, one past it, far past it), and which source's parameters carry the batch size.
+///
+/// The caps are the per-call entry limits of the target services' own batch APIs
+/// (`state::target_batch_size_cap`): Amazon SQS `SendMessageBatch` and EventBridge
+/// `PutEvents` 10 entries, Kinesis `PutRecords` and Amazon Data Firehose `PutRecordBatch`
+/// 500 records, CloudWatch Logs `PutLogEvents` 10,000 events.
 #[tokio::test]
 async fn a_batch_size_past_what_the_target_takes_is_refused() {
     let rows = vec![
@@ -171,6 +183,70 @@ async fn a_batch_size_past_what_the_target_takes_is_refused() {
             target_type: "lambda",
         },
         Batch {
+            case: "delivery-stream-target-at-the-cap",
+            source: SOURCE_SQS,
+            source_parameters: json!({"SqsQueueParameters": {"BatchSize": 500}}),
+            target: TARGET_FIREHOSE,
+            batch_size: 500,
+            cap: None,
+            target_type: "firehose",
+        },
+        Batch {
+            case: "delivery-stream-target-one-past-the-cap",
+            source: SOURCE_SQS,
+            source_parameters: json!({"SqsQueueParameters": {"BatchSize": 501}}),
+            target: TARGET_FIREHOSE,
+            batch_size: 501,
+            cap: Some(500),
+            target_type: "firehose",
+        },
+        Batch {
+            // The cap belongs to the TARGET, so the stream the records come off does not
+            // change it — and the source member's own maximum is still refused by it.
+            case: "stream-source-far-past-the-delivery-stream-targets-cap",
+            source: SOURCE_DYNAMODB,
+            source_parameters: json!({
+                "DynamoDBStreamParameters": {"StartingPosition": "LATEST", "BatchSize": 10_000},
+            }),
+            target: TARGET_FIREHOSE,
+            batch_size: 10_000,
+            cap: Some(500),
+            target_type: "firehose",
+        },
+        Batch {
+            case: "stream-source-one-past-the-event-bus-targets-cap",
+            source: SOURCE_DYNAMODB,
+            source_parameters: json!({
+                "DynamoDBStreamParameters": {"StartingPosition": "LATEST", "BatchSize": 11},
+            }),
+            target: TARGET_EVENT_BUS,
+            batch_size: 11,
+            cap: Some(10),
+            target_type: "events",
+        },
+        Batch {
+            case: "stream-source-within-the-delivery-stream-targets-cap",
+            source: SOURCE_DYNAMODB,
+            source_parameters: json!({
+                "DynamoDBStreamParameters": {"StartingPosition": "LATEST", "BatchSize": 500},
+            }),
+            target: TARGET_FIREHOSE,
+            batch_size: 500,
+            cap: None,
+            target_type: "firehose",
+        },
+        Batch {
+            // The widest cap in the catalog is the source member's own maximum, so a
+            // log-group target refuses nothing the member admits.
+            case: "log-group-target-at-the-cap",
+            source: SOURCE_SQS,
+            source_parameters: json!({"SqsQueueParameters": {"BatchSize": 10_000}}),
+            target: TARGET_LOG_GROUP,
+            batch_size: 10_000,
+            cap: None,
+            target_type: "logs",
+        },
+        Batch {
             // The batch size is the same member on every source's parameters, so the rule
             // does not care which source carries it.
             case: "stream-source-past-the-queue-targets-cap",
@@ -233,6 +309,14 @@ async fn a_batch_size_past_what_the_target_takes_is_refused() {
             "case {:?}: a refused CreatePipe must have stored no pipe, got {described:?}",
             row.case
         );
+        let listed = list(&router, "").await;
+        assert_eq!(
+            listed_names(&listed),
+            Vec::<String>::new(),
+            "case {:?}: a refused CreatePipe must leave the pipe out of ListPipes, \
+             got {listed:?}",
+            row.case
+        );
     }
 }
 
@@ -243,8 +327,8 @@ async fn a_batch_size_past_what_the_target_takes_is_refused() {
 async fn an_update_into_a_batch_size_the_target_cannot_take_is_refused() {
     // (the case and pipe name, the target the pipe is created with, the SourceParameters it
     // is created with, the update body, the cap the refusal must state, the batch size it
-    // must state).
-    let rows: Vec<(&str, &str, Value, Value, i64, i64)> = vec![
+    // must state, the target service the refusal must name).
+    let rows: Vec<(&str, &str, Value, Value, i64, i64, &str)> = vec![
         (
             "batchupdate",
             TARGET_SQS,
@@ -255,6 +339,7 @@ async fn an_update_into_a_batch_size_the_target_cannot_take_is_refused() {
             }),
             10,
             40,
+            "sqs",
         ),
         (
             "targetupdate",
@@ -263,10 +348,34 @@ async fn an_update_into_a_batch_size_the_target_cannot_take_is_refused() {
             json!({"RoleArn": ROLE, "Target": TARGET_SQS}),
             10,
             40,
+            "sqs",
+        ),
+        (
+            // The same two shapes of update against the widest cap in the catalog: the
+            // rule is the target's limit, whichever target service imposes it.
+            "deliverystreambatchupdate",
+            TARGET_FIREHOSE,
+            json!({"SqsQueueParameters": {"BatchSize": 500}}),
+            json!({
+                "RoleArn": ROLE,
+                "SourceParameters": {"SqsQueueParameters": {"BatchSize": 501}},
+            }),
+            500,
+            501,
+            "firehose",
+        ),
+        (
+            "deliverystreamtargetupdate",
+            TARGET_LAMBDA,
+            json!({"SqsQueueParameters": {"BatchSize": 9_000}}),
+            json!({"RoleArn": ROLE, "Target": TARGET_FIREHOSE}),
+            500,
+            9_000,
+            "firehose",
         ),
     ];
 
-    for (case, target, created_parameters, update_body, cap, batch_size) in rows {
+    for (case, target, created_parameters, update_body, cap, batch_size, target_type) in rows {
         let router = router();
         let created = create(
             &router,
@@ -291,7 +400,7 @@ async fn an_update_into_a_batch_size_the_target_cannot_take_is_refused() {
             "BatchSize",
             &format!(
                 "The configured batch size {batch_size} is greater than the max supported \
-                 batch size {cap} for target sqs."
+                 batch size {cap} for target {target_type}."
             ),
         );
 

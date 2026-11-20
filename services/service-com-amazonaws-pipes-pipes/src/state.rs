@@ -542,8 +542,8 @@ pub fn foreign_resource_arn(arn: &str) -> Option<String> {
 /// A pipe's batch size is bounded by what the TARGET takes in ONE delivery, not by the
 /// source: each entry is the maximum number of entries that target service's own batch API
 /// accepts per call — Amazon SQS `SendMessageBatch` and EventBridge `PutEvents` 10 entries,
-/// Kinesis Data Streams `PutRecords` 500 records, CloudWatch Logs `PutLogEvents` 10,000
-/// events.
+/// Kinesis Data Streams `PutRecords` and Amazon Data Firehose `PutRecordBatch` 500 records,
+/// CloudWatch Logs `PutLogEvents` 10,000 events.
 ///
 /// A target whose delivery is ONE call per batch (Lambda, Step Functions, ECS, Batch,
 /// SageMaker, an API destination, Timestream, Redshift Data) is deliberately absent: it has
@@ -551,6 +551,7 @@ pub fn foreign_resource_arn(arn: &str) -> Option<String> {
 /// bounds it.
 const TARGET_BATCH_SIZE_CAPS: &[(&str, i32)] = &[
     ("events", 10),
+    ("firehose", 500),
     ("kinesis", 500),
     ("logs", 10_000),
     (PIPES_SERVICE_SQS, 10),
