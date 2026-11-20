@@ -26,6 +26,7 @@ use service_com_amazonaws_lambdaweb_lambdaweb::state::{
     service_state, MAX_ENDPOINTS_PER_FUNCTION, PROVISIONING_DELAY,
 };
 
+use super::endpoint_data_plane::{forbidden_page, REQUEST_ID_HEADER};
 use super::web_function_lifecycle::{
     build_config, expected_arn, percent_encoded, role_arn, Emulator, Reply,
 };
@@ -859,7 +860,11 @@ async fn function_with_a_revision(emulator: &Emulator, function_name: &str) -> S
 /// The `Pending -> Active` transition is owed to the CLOCK, so the test waits for the
 /// condition to hold rather than for a duration: it looks again until it does, or
 /// until a deadline far longer than the service's own span has passed.
-async fn poll_until_active(emulator: &Emulator, function_name: &str, endpoint_name: &str) -> Value {
+pub(crate) async fn poll_until_active(
+    emulator: &Emulator,
+    function_name: &str,
+    endpoint_name: &str,
+) -> Value {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
         let read = get_endpoint(emulator, function_name, endpoint_name).await;
@@ -1600,9 +1605,9 @@ async fn a_create_past_the_endpoint_quota_is_refused() {
 /// RULE: an endpoint created on a stored function publishes a data plane of its own —
 /// it reaches `Active` on the clock, and at its published address its `authType`
 /// decides: `IamAuth` ("requests ... must be signed with Signature Version 4") refuses
-/// a request presenting no SigV4 credential with Lambda's `403 Forbidden` document,
-/// while `ApplicationManaged` ("your application handles authorization") refuses
-/// nothing of its own.
+/// a request presenting no SigV4 credential with the `403 Forbidden` page naming the
+/// response it is, while `ApplicationManaged` ("your application handles authorization")
+/// refuses nothing of its own.
 ///
 /// What an authorized request is answered with is the web function's own handler
 /// response, and this emulator runs no web function code, so it answers `501` and
@@ -1689,10 +1694,25 @@ async fn an_endpoint_created_on_a_stored_function_serves_its_own_address() {
                 String::from_utf8_lossy(answered.body())
             );
             if *expected == 403 {
+                // The refusal names the response it is, in its own header, and the page it
+                // serves states that same id.
+                let request_id = answered
+                    .headers()
+                    .get(REQUEST_ID_HEADER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                assert!(
+                    !request_id.is_empty(),
+                    "case {case:?}/{request_case:?}: a 403 response must carry a \
+                     {REQUEST_ID_HEADER} header, got the headers {:?}",
+                    answered.headers()
+                );
                 assert_eq!(
                     String::from_utf8_lossy(answered.body()),
-                    "{\"Message\":\"Forbidden\"}",
-                    "case {case:?}/{request_case:?}: expected Lambda's Forbidden document"
+                    forbidden_page(&request_id),
+                    "case {case:?}/{request_case:?}: expected the Forbidden page naming \
+                     {request_id:?}"
                 );
             }
         }

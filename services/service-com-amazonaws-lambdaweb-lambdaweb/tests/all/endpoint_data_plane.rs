@@ -7,8 +7,9 @@
 //! request to — so it is an address this emulator answers on, and the endpoint's own
 //! requests are served there: a request for an endpoint that is not serving traffic is a
 //! `404`, an `IamAuth` endpoint ("requests ... must be signed with Signature Version 4")
-//! refuses a request presenting no SigV4 credential with Lambda's `403 Forbidden`
-//! document, and an `ApplicationManaged` endpoint ("your application handles
+//! refuses a request presenting no SigV4 credential with the `403 Forbidden` PAGE — which
+//! names the response it is, in the `lambda-web-request-id` header the page's `Request ID:`
+//! line states — and an `ApplicationManaged` endpoint ("your application handles
 //! authorization") refuses nothing of its own.
 //!
 //! The published address is read off the wire (`CreateWebFunction` and
@@ -18,13 +19,12 @@
 //! rows span the `authType` values, how a client may present a credential, and the
 //! endpoint's lifecycle state.
 
-use std::time::Duration;
-
 use serde_json::{json, Value};
 
 use service_com_amazonaws_lambdaweb_lambdaweb::state::endpoint_plane::serve_request;
-use service_com_amazonaws_lambdaweb_lambdaweb::state::{service_state, PROVISIONING_DELAY};
+use service_com_amazonaws_lambdaweb_lambdaweb::state::service_state;
 
+use super::web_function_endpoint::poll_until_active;
 use super::web_function_lifecycle::{build_config, role_arn, Emulator};
 
 /// The region every request here signs with.
@@ -34,10 +34,31 @@ const REGION: &str = "us-east-1";
 const SIGNED: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/lambda/\
                       aws4_request, SignedHeaders=host, Signature=deadbeef";
 
-/// How long a test waits for an endpoint's clock-owed `Pending -> Active` transition: it
-/// serves a revision, so it is ready one span after that revision is, plus slack.
-fn endpoint_settled() -> Duration {
-    PROVISIONING_DELAY + PROVISIONING_DELAY + Duration::from_millis(400)
+/// The response header every answer a published address names the response it is by.
+pub(crate) const REQUEST_ID_HEADER: &str = "lambda-web-request-id";
+
+/// The `403 Forbidden` page an `IamAuth` endpoint refuses a request presenting no SigV4
+/// credential with, naming the response that served it.
+///
+/// Written out here independently of the document the service builds — one entry per LINE
+/// of the page, joined by the newlines that separate them, so the indentation is part of
+/// the line and nothing is lost to a source continuation — so a drift in a tag, a sentence
+/// or a line break is caught.
+pub(crate) fn forbidden_page(request_id: &str) -> String {
+    [
+        "<!DOCTYPE html>",
+        "<html>",
+        "<head>",
+        "    <title>HTTP Error 403</title>",
+        "</head>",
+        "<body>",
+        "    <h1>403 Forbidden</h1>",
+        "    <p>You are not authorized to access this endpoint.</p>",
+        &format!("    <p>Request ID: {request_id}</p>"),
+        "</body>",
+        "</html>",
+    ]
+    .join("\n")
 }
 
 /// Create a function with one endpoint of `auth_type` through the shared harness, and
@@ -84,7 +105,19 @@ fn request_endpoint(
     uri: &str,
     headers: &[(&str, &str)],
 ) -> ::http::Response<Vec<u8>> {
-    let mut builder = ::http::Request::builder().method("GET").uri(uri);
+    requested(emulator, function_name, endpoint_name, "GET", uri, headers)
+}
+
+/// [`request_endpoint`] for a request of any method, which an unsigned request may be.
+fn requested(
+    emulator: &Emulator,
+    function_name: &str,
+    endpoint_name: &str,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+) -> ::http::Response<Vec<u8>> {
+    let mut builder = ::http::Request::builder().method(method).uri(uri);
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }
@@ -97,9 +130,23 @@ fn request_endpoint(
 /// the status the published address answers it with.
 type RequestRow<'a> = (&'a str, &'a str, &'a [(&'a str, &'a str)], u16);
 
+/// One row of the unsigned-request table: the case, the request's method, its URI and the
+/// headers it carries.
+type UnsignedRow<'a> = (&'a str, &'a str, &'a str, &'a [(&'a str, &'a str)]);
+
 /// The body of an answer from a published address, as text.
 fn body_text(response: &::http::Response<Vec<u8>>) -> String {
     String::from_utf8_lossy(response.body()).to_string()
+}
+
+/// The value of `name` on an answer from a published address, empty when it carries none.
+fn header_of(response: &::http::Response<Vec<u8>>, name: &str) -> String {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// RULE: the published `domainName` is an address this emulator answers on — a `host:port`
@@ -157,7 +204,7 @@ async fn a_published_domain_name_is_an_address_the_emulator_answers_on() {
 }
 
 /// RULE: at the published address, an `IamAuth` endpoint refuses a request presenting no
-/// SigV4 credential with Lambda's `403 Forbidden` document, and serves one that presents a
+/// SigV4 credential with the `403 Forbidden` page, and serves one that presents a
 /// credential; an `ApplicationManaged` endpoint refuses nothing of its own.
 ///
 /// What an authorized request is answered with is the web function's OWN handler response,
@@ -183,7 +230,9 @@ async fn the_published_address_applies_the_endpoints_auth_type() {
             body_text(&pending)
         );
 
-        tokio::time::sleep(endpoint_settled()).await;
+        // An endpoint serves traffic once it is `Active`, which the clock owes it: the wait
+        // is for that CONDITION, through the one poll this crate's tests share.
+        poll_until_active(&emulator, &name, "ep").await;
 
         // (case, the request URI, its headers, the status the address answers)
         let unsigned_status = if auth_type == "IamAuth" { 403 } else { 501 };
@@ -219,14 +268,107 @@ async fn the_published_address_applies_the_endpoints_auth_type() {
                 body_text(&answered)
             );
             if *expected == 403 {
+                let request_id = header_of(&answered, REQUEST_ID_HEADER);
+                assert!(
+                    !request_id.is_empty(),
+                    "case {case:?}/{request_case:?}: a 403 must name the response it is in \
+                     its {REQUEST_ID_HEADER} header"
+                );
                 assert_eq!(
                     body_text(&answered),
-                    "{\"Message\":\"Forbidden\"}",
-                    "case {case:?}/{request_case:?}: expected Lambda's Forbidden document"
+                    forbidden_page(&request_id),
+                    "case {case:?}/{request_case:?}: expected the Forbidden page naming \
+                     {request_id:?}"
                 );
             }
         }
     }
+}
+
+/// RULE: the `403` an `IamAuth` endpoint refuses a request presenting no SigV4 credential
+/// with is the `Forbidden` PAGE, served as `text/html`, and it NAMES THE RESPONSE IT IS:
+/// the id in its `Request ID:` line is the value of that same response's
+/// `lambda-web-request-id` header, and every refusal carries its own.
+///
+/// The rows span the forms an unsigned request arrives in — its method, the depth of its
+/// path, whether it carries a query string, and an `Authorization` header that is not a
+/// SigV4 credential — because the refusal depends on none of them.
+#[tokio::test]
+async fn an_unsigned_request_is_refused_with_the_forbidden_page_naming_that_response() {
+    let emulator = Emulator::new();
+    let name = "forbidden-page";
+    create_with_endpoint(&emulator, name, "IamAuth").await;
+    // The address answers the endpoint's own decisions once the endpoint is `Active`.
+    poll_until_active(&emulator, name, "ep").await;
+
+    // (case, the request's method, its URI, its headers)
+    let rows: &[UnsignedRow<'_>] = &[
+        ("an unsigned GET", "GET", "/", &[]),
+        (
+            "an unsigned GET deeper in the path",
+            "GET",
+            "/items/42/reviews",
+            &[],
+        ),
+        ("an unsigned GET with a query", "GET", "/items?page=2", &[]),
+        ("an unsigned POST", "POST", "/orders", &[]),
+        (
+            "an unsigned PUT with a query",
+            "PUT",
+            "/orders/7?mode=replace",
+            &[],
+        ),
+        (
+            "another authorization scheme",
+            "GET",
+            "/",
+            &[("authorization", "Basic dXNlcjpwYXNz")],
+        ),
+        (
+            "a bearer token",
+            "DELETE",
+            "/sessions/9",
+            &[("authorization", "Bearer abc.def")],
+        ),
+    ];
+    let mut named = Vec::new();
+    for (case, method, uri, headers) in rows {
+        let answered = requested(&emulator, name, "ep", method, uri, headers);
+        assert_eq!(
+            answered.status().as_u16(),
+            403,
+            "case {case:?}: expected 403, got {} with {:?}",
+            answered.status(),
+            body_text(&answered)
+        );
+        assert_eq!(
+            header_of(&answered, "content-type"),
+            "text/html",
+            "case {case:?}: expected the page to be served as HTML, got {:?}",
+            header_of(&answered, "content-type")
+        );
+        let request_id = header_of(&answered, REQUEST_ID_HEADER);
+        assert!(
+            !request_id.is_empty(),
+            "case {case:?}: a 403 response must carry a {REQUEST_ID_HEADER} header, got the \
+             headers {:?}",
+            answered.headers()
+        );
+        assert_eq!(
+            body_text(&answered),
+            forbidden_page(&request_id),
+            "case {case:?}: expected the Forbidden page naming {request_id:?}, got {:?}",
+            body_text(&answered)
+        );
+        named.push(request_id);
+    }
+    // The id names the RESPONSE, so two refusals are distinguishable by it.
+    let distinct: std::collections::BTreeSet<&String> = named.iter().collect();
+    assert_eq!(
+        distinct.len(),
+        named.len(),
+        "each refusal must name its own response, got {named:?}"
+    );
 }
 
 /// RULE: the published address is a socket this emulator ANSWERS on — a client that
@@ -239,7 +381,8 @@ async fn the_published_address_applies_the_endpoints_auth_type() {
 async fn a_client_that_dials_the_published_address_is_answered_there() {
     let emulator = Emulator::new();
     let domain_name = create_with_endpoint(&emulator, "dialled-endpoint", "IamAuth").await;
-    tokio::time::sleep(endpoint_settled()).await;
+    // The address answers the endpoint's own decisions once the endpoint is `Active`.
+    poll_until_active(&emulator, "dialled-endpoint", "ep").await;
 
     // (case, the request's headers, the status line the address answers with)
     let rows: [(&str, &str, &str); 2] = [
@@ -297,6 +440,67 @@ async fn dial(authority: &str, headers: &str) -> String {
     String::from_utf8_lossy(&read).to_string()
 }
 
+/// The value of the response header `name` on a raw answer read off the socket, empty when
+/// the answer carries none.
+fn header_on_the_wire(answered: &str, name: &str) -> String {
+    answered
+        .split("\r\n\r\n")
+        .next()
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(header, _)| header.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// RULE: what a CLIENT is served at the published address is the refusal itself — the page
+/// as the body and the id on the response — so a client that followed `domainName` and
+/// dialled it can show the page and correlate the refusal by its id.
+#[tokio::test]
+async fn a_dialled_unsigned_request_is_served_the_page_and_its_id() {
+    let emulator = Emulator::new();
+    let name = "dialled-refusal";
+    let domain_name = create_with_endpoint(&emulator, name, "IamAuth").await;
+    // The address answers the endpoint's own decisions once the endpoint is `Active`.
+    poll_until_active(&emulator, name, "ep").await;
+
+    // Two dials, so the per-response id is proved over the wire and not just once.
+    let mut named = Vec::new();
+    for case in ["the first dial", "the second dial"] {
+        let answered = dial(&domain_name, "").await;
+        assert!(
+            answered.starts_with("HTTP/1.1 403 Forbidden"),
+            "case {case:?}: expected a 403, got {answered:?}"
+        );
+        assert_eq!(
+            header_on_the_wire(&answered, "content-type"),
+            "text/html",
+            "case {case:?}: expected the page to be served as HTML, got {answered:?}"
+        );
+        let request_id = header_on_the_wire(&answered, REQUEST_ID_HEADER);
+        assert!(
+            !request_id.is_empty(),
+            "case {case:?}: a 403 response must carry a {REQUEST_ID_HEADER} header, got \
+             {answered:?}"
+        );
+        let body = answered
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            body,
+            forbidden_page(&request_id),
+            "case {case:?}: expected the Forbidden page naming {request_id:?}, got {body:?}"
+        );
+        named.push(request_id);
+    }
+    assert_ne!(
+        named[0], named[1],
+        "each refusal must name its own response, got {named:?}"
+    );
+}
+
 /// RULE: the address belongs to the endpoint — once the endpoint is gone, nothing is
 /// published there, and the listener it answered on is released.
 #[tokio::test]
@@ -304,7 +508,8 @@ async fn a_deleted_endpoints_address_publishes_nothing() {
     let emulator = Emulator::new();
     let name = "address-lifetime";
     create_with_endpoint(&emulator, name, "ApplicationManaged").await;
-    tokio::time::sleep(endpoint_settled()).await;
+    // The address answers the endpoint's own decisions once the endpoint is `Active`.
+    poll_until_active(&emulator, name, "ep").await;
     let serving = request_endpoint(&emulator, name, "ep", "/", &[]);
     assert_eq!(
         serving.status().as_u16(),

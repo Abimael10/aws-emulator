@@ -35,16 +35,26 @@
 //!   longer) `Active` — nothing is published there, so `404`;
 //! * on an `IamAuth` endpoint ("Lambda uses IAM to authorize requests, which must be signed
 //!   with Signature Version 4 (SigV4)"), a request presenting no SigV4 credential at all —
-//!   `403` with Lambda's own `Forbidden` document, which is what an unsigned request to an
-//!   IAM-authorized Lambda endpoint earns. What is checked is that the request PRESENTS a
-//!   SigV4 credential (in the `Authorization` header or as the query parameters of a
-//!   presigned URL); verifying a signature is the emulator's own concern and no service
-//!   does it, so nothing here claims to. An `ApplicationManaged` endpoint ("Your
-//!   application handles authorization") refuses nothing here;
+//!   `403` with the service's own `Forbidden` PAGE ([`forbidden_document`]), which is what
+//!   an unsigned request to an IAM-authorized endpoint earns. What is checked is that the
+//!   request PRESENTS a SigV4 credential (in the `Authorization` header or as the query
+//!   parameters of a presigned URL); verifying a signature is the emulator's own concern
+//!   and no service does it, so nothing here claims to. An `ApplicationManaged` endpoint
+//!   ("Your application handles authorization") refuses nothing here;
 //! * an authorized request — the web function's OWN handler response belongs here, and this
 //!   emulator runs no web function code (the revision's deployment package is JavaScript
 //!   for a Node.js runtime, and no execution engine is mounted in this crate), so the
 //!   honest answer is `501`. Nothing is synthesised in the handler's name.
+//!
+//! Every answer the ENDPOINT's own decision serves ([`serve_request`], the three above)
+//! NAMES THE RESPONSE IT IS, in the [`REQUEST_ID_HEADER`] response header: an id minted for
+//! that one response, so a client that logs or reports what the endpoint answered has a
+//! value to correlate the answer by. The `Forbidden` page states that same id in its
+//! `Request ID:` line, so the document and the header of one refusal never name two
+//! different responses. The transport refusals above it
+//! ([`refused_before_the_endpoint`], and the shed at the in-flight cap) are the CORE's own
+//! predicates, decided before an endpoint is resolved, and carry what a core HTTP listener
+//! carries.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -81,9 +91,31 @@ fn in_flight() -> Arc<Semaphore> {
 const NO_ENDPOINT_AT_THIS_ADDRESS: &str = "No web function endpoint is published at this \
                                            address.\n";
 
+/// The response header every answer a published endpoint address serves names itself by:
+/// the id of that one response, which the `Forbidden` page below also states. A client
+/// correlates a refusal it was served by this value, so a refusal that carried none would
+/// be unattributable.
+const REQUEST_ID_HEADER: &str = "lambda-web-request-id";
+
 /// What an `IamAuth` endpoint answers a request that presents no SigV4 credential: the
-/// document Lambda answers an unauthorized request to an IAM-authorized endpoint with.
-const FORBIDDEN_DOCUMENT: &str = "{\"Message\":\"Forbidden\"}";
+/// `403 Forbidden` page an unauthorized request to an IAM-authorized endpoint earns, whose
+/// only variable part is `request_id` — the id of THIS response, reported in
+/// [`REQUEST_ID_HEADER`] as well, so the page and the header name one response.
+fn forbidden_document(request_id: &str) -> String {
+    format!(
+        "<!DOCTYPE html>\n\
+         <html>\n\
+         <head>\n    \
+         <title>HTTP Error 403</title>\n\
+         </head>\n\
+         <body>\n    \
+         <h1>403 Forbidden</h1>\n    \
+         <p>You are not authorized to access this endpoint.</p>\n    \
+         <p>Request ID: {request_id}</p>\n\
+         </body>\n\
+         </html>"
+    )
+}
 
 /// What the address answers an AUTHORIZED request: the handler's own response belongs
 /// there, and no handler ran — see this module's header.
@@ -369,7 +401,8 @@ fn host_allowed(host: &str) -> bool {
 /// names none.
 const MISDIRECTED_REQUEST: u16 = 421;
 
-/// What it answers a request a browser made cross-site.
+/// What it answers a request a browser made cross-site, and the status an `IamAuth`
+/// endpoint refuses a request presenting no SigV4 credential with.
 const FORBIDDEN: u16 = 403;
 
 /// What it answers a request carrying more than one connection may.
@@ -393,7 +426,9 @@ const BODY_TOO_LARGE: &str = "This request is larger than this address accepts.\
 ///
 /// The endpoint is resolved FIRST and the authorization second, which is the order the real
 /// address works in: only an address that publishes an endpoint answers at all, and then
-/// the endpoint's `authType` decides. The one write is the clock's own
+/// the endpoint's `authType` decides. Every answer names the response it is
+/// ([`REQUEST_ID_HEADER`]), minted once here and used in both the header and the
+/// `Forbidden` page, so the two cannot disagree. The one write is the clock's own
 /// ([`ServiceState::materialise_due_transitions`]), owed at this instant whether or not
 /// anybody connected, so reaching an endpoint changes nothing a later caller sees.
 pub fn serve_request(
@@ -404,6 +439,10 @@ pub fn serve_request(
 ) -> ::http::Response<Vec<u8>> {
     let head = req.method() == ::http::Method::HEAD;
     let presented = presents_sigv4_credential(req);
+    // One id per RESPONSE, minted before the decision and reported by whichever answer this
+    // request earns: two answers are then distinguishable, which is what a client logging
+    // or reporting a refusal correlates on.
+    let request_id = ::service_common::query_error_envelope::new_request_id();
 
     let mut store = state.lock();
     store.materialise_due_transitions(SystemTime::now());
@@ -413,25 +452,46 @@ pub fn serve_request(
         .and_then(|function| function.endpoints.get(endpoint_name))
         .filter(|endpoint| endpoint.state == EndpointState::Active)
     else {
-        return plain(head, 404, NO_ENDPOINT_AT_THIS_ADDRESS);
+        return attributed(plain(head, 404, NO_ENDPOINT_AT_THIS_ADDRESS), &request_id);
     };
     let auth_type = endpoint.auth_type.clone();
     let endpoint_arn = endpoint.endpoint_arn.clone();
     drop(store);
 
     if auth_type == super::AUTH_TYPE_IAM && !presented {
-        // Every attempt on a published endpoint is attributable: the endpoint addressed and
-        // the outcome. Nothing the client sent is logged — not the path, not a header.
+        // Every attempt on a published endpoint is attributable: the endpoint addressed, the
+        // outcome, and the id the client was answered under, so a refusal a client reports
+        // is the refusal this log line records. Nothing the client sent is logged — not the
+        // path, not a header.
         ::tracing::info!(
             audit = true,
             operation = "WebFunctionEndpointRequest",
             outcome = "refused",
             endpoint_arn = %endpoint_arn,
+            request_id = %request_id,
             "web function endpoint request presenting no SigV4 credential"
         );
-        return json(head, 403, FORBIDDEN_DOCUMENT);
+        return attributed(
+            html(head, FORBIDDEN, &forbidden_document(&request_id)),
+            &request_id,
+        );
     }
-    plain(head, 501, NO_WEB_FUNCTION_HANDLER)
+    attributed(plain(head, 501, NO_WEB_FUNCTION_HANDLER), &request_id)
+}
+
+/// `response` with the id of the response it is named on it ([`REQUEST_ID_HEADER`]).
+///
+/// The id is this module's own minting ([`::service_common::query_error_envelope::
+/// new_request_id`]), so it is always a legal header value; a value that somehow is not is
+/// dropped rather than failing the answer the client is owed.
+fn attributed(
+    mut response: ::http::Response<Vec<u8>>,
+    request_id: &str,
+) -> ::http::Response<Vec<u8>> {
+    if let Ok(value) = ::http::HeaderValue::from_str(request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    response
 }
 
 /// Whether `req` PRESENTS a SigV4 credential: the `Authorization` header a signed request
@@ -460,13 +520,17 @@ fn presents_sigv4_credential(req: &::http::Request<Vec<u8>>) -> bool {
 /// of this module, never built from the request. A `HEAD` carries the metadata of what a
 /// `GET` of the same address would answer — its status and its length — without the body,
 /// which is what the method means.
-fn plain(head: bool, status: u16, message: &'static str) -> ::http::Response<Vec<u8>> {
+fn plain(head: bool, status: u16, message: &str) -> ::http::Response<Vec<u8>> {
     text_answer(head, status, "text/plain; charset=utf-8", message)
 }
 
-/// One JSON answer of this address's own, for the refusal Lambda words as a document.
-fn json(head: bool, status: u16, document: &'static str) -> ::http::Response<Vec<u8>> {
-    text_answer(head, status, "application/json", document)
+/// One HTML answer of this address's own, for the refusal this service words as a PAGE
+/// rather than a sentence ([`forbidden_document`]).
+///
+/// The media type carries no `charset` parameter, unlike the plain-text answers above: that
+/// is the value a published endpoint reports for this page, so it is left as it is served.
+fn html(head: bool, status: u16, document: &str) -> ::http::Response<Vec<u8>> {
+    text_answer(head, status, "text/html", document)
 }
 
 /// The response both forms above are built from.
@@ -474,7 +538,7 @@ fn text_answer(
     head: bool,
     status: u16,
     content_type: &'static str,
-    message: &'static str,
+    message: &str,
 ) -> ::http::Response<Vec<u8>> {
     let body = if head {
         Vec::new()
@@ -486,8 +550,8 @@ fn text_answer(
         .header("content-type", content_type)
         .header("content-length", message.len().to_string())
         .body(body)
-        // Every argument is this module's own constant, so the builder cannot fail; answer
-        // a bare 500 rather than panicking if it ever does.
+        // Every argument is this module's own, none of it built from the request, so the
+        // builder cannot fail; answer a bare 500 rather than panicking if it ever does.
         .unwrap_or_else(|_| {
             let mut response = ::http::Response::new(Vec::new());
             *response.status_mut() = ::http::StatusCode::INTERNAL_SERVER_ERROR;
@@ -498,6 +562,8 @@ fn text_answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use ::service_common::query_error_envelope::new_request_id;
 
     /// A request of `method` to `uri` carrying the headers `headers`.
     fn request(method: &str, uri: &str, headers: &[(&str, &str)]) -> ::http::Request<Vec<u8>> {
@@ -549,6 +615,75 @@ mod tests {
                 "case {case:?}: expected presents-a-credential {expected}, got {presented}"
             );
         }
+    }
+
+    /// The `Forbidden` page's text is fixed but for the id of the response serving it: the
+    /// whole document is written out here, independently of the one the code builds, so a
+    /// drift in a tag, a sentence or a line break is caught.
+    ///
+    /// The rows differ only in the one variable part — the id — and they span what an id
+    /// may look like, the minted form included.
+    #[test]
+    fn the_forbidden_page_states_only_the_responses_own_id() {
+        for (case, request_id) in [
+            ("a minted id", new_request_id()),
+            ("another minted id", new_request_id()),
+            ("a short id", "r-1".to_string()),
+            ("an upper-cased id", "A1B2C3D4".to_string()),
+        ] {
+            let expected = format!(
+                "<!DOCTYPE html>\n<html>\n<head>\n    <title>HTTP Error 403</title>\n</head>\n\
+                 <body>\n    <h1>403 Forbidden</h1>\n    <p>You are not authorized to access \
+                 this endpoint.</p>\n    <p>Request ID: {request_id}</p>\n</body>\n</html>"
+            );
+            let built = forbidden_document(&request_id);
+            assert_eq!(
+                built, expected,
+                "case {case:?}: expected the Forbidden page, got {built:?}"
+            );
+        }
+    }
+
+    /// The page is served as the HTML document it is, with the answering response's id on
+    /// the answer as well as in the page.
+    #[test]
+    fn the_forbidden_answer_carries_the_page_and_its_id() {
+        let request_id = new_request_id();
+        let answered = attributed(
+            html(false, FORBIDDEN, &forbidden_document(&request_id)),
+            &request_id,
+        );
+        assert_eq!(
+            answered.status().as_u16(),
+            403,
+            "expected 403, got {}",
+            answered.status()
+        );
+        let header = |name: &str| {
+            answered
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_eq!(
+            header("content-type"),
+            "text/html",
+            "expected the page to be served as HTML, got {:?}",
+            header("content-type")
+        );
+        assert_eq!(
+            header(REQUEST_ID_HEADER),
+            request_id,
+            "expected the answering response's id on the answer, got {:?}",
+            header(REQUEST_ID_HEADER)
+        );
+        let body = String::from_utf8_lossy(answered.body()).to_string();
+        assert!(
+            body.contains(&format!("<p>Request ID: {request_id}</p>")),
+            "expected the page to state the id of the response carrying it, got {body:?}"
+        );
     }
 
     /// A `HEAD` carries the status and the length a `GET` would answer, and no body.
