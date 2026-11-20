@@ -333,18 +333,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 continue;
             }
-            // `ExternalUserId` is an idempotency token: an identity named twice in the
-            // same request gets ONE attendee, reported for both items.
-            let existing = store
-                .meetings
-                .get(&meeting_id)
-                .and_then(|stored| stored.attendee_with_external_user_id(&item.external_user_id))
-                .cloned();
-            if let Some(existing) = existing {
-                created.push(existing);
-                continue;
-            }
-
+            // A capability set the ITEM carries is judged against the meeting's features
+            // BEFORE this identity's attendee is resolved, because the refusal is a fact
+            // about the REQUEST and not about what the meeting already holds: the
+            // documented rule refuses every request that includes a forbidden value for a
+            // capability member. The same order `CreateAttendee` and `BatchCreateAttendee`
+            // judge an item in.
             let capabilities = match item.capabilities {
                 Some(requested) => {
                     match crate::state::capability_problem(&requested, features.as_ref()) {
@@ -365,6 +359,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 None => crate::state::default_capabilities(features.as_ref()),
             };
+
+            // `ExternalUserId` is an idempotency token: an identity named twice in the
+            // same request gets ONE attendee, reported for both items — and an admissible
+            // set a later item carried does not replace the one that attendee holds.
+            let existing = store
+                .meetings
+                .get(&meeting_id)
+                .and_then(|stored| stored.attendee_with_external_user_id(&item.external_user_id))
+                .cloned();
+            if let Some(existing) = existing {
+                created.push(existing);
+                continue;
+            }
 
             let admitted = store
                 .meetings

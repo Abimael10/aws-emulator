@@ -209,19 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 });
                 continue;
             }
-            // `ExternalUserId` is an idempotency token, so an identity that already has an
-            // attendee in this meeting is reported with THAT attendee and nothing is
-            // minted — the same resolution a single `CreateAttendee` makes.
-            let existing = store
-                .meetings
-                .get(&input.meeting_id)
-                .and_then(|stored| stored.attendee_with_external_user_id(&item.external_user_id))
-                .cloned();
-            if let Some(existing) = existing {
-                created.push(existing);
-                continue;
-            }
-
+            // A capability set the ITEM carries is judged against the meeting's features
+            // BEFORE this identity's stored attendee is resolved, because the refusal is a
+            // fact about the REQUEST and not about what the meeting already holds: the
+            // documented rule refuses every request that includes a forbidden value for a
+            // capability member, whatever the store would otherwise have answered — which
+            // is why the reserved-prefix rule above is read the same way. A single
+            // `CreateAttendee` carrying this item judges it in exactly this order.
             let capabilities = match item.capabilities {
                 Some(requested) => {
                     match crate::state::capability_problem(&requested, features.as_ref()) {
@@ -242,6 +236,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 None => crate::state::default_capabilities(features.as_ref()),
             };
+
+            // `ExternalUserId` is an idempotency token, so an identity that already has an
+            // attendee in this meeting is reported with THAT attendee and nothing is
+            // minted — and an admissible set this item carried does not replace the one the
+            // attendee holds, since changing those is `UpdateAttendeeCapabilities`. The
+            // same resolution a single `CreateAttendee` makes.
+            let existing = store
+                .meetings
+                .get(&input.meeting_id)
+                .and_then(|stored| stored.attendee_with_external_user_id(&item.external_user_id))
+                .cloned();
+            if let Some(existing) = existing {
+                created.push(existing);
+                continue;
+            }
 
             // The ceiling counts the attendees the meeting ALREADY holds, so the items of
             // this request fill the places that are left and the ones past it are refused.

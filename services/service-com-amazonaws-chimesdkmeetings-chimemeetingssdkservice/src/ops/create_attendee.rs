@@ -10,7 +10,10 @@
 //! that already has an attendee in this meeting answers with THAT attendee — the same
 //! `AttendeeId` and `JoinToken` — rather than minting a second one; and a value beginning
 //! with the prefix the model reserves is refused before anything is resolved
-//! ([`crate::state::reserved_prefix_refusal`]).
+//! ([`crate::state::reserved_prefix_refusal`]). A `Capabilities` set the meeting's
+//! `MeetingFeatures` do not admit is refused the same way — before the repeat is answered —
+//! since that refusal is a fact about the request rather than about what the meeting holds
+//! ([`crate::state::capability_problem`]).
 //!
 //! ## Shape of an operation
 //!
@@ -206,6 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .attendee_with_external_user_id(&input.external_user_id)
             .cloned();
 
+        // A capability set the REQUEST carries is judged against the meeting's features
+        // BEFORE the replay above is answered, because the refusal is a fact about the
+        // request and not about what the meeting already holds: the documented rule refuses
+        // every request that includes a forbidden value for a capability member, whatever
+        // the store would otherwise have answered — which is why the reserved-prefix rule
+        // is read the same way. The two batch creation paths judge an item in this order
+        // too, so one item gets one answer whichever of the three it is sent through.
         let capabilities = match input.capabilities {
             Some(requested) => {
                 if let Some(problem) =
@@ -222,8 +232,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The repeat of a create this meeting already served: the stored attendee is
-        // answered as it stands, nothing is minted, and the capabilities this call carried
-        // do not replace the ones the attendee holds — changing them is
+        // answered as it stands, nothing is minted, and an admissible set this call carried
+        // does not replace the one the attendee holds — changing them is
         // `UpdateAttendeeCapabilities`.
         if let Some(existing) = existing {
             return Ok(CreateAttendeeOutput {

@@ -19,6 +19,12 @@
 //! The harness, the three sentences and the documented expectation [`expected_refusal`]
 //! are shared with the sibling suite that spans the whole catalog of modelled maximum
 //! resolutions, so the expected wording lives in exactly one place.
+//!
+//! The last suite below pins WHEN that judgement happens: a set the meeting does not admit
+//! is refused for every request that carries one, so a create for an identity the meeting
+//! already holds an attendee for is refused too — the same answer through each of the three
+//! creation paths — while an admissible set is answered with the stored attendee and is
+//! never applied to it.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -437,6 +443,347 @@ async fn a_capability_conflict_is_refused_with_the_fixed_message_for_its_class()
     assert_eq!(
         served, expected_messages,
         "the three classes must serve exactly their three sentences, got {served:?}"
+    );
+}
+
+/// Ask `BatchCreateAttendee` to add `items` to a meeting this service already holds.
+async fn batch_create_attendees(
+    router: &MultiServiceRouter,
+    meeting_id: &str,
+    items: &Value,
+) -> Reply {
+    call(
+        router,
+        "POST",
+        &format!("/meetings/{meeting_id}/attendees?operation=batch-create"),
+        Some(&json!({ "Attendees": items })),
+    )
+    .await
+}
+
+/// Ask `CreateMeetingWithAttendees` for a meeting with `features` holding `items`.
+async fn create_meeting_with_attendees(
+    router: &MultiServiceRouter,
+    token: &str,
+    features: Option<Value>,
+    items: &Value,
+) -> Reply {
+    let mut request = json!({
+        "ClientRequestToken": token,
+        "MediaRegion": "us-east-1",
+        "ExternalMeetingId": format!("ext-{token}"),
+        "Attendees": items,
+    });
+    if let Some(features) = features {
+        request["MeetingFeatures"] = features;
+    }
+    call(router, "POST", "/meetings?operation=create-attendees", Some(&request)).await
+}
+
+/// The attendees of `meeting_id`, as `ListAttendees` reports them.
+async fn list_attendees(router: &MultiServiceRouter, meeting_id: &str) -> Vec<Value> {
+    let reply = call(
+        router,
+        "GET",
+        &format!("/meetings/{meeting_id}/attendees?MaxResults=100"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        reply.status, 200,
+        "ListAttendees({meeting_id}): expected 200, got {} with {:?}",
+        reply.status, reply.body
+    );
+    list_of(&reply, "Attendees")
+}
+
+/// A list member of a success body, empty when the body carries none.
+fn list_of(reply: &Reply, member: &str) -> Vec<Value> {
+    reply
+        .body
+        .get(member)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// One capability member of a set, as the wire carries it.
+fn axis(set: &Value, member: &str) -> String {
+    set.get(member)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("member `{member}` is not a string in {set:?}"))
+        .to_string()
+}
+
+/// One row of the ordering table: the meeting's `MeetingFeatures`, its effective maximum
+/// resolutions (so the expectation comes from the documentation and not from the handler),
+/// and the capability set a REPEATED create for an identity the meeting already holds
+/// carries.
+struct RepeatCase {
+    name: &'static str,
+    features: Option<Value>,
+    resolutions: (&'static str, &'static str),
+    carried: Value,
+}
+
+/// A capability set is judged against the meeting's features for EVERY request that
+/// carries one, so a create for an identity whose attendee the meeting already holds is
+/// refused when the set is inadmissible — identically through `CreateAttendee`,
+/// `BatchCreateAttendee` and `CreateMeetingWithAttendees` — and is answered with the stored
+/// attendee, unchanged, when it is admissible.
+///
+/// The rows span what the rule generalises over: which of the three documented classes the
+/// set breaks, which capability value breaks it, which meeting features make it
+/// inadmissible, and sets the same meetings DO admit.
+#[tokio::test]
+async fn a_capability_set_is_judged_before_the_external_user_id_replay() {
+    let cases = vec![
+        RepeatCase {
+            name: "a video capability a Video:MaxResolution:None meeting forbids",
+            features: Some(json!({ "Video": { "MaxResolution": "None" } })),
+            resolutions: ("None", "FHD"),
+            carried: capability_set("SendReceive", "SendReceive", "None"),
+        },
+        RepeatCase {
+            name: "a video capability asking only to receive, in the same meeting",
+            features: Some(json!({ "Video": { "MaxResolution": "None" } })),
+            resolutions: ("None", "FHD"),
+            carried: capability_set("None", "Receive", "None"),
+        },
+        RepeatCase {
+            name: "a content capability a Content:MaxResolution:None meeting forbids",
+            features: Some(json!({ "Content": { "MaxResolution": "None" } })),
+            resolutions: ("HD", "None"),
+            carried: capability_set("Send", "SendReceive", "Send"),
+        },
+        RepeatCase {
+            name: "content reception without video reception, under the default features",
+            features: None,
+            resolutions: ("HD", "FHD"),
+            carried: capability_set("SendReceive", "None", "Receive"),
+        },
+        RepeatCase {
+            name: "a set a meeting capping both axes at None forbids",
+            features: Some(json!({
+                "Video": { "MaxResolution": "None" },
+                "Content": { "MaxResolution": "None" },
+            })),
+            resolutions: ("None", "None"),
+            carried: capability_set("Send", "Send", "Send"),
+        },
+        RepeatCase {
+            name: "a set the default features admit, which the replay must not apply",
+            features: None,
+            resolutions: ("HD", "FHD"),
+            carried: capability_set("None", "Receive", "Receive"),
+        },
+        RepeatCase {
+            name: "a set a Video:MaxResolution:None meeting admits",
+            features: Some(json!({ "Video": { "MaxResolution": "None" } })),
+            resolutions: ("None", "FHD"),
+            carried: capability_set("Send", "None", "None"),
+        },
+    ];
+
+    let router = router();
+    let mut refused_rows = 0usize;
+    let mut admitted_rows = 0usize;
+
+    for (index, case) in cases.into_iter().enumerate() {
+        let RepeatCase {
+            name,
+            features,
+            resolutions,
+            carried,
+        } = case;
+        let expected = expected_refusal(
+            &axis(&carried, "Video"),
+            &axis(&carried, "Content"),
+            resolutions.0,
+            resolutions.1,
+        );
+        let user = format!("user-order-{index}");
+
+        // A meeting already holding exactly one attendee for this identity, created with
+        // the meeting's own documented default capabilities.
+        let meeting_id =
+            new_meeting(&router, &format!("tok-order-{index}"), features.clone()).await;
+        let attendee_id = new_attendee(&router, &meeting_id, &user).await;
+        let stored = get_attendee(&router, &meeting_id, &attendee_id)
+            .await
+            .body
+            .get("Attendee")
+            .cloned()
+            .unwrap_or_else(|| panic!("case {name:?}: GetAttendee returned no attendee"));
+
+        // The single create for the identity the meeting already holds.
+        let repeat = create_attendee_with(&router, &meeting_id, &user, &carried).await;
+        match expected {
+            Some(message) => {
+                refused_rows += 1;
+                assert_eq!(
+                    (repeat.status, repeat.error_code.as_deref()),
+                    (400, Some("BadRequestException")),
+                    "case {name:?} via CreateAttendee: an inadmissible set must be refused \
+                     with the modelled 400 BadRequestException however many attendees the \
+                     meeting holds, got {} {:?} with {:?}",
+                    repeat.status,
+                    repeat.error_code,
+                    repeat.body
+                );
+                assert_eq!(
+                    repeat.message().as_deref(),
+                    Some(message),
+                    "case {name:?} via CreateAttendee: expected message {message:?}, got {:?}",
+                    repeat.message()
+                );
+            }
+            None => {
+                admitted_rows += 1;
+                assert_eq!(
+                    (repeat.status, repeat.error_code.as_deref()),
+                    (200, None),
+                    "case {name:?} via CreateAttendee: an admissible set must replay the \
+                     stored attendee, got {} {:?} with {:?}",
+                    repeat.status,
+                    repeat.error_code,
+                    repeat.body
+                );
+                assert_eq!(
+                    repeat.body.get("Attendee"),
+                    Some(&stored),
+                    "case {name:?} via CreateAttendee: expected the stored attendee \
+                     {stored:?}, got {:?}",
+                    repeat.body.get("Attendee")
+                );
+            }
+        }
+
+        // The same item through the batch, which must answer it the same way.
+        let batch = batch_create_attendees(
+            &router,
+            &meeting_id,
+            &json!([{ "ExternalUserId": user, "Capabilities": carried }]),
+        )
+        .await;
+        assert_eq!(
+            batch.status, 200,
+            "case {name:?} via BatchCreateAttendee: a per-item refusal never fails the call, \
+             got {} with {:?}",
+            batch.status, batch.body
+        );
+        let batch_attendees = list_of(&batch, "Attendees");
+        let batch_errors = list_of(&batch, "Errors");
+        match expected {
+            Some(message) => {
+                assert_eq!(
+                    (batch_attendees.len(), batch_errors.len()),
+                    (0, 1),
+                    "case {name:?} via BatchCreateAttendee: expected the item reported in \
+                     Errors and nothing in Attendees, got {batch_attendees:?} and \
+                     {batch_errors:?}"
+                );
+                assert_eq!(
+                    (
+                        batch_errors[0].get("ExternalUserId").and_then(Value::as_str),
+                        batch_errors[0].get("ErrorCode").and_then(Value::as_str),
+                        batch_errors[0].get("ErrorMessage").and_then(Value::as_str),
+                    ),
+                    (Some(user.as_str()), Some("BadRequest"), Some(message)),
+                    "case {name:?} via BatchCreateAttendee: expected the identity, the \
+                     refusal's code and {message:?}, got {:?}",
+                    batch_errors[0]
+                );
+            }
+            None => {
+                assert_eq!(
+                    (batch_attendees.as_slice(), batch_errors.len()),
+                    (std::slice::from_ref(&stored), 0),
+                    "case {name:?} via BatchCreateAttendee: an admissible set must replay \
+                     the stored attendee {stored:?} and refuse nothing, got \
+                     {batch_attendees:?} and {batch_errors:?}"
+                );
+            }
+        }
+
+        // The creation path that mints the meeting too: the identity is named TWICE in one
+        // request, the second item carrying the row's set.
+        let paired = create_meeting_with_attendees(
+            &router,
+            &format!("tok-order-pair-{index}"),
+            features.clone(),
+            &json!([
+                { "ExternalUserId": user },
+                { "ExternalUserId": user, "Capabilities": carried },
+            ]),
+        )
+        .await;
+        assert_eq!(
+            paired.status, 200,
+            "case {name:?} via CreateMeetingWithAttendees: expected 200, got {} with {:?}",
+            paired.status, paired.body
+        );
+        let paired_attendees = list_of(&paired, "Attendees");
+        let paired_errors = list_of(&paired, "Errors");
+        match expected {
+            Some(message) => {
+                assert_eq!(
+                    (paired_attendees.len(), paired_errors.len()),
+                    (1, 1),
+                    "case {name:?} via CreateMeetingWithAttendees: expected the first item \
+                     created and the repeat refused, got {paired_attendees:?} and \
+                     {paired_errors:?}"
+                );
+                assert_eq!(
+                    (
+                        paired_errors[0].get("ExternalUserId").and_then(Value::as_str),
+                        paired_errors[0].get("ErrorCode").and_then(Value::as_str),
+                        paired_errors[0].get("ErrorMessage").and_then(Value::as_str),
+                    ),
+                    (Some(user.as_str()), Some("BadRequest"), Some(message)),
+                    "case {name:?} via CreateMeetingWithAttendees: expected the identity, \
+                     the refusal's code and {message:?}, got {:?}",
+                    paired_errors[0]
+                );
+            }
+            None => {
+                assert_eq!(
+                    (paired_attendees.len(), paired_errors.len()),
+                    (2, 0),
+                    "case {name:?} via CreateMeetingWithAttendees: an admissible set must \
+                     replay the item the first one minted and refuse nothing, got \
+                     {paired_attendees:?} and {paired_errors:?}"
+                );
+                assert_eq!(
+                    paired_attendees[0], paired_attendees[1],
+                    "case {name:?} via CreateMeetingWithAttendees: one identity gets one \
+                     attendee, reported for both items, got {:?} and {:?}",
+                    paired_attendees[0], paired_attendees[1]
+                );
+            }
+        }
+
+        // None of the three calls applied the set it carried, and none minted a second
+        // attendee for the identity: changing a stored set is `UpdateAttendeeCapabilities`.
+        let after = get_attendee(&router, &meeting_id, &attendee_id).await;
+        assert_eq!(
+            after.body.get("Attendee"),
+            Some(&stored),
+            "case {name:?}: the stored attendee must still be {stored:?}, got {:?}",
+            after.body.get("Attendee")
+        );
+        let listed = list_attendees(&router, &meeting_id).await;
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {name:?}: the meeting must still hold exactly one attendee, got {listed:?}"
+        );
+    }
+
+    assert!(
+        refused_rows > 0 && admitted_rows > 0,
+        "the table must span both outcomes, got {refused_rows} refused and {admitted_rows} \
+         admitted rows"
     );
 }
 

@@ -695,6 +695,12 @@ pub fn default_capabilities(features: Option<&MeetingFeaturesConfiguration>) -> 
 /// Each of the three answers with the sentence the service serves for that error class —
 /// fixed text naming the capability member and the rule, with nothing of the request
 /// spliced into it, so one rule always reads the same however it was broken.
+///
+/// Every caller judges the set it was GIVEN before it resolves what the store already
+/// holds for that identity: the documentation refuses every request that includes a
+/// forbidden value ("all API requests that include …"), so the refusal follows from the
+/// request and the meeting's features alone — never from whether the identity named
+/// already has an attendee.
 pub fn capability_problem(
     capabilities: &AttendeeCapabilities,
     features: Option<&MeetingFeaturesConfiguration>,
