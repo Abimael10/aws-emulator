@@ -1260,7 +1260,9 @@ async fn a_component_configuration_round_trips() {
             configuration: None,
             expected_monitor: false,
             expected_tier: "DEFAULT",
-            expected_configuration: None,
+            // A component nothing has configured reports the EMPTY configuration
+            // document rather than no member at all.
+            expected_configuration: Some("{}"),
         },
         Row {
             case: "monitoring, a tier and a configuration together",
@@ -1503,7 +1505,7 @@ async fn a_configuration_the_service_cannot_apply_is_refused() {
     );
     assert_eq!(
         read.get("ComponentConfiguration").and_then(Value::as_str),
-        None,
+        Some("{}"),
         "a refused configuration must store no document, got {read:?}"
     );
 }

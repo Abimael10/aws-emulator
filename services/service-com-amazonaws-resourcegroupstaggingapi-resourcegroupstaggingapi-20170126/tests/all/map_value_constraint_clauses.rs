@@ -32,7 +32,7 @@ const REGION: &str = "us-east-1";
 /// An ARN of a service no owning crate resolves, so it needs no live resource
 /// behind it: this service's own store is its tag home. Every refused request
 /// carries it, so nothing but the tags can be what the refusal is about.
-const SERVED: &str = "arn:aws:s3:::map-value-clause-bucket";
+const SERVED: &str = "arn:aws:cloudwatch:us-east-1:000000000000:alarm/map-value-clause";
 
 /// The declared bounds of a tag VALUE, and the expression it has to match.
 ///

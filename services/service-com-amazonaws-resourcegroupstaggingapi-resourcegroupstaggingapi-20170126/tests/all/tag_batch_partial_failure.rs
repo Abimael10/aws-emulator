@@ -434,7 +434,7 @@ async fn the_same_batch_answers_the_same_per_resource_selection_twice() {
 
 /// An ARN in a namespace no owning crate is linked against, so it needs no live resource
 /// behind it: the tagging store is its tag home, and a batch that names it must tag it.
-const UNOWNED: &str = "arn:aws:s3:::batch-owner-bucket";
+const UNOWNED: &str = "arn:aws:cloudwatch:us-east-1:000000000000:alarm/batch-owner-control";
 
 /// What Amazon SNS says about a topic ARN it holds no topic for. The WHOLE sentence is
 /// fixed text with no variable part, so a test pins it as the wire carries it rather than

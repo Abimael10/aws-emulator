@@ -13,10 +13,10 @@
 //! This module is that view, and the ONE place this crate reaches it: the
 //! resource-tagging service already projects every tagged resource of a region
 //! out of the service that OWNS it (a queue out of Amazon SQS, a key out of AWS
-//! KMS, …) plus the resources tagged through its own API, so a query runs over
-//! that projection instead of a second copy assembled here. A resource an owning
-//! service no longer holds is absent from the projection, so it leaves a group's
-//! membership with nothing to keep in step.
+//! KMS, a bucket out of Amazon S3, …) plus the resources tagged through its own
+//! API, so a query runs over that projection instead of a second copy assembled
+//! here. A resource an owning service no longer holds is absent from the
+//! projection, so it leaves a group's membership with nothing to keep in step.
 //!
 //! Reading the projection locks the owning services' stores, so a caller reads it
 //! BEFORE taking this service's own store lock: the two are then never locked in

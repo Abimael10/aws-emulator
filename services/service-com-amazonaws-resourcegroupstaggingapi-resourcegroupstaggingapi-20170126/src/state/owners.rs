@@ -34,7 +34,10 @@
 //! resource and [`crate::state`]'s own store holds its tags, which is this
 //! emulator's boundary rather than an AWS rule. Adding a service here is a
 //! dependency in `Cargo.toml` plus one arm of [`visit`] and one of
-//! [`tagged_resources`].
+//! [`tagged_resources`] — and, because an ARN of that namespace naming a resource
+//! the owner does not hold then becomes a per-resource failure rather than an
+//! entry in this crate's own store, the fixtures of every test that used such an
+//! ARN as an unowned one.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -51,6 +54,7 @@ use service_com_amazonaws_eventbridge_awsevents as owner_events;
 use service_com_amazonaws_glue_awsglue as owner_glue;
 use service_com_amazonaws_kms_trentservice as owner_kms;
 use service_com_amazonaws_lambda_awsgirapiservice as owner_lambda;
+use service_com_amazonaws_s3_amazons3 as owner_s3;
 use service_com_amazonaws_secretsmanager_secretsmanager as owner_secretsmanager;
 use service_com_amazonaws_sfn_awsstepfunctions as owner_sfn;
 use service_com_amazonaws_sns_amazonsimplenotificationservice as owner_sns;
@@ -244,6 +248,7 @@ pub fn visit<Eng: Send + Sync + 'static>(
         "glue" => glue(engine, arn, change),
         "kms" => kms(engine, arn, change),
         "lambda" => lambda(engine, arn, change),
+        "s3" => s3(engine, arn, change),
         "secretsmanager" => secretsmanager(engine, arn, change),
         "sns" => sns(engine, arn, change),
         "states" => states(engine, arn, change),
@@ -447,6 +452,23 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
         state.expire_due(SystemTime::now());
         for secret in state.secrets.values() {
             record(secret.arn.clone(), option_tag_pairs!(secret.tags));
+        }
+    }
+    if let Some(state) = owner_s3::state::service_state(engine) {
+        // A bucket is reported by the endpoint of the Region it LIVES in — "all the
+        // tagged … resources that are located in the specified Amazon Web Services
+        // Region" (`GetResources`' own documentation) — and a bucket ARN carries no
+        // Region segment to read that from, so the Region compared is the one the bucket
+        // itself records. Only the buckets of the caller's OWN S3 account are rows, read
+        // through the seam that service's own `ListBuckets` reports from: a bucket AWS
+        // publishes, or one another emulated service provisioned as the object store of
+        // its own resource, is not a bucket of this account.
+        let store = state.lock();
+        for (name, bucket) in store.general_purpose_account_buckets() {
+            if bucket.region != region {
+                continue;
+            }
+            record(owner_s3::state::bucket_arn(name), bucket_tags(bucket));
         }
     }
     if let Some(state) = owner_sns::state::service_state(engine) {
@@ -662,6 +684,109 @@ fn sns<Eng: Send + Sync + 'static>(
         topic.tags = held.clone().into_iter().collect();
     }
     Resolution::Present { tags: Some(held) }
+}
+
+/// Amazon S3: a general purpose BUCKET OF THIS ACCOUNT, whose tags are the bucket's own —
+/// a bucket has ONE tag set however it is written, so the set this API reads and writes IS
+/// the set `GetBucketTagging` reports and `PutBucketTagging` replaces, and a bucket created
+/// or deleted through S3 appears in and disappears from this API's answers with nothing to
+/// keep in step.
+///
+/// The bucket is resolved through the SAME seam [`tagged_resources`] projects from — the
+/// caller's own general purpose buckets, which is what that service's own `ListBuckets`
+/// reports — so a bucket this API accepts a write for is a bucket it also reports: a
+/// directory bucket, one AWS publishes, or one another emulated service provisioned as the
+/// object store of its own resource is no bucket of this account, and is answered the same
+/// `NoSuchBucket` as a name no bucket exists under. The Region is the one half the two
+/// cannot share: a bucket ARN carries no Region segment, so a write is addressed by NAME
+/// from whichever endpoint it arrives at, exactly as that service's own `PutBucketTagging`
+/// is, while a READ reports only the Region the bucket lives in because `GetResources`
+/// documents its projection that way.
+///
+/// An `s3` ARN that names anything else — an object (`<bucket>/<key>`), an access point —
+/// is left [`Resolution::Unowned`], the answer every value no linked owner addresses gets,
+/// so this crate's own store stays its tag home.
+fn s3<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &ParsedArn,
+    change: Option<&Change<'_>>,
+) -> Resolution {
+    let Some(state) = owner_s3::state::service_state(engine) else {
+        return Resolution::Unowned;
+    };
+    let Some(name) = bucket_named_by(arn) else {
+        return Resolution::Unowned;
+    };
+    let mut store = state.lock();
+    // That service's own refusal for a name this account holds no bucket under:
+    // `NoSuchBucket` at HTTP 404 (`smithy_query(query="shape",shape="NoSuchBucket")` on the
+    // S3 model), carrying the sentence it words for it.
+    let not_found = || {
+        absent_with_status(
+            404,
+            owner_s3::state::NO_SUCH_BUCKET_CODE,
+            owner_s3::state::NO_SUCH_BUCKET_MESSAGE.to_string(),
+        )
+    };
+    // A resolution with no change is a READ, so it borrows the bucket immutably and the
+    // store is never reached for mutably; only a tag write asks for the bucket itself.
+    let Some(held) = store.bucket(name).filter(is_this_accounts).map(bucket_tags) else {
+        return not_found();
+    };
+    let mut held: Tags = held;
+    if let Some(change) = change {
+        if let Err(would_hold) = change.apply(&mut held) {
+            return Resolution::TooManyTags(would_hold);
+        }
+        // That service's own cap on a BUCKET's tag set, which a write through this API is
+        // held to exactly as a write through its own `PutBucketTagging` is.
+        if held.len() > owner_s3::state::BUCKET_TAG_SET_LIMITS.max_tags {
+            return Resolution::TooManyTags(held.len());
+        }
+        let Some(bucket) = store.bucket_mut(name) else {
+            return not_found();
+        };
+        bucket.replace_tags(
+            held.iter()
+                .map(|(key, value)| owner_s3::state::ResourceTag {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
+        );
+    }
+    Resolution::Present { tags: Some(held) }
+}
+
+/// Whether `bucket` is a general purpose bucket of the CALLER'S OWN S3 account, which is
+/// what [`tagged_resources`] projects and therefore what this API may tag: the test that
+/// service's own `general_purpose_account_buckets` applies, read off the one bucket a
+/// request names.
+fn is_this_accounts(bucket: &&owner_s3::state::Bucket) -> bool {
+    bucket.provisioned_by().is_none() && !bucket.is_aws_published() && !bucket.is_directory()
+}
+
+/// The general purpose bucket `arn` names, or `None` for an `s3` ARN that names
+/// something else.
+///
+/// The documented form is `arn:aws:s3:::<bucket>` — "because a bucket name is globally
+/// unique" the Region and account fields are empty — and the resource field is the bucket
+/// name alone, so an ARN carrying either field, or a resource field with a further segment
+/// (an object, an access point), names something other than a bucket.
+fn bucket_named_by(arn: &ParsedArn) -> Option<&str> {
+    let names_a_bucket =
+        arn.region.is_empty() && arn.account.is_empty() && !arn.resource.contains([':', '/']);
+    names_a_bucket.then_some(arn.resource.as_str())
+}
+
+/// One bucket's tag set as [`Tags`]: that service holds a bucket's tags as an ordered list
+/// of key/value records, and this crate handles tags as one ordered map.
+fn bucket_tags(bucket: &owner_s3::state::Bucket) -> Tags {
+    bucket
+        .tags()
+        .iter()
+        .map(|tag| (tag.key.clone(), tag.value.clone()))
+        .collect()
 }
 
 /// Amazon DynamoDB: a table, whose tags are the table's own — the resource that

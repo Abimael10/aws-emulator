@@ -359,7 +359,38 @@ impl Component {
             detected_workload: None,
         }
     }
+
+    /// The `ComponentConfiguration` a read of this component's monitoring
+    /// configuration reports: the escaped JSON the last `UpdateComponentConfiguration`
+    /// stored, and the EMPTY DOCUMENT for a component nothing has configured.
+    ///
+    /// The member is ALWAYS reported, because every component has a configuration to
+    /// report — an onboarded one simply has nothing in it — so a caller reads the
+    /// configuration the same way whether or not anything has written one, instead of
+    /// having to tell an absent member from an empty configuration. The value is "the
+    /// escaped JSON of the configuration"
+    /// (`smithy_query(query="shape",shape="DescribeComponentConfigurationResponse")`),
+    /// which is why an empty configuration is reported as the empty JSON OBJECT and not
+    /// as empty text: a configuration this service would refuse on the way in
+    /// (`UpdateComponentConfiguration` refuses a value that is not a JSON document) is
+    /// not one it hands back.
+    ///
+    /// The empty document is this emulator's own convention, not a modelled value: what
+    /// Application Insights reports for a component nothing has configured is the
+    /// RECOMMENDED configuration for that component's type and tier, which is what
+    /// `DescribeComponentConfigurationRecommendation` computes — a later slice, still
+    /// answering 501 here, so there is no recommendation to report and nothing is
+    /// invented in its place.
+    pub fn reported_configuration(&self) -> String {
+        self.component_configuration
+            .clone()
+            .unwrap_or_else(|| EMPTY_CONFIGURATION.to_string())
+    }
 }
+
+/// The configuration a component nothing has configured reports: the empty JSON
+/// document. See [`Component::reported_configuration`].
+pub const EMPTY_CONFIGURATION: &str = "{}";
 
 /// The longest `ComponentName` the model admits (length 1..1011), which a
 /// discovered component's name — the resource's own ARN — has to fit: a resource

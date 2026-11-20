@@ -45,6 +45,12 @@ service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = tru
 # through `GetResources`.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
+# A general purpose S3 bucket carries the tag set this API reads and writes for the `s3`
+# namespace: `PutBucketTagging`/`DeleteBucketTagging` there and `TagResources`/
+# `UntagResources` here edit ONE set, which is why a bucket tagged through S3's own API is
+# discoverable through `GetResources` — and, through that view, selectable by a Resource
+# Groups tag query.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-glue-awsglue = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }

@@ -267,16 +267,16 @@ async fn a_value_past_the_published_maximum_is_not_refused_by_the_arn_template()
 ///
 /// The rows are the length extremes of a parseable element, which is this suite's
 /// own subject and what the sibling suite's positive control does not cover: the
-/// shortest ARN the parse admits, and one exactly at the member's published
-/// maximum.
+/// shortest ARN the parse admits in a namespace no owning crate resolves, and one
+/// exactly at the member's published maximum.
 #[tokio::test]
 async fn a_parseable_element_at_each_length_extreme_is_tagged_and_read_back() {
     let router = emulator();
 
-    let shortest = "arn:aws:s3:::b".to_string();
+    let shortest = "arn:aws:logs:::b".to_string();
     let longest = format!(
-        "arn:aws:s3:::{}",
-        "b".repeat(RESOURCE_ARN_MAX_LENGTH - "arn:aws:s3:::".len())
+        "arn:aws:logs:::{}",
+        "b".repeat(RESOURCE_ARN_MAX_LENGTH - "arn:aws:logs:::".len())
     );
     let served: &[(&str, &String)] = &[
         ("the shortest parseable ARN", &shortest),

@@ -206,7 +206,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(DescribeComponentConfigurationOutput {
             monitor: Some(component.monitor),
             tier: Some(component.tier.clone()),
-            component_configuration: component.component_configuration.clone(),
+            // Always reported: the escaped JSON last stored for this component, or the
+            // empty document for one nothing has configured
+            // ([`crate::state::Component::reported_configuration`]).
+            component_configuration: Some(component.reported_configuration()),
         })
     }
 }

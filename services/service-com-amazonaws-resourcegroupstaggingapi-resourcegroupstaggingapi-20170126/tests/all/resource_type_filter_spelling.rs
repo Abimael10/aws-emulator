@@ -207,20 +207,26 @@ type AcceptedRow = (&'static [&'static str], &'static [usize]);
 /// in a namespace no owning service crate resolves, so this API's own store is
 /// their tag home and no second service has to be standing; between them they
 /// spell their resource type the three ways an ARN can (`type/id`, `type:id`,
-/// and the bare id whose type `crate::state::implicit_resource_type` names).
+/// and a bare id, whose type key is the bare service token for a service
+/// `crate::state::implicit_resource_type` does not name).
+///
+/// A bare id whose type that table DOES name belongs to a service this crate is
+/// linked against (a bucket, a queue, a topic), so such a resource has to be
+/// standing in its owner for a tag to be written at all: the cross-service suite
+/// `core/router/tests/all/s3_bucket_tags_reach_resource_group_discovery.rs` pins
+/// that half over a real bucket.
 const TAGGED: &[&str] = &[
     "arn:aws:auditmanager:us-east-1:ACCOUNT:assessment/spelling-assessment",
     "arn:aws:qldb:us-east-1:ACCOUNT:ledger/spelling-ledger",
     "arn:aws:rds:us-east-1:ACCOUNT:db:spelling-db",
-    "arn:aws:s3:::spelling-bucket",
+    "arn:aws:codecommit:us-east-1:ACCOUNT:spelling-repo",
 ];
 
 const ACCEPTED: &[AcceptedRow] = &[
-    // A bare service token selects every resource of that service.
-    (&["s3"], &[3]),
-    // The qualified form of the same resource, whose type comes from the table
-    // of implicit resource types rather than from the ARN.
-    (&["s3:bucket"], &[3]),
+    // A bare service token selects every resource of that service — and for a
+    // bare-id ARN the qualified form its own type key spells is that same token,
+    // so there is no second spelling of this one to state.
+    (&["codecommit"], &[3]),
     // An ARN whose resource field carries `type:id`.
     (&["rds:db"], &[2]),
     // An ARN whose resource field carries `type/id`.
@@ -228,8 +234,8 @@ const ACCEPTED: &[AcceptedRow] = &[
     // The worked example from the member's own documentation.
     (&["auditmanager"], &[0]),
     (&["auditmanager:assessment"], &[0]),
-    // Several entries select the union of what each selects.
-    (&["rds:db", "s3"], &[2, 3]),
+    // Several entries select the union of what each selects, reported in ARN order.
+    (&["rds:db", "codecommit"], &[3, 2]),
     // A supported service nothing is tagged under: an empty answer, not an error.
     (&["ec2:instance"], &[]),
     (&["kms"], &[]),

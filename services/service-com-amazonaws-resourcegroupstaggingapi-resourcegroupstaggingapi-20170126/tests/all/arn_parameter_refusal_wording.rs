@@ -30,8 +30,11 @@ const REGION: &str = "us-east-1";
 
 /// An ARN of a service no owning crate resolves, so it needs no live resource
 /// behind it: this service's own store is its tag home. The control ARN every
-/// refused batch carries beside its bad value.
-const UNOWNED: &str = "arn:aws:s3:::wording-control-bucket";
+/// refused batch carries beside its bad value. Its Region segment is EMPTY — a
+/// global resource, which every regional endpoint answers for — so a case that
+/// sends the batch to another Region's endpoint is refused for the value under
+/// test and never for this control.
+const UNOWNED: &str = "arn:aws:iam::000000000000:user/wording-control";
 
 /// A router carrying only this service, over its own fresh engine, so each test
 /// starts from an empty store and observes the same state across requests.

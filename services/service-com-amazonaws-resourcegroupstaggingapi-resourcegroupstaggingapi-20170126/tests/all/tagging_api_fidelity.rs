@@ -292,7 +292,7 @@ async fn arns_of_type(router: &MultiServiceRouter, filters: &[&str]) -> Vec<Stri
 
 /// An ARN of a service no owning crate is linked against, so it needs no live
 /// resource behind it: the tagging store is its tag home.
-const UNOWNED: &str = "arn:aws:s3:::fidelity-bucket";
+const UNOWNED: &str = "arn:aws:cloudwatch:us-east-1:000000000000:alarm/fidelity-control";
 
 /// A well-formed ARN naming a resource that was never created is NOT a request
 /// fault: the call is a 200 whose `FailedResourcesMap` names that ARN alone,
@@ -1626,7 +1626,7 @@ async fn the_reads_report_only_the_region_the_request_is_signed_for() {
     // resource behind it; they differ exactly along what the rule generalises
     // over — one carries a Region segment, one does not.
     let regional = "arn:aws:qldb:us-east-1:000000000000:ledger/in-region";
-    let global = "arn:aws:s3:::fidelity-global";
+    let global = "arn:aws:iam::000000000000:user/fidelity-global";
     for (arn, scope) in [(regional, "regional"), (global, "global")] {
         let (status, body) = tagging(
             &router,

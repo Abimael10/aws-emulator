@@ -145,7 +145,7 @@ async fn a_full_get_resources_page_is_never_the_last_one() {
         let case = format!("{resources} resources, ResourcesPerPage={per_page}");
         let router = emulator();
         let arns: Vec<String> = (0..resources)
-            .map(|n| format!("arn:aws:s3:::bucket-{n:03}"))
+            .map(|n| format!("arn:aws:cloudwatch:us-east-1:000000000000:alarm/probe-{n:03}"))
             .collect();
         let borrowed: Vec<&str> = arns.iter().map(String::as_str).collect();
         tag(&router, &borrowed, &[("Env", "prod")]).await;
@@ -227,7 +227,7 @@ async fn following_a_full_pages_token_serves_an_empty_terminal_page() {
     // exactly full at ResourcesPerPage=1 with nothing left behind it. The ARN is
     // under a service this crate does not resolve live resources against, so no
     // second service has to be standing for the write to land.
-    let arn = "arn:aws:s3:::sized-bucket";
+    let arn = "arn:aws:cloudwatch:us-east-1:000000000000:alarm/sized-probe";
     tag(&router, &[arn], &[("PageSizeProbe", "sized")]).await;
     let filter = serde_json::json!([{ "Key": "PageSizeProbe" }]);
 
@@ -299,7 +299,7 @@ async fn a_full_get_tag_keys_page_is_never_the_last_one() {
     // fill one page and consume the whole projection — spread over two
     // resources, since one resource holds at most 50 tags.
     for chunk in 0..2 {
-        let arn = format!("arn:aws:s3:::keys-bucket-{chunk}");
+        let arn = format!("arn:aws:cloudwatch:us-east-1:000000000000:alarm/keys-probe-{chunk}");
         let keys: Vec<String> = (0..50)
             .map(|n| format!("Key{:03}", chunk * 50 + n))
             .collect();
