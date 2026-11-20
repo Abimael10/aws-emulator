@@ -1219,7 +1219,12 @@ async fn only_a_held_action_is_announced_and_only_its_token_completes_it() {
                 ("LifecycleActionResult", CONTINUE.to_string()),
             ],
             code: "ValidationError",
-            message: format!("No active Lifecycle Action found with instance ID {instance_id}"),
+            // The instance IS waiting — just not at the hook this call named — so the hook
+            // is the half of the address that matched nothing and the refusal names it too.
+            message: format!(
+                "No active Lifecycle Action found with instance ID {instance_id} and HookName \
+                 not-a-hook"
+            ),
         },
     ];
 

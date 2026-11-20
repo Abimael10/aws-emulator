@@ -872,10 +872,10 @@ async fn a_put_past_the_documented_hook_limit_is_refused() {
         code, "LimitExceeded",
         "expected the LimitExceeded code past the limit, got {code:?} {message:?}"
     );
-    let expected = format!(
-        "The lifecycle hook hook-past-the-limit exceeds the limit of {MAX_HOOKS_PER_GROUP} \
-         lifecycle hooks per Auto Scaling group"
-    );
+    // The quota refusal states the LIMIT and nothing of the request — not the hook's name
+    // either, since the same sentence answers every request past the ceiling.
+    let expected =
+        format!("You cannot have more than {MAX_HOOKS_PER_GROUP} hooks per Auto Scaling group");
     assert_eq!(
         message, expected,
         "expected the message {expected:?}, got {message:?}"

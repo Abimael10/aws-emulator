@@ -309,6 +309,7 @@ impl AutoScalingState {
         // launch lifecycle hook the group configures holds it exactly as it holds one the
         // group launched itself ([`super::lifecycle_actions`]).
         self.hold_lifecycle_transition(
+            engine,
             group_name,
             super::HeldTransition::Launching,
             &attached_ids,

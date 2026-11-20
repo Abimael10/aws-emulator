@@ -265,6 +265,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &format!("{group_name}/{hook_name}"),
             "lifecycle hook stored",
         );
+
+        // A LAUNCH hook acts on the launches of its group that have not COMPLETED: an
+        // instance the group still reports `Pending` has not passed the launching
+        // transition, so a hook stored while that launch is in flight takes it into the
+        // wait state exactly as a hook stored before the launch does
+        // ([`crate::state::AutoScalingState::hold_launches_in_flight`], which states why the
+        // other transition has no such point to catch). The transition is read off the
+        // STORED hook, because an update need not carry one.
+        let holds_launches = state
+            .groups
+            .get(&group_name)
+            .and_then(|group| group.lifecycle_hook(&hook_name))
+            .is_some_and(|hook| hook.lifecycle_transition == crate::state::TRANSITION_LAUNCHING);
+        let held =
+            holds_launches && state.hold_launches_in_flight(&*self.engine, &group_name, now);
+        // The hold this stored hook took is announced as every hold is, by the one pump
+        // that publishes what the clock owes. The store's lock is released first: the pump
+        // takes it itself.
+        drop(state);
+        if held {
+            crate::state::drive_lifecycle_clock(ctx, &self.engine);
+        }
         Ok(PutLifecycleHookOutput {})
     }
 }

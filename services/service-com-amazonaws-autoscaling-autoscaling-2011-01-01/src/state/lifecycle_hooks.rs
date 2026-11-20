@@ -161,8 +161,9 @@ impl LifecycleHookRefusal {
     ///
     /// ONE spelling per situation for every writer of a hook — the operation that
     /// upserts one and the group create that carries specifications — so two of them
-    /// cannot refuse the same request differently. The hook's name is the only part
-    /// taken from the request where the sentence does not quote the offending value.
+    /// cannot refuse the same request differently. A sentence that states what a member
+    /// admits, or what the group's ceiling is, carries no part of the request at all:
+    /// the hook's name appears only where the refusal is about THAT hook.
     pub fn message(&self, hook_name: &str) -> String {
         match self {
             Self::TransitionMissing => transition_missing_message(hook_name),
@@ -172,7 +173,7 @@ impl LifecycleHookRefusal {
                 unsupported_notification_target_message(vendor)
             }
             Self::HeartbeatOutOfRange => heartbeat_timeout_violation_message(),
-            Self::LimitExceeded => too_many_hooks_message(hook_name),
+            Self::LimitExceeded => too_many_hooks_message(),
         }
     }
 }
@@ -408,13 +409,14 @@ pub fn heartbeat_timeout_violation_message() -> String {
 }
 
 /// The message a request that would create a hook past
-/// [`MAX_LIFECYCLE_HOOKS_PER_GROUP`] is refused with, which quotes the limit the caller
-/// has to come back under — the shape this service reports every per-group ceiling in.
-pub fn too_many_hooks_message(name: &str) -> String {
-    format!(
-        "The lifecycle hook {name} exceeds the limit of {MAX_LIFECYCLE_HOOKS_PER_GROUP} lifecycle \
-         hooks per Auto Scaling group"
-    )
+/// [`MAX_LIFECYCLE_HOOKS_PER_GROUP`] is refused with: the QUOTA the caller has to come back
+/// under, and nothing else.
+///
+/// A quota refusal is about the limit rather than about the resource that happened to hit
+/// it, so the sentence carries no part of the request — not the hook's name either: the
+/// same sentence answers every request that would take the group past the ceiling.
+pub fn too_many_hooks_message() -> String {
+    format!("You cannot have more than {MAX_LIFECYCLE_HOOKS_PER_GROUP} hooks per Auto Scaling group")
 }
 
 /// The message a request that creates a hook without naming a transition is refused

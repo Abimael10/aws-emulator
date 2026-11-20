@@ -552,6 +552,70 @@ pub fn running_state() -> &'static str {
     ec2::InstanceStateName::Running.as_str()
 }
 
+/// Finish the START of the instances `instance_ids` names in the account's Amazon EC2
+/// store: a start Amazon EC2's own clock has not retired by `at` is due at that instant and
+/// retired here, so Amazon EC2 reports the instance `running`.
+///
+/// What a LAUNCH lifecycle hook's wait state means for the instance it holds: the work that
+/// wait exists for runs ON a started instance — "create a launch template or launch
+/// configuration with a user data script that runs while an instance is in a wait state due
+/// to a lifecycle hook"
+/// (`smithy_query(query="operation",operation="CompleteLifecycleAction")`) — so an instance a
+/// hook has taken into that wait has finished starting, and Amazon EC2 reports it `running`
+/// for as long as the hold lasts rather than still coming up. Without this, a group could
+/// admit an instance to service (which is what resolving the hold does) while Amazon EC2 was
+/// still starting it, and the two services would disagree about an instance the group has
+/// already reported in service.
+///
+/// `at` is the instant the hold began, which is the instant the start COMPLETED: the span
+/// Amazon EC2 runs to `running` was spent getting the instance to the point the hook holds it
+/// at, so it is not restarted here. Anchored like every other writer in this module
+/// ([`terminate`]) — a hold the clock took earlier leaves the move due at once, and one taken
+/// at an instant still ahead leaves it due then.
+///
+/// The move is applied through Amazon EC2's OWN pass — the instance's pending transition is
+/// made due and that pass retires it — so everything Amazon EC2 does when a start completes
+/// is done once, by Amazon EC2. An instance it holds no record of, one already running, and
+/// one on its way out are left exactly as they are.
+pub fn finish_starting<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    instance_ids: &[String],
+    at: SystemTime,
+) {
+    if instance_ids.is_empty() {
+        return;
+    }
+    let Some(state) = ec2::service_state(engine) else {
+        return;
+    };
+    let mut store = state.lock();
+    // What is left of the span at this instant: nothing for an instant already past, which is
+    // what leaves the move due at once.
+    let remaining = at
+        .duration_since(SystemTime::now())
+        .unwrap_or_default();
+    let mut starting = false;
+    for instance_id in instance_ids {
+        let Some(instance) = store.instances.get_mut(instance_id) else {
+            continue;
+        };
+        if instance.state != ec2::InstanceStateName::Pending {
+            continue;
+        }
+        instance.pending_transition = Some(ec2::PendingTransition {
+            to: ec2::InstanceStateName::Running,
+            due_at: ::std::time::Instant::now() + remaining,
+        });
+        // The guest comes up with it: its first boot is what runs the user-data program the
+        // wait state exists for, so it is owed at the same instant.
+        instance.boot_due = Some(at);
+        starting = true;
+    }
+    if starting {
+        store.materialize_due_transitions();
+    }
+}
+
 /// What the account's own Amazon EC2 store holds for one instance a request named: the
 /// facts a consumer of an EXISTING instance needs, as Amazon EC2 holds them.
 #[derive(Debug, Clone)]

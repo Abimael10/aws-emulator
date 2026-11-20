@@ -128,11 +128,12 @@ pub mod lifecycle_actions;
 
 pub use lifecycle_actions::{
     abandoned_launch_cause, no_active_action_by_instance_message, no_active_action_by_token_message,
-    not_addressed_message, HeldStep, HeldTransition, LifecycleActionKey, LifecycleActionRefusal,
-    PendingLifecycleActionEvent, StoredLifecycleAction, LAUNCH_LIFECYCLE_ACTION,
-    LIFECYCLE_PENDING_PROCEED, LIFECYCLE_PENDING_WAIT, LIFECYCLE_TERMINATING_PROCEED,
-    LIFECYCLE_TERMINATING_WAIT, MAX_PENDING_LIFECYCLE_ACTION_EVENTS, TERMINATE_LIFECYCLE_ACTION,
-    TRANSITION_LAUNCHING, TRANSITION_TERMINATING,
+    no_active_action_under_hook_message, not_addressed_message, HeldStep, HeldTransition,
+    LifecycleActionKey, LifecycleActionRefusal, PendingLifecycleActionEvent, StoredLifecycleAction,
+    LAUNCH_LIFECYCLE_ACTION, LIFECYCLE_PENDING_PROCEED, LIFECYCLE_PENDING_WAIT,
+    LIFECYCLE_TERMINATING_PROCEED, LIFECYCLE_TERMINATING_RETAINED, LIFECYCLE_TERMINATING_WAIT,
+    MAX_PENDING_LIFECYCLE_ACTION_EVENTS, MAX_RETAINED_INSTANCES_PER_GROUP,
+    TERMINATE_LIFECYCLE_ACTION, TRANSITION_LAUNCHING, TRANSITION_TERMINATING,
 };
 
 /// The warm pool of a group: the pre-initialized instances `PutWarmPool` has the group
@@ -1212,14 +1213,16 @@ impl StoredGroup {
     /// An id this group does not hold contributes nothing, an id the request repeats
     /// names one instance, and one already `Terminating` is already on its way out — so
     /// this is both what a termination acts on and what its decrement of the desired
-    /// capacity counts.
+    /// capacity counts. An instance the group RETAINED is taken: a retained instance
+    /// "remain[s] until you call `TerminateInstanceInAutoScalingGroup`"
+    /// (`RetentionTriggers$TerminateHookAbandon`), so that call is exactly what takes it.
     pub fn instances_to_terminate(&self, instance_ids: &[String]) -> Vec<String> {
         let mut taken: Vec<String> = Vec::new();
         for instance_id in instance_ids {
-            let still_in_service = self
-                .instances
-                .iter()
-                .any(|instance| instance.instance_id == *instance_id && !instance.is_leaving_group());
+            let still_in_service = self.instances.iter().any(|instance| {
+                instance.instance_id == *instance_id
+                    && (!instance.is_leaving_group() || instance.is_retained())
+            });
             if still_in_service && !taken.contains(instance_id) {
                 taken.push(instance_id.clone());
             }
@@ -1935,6 +1938,13 @@ impl AutoScalingState {
         // Before the lifecycle pass below, so an instance a replacement launched at
         // an instant already past leaves its transient state in this same call.
         self.advance_instance_refreshes(engine, now);
+        // The holds the clock has timed out: a lifecycle action nobody completed before its
+        // own deadline resolves to the hook's `DefaultResult`, which is what keeps an
+        // instance from waiting for a client that never came back. Before the lifecycle pass
+        // below for the same reason as the refreshes: the wait ended at its own deadline, so
+        // whatever that ending itself made due is retired in this same call rather than
+        // waiting for another reader.
+        self.expire_lifecycle_actions(engine, now);
 
         for group in self.groups.values_mut() {
             for instance in &mut group.instances {
@@ -1958,15 +1968,16 @@ impl AutoScalingState {
             // An instance whose span out of the group has elapsed has left it. One a
             // termination hook is still holding has NOT: its wait is what the group is
             // waiting on, and resolving that hold is what starts the span
-            // ([`lifecycle_actions`]).
+            // ([`lifecycle_actions`]). Neither has one the group RETAINED: its termination
+            // was abandoned under a retention trigger that keeps it, so it stays a member
+            // until a caller takes it out.
             group.instances.retain(|i| {
-                !i.is_leaving_group() || i.transition_due.is_some() || i.is_held_by_lifecycle_hook()
+                !i.is_leaving_group()
+                    || i.transition_due.is_some()
+                    || i.is_held_by_lifecycle_hook()
+                    || i.is_retained()
             });
         }
-        // The holds the clock has timed out: a lifecycle action nobody completed before its
-        // own deadline resolves to the hook's `DefaultResult`, which is what keeps an
-        // instance from waiting for a client that never came back.
-        self.expire_lifecycle_actions(engine, now);
         // The warm pools the groups maintain: the transitions of their instances, and the
         // difference between each pool's size and the size it maintains, which the clock
         // owes exactly as it owes a group's own ([`warm_pools`]).
@@ -2545,6 +2556,7 @@ impl AutoScalingState {
         // group, so nothing holds them here.
         if request.destination == LaunchDestination::Group {
             self.hold_lifecycle_transition(
+                engine,
                 request.group_name,
                 HeldTransition::Launching,
                 &launched_ids,
@@ -2604,6 +2616,7 @@ impl AutoScalingState {
         due: SystemTime,
     ) {
         let held = self.hold_lifecycle_transition(
+            engine,
             group_name,
             HeldTransition::Terminating,
             instance_ids,
@@ -2618,7 +2631,7 @@ impl AutoScalingState {
             for instance in &mut group.instances {
                 if instance_ids.contains(&instance.instance_id)
                     && !held.contains(&instance.instance_id)
-                    && !instance.is_leaving_group()
+                    && (!instance.is_leaving_group() || instance.is_retained())
                 {
                     instance.lifecycle_state = LIFECYCLE_TERMINATING.to_string();
                     instance.transition_due = Some(due);
