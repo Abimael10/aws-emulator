@@ -96,6 +96,15 @@ base64 = "0.22"
 # schema registry's compatibility modes ask of two versions of a schema set. Only the
 # schema algebra is used; no codec feature is enabled.
 apache-avro = { version = "0.17", default-features = false }
+# Parses a `.proto` source document — the text a PROTOBUF `SchemaDefinition` is written as
+# — so whether such a definition is a schema document at all is answered by a protobuf
+# parser rather than by scanning the text (`state::schema_definition_protobuf`). Pure Rust
+# and in-memory: it takes the definition as a string and compiles no native code.
+protox-parse = "0.10"
+# Reads the source SPAN a protobuf parse error carries (the diagnostic interface
+# `protox-parse` reports one through), so a definition fault is reported at the position in
+# the submitted definition the parse stopped at.
+miette = "7"
 # The CONTAINED Python interpreter a Glue job run's own script is executed by, and the AWS
 # SDK modules that interpreter puts on a script's import path — both reached through the
 # Lambda service crate, which is where this workspace's ONE embedded Python execution

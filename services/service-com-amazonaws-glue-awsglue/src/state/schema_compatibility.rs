@@ -42,6 +42,14 @@ pub const DATA_FORMAT_AVRO: &str = "AVRO";
 /// Source: `smithy_query shape=DataFormat` (AVRO | JSON | PROTOBUF).
 pub const DATA_FORMAT_JSON: &str = "JSON";
 
+/// The third modelled `DataFormat`, whose schema documents are the source text of a
+/// `.proto` file, so a definition submitted for it is READ as protobuf source
+/// ([`schema_definition_fault`]) — while what a document of it says about a schema's
+/// evolution is not decided here.
+///
+/// Source: `smithy_query shape=DataFormat` (AVRO | JSON | PROTOBUF).
+pub const DATA_FORMAT_PROTOBUF: &str = "PROTOBUF";
+
 /// Ceiling on how much schema text ONE registration's compatibility check will parse.
 ///
 /// The check is work a single request drives: an `_ALL` mode asks for a comparison against
@@ -252,6 +260,10 @@ pub fn schema_definition_fault(data_format: &str, definition: &str) -> Option<St
                 .err()
                 .map(|error| error.to_string())
         }
+        // A protobuf schema document is the source text of a `.proto` file, so the
+        // language's own parser is what says whether a definition is one
+        // ([`super::unreadable_definition_protobuf`]).
+        DATA_FORMAT_PROTOBUF => super::unreadable_definition_protobuf(definition),
         _ => None,
     }
 }

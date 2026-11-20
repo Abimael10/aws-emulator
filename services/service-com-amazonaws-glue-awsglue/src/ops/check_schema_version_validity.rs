@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CheckSchemaVersionValidity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CheckSchemaVersionValidity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CheckSchemaVersionValidity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Answers whether a `SchemaDefinition` is a schema document of the `DataFormat` it was
+//! submitted for. "This call has no side effects, it simply validates using the supplied
+//! schema using DataFormat as the format", so nothing is written and no schema set is
+//! read: the answer is computed from the definition in the request alone, and "since it
+//! does not take a schema set name, no compatibility checks are performed".
+//!
+//! The question — is this text a schema document of this data format? — is the same one a
+//! registration asks of the definition it stores, so it is answered by the same reading
+//! ([`crate::state::schema_definition_fault`]): that format's own parser either accepts the
+//! text or names what the document was required to carry and where. A definition the parser
+//! accepts is reported `Valid` with no `Error`; one it does not is reported invalid carrying
+//! that reading as its `Error` — the reading alone, because this call refuses nothing: the
+//! sentence a WRITE of the same definition is refused with states the same reading inside
+//! its own frame ([`crate::state::messages::schema_definition_invalid`]), which a report
+//! carrying no refusal has no part in.
+//!
+//! A failed validation is this operation's SUCCESS: the model carries the outcome in
+//! `Valid`/`Error` on a 200 rather than in an error, so an invalid definition is never
+//! answered with `InvalidInputException` here.
 //!
 //! ## Shape of an operation
 //!
@@ -143,20 +156,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CheckSchemaVersionValidity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CheckSchemaVersionValidityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CheckSchemaVersionValidity"))
+        // No side effects and no schema set: the store is neither read nor written here,
+        // so the engine this operation was constructed with goes untouched. The modelled
+        // constraints on `DataFormat` (one of AVRO | JSON | PROTOBUF) and on
+        // `SchemaDefinition` (len 1..170000, pattern \S) are already enforced before this
+        // handler runs.
+        let _ = &self.engine;
+        let fault =
+            crate::state::schema_definition_fault(&input.data_format, &input.schema_definition);
+
+        Ok(CheckSchemaVersionValidityOutput {
+            // "Return true, if the schema is valid and false otherwise": valid is exactly
+            // the absence of a fault, so the two members can never disagree.
+            valid: fault.is_none(),
+            // "A validation failure error message": the reading of the definition itself,
+            // as the format's parser states it (recorded: a protobuf field left without
+            // its terminator is reported `Syntax error in :<line>:<column>: expected ';'`).
+            // The frame a schema-registry WRITE states the same reading in
+            // ([`crate::state::messages::schema_definition_invalid`]) belongs to that
+            // refusal and not to this report, which carries no refusal to frame.
+            error: fault
+                .as_deref()
+                .map(validation_error)
+                // The modelled `SchemaValidationError` admits 1..5000 characters, so a
+                // reading with nothing in it is no message to report.
+                .filter(|reading| !reading.is_empty()),
+        })
     }
+}
+
+/// The longest `Error` this operation reports: the modelled `SchemaValidationError` admits
+/// 1..5000 characters, while the parser's reading of a definition the modelled
+/// `SchemaDefinitionString` admits 170000 characters of can quote a token longer than that.
+///
+/// Source: `smithy_query shape=SchemaValidationError` (length 1..5000).
+const MAX_VALIDATION_ERROR_CHARS: usize = 5000;
+
+/// `message` as the modelled `SchemaValidationError` admits it: the reading, cut to
+/// [`MAX_VALIDATION_ERROR_CHARS`] characters so a long quoted token cannot push the member
+/// past the length its shape pins. The cut falls on a character boundary, so a multi-byte
+/// character is never split.
+fn validation_error(message: &str) -> String {
+    message.chars().take(MAX_VALIDATION_ERROR_CHARS).collect()
 }

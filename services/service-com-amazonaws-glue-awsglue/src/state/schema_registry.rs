@@ -557,17 +557,6 @@ impl SchemaEntry {
             .find(|version| version.version_number == version_number)
     }
 
-    /// The version whose stored `SchemaDefinition` is exactly `definition`, or `None` when
-    /// this schema set holds no version of it.
-    ///
-    /// Compared byte for byte, as stored: a definition is the artefact a registration
-    /// submitted, and the registry documents no normalisation of it.
-    pub fn version_with_definition(&self, definition: &str) -> Option<&SchemaVersionEntry> {
-        self.versions
-            .iter()
-            .find(|version| version.definition == definition)
-    }
-
     /// Whether this schema set's recorded `Compatibility` admits a FURTHER version:
     /// [`COMPATIBILITY_DISABLED`] "restricts any additional schema versions from being
     /// added after the first schema version", so a set already holding one admits none —

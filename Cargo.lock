@@ -7600,6 +7600,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "prost-types"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f29a7c4c7a84cef41a53d338a2d10d4f1b043ea5c3dde26db22ee2c9c1b1c75b"
+dependencies = [
+ "prost 0.14.6",
+]
+
+[[package]]
+name = "protox-parse"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34efee6fad0cf6d71642d20a66bfe0c281919c9577e7c66d20360dfcb7549272"
+dependencies = [
+ "logos 0.16.1",
+ "miette",
+ "prost-types",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "psl"
 version = "2.1.259"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14705,6 +14726,8 @@ dependencies = [
  "globset",
  "hex",
  "http",
+ "miette",
+ "protox-parse",
  "regex",
  "serde_json",
  "service-com-amazonaws-cloudformation-cloudformation",
@@ -22784,7 +22807,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
