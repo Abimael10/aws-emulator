@@ -3,7 +3,8 @@
 //! @op UpdateCluster
 //! Implemented: writes the stored cluster's network type, then answers with the SAME
 //! stored record `DescribeCluster` projects — including the five Regional data-plane
-//! endpoints that projection derives from the address this emulator is reachable at.
+//! endpoints that projection derives from the address this emulator is reachable at, in
+//! the order the stored cluster publishes them (its own Region first).
 //!
 //! Everything else about the cluster (its ARN, name, owner and tags) is untouched: the
 //! model's `UpdateClusterRequest` carries no other member, and the operation's own

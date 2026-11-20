@@ -20,9 +20,10 @@ use serde_json::{json, Value};
 // The HTTP harness every suite in this target shares, and the facts about this
 // service's resources the lifecycle suite already states.
 use super::body_enum_refusals::{enum_clause, NETWORK_TYPE_VALUES};
-use super::common::{call, create_cluster, enc, error_code, router};
+use super::common::{call, create_cluster, enc, error_code, router, REGION};
 use super::recovery_control_lifecycle::{
-    ACCOUNT, ARN_PREFIX, ENDPOINT_REGIONS, PAST_DEPLOYMENT, STATUS_DEPLOYED, STATUS_PENDING,
+    published_endpoint_regions, ACCOUNT, ARN_PREFIX, PAST_DEPLOYMENT, STATUS_DEPLOYED,
+    STATUS_PENDING,
 };
 
 /// The `NetworkType` values the model declares, via
@@ -150,8 +151,10 @@ async fn update_writes_the_network_type_and_describe_answers_it() {
             })
             .unwrap_or_default();
         assert_eq!(
-            regions, ENDPOINT_REGIONS,
-            "case {case}: expected one endpoint per supported Region, got {regions:?}"
+            regions,
+            published_endpoint_regions(REGION),
+            "case {case}: expected one endpoint per supported Region, the cluster's own \
+             Region first, got {regions:?}"
         );
         let templates = endpoint_templates(&updated);
         assert_eq!(

@@ -42,7 +42,8 @@ pub(crate) const STATUS_PENDING: &str = "PENDING";
 pub(crate) const STATUS_DEPLOYED: &str = "DEPLOYED";
 
 /// The Regions a cluster publishes a data-plane endpoint in — five, "one for each
-/// supported Amazon Web Services Region" (`CreateCluster`'s own documentation).
+/// supported Amazon Web Services Region" (`CreateCluster`'s own documentation). The order
+/// a cluster publishes them in is [`published_endpoint_regions`]; this is the SET.
 pub(crate) const ENDPOINT_REGIONS: &[&str] = &[
     "ap-northeast-1",
     "ap-southeast-2",
@@ -50,6 +51,24 @@ pub(crate) const ENDPOINT_REGIONS: &[&str] = &[
     "us-east-1",
     "us-west-2",
 ];
+
+/// The Region labels a cluster whose own Region is `home_region` publishes its endpoints
+/// under, in the order it publishes them: the cluster's OWN Region first — the Region the
+/// cluster was created in and is addressed on — then the remaining supported Regions.
+///
+/// A `home_region` that is none of the supported five publishes no endpoint of its own, so
+/// there is nothing for it to lead with and the supported Regions keep their own order.
+pub(crate) fn published_endpoint_regions(home_region: &str) -> Vec<&'static str> {
+    let own = ENDPOINT_REGIONS
+        .iter()
+        .copied()
+        .filter(|region| *region == home_region);
+    let rest = ENDPOINT_REGIONS
+        .iter()
+        .copied()
+        .filter(|region| *region != home_region);
+    own.chain(rest).collect()
+}
 
 /// Longer than the span the service gives a `PENDING` -> `DEPLOYED` transition, so a
 /// read after it must observe the deployed resource.
@@ -122,8 +141,10 @@ async fn create_persists_the_cluster_and_describe_answers_the_same_body() {
             .map(|e| e["Region"].as_str().unwrap_or_default())
             .collect();
         assert_eq!(
-            regions, ENDPOINT_REGIONS,
-            "case {name}: expected one endpoint per supported Region, got {regions:?}"
+            regions,
+            published_endpoint_regions(REGION),
+            "case {name}: expected one endpoint per supported Region, the cluster's own \
+             Region first, got {regions:?}"
         );
         // `Endpoint` is the address a client SENDS a routing-control state call to, so
         // every entry is the base this emulator is reachable at — the Region label it is

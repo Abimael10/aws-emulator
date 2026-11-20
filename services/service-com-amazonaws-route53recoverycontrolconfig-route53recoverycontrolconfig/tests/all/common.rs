@@ -72,17 +72,29 @@ pub async fn call(
     path: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
+    call_in_region(router, REGION, method, path, body).await
+}
+
+/// The same request, addressed to and signed for `region` instead of [`REGION`] — for a
+/// suite whose rule is about the Region a call is made in, rather than about one Region.
+pub async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> (u16, Value) {
     let payload = body.map_or_else(Bytes::new, |value| {
         Bytes::from(serde_json::to_vec(&value).expect("the request body serializes"))
     });
     let request = http::Request::builder()
         .method(method)
-        .uri(format!("https://{SIGNING_NAME}.{REGION}.amazonaws.com{path}"))
+        .uri(format!("https://{SIGNING_NAME}.{region}.amazonaws.com{path}"))
         .header("content-type", "application/json")
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIAEMULATOR/20260101/{REGION}/{SIGNING_NAME}/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIAEMULATOR/20260101/{region}/{SIGNING_NAME}/aws4_request, \
                  SignedHeaders=host, Signature=0000"
             ),
         )

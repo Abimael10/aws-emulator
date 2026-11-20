@@ -151,7 +151,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The data-plane address every listed cluster reports is where the emulator is
-        // reachable NOW; see `crate::state::cluster_endpoints`.
+        // reachable NOW, led by that cluster's own Region; see
+        // `crate::state::cluster_endpoints`.
         let endpoint_base = ctx.endpoint();
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListClustersErrorModeled::InternalServerException(

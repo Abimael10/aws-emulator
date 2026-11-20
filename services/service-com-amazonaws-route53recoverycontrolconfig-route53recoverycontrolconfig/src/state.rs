@@ -20,7 +20,8 @@
 //!   reachable at, as the asking request's own context reports it
 //!   ([`cluster_endpoints`]). Stored once at create time they would name wherever the
 //!   emulator was reachable then, which is not where a later caller has to send its
-//!   request.
+//!   request. Their ORDER is the cluster's own — [`ClusterRecord::home_region`] leads, see
+//!   [`cluster_endpoint_regions`] — so every read publishes the same order.
 //!
 //! The refusals every handler shares are worded here as well, so two operations cannot
 //! say the same thing differently: the sentences a lookup, a reference and a dependent
@@ -112,6 +113,45 @@ pub const CLUSTER_ENDPOINT_REGIONS: &[&str] = &[
     "us-west-2",
 ];
 
+/// The Region a request carrying no SigV4 credential scope is attributed to: the one
+/// Region AWS serves this control plane from, so a cluster created by an unsigned request
+/// is the cluster an AWS client creates when it names no Region of its own.
+const DEFAULT_REGION: &str = "us-west-2";
+
+/// The Region this request was addressed to, read off its SigV4 credential scope;
+/// [`DEFAULT_REGION`] for a request that carries no scope.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map(|scope| scope.region)
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+/// The Region labels a cluster whose own Region is `home_region` publishes its endpoints
+/// under, in the order it publishes them: the cluster's OWN Region first, then the
+/// remaining supported Regions in [`CLUSTER_ENDPOINT_REGIONS`] order.
+///
+/// The published SET is the supported Regions, one endpoint each; the ORDER is the
+/// cluster's. A cluster leads with the entry for the Region it itself lives in and is
+/// addressed on, so a client that dials the first published entry — the common shortcut,
+/// since this data plane has no generic Regional endpoint to fall back on — reaches the
+/// endpoint of its own Region rather than one picked independently of the cluster.
+///
+/// A `home_region` the supported set does not name publishes no endpoint of its own, so
+/// there is nothing for it to lead with and the supported Regions keep their own order.
+/// Matching is case-insensitive, as a Region label read off a credential scope is.
+pub fn cluster_endpoint_regions(home_region: &str) -> Vec<&'static str> {
+    let mut regions: Vec<&'static str> = CLUSTER_ENDPOINT_REGIONS.to_vec();
+    if let Some(at) = regions
+        .iter()
+        .position(|region| region.eq_ignore_ascii_case(home_region))
+    {
+        let own = regions.remove(at);
+        regions.insert(0, own);
+    }
+    regions
+}
+
 /// The instant a create call performed now makes the resource's deployment due.
 pub fn deploy_due() -> Instant {
     Instant::now() + DEPLOY_DELAY
@@ -129,7 +169,9 @@ pub fn status_at(due: Instant) -> &'static str {
 }
 
 /// The Regional data-plane endpoints a cluster publishes, one per label in
-/// [`CLUSTER_ENDPOINT_REGIONS`], for an emulator reachable at `endpoint_base`.
+/// [`CLUSTER_ENDPOINT_REGIONS`], for an emulator reachable at `endpoint_base`, in the
+/// order a cluster whose own Region is `home_region` publishes them
+/// ([`cluster_endpoint_regions`]).
 ///
 /// `ClusterEndpoint$Endpoint` is not a label a client reads: it is the address the client
 /// then SENDS its `GetRoutingControlState` / `UpdateRoutingControlState(s)` /
@@ -159,11 +201,11 @@ pub fn status_at(due: Instant) -> &'static str {
 /// is published as the client must dial it rather than trimmed into the pattern and left
 /// unreachable. Every other base — a name, an IPv4 address, with or without a port — is
 /// inside both the pattern and the `@length 1..128`.
-pub fn cluster_endpoints(endpoint_base: &str) -> Vec<(String, String)> {
+pub fn cluster_endpoints(endpoint_base: &str, home_region: &str) -> Vec<(String, String)> {
     let endpoint = endpoint_base.trim_end_matches('/');
-    CLUSTER_ENDPOINT_REGIONS
-        .iter()
-        .map(|region| ((*region).to_string(), endpoint.to_string()))
+    cluster_endpoint_regions(home_region)
+        .into_iter()
+        .map(|region| (region.to_string(), endpoint.to_string()))
         .collect()
 }
 
@@ -178,6 +220,11 @@ pub struct ClusterRecord {
     /// The account that owns the cluster — this emulator's account id.
     pub owner: String,
     pub network_type: String,
+    /// The Region this cluster lives in: the one its create call was addressed to
+    /// ([`request_region`]). The cluster publishes its own Region's data-plane endpoint
+    /// first ([`cluster_endpoint_regions`]), and that order belongs to the cluster rather
+    /// than to the read, so every later projection publishes the same one.
+    pub home_region: String,
     pub tags: BTreeMap<String, String>,
     /// The control panel AWS creates together with the cluster, and the one
     /// `CreateRoutingControl` attaches to when the request names none.
@@ -219,7 +266,7 @@ impl ClusterRecord {
         Cluster {
             cluster_arn: Some(self.arn.clone()),
             cluster_endpoints: Some(
-                cluster_endpoints(endpoint_base)
+                cluster_endpoints(endpoint_base, &self.home_region)
                     .into_iter()
                     .map(|(region, endpoint)| ClusterEndpoint {
                         endpoint: Some(endpoint),
@@ -1361,6 +1408,7 @@ mod tests {
                     name: "c".to_string(),
                     owner: "000000000000".to_string(),
                     network_type: from.to_string(),
+                    home_region: "us-east-1".to_string(),
                     tags: BTreeMap::new(),
                     default_control_panel_arn: String::new(),
                     deploy_due: Instant::now(),

@@ -29,7 +29,10 @@
 //! Every config-plane operation that answers a `Cluster` is read: `CreateCluster` and
 //! `DescribeCluster` for the discovery path itself, then `ListClusters` and `UpdateCluster`,
 //! so a client that found the cluster in a listing or read it straight after a change is
-//! handed the same served address.
+//! handed the same served address. The published list leads with the entry for the cluster's
+//! OWN Region — the Region these calls are addressed to — which is the entry a client that
+//! takes the first one dials; the config plane's own suite owns that rule, and here it only
+//! fixes the order the rows below walk.
 //!
 //! Two crates have to agree for one of these rows to hold: the config plane publishes the
 //! address, the cluster data plane answers at it, both over one engine, so the suite lives
@@ -79,6 +82,8 @@ const TARGET_PREFIX: &str = "ToggleCustomerAPI";
 /// The Region labels a cluster publishes an endpoint under: "an array of the five cluster
 /// endpoints (one for each supported Amazon Web Services Region)"
 /// (`smithy_query(query="doc",shape="CreateCluster")` on the recovery-control-config model).
+/// This is the SET; the order a cluster publishes them in is
+/// [`published_regions_from`].
 const PUBLISHED_REGIONS: &[&str] = &[
     "ap-northeast-1",
     "ap-southeast-2",
@@ -86,6 +91,23 @@ const PUBLISHED_REGIONS: &[&str] = &[
     "us-east-1",
     "us-west-2",
 ];
+
+/// The Region labels a cluster created in `home_region` publishes its endpoints under, in
+/// the ORDER it publishes them: the cluster's own Region first — the Region it was created
+/// in and is addressed on — then the remaining supported Regions. A client that dials the
+/// first published entry is the common case, and this data plane has no generic Regional
+/// endpoint to fall back on.
+fn published_regions_from(home_region: &str) -> Vec<&'static str> {
+    let own = PUBLISHED_REGIONS
+        .iter()
+        .copied()
+        .filter(|region| *region == home_region);
+    let rest = PUBLISHED_REGIONS
+        .iter()
+        .copied()
+        .filter(|region| *region != home_region);
+    own.chain(rest).collect()
+}
 
 /// The bases these rows make the emulator reachable at: the base of an emulator served on no
 /// port at all (`smithy_server_runtime::UNSERVED_URL_BASE`), a loopback address with a port,
@@ -412,9 +434,10 @@ async fn every_published_cluster_endpoint_serves_the_routing_control_data_plane(
             .map(|(region, _endpoint)| region.as_str())
             .collect();
         assert_eq!(
-            regions, PUBLISHED_REGIONS,
-            "case {case:?}: a cluster publishes one endpoint per supported Region, got \
-             {endpoints:?}"
+            regions,
+            published_regions_from(REGION),
+            "case {case:?}: a cluster publishes one endpoint per supported Region, its own \
+             Region first, got {endpoints:?}"
         );
         for (region, endpoint) in &endpoints {
             assert_eq!(

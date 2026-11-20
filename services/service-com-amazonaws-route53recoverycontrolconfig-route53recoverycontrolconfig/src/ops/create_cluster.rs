@@ -5,7 +5,8 @@
 //! alongside it, and persists both in [`crate::state`]; `DescribeCluster` projects the
 //! same stored record, with the five Regional data-plane endpoints it publishes derived
 //! from the base URL this emulator is reachable at
-//! ([`crate::state::cluster_endpoints`]).
+//! ([`crate::state::cluster_endpoints`]), led by the entry for the Region this create
+//! call was addressed to ([`crate::state::cluster_endpoint_regions`]).
 //!
 //! The cluster's `Status` is DERIVED from the instant its deployment became due, so it
 //! reads `PENDING` right after this call and `DEPLOYED` once that instant has passed
@@ -171,6 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The address the created cluster PUBLISHES for its data plane is the base URL
         // this emulator is reachable at, so the caller's next call reaches this process.
         let endpoint_base = ctx.endpoint();
+        // The Region the cluster lives in: the one this create call was addressed to. The
+        // cluster leads its published endpoints with its own Region's, so the Region is
+        // stored with the record and every later read answers in that same order.
+        let home_region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateClusterErrorModeled::InternalServerException(
                 InternalServerException {
@@ -272,6 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: input.cluster_name,
                 owner: owner.clone(),
                 network_type,
+                home_region,
                 tags: crate::state::tags_map(input.tags),
                 default_control_panel_arn: default_panel_arn.clone(),
                 deploy_due: due,

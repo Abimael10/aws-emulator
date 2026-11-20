@@ -151,8 +151,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The data-plane address this reports is where the emulator is reachable NOW; see
-        // `crate::state::cluster_endpoints`.
+        // The data-plane address this reports is where the emulator is reachable NOW, led
+        // by the stored cluster's own Region; see `crate::state::cluster_endpoints`.
         let endpoint_base = ctx.endpoint();
         // Whether the caller may act on the resource an ARN names is decided from the
         // request alone, so it is decided BEFORE the ARN is looked up: an ARN of another
