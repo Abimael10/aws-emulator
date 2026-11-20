@@ -3671,7 +3671,7 @@ fn queue_delivery_refusal(
             "an EventBridge delivery was withheld: the queue's own policy does not allow this \
              service to send it a message"
         );
-        let (code, message) = crate::state::queue_access_refusal(resource, action);
+        let (code, message) = crate::state::queue_access_refusal();
         return Some(crate::state::InvocationOutcome::Failed {
             code: delivery_condition(code).to_string(),
             message,

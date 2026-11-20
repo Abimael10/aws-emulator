@@ -19,13 +19,14 @@
 //! is one that FAILED, so it is counted on the rule's `FailedInvocations` and sent to
 //! the target's dead-letter queue — which is the same send by the same principal, so
 //! that queue's own policy decides it the same way. What the dead letter REPORTS is
-//! the answer Amazon SQS gave the refused `sqs:SendMessage`: that service answers a
-//! call the documents in force do not permit with its authorization refusal (HTTP
-//! 403 under `AccessDenied`, as its own gate does —
-//! `service_com_amazonaws_sqs_amazonsqs::state::authorization::denied`), whose
-//! sentence names the principal, the action and the queue — and the condition beside
-//! it is this service's classification of that code, which is the permission one
-//! (`NO_PERMISSIONS`).
+//! the answer Amazon SQS gave the refused `sqs:SendMessage`: that service has one
+//! answer for a send it will not make, whether the queue is absent or the documents
+//! in force do not permit the sender — `QueueDoesNotExist` at HTTP 400 under
+//! `AWS.SimpleQueueService.NonExistentQueue`, `SendMessage` modelling no
+//! authorization failure at all — whose sentence states both reasons and names
+//! nothing of the delivery, because that service discloses nothing about a queue it
+//! will not let the caller write to; and the condition beside it is this service's
+//! classification of that code, which is the resource one (`NO_RESOURCE`).
 //!
 //! The first test spans a TABLE whose rows differ along what the queue's document
 //! states: whether there is one at all, which principal it names, which action and
@@ -44,8 +45,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC,
-    NO_PERMISSIONS, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, FAILED_INVOCATIONS_METRIC, INVOCATIONS_METRIC, NO_RESOURCE,
+    SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
@@ -60,17 +61,14 @@ const SEND_MESSAGE: &str = "sqs:SendMessage";
 const ERROR_CODE_ATTRIBUTE: &str = "ERROR_CODE";
 const ERROR_MESSAGE_ATTRIBUTE: &str = "ERROR_MESSAGE";
 
-/// The fixed text of the answer Amazon SQS gives a caller whose send its documents
-/// do not permit: its authorization refusal, whose sentence names the principal the
-/// call was made as, the action and the queue it was refused on — which is what a
-/// withheld delivery's `ERROR_MESSAGE` opens with. Only the id of the refused
-/// request varies; the queue ARN comes from the delivery's own target.
-fn withheld_send_text(queue_arn: &str) -> String {
-    format!(
-        "User: {SERVICE_PRINCIPAL} is not authorized to perform: {SEND_MESSAGE} on resource: \
-         {queue_arn} because no resource-based policy allows the {SEND_MESSAGE} action (Service: \
-         AmazonSQS; Status Code: 403; Error Code: AccessDenied; Request ID: "
-    )
+/// The fixed text of the answer Amazon SQS gives a caller whose send it will not
+/// make: one sentence for both reasons it covers, naming neither the queue, the
+/// principal nor the action — which is what a withheld delivery's `ERROR_MESSAGE`
+/// opens with. Only the id of the refused request varies.
+fn withheld_send_text() -> String {
+    "The specified queue does not exist or you do not have access to it. (Service: AmazonSQS; \
+     Status Code: 400; Error Code: AWS.SimpleQueueService.NonExistentQueue; Request ID: "
+        .to_string()
 }
 
 /// The account every resource below belongs to.
@@ -456,15 +454,14 @@ async fn a_withheld_delivery_is_dead_lettered_only_where_that_queue_allows_it() 
                 .as_str()
                 .unwrap_or_default();
             assert_eq!(
-                code, NO_PERMISSIONS,
+                code, NO_RESOURCE,
                 "case {case:?}: expected the dead letter to name the condition the delivery \
                  failed at, got {message:?}"
             );
-            // The sentence is the one Amazon SQS answers a caller whose send its
-            // documents do not permit, as the refused delivery read it; only the id
-            // of that refused request varies. The queue it was refused on is named
-            // in that answer, as that service names it.
-            let expected = withheld_send_text(&target_arn);
+            // The sentence is the one Amazon SQS answers a caller whose send it will
+            // not make, as the refused delivery read it; only the id of that refused
+            // request varies, and nothing of the delivery is named in it.
+            let expected = withheld_send_text();
             let reported = message["MessageAttributes"][ERROR_MESSAGE_ATTRIBUTE]["StringValue"]
                 .as_str()
                 .unwrap_or_default();

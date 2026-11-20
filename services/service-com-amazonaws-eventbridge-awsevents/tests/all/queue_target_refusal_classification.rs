@@ -11,14 +11,12 @@
 //! (`PutTargets`: "for Lambda functions, Amazon SNS topics and Amazon SQS queues,
 //! EventBridge relies on resource-based policies"), and the dead letter's
 //! `ERROR_CODE` is EventBridge's classification OF THE ANSWER the target's service
-//! gave — never a verdict this service reaches on its own. A queue that IS there and
-//! refuses the send answers that service's own authorization refusal (HTTP 403 under
-//! `AccessDenied`, the pair its gate answers a call the documents in force do not
-//! permit with —
-//! `service_com_amazonaws_sqs_amazonsqs::state::authorization::denied`), so every
-//! form of withholding lands in the permission class (`NO_PERMISSIONS`); the
-//! resource class (`NO_RESOURCE`) belongs to a queue that is not there at all, whose
-//! not-found answer the delivery reads from `SendMessage` itself.
+//! gave — never a verdict this service reaches on its own. Amazon SQS answers a
+//! sender it has not authorized with the one answer it has for a send it will not
+//! make: `QueueDoesNotExist` at HTTP 400, `SendMessage` modelling no authorization
+//! failure at all because that service does not disclose a queue it will not let the
+//! caller write to. So every form of withholding, and a queue that is not there,
+//! land in the one class that answer's code belongs to (`NO_RESOURCE`).
 //!
 //! The table spans the class rather than one case: the rows differ along the FORM
 //! the withholding takes (no document at all, an explicit `Deny`, a grant scoped by
@@ -32,18 +30,18 @@
 //! `Policy` is an IAM policy document
 //! (`smithy_query(query="doc",shape="com.amazonaws.sqs#QueueAttributeName")`).
 //!
-//! The last test closes the loop the classification claims: the very queue a
-//! withheld delivery was dead-lettered for receives the NEXT event once its policy
-//! grants the send, with nothing else changed — so the queue was there all along and
-//! only the authorization had failed, which is exactly what the class beside it
-//! says.
+//! The last test closes the loop the answer leaves open: the very queue a withheld
+//! delivery was dead-lettered for receives the NEXT event once its policy grants the
+//! send, with nothing else changed — so the queue was there all along and only the
+//! authorization had failed, which is precisely what the answer withholds and what an
+//! operator reading the letter has to check.
 //!
 //! The harness (the router with EventBridge, Amazon SQS, Step Functions, IAM and
 //! CloudWatch on one engine) is `tests/all/target_dispatch.rs`'s.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_eventbridge_awsevents::state::{
-    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_PERMISSIONS, NO_RESOURCE, SERVICE_PRINCIPAL,
+    rule_arn, DEFAULT_EVENT_BUS_NAME, NO_RESOURCE, SERVICE_PRINCIPAL,
 };
 
 use crate::target_dispatch::{
@@ -218,32 +216,32 @@ async fn a_queue_targets_failure_class_is_the_one_its_own_state_puts_it_in() {
         Row {
             case: "a queue carrying no policy at all",
             setup: Setup::Queue(None),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue whose policy denies the send beside granting it",
             setup: Setup::Queue(Some(granting_then_denying)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue whose grant is scoped by aws:SourceArn to another rule",
             setup: Setup::Queue(Some(granting_another_rule)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue granting this service another action",
             setup: Setup::Queue(Some(granting_another_action)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue whose grant names another queue as its resource",
             setup: Setup::Queue(Some(granting_another_resource)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue granting the send to another service principal",
             setup: Setup::Queue(Some(granting_another_principal)),
-            class: NO_PERMISSIONS,
+            class: NO_RESOURCE,
         },
         Row {
             case: "a queue ARN no queue was created for",
@@ -321,9 +319,9 @@ async fn a_queue_targets_failure_class_is_the_one_its_own_state_puts_it_in() {
 }
 
 /// The queue a withheld delivery was dead-lettered for IS there: the same queue,
-/// with nothing changed but its policy, receives the next event — which is why the
-/// class beside it names the permission rather than claiming the queue is gone, and
-/// what an operator reading the letter has to repair.
+/// with nothing changed but its policy, receives the next event — so the answer the
+/// letter carries, which tells the two apart for nobody, is about the authorization
+/// and that is what an operator reading it has to repair.
 #[tokio::test]
 async fn the_queue_a_withheld_delivery_names_receives_once_its_policy_grants_the_send() {
     let case = "a target queue granted the send after a withheld delivery";
@@ -353,8 +351,8 @@ async fn the_queue_a_withheld_delivery_names_receives_once_its_policy_grants_the
     );
     let code = attribute(&dead_lettered[0], ERROR_CODE_ATTRIBUTE);
     assert_eq!(
-        code, NO_PERMISSIONS,
-        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_PERMISSIONS:?}, got \
+        code, NO_RESOURCE,
+        "case {case:?}: expected the dead-letter {ERROR_CODE_ATTRIBUTE} {NO_RESOURCE:?}, got \
          {code:?} in {:?}",
         dead_lettered[0]
     );
