@@ -76,23 +76,13 @@ use ::smithy_server_runtime::OperationContext;
 
 use crate::ops::types::Origin;
 use crate::state::{
-    origin_access_identity_reference, ComAmazonawsCloudfrontCloudfront20200531State,
-    StoredDistribution,
+    origin_access_identity_principal_arn, origin_access_identity_reference,
+    ComAmazonawsCloudfrontCloudfront20200531State, StoredDistribution,
 };
 
 /// The service principal an origin request CloudFront makes is made as, and so the principal
 /// an origin's resource policy grants the read to.
 pub const SERVICE_PRINCIPAL: &str = "cloudfront.amazonaws.com";
-
-/// The account field of the IAM principal a LEGACY origin access identity is named by in a
-/// bucket policy: an origin access identity is an identity of CloudFront's own account, not
-/// of the caller's.
-const ORIGIN_ACCESS_IDENTITY_ACCOUNT: &str = "cloudfront";
-
-/// The resource the same principal names, ahead of the identity's own id
-/// (`arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity <id>` — the spelling the
-/// Amazon S3 User Guide's own OAI bucket policy carries).
-const ORIGIN_ACCESS_IDENTITY_USER_PREFIX: &str = "user/CloudFront Origin Access Identity ";
 
 /// The `SigningBehavior` values under which CloudFront signs EVERY origin request: `always`
 /// ("CloudFront signs all origin requests") and `always-amz-auth` ("CloudFront signs all
@@ -326,11 +316,9 @@ fn of_origin_access_identity(
         host,
         source_arn: distribution.arn.clone(),
         principals: vec![
-            format!(
-                "arn:{partition}:iam::{ORIGIN_ACCESS_IDENTITY_ACCOUNT}:\
-                 {ORIGIN_ACCESS_IDENTITY_USER_PREFIX}{id}",
-                partition = partition_of(&distribution.arn),
-                id = identity.id
+            origin_access_identity_principal_arn(
+                &partition_of(&distribution.arn),
+                &identity.id,
             ),
             identity.s3_canonical_user_id.clone(),
         ],

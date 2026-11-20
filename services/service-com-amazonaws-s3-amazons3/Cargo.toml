@@ -100,6 +100,14 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # `GetMetricStatistics` and the alarm evaluation read — rather than to a second copy of them
 # (`service::request_metrics`).
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The CloudFront store is the only record of an ORIGIN ACCESS IDENTITY, which is one of the
+# identities a bucket policy grants to: `PutBucketPolicy` resolves a principal spelled as one
+# against that service's own identities, over the shared engine, rather than taking the ARN
+# text on trust or keeping a second copy of the identities
+# (`service::policy_principals`). CloudFront takes this crate as a DEV-dependency only (its
+# own suites mount Amazon S3 beside it), so the cycle closes through a dev-dependency, which
+# Cargo allows.
+service-com-amazonaws-cloudfront-cloudfront2020-05-31 = { workspace = true }
 # The S3 Tables store owns the tables an S3 Metadata configuration is provisioned into: the
 # managed table bucket, the namespace of the general purpose bucket they belong to and the
 # journal, inventory and annotation tables themselves are written into that service's own

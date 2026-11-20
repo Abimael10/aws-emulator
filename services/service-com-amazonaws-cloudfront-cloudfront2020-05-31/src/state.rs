@@ -4331,6 +4331,14 @@ pub use anycast_entitlement::*;
 mod key_group_config;
 pub use key_group_config::*;
 
+/// The PRINCIPAL an origin access identity is named by in another service's resource-based
+/// policy: the one spelling of it, built for the origin request the edge makes as the identity
+/// and read back for the service resolving such a document's principals, beside the existence
+/// read that answers whether this account holds the identity named. A SUBMODULE for the same
+/// reason [`functions`] is one; `pub use` keeps every name reachable as `crate::state::<name>`.
+mod origin_access_identity_principal;
+pub use origin_access_identity_principal::*;
+
 /// The judgement a submitted DISTRIBUTION configuration's own MEMBERS are admitted by: the
 /// published per-list quotas its counts are bounded by, the domain each member's value has to
 /// be inside, and the references it resolves — made ONCE for every call that writes a whole

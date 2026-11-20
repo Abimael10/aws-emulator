@@ -19558,6 +19558,7 @@ dependencies = [
  "quick-xml",
  "regex",
  "serde_json",
+ "service-com-amazonaws-cloudfront-cloudfront2020-05-31",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
