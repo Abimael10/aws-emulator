@@ -395,6 +395,61 @@ pub(crate) enum Deadline {
     Rest,
 }
 
+/// Launch a MicroVM of `image` carrying an `idlePolicy` of the three durations `case`
+/// names, and hand back its id once it reports `RUNNING` — the state from which the
+/// policy's own idle span is measured.
+async fn microvm_with_idle_policy(
+    router: &MultiServiceRouter,
+    image: &str,
+    case: &str,
+    max_idle: u64,
+    rest_for: u64,
+    auto_resume: bool,
+) -> String {
+    let (status, run) = run_microvm(
+        router,
+        json!({
+            "imageIdentifier": image,
+            "idlePolicy": {
+                "maxIdleDurationSeconds": max_idle,
+                "suspendedDurationSeconds": rest_for,
+                "autoResumeEnabled": auto_resume,
+            },
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "case {case:?}: run got {status} {run}");
+    let id = run["microvmId"].as_str().unwrap_or_default().to_string();
+    poll_until_microvm_state(router, case, &id, RUNNING).await;
+    id
+}
+
+/// How far a deadline the store holds may sit from the duration the REQUEST gave it: a
+/// deadline is armed at the instant the MicroVM entered the state it is measured from, so
+/// what a case reads back is that duration less however long the emulator took to get
+/// there — generous room for a loaded host, and far too tight to be satisfied by any other
+/// duration a row carries.
+const DEADLINE_SLACK: Duration = Duration::from_secs(30);
+
+/// Assert that the `which` deadline of the MicroVM `microvm_id` is owed, `expected_seconds`
+/// away — the duration the request gave it rather than a span of this emulator's choosing.
+fn assert_deadline_owed(
+    engine: &Arc<engine::InMemoryEngine>,
+    microvm_id: &str,
+    which: Deadline,
+    expected_seconds: u64,
+    case: &str,
+    what: &str,
+) {
+    let expected = Duration::from_secs(expected_seconds);
+    let left = deadline_left(engine, microvm_id, which)
+        .unwrap_or_else(|| panic!("case {case:?}: {what}"));
+    assert!(
+        left <= expected && left + DEADLINE_SLACK > expected,
+        "case {case:?}: expected about {expected_seconds}s left of {what}, got {left:?}"
+    );
+}
+
 /// RULE: an `idlePolicy` is enforced by the PLATFORM's own clock, with no call from the
 /// client: a MicroVM that carries one is suspended once `maxIdleDurationSeconds` has
 /// passed with no inbound traffic through its endpoint, a MicroVM that then rests longer
@@ -421,30 +476,17 @@ async fn an_idle_policy_suspends_and_then_terminates_a_microvm_on_the_platforms_
     ];
 
     for (case, max_idle, rest_for, rests) in rows {
-        let (status, run) = run_microvm(
-            &router,
-            json!({
-                "imageIdentifier": "idling",
-                "idlePolicy": {
-                    "maxIdleDurationSeconds": max_idle,
-                    "suspendedDurationSeconds": rest_for,
-                    "autoResumeEnabled": true,
-                },
-            }),
-        )
-        .await;
-        assert_eq!(status, 200, "case {case:?}: run got {status} {run}");
-        let id = run["microvmId"].as_str().unwrap_or_default().to_string();
-        poll_until_microvm_state(&router, case, &id, RUNNING).await;
+        let id = microvm_with_idle_policy(&router, "idling", case, max_idle, rest_for, true).await;
 
         // The deadline a RUNNING MicroVM owes is one `maxIdleDurationSeconds` away: the
         // caller's own duration, not a span of this emulator's choosing.
-        let left = deadline_left(&engine, &id, Deadline::Idle)
-            .unwrap_or_else(|| panic!("case {case:?}: a MicroVM with a policy owes a suspend"));
-        assert!(
-            left <= Duration::from_secs(max_idle)
-                && left + Duration::from_secs(30) > Duration::from_secs(max_idle),
-            "case {case:?}: expected about {max_idle}s of idle time left, got {left:?}"
+        assert_deadline_owed(
+            &engine,
+            &id,
+            Deadline::Idle,
+            max_idle,
+            case,
+            "the automatic suspend a MicroVM with a policy owes",
         );
 
         // Waiting the idle duration out: the suspend is the platform's, so no
@@ -455,13 +497,13 @@ async fn an_idle_policy_suspends_and_then_terminates_a_microvm_on_the_platforms_
 
             // A resting MicroVM owes the other deadline, one `suspendedDurationSeconds`
             // away.
-            let left = deadline_left(&engine, &id, Deadline::Rest).unwrap_or_else(|| {
-                panic!("case {case:?}: a resting MicroVM with a policy owes a termination")
-            });
-            assert!(
-                left <= Duration::from_secs(rest_for)
-                    && left + Duration::from_secs(30) > Duration::from_secs(rest_for),
-                "case {case:?}: expected about {rest_for}s of rest left, got {left:?}"
+            assert_deadline_owed(
+                &engine,
+                &id,
+                Deadline::Rest,
+                rest_for,
+                case,
+                "the automatic termination a resting MicroVM with a policy owes",
             );
             set_deadline(&engine, &id, Deadline::Rest, None);
         }
@@ -556,4 +598,154 @@ async fn a_transition_on_an_unknown_identifier_answers_resource_not_found() {
         "no refused transition may touch the MicroVM that does exist, got {:?}",
         got["state"]
     );
+}
+
+/// How many times the idle-policy case below reads a MicroVM whose idle duration has NOT
+/// passed. A clock-owed move is materialised by whatever call next reads the record, so a
+/// read that brought the automatic suspend forward would show up here.
+const READS_WHILE_STILL_IDLING: usize = 5;
+
+/// RULE: the suspend an `idlePolicy` owes is the PLATFORM's own and is owed by the CLOCK
+/// alone — a MicroVM carrying a policy keeps reporting `RUNNING` while
+/// `maxIdleDurationSeconds` has not passed without inbound traffic, however often it is
+/// read, so the span really runs rather than firing on launch — and once that duration has
+/// passed the MicroVM comes to rest in the SAME `SUSPENDED` state a requested suspend
+/// brings it to, carrying the whole record it was running with: a `SuspendMicrovm` is then
+/// the no-op an already suspended MicroVM answers, and `ResumeMicrovm` puts it back in
+/// `RUNNING` on a fresh idle span.
+///
+/// Source for the policy's members and their bounds:
+/// `smithy_query(query="shape",shape="IdlePolicy")` — `maxIdleDurationSeconds`
+/// `@range(min: 60)`, `suspendedDurationSeconds` `@range(min: 0)` and `autoResumeEnabled`,
+/// all three required.
+#[tokio::test]
+async fn the_platforms_own_suspend_waits_for_the_idle_duration_and_rests_like_a_requested_one() {
+    let (router, engine) = emulator_with_engine();
+    built_image(&router, "idle-rest").await;
+
+    // Rows differ along the durations the policy carries — the smallest idle duration the
+    // member admits and two longer ones, each with a rest long enough that the automatic
+    // termination is not what ends the case — and along `autoResumeEnabled`, which governs
+    // the TRAFFIC-driven resume and so cannot change what a requested one does.
+    //
+    // `reads_while_idling` says whether the row also drives the reads that must NOT bring
+    // the suspend forward. That half of the claim can only be made while the span is still
+    // running, so it belongs to the rows whose duration leaves generous room for a loaded
+    // host to get through the reads — never to the row carrying the SMALLEST duration a
+    // caller may ask for, which would be this case bounding its own wall clock by one
+    // minute. The minimum-bound row still drives everything after it.
+    let rows: Vec<(&str, u64, u64, bool, bool)> = vec![
+        (
+            "the smallest idle duration the member admits",
+            60,
+            3_600,
+            true,
+            false,
+        ),
+        (
+            "a quarter of an hour idle, auto-resume off",
+            900,
+            1_800,
+            false,
+            true,
+        ),
+        ("eight hours idle", 28_800, 28_800, true, true),
+    ];
+
+    for (case, max_idle, rest_for, auto_resume, reads_while_idling) in rows {
+        let id =
+            microvm_with_idle_policy(&router, "idle-rest", case, max_idle, rest_for, auto_resume)
+                .await;
+
+        if reads_while_idling {
+            // Nothing has reached the MicroVM's endpoint and its idle duration has not
+            // passed, so no read may take it out of RUNNING.
+            for read in 1..=READS_WHILE_STILL_IDLING {
+                let (_, got) = get_microvm(&router, &id).await;
+                assert_eq!(
+                    got["state"].as_str(),
+                    Some(RUNNING),
+                    "case {case:?}: read {read} must not bring the automatic suspend forward, \
+                     got {:?}",
+                    got["state"]
+                );
+            }
+            // And the suspend is still OWED after them: the reads neither took it nor
+            // dropped it. Its VALUE is asserted where it is armed — at the launch above by
+            // the case beside this one, and after the resume below.
+            let left = deadline_left(&engine, &id, Deadline::Idle)
+                .unwrap_or_else(|| panic!("case {case:?}: a MicroVM with a policy owes a suspend"));
+            assert!(
+                left > Duration::ZERO && left <= Duration::from_secs(max_idle),
+                "case {case:?}: the suspend must still be owed, within the caller's own \
+                 {max_idle}s, got {left:?}"
+            );
+        }
+        // The whole of the rest of this case is driven off the STORE's clock, so put the
+        // idle deadline back a full span from here — where arming it on reaching RUNNING
+        // put it — and no later step depends on how fast this host got through the reads.
+        set_deadline(
+            &engine,
+            &id,
+            Deadline::Idle,
+            Some(Duration::from_secs(max_idle)),
+        );
+        let (_, running) = get_microvm(&router, &id).await;
+
+        // Waiting that duration out, by moving the instant the store holds it at into the
+        // past: the suspend is the PLATFORM's, so no SuspendMicrovm is called here at all.
+        set_deadline(&engine, &id, Deadline::Idle, None);
+        poll_until_microvm_state(&router, case, &id, SUSPENDED).await;
+        let (_, suspended) = get_microvm(&router, &id).await;
+        assert_eq!(
+            without_run_state(&suspended),
+            without_run_state(&running),
+            "case {case:?}: the platform's own suspend preserves the whole record apart \
+             from its run state: {suspended} vs {running}"
+        );
+
+        // It rests exactly where a requested suspend rests: asking for the suspend it has
+        // already taken is the no-op `SuspendMicrovm` answers a suspended MicroVM with.
+        let (status, asked) = transition(&router, SUSPEND, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: suspending an auto-suspended MicroVM got {status} {asked}"
+        );
+        let (_, after_suspend) = get_microvm(&router, &id).await;
+        assert_eq!(
+            after_suspend, suspended,
+            "case {case:?}: that suspend must change nothing, got {after_suspend}"
+        );
+
+        // And a requested resume brings it back on a FRESH span of the caller's own idle
+        // duration, which is what makes the automatic suspend repeatable rather than
+        // terminal.
+        let (status, resumed) = transition(&router, RESUME, &id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: resuming an auto-suspended MicroVM got {status} {resumed}"
+        );
+        let (_, back) = get_microvm(&router, &id).await;
+        assert_eq!(
+            back["state"].as_str(),
+            Some(RUNNING),
+            "case {case:?}: the resume restores RUNNING, got {:?}",
+            back["state"]
+        );
+        // The whole record, run state included: a MicroVM the platform suspended and the
+        // caller resumed is the one it was running with, not a copy of it.
+        assert_eq!(
+            back, running,
+            "case {case:?}: the resume restores the record the MicroVM was running with, \
+             got {back}"
+        );
+        assert_deadline_owed(
+            &engine,
+            &id,
+            Deadline::Idle,
+            max_idle,
+            case,
+            "the fresh automatic suspend a MicroVM that runs again owes",
+        );
+    }
 }

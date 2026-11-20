@@ -327,7 +327,8 @@ async fn a_denial_names_the_identifier_the_request_carried() {
     for (case, name) in rows {
         let identifier = format!("arn:aws:lambda:{REGION}:{ACCOUNT}:microvm-image/{name}");
         let path = format!(
-            "/2025-09-09/microvm-images/arn:aws:lambda:{REGION}:{ACCOUNT}:microvm-image%2F{name}"
+            "/2025-09-09/microvm-images/{}",
+            as_path_segment(&identifier)
         );
         for (operation, method, uri, body) in image_calls_at_path(&path) {
             let (status, response) = call(&router, method, &uri, body).await;
@@ -339,6 +340,223 @@ async fn a_denial_names_the_identifier_the_request_carried() {
             );
         }
     }
+}
+
+/// `UpdateMicrovmImage`'s required body members
+/// (`smithy_query(query="operation",operation="UpdateMicrovmImage")`: `baseImageArn`,
+/// `buildRoleArn` and `codeArtifact`).
+///
+/// A refusal on the identifier is taken before anything the body configures is read, so
+/// WHAT it configures cannot matter — but it has to satisfy the boundary validator for the
+/// call to reach the operation at all.
+fn update_image_body() -> Value {
+    json!({
+        "baseImageArn": managed_base_image_arn(REGION, MANAGED_BASE_IMAGE_IDS[0]),
+        "buildRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/microvm-build"),
+        "codeArtifact": {"uri": "s3://artifacts/app.zip"},
+    })
+}
+
+/// `identifier` as ONE URI path segment: `MicrovmImageIdentifier` is bound to an
+/// `@httpLabel`, so a `/` the value carries arrives percent-encoded to stay part of that
+/// one label instead of splitting it — which is also why [`as_uri_value`] refuses such a
+/// value outright.
+fn as_path_segment(identifier: &str) -> String {
+    match identifier.contains('/') {
+        true => identifier.replace('/', "%2F"),
+        false => as_uri_value(identifier).to_string(),
+    }
+}
+
+/// One call that MUTATES or LAUNCHES through an `imageIdentifier`: the IAM action name,
+/// the method and URI the model binds it to, its body, and which identifiers it takes the
+/// AUTHORIZATION verdict on.
+struct Changing {
+    operation: &'static str,
+    method: &'static str,
+    uri: String,
+    body: Option<Value>,
+    /// Whether this call takes the authorization verdict on EVERY identifier outside this
+    /// account's own image namespace, as the read path does
+    /// ([`crate::image_read_authorization`]), or only on one of AWS's own namespace and
+    /// answers about the RESOURCE for the rest.
+    ///
+    /// WHICH identifiers a call is refused on is that operation's own behaviour and is
+    /// pinned by that operation's own suite — `gone_image_delete_refusal` holds
+    /// `DeleteMicrovmImage` to the identifier's RESOLUTION, where another account's,
+    /// another partition's and another resource type's ARN are all the modelled 404, and
+    /// `microvm_lifecycle` holds `RunMicrovm` to the one failed resolution it reports.
+    /// What THIS suite owns is the WORDING wherever the authorization verdict is the
+    /// answer, so a row a call answers about the resource instead is still asserted: it
+    /// must carry no `AccessDeniedException` at all
+    /// ([`assert_not_an_authorization_refusal`]), which is what keeps the two rules from
+    /// drifting into one another unnoticed.
+    refuses_every_ungranted_identifier: bool,
+}
+
+/// Every write and launch this suite addresses at one `imageIdentifier`, for the
+/// identifier `identifier`.
+///
+/// The methods and URIs are the ones the model binds
+/// (`smithy_query(query="operation",operation="DeleteMicrovmImage,UpdateMicrovmImage,DeleteMicrovmImageVersion,RunMicrovm")`),
+/// and the operation name is the IAM action of that API — what the refusal of it has to
+/// name. `RunMicrovm` carries its identifier in the BODY rather than in a path label,
+/// which changes nothing about the sentence it is refused with.
+fn changing_calls(identifier: &str) -> Vec<Changing> {
+    let path = format!("/2025-09-09/microvm-images/{}", as_path_segment(identifier));
+    vec![
+        Changing {
+            operation: "DeleteMicrovmImage",
+            method: "DELETE",
+            uri: path.clone(),
+            body: None,
+            refuses_every_ungranted_identifier: false,
+        },
+        Changing {
+            operation: "UpdateMicrovmImage",
+            method: "PUT",
+            uri: path.clone(),
+            body: Some(update_image_body()),
+            refuses_every_ungranted_identifier: false,
+        },
+        Changing {
+            operation: "DeleteMicrovmImageVersion",
+            method: "DELETE",
+            uri: format!("{path}/versions/{FIRST_IMAGE_VERSION}"),
+            body: None,
+            refuses_every_ungranted_identifier: true,
+        },
+        Changing {
+            operation: "RunMicrovm",
+            method: "POST",
+            uri: "/2025-09-09/microvms".to_string(),
+            body: Some(json!({"imageIdentifier": identifier})),
+            refuses_every_ungranted_identifier: false,
+        },
+    ]
+}
+
+/// What a call that does NOT take the authorization verdict on this identifier must
+/// answer: the modelled 404 its own suite pins for an identifier that resolves to no
+/// record this account holds — never a success, and never the denial this suite words,
+/// because a 403 `AccessDeniedException` here would be an authorization answer with no
+/// authorization rule behind it.
+///
+/// The SENTENCE of that 404 belongs to the suite that owns the operation
+/// (`gone_image_delete_refusal` for the delete, `microvm_lifecycle` for the launch); what
+/// is asserted here is only that the answer is that refusal and not this one.
+fn assert_not_an_authorization_refusal(status: u16, body: &Value, case: &str) {
+    assert_eq!(
+        status, 404,
+        "case {case}: an identifier this account holds no record of is the modelled \
+         not-found here, got {status} {body}"
+    );
+    assert_eq!(
+        body["__type"].as_str(),
+        Some("ResourceNotFoundException"),
+        "case {case}: expected the resource answer rather than an authorization one, got \
+         {body}"
+    );
+}
+
+/// RULE: the denial sentence belongs to the API's AUTHORIZATION VERDICT wherever that
+/// verdict is what answers, not to the read path — a WRITE and a LAUNCH refused on an
+/// `imageIdentifier` carry the same two forms, each naming its OWN IAM action. Which
+/// identifiers a given call takes that verdict on is the operation's own behaviour
+/// ([`Changing::refuses_every_ungranted_identifier`]), and where it answers about the
+/// RESOURCE instead it carries no denial at all. Either way a refused call writes nothing:
+/// the image this account does hold is still there afterwards, exactly as it was.
+#[tokio::test]
+async fn a_denied_write_or_launch_names_the_caller_and_what_it_was_refused() {
+    let router = emulator();
+
+    // An image this account DOES hold, so a refusal that let a write through would be
+    // visible as a change to it.
+    let held = "held-image";
+    create_image(&router, held).await;
+    let (_, before) = call(
+        &router,
+        "GET",
+        &format!(
+            "/2025-09-09/microvm-images/{}",
+            as_uri_value(&expected_image_arn(held))
+        ),
+        None,
+    )
+    .await;
+
+    // Rows differ in WHY the caller holds no grant on the identifier: AWS's own namespace
+    // (an entry the catalogue publishes and one it does not — a denial says nothing about
+    // whether the identifier names anything), and two identifiers outside that namespace
+    // the account was never granted either.
+    let rows: Vec<Refused> = vec![
+        Refused {
+            case: "an AWS-owned image the catalogue publishes".to_string(),
+            identifier: managed_base_image_arn(REGION, MANAGED_BASE_IMAGE_IDS[0]),
+            aws_owned: true,
+        },
+        Refused {
+            case: "an AWS-owned ARN the catalogue does not publish".to_string(),
+            identifier: managed_base_image_arn(REGION, "no-such-base-image"),
+            aws_owned: true,
+        },
+        Refused {
+            case: "another account's ARN for a name this one holds".to_string(),
+            identifier: format!("arn:aws:lambda:{REGION}:210987654321:microvm-image:{held}"),
+            aws_owned: false,
+        },
+        Refused {
+            case: "this account's resource type in the `type/id` form".to_string(),
+            identifier: format!("arn:aws:lambda:{REGION}:{ACCOUNT}:microvm-image/never-created"),
+            aws_owned: false,
+        },
+    ];
+
+    for row in &rows {
+        for changing in changing_calls(&row.identifier) {
+            let case = format!(
+                "{} on {} ({})",
+                changing.operation, row.case, row.identifier
+            );
+            let (status, response) =
+                call(&router, changing.method, &changing.uri, changing.body).await;
+            // The authorization verdict is what answers an identifier of AWS's own
+            // namespace on every one of these calls, and every OTHER ungranted identifier
+            // on the calls that take that verdict before they look anything up. Where it
+            // is not, the row is still asserted — on the one thing this suite's rule says
+            // about it: the answer is a refusal of its own and carries no denial sentence.
+            match row.aws_owned || changing.refuses_every_ungranted_identifier {
+                true => assert_denied(
+                    status,
+                    &response,
+                    &case,
+                    &row.expected_sentence(changing.operation),
+                ),
+                false => assert_not_an_authorization_refusal(status, &response, &case),
+            }
+        }
+    }
+
+    // The control: not one refusal touched the image this account holds — a denied write
+    // leaves the record it was refused on exactly as it was.
+    let (status, after) = call(
+        &router,
+        "GET",
+        &format!(
+            "/2025-09-09/microvm-images/{}",
+            as_uri_value(&expected_image_arn(held))
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the image this account holds is still served after the refusals, got {status} {after}"
+    );
+    assert_eq!(
+        after, before,
+        "no refused write may change the stored image, got {after}"
+    );
 }
 
 /// RULE: the sentence is built from the request and the calling identity alone, so it
