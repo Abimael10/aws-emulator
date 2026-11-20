@@ -210,8 +210,12 @@ pub async fn call_in_region(
 }
 
 /// Dispatch one built request and reduce the response to an [`Answer`] — the one reduction
-/// every call in this crate's suites goes through.
-async fn send(router: &MultiServiceRouter, request: http::Request<bytes::Bytes>) -> Answer {
+/// every call in this crate's suites goes through, including a suite that builds the
+/// request itself because WHAT it varies is the request line or the `Host` header.
+pub(crate) async fn send(
+    router: &MultiServiceRouter,
+    request: http::Request<bytes::Bytes>,
+) -> Answer {
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let error_type = response

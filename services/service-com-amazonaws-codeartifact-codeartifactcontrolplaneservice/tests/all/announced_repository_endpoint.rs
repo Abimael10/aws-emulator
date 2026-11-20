@@ -112,7 +112,7 @@ async fn get_endpoint_at(
 }
 
 /// The `repositoryEndpoint` of an answer that must have succeeded.
-fn announced(answer: &Answer, case: &str) -> String {
+pub(crate) fn announced(answer: &Answer, case: &str) -> String {
     assert_eq!(
         answer.status, 200,
         "case {case:?}: expected GetRepositoryEndpoint 200, got {answer:?}"
@@ -162,7 +162,7 @@ fn expected_endpoint(
 }
 
 /// The `(authority, path)` of an announced URL — what a client splits it into to dial it.
-fn dialable(url: &str) -> (String, String) {
+pub(crate) fn dialable(url: &str) -> (String, String) {
     let without_scheme = url
         .split_once("://")
         .map(|(_scheme, rest)| rest)

@@ -78,6 +78,9 @@ flate2 = "1"
 tar = "0.4"
 
 [dev-dependencies]
+# One module per `tests/all/<name>.rs`, so a new suite is a new file: the integration-test
+# target's root (`tests/all/main.rs`) declares the directory instead of each suite.
+automod = { workspace = true }
 # EventBridge and SQS are mounted beside CodeArtifact on one engine in the integration
 # tests, because a package version state change is published onto the default event bus and
 # a rule on that bus delivers it to an SQS queue: without them mounted there is nothing for
