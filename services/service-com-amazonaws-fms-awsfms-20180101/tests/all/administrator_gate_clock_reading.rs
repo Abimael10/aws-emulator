@@ -48,13 +48,13 @@ const ACCESS_DENIED: &str = "AccessDeniedException";
 const INVALID_OPERATION: &str = "InvalidOperationException";
 
 /// The operations whose refusal is that modelled `InvalidOperationException`:
-/// the organization's Firewall Manager administration, which the model documents
-/// as the management account's alone.
-const MANAGEMENT_ACCOUNT_ONLY: &[&str] = &[
-    "ListAdminAccountsForOrganization",
-    "GetAdminScope",
-    "PutAdminAccount",
-];
+/// the ones that change or enumerate the organization's Firewall Manager
+/// administration, which the model documents as the management account's alone.
+/// The id-keyed `GetAdminScope` is NOT among them: it answers from its own
+/// lookup of the account it names, so it is not refused by this admission test
+/// at all (see [`crate::management_account_only_calls`]).
+const MANAGEMENT_ACCOUNT_ONLY: &[&str] =
+    &["ListAdminAccountsForOrganization", "PutAdminAccount"];
 
 /// The code `operation` is refused with when no administrator association is
 /// active at the instant the request decides from.
@@ -323,7 +323,6 @@ fn association_cases() -> Vec<AssociationCase> {
 fn gated_calls() -> Vec<(&'static str, Value)> {
     vec![
         ("ListAdminAccountsForOrganization", json!({})),
-        ("GetAdminScope", json!({ "AdminAccount": OTHER_ACCOUNT })),
         ("PutAdminAccount", json!({ "AdminAccount": OTHER_ACCOUNT })),
         (
             "PutPolicy",

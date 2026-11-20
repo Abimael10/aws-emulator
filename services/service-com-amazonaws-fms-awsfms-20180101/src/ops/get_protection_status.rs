@@ -5,14 +5,17 @@
 //! Reports the DDoS attacks recorded against the resources ONE Shield Advanced
 //! policy protects, as a page of the `ProtectionData` JSON document.
 //!
-//! The read is organisation-scoped, so with no Firewall Manager administrator
-//! association in this account/Region it is refused by
-//! [`crate::state::require_administrator`] BEFORE any identifier is looked up —
-//! and the administrator it resolves is the `AdminAccountId` the response
-//! carries. The policy and, when the request names one, the member account are
-//! then resolved: an account the policy does not apply to is the modelled
-//! not-found, the same answer this service's other member-account readers give.
-//! The attacks come from the store's attack inventory
+//! The page is answered from this operation's OWN lookup of the identifiers the
+//! request names, with nothing decided ahead of it: the policy and, when the
+//! request names one, the member account are resolved first — a `PolicyId`
+//! naming no stored policy and an account the policy does not apply to are both
+//! the modelled not-found, the same answer this service's other member-account
+//! readers give. `AdminAccountId` reports the organisation's Firewall Manager
+//! administrator as the store holds it
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::active_admin_account_at`]),
+//! and carries no member at all when the organisation holds none: there is then
+//! no administrator account to name. The attacks come from the store's attack
+//! inventory
 //! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::shield_attacks`]),
 //! filtered by the request's policy and time period and by the accounts the
 //! policy applies to — the named member account when the request names one, the
@@ -195,18 +198,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        // ONE reading of the clock for the whole request: the gate and the
-        // policy's scope both the named account and the page are resolved against
-        // are clock-derived, so they are decided from the same instant (see
+        // ONE reading of the clock for the whole request: the administrator this
+        // response names and the policy's scope both the named account and the
+        // page are resolved against are clock-derived, so they are decided from
+        // the same instant (see
         // [`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_scope_accounts`]).
         let now = ::std::time::SystemTime::now();
-        // Authorization FIRST, before any identifier is looked up: the
-        // administrator association is also what the response's
-        // `AdminAccountId` reports, so a caller with no administrator has
-        // nothing to be told about this policy.
-        let admin = crate::state::require_administrator_at(&store, &region, now)?;
+        // Nothing of this answer is read off the request's metadata: it is the
+        // outcome of resolving the payload's identifiers in this service's own
+        // store.
+        let _ = ctx;
+        // `AdminAccountId` is "the ID of the Firewall Manager administrator
+        // account": the association the store holds at that instant, and no
+        // member at all when it holds none — reported, not required, because
+        // this page is about the policy the request names.
+        let admin_account_id = store
+            .active_admin_account_at(now)
+            .map(|admin| admin.account_id.clone());
 
         let Some(policy) = store.policies.get(&input.policy_id) else {
             return Err(GetProtectionStatusErrorModeled::ResourceNotFoundException(
@@ -367,7 +376,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         Ok(GetProtectionStatusOutput {
-            admin_account_id: Some(admin.account_id.clone()),
+            admin_account_id,
             service_type: Some(service_type),
             data: Some(data),
             next_token,

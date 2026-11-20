@@ -10,10 +10,10 @@
 //!
 //! The rules asserted here:
 //!
-//! 1. The read is organisation-scoped, so with no Firewall Manager administrator
-//!    association in the account/Region it is refused with HTTP 400
-//!    `AccessDeniedException` — whatever else the request carries, and before the
-//!    policy id is looked up.
+//! 1. The read is answered from its own lookup of the `PolicyId` it names, so
+//!    its answer does not depend on whether this account/Region holds a Firewall
+//!    Manager administrator association: the same request answers the same with
+//!    and without one.
 //! 2. A `PolicyId` naming no stored policy is the modelled
 //!    `ResourceNotFoundException`.
 //! 3. Answered, it reports ONE `PolicyComplianceStatus` per organisation account
@@ -338,21 +338,21 @@ fn limit_exceeded(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Rule 1: no administrator association, no organisation-scoped answer — and the
-/// refusal does not depend on what else the request carries, nor on whether the
-/// policy exists.
+/// Rule 1: the read answers from its OWN lookup of the policy id, so with no
+/// administrator association a stored policy is still served and an id naming
+/// nothing is still the modelled not-found — whatever else the request carries,
+/// and in every Region.
 #[tokio::test]
-async fn list_compliance_status_is_refused_until_an_administrator_is_associated() {
+async fn list_compliance_status_answers_from_its_own_lookup_without_an_administrator() {
     let (router, engine) = emulator_with_engine();
-    // A stored policy, so the gate is shown to run before the id is looked up:
-    // the known and the unknown id are refused identically. Writing a policy is
-    // organisation-scoped too, so it is created with an administrator associated
-    // and the association is then removed through the store seam — which is the
-    // precondition rule 1 is about: a store that holds policies but no
-    // administrator.
+    // A stored policy, scoped by an `IncludeMap` so what it applies to is its
+    // own document rather than the organisation roster the association
+    // contributes to. Writing a policy IS organisation-scoped, so it is created
+    // with an administrator associated and the association is then removed
+    // through the store seam — which is the precondition rule 1 is about: a
+    // store that holds policies but no administrator.
     associate(&router, ADMIN).await;
-    let policy_id = put_policy(&router, "gated", None, None).await;
-    with_store(&engine, |store| store.admin_account = None);
+    let policy_id = put_policy(&router, "ungated", Some(json!({ "ACCOUNT": ROSTER })), None).await;
 
     // Request shapes spanning everything the operation accepts: a known id, an id
     // naming nothing, each published `MaxResults` bound, and a `NextToken` this
@@ -374,18 +374,26 @@ async fn list_compliance_status_is_refused_until_an_administrator_is_associated(
         ),
     ];
 
-    for (shape, request) in &shapes {
-        let (status, body) = list(&router, request).await;
+    // What each shape answers while the administrator IS associated.
+    let mut associated: Vec<(u16, Value)> = Vec::new();
+    for (_, request) in &shapes {
+        associated.push(list(&router, request).await);
+    }
+
+    with_store(&engine, |store| store.admin_account = None);
+
+    for ((shape, request), before) in shapes.iter().zip(associated.iter()) {
+        let after = list(&router, request).await;
         assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "AccessDeniedException"),
-            "case {shape}: with no administrator association the call must be refused, \
-             got {status} with {body}"
+            &after, before,
+            "case {shape}: the page is the outcome of this operation's own lookup, so removing \
+             the administrator association must not change it, got {after:?} after {before:?}"
         );
     }
 
-    // The refusal's message is built from the request: it names the calling
-    // account and the Region the request was signed for.
+    // The identifier decides it: a stored policy is served, an id naming nothing
+    // is the modelled not-found with the service-wide text, and neither answer
+    // is composed from the request's account or Region.
     for region in [REGION, "eu-central-1", "ap-southeast-4"] {
         let (status, body) = call_in(
             &router,
@@ -395,28 +403,39 @@ async fn list_compliance_status_is_refused_until_an_administrator_is_associated(
         )
         .await;
         assert_eq!(
+            status, 200,
+            "case {region}: a stored policy is served with no administrator associated, got \
+             {status} with {body}"
+        );
+        let (status, body) = call_in(
+            &router,
+            "ListComplianceStatus",
+            &json!({ "PolicyId": UNKNOWN_POLICY_ID }),
+            region,
+        )
+        .await;
+        assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, "AccessDeniedException"),
-            "case {region}: expected the authorization refusal, got {status} with {body}"
+            (400, "ResourceNotFoundException"),
+            "case {region}: an id naming no policy is the modelled not-found, got {status} with \
+             {body}"
         );
         assert_eq!(
             error_message(&body),
-            format!("No default admin could be found for account {ACCOUNT} in Region {region}"),
-            "case {region}: the refusal must name the calling account and the Region of the \
-             request, got {body}"
+            state::RESOURCE_NOT_FOUND_MESSAGE,
+            "case {region}: the not-found text is the service-wide constant, got {body}"
         );
     }
 
-    // A refused call writes nothing.
+    // A read writes nothing.
     let violations = with_store(&engine, |store| store.policy_violations.len());
     assert_eq!(
         violations, 0,
-        "a refused call must leave the violation inventory empty, got {violations} entries"
+        "a read must leave the violation inventory empty, got {violations} entries"
     );
 
-    // With an administrator associated, the same shapes are judged on their own
-    // merits.
-    associate(&router, ADMIN).await;
+    // And each shape is still judged on its own merits: the page bounds are
+    // served, and only the token this service never minted is refused.
     for (shape, request) in &shapes {
         let (status, body) = list(&router, request).await;
         let expected = match *shape {
@@ -427,8 +446,7 @@ async fn list_compliance_status_is_refused_until_an_administrator_is_associated(
         if expected.0 == 200 {
             assert_eq!(
                 status, 200,
-                "case {shape}: an associated administrator must be answered, got {status} \
-                 with {body}"
+                "case {shape}: the stored policy must be answered, got {status} with {body}"
             );
         } else {
             assert_eq!(

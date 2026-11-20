@@ -5,21 +5,27 @@
 //! Organizations reports for the organization.
 //!
 //! Firewall Manager refuses a call that only the organization's management
-//! account can perform — the organization's Firewall Manager administration:
+//! account can perform — the operations that change or enumerate the
+//! organization's Firewall Manager administration:
 //! `ListAdminAccountsForOrganization` ("This operation can be called only from
-//! the organization's management account"), `PutAdminAccount` ("Only the
+//! the organization's management account") and `PutAdminAccount` ("Only the
 //! organization's management account can create an Firewall Manager
-//! administrator account") and `GetAdminScope`, the read side of what
-//! `PutAdminAccount` writes — with a message that NAMES that management
+//! administrator account") — with a message that NAMES that management
 //! account, so a client learns which account to re-issue the call from. The
 //! account it names must be the one the organization itself reports, which is to
 //! say `Organization$MasterAccountId` from `organizations:DescribeOrganization`:
 //! only a cross-service suite can pin that, because each crate's own tests can
 //! assert no more than its own half.
 //!
-//! The rows vary what the rule generalises over: the refusing operation (all
-//! three), the form of its payload, and the Region the request is signed for —
+//! The rows vary what the rule generalises over: the refusing operation (both of
+//! them), the form of its payload, and the Region the request is signed for —
 //! none of which changes the account the refusal names.
+//!
+//! `GetAdminScope`, the read side of what `PutAdminAccount` writes, is NOT in
+//! that class, and is asserted here as the contrast: it answers from its own
+//! lookup of the account it names, so it reports the modelled
+//! `ResourceNotFoundException` while the organization holds no administration
+//! rather than naming the management account.
 
 use std::sync::Arc;
 
@@ -149,16 +155,6 @@ fn management_account_only_calls() -> Vec<(&'static str, &'static str, Value)> {
             json!({ "MaxResults": 5 }),
         ),
         (
-            "a scope read of a 12-digit account",
-            "GetAdminScope",
-            json!({ "AdminAccount": "123456789012" }),
-        ),
-        (
-            "a scope read of the shortest well-formed account id",
-            "GetAdminScope",
-            json!({ "AdminAccount": "7" }),
-        ),
-        (
             "an administrator write",
             "PutAdminAccount",
             json!({
@@ -168,6 +164,11 @@ fn management_account_only_calls() -> Vec<(&'static str, &'static str, Value)> {
         ),
     ]
 }
+
+/// Account ids `GetAdminScope` is read for below, spanning the forms the model's
+/// `AWSAccountId` admits (`^[0-9]+$`, length 1..1024): a 12-digit one and the
+/// shortest well-formed one.
+const UNADMINISTERED_ACCOUNTS: &[&str] = &["123456789012", "7"];
 
 /// With the organization not onboarded to Firewall Manager, each
 /// management-account-only call is refused with the modelled
@@ -209,6 +210,49 @@ async fn the_firewall_manager_refusal_names_the_management_account_organizations
                 )),
                 "case {case:?} in {region}: the refusal must name the management account \
                  Organizations reports ({management}), got {message:?}"
+            );
+        }
+    }
+}
+
+/// The contrast, on the same organization: the scope read is answered from its
+/// own lookup of the account it names, so an organization that holds no Firewall
+/// Manager administration answers the modelled `ResourceNotFoundException` for
+/// it — never the management-account refusal, which would name an account
+/// instead of reporting what the identifier resolves to.
+#[tokio::test]
+async fn the_scope_read_answers_its_own_not_found_for_an_unadministered_organization() {
+    let router = build_router();
+    let management = management_account(&router).await;
+
+    for region in ["us-west-2", "eu-central-1"] {
+        let mut accounts: Vec<&str> = UNADMINISTERED_ACCOUNTS.to_vec();
+        // The organization's own management account too: it administers the
+        // organization, but it is no Firewall Manager administrator until one is
+        // associated, which is what this read reports on.
+        accounts.push(management.as_str());
+        for account in accounts {
+            let (status, body) = call(
+                &router,
+                "fms",
+                "AWSFMS_20180101",
+                "GetAdminScope",
+                region,
+                &json!({ "AdminAccount": account }),
+            )
+            .await;
+            let code = error_code(&body);
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "ResourceNotFoundException"),
+                "case {account} in {region}: an account that is no administrator is this read's \
+                 own not-found, got {status} / {code:?} with {body}"
+            );
+            let message = body["Message"].as_str().unwrap_or_default().to_string();
+            assert!(
+                !message.contains(&management),
+                "case {account} in {region}: the not-found text is the service-wide constant, so \
+                 it names no account, got {message:?}"
             );
         }
     }

@@ -18,6 +18,13 @@
 //! ranges over: one row per gated operation, the rows differing in payload form
 //! (no members at all, an id, ARNs, enum values, a malformed ARN, a bogus
 //! resource type), each asserted in more than one Region.
+//!
+//! The gate's CLASS BOUNDARY is asserted here too, by
+//! [`reads_answered_from_their_own_lookup`]: a read whose answer is the outcome
+//! of its own lookup of the identifier it names takes no such gate, and answers
+//! an identifier that names nothing with the modelled
+//! `ResourceNotFoundException` — the same answer with and without an
+//! administrator association.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -1513,4 +1520,380 @@ async fn reads_are_stable_across_repeated_calls() {
              then {second:?}"
         );
     }
+}
+
+/// A third Region, so the not-found rows below are asserted in more Regions than
+/// the gate's own refusal is — a constant message can then be told from one
+/// composed from the request.
+const THIRD_REGION: &str = "ap-southeast-4";
+
+/// A `PolicyId` of a second well-formed FORM: the model's
+/// `com.amazonaws.fms#PolicyId` is 36 characters of `^[a-z0-9A-Z-]{36}$`
+/// (`smithy_query(query="shape", shape="PolicyId")`) and nothing narrows that to
+/// a UUID, so the rows naming nothing do not all name one shape of identifier.
+const OTHER_UNKNOWN_POLICY_ID: &str = "Zz9-Zz9-Zz9-Zz9-Zz9-Zz9-Zz9-Zz9-Zz9-";
+
+/// Account ids that are no administrator and no member account of any stored
+/// policy, spanning the forms the model's `AWSAccountId` admits (`^[0-9]+$`,
+/// length 1..1024): the shortest, the twelve-digit one and a long one.
+const UNRESOLVED_ACCOUNTS: &[&str] = &["7", "555566667777", "99999999999999999999"];
+
+/// The `Message` every `ResourceNotFoundException` of this service carries: a
+/// service-wide constant with no variable part, because this error does not
+/// restate the identifier that was looked up (the `error_message_members` suite
+/// pins the same text).
+const NOT_FOUND_MESSAGE: &str = "The referenced item does not exist.";
+
+/// The accounts the fixture's policies are scoped to by an `IncludeMap`, so what
+/// each policy applies to is the policy's own document rather than the
+/// organisation roster the administrator association contributes to.
+const FIXTURE_SCOPED_ACCOUNTS: &[&str] = &["111111111111", "222222222222"];
+
+/// The resource id and type [`crate::compliance_status::seed_violations`] records
+/// a violator under, so the violation-detail row names a resource the store
+/// really holds a violation of.
+const VIOLATOR_RESOURCE_ID: &str = "violator-0000";
+const VIOLATOR_RESOURCE_TYPE: &str = "AWS::ElasticLoadBalancingV2::LoadBalancer";
+
+/// The instant the fixture's violation is recorded at, in Unix seconds — the
+/// form Firewall Manager documents for its `TimeStamp` members — so every
+/// answer below is derived from stored values and not from the clock.
+const VIOLATION_DETECTED_SECS: u64 = 1_767_229_200;
+
+/// One read keyed by the identifier of ONE resource it reports about: a name for
+/// the assertion messages, the operation, and a request whose identifier names
+/// no such resource.
+struct OwnLookupRead {
+    case: String,
+    operation: &'static str,
+    body: Value,
+}
+
+/// Every Firewall Manager read whose answer is the outcome of its OWN lookup of
+/// the identifier its request names, each with a request naming nothing.
+///
+/// These are the operations the administrator gate does NOT apply to: none of
+/// them declares an authorization error (`smithy_query(query="operation",
+/// operation="GetAdminScope,ListComplianceStatus,GetComplianceDetail,GetProtectionStatus,GetViolationDetails")`
+/// lists `AccessDeniedException` in no union), and each reports about one named
+/// resource, so an identifier that resolves to nothing is the modelled
+/// not-found. The rows differ in operation, in identifier form (two `PolicyId`
+/// forms, account ids of one, twelve and twenty digits), and in which optional
+/// members accompany the identifier.
+fn reads_answered_from_their_own_lookup() -> Vec<OwnLookupRead> {
+    let mut rows = Vec::new();
+    for account in UNRESOLVED_ACCOUNTS {
+        rows.push(OwnLookupRead {
+            case: format!("GetAdminScope of the account {account}"),
+            operation: "GetAdminScope",
+            body: json!({ "AdminAccount": account }),
+        });
+    }
+    for (form, policy_id) in [
+        ("a UUID-shaped id", UNKNOWN_POLICY_ID),
+        ("a letter/digit/hyphen id", OTHER_UNKNOWN_POLICY_ID),
+    ] {
+        let account = UNRESOLVED_ACCOUNTS[0];
+        let other_account = UNRESOLVED_ACCOUNTS[2];
+        rows.push(OwnLookupRead {
+            case: format!("ListComplianceStatus of {form}"),
+            operation: "ListComplianceStatus",
+            body: json!({ "PolicyId": policy_id }),
+        });
+        rows.push(OwnLookupRead {
+            case: format!("ListComplianceStatus of {form}, page-bounded"),
+            operation: "ListComplianceStatus",
+            body: json!({ "PolicyId": policy_id, "MaxResults": 100 }),
+        });
+        rows.push(OwnLookupRead {
+            case: format!("GetComplianceDetail of {form}"),
+            operation: "GetComplianceDetail",
+            body: json!({ "PolicyId": policy_id, "MemberAccount": account }),
+        });
+        rows.push(OwnLookupRead {
+            case: format!("GetProtectionStatus of {form}"),
+            operation: "GetProtectionStatus",
+            body: json!({ "PolicyId": policy_id }),
+        });
+        rows.push(OwnLookupRead {
+            case: format!("GetProtectionStatus of {form}, narrowed to a member account"),
+            operation: "GetProtectionStatus",
+            body: json!({
+                "PolicyId": policy_id,
+                "MemberAccountId": other_account,
+                "MaxResults": 1,
+            }),
+        });
+        rows.push(OwnLookupRead {
+            case: format!("GetViolationDetails of {form}"),
+            operation: "GetViolationDetails",
+            body: json!({
+                "PolicyId": policy_id,
+                "MemberAccount": account,
+                "ResourceId": "sg-0123456789abcdef0",
+                "ResourceType": "AWS::EC2::SecurityGroup",
+            }),
+        });
+    }
+    rows
+}
+
+/// With NO administrator association anywhere in the store, every read keyed by
+/// the identifier of one resource answers the modelled
+/// `ResourceNotFoundException` with the service-wide not-found message — in
+/// every Region and for every identifier form — and never an authorization code
+/// its model does not declare.
+#[tokio::test]
+async fn an_unresolved_identifier_is_the_modelled_not_found_with_no_administrator_association() {
+    for region in [REGION, OTHER_REGION, THIRD_REGION] {
+        let (router, _engine) = emulator_with_engine();
+
+        // The precondition, read through an implemented operation rather than
+        // assumed: nothing is associated, which GetAdminAccount reports as the
+        // modelled not-found.
+        let (status, body) = call_in(&router, "GetAdminAccount", &json!({}), region).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ResourceNotFoundException"),
+            "region {region}: expected no administrator association, got {status} with {body}"
+        );
+
+        for row in reads_answered_from_their_own_lookup() {
+            let (status, body) = call_in(&router, row.operation, &row.body, region).await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "ResourceNotFoundException"),
+                "case {:?} in {region}: expected the modelled not-found of the identifier the \
+                 request names, got {status} with {body}",
+                row.case
+            );
+            let message = error_message(&body);
+            assert_eq!(
+                message, NOT_FOUND_MESSAGE,
+                "case {:?} in {region}: expected the service-wide not-found message, got \
+                 {message:?}",
+                row.case
+            );
+            assert!(
+                !message.contains(region) && !message.contains(ACCOUNT),
+                "case {:?} in {region}: the not-found text is a constant, so it names neither \
+                 the calling account nor the Region, got {message:?}",
+                row.case
+            );
+        }
+    }
+}
+
+/// The fixture the served rows are read against: an administrator associated, a
+/// second administrator onboarded under it, a `WAFV2` policy and a
+/// `SHIELD_ADVANCED` policy each scoped to [`FIXTURE_SCOPED_ACCOUNTS`] by an
+/// `IncludeMap`, one recorded violation and one recorded attack.
+///
+/// Returns the router, the engine, the two `PolicyId`s and the onboarded
+/// administrator's account.
+async fn own_lookup_fixture() -> (
+    MultiServiceRouter,
+    Arc<engine::InMemoryEngine>,
+    String,
+    String,
+    &'static str,
+) {
+    let (router, engine) = emulator_with_engine();
+    associate_admin(&router).await;
+    let onboarded = FIXTURE_SCOPED_ACCOUNTS[1];
+    crate::admin_account_scopes::put_admin_account(
+        &router,
+        "the administrator the scope read reports",
+        onboarded,
+        Some(&json!({ "AccountScope": { "Accounts": [onboarded] } })),
+    )
+    .await;
+    let compliance_policy = crate::compliance_status::put_policy(
+        &router,
+        "own-lookup-compliance",
+        Some(json!({ "ACCOUNT": FIXTURE_SCOPED_ACCOUNTS })),
+        None,
+    )
+    .await;
+    let shield_policy = crate::protection_status::put_scoped_policy(
+        &router,
+        "own-lookup-shield",
+        "SHIELD_ADVANCED",
+        Some(json!({ "ACCOUNT": FIXTURE_SCOPED_ACCOUNTS })),
+        None,
+    )
+    .await;
+    crate::compliance_status::seed_violations(
+        &engine,
+        &compliance_policy,
+        FIXTURE_SCOPED_ACCOUNTS[0],
+        1,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(VIOLATION_DETECTED_SECS),
+    );
+    with_store(&engine, |store| {
+        crate::protection_status::seed_attack(
+            store,
+            &shield_policy,
+            &crate::protection_status::Attack {
+                attack_id: "own-lookup-attack",
+                account: FIXTURE_SCOPED_ACCOUNTS[0],
+                start_secs: 0,
+                start_millis: 0,
+                duration_secs: Some(600),
+                vectors: &["UDP_TRAFFIC"],
+            },
+        );
+    });
+    (router, engine, compliance_policy, shield_policy, onboarded)
+}
+
+/// The reads of the fixture's own stored resources: the case name, the operation
+/// and a request naming a resource the store holds.
+fn resolving_reads(compliance_policy: &str, shield_policy: &str) -> Vec<(&'static str, Value)> {
+    let scoped = FIXTURE_SCOPED_ACCOUNTS[0];
+    vec![
+        (
+            "ListComplianceStatus",
+            json!({ "PolicyId": compliance_policy }),
+        ),
+        (
+            "GetComplianceDetail",
+            json!({ "PolicyId": compliance_policy, "MemberAccount": scoped }),
+        ),
+        (
+            "GetViolationDetails",
+            json!({
+                "PolicyId": compliance_policy,
+                "MemberAccount": scoped,
+                "ResourceId": VIOLATOR_RESOURCE_ID,
+                "ResourceType": VIOLATOR_RESOURCE_TYPE,
+            }),
+        ),
+        ("GetProtectionStatus", json!({ "PolicyId": shield_policy })),
+    ]
+}
+
+/// The answer with `AdminAccountId` taken out: that member reports the
+/// administrator association itself, which is the one thing these answers may
+/// differ in once the association is gone.
+fn without_admin_account_id(body: &Value) -> Value {
+    let mut stripped = body.clone();
+    if let Some(members) = stripped.as_object_mut() {
+        members.remove("AdminAccountId");
+    }
+    stripped
+}
+
+/// The other side of the same rule: because these reads answer from their own
+/// lookup, removing the administrator association does not change what they
+/// report about a resource the store still holds — the identifier and the stored
+/// state decide the answer. `GetProtectionStatus`'s `AdminAccountId` is the one
+/// member that follows the association, and `GetAdminScope` of the account that
+/// WAS the default administrator becomes its own not-found, because that
+/// association is the resource it reports.
+#[tokio::test]
+async fn the_same_reads_are_served_from_the_store_with_no_administrator_association() {
+    let (router, engine, compliance_policy, shield_policy, onboarded) =
+        own_lookup_fixture().await;
+    let rows = resolving_reads(&compliance_policy, &shield_policy);
+
+    let mut associated: Vec<(u16, Value)> = Vec::new();
+    for (operation, request) in &rows {
+        let (status, body) = call(&router, operation, request).await;
+        assert_eq!(
+            status, 200,
+            "case {operation}: the fixture's own resource must be served, got {status} with {body}"
+        );
+        associated.push((status, body));
+    }
+    // The served answers really report the seeded state, so the comparison below
+    // is between two reports and not between two empty documents.
+    assert_eq!(
+        associated[0].1["PolicyComplianceStatusList"]
+            .as_array()
+            .map(Vec::len),
+        Some(FIXTURE_SCOPED_ACCOUNTS.len()),
+        "ListComplianceStatus must report one entry per scoped account, got {}",
+        associated[0].1
+    );
+    assert_eq!(
+        associated[1].1["PolicyComplianceDetail"]["Violators"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "GetComplianceDetail must name the recorded violator, got {}",
+        associated[1].1
+    );
+    assert_eq!(
+        associated[3].1["AdminAccountId"].as_str(),
+        Some(ACCOUNT),
+        "GetProtectionStatus must name the associated administrator, got {}",
+        associated[3].1
+    );
+
+    // The precondition the rule is about: a store that holds those resources and
+    // no administrator association at all.
+    with_store(&engine, |store| store.admin_account = None);
+    let (status, body) = call(&router, "GetAdminAccount", &json!({})).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ResourceNotFoundException"),
+        "the association must be gone, got {status} with {body}"
+    );
+
+    for (index, (operation, request)) in rows.iter().enumerate() {
+        let (status, body) = call(&router, operation, request).await;
+        assert_eq!(
+            (status, without_admin_account_id(&body)),
+            (
+                associated[index].0,
+                without_admin_account_id(&associated[index].1)
+            ),
+            "case {operation}: the answer is the outcome of this operation's own lookup, so it \
+             must not change when the administrator association is removed, got {status} with \
+             {body}"
+        );
+    }
+
+    // `AdminAccountId` is "the ID of the Firewall Manager administrator
+    // account": with no association there is no administrator account to name,
+    // so the member is absent rather than invented.
+    let (status, body) = call(
+        &router,
+        "GetProtectionStatus",
+        &json!({ "PolicyId": shield_policy }),
+    )
+    .await;
+    assert_eq!(
+        (status, body.get("AdminAccountId")),
+        (200, None),
+        "with no association there is no administrator to name, got {status} with {body}"
+    );
+
+    // The administrator record `PutAdminAccount` wrote is a resource of its own,
+    // so the scope read still reports it; the account that was the DEFAULT
+    // administrator is no administrator any more, which is that read's own
+    // not-found.
+    let (status, body) = call(
+        &router,
+        "GetAdminScope",
+        &json!({ "AdminAccount": onboarded }),
+    )
+    .await;
+    assert_eq!(
+        (
+            status,
+            body["AdminScope"]["AccountScope"]["Accounts"].clone()
+        ),
+        (200, json!([onboarded])),
+        "case {onboarded}: an onboarded administrator's stored scope must still be reported, got \
+         {status} with {body}"
+    );
+    let (status, body) = call(&router, "GetAdminScope", &json!({ "AdminAccount": ACCOUNT })).await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ResourceNotFoundException"),
+        "case {ACCOUNT}: the association this read reported is gone, so it is this read's own \
+         not-found, got {status} with {body}"
+    );
 }

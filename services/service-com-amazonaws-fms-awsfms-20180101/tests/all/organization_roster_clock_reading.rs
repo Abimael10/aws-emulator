@@ -54,6 +54,12 @@ use crate::policy_lifecycle::{call, emulator_with_engine, error_code, ACCOUNT, R
 /// association is active at the instant it decides from.
 const ACCESS_DENIED: &str = "AccessDeniedException";
 
+/// The operations of the table below that take NO administrator gate: each is
+/// keyed by the `PolicyId` of the one policy it reports about, so it answers
+/// from its own lookup of that policy and reports the roster as it stands at the
+/// request's instant rather than refusing the call.
+const ANSWERED_FROM_THEIR_OWN_LOOKUP: &[&str] = &["ListComplianceStatus", "GetComplianceDetail"];
+
 /// An account the organisation holds because a stored policy's scope map names
 /// it. Nothing about it is clock-derived, so it is in the roster at every
 /// instant. The model constrains `AWSAccountId` to `^[0-9]+$`, length 1..1024.
@@ -395,12 +401,14 @@ fn reports_the_administrators_account(operation: &str, body: &Value) -> bool {
 }
 
 /// Over the wire: every operation whose answer is derived from the
-/// organisation's roster either is refused with `AccessDeniedException` —
-/// because the association is no longer an administrator at the instant the
-/// request decides from — or is served reporting the administrator's own account
-/// as one of the organisation's. Never served while claiming that account is
-/// outside the organisation, which is what a second, later reading of the clock
-/// inside one request produces.
+/// organisation's roster either is refused — because the association is no
+/// longer an administrator at the instant the request decides from — or is
+/// served reporting the administrator's own account as one of the organisation's.
+/// Never served while claiming that account is outside the organisation, which
+/// is what a second, later reading of the clock inside one request produces. The
+/// two reads that take no gate ([`ANSWERED_FROM_THEIR_OWN_LOOKUP`]) are held to
+/// the same agreement from the other side: once the association is gone they
+/// report the administrator's account as no account of the organisation.
 #[tokio::test]
 async fn a_roster_derived_answer_agrees_with_the_gate_that_admitted_the_call() {
     for case in association_cases() {
@@ -489,6 +497,27 @@ async fn a_roster_derived_answer_agrees_with_the_gate_that_admitted_the_call() {
                     "case {name:?} / {operation}: the administrator's own resource must not be \
                      refused as naming no account of the organisation, got {body}"
                 );
+            } else if ANSWERED_FROM_THEIR_OWN_LOOKUP.contains(operation) {
+                // These two reads are not gated: they answer from their own
+                // lookup of the policy the request names. Read at the SAME
+                // instant, their answer agrees with the gate's decision in the
+                // only way it can — the administrator's own account is no
+                // account of the organisation then, so the policy's scope does
+                // not carry it.
+                assert!(
+                    !reports_the_administrators_account(operation, &body),
+                    "case {name:?} / {operation}: an administrator already removed at the \
+                     request's instant is no account of the organisation, so the answer must \
+                     not report {ACCOUNT} as one, got {status} with {body}"
+                );
+                if status != 200 {
+                    assert_eq!(
+                        error_code(&body),
+                        "ResourceNotFoundException",
+                        "case {name:?} / {operation}: an account the policy no longer applies to \
+                         is this operation's own modelled not-found, got {status} with {body}"
+                    );
+                }
             } else {
                 assert_eq!(
                     (status, error_code(&body).as_str()),

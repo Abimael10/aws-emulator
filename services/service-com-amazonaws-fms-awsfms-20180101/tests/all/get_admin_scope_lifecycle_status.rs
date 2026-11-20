@@ -209,13 +209,14 @@ async fn get_admin_scope_reports_the_lifecycle_phase_the_clock_has_reached() {
     expect_phase(&offboarding, "a default administrator being removed", &rows).await;
 
     // Once the tear-down has completed the organization holds no Firewall
-    // Manager administration for this read to report, so the call — which only
-    // the organization's management account can make — is refused with the
-    // modelled `InvalidOperationException` for every account alike, including
-    // the one that is no administrator, which the refusal must not distinguish.
+    // Manager administrator association for this read to report, and no account
+    // has an administrator record of its own either — so the read answers its
+    // OWN modelled `ResourceNotFoundException` for every account alike,
+    // including the account that WAS the default administrator: that association
+    // is the resource it reported, and it is gone.
     wait_out_the_disassociation();
     for row in rows.iter_mut() {
-        row.1 = Expectation::Refused("InvalidOperationException");
+        row.1 = Expectation::Refused("ResourceNotFoundException");
     }
     expect_phase(&offboarding, "no administrator association left", &rows).await;
 }

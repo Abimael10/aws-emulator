@@ -6,11 +6,11 @@
 //! summaries Firewall Manager holds for it: one `PolicyComplianceStatus` per
 //! organisation account that policy applies to, in ascending account-id order.
 //!
-//! The read is organisation-scoped — it enumerates the organisation's member
-//! accounts — so with no Firewall Manager administrator association in this
-//! account/Region it is refused by [`crate::state::require_administrator`]
-//! BEFORE the policy is looked up. Which accounts the policy applies to is the
-//! stored policy's own scope
+//! The page is answered from this operation's OWN lookup of the `PolicyId` the
+//! request names, with nothing decided ahead of it: a `PolicyId` naming no
+//! stored policy is the modelled not-found, whether or not this account/Region
+//! holds a Firewall Manager administrator association. Which accounts the policy
+//! applies to is the stored policy's own scope
 //! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_scope_accounts`]),
 //! and each account's evaluation is the violations recorded against it in the
 //! store's violation inventory
@@ -172,20 +172,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        // ONE reading of the clock for the whole request: the gate and the
-        // policy's scope this page is served from are both clock-derived, so they
-        // are decided from the same instant (see
+        // ONE reading of the clock for the whole request: the policy's scope
+        // this page is served from is clock-derived (see
         // [`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_scope_accounts`]).
         let now = ::std::time::SystemTime::now();
-        // Authorization FIRST, before any identifier is looked up: this read
-        // enumerates the organisation's member accounts, so a caller that is
-        // neither a Firewall Manager administrator nor the organisation's
-        // management account is refused identically whatever it sent — a refusal
-        // that leaked whether the policy exists would tell an unauthorized
-        // caller what the organisation holds.
-        crate::state::require_administrator_at(&store, &region, now)?;
+        // Nothing of this answer is read off the request's metadata: the page is
+        // the outcome of resolving the payload's `PolicyId` in this service's
+        // own store.
+        let _ = ctx;
 
         // "The ID of the Firewall Manager policy that you want the details for":
         // an id naming no stored policy is the modelled not-found.

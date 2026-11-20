@@ -3,25 +3,31 @@
 //! The refusal of a Firewall Manager call that only the organization's
 //! management account can perform.
 //!
-//! Three operations of this service act on the organization's Firewall Manager
-//! ADMINISTRATION — the set of administrator accounts and the `AdminScope` each
-//! of them manages — and the model documents that administration as the
-//! management account's alone: `ListAdminAccountsForOrganization` ("This
-//! operation can be called only from the organization's management account"),
-//! `PutAdminAccount` ("Only the organization's management account can create an
-//! Firewall Manager administrator account") and `GetAdminScope`, the read side
-//! of what `PutAdminAccount` writes.
+//! Two operations of this service CHANGE or ENUMERATE the organization's
+//! Firewall Manager ADMINISTRATION — the set of administrator accounts and the
+//! `AdminScope` each of them manages — and the model documents that
+//! administration as the management account's alone:
+//! `ListAdminAccountsForOrganization` ("This operation can be called only from
+//! the organization's management account") and `PutAdminAccount` ("Only the
+//! organization's management account can create an Firewall Manager
+//! administrator account").
 //!
 //! Until an organization is onboarded to Firewall Manager by
-//! `AssociateAdminAccount` there is no such administration to read or write:
-//! the organization has no Firewall Manager administrator, so the call is not
-//! possible for the account making it, and the live service refuses it as one
-//! only the organization's management account can perform. That is the class of
-//! the modelled `InvalidOperationException` ("The operation failed because there
-//! was nothing to do or the operation wasn't possible"), which all three
+//! `AssociateAdminAccount` there is no such administration to enumerate or
+//! write: the organization has no Firewall Manager administrator, so the call is
+//! not possible for the account making it, and the live service refuses it as
+//! one only the organization's management account can perform. That is the class
+//! of the modelled `InvalidOperationException` ("The operation failed because
+//! there was nothing to do or the operation wasn't possible"), which both
 //! operations declare; `AccessDeniedException` — the refusal the broader
 //! administrator gate states ([`super::no_administrator_refusal`]) — is in NONE
 //! of their modelled error unions, so it cannot be the refusal here.
+//!
+//! `GetAdminScope`, the read side of what `PutAdminAccount` writes, is NOT in
+//! this class: it reports what the ONE account its request names resolves to, so
+//! it answers from its own lookup — an account that is no administrator is its
+//! modelled `ResourceNotFoundException` — rather than taking an admission test
+//! ahead of that lookup.
 //!
 //! The refusal's message is built from state, never from a literal: the account
 //! the request is made by, and the organization's management account as AWS
@@ -112,11 +118,11 @@ pub fn management_account_only_refusal<Eng: Send + Sync + 'static>(
 ///
 /// The gate of the operations only the organization's management account can
 /// perform, and the counterpart of [`super::require_administrator_at`] for them:
-/// the ADMISSION test is the same one — an association that is still an
+/// the ADMISSION test is the same one — the association that is still an
 /// administrator at the instant the request decides from
-/// ([`AdminAccountRecord::is_active_at`]), so a tear-down the clock has
-/// completed closes this gate too — and only the REFUSAL differs, because what
-/// these operations model for it differs
+/// ([`ComAmazonawsFmsAwsfms20180101State::active_admin_account_at`]), so a
+/// tear-down the clock has completed closes this gate too — and only the REFUSAL
+/// differs, because what these operations model for it differs
 /// ([`management_account_only_refusal`]).
 ///
 /// It answers with an OWNED record so the caller can drop the store guard before
@@ -125,9 +131,5 @@ pub fn management_account_administration_at(
     store: &ComAmazonawsFmsAwsfms20180101State,
     now: SystemTime,
 ) -> Option<AdminAccountRecord> {
-    store
-        .admin_account
-        .as_ref()
-        .filter(|admin| admin.is_active_at(now))
-        .cloned()
+    store.active_admin_account_at(now).cloned()
 }

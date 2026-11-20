@@ -931,12 +931,15 @@ async fn the_number_of_administrator_accounts_is_bounded() {
     );
 }
 
-/// Both operations administer the organisation's Firewall Manager
+/// `PutAdminAccount` administers the organisation's Firewall Manager
 /// administrators, which only the organization's management account can do, so
-/// with no Firewall Manager administrator association they are refused with the
+/// with no Firewall Manager administrator association it is refused with the
 /// modelled HTTP 400 `InvalidOperationException` naming the calling account and
-/// the organization's management account — whatever their payload and whichever
-/// Region the request is signed for — before anything is read or written.
+/// the organization's management account — whatever its payload and whichever
+/// Region the request is signed for — before anything is read or written. The
+/// read beside it is not in that class: `GetAdminScope` answers from its own
+/// lookup of the account it names, so it is the modelled
+/// `ResourceNotFoundException` for an account that is no administrator.
 #[tokio::test]
 async fn both_operations_are_refused_without_an_administrator_association() {
     let payloads = vec![
@@ -960,16 +963,6 @@ async fn both_operations_are_refused_without_an_administrator_association() {
                 "AdminAccount": DELEGATED_ACCOUNTS[2],
                 "AdminScope": { "AccountScope": { "AllAccountsEnabled": true, "Accounts": ["7"] } },
             }),
-        ),
-        (
-            "GetAdminScope of an unknown account",
-            "GetAdminScope",
-            json!({ "AdminAccount": DELEGATED_ACCOUNTS[0] }),
-        ),
-        (
-            "GetAdminScope of the calling account",
-            "GetAdminScope",
-            json!({ "AdminAccount": ACCOUNT }),
         ),
     ];
 
@@ -995,6 +988,25 @@ async fn both_operations_are_refused_without_an_administrator_association() {
                 "case {case:?} in {region}: the refusal's message is built from state, so it must \
                  name the calling account and the organization's management account, got \
                  {message:?}"
+            );
+        }
+
+        // The read answers from its own lookup instead, for the calling account
+        // and for an account no record of the store names alike.
+        for account in [ACCOUNT, DELEGATED_ACCOUNTS[0]] {
+            let (status, answered) = call_in(
+                &router,
+                "GetAdminScope",
+                &json!({ "AdminAccount": account }),
+                region,
+            )
+            .await;
+            let code = error_code(&answered);
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "ResourceNotFoundException"),
+                "case {account} in {region}: an account that is no administrator is this read's \
+                 own not-found, got {status} / {code:?} with {answered:?}"
             );
         }
 

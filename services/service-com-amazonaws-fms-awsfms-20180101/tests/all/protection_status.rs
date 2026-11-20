@@ -803,12 +803,14 @@ fn hex_token(policy_id: &str) -> String {
     ))
 }
 
-/// The read is organisation-scoped: with no administrator association it is
-/// refused before any identifier is looked up, in every Region.
+/// The read answers from its OWN lookup of the identifiers it names: with no
+/// administrator association a `PolicyId` naming nothing is the modelled
+/// not-found — in every Region — and a stored policy is still served, with no
+/// `AdminAccountId` to name.
 #[tokio::test]
-async fn get_protection_status_is_gated_on_the_administrator_association() {
+async fn get_protection_status_answers_from_its_own_lookup_without_an_administrator() {
     for region in [REGION, OTHER_REGION] {
-        let (router, _engine) = emulator_with_engine();
+        let (router, engine) = emulator_with_engine();
         let (status, body) = call_in(
             &router,
             "GetProtectionStatus",
@@ -817,14 +819,41 @@ async fn get_protection_status_is_gated_on_the_administrator_association() {
         )
         .await;
         assert_eq!(
-            status, 400,
-            "case {region:?}: with no administrator the read must be refused with 400, got \
-             {status} with {body}"
+            (status, error_code(&body).as_str()),
+            (400, "ResourceNotFoundException"),
+            "case {region:?}: an id naming no policy is the modelled not-found, got {status} \
+             with {body}"
         );
         assert_eq!(
-            error_code(&body),
-            "AccessDeniedException",
-            "case {region:?}: expected the authorization refusal, got {body}"
+            body["Message"].as_str(),
+            Some(state::RESOURCE_NOT_FOUND_MESSAGE),
+            "case {region:?}: the not-found text is the service-wide constant, got {body}"
+        );
+
+        // The same read of a STORED policy, on a store that holds no
+        // administrator association: the page is served from the policy's own
+        // scope, and `AdminAccountId` is absent because there is no
+        // administrator account to name.
+        associate_admin(&router).await;
+        let policy_id = put_policy(&router, "ungated-shield", "SHIELD_ADVANCED").await;
+        with_store(&engine, |store| store.admin_account = None);
+        let (status, body) = call_in(
+            &router,
+            "GetProtectionStatus",
+            &json!({ "PolicyId": policy_id }),
+            region,
+        )
+        .await;
+        assert_eq!(
+            (status, body.get("AdminAccountId")),
+            (200, None),
+            "case {region:?}: a stored policy is served with no administrator associated, and \
+             there is then no administrator to name, got {status} with {body}"
+        );
+        assert_eq!(
+            body["ServiceType"].as_str(),
+            Some("SHIELD_ADVANCED"),
+            "case {region:?}: the stored policy's own service type must be reported, got {body}"
         );
     }
 }

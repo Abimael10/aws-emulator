@@ -10,10 +10,10 @@
 //!
 //! The rules asserted here:
 //!
-//! 1. The read is organisation-scoped, so with no Firewall Manager administrator
-//!    association in the account/Region it is refused with HTTP 400
-//!    `AccessDeniedException` — whatever else the request carries, and before any
-//!    identifier is looked up.
+//! 1. The read is answered from its own lookup of the identifiers it names, so
+//!    its answer does not depend on whether this account/Region holds a Firewall
+//!    Manager administrator association: the same request answers the same with
+//!    and without one.
 //! 2. Answered, the `ViolationDetail` is the violation the store records for the
 //!    (policy, member account, resource) triple the request names, every member
 //!    read off that record: the findings in the order they were recorded, the
@@ -57,7 +57,7 @@ use smithy_server_runtime::MultiServiceRouter;
 // the store is seeded or the organisation is set up.
 use crate::administrator_gated_operations::with_store;
 use crate::compliance_status::{associate, error_message, put_policy, seed_violations, ADMIN};
-use crate::policy_lifecycle::{call, call_in, emulator_with_engine, error_code, ACCOUNT, REGION};
+use crate::policy_lifecycle::{call, call_in, emulator_with_engine, error_code, REGION};
 
 /// A `PolicyId` (the model's `com.amazonaws.fms#PolicyId`: 36 characters matching
 /// `^[a-z0-9A-Z-]{36}$`) that names no policy.
@@ -426,24 +426,24 @@ async fn put_scoped_policy(router: &MultiServiceRouter, name: &str) -> String {
     .await
 }
 
-/// Rule 1: no administrator association, no organisation-scoped answer — and the
-/// refusal does not depend on what else the request carries, nor on whether the
-/// policy, the account or the resource exists.
+/// Rule 1: the read answers from its OWN lookup of the triple it names, so with
+/// no administrator association the recorded violation is still reported and
+/// every other triple is still the modelled not-found — whatever else the
+/// request carries, and in every Region.
 #[tokio::test]
-async fn get_violation_details_is_refused_until_an_administrator_is_associated() {
+async fn get_violation_details_answers_from_its_own_lookup_without_an_administrator() {
     let (router, engine) = emulator_with_engine();
-    // A stored policy with a recorded violation, so the gate is shown to run
-    // before any identifier is looked up: the request that WOULD be answered and
-    // the ones that would not are refused identically. Writing a policy is
-    // organisation-scoped too, so it is created with an administrator associated
-    // and the association is then removed through the store seam — which is the
-    // precondition this rule is about.
+    // A stored policy with a recorded violation, scoped by an `IncludeMap` so
+    // what it applies to is its own document rather than the organisation roster
+    // the association contributes to. Writing a policy IS organisation-scoped,
+    // so it is created with an administrator associated and the association is
+    // then removed through the store seam — which is the precondition this rule
+    // is about.
     associate(&router, ADMIN).await;
-    let policy_id = put_scoped_policy(&router, "gated").await;
+    let policy_id = put_scoped_policy(&router, "ungated").await;
     let table = rows();
     let answerable = &table[0];
     record_violation(&engine, &policy_id, answerable);
-    with_store(&engine, |store| store.admin_account = None);
 
     let shapes = [
         (
@@ -483,18 +483,27 @@ async fn get_violation_details_is_refused_until_an_administrator_is_associated()
         ),
     ];
 
-    for (shape, policy, account, resource_id, resource_type) in &shapes {
-        let (status, body) = details(&router, policy, account, resource_id, resource_type).await;
+    // What each shape answers while the administrator IS associated.
+    let mut associated: Vec<(u16, Value)> = Vec::new();
+    for (_, policy, account, resource_id, resource_type) in &shapes {
+        associated.push(details(&router, policy, account, resource_id, resource_type).await);
+    }
+
+    with_store(&engine, |store| store.admin_account = None);
+
+    for ((shape, policy, account, resource_id, resource_type), before) in
+        shapes.iter().zip(associated.iter())
+    {
+        let after = details(&router, policy, account, resource_id, resource_type).await;
         assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "AccessDeniedException"),
-            "case {shape}: with no administrator association the call must be refused, \
-             got {status} with {body}"
+            &after, before,
+            "case {shape}: the detail is the outcome of this operation's own lookup, so removing \
+             the administrator association must not change it, got {after:?} after {before:?}"
         );
     }
 
-    // The refusal's message is built from the request: it names the calling
-    // account and the Region the request was signed for.
+    // Only the recorded violation is answered, and every other triple carries
+    // the service-wide not-found text — the same answers, in every Region.
     for region in [REGION, "eu-central-1", "ap-southeast-4"] {
         let (status, body) = call_in(
             &router,
@@ -509,34 +518,34 @@ async fn get_violation_details_is_refused_until_an_administrator_is_associated()
         )
         .await;
         assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "AccessDeniedException"),
-            "case {region}: expected the authorization refusal, got {status} with {body}"
+            status, 200,
+            "case {region}: the recorded violation is reported with no administrator associated, \
+             got {status} with {body}"
         );
-        assert_eq!(
-            error_message(&body),
-            format!("No default admin could be found for account {ACCOUNT} in Region {region}"),
-            "case {region}: the refusal must name the calling account and the Region of the \
-             request, got {body}"
-        );
-    }
-
-    // With the administrator associated again, the same shapes are judged on
-    // their own merits: only the recorded violation is answered.
-    associate(&router, ADMIN).await;
-    for (shape, policy, account, resource_id, resource_type) in &shapes {
-        let (status, body) = details(&router, policy, account, resource_id, resource_type).await;
-        if *shape == "recorded-violation" {
-            assert_eq!(
-                status, 200,
-                "case {shape}: an associated administrator must be answered, got {status} \
-                 with {body}"
-            );
-        } else {
+        for (shape, policy, account, resource_id, resource_type) in &shapes[1..] {
+            let (status, body) = call_in(
+                &router,
+                "GetViolationDetails",
+                &json!({
+                    "PolicyId": policy,
+                    "MemberAccount": account,
+                    "ResourceId": resource_id,
+                    "ResourceType": resource_type,
+                }),
+                region,
+            )
+            .await;
             assert_eq!(
                 (status, error_code(&body).as_str()),
                 (400, "ResourceNotFoundException"),
-                "case {shape}: expected the modelled not-found, got {status} with {body}"
+                "case {shape} in {region}: expected the modelled not-found, got {status} with \
+                 {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                state::RESOURCE_NOT_FOUND_MESSAGE,
+                "case {shape} in {region}: the not-found text is the service-wide constant, got \
+                 {body}"
             );
         }
     }

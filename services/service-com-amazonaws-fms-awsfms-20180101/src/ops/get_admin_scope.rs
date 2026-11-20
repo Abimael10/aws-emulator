@@ -24,13 +24,12 @@
 //! An account that is neither is no administrator resource to report, which is
 //! the modelled `ResourceNotFoundException`.
 //!
-//! Both answers are for a caller that may administer the organization's
-//! Firewall Manager administrators at all: this is the read side of
-//! `PutAdminAccount`, which only the organization's management account can
-//! perform, and until the organization is onboarded to Firewall Manager there
-//! is no such administration to report — the modelled `InvalidOperationException`
-//! this service words in ONE place
-//! ([`crate::state::management_account_only_refusal`]).
+//! Both answers come from this operation's OWN lookup of the ONE account the
+//! request names, and nothing is decided ahead of that lookup: an organization
+//! that holds no Firewall Manager administrator at all holds no administrator
+//! record for the named account either, so it is that same modelled
+//! `ResourceNotFoundException` — not an admission refusal, which would answer a
+//! caller asking about one account with a verdict about the caller.
 //!
 //! A REPORTING operation: the only write it makes is the one the CLOCK already
 //! made due — the `ONBOARDING` → `ONBOARDING_COMPLETE` transition owed at this
@@ -190,8 +189,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Nothing of this answer is read off the request's metadata: the account
-        // whose scope is reported is the payload's, and the refusal below names
-        // the organization's management account rather than a Region.
+        // whose scope is reported is the payload's, and every answer is the
+        // outcome of resolving that account in this service's own store.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetAdminScopeErrorModeled::InternalErrorException(
@@ -204,28 +203,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // Reading an administrator's scope is part of administering the
-        // organization's Firewall Manager administrators, which only the
-        // organization's management account can do, and there is none of that
-        // administration to read until the organization is onboarded to
-        // Firewall Manager by `AssociateAdminAccount`. The refusal is built
-        // with the store guard released, because it reads the organization's
-        // management account from the Organizations service's own store.
-        let Some(default_admin) = crate::state::management_account_administration_at(&store, now)
-        else {
-            drop(store);
-            return Err(GetAdminScopeErrorModeled::InvalidOperationException(
-                crate::state::management_account_only_refusal(&*self.engine),
-            )
-            .into());
-        };
-
-        if input.admin_account == default_admin.account_id {
+        // The organization's DEFAULT administrator, when it has one: being the
+        // default administrator IS that account's scope, so the account the
+        // request names is resolved against the association first. Cloned so the
+        // lookup below can settle what the clock owes.
+        let default_admin = store.active_admin_account_at(now).cloned();
+        if let Some(admin) = default_admin.filter(|admin| input.admin_account == admin.account_id) {
             return Ok(GetAdminScopeOutput {
                 admin_scope: Some(crate::state::default_admin_scope()),
                 status: Some(
-                    crate::state::default_admin_organization_status(&default_admin.role_status)
-                        .to_string(),
+                    crate::state::default_admin_organization_status(&admin.role_status).to_string(),
                 ),
             });
         }

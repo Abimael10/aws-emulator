@@ -1530,6 +1530,19 @@ impl ComAmazonawsFmsAwsfms20180101State {
     pub fn active_admin_account(&mut self) -> Option<&AdminAccountRecord> {
         let now = SystemTime::now();
         self.settle_admin_account_at(now);
+        self.active_admin_account_at(now)
+    }
+
+    /// The association that is the organisation's default administrator AT
+    /// `now`, read-only: the ONE place the active-association predicate lives,
+    /// so the gate, the operations that report the administrator and the ones
+    /// that only need to know whether there is one cannot disagree about it.
+    ///
+    /// It settles nothing and writes nothing, because the predicate is
+    /// clock-derived: a tear-down the clock has completed closes this whether or
+    /// not any operation has materialised the `DELETED` status yet (see
+    /// [`Self::settle_admin_account_at`]).
+    pub fn active_admin_account_at(&self, now: SystemTime) -> Option<&AdminAccountRecord> {
         self.admin_account.as_ref().filter(|a| a.is_active_at(now))
     }
 
@@ -2792,20 +2805,25 @@ fn out_of_admin_scope_refusal(
 /// Which operations take this gate is decided PER OPERATION, by what each one
 /// answers, never by the resource it names: an operation whose recorded answer to
 /// a caller with no administrator association is the outcome of its own lookup is
-/// not gated here, and reaches the store directly (`GetPolicy` and `DeletePolicy`
-/// are that case — `AccessDeniedException` is in neither one's modeled error set,
-/// nor in this service's common errors).
+/// not gated here, and reaches the store directly. The operations keyed by the
+/// identifier of ONE resource they report about are that case — `GetPolicy` and
+/// `DeletePolicy`, the policy-compliance and protection reads
+/// (`ListComplianceStatus`, `GetComplianceDetail`, `GetProtectionStatus`,
+/// `GetViolationDetails`) and the administrator-scope read (`GetAdminScope`) —
+/// and each answers an identifier that names nothing with the modelled
+/// [`resource_not_found`] instead, because `AccessDeniedException` is in none of
+/// their modelled error sets nor in this service's common errors.
 ///
 /// The refusal [`require_administrator`] states when the organization has no
 /// Firewall Manager administrator: HTTP 400 `AccessDeniedException`, naming the
 /// calling account and the Region the request was signed for.
 ///
 /// It is NOT the refusal of an operation only the organization's management
-/// account can perform (`GetAdminScope`, `ListAdminAccountsForOrganization`,
-/// `PutAdminAccount`): those declare `AccessDeniedException` in none of their
-/// modelled error unions and state this refusal as the modelled
-/// `InvalidOperationException` instead ([`management_account_only_refusal`]), so
-/// the gate's refusal class depends on what the operation models for it.
+/// account can perform (`ListAdminAccountsForOrganization`, `PutAdminAccount`):
+/// those declare `AccessDeniedException` in none of their modelled error unions
+/// and state this refusal as the modelled `InvalidOperationException` instead
+/// ([`management_account_only_refusal`]), so the gate's refusal class depends on
+/// what the operation models for it.
 ///
 /// Separate from the gate so an operation that resolves the association itself —
 /// one that must hold it MUTABLY to change it, and so cannot take the gate's
@@ -2831,19 +2849,21 @@ pub fn no_administrator_refusal<E>(region: &str) -> crate::scaffolded::Scaffolde
 /// operations are not among them: they name their target by the model's generic
 /// `ResourceArn` and nothing else, declare no authorization error in their error
 /// unions, and are answered from that ARN alone — its form, then its resolution
-/// — so they do not call this. Neither are the operations only the
-/// organization's management account can perform, which take the same admission
-/// test through [`management_account_administration_at`] and state the refusal
-/// their own models declare.
+/// — so they do not call this. Neither are the reads answered from their own
+/// resolution of the identifier they name, which report what that identifier
+/// resolves to and read the administrator they report through
+/// [`ComAmazonawsFmsAwsfms20180101State::active_admin_account_at`]. Neither are
+/// the operations only the organization's management account can perform, which
+/// take the same admission test through
+/// [`management_account_administration_at`] and state the refusal their own
+/// models declare.
 pub fn require_administrator_at<'store, E>(
     store: &'store ComAmazonawsFmsAwsfms20180101State,
     region: &str,
     now: SystemTime,
 ) -> Result<&'store AdminAccountRecord, crate::scaffolded::Scaffolded<E>> {
     store
-        .admin_account
-        .as_ref()
-        .filter(|admin| admin.is_active_at(now))
+        .active_admin_account_at(now)
         .ok_or_else(|| no_administrator_refusal(region))
 }
 

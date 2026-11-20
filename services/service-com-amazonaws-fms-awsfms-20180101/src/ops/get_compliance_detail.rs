@@ -7,10 +7,8 @@
 //! `PolicyComplianceDetail` whose `Violators` NAME the resources
 //! `ListComplianceStatus` only counts.
 //!
-//! The read is organisation-scoped — it answers about an organisation member
-//! account — so with no Firewall Manager administrator association in this
-//! account/Region it is refused by [`crate::state::require_administrator`]
-//! BEFORE any identifier is looked up. The pair is then resolved: a `PolicyId`
+//! The detail is answered from this operation's OWN lookup of the identifiers
+//! the request names, with nothing decided ahead of it: a `PolicyId`
 //! naming no stored policy, and a `MemberAccount` the stored policy does not
 //! apply to
 //! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_scope_accounts`],
@@ -175,20 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
-        // ONE reading of the clock for the whole request: the gate and the
-        // policy's scope the named account is resolved against are both
-        // clock-derived, so they are decided from the same instant (see
+        // ONE reading of the clock for the whole request: the policy's scope the
+        // named account is resolved against is clock-derived (see
         // [`crate::state::ComAmazonawsFmsAwsfms20180101State::policy_applies_to_account`]).
         let now = ::std::time::SystemTime::now();
-        // Authorization FIRST, before any identifier is looked up: this read
-        // answers about an organisation member account, so a caller that is
-        // neither a Firewall Manager administrator nor the organisation's
-        // management account is refused identically whatever it sent — a refusal
-        // that leaked whether the policy exists would tell an unauthorized
-        // caller what the organisation holds.
-        crate::state::require_administrator_at(&store, &region, now)?;
+        // Nothing of this answer is read off the request's metadata: it is the
+        // outcome of resolving the payload's identifiers in this service's own
+        // store.
+        let _ = ctx;
 
         // "The ID of the policy that you want to get the details for": an id
         // naming no stored policy is the modelled not-found.

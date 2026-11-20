@@ -11,23 +11,28 @@
 //! management account, never with an error code outside that operation's own
 //! modelled error union.
 //!
-//! The three operations are the ones whose model says so:
+//! The two operations are the ones whose model says so:
 //! `ListAdminAccountsForOrganization` ("This operation can be called only from
-//! the organization's management account"), `PutAdminAccount` ("Only the
+//! the organization's management account") and `PutAdminAccount` ("Only the
 //! organization's management account can create an Firewall Manager
-//! administrator account") and `GetAdminScope`, the read side of what
-//! `PutAdminAccount` writes. Their modelled error unions
-//! (`smithy_query(query="operation", operation="GetAdminScope,
-//! ListAdminAccountsForOrganization,PutAdminAccount")`) all declare
-//! `InvalidOperationException` and NONE of them declares
-//! `AccessDeniedException`, which is why that code is asserted against here.
+//! administrator account"). Their modelled error unions
+//! (`smithy_query(query="operation",
+//! operation="ListAdminAccountsForOrganization,PutAdminAccount")`) both declare
+//! `InvalidOperationException` and NEITHER declares `AccessDeniedException`,
+//! which is why that code is asserted against here.
+//!
+//! `GetAdminScope`, the read side of what `PutAdminAccount` writes, is NOT in
+//! this class and is asserted here as the contrast: it reports what the ONE
+//! account its request names resolves to, so while the organization holds no
+//! administration it answers its OWN modelled `ResourceNotFoundException`
+//! rather than this refusal.
 //!
 //! The classes the rule ranges over:
 //!
-//! * the OPERATION — all three — each with payload forms that differ in shape:
-//!   no members at all, a page bound, a one-digit account id, a 12-digit one,
-//!   the calling account, a scope, and a scope that is invalid anyway (so the
-//!   refusal is shown to precede payload validation);
+//! * the OPERATION — both of them — each with payload forms that differ in
+//!   shape: no members at all, a page bound, a one-digit account id, a 12-digit
+//!   one, a scope, and a scope that is invalid anyway (so the refusal is shown
+//!   to precede payload validation);
 //! * the STORE state that holds no administration: an organization that was
 //!   never onboarded, and an association whose tear-down the CLOCK has already
 //!   completed (a role pending deletion whose completion instant has passed,
@@ -88,21 +93,6 @@ fn management_account_only_calls() -> Vec<(&'static str, &'static str, serde_jso
             "the enumeration with a page bound",
             "ListAdminAccountsForOrganization",
             json!({ "MaxResults": 1 }),
-        ),
-        (
-            "a scope read of the calling account",
-            "GetAdminScope",
-            json!({ "AdminAccount": ACCOUNT }),
-        ),
-        (
-            "a scope read of a 12-digit account that is no administrator",
-            "GetAdminScope",
-            json!({ "AdminAccount": OTHER_ACCOUNT }),
-        ),
-        (
-            "a scope read of the shortest well-formed account id",
-            "GetAdminScope",
-            json!({ "AdminAccount": SHORTEST_ACCOUNT }),
         ),
         (
             "an administrator write with no scope",
@@ -188,6 +178,49 @@ async fn management_account_only_calls_are_refused_with_the_modelled_invalid_ope
                     "case {store_case:?} / {case:?} in {region}: expected the refusal to name \
                      the calling account and the organization's management account, got \
                      {message:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The contrast: `GetAdminScope` is answered from its OWN lookup of the account
+/// it names in every one of those same states, so an organization that holds no
+/// Firewall Manager administration answers the modelled
+/// `ResourceNotFoundException` for it and never the refusal above \u2014 whichever
+/// account the request names and whichever Region it is signed for.
+#[tokio::test]
+async fn the_scope_read_answers_its_own_not_found_while_the_organization_holds_no_administration() {
+    for (store_case, seeded) in unadministered_stores() {
+        for region in [REGION, OTHER_REGION] {
+            let (router, engine) = emulator_with_engine();
+            with_store(&engine, |store| {
+                store.admin_account = seeded.clone();
+            });
+            // Account-id forms spanning the modelled `AWSAccountId` (`^[0-9]+$`,
+            // length 1..1024): the calling account, another 12-digit one, and
+            // the shortest well-formed id.
+            for account in [ACCOUNT, OTHER_ACCOUNT, SHORTEST_ACCOUNT] {
+                let (status, body) = call_in(
+                    &router,
+                    "GetAdminScope",
+                    &json!({ "AdminAccount": account }),
+                    region,
+                )
+                .await;
+                let code = error_code(&body);
+                assert_eq!(
+                    (status, code.as_str()),
+                    (400, "ResourceNotFoundException"),
+                    "case {store_case:?} / {account} in {region}: an account that is no \
+                     administrator is this read's own not-found, got {status} / {code:?} with \
+                     {body}"
+                );
+                assert_eq!(
+                    error_message(&body),
+                    state::RESOURCE_NOT_FOUND_MESSAGE,
+                    "case {store_case:?} / {account} in {region}: the not-found text is the \
+                     service-wide constant, got {body}"
                 );
             }
         }
