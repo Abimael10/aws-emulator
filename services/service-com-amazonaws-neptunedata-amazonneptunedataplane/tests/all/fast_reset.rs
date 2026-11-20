@@ -8,13 +8,17 @@
 //!
 //! One rule is under test: fast reset is a two-step command, and only the token the
 //! engine itself minted on the latest `initiateDatabaseReset` lets a
-//! `performDatabaseReset` empty the database — a request carrying no token is refused for
-//! the missing parameter, any other token value is refused as invalid, and a token that
+//! `performDatabaseReset` empty the database — a request carrying no token is a request
+//! that cannot be processed, any other token value is refused as invalid, and a token that
 //! did perform a reset is consumed, so it cannot perform a second one.
 //!
 //! The table rows differ along what the rule generalises over: whether a token is sent at
 //! all, its form (absent, empty, blank, free text, a well-formed UUID the engine never
 //! minted), and its age (a superseded token, the outstanding one, a consumed one).
+//!
+//! Every row also pins the two things every answer of this data plane carries whatever it
+//! answers: the media type it announces ([`ANNOUNCED_MEDIA_TYPE`]) and, on a refusal, the
+//! exception class under `code` and the refusal's text under `message`.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -39,6 +43,12 @@ const SIGNED_FOR_NEPTUNE_DB: &str = "AWS4-HMAC-SHA256 \
 const INITIATE: &str = "initiateDatabaseReset";
 const PERFORM: &str = "performDatabaseReset";
 
+/// The media type this data plane announces on every JSON response, success and refusal
+/// alike: the protocol's JSON media type WITH the charset its body is written in. Spelled
+/// out here rather than imported from the crate so a wrong value in `src/service.rs` fails
+/// this test.
+const ANNOUNCED_MEDIA_TYPE: &str = "application/json; charset=UTF-8";
+
 /// One emulator: a router carrying only this service, over one shared engine. The engine
 /// is handed back so a test can seed the Gremlin registry and read the stored fast-reset
 /// record the way another request would.
@@ -55,9 +65,11 @@ fn emulator() -> Emulator {
     Emulator { router, engine }
 }
 
-/// What the emulator answered: the HTTP status and the JSON body.
+/// What the emulator answered: the HTTP status, the media type it announced and the JSON
+/// body.
 struct Answer {
     status: u16,
+    content_type: String,
     body: Value,
 }
 
@@ -103,6 +115,12 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
         Value::Null
@@ -114,7 +132,11 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
             )
         })
     };
-    Answer { status, body }
+    Answer {
+        status,
+        content_type,
+        body,
+    }
 }
 
 /// `ExecuteFastReset` is `POST /system`, with `action` and `token` in the JSON body.
@@ -189,7 +211,8 @@ fn reset_instants(
 }
 
 /// Assert a refusal: the status, the modelled error code, and the two members every
-/// Neptune error carries (`code` naming the HTTP status, `requestId` naming the response).
+/// Neptune error carries (`code` naming the exception class, `requestId` naming the
+/// response).
 fn assert_refused(case: &str, answer: &Answer, expected_code: &str) {
     assert_eq!(
         answer.status, 400,
@@ -204,9 +227,20 @@ fn assert_refused(case: &str, answer: &Answer, expected_code: &str) {
     );
     assert_eq!(
         answer.body["code"].as_str(),
-        Some("400"),
-        "case {case}: the error must carry its HTTP status in `code`, got {:?}",
+        Some(expected_code),
+        "case {case}: the error must carry its exception class in `code`, got {:?}",
         answer.body["code"]
+    );
+    assert_eq!(
+        answer.body["message"].as_str(),
+        Some(answer.detailed_message()),
+        "case {case}: the error must carry its text under `message` too, got {:?}",
+        answer.body["message"]
+    );
+    assert_eq!(
+        answer.content_type, ANNOUNCED_MEDIA_TYPE,
+        "case {case}: expected the announced media type, got {:?}",
+        answer.content_type
     );
     assert!(
         !answer.request_id().is_empty(),
@@ -289,12 +323,13 @@ enum Presented {
 }
 
 /// The error code a presented token must be refused with, or `None` when it must work.
-/// `MissingParameterException` is the modelled "a required parameter is missing";
+/// `BadRequestException` is the modelled "a request that cannot be processed", which is what
+/// a command carrying no value for the member its action needs is;
 /// `InvalidParameterException` is the modelled "a parameter value is not valid".
 const PRESENTED_CASES: [(Presented, Option<&str>); 8] = [
-    (Presented::Absent, Some("MissingParameterException")),
-    (Presented::Literal(""), Some("MissingParameterException")),
-    (Presented::Literal("   "), Some("MissingParameterException")),
+    (Presented::Absent, Some("BadRequestException")),
+    (Presented::Literal(""), Some("BadRequestException")),
+    (Presented::Literal("   "), Some("BadRequestException")),
     (Presented::Literal("not-a-token"), Some("InvalidParameterException")),
     // A well-formed v4 UUID this engine never minted: the FORM is right and it still
     // cannot authorise a reset.
@@ -344,10 +379,13 @@ async fn perform_resets_only_for_the_outstanding_token() {
         match expected_error {
             Some(code) => {
                 assert_refused(&case, &answer, code);
-                if code == "MissingParameterException" {
-                    assert!(
-                        answer.detailed_message().contains("token"),
-                        "case {case}: the message must name the missing member, got {:?}",
+                if code == "BadRequestException" {
+                    // The engine reports the member it found no value in, by its own name:
+                    // `<member> is null`.
+                    assert_eq!(
+                        answer.detailed_message(),
+                        "token is null",
+                        "case {case}: expected the member-is-null refusal, got {:?}",
                         answer.detailed_message()
                     );
                 }
@@ -366,6 +404,11 @@ async fn perform_resets_only_for_the_outstanding_token() {
                     answer.status, 200,
                     "case {case}: expected 200, got {} with body {:?}",
                     answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.content_type, ANNOUNCED_MEDIA_TYPE,
+                    "case {case}: expected the announced media type, got {:?}",
+                    answer.content_type
                 );
                 assert_eq!(
                     answer.body["status"].as_str(),

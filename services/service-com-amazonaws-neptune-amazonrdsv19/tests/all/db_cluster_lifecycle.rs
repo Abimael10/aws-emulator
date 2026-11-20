@@ -364,7 +364,7 @@ const CLUSTER_CASES: &[ClusterCase] = &[
         extra: &[],
         // Port — "Default: 8182".
         expected_port: "8182",
-        expected_engine_version: "1.3.2.1",
+        expected_engine_version: "1.4.8.0",
         // BackupRetentionPeriod — "Default: 1".
         expected_backup_retention: "1",
         expected_storage_encrypted: "false",
@@ -382,7 +382,7 @@ const CLUSTER_CASES: &[ClusterCase] = &[
         stored_identifier: "mygraph-two",
         extra: &[],
         expected_port: "8182",
-        expected_engine_version: "1.3.2.1",
+        expected_engine_version: "1.4.8.0",
         expected_backup_retention: "1",
         expected_storage_encrypted: "false",
         expected_deletion_protection: "false",
@@ -425,7 +425,7 @@ const CLUSTER_CASES: &[ClusterCase] = &[
         // "When set to standard, the storage type is not returned in the response."
         extra: &[("StorageType", "standard"), ("BackupRetentionPeriod", "1")],
         expected_port: "8182",
-        expected_engine_version: "1.3.2.1",
+        expected_engine_version: "1.4.8.0",
         // The published lower bound of "Must be a value from 1 to 35".
         expected_backup_retention: "1",
         expected_storage_encrypted: "false",

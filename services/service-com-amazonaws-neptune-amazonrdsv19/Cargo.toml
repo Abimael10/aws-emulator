@@ -22,7 +22,9 @@ http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # `data_plane_addressing`: the tree's one reading of which host is the emulator's own, so
-# the address a cluster announces is one this process answers on.
+# the address a cluster announces is one this process answers on. `graph_db_clusters`: the
+# shared directory this control plane records a provisioned cluster's engine and feature
+# configuration in, which the Neptune data plane answers its engine status from.
 service-common = { path = "../common" }
 # SHA-256, used to mint the opaque resource ids and DNS labels the API reports
 # (DbClusterResourceId, DbiResourceId, endpoint shard labels) deterministically.

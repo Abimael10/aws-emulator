@@ -11,7 +11,10 @@
 //! * [`EngineStatusRecord`] — the one DB instance `GetEngineStatus` reports on. It is
 //!   built ONCE, when this state is first reached (the instant this emulator's engine
 //!   "started"), so every later read answers the same `startTime` instead of a fresh
-//!   clock reading.
+//!   clock reading. What the CLUSTER this plane answers for settles — its engine version
+//!   and the features a create turned on — is layered over that record from the shared
+//!   directory the Neptune control plane records a provisioned cluster in (see
+//!   [`engine_status`]).
 //! * [`GremlinQueryRecord`] — one per Gremlin query the engine has accepted, keyed by
 //!   query id. `ListGremlinQueries` and `GetGremlinQueryStatus` report on these and
 //!   `CancelGremlinQuery` mutates them.
@@ -51,15 +54,14 @@
 //! dropped when the report is written.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use crate::ops::types::{
     BadRequestException, FailureByQueryException, GremlinQueryStatus, IllegalArgumentException,
     InternalFailureException, InvalidParameterException, MissingParameterException, QueryEvalStats,
     ServerShutdownException,
 };
+mod engine_status;
 mod gremlin_plan;
 mod ml;
 mod open_cypher;
@@ -67,50 +69,13 @@ mod parse_refusal;
 mod property_graph;
 mod statistics;
 
+pub use engine_status::*;
 pub use gremlin_plan::*;
 pub use ml::*;
 pub use open_cypher::*;
 pub use parse_refusal::*;
 pub use property_graph::*;
 pub use statistics::*;
-
-/// `GetEngineStatusOutput$status` for an instance that is not experiencing problems:
-/// the member's own documentation says "Set to `healthy` if the instance is not
-/// experiencing problems".
-pub const ENGINE_STATUS_HEALTHY: &str = "healthy";
-
-/// `GetEngineStatusOutput$role` for the primary instance: the member's documentation
-/// says "Set to `reader` if the instance is a read-replica, or to `writer` if the
-/// instance is the primary instance". This emulator serves one instance, and it accepts
-/// writes, so it is the primary.
-pub const ENGINE_ROLE_WRITER: &str = "writer";
-
-/// `GetEngineStatusOutput$dfeQueryEngine`'s documented default — the member's own
-/// documentation names `viaQueryHint` "(the default)".
-pub const DFE_QUERY_ENGINE_DEFAULT: &str = "viaQueryHint";
-
-/// The Neptune engine version this emulator reports. A released Neptune engine version,
-/// carried on the record so one place states it; unprefixed, because the member's
-/// documentation reserves the `Patch-` prefix for a manually patched engine.
-pub const DB_ENGINE_VERSION: &str = "1.3.2.0";
-
-/// The Apache TinkerPop version `GetEngineStatusOutput$gremlin` reports.
-pub const GREMLIN_LANGUAGE_VERSION: &str = "tinkerpop-3.6.2";
-
-/// The SPARQL version `GetEngineStatusOutput$sparql` reports.
-pub const SPARQL_LANGUAGE_VERSION: &str = "sparql-1.1";
-
-/// The openCypher version `GetEngineStatusOutput$opencypher` reports.
-pub const OPENCYPHER_LANGUAGE_VERSION: &str = "Neptune-9.0.20190305-1.0";
-
-/// The cluster query timeout, in milliseconds, reported under `settings` — the member's
-/// own documentation names `clusterQueryTimeoutInMs` as what `settings` carries, and
-/// 120000 ms is the documented default of the `neptune_query_timeout` DB cluster
-/// parameter it reflects.
-pub const CLUSTER_QUERY_TIMEOUT_MS: &str = "120000";
-
-/// The settings key [`CLUSTER_QUERY_TIMEOUT_MS`] is reported under.
-pub const CLUSTER_QUERY_TIMEOUT_SETTING: &str = "clusterQueryTimeoutInMs";
 
 /// `CancelGremlinQueryOutput$status` for a cancellation the engine accepted. It reports
 /// the status of the cancellation request itself, not of the query.
@@ -140,72 +105,6 @@ pub const LOADER_JOB_LIST_MIN_LIMIT: i32 = 1;
 /// member reports "whether or not the fast reset rquest is accepted", and the system
 /// endpoint states that acceptance as the HTTP status line of the answer.
 pub const FAST_RESET_ACCEPTED: &str = "200 OK";
-
-/// The engine state `GetEngineStatus` reports: one record, built at state init.
-#[derive(Debug, Clone)]
-pub struct EngineStatusRecord {
-    /// `healthy` for an instance with no problem to report.
-    pub status: String,
-    /// When this emulator's engine process started. Fixed at state init: a later read
-    /// reports this instant, never a fresh clock reading.
-    pub start_time: SystemTime,
-    pub db_engine_version: String,
-    pub role: String,
-    pub dfe_query_engine: String,
-    pub gremlin_version: String,
-    pub sparql_version: String,
-    pub opencypher_version: String,
-    /// The Lab Mode parameters this engine carries, by parameter name.
-    pub lab_mode: BTreeMap<String, String>,
-    /// How many transactions are being rolled back right now.
-    pub rolling_back_trx_count: i32,
-    /// When the earliest transaction being rolled back started. `None` while nothing is
-    /// rolling back, which is what keeps the member off the wire.
-    pub rolling_back_trx_earliest_start_time: Option<SystemTime>,
-    /// Each optional engine feature's status, by feature name.
-    pub features: BTreeMap<String, String>,
-    /// The cluster settings this engine runs with, by setting name.
-    pub settings: BTreeMap<String, String>,
-}
-
-impl Default for EngineStatusRecord {
-    fn default() -> Self {
-        Self {
-            status: ENGINE_STATUS_HEALTHY.to_string(),
-            start_time: SystemTime::now(),
-            db_engine_version: DB_ENGINE_VERSION.to_string(),
-            role: ENGINE_ROLE_WRITER.to_string(),
-            dfe_query_engine: DFE_QUERY_ENGINE_DEFAULT.to_string(),
-            gremlin_version: GREMLIN_LANGUAGE_VERSION.to_string(),
-            sparql_version: SPARQL_LANGUAGE_VERSION.to_string(),
-            opencypher_version: OPENCYPHER_LANGUAGE_VERSION.to_string(),
-            // Neptune's two engine-level Lab Mode parameters at their documented
-            // defaults: `ObjectIndex` is off unless a cluster turns it on, and
-            // read/write conflict detection is on.
-            lab_mode: BTreeMap::from([
-                ("ObjectIndex".to_string(), "disabled".to_string()),
-                ("ReadWriteConflictDetection".to_string(), "enabled".to_string()),
-            ]),
-            // No transaction is rolling back in a freshly started engine, so the
-            // earliest-rollback instant has nothing to report.
-            rolling_back_trx_count: 0,
-            rolling_back_trx_earliest_start_time: None,
-            // Every optional engine feature is off, and each entry below says something
-            // true of this emulator: there is no DFE result cache, the stream endpoints
-            // are not implemented, and neither log is collected.
-            features: BTreeMap::from([
-                ("AuditLog".to_string(), "disabled".to_string()),
-                ("ResultCache".to_string(), "disabled".to_string()),
-                ("SlowQueryLogs".to_string(), "disabled".to_string()),
-                ("Streams".to_string(), "disabled".to_string()),
-            ]),
-            settings: BTreeMap::from([(
-                CLUSTER_QUERY_TIMEOUT_SETTING.to_string(),
-                CLUSTER_QUERY_TIMEOUT_MS.to_string(),
-            )]),
-        }
-    }
-}
 
 /// How far a Gremlin query the engine accepted has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -728,43 +627,14 @@ impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
     }
 }
 
-/// An instant as the engine-status timestamps report it: the ISO-8601 (RFC 3339) form
-/// `aws_smithy_types` renders a `DateTime` in.
-///
-/// The format error the renderer declares is reachable only for a year outside the
-/// range it can print, which no instant this emulator stores can be, so an unprintable
-/// instant reports as the empty string rather than failing a status read.
-pub fn engine_timestamp(instant: SystemTime) -> String {
-    let rendered = ::aws_smithy_types::DateTime::from(instant)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime);
-    debug_assert!(
-        rendered.is_ok(),
-        "an instant this emulator stores must be printable: {rendered:?}"
-    );
-    rendered.unwrap_or_default()
-}
-
-/// The counter the second half of a request id comes from, and the per-process tag the
-/// first half carries. Neither is service state: they name responses, not resources, so
-/// they live beside the id generator rather than in the store.
-static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static PROCESS_TAG: OnceLock<u64> = OnceLock::new();
-
 /// A fresh id naming ONE response, for the `requestId` a modelled Neptune error carries.
 ///
-/// The member documents it only as "the ID of the request" and the service publishes no
-/// format, so the one requirement is that two responses carry different ids. It is built
-/// from a tag fixed when this process first needed an id and a counter, which is unique
-/// within a run and across concurrent requests; the id names a request for correlation,
-/// is derived from nothing the caller sent, and is not a credential.
+/// The member documents it only as "the ID of the request", and the ids this data plane
+/// answers one with are UUIDs, so one is minted here: the id names a request for
+/// correlation, two responses never carry the same one, it is derived from nothing the
+/// caller sent, and it is not a credential.
 pub fn new_request_id() -> String {
-    let tag = *PROCESS_TAG.get_or_init(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |since_epoch| since_epoch.as_nanos() as u64)
-    });
-    let sequence = REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!("{tag:016x}-{sequence:016x}")
+    ::uuid::Uuid::new_v4().to_string()
 }
 
 /// A fresh fast-reset token: the UUID `ExecuteFastReset`'s `initiateDatabaseReset` action
@@ -813,14 +683,13 @@ pub fn echoed(value: &str) -> String {
 
 /// The `InvalidParameterException` payload for a `queryId` the registry does not hold.
 ///
-/// `code` carries the HTTP status, which is what the member's own documentation says it
-/// is ("The HTTP status code returned with the exception"), and `detailedMessage` names
-/// the member and the value that was wrong, so the caller can fix the request from it.
+/// `detailedMessage` names the member and the value that was wrong, so the caller can fix
+/// the request from it; the error CLASS a client branches on is written from the shape's own
+/// name (see `crate::ops::types::error_message_wire`).
 pub fn invalid_query_id(query_id: &str) -> InvalidParameterException {
     InvalidParameterException {
         detailed_message: format!("Supplied queryId {} is invalid", echoed(query_id)),
         request_id: new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -842,7 +711,6 @@ pub fn invalid_parameter_range(
              not less than {minimum} and not more than {maximum}"
         ),
         request_id: new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -853,7 +721,22 @@ pub fn missing_parameter(member: &str) -> MissingParameterException {
     MissingParameterException {
         detailed_message: format!("Request is missing mandatory parameter '{member}'"),
         request_id: new_request_id(),
-        code: "400".to_string(),
+    }
+}
+
+/// The `BadRequestException` payload for a SYSTEM COMMAND that cannot be processed because
+/// the member its action needs arrived empty: the engine reports the member it found no
+/// value in, by its own name, and nothing else.
+///
+/// `BadRequestException` is the class — "raised when a request is submitted that cannot be
+/// processed": the command names an action the engine supports and carries no value for it
+/// to act on, so what is wrong is the request as a whole rather than a parameter outside
+/// its bounds. `member` is the modelled member's wire name, which is the message's one
+/// variable part.
+pub fn member_is_null(member: &str) -> BadRequestException {
+    BadRequestException {
+        detailed_message: format!("{member} is null"),
+        request_id: new_request_id(),
     }
 }
 
@@ -868,7 +751,6 @@ pub fn invalid_fast_reset_token() -> InvalidParameterException {
         detailed_message: "Supplied token is invalid. Please initiate the database reset again."
             .to_string(),
         request_id: new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -893,15 +775,13 @@ pub fn unsupported_member_value(
             accepted.join(", ")
         ),
         request_id: new_request_id(),
-        code: "400".to_string(),
     }
 }
 
 /// What a request that could not reach this service's store at all is told: a
-/// server-side failure, not anything the caller sent. One statement of the message and
-/// the status, so the two payloads below cannot drift apart.
+/// server-side failure, not anything the caller sent. One statement of the message, so the
+/// payloads below cannot drift apart.
 const STORE_UNAVAILABLE_MESSAGE: &str = "the neptunedata engine store is unavailable";
-const SERVER_ERROR_STATUS: &str = "500";
 
 /// The `FailureByQueryException` payload for a request that could not reach this
 /// service's store.
@@ -909,7 +789,6 @@ pub fn store_unavailable_failure() -> FailureByQueryException {
     FailureByQueryException {
         detailed_message: STORE_UNAVAILABLE_MESSAGE.to_string(),
         request_id: new_request_id(),
-        code: SERVER_ERROR_STATUS.to_string(),
     }
 }
 
@@ -919,7 +798,6 @@ pub fn store_unavailable_internal() -> InternalFailureException {
     InternalFailureException {
         detailed_message: STORE_UNAVAILABLE_MESSAGE.to_string(),
         request_id: new_request_id(),
-        code: SERVER_ERROR_STATUS.to_string(),
     }
 }
 
@@ -929,7 +807,6 @@ pub fn store_unavailable_shutdown() -> ServerShutdownException {
     ServerShutdownException {
         detailed_message: STORE_UNAVAILABLE_MESSAGE.to_string(),
         request_id: new_request_id(),
-        code: SERVER_ERROR_STATUS.to_string(),
     }
 }
 
@@ -941,7 +818,6 @@ pub fn store_unavailable_bad_request() -> BadRequestException {
     BadRequestException {
         detailed_message: STORE_UNAVAILABLE_MESSAGE.to_string(),
         request_id: new_request_id(),
-        code: SERVER_ERROR_STATUS.to_string(),
     }
 }
 
@@ -955,7 +831,6 @@ pub fn missing_one_of_parameters(members: &[&str]) -> MissingParameterException 
             named.join(" or ")
         ),
         request_id: new_request_id(),
-        code: "400".to_string(),
     }
 }
 

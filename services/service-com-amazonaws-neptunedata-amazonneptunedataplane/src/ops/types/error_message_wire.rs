@@ -18,7 +18,10 @@
 //!
 //! `message` is not a field of its own: a refusal carries ONE text, so the serializer
 //! writes `detailedMessage`'s value under both names rather than letting two copies of one
-//! sentence drift apart.
+//! sentence drift apart. `code` is not a field either: the code a client branches on is the
+//! error CLASS, which is the exception shape's own name, so the serializer writes
+//! `shape_name()` there and no payload builder can state a status number or a different
+//! class in it.
 //!
 //! WHAT IS DELIBERATELY ABSENT, because the derive's own output would be inert here too:
 //! constraint traits (the validating walk runs on operation INPUTS, and an exception is
@@ -61,7 +64,11 @@ macro_rules! neptune_error_wire {
             /// `requestId`: the id of the request this refusal answers.
             pub const M_REQUEST_ID: ::aws_smithy_schema::Schema =
                 neptune_member_schema!($ns, $local, "requestId", 1);
-            /// `code`: "The HTTP status code returned with the exception."
+            /// `code`: the wire error code this refusal carries — the exception's own NAME,
+            /// which is what a client branches on. The on-disk model documents the member as
+            /// the HTTP status code, and the data plane answers the exception name there:
+            /// the status is already on the response's status line, so the member a client
+            /// reads for the error CLASS carries the class.
             pub const M_CODE: ::aws_smithy_schema::Schema =
                 neptune_member_schema!($ns, $local, "code", 2);
             /// `message`: the member the on-disk model omits and the data plane writes the
@@ -104,7 +111,10 @@ macro_rules! neptune_error_wire {
             ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
                 s.write_string(&Self::M_DETAILED_MESSAGE, self.detailed_message.as_str())?;
                 s.write_string(&Self::M_REQUEST_ID, self.request_id.as_str())?;
-                s.write_string(&Self::M_CODE, self.code.as_str())?;
+                // The exception's NAME, not the HTTP status: the code a client branches on
+                // is the error class, and it is the shape's own name wherever this
+                // serializer is used, so no payload builder can state a different one.
+                s.write_string(&Self::M_CODE, Self::shape_name())?;
                 // ONE text, written under both names: `message` is where a client reads
                 // the refusal, `detailedMessage` is where the model declares it.
                 s.write_string(&Self::M_MESSAGE, self.detailed_message.as_str())?;
@@ -124,15 +134,14 @@ macro_rules! neptune_error_wire {
 macro_rules! neptune_error_shape {
     ($ty:ident, $schema_static:ident, $shape:literal, $ns:literal, $local:literal $(,)?) => {
         #[doc = concat!(
-            "The modelled `", $local, "` refusal. Carries the three members the model \
-             declares — `detailedMessage`, `requestId` and `code` — and is written to the \
-             wire with `message` as well; see `types::error_message_wire`."
+            "The modelled `", $local, "` refusal. Carries the two members whose value is \
+             this refusal's own — `detailedMessage` and `requestId` — and is written to the \
+             wire with `message` and `code` as well; see `types::error_message_wire`."
         )]
         #[derive(Debug, Clone, Default)]
         pub struct $ty {
             pub detailed_message: String,
             pub request_id: String,
-            pub code: String,
         }
 
         neptune_error_wire!($ty, $schema_static, $shape, $ns, $local);

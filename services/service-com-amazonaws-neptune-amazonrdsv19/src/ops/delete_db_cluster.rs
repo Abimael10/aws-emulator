@@ -238,6 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.clusters.remove(&key) else {
             return Err(not_found().into());
         };
+        // The cluster is gone, so the shared directory must stop claiming an engine for it:
+        // the data plane reads it to report what the cluster it answers for was provisioned
+        // with (`st::graph_db_clusters`).
+        if let Some(directory) = st::graph_db_clusters(&*self.engine) {
+            directory.forget(&key);
+        }
         Ok(DeleteDBClusterOutput {
             db_cluster: Some(st::cluster_view(&record, st::STATUS_DELETING)),
         })

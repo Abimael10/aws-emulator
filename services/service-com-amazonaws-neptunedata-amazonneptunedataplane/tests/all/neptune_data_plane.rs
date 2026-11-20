@@ -9,8 +9,10 @@
 //! Two rules are under test:
 //!
 //! * `GetEngineStatus` reports the ONE engine record this service's state was created
-//!   with, so every member comes from that record and a value fixed at engine start
-//!   (`startTime`) is the same on every read.
+//!   with, with what the CLUSTER the Neptune control plane provisioned settles layered
+//!   over it — so every member comes from the record or from that cluster's recorded
+//!   configuration, and a value fixed at engine start (`startTime`) is the same on every
+//!   read;
 //! * the Gremlin query-status family computes every answer by looking the query up in
 //!   the registry: the list reports the queries that are accepted and not completed (the
 //!   queued ones only when the request asks for them), the status read reports the stored
@@ -29,8 +31,10 @@ use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use serde_json::Value;
+use service_com_amazonaws_neptunedata_amazonneptunedataplane::state;
 use service_com_amazonaws_neptunedata_amazonneptunedataplane::state::{
-    ComAmazonawsNeptunedataAmazonneptunedataplaneState, GremlinQueryRecord, QueryState,
+    ComAmazonawsNeptunedataAmazonneptunedataplaneState, GraphClusterConfiguration,
+    GremlinQueryRecord, QueryState,
 };
 use service_com_amazonaws_neptunedata_amazonneptunedataplane::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -49,6 +53,63 @@ const DFE_QUERY_ENGINE_DEFAULT: &str = "viaQueryHint";
 /// the `neptune_query_timeout` cluster parameter it reflects, in milliseconds.
 const CLUSTER_QUERY_TIMEOUT: (&str, &str) = ("clusterQueryTimeoutInMs", "120000");
 
+/// The keys the engine status reports under `settings` and `labMode`, with the value each
+/// carries for an engine no cluster has overridden: the cluster query timeout, the
+/// slow-query threshold and the strict-timeout switch, and the lab-mode parameters.
+/// Spelled out here rather than imported so a wrong key or value in `src/state/` fails this
+/// test.
+const REPORTED_SETTINGS: &[(&str, &str, &str)] = &[
+    ("settings", CLUSTER_QUERY_TIMEOUT.0, CLUSTER_QUERY_TIMEOUT.1),
+    ("settings", "SlowQueryLogsThreshold", "5000"),
+    ("settings", "StrictTimeoutValidation", "true"),
+    ("labMode", "ObjectIndex", "disabled"),
+    ("labMode", "ReadWriteConflictDetection", "enabled"),
+    ("labMode", "TableSpaceAutoExtendSizeInMB", "disabled"),
+];
+
+/// The features whose entry under `features` is a DOCUMENT of its own rather than the bare
+/// status string: the DFE result cache reports a record.
+const DOCUMENT_VALUED_FEATURES: [&str; 1] = ["ResultCache"];
+
+/// The features whose entry is the status STRING itself, each of which the engine status
+/// reports.
+const STATUS_VALUED_FEATURES: [&str; 5] = [
+    "AuditLog",
+    "IAMAuthentication",
+    "InlineServerGeneratedEdgeId",
+    "SlowQueryLogs",
+    "Streams",
+];
+
+/// The media type this data plane announces on every JSON response. Spelled out here rather
+/// than imported from the crate so a wrong value in `src/service.rs` fails this test.
+const ANNOUNCED_MEDIA_TYPE: &str = "application/json; charset=UTF-8";
+
+/// Whether `value` is an instant in the form the engine status states one in — the weekday,
+/// the month, the zero-padded day, the clock time, the zone and the year, as
+/// `EEE MMM dd HH:mm:ss UTC yyyy`.
+fn is_engine_status_instant(value: &str) -> bool {
+    const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let fields: Vec<&str> = value.split(' ').collect();
+    let [weekday, month, day, clock, zone, year] = fields.as_slice() else {
+        return false;
+    };
+    let digits = |field: &str, width: usize| {
+        field.len() == width && field.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let clock_fields: Vec<&str> = clock.split(':').collect();
+    WEEKDAYS.contains(weekday)
+        && MONTHS.contains(month)
+        && digits(day, 2)
+        && clock_fields.len() == 3
+        && clock_fields.iter().all(|field| digits(field, 2))
+        && *zone == "UTC"
+        && digits(year, 4)
+}
+
 /// One emulator: a router carrying only this service, over one shared engine. The engine
 /// is handed back so a test can seed the registry the way whatever admits a query would.
 struct Emulator {
@@ -64,9 +125,11 @@ fn emulator() -> Emulator {
     Emulator { router, engine }
 }
 
-/// What the emulator answered: the HTTP status and the JSON body.
+/// What the emulator answered: the HTTP status, the media type it announced and the JSON
+/// body.
 struct Answer {
     status: u16,
+    content_type: String,
     body: Value,
 }
 
@@ -93,6 +156,12 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     let bytes = response.into_body();
     let body = if bytes.is_empty() {
         Value::Null
@@ -104,7 +173,11 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
             )
         })
     };
-    Answer { status, body }
+    Answer {
+        status,
+        content_type,
+        body,
+    }
 }
 
 async fn engine_status(router: &MultiServiceRouter) -> Answer {
@@ -302,22 +375,26 @@ async fn engine_status_reports_the_one_stored_engine_record() {
         );
     }
 
-    // `labMode` and `settings` are string-valued maps; `settings` carries the cluster
-    // query timeout the member's own documentation names.
+    // `labMode` and `settings` are string-valued maps; each key below is one the engine
+    // status reports, and `settings` carries the cluster query timeout the member's own
+    // documentation names.
     assert!(
         first.body["labMode"].is_object(),
         "labMode: expected a map of lab-mode settings, got {:?}",
         first.body["labMode"]
     );
-    let (timeout_key, timeout_value) = CLUSTER_QUERY_TIMEOUT;
-    assert_eq!(
-        first.body["settings"][timeout_key].as_str(),
-        Some(timeout_value),
-        "settings.{timeout_key}: expected the cluster query timeout, got {:?}",
-        first.body["settings"]
-    );
+    for (map, key, value) in REPORTED_SETTINGS {
+        assert_eq!(
+            first.body[map][key].as_str(),
+            Some(*value),
+            "case {map}.{key}: expected {value:?}, got {:?}",
+            first.body[map]
+        );
+    }
 
-    // `features` is a DOCUMENT-valued map: each feature reports its own status object.
+    // `features` is a DOCUMENT-valued map, and the engine uses that freedom: a feature
+    // whose status is all it reports answers the status STRING, and one that reports more
+    // than a status answers a document of its own.
     let features = first.body["features"]
         .as_object()
         .unwrap_or_else(|| panic!("features: expected a map, got {:?}", first.body["features"]));
@@ -325,10 +402,28 @@ async fn engine_status_reports_the_one_stored_engine_record() {
         !features.is_empty(),
         "features: expected the engine's feature statuses, got an empty map"
     );
-    for (name, feature) in features {
+    for (name, reported) in &features.clone() {
+        let expected_document = DOCUMENT_VALUED_FEATURES.contains(&name.as_str());
+        let answered = if expected_document {
+            reported["status"].as_str()
+        } else {
+            reported.as_str()
+        };
         assert!(
-            feature["status"].is_string(),
-            "case {name}: expected a feature status document, got {feature:?}"
+            answered.is_some_and(|status| ["enabled", "disabled"].contains(&status)),
+            "case {name}: expected a {} status, got {reported:?}",
+            if expected_document {
+                "document carrying the feature's"
+            } else {
+                "bare"
+            }
+        );
+    }
+    for feature in STATUS_VALUED_FEATURES {
+        assert!(
+            features.contains_key(feature),
+            "case {feature}: the engine must report this feature, got {:?}",
+            first.body["features"]
         );
     }
 
@@ -344,14 +439,22 @@ async fn engine_status_reports_the_one_stored_engine_record() {
         );
     }
 
+    // Every response of this data plane announces the media type AND the encoding its body
+    // is written in.
+    assert_eq!(
+        first.content_type, ANNOUNCED_MEDIA_TYPE,
+        "content-type: expected the announced media type, got {:?}",
+        first.content_type
+    );
+
     // `startTime` is fixed when the engine record is created, so a later read answers
     // the same instant rather than a fresh clock reading.
     let start_time = first.body["startTime"].as_str().unwrap_or_default().to_string();
     assert!(
-        start_time.contains('T') && start_time.ends_with('Z'),
-        "startTime: expected a UTC timestamp, got {start_time:?}"
+        is_engine_status_instant(&start_time),
+        "startTime: expected the form the engine status states an instant in, got \
+         {start_time:?}"
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let second = engine_status(&router).await;
     assert_eq!(
         second.body["startTime"].as_str(),
@@ -364,6 +467,127 @@ async fn engine_status_reports_the_one_stored_engine_record() {
         second.body, first.body,
         "a second read of an unchanged engine record must answer identically"
     );
+}
+
+/// RULE: the engine status reports the engine version the CONTROL PLANE provisioned for the
+/// cluster this plane answers for, the query-language versions that engine line carries, and
+/// the status of every feature that cluster's own configuration settles.
+///
+/// The rows differ along what the rule generalises over: the engine line provisioned (two
+/// released lines and one past the catalog), and each feature switch a create settles. The
+/// cluster is recorded exactly as the Neptune control plane records one — the shared
+/// directory both services read — so the data plane answers a cluster it configured nothing
+/// about.
+#[tokio::test]
+async fn engine_status_reports_the_provisioned_cluster_configuration() {
+    // (case, engine version provisioned, IAM auth, audit log, slow-query log, the
+    //  dbEngineVersion and the Gremlin version it must report)
+    let rows: &[(&str, &str, bool, bool, bool, &str, &str)] = &[
+        (
+            "the 1.4 line with IAM authentication on",
+            "1.4.8.0",
+            true,
+            false,
+            false,
+            "1.4.8.0.R1",
+            "tinkerpop-3.7.1",
+        ),
+        (
+            "the 1.3 line with every switch off",
+            "1.3.2.1",
+            false,
+            false,
+            false,
+            "1.3.2.1.R1",
+            "tinkerpop-3.6.2",
+        ),
+        (
+            "the 1.3 line publishing both logs",
+            "1.3.0.0",
+            false,
+            true,
+            true,
+            "1.3.0.0.R1",
+            "tinkerpop-3.6.2",
+        ),
+        (
+            "a line past the catalog, with every switch on",
+            "1.9.0.0",
+            true,
+            true,
+            true,
+            "1.9.0.0.R1",
+            "tinkerpop-3.7.1",
+        ),
+    ];
+    for (case, engine_version, iam, audit, slow_query, expected_version, expected_gremlin) in rows {
+        let Emulator { router, engine } = emulator();
+        // Recorded the way the control plane records a cluster it has just created.
+        let directory = state::GraphDbClusters::of(&*engine)
+            .expect("the shared engine vends the cluster directory");
+        directory.provision(
+            "graph-under-test",
+            GraphClusterConfiguration {
+                engine_version: (*engine_version).to_string(),
+                iam_database_authentication_enabled: *iam,
+                audit_log_enabled: *audit,
+                slow_query_log_enabled: *slow_query,
+                provisioned_at: SystemTime::now(),
+            },
+        );
+
+        let answer = engine_status(&router).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: expected 200, got {} with body {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.body["dbEngineVersion"].as_str(),
+            Some(*expected_version),
+            "case {case}: expected the provisioned engine version, got {:?}",
+            answer.body["dbEngineVersion"]
+        );
+        assert_eq!(
+            answer.body["gremlin"]["version"].as_str(),
+            Some(*expected_gremlin),
+            "case {case}: expected the TinkerPop version that engine line carries, got {:?}",
+            answer.body["gremlin"]
+        );
+        for (feature, enabled) in [
+            ("IAMAuthentication", *iam),
+            ("AuditLog", *audit),
+            ("SlowQueryLogs", *slow_query),
+        ] {
+            let expected = if enabled { "enabled" } else { "disabled" };
+            assert_eq!(
+                answer.body["features"][feature].as_str(),
+                Some(expected),
+                "case {case}: expected features.{feature} {expected:?}, got {:?}",
+                answer.body["features"][feature]
+            );
+        }
+
+        // The cluster this plane answers for is the one provisioned most recently: a second
+        // cluster created after the first is the one a /status call is addressing.
+        directory.provision(
+            "graph-created-later",
+            GraphClusterConfiguration {
+                engine_version: "1.3.1.0".to_string(),
+                iam_database_authentication_enabled: false,
+                audit_log_enabled: false,
+                slow_query_log_enabled: false,
+                provisioned_at: SystemTime::now() + Duration::from_secs(60),
+            },
+        );
+        let later = engine_status(&router).await;
+        assert_eq!(
+            later.body["dbEngineVersion"].as_str(),
+            Some("1.3.1.0.R1"),
+            "case {case}: expected the cluster provisioned last, got {:?}",
+            later.body["dbEngineVersion"]
+        );
+    }
 }
 
 /// The rollback members are reported only while the engine record holds a rollback —
@@ -421,8 +645,9 @@ async fn engine_status_reports_a_rollback_only_while_one_is_in_progress() {
                 .as_str()
                 .unwrap_or_default();
             assert!(
-                started.contains('T') && started.ends_with('Z'),
-                "case {count}/{store_instant}: expected the earliest rollback start time, got {started:?}"
+                is_engine_status_instant(started),
+                "case {count}/{store_instant}: expected the earliest rollback start time in the \
+                 form the engine status states an instant in, got {started:?}"
             );
         } else {
             assert!(
@@ -641,9 +866,20 @@ async fn an_unknown_query_id_is_refused_by_both_the_status_read_and_the_cancel()
             );
             assert_eq!(
                 answer.body["code"].as_str(),
-                Some("400"),
-                "case {method} {id}: code carries the HTTP status, got {:?}",
+                Some("InvalidParameterException"),
+                "case {method} {id}: code carries the exception class, got {:?}",
                 answer.body["code"]
+            );
+            assert_eq!(
+                answer.body["message"].as_str(),
+                Some(detail),
+                "case {method} {id}: the refusal's text goes out under `message` too, got {:?}",
+                answer.body["message"]
+            );
+            assert_eq!(
+                answer.content_type, ANNOUNCED_MEDIA_TYPE,
+                "case {method} {id}: expected the announced media type, got {:?}",
+                answer.content_type
             );
             // Each error names its own request: the id is non-empty and no two responses
             // share one, which is the whole requirement on the member.

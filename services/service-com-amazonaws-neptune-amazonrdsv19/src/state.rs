@@ -37,7 +37,22 @@ pub const NEPTUNE_ENGINE: &str = "neptune";
 /// The engine version a cluster is created with when the request names none. The model
 /// declares no default, so the emulator picks one Neptune release and PERSISTS it; every
 /// later read reports the stored value.
-pub const DEFAULT_ENGINE_VERSION: &str = "1.3.2.1";
+///
+/// The release the shared `rds` front door publishes as this engine's DEFAULT version (the
+/// `neptune` row its engine-version catalog marks as the engine default), so a cluster
+/// created without an `EngineVersion` runs the same engine whichever of the two views of
+/// that door served the create — and a client that gates a feature on the engine line it
+/// reads back (the data plane's engine status reports this version) sees the line the
+/// service provisions today rather than a retired one.
+pub const DEFAULT_ENGINE_VERSION: &str = "1.4.8.0";
+
+/// The CloudWatch log a cluster publishes when `EnableCloudwatchLogsExports` names `audit`,
+/// which is the audit-log configuration this control plane holds for a cluster.
+pub const AUDIT_LOG_EXPORT: &str = "audit";
+
+/// The CloudWatch log a cluster publishes when `EnableCloudwatchLogsExports` names
+/// `slowquery`.
+pub const SLOW_QUERY_LOG_EXPORT: &str = "slowquery";
 
 /// Days of automated backups retained when the request names none.
 /// Source: `CreateDBClusterMessage$BackupRetentionPeriod` — "Default: 1".
@@ -343,6 +358,52 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsNeptuneAmazonrdsv19State>)
+}
+
+/// The directory of what each graph DB cluster this emulator provisioned RUNS is reached
+/// through the ONE handle the shared crate exposes
+/// ([`::service_common::graph_db_clusters::GraphDbClusters`]), in the SAME shared engine as
+/// this service's own store — so this service spells no engine downcast of its own.
+///
+/// The Neptune DATA plane is addressed at a cluster's own endpoint and configures nothing:
+/// its engine-status endpoint reports the engine version and the feature configuration the
+/// cluster was PROVISIONED with, and the only service that knows those is this one. The
+/// engine keys state by TYPE, so a copy inside [`ComAmazonawsNeptuneAmazonrdsv19State`]
+/// would be invisible to the data plane.
+///
+/// LOCK ORDER: a writer takes [`service_state`] first and this directory second, and nothing
+/// here holds this one while taking another store, so the order cannot invert.
+///
+/// Answer `None` by leaving the directory unwritten: the record is an aid to the data plane,
+/// never part of this operation's own answer.
+pub fn graph_db_clusters<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::service_common::graph_db_clusters::GraphDbClusters> {
+    ::service_common::graph_db_clusters::GraphDbClusters::of(engine)
+}
+
+/// What `record` was provisioned with, as the shared directory holds it — the engine version
+/// the cluster runs and the feature configuration its create settled.
+///
+/// The two log switches are read off `EnabledCloudwatchLogsExports`, which is the logging
+/// configuration this control plane persists for a cluster; a log the cluster does not
+/// publish is off.
+pub fn provisioned_cluster_configuration(
+    record: &DbClusterRecord,
+) -> ::service_common::graph_db_clusters::GraphClusterConfiguration {
+    let publishes = |log: &str| {
+        record
+            .enabled_cloudwatch_logs_exports
+            .iter()
+            .any(|export| export.eq_ignore_ascii_case(log))
+    };
+    ::service_common::graph_db_clusters::GraphClusterConfiguration {
+        engine_version: record.engine_version.clone(),
+        iam_database_authentication_enabled: record.iam_database_authentication_enabled,
+        audit_log_enabled: publishes(AUDIT_LOG_EXPORT),
+        slow_query_log_enabled: publishes(SLOW_QUERY_LOG_EXPORT),
+        provisioned_at: record.cluster_create_time,
+    }
 }
 
 // ---------------------------------------------------------------------------

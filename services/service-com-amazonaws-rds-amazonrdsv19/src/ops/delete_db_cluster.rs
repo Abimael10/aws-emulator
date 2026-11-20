@@ -601,6 +601,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
             directory.lock().forget(&resource_id);
         }
+        // The same for a GRAPH cluster's record in the directory its own data plane reads:
+        // the cluster is on its way out, so nothing may go on reporting an engine for it
+        // ([`crate::state::graph_db_clusters`]).
+        if let Some(directory) = crate::state::graph_db_clusters(&*self.engine) {
+            directory.forget(&identifier);
+        }
 
         (db_cluster, managed_secret, member_secrets)
         };

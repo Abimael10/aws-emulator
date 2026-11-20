@@ -1456,6 +1456,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let db_cluster = store.cluster_to_wire(&record);
                 let resource_id = record.resource_id.clone();
                 let engine = record.engine.clone();
+                // What a GRAPH cluster was provisioned with, for the directory its own data
+                // plane reads: that plane reports this cluster's engine version and feature
+                // configuration and settles neither
+                // ([`crate::state::provisioned_graph_cluster`]). `None` for every engine
+                // whose data plane is not a graph API served here.
+                let provisioned_graph =
+                    crate::state::provisioned_graph_cluster(&record).map(|configuration| {
+                        (record.identifier.clone(), configuration)
+                    });
                 let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
                     performance_insights_enabled: record.performance_insights_enabled,
                     database_insights_mode: Some(record.database_insights_mode.clone()),
@@ -1503,6 +1512,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &engine,
                     );
                     directory.record_monitoring(&resource_id, monitoring);
+                }
+                // The same hand-off for a graph cluster's own data plane, under the same
+                // lock order: the RDS store is held and the directory is taken second.
+                if let Some((identifier, configuration)) = provisioned_graph {
+                    if let Some(directory) = crate::state::graph_db_clusters(&*self.engine) {
+                        directory.provision(&identifier, configuration);
+                    }
                 }
                 Some(db_cluster)
             }

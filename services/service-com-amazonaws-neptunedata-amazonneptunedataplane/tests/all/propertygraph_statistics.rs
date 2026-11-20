@@ -189,8 +189,8 @@ async fn read(router: &MultiServiceRouter, case: &str) -> Answer {
 }
 
 /// Assert a read was refused as statistics-not-available: the status, the modelled error
-/// code, and the two members every Neptune error carries (`code` naming the HTTP status,
-/// `requestId` naming the response).
+/// code, and the two members every Neptune error carries (`code` naming the exception
+/// class, `requestId` naming the response).
 fn assert_not_available(case: &str, answer: &Answer) {
     assert_eq!(
         answer.status, 400,
@@ -205,8 +205,8 @@ fn assert_not_available(case: &str, answer: &Answer) {
     );
     assert_eq!(
         answer.body["code"].as_str(),
-        Some("400"),
-        "case {case}: the error must carry its HTTP status in `code`, got {:?}",
+        Some("StatisticsNotAvailableException"),
+        "case {case}: the error must carry its exception class in `code`, got {:?}",
         answer.body["code"]
     );
     assert!(

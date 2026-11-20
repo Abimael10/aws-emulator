@@ -21,6 +21,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `graph_db_clusters`: the shared directory the Neptune control plane records a provisioned
+# cluster's engine version and feature configuration in, which this data plane's engine
+# status reports on. `response_media_type`: the media type this service announces.
+service-common = { path = "../common" }
 # The lexer the Gremlin explain endpoint reads a submitted traversal with: its token
 # definitions live beside the recursive descent in `src/state/gremlin_plan.rs`.
 logos = "0.16"
@@ -45,6 +49,14 @@ opencypher = "0.1.4"
 # construction (no backtracking), and the program one pattern may compile to is capped
 # before it is built (`MAX_REGEX_PROGRAM_BYTES`).
 regex = "1"
+# `time`: the engine status states an instant in a calendar form carrying the weekday and
+# the month by name, which a real calendar library renders — no date arithmetic of this
+# crate's own. A LIBRARY that computes over data in process: formatting only, with
+# `default-features = false` so no parsing, no clock and no local-time-zone lookup is
+# compiled in; it opens no socket, reads no file and declares no FFI. Its one build-time
+# step is the `time-macros` proc macro the format description is written with, which runs
+# on the builder's machine like every other derive in this crate.
+time = { version = "0.3", default-features = false, features = ["std", "macros", "formatting"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

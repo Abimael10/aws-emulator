@@ -338,6 +338,10 @@ pub mod data_api_rows;
 // The address a resource publishes when its data plane is an AWS API this emulator serves
 // at its own endpoint (Amazon Neptune's graph API) rather than a native engine wire.
 mod api_plane_address;
+// What a graph DB cluster this front door provisioned runs, recorded where that cluster's
+// own data plane reads it.
+mod graph_cluster_directory;
+pub use graph_cluster_directory::*;
 // The Secrets Manager secret RDS manages for a resource's master user password: the
 // record a resource stores for it, and the minting a request that turns
 // `ManageMasterUserPassword` on depends on.

@@ -8,9 +8,11 @@
 //! * `initiateDatabaseReset` mints a fresh UUID token, stores it as the ONE token the
 //!   engine will accept, and returns it in `payload`.
 //! * `performDatabaseReset` empties the database, but only for a request presenting that
-//!   token: a missing `token` is refused with the modelled `MissingParameterException`
-//!   (HTTP 400), and any other value — a wrong token, a token already used, or any token
-//!   at all while no reset is outstanding — with `InvalidParameterException` (HTTP 400).
+//!   token: a missing `token` is refused with `BadRequestException` (HTTP 400) — the
+//!   command names an action the engine supports and carries nothing for it to act on, so
+//!   the refusal reports the member it found no value in (`token is null`) — and any other
+//!   value — a wrong token, a token already used, or any token at all while no reset is
+//!   outstanding — with `InvalidParameterException` (HTTP 400).
 //!   On a match the token is consumed, so one token empties the database once.
 //!
 //! The reset itself is what makes the second step more than bookkeeping: the data the
@@ -87,6 +89,10 @@
 //!
 //! * `AccessDeniedException` (HTTP 403) — Raised in case of an authentication or
 //!   authorization failure.
+//! * `BadRequestException` (HTTP 400) — Raised when a request is submitted that cannot be
+//!   processed. Widened in through `extra_errors` below: this SERVICE models the shape (it is
+//!   what the ML endpoints answer with) and this operation's error list does not name it,
+//!   while the data plane refuses a `performDatabaseReset` carrying no token with it.
 //! * `ClientTimeoutException` (HTTP 408) — Raised when a request timed out in the client.
 //! * `ConstraintViolationException` (HTTP 400) — Raised when a value in a request field did
 //!   not satisfy required constraints.
@@ -123,10 +129,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-neptunedata-amazonneptu
 // here — hence the `ExecuteFastResetError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.neptunedata#ExecuteFastReset")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.neptunedata#ExecuteFastReset",
+    extra_errors = ["BadRequestException"]
+)]
 #[derive(Debug)]
 pub enum ExecuteFastResetErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    BadRequestException(BadRequestException),
     ClientTimeoutException(ClientTimeoutException),
     ConstraintViolationException(ConstraintViolationException),
     IllegalArgumentException(IllegalArgumentException),
@@ -230,8 +240,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let supplied = input.token.as_deref().unwrap_or_default();
                 if supplied.trim().is_empty() {
                     record_access(ctx, &input.action, "missing-token");
-                    return Err(ExecuteFastResetErrorModeled::MissingParameterException(
-                        crate::state::missing_parameter(TOKEN_MEMBER),
+                    return Err(ExecuteFastResetErrorModeled::BadRequestException(
+                        crate::state::member_is_null(TOKEN_MEMBER),
                     )
                     .into());
                 }

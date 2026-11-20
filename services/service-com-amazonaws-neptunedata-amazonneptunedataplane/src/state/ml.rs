@@ -38,7 +38,6 @@ pub fn ml_resource_not_found() -> MLResourceNotFoundException {
     MLResourceNotFoundException {
         detailed_message: ML_RESOURCE_NOT_FOUND_MESSAGE.to_string(),
         request_id: super::new_request_id(),
-        code: "404".to_string(),
     }
 }
 
@@ -56,7 +55,6 @@ pub fn ml_endpoint_limit() -> ConstraintViolationException {
     ConstraintViolationException {
         detailed_message: format!("This engine holds at most {MAX_ML_ENDPOINTS} inference endpoints"),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -72,7 +70,6 @@ pub fn ml_job_not_completed(job_id: &str, status: &str) -> PreconditionsFailedEx
             ML_JOB_STATUS_COMPLETED
         ),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -86,7 +83,6 @@ pub fn ml_endpoint_exists(endpoint_id: &str) -> PreconditionsFailedException {
             super::echoed(endpoint_id)
         ),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 

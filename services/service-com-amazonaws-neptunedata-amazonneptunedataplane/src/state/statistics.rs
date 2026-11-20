@@ -62,7 +62,6 @@ pub fn statistics_not_available() -> StatisticsNotAvailableException {
     StatisticsNotAvailableException {
         detailed_message: STATISTICS_NOT_AVAILABLE_MESSAGE.to_string(),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -276,7 +275,6 @@ pub fn statistics_generation_interrupted(reason: &str) -> BadRequestException {
             super::echoed(reason)
         ),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 

@@ -399,7 +399,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let db_cluster = st::cluster_view(&record, &record.status);
-        state.clusters.insert(identifier, record);
+        // What the cluster was provisioned with, recorded where the Neptune DATA plane can
+        // read it: that plane is addressed at this cluster's endpoint and reports the engine
+        // version and feature configuration of the cluster it answers for, neither of which
+        // it configures itself (`st::graph_db_clusters`).
+        let provisioned = st::provisioned_cluster_configuration(&record);
+        state.clusters.insert(identifier.clone(), record);
+        if let Some(directory) = st::graph_db_clusters(&*self.engine) {
+            directory.provision(&identifier, provisioned);
+        }
         Ok(CreateDBClusterOutput {
             db_cluster: Some(db_cluster),
         })

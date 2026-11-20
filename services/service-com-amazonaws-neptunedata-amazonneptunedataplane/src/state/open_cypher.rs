@@ -1858,7 +1858,6 @@ pub fn malformed_open_cypher_query(reason: &str) -> MalformedQueryException {
     MalformedQueryException {
         detailed_message: reason.to_string(),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -1867,7 +1866,6 @@ pub fn open_cypher_query_too_large(reason: &str) -> QueryTooLargeException {
     QueryTooLargeException {
         detailed_message: format!("openCypher query is too large: {reason}"),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -1877,7 +1875,6 @@ pub fn open_cypher_query_limit(reason: &str) -> QueryLimitException {
     QueryLimitException {
         detailed_message: format!("openCypher query exceeds a system limit: {reason}"),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -1886,7 +1883,6 @@ pub fn open_cypher_time_limit(reason: &str) -> TimeLimitExceededException {
     TimeLimitExceededException {
         detailed_message: format!("openCypher query exceeded the time limit: {reason}"),
         request_id: super::new_request_id(),
-        code: "500".to_string(),
     }
 }
 
@@ -1896,7 +1892,6 @@ pub fn open_cypher_constraint(reason: &str) -> ConstraintViolationException {
     ConstraintViolationException {
         detailed_message: reason.to_string(),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -1905,7 +1900,6 @@ pub fn open_cypher_memory_limit(reason: &str) -> MemoryLimitExceededException {
     MemoryLimitExceededException {
         detailed_message: format!("openCypher query ran out of room: {reason}"),
         request_id: super::new_request_id(),
-        code: "500".to_string(),
     }
 }
 
@@ -1915,7 +1909,6 @@ pub fn invalid_open_cypher_parameters(reason: &str) -> InvalidParameterException
     InvalidParameterException {
         detailed_message: reason.to_string(),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -1924,7 +1917,6 @@ pub fn open_cypher_unsupported(clause: &str) -> UnsupportedOperationException {
     UnsupportedOperationException {
         detailed_message: format!("openCypher {clause} is not supported by this engine"),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -1934,6 +1926,5 @@ pub fn engine_failure(reason: &str) -> FailureByQueryException {
     FailureByQueryException {
         detailed_message: reason.to_string(),
         request_id: super::new_request_id(),
-        code: "500".to_string(),
     }
 }

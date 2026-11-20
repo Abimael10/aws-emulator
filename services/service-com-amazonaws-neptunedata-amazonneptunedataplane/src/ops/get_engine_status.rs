@@ -15,6 +15,13 @@
 //! built once, when that store is first created — so `startTime` is the instant this
 //! emulator's engine started and is the same on every read.
 //!
+//! What the CLUSTER this plane is addressed at was PROVISIONED with — the engine version it
+//! runs, and the features its create turned on — is not this engine's to choose: it is read
+//! through [`crate::state::provisioned_cluster`], out of the directory the Neptune control
+//! plane records a created cluster in, and layered over that record by
+//! [`crate::state::EngineStatusRecord::reported`]. With no cluster provisioned the engine
+//! reports its own defaults.
+//!
 //! ---
 //!
 //! # Modeled contract for `GetEngineStatus`
@@ -191,7 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A @readonly operation: the engine record is read, never written. Cloning it
         // under the lock keeps the rendering below off the critical section.
-        let record = state.lock().engine_status.clone();
+        let stored = state.lock().engine_status.clone();
+
+        // What the CLUSTER this plane is addressed at was provisioned with: its engine
+        // version, and the features a create turned on. The engine configures none of that
+        // — the control plane does — so it is read out of the shared directory and layered
+        // over the stored record, which is where every value this engine process owns stays.
+        let record = stored.reported(crate::state::provisioned_cluster(&*self.engine).as_ref());
 
         // "If there are transactions being rolled back, this field is set to the number
         // of such transactions. If there are none, the field doesn't appear at all" — the
@@ -203,20 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // because the companion instant is missing.
         let rolling_back = record.rolling_back_trx_count > 0;
 
-        // Each feature's status is a document, the way the engine reports a feature's
-        // status information rather than a bare string.
+        // Each feature's value is the document the engine reports for that feature: the
+        // status string itself for a feature whose status is all it reports, and a document
+        // of its own for one that reports more (see `crate::state::FeatureReport`).
         let features = record
             .features
-            .into_iter()
-            .map(|(name, status)| {
-                (
-                    name,
-                    ::aws_smithy_types::Document::Object(HashMap::from([(
-                        "status".to_string(),
-                        ::aws_smithy_types::Document::String(status),
-                    )])),
-                )
-            })
+            .iter()
+            .map(|(name, report)| (name.clone(), report.document()))
             .collect();
         let lab_mode = record.lab_mode.into_iter().collect();
         let settings = record.settings.into_iter().collect();

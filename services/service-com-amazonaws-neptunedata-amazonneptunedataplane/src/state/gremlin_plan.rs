@@ -52,7 +52,7 @@ const STEP_LABEL: &str = "as";
 /// a step to it, so a plan carries none of them.
 ///
 /// Source: the terminal methods of Apache TinkerPop's `Traversal` (the TinkerPop version
-/// this engine reports in its status, [`super::GREMLIN_LANGUAGE_VERSION`]).
+/// this engine reports in its status, [`super::gremlin_language_version`]).
 const TRAVERSAL_ACTIONS: &[&str] = &[
     "next",
     "tryNext",
@@ -259,7 +259,6 @@ pub fn malformed_gremlin_query(reason: &str) -> MalformedQueryException {
     MalformedQueryException {
         detailed_message: format!("Failed to interpret Gremlin query: {reason}"),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -268,7 +267,6 @@ pub fn gremlin_query_too_large(reason: &str) -> QueryTooLargeException {
     QueryTooLargeException {
         detailed_message: format!("Gremlin query is too large: {reason}"),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 
@@ -278,7 +276,6 @@ pub fn gremlin_query_too_complex(reason: &str) -> QueryLimitException {
     QueryLimitException {
         detailed_message: format!("Gremlin query exceeds a system limit: {reason}"),
         request_id: super::new_request_id(),
-        code: "400".to_string(),
     }
 }
 

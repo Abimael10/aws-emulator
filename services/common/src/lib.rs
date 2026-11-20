@@ -400,6 +400,11 @@ pub mod cloudwatch_logs;
 /// cannot disagree about a request they both refuse.
 pub mod connect_instance_registry;
 pub mod db_data_sources;
+/// What each GRAPH DB CLUSTER this emulator provisioned runs — its engine version and the
+/// feature configuration its create settled — written by the graph control plane that
+/// provisions a cluster and read by the graph DATA plane, which answers for a cluster it
+/// configures nothing about.
+pub mod graph_db_clusters;
 /// The ONE rendering of a DynamoDB STREAM RECORD as the envelope a consumer of that stream
 /// is handed one in, for every service that reads a table's stream and passes its records on
 /// — so two consumers of the same record are handed the same document.
