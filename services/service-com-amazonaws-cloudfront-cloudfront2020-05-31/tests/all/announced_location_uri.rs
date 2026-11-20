@@ -21,6 +21,11 @@
 //! was announced to, which is the whole point of the header: the resource the create just
 //! made answers there.
 //!
+//! The own-endpoint rows address ports this process HOLDS ([`addressed_hosts`]), because a
+//! distribution's edge is served on a loopback listener of its own and a request addressed to
+//! that listener's authority is viewer traffic to that distribution rather than a call of the
+//! control plane.
+//!
 //! The wire harness (the router, the request helpers and the element scanner) is the one
 //! [`crate::distribution_lifecycle`] already builds; the one addition is its request helper
 //! that takes the `Host` a request carries.
@@ -40,45 +45,88 @@ const SERVICE_HOST: &str = HOST;
 pub(crate) struct Addressed {
     pub(crate) case: &'static str,
     /// The `Host` the request carries.
-    pub(crate) host: &'static str,
+    pub(crate) host: String,
     /// The authority the announced URI must name.
-    pub(crate) authority: &'static str,
+    pub(crate) authority: String,
     /// Whether that authority is the emulator's OWN endpoint, which is the case where
     /// following the announced URI has to reach the resource over this same harness.
     pub(crate) own_endpoint: bool,
+}
+
+/// The hosts every create below is issued from, together with the loopback ports the
+/// own-endpoint rows address — HELD, for as long as this value lives.
+///
+/// Which plane a request belongs to is decided by its HOST, and a distribution's edge is served
+/// on a listener of its own whose address — a loopback `host:port` the operating system chose —
+/// is the `DomainName` that distribution publishes. So a loopback authority a row addresses as
+/// the emulator's own endpoint has to be one no listener of this engine can hold, or a create
+/// this suite issues becomes viewer traffic to a distribution it created earlier. A port THIS
+/// process has bound is such an authority: the operating system never hands a bound port to a
+/// second listener, so the reservation decides it rather than which ports the host running the
+/// suite happened to have free.
+///
+/// [`crate::own_endpoint_addressing`] is the suite that pins that reading.
+pub(crate) struct AddressedHosts {
+    /// The sockets holding the ports the own-endpoint rows address. Never read: they are held
+    /// because dropping one frees its port for the next listener this emulator opens.
+    _held: Vec<::std::net::TcpListener>,
+    /// The rows themselves, in the order they are driven.
+    pub(crate) rows: Vec<Addressed>,
+}
+
+/// One loopback port this process HOLDS, and the socket holding it.
+///
+/// Bound on the loopback interface, which is the interface every listener this emulator opens
+/// binds too, so the port is withheld from them.
+fn held_loopback_port() -> (::std::net::TcpListener, u16) {
+    let socket = ::std::net::TcpListener::bind((::std::net::Ipv4Addr::LOCALHOST, 0))
+        .expect("a loopback port to address the emulator's own endpoint on");
+    let port = socket
+        .local_addr()
+        .expect("the address the held socket is bound to")
+        .port();
+    (socket, port)
 }
 
 /// The hosts every create below is issued from.
 ///
 /// `pub(crate)` so the sibling suite that drives the RESOURCE creates over the same rule reads
 /// one spelling of this table rather than a copy of it.
-pub(crate) fn addressed_hosts() -> Vec<Addressed> {
-    vec![
-        Addressed {
-            case: "the emulator's own loopback endpoint",
-            host: "127.0.0.1:39461",
-            authority: "127.0.0.1:39461",
-            own_endpoint: true,
-        },
-        Addressed {
-            case: "the same endpoint by its loopback name on another port",
-            host: "localhost:9297",
-            authority: "localhost:9297",
-            own_endpoint: true,
-        },
-        Addressed {
-            case: "this service's own global host",
-            host: SERVICE_HOST,
-            authority: SERVICE_HOST,
-            own_endpoint: false,
-        },
-        Addressed {
-            case: "this service's host in a regional spelling",
-            host: "cloudfront.us-east-1.amazonaws.com",
-            authority: SERVICE_HOST,
-            own_endpoint: false,
-        },
-    ]
+pub(crate) fn addressed_hosts() -> AddressedHosts {
+    // Two ports of the emulator's own interface, each held by this process, so the rows below
+    // address the same endpoint by its literal address and by its loopback name, each "on a
+    // port of its own".
+    let (literal_socket, literal_port) = held_loopback_port();
+    let (named_socket, named_port) = held_loopback_port();
+    AddressedHosts {
+        _held: vec![literal_socket, named_socket],
+        rows: vec![
+            Addressed {
+                case: "the emulator's own loopback endpoint",
+                host: format!("127.0.0.1:{literal_port}"),
+                authority: format!("127.0.0.1:{literal_port}"),
+                own_endpoint: true,
+            },
+            Addressed {
+                case: "the same endpoint by its loopback name on another port",
+                host: format!("localhost:{named_port}"),
+                authority: format!("localhost:{named_port}"),
+                own_endpoint: true,
+            },
+            Addressed {
+                case: "this service's own global host",
+                host: SERVICE_HOST.to_string(),
+                authority: SERVICE_HOST.to_string(),
+                own_endpoint: false,
+            },
+            Addressed {
+                case: "this service's host in a regional spelling",
+                host: "cloudfront.us-east-1.amazonaws.com".to_string(),
+                authority: SERVICE_HOST.to_string(),
+                own_endpoint: false,
+            },
+        ],
+    }
 }
 
 /// One create that announces a `Location`, as a row issues it.
@@ -171,13 +219,17 @@ pub(crate) fn created_id(answer: &Answer, case: &str) -> String {
 #[tokio::test]
 async fn a_create_announces_the_endpoint_the_request_reached() {
     let router = emulator();
-    for (row, addressed) in addressed_hosts().into_iter().enumerate() {
+    // Held for the whole test: the ports the own-endpoint rows address stay this process's own,
+    // so no edge listener the creates below open can be given one of them.
+    let addressed_hosts = addressed_hosts();
+    for (row, addressed) in addressed_hosts.rows.iter().enumerate() {
         let Addressed {
             case: host_case,
             host,
             authority,
             own_endpoint,
         } = addressed;
+        let own_endpoint = *own_endpoint;
         // The distribution the nested create below nests its collection in, made over the
         // same host so one row is one client throughout.
         let host_distribution = create_distribution(

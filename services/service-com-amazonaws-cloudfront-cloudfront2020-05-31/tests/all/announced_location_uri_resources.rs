@@ -42,7 +42,7 @@
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::announced_location_uri::{
-    addressed_hosts, created_id, origin_access_identity_xml, Addressed,
+    addressed_hosts, created_id, origin_access_identity_xml, Addressed, AddressedHosts,
 };
 use crate::distribution_lifecycle::{call_from_host, emulator, Answer, API_VERSION};
 use crate::field_level_encryption_config_lifecycle::simple;
@@ -55,12 +55,12 @@ use crate::public_key_lifecycle::{pem, Key};
 /// (the emulator's own endpoint as a loopback literal and as a loopback name, each on a port of
 /// its own, against this service's global published host and its regional spelling), and beside
 /// them an own endpoint carrying NO port, which is the one form that table does not hold.
-fn rows() -> Vec<Addressed> {
+fn rows() -> AddressedHosts {
     let mut rows = addressed_hosts();
-    rows.push(Addressed {
+    rows.rows.push(Addressed {
         case: "the emulator's own endpoint carrying no port",
-        host: "127.0.0.1",
-        authority: "127.0.0.1",
+        host: "127.0.0.1".to_string(),
+        authority: "127.0.0.1".to_string(),
         own_endpoint: true,
     });
     rows
@@ -86,12 +86,7 @@ struct Case {
 }
 
 /// `POST /2020-05-31/{collection}` with `body`, addressed to `host`.
-async fn create(
-    router: &MultiServiceRouter,
-    host: &str,
-    collection: &str,
-    body: &str,
-) -> Answer {
+async fn create(router: &MultiServiceRouter, host: &str, collection: &str, body: &str) -> Answer {
     call_from_host(
         router,
         host,
@@ -163,7 +158,7 @@ fn origin_access_control_body(row: usize) -> String {
 /// configuration maps a query argument onto a profile — so each prerequisite is itself one of
 /// the creates under test rather than an identifier invented here.
 async fn creates(router: &MultiServiceRouter, row: usize, addressed: &Addressed) -> Vec<Case> {
-    let host = addressed.host;
+    let host = addressed.host.as_str();
     let named = |operation: &str| format!("{} / {operation}", addressed.case);
     let mut cases: Vec<Case> = Vec::new();
 
@@ -322,8 +317,11 @@ async fn creates(router: &MultiServiceRouter, row: usize, addressed: &Addressed)
 #[tokio::test]
 async fn every_resource_create_announces_the_endpoint_the_request_reached() {
     let router = emulator();
+    // Held for the whole test, as the sibling suite's table is: the ports the own-endpoint rows
+    // address stay this process's own, so no listener this emulator opens takes one.
+    let addressed_hosts = rows();
 
-    for (row, addressed) in rows().into_iter().enumerate() {
+    for (row, addressed) in addressed_hosts.rows.iter().enumerate() {
         for Case {
             case,
             collection,
@@ -331,7 +329,7 @@ async fn every_resource_create_announces_the_endpoint_the_request_reached() {
             readable,
             caller_input,
             answer,
-        } in creates(&router, row, &addressed).await
+        } in creates(&router, row, addressed).await
         {
             assert_eq!(
                 answer.status, 201,
@@ -369,7 +367,8 @@ async fn every_resource_create_announces_the_endpoint_the_request_reached() {
             // resource the create just made — on the very host it was announced to, which is
             // what makes the announced address usable rather than merely well formed.
             if readable {
-                let followed = call_from_host(&router, addressed.host, "GET", &path, None, &[]).await;
+                let followed =
+                    call_from_host(&router, &addressed.host, "GET", &path, None, &[]).await;
                 assert_eq!(
                     followed.status, 200,
                     "case {case}: following {location:?} must reach the resource, got {} with {}",
