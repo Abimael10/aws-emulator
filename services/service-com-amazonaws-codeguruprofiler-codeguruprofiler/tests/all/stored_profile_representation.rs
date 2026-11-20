@@ -26,7 +26,7 @@ use crate::frame_metric_data::{
 };
 use crate::interval_validation::create_group;
 use crate::profile_times::place_receipts;
-use crate::profiling_group_lifecycle::{Harness, element_of};
+use crate::profiling_group_lifecycle::{Harness, data_of, element_of, profile_data};
 
 /// The media types the model's `GetProfile$accept` doc names: "application/json —
 /// standard JSON format" and "application/x-amzn-ion — the Amazon Ion data format".
@@ -194,7 +194,7 @@ async fn group_holding(harness: &Harness, name: &str, case: &Case, at: i64) -> V
 
 /// `GetProfile` serves a stored profile in the representation its BYTES are a document
 /// in: `contentType` names that representation whatever media type the profile was
-/// announced under, the stored bytes answer a request that accepts it unbounded, and the
+/// announced under, the aggregated profile holds the stored document's data, and the
 /// request's `accept` chooses between the two representations either way.
 #[tokio::test]
 async fn the_representation_served_is_the_one_the_stored_bytes_are_a_document_in() {
@@ -223,9 +223,9 @@ async fn the_representation_served_is_the_one_the_stored_bytes_are_a_document_in
             answer.content_type
         );
         assert_eq!(
-            answer.body,
-            stored,
-            "case {label:?}: expected the stored bytes, got {:?}",
+            profile_data(&answer.body),
+            profile_data(&stored),
+            "case {label:?}: expected the stored data, got {:?}",
             String::from_utf8_lossy(&answer.body)
         );
 
@@ -255,9 +255,9 @@ async fn the_representation_served_is_the_one_the_stored_bytes_are_a_document_in
                 answer.content_type
             );
             let served = element_of(&answer.body);
-            let expected = expected_element(&profile());
             assert_eq!(
-                served, expected,
+                profile_data(&answer.body),
+                data_of(&expected_element(&profile())),
                 "case {label:?} accepting {asked}: expected the stored document, got {served}"
             );
         }
@@ -293,20 +293,22 @@ async fn the_representation_served_is_the_one_the_stored_bytes_are_a_document_in
                     answer.content_type
                 );
                 let served = element_of(&answer.body);
-                let expected = expected_element(&bounded_profile(max_depth));
+                let expected = data_of(&expected_element(&bounded_profile(max_depth)));
                 assert_eq!(
-                    served, expected,
+                    profile_data(&answer.body),
+                    expected,
                     "case {label:?} bounded to {max_depth} accepting {asked}: expected \
                      {expected}, got {served}"
                 );
             }
         }
 
-        // Serving the profile changed nothing: the stored bytes still answer the next
-        // plain read.
+        // Serving the profile changed nothing: the same aggregated profile answers the
+        // next plain read.
         let again = harness.get_profile(&name, "").await;
         assert_eq!(
-            again.body, stored,
+            profile_data(&again.body),
+            profile_data(&stored),
             "case {label:?}: a read must not change what the next caller is served"
         );
         assert_eq!(

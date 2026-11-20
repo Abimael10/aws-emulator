@@ -32,7 +32,7 @@
 
 use crate::interval_validation::create_group;
 use crate::profiling_group_lifecycle::{
-    Harness, servable_window, servable_window_from_start, servable_window_to_end,
+    Harness, profile_data, servable_window, servable_window_from_start, servable_window_to_end,
 };
 
 /// The group the rows run against, created through the API like any other.
@@ -457,9 +457,10 @@ async fn a_window_bound_without_a_companion_is_refused_whichever_bound_it_is() {
             String::from_utf8_lossy(&served.body)
         );
         assert_eq!(
-            served.body,
-            PROFILE.to_vec(),
-            "case {label:?} ({window}): that window must serve the posted profile, got {:?}",
+            profile_data(&served.body),
+            profile_data(PROFILE),
+            "case {label:?} ({window}): that window must serve the posted profile's data, \
+             got {:?}",
             String::from_utf8_lossy(&served.body)
         );
     }
@@ -550,9 +551,9 @@ async fn a_bound_without_a_companion_names_no_window_at_all() {
         String::from_utf8_lossy(&served.body)
     );
     assert_eq!(
-        served.body,
-        PROFILE.to_vec(),
-        "the stored profile must still read back byte for byte, got {:?}",
+        profile_data(&served.body),
+        profile_data(PROFILE),
+        "the stored profile's data must still read back, got {:?}",
         String::from_utf8_lossy(&served.body)
     );
 }

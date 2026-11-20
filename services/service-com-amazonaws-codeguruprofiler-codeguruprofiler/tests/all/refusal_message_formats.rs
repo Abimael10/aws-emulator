@@ -159,10 +159,11 @@ impl Harness {
         .await
     }
 
-    /// Post one agent profile to `name`, then re-stamp its receipt time to `at` (epoch
+    /// Post one agent profile to `name`, then re-stamp its receipt time and the period it
+    /// covers to `at` (epoch
     /// seconds): the clock cannot be asked for a past instant, so this is how a test
     /// places a retained profile outside the window a later read asks about. It writes
-    /// the same stored field `PostAgentProfile` writes and nothing else.
+    /// the same stored fields `PostAgentProfile` writes and nothing else.
     async fn post_profile_at(&self, name: &str, at: i64) {
         let posted = self
             .send(
@@ -190,6 +191,7 @@ impl Harness {
         let stamped = DateTime::from_secs(at);
         for profile in group.profiles.iter_mut() {
             profile.received_at = stamped;
+            profile.period_start = stamped;
         }
         group.latest_agent_profile_reported_at = Some(stamped);
     }
@@ -814,9 +816,11 @@ async fn a_group_that_does_hold_a_profile_in_the_range_is_still_served() {
         String::from_utf8_lossy(&profile.body)
     );
     assert_eq!(
-        profile.body,
-        b"{\"start\":1600000000000,\"profile\":\"payload\"}".to_vec(),
-        "the served profile must be the bytes posted, got {}",
+        crate::profiling_group_lifecycle::profile_data(&profile.body),
+        crate::profiling_group_lifecycle::profile_data(
+            b"{\"start\":1600000000000,\"profile\":\"payload\"}"
+        ),
+        "the served profile must hold the data posted, got {}",
         String::from_utf8_lossy(&profile.body)
     );
 }

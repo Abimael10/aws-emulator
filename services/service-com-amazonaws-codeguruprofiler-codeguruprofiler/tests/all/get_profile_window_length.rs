@@ -30,7 +30,7 @@
 //! harness, not a fork of it.
 
 use crate::interval_validation::{canonical, create_group};
-use crate::profiling_group_lifecycle::{Harness, servable_window};
+use crate::profiling_group_lifecycle::{Harness, profile_data, servable_window};
 
 /// The group the rows run against, created through the API like any other.
 const GROUP: &str = "get-profile-length";
@@ -453,9 +453,9 @@ async fn a_requested_range_longer_than_the_documented_maximum_is_refused_however
         String::from_utf8_lossy(&served.body)
     );
     assert_eq!(
-        served.body,
-        PROFILE.to_vec(),
-        "that window must serve the posted profile, got {:?}",
+        profile_data(&served.body),
+        profile_data(PROFILE),
+        "that window must serve the posted profile's data, got {:?}",
         String::from_utf8_lossy(&served.body)
     );
 }

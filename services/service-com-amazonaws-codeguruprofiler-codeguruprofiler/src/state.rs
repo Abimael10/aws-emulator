@@ -264,17 +264,17 @@ pub fn finest_aggregation_period_seconds() -> i64 {
 pub const AGGREGATION_PASS_MILLIS: i64 = 500;
 
 /// When the aggregated profile OF THE AGGREGATION PERIOD `period_seconds` LONG that
-/// covers a profile received at `received_at` becomes available: the end of that period's
-/// window containing the receipt, plus [`AGGREGATION_PASS_MILLIS`].
+/// covers the data starting at `data_start` becomes available: the end of that period's
+/// window containing that instant, plus [`AGGREGATION_PASS_MILLIS`].
 ///
 /// A window still open cannot have been aggregated — the service is still collecting
 /// profiles into it — so this is never earlier than the window's end, and the window is
 /// the one of the period being asked about: the aggregate of an hourly or daily window
-/// holding the receipt falls due when THAT window closes, however many finer windows
+/// holding the data falls due when THAT window closes, however many finer windows
 /// inside it have closed already. A period that is not positive names no window
-/// ([`aggregation_window_start`]), so the receipt's own instant stands in for the end.
-pub fn aggregated_at(received_at: DateTime, period_seconds: i64) -> DateTime {
-    let window_end = aggregation_window_start(received_at, period_seconds)
+/// ([`aggregation_window_start`]), so the instant itself stands in for the end.
+pub fn aggregated_at(data_start: DateTime, period_seconds: i64) -> DateTime {
+    let window_end = aggregation_window_start(data_start, period_seconds)
         .secs()
         .saturating_add(period_seconds.max(0));
     // The pass is stated in milliseconds, so it splits into the whole seconds to add and
@@ -816,21 +816,43 @@ fn render_policy_document(document: &PolicyDocumentWire<'_>) -> String {
 }
 
 /// One agent profile as `PostAgentProfile` uploaded it. The bytes are kept verbatim:
-/// the agent profile is an opaque payload (Amazon Ion or JSON) that `GetProfile`
-/// hands back byte-identical.
+/// the agent profile is an opaque payload (Amazon Ion or JSON), and what an aggregated
+/// profile states about the data in it is derived from the record below rather than
+/// copied out of the upload.
 #[derive(Debug, Clone)]
 pub struct AgentProfile {
     pub bytes: Vec<u8>,
     pub content_type: String,
+    /// When the service RECEIVED this upload — what
+    /// `profilingStatus.latestAgentProfileReportedAt` reports, and nothing else.
     pub received_at: DateTime,
+    /// The start of the PERIOD this profile's data covers: the instant whose aligned
+    /// window the data belongs to.
+    ///
+    /// An agent collects samples over a period and uploads the profile of that period
+    /// afterwards, so the window a profile is collected into is the one its DATA covers
+    /// and not the one the upload happened to arrive in: the aggregated profile of a
+    /// window "contains profiles posted by the agent starting at this time for an
+    /// aggregation period specified by the period property"
+    /// (`smithy_query(query="doc", shape="AggregatedProfileTime", member="start")`) —
+    /// the data's period, which is why every window this service derives for a profile
+    /// ([`ProfilingGroup::aggregated_profile_starts`],
+    /// [`ProfilingGroup::aggregated_profiles_in`],
+    /// [`ProfilingGroup::latest_aggregated_window`], [`AgentProfile::is_aggregated`])
+    /// is derived from this instant.
+    ///
+    /// It is the start the submitted document states for itself, and the receipt instant
+    /// for a profile whose document states no instant there — a document states its own
+    /// period, so a profile that says nothing about it is placed where it arrived.
+    pub period_start: DateTime,
 }
 
 impl AgentProfile {
     /// When this posted profile has been collected into the aggregated profile of the
     /// aggregation period `period_seconds` long — the instant [`aggregated_at`] places for
-    /// its receipt time in that period's window.
+    /// the window its data covers.
     pub fn aggregated_at(&self, period_seconds: i64) -> DateTime {
-        aggregated_at(self.received_at, period_seconds)
+        aggregated_at(self.period_start, period_seconds)
     }
 
     /// Whether, as of `at`, this posted profile is part of the aggregated profile of the
@@ -839,7 +861,9 @@ impl AgentProfile {
     /// The operations that report AGGREGATED profiles (`GetProfile`, `ListProfileTimes`)
     /// count a posted profile only once this holds: until then the group has received
     /// the profile — `profilingStatus.latestAgentProfileReportedAt` says so — and no
-    /// aggregated profile of that period covers it yet. The period is the one the caller
+    /// aggregated profile of that period covers it yet. A profile whose data covers a
+    /// window that has already closed is therefore servable as soon as the pass over
+    /// that window is through, whenever the upload itself arrived. The period is the one the caller
     /// is reporting about, so a window that is still open counts no profile it holds
     /// whatever finer windows inside it have closed; a reader of a FREE-FORM range, which
     /// names no aggregation period, asks about the finest window a profile is collected
@@ -1560,7 +1584,8 @@ impl ProfilingGroup {
     /// The `GetProfile` doc fixes the rule: "Amazon CodeGuru Profiler collects posted
     /// agent profiles for a profiling group into aggregated profiles", at periods
     /// "aligned to UTC". So each posted profile belongs to the one aligned window that
-    /// contains its receipt time, and every window holding at least one posted profile
+    /// contains the period its data covers ([`AgentProfile::period_start`]), and every
+    /// window holding at least one posted profile
     /// whose aggregation IN THAT WINDOW is due is exactly one available aggregated
     /// profile, reported by its window start. A window the service is still collecting
     /// into — one that has not closed, or whose aggregation pass is not through yet
@@ -1572,15 +1597,15 @@ impl ProfilingGroup {
             .profiles
             .iter()
             .filter(|profile| profile.is_aggregated(period_seconds, at))
-            .map(|profile| aggregation_window_start(profile.received_at, period_seconds).secs())
+            .map(|profile| aggregation_window_start(profile.period_start, period_seconds).secs())
             .collect();
         starts.sort_unstable();
         starts.dedup();
         starts.into_iter().map(DateTime::from_secs).collect()
     }
 
-    /// Every profile this group retains whose receipt time falls in the HALF-OPEN window
-    /// `[start, end)`, oldest first.
+    /// Every profile this group retains whose DATA falls in the HALF-OPEN window
+    /// `[start, end)` ([`AgentProfile::period_start`]), oldest first.
     ///
     /// Half-open at the end, like every other window this service steps a time axis with
     /// ([`aggregated_profile_starts`] reports one aggregated profile per aligned window),
@@ -1589,7 +1614,7 @@ impl ProfilingGroup {
     /// while a caller that has to tell "no data in this window" from "data not collected
     /// yet" needs to see both.
     ///
-    /// Instants are compared through [`instant_key`], so a receipt a fraction of a
+    /// Instants are compared through [`instant_key`], so data a fraction of a
     /// microsecond inside a bound still falls on the right side of it.
     ///
     /// [`aggregated_profile_starts`]: ProfilingGroup::aggregated_profile_starts
@@ -1598,7 +1623,7 @@ impl ProfilingGroup {
         self.profiles
             .iter()
             .filter(|profile| {
-                let at = instant_key(profile.received_at);
+                let at = instant_key(profile.period_start);
                 at >= lower && at < upper
             })
             .collect()
@@ -1617,9 +1642,10 @@ impl ProfilingGroup {
     }
 
     /// The span the AGGREGATED profiles this group retains inside `[start, end]` cover
-    /// as of `at`, as (earliest receipt time, latest receipt time), or `None` when it
+    /// as of `at`, as (earliest data start, latest data start), or `None` when it
     /// retains no such profile in that window. Both bounds are inclusive, and the answer
-    /// is derived from the stored receipt times and `at` alone — this is what
+    /// is derived from the periods the stored profiles cover
+    /// ([`AgentProfile::period_start`]) and `at` alone — this is what
     /// `GetRecommendations` reports as the span its analysis is about.
     ///
     /// A profile whose aggregation is not due yet ([`AgentProfile::is_aggregated`]) is in
@@ -1632,7 +1658,7 @@ impl ProfilingGroup {
     /// ([`finest_aggregation_period_seconds`]), the resolution the data of an arbitrary
     /// range is assembled from.
     ///
-    /// Instants are compared through [`instant_key`], so two receipt times a fraction of
+    /// Instants are compared through [`instant_key`], so two instants a fraction of
     /// a microsecond apart still order exactly.
     pub fn profile_span_in(
         &self,
@@ -1644,20 +1670,20 @@ impl ProfilingGroup {
         let period_seconds = finest_aggregation_period_seconds();
         let mut span: Option<(DateTime, DateTime)> = None;
         for profile in &self.profiles {
-            let received = instant_key(profile.received_at);
-            if received < lower || received > upper || !profile.is_aggregated(period_seconds, at) {
+            let covered = instant_key(profile.period_start);
+            if covered < lower || covered > upper || !profile.is_aggregated(period_seconds, at) {
                 continue;
             }
             span = Some(match span {
-                None => (profile.received_at, profile.received_at),
+                None => (profile.period_start, profile.period_start),
                 Some((earliest, latest)) => (
-                    if received < instant_key(earliest) {
-                        profile.received_at
+                    if covered < instant_key(earliest) {
+                        profile.period_start
                     } else {
                         earliest
                     },
-                    if received > instant_key(latest) {
-                        profile.received_at
+                    if covered > instant_key(latest) {
+                        profile.period_start
                     } else {
                         latest
                     },
@@ -1714,7 +1740,7 @@ impl ProfilingGroup {
         self.ordered_findings_reports(|report| !daily_only || report.is_daily())
     }
 
-    /// EVERY AGGREGATED profile whose receipt time falls in `[start, end]` (either bound
+    /// EVERY AGGREGATED profile whose DATA falls in `[start, end]` (either bound
     /// absent means unbounded) as of `at`, oldest first.
     ///
     /// All of them, because the aggregated profile of a range is what the profiles of
@@ -1737,7 +1763,7 @@ impl ProfilingGroup {
     /// [`ProfilingGroup::aggregated_profile_starts`], which is asked about one period's
     /// own windows and gates each by that period.
     ///
-    /// Both inclusive-bound tests go through [`instant_key`], so a receipt time a
+    /// Both inclusive-bound tests go through [`instant_key`], so data a
     /// fraction of a microsecond outside the requested window is excluded rather than
     /// comparing equal to the bound.
     pub fn aggregated_profiles_in(
@@ -1751,45 +1777,50 @@ impl ProfilingGroup {
         self.profiles
             .iter()
             .filter(|profile| {
-                let received = instant_key(profile.received_at);
+                let covered = instant_key(profile.period_start);
                 profile.is_aggregated(period_seconds, at)
-                    && lower.is_none_or(|s| received >= s)
-                    && upper.is_none_or(|e| received <= e)
+                    && lower.is_none_or(|s| covered >= s)
+                    && upper.is_none_or(|e| covered <= e)
             })
             .collect()
     }
 
-    /// The AGGREGATED profiles this group's LATEST aggregated profile of a `span`-long
-    /// aggregation period holds as of `at`, oldest first: every aggregated profile of the
-    /// last `span`-long window aligned to UTC that the group has anything aggregated in.
-    /// Empty when it holds no aggregated profile at all.
+    /// This group's LATEST aggregated profile of a `span`-long aggregation period as of
+    /// `at`, as (the start of the aligned window it covers, the profiles that window
+    /// holds, oldest first) — or `None` when the group holds no aggregated profile at
+    /// all.
     ///
     /// This is what a request that names a window's LENGTH and neither of its bounds asks
     /// for: a length says how long the aggregated profile wanted is, not where it sits, and
     /// the `GetProfile` doc fixes which one is then served — "If you specify only period,
     /// the latest aggregated profile is returned." A posted profile belongs to the one
-    /// window of that length containing its receipt ([`aligned_window_start`] — the same
+    /// window of that length containing the period its data covers
+    /// ([`aligned_window_start`] over [`AgentProfile::period_start`] — the same
     /// alignment [`ProfilingGroup::aggregated_profile_starts`] reports a profile time by),
     /// so the latest aggregated profile is the one of the LAST such window, and not the
-    /// profiles of every window the group retains.
+    /// profiles of every window the group retains. The window start is answered beside
+    /// them because an aggregated profile states the window it covers, which is that
+    /// window and not the data of any one profile in it.
     ///
     /// Windows are compared through [`instant_key`], exactly, so two windows a fraction of
     /// a microsecond apart — which a sub-second length can name — still order by window.
-    pub fn latest_aggregated_profiles(
+    pub fn latest_aggregated_window(
         &self,
         span: Duration,
         at: DateTime,
-    ) -> Vec<&AgentProfile> {
+    ) -> Option<(DateTime, Vec<&AgentProfile>)> {
         let aggregated = self.aggregated_profiles_in(None, None, at);
-        let window =
-            |profile: &AgentProfile| instant_key(aligned_window_start(profile.received_at, span));
-        let Some(latest) = aggregated.iter().map(|profile| window(profile)).max() else {
-            return Vec::new();
-        };
-        aggregated
+        let window = |profile: &AgentProfile| aligned_window_start(profile.period_start, span);
+        let latest = aggregated
+            .iter()
+            .map(|profile| instant_key(window(profile)))
+            .max()?;
+        let held: Vec<&AgentProfile> = aggregated
             .into_iter()
-            .filter(|profile| window(profile) == latest)
-            .collect()
+            .filter(|profile| instant_key(window(profile)) == latest)
+            .collect();
+        let start = held.first().map(|profile| window(profile))?;
+        Some((start, held))
     }
 }
 
@@ -2587,6 +2618,28 @@ pub fn iso8601(at: DateTime) -> String {
     }
 }
 
+/// One instant from the epoch MILLISECONDS `millis`, or `None` when that number names no
+/// instant this service can hold.
+///
+/// The `start` an agent profile document states for the period it covers is a number of
+/// milliseconds since the epoch — which is how a submitted profile states its own period,
+/// as opposed to the ISO 8601 `date-time` form the modelled timestamp MEMBERS of this
+/// service carry ([`iso8601`]) — so the one reading of such a number lives here.
+///
+/// The number is read as the document states it, so a fraction of a millisecond is kept
+/// as part of the instant: it is the epoch shifted by that many nanoseconds, through the
+/// one piece of instant arithmetic this module has ([`shifted`]), which floors towards the
+/// past on both sides of the epoch — so a negative number names the instant before it. A
+/// number no instant can be shifted by names none.
+pub fn instant_from_epoch_millis(millis: f64) -> Option<DateTime> {
+    const NANOS_PER_MILLISECOND: f64 = 1_000_000.0;
+    let nanos = (millis * NANOS_PER_MILLISECOND).round();
+    if !nanos.is_finite() || nanos < i128::MIN as f64 || nanos > i128::MAX as f64 {
+        return None;
+    }
+    Some(shifted(DateTime::from_secs(0), nanos as i128))
+}
+
 /// This service's INTERVAL rule, in one place for every operation that takes a time
 /// range: a pair of bounds names an interval only when its start is STRICTLY before its
 /// end, so a reversed pair and a zero-width pair are both refused — before any lookup,
@@ -2786,15 +2839,35 @@ pub fn profiling_group_arn(region: &str, name: &str) -> String {
 /// the group — a different sentence from the one every other operation states
 /// ([`group_not_found_message`]).
 ///
-/// The agent plane is `ConfigureAgent` and `PostAgentProfile` — the two operations the
-/// model's own `ActionGroup` enum names as the agent APIs ("Permission group type for Agent
-/// APIs - ConfigureAgent, PostAgentProfile",
-/// `smithy_query(query="shape", shape="com.amazonaws.codeguruprofiler#ActionGroup")`). The
+/// This is `ConfigureAgent`'s sentence. The agent plane is `ConfigureAgent` and
+/// `PostAgentProfile` — the two operations the model's own `ActionGroup` enum names as the
+/// agent APIs ("Permission group type for Agent APIs - ConfigureAgent, PostAgentProfile",
+/// `smithy_query(query="shape", shape="com.amazonaws.codeguruprofiler#ActionGroup")`) —
+/// but a refusal's wording belongs to the operation that answers it, and
+/// `PostAgentProfile`'s own is recorded, so it states that instead
+/// ([`posted_profile_group_not_found_message`]). The
 /// account is the emulator's canonical one, the same account every ARN this service mints
 /// carries.
 pub fn agent_group_not_found_message(name: &str) -> String {
     format!(
         "Profiling group for {}/{name} does not exist!",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How `PostAgentProfile` says that the profiling group a submission names does not
+/// exist: it states the lookup it performed — the account the group was looked for in and
+/// the `profilingGroupName` it was looked up by — in a sentence of its own.
+///
+/// A refusal's wording belongs to the OPERATION that answers it, so an operation whose
+/// own text is recorded states that text and not another operation's: this is
+/// `PostAgentProfile`'s, while `ConfigureAgent` — the other agent-plane operation — keeps
+/// its own ([`agent_group_not_found_message`]). The account is the emulator's canonical
+/// one, the same account every ARN this service mints carries, and the group name is the
+/// request's; nothing else of the request is interpolated.
+pub fn posted_profile_group_not_found_message(name: &str) -> String {
+    format!(
+        "No profiling group found in account {} with name {name}.",
         ::engine::emulator_account_id()
     )
 }

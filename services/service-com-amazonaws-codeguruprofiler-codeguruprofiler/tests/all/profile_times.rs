@@ -111,9 +111,11 @@ async fn list_profile_times(harness: &Harness, name: &str, query: &str) -> Answe
 
 /// Place the group's stored profiles at `receipts` (epoch seconds), oldest first.
 ///
-/// Posting over HTTP stamps each profile with the clock, so a case that needs profiles
-/// spread over hours and days — which is what an aggregation period is about — sets
-/// their receipt times in the store afterwards. This writes the same fields
+/// Posting over HTTP stamps each profile with the clock and with the period its own
+/// document states, so a case that needs profiles spread over hours and days — which is
+/// what an aggregation period is about — places both afterwards: the receipt and the
+/// period the data covers, which is the window the service collects the profile into.
+/// This writes the same fields
 /// `PostAgentProfile` wrote, through the harness's one shared engine, and nothing else.
 /// `pub(crate)` so every suite that needs a profile at a chosen instant places it one
 /// way.
@@ -145,7 +147,9 @@ pub(crate) fn place_receipts_at(harness: &Harness, name: &str, receipts: &[(i64,
         receipts.len()
     );
     for (profile, (secs, nanos)) in group.profiles.iter_mut().zip(receipts) {
-        profile.received_at = DateTime::from_secs_and_nanos(*secs, *nanos);
+        let at = DateTime::from_secs_and_nanos(*secs, *nanos);
+        profile.received_at = at;
+        profile.period_start = at;
     }
     group.latest_agent_profile_reported_at = receipts
         .iter()
@@ -184,6 +188,7 @@ pub(crate) fn place_profile(
             bytes,
             content_type: content_type.to_string(),
             received_at,
+            period_start: received_at,
         },
     );
     group.latest_agent_profile_reported_at = Some(received_at);
@@ -587,26 +592,21 @@ async fn a_reported_profile_time_names_a_window_get_profile_can_serve() {
     );
 
     for start in times {
-        // Every profile whose receipt falls in this window is in the window's ONE
+        // Every profile whose data falls in this window is in the window's ONE
         // aggregated profile, so what `GetProfile` serves for it holds all of them: these
-        // payloads state one start and one name each, so the combination states the
-        // earliest start of them and the name the most recently posted one states.
+        // payloads state one name each, so the combination states the name the most
+        // recently posted one states — beside the window the aggregation covers and the
+        // number of agents that reported into it.
         let in_window: Vec<usize> = receipts
             .iter()
             .enumerate()
             .filter(|(_, at)| **at >= start && **at < start + 300)
             .map(|(index, _)| index)
             .collect();
-        let first = *in_window
-            .first()
-            .unwrap_or_else(|| panic!("window {start} was reported with no profile in it"));
         let last = *in_window
             .last()
             .unwrap_or_else(|| panic!("window {start} was reported with no profile in it"));
-        let expected = serde_json::json!({
-            "start": 1_000 + first,
-            "profile": format!("{name}-{last}"),
-        });
+        let expected = serde_json::json!({ "profile": format!("{name}-{last}") });
         let answer = harness
             .get_profile(name, &format!("?startTime={}&period=PT5M", iso(start)))
             .await;
@@ -623,9 +623,31 @@ async fn a_reported_profile_time_names_a_window_get_profile_can_serve() {
                 String::from_utf8_lossy(&answer.body)
             )
         });
+        let data = crate::profiling_group_lifecycle::profile_data(&answer.body);
         assert_eq!(
-            served, expected,
+            data,
+            crate::profiling_group_lifecycle::profile_data(
+                &serde_json::to_vec(&expected).expect("a serializable document")
+            ),
             "window {start}: expected the profiles posted in that window combined, got {served}"
+        );
+        let case = format!("window {start}");
+        let (window_start, window_end, agents) =
+            crate::profiling_group_lifecycle::aggregation_of(&case, &answer.body);
+        assert_eq!(
+            (window_start.as_str(), window_end.as_str()),
+            (
+                crate::profiling_group_lifecycle::iso_millis(start).as_str(),
+                crate::profiling_group_lifecycle::iso_millis(start + 300).as_str()
+            ),
+            "window {start}: the aggregated profile must state the window it covers, got \
+             {served}"
+        );
+        assert_eq!(
+            agents,
+            i64::try_from(in_window.len()).unwrap_or(0),
+            "window {start}: expected the window's {} submissions to be reported, got {served}",
+            in_window.len()
         );
     }
 }

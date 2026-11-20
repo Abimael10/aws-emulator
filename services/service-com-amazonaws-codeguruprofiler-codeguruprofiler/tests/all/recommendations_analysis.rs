@@ -194,9 +194,10 @@ impl Harness {
         .await
     }
 
-    /// Re-stamp, oldest first, the receipt times of the profiles one group retains. The
+    /// Re-stamp, oldest first, the receipt times of the profiles one group retains — and
+    /// the period each covers, which is the window the service collects it into. The
     /// clock cannot be asked for a past instant, so this is how a test places retained
-    /// profiles at chosen instants; it writes the same stored field `PostAgentProfile`
+    /// profiles at chosen instants; it writes the same stored fields `PostAgentProfile`
     /// writes and nothing else.
     fn stamp_receipt_times(&self, name: &str, at: &[i64]) {
         let state = self
@@ -214,6 +215,7 @@ impl Harness {
         );
         for (profile, secs) in group.profiles.iter_mut().zip(at) {
             profile.received_at = DateTime::from_secs(*secs);
+            profile.period_start = DateTime::from_secs(*secs);
         }
         group.latest_agent_profile_reported_at = at.iter().copied().max().map(DateTime::from_secs);
     }

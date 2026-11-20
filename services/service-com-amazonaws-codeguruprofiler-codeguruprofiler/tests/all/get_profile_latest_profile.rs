@@ -39,7 +39,9 @@
 
 use crate::interval_validation::create_group;
 use crate::profile_times::place_receipts_at;
-use crate::profiling_group_lifecycle::{Harness, element_of};
+use crate::profiling_group_lifecycle::{
+    Harness, aggregation_of, data_of, element_of, profile_data,
+};
 
 /// The media type every profile here is posted and served in, one of the two the model's
 /// `GetProfile$accept` doc names.
@@ -185,11 +187,11 @@ fn posted_bytes(index: usize) -> Vec<u8> {
     serde_json::to_vec(&document(index)).expect("a serializable document")
 }
 
-/// The aggregated profile the profiles `indices` were collected into: every frame of each,
-/// in posting order, under the EARLIEST start they state (the combination covers the
-/// periods of all of them).
+/// The profiling DATA the aggregated profile of the profiles `indices` holds: every frame
+/// of each, in posting order. What the document states about the aggregation itself (the
+/// window it covers, the agents that reported into it) is derived by the service, so it is
+/// asserted on its own rather than restated here.
 fn expected_document(indices: &[usize]) -> serde_json::Value {
-    let earliest = indices.iter().copied().min().unwrap_or(0);
     let mut callgraph = serde_json::Map::new();
     for index in indices {
         let counted = i64::try_from(*index).unwrap_or(0);
@@ -198,10 +200,7 @@ fn expected_document(indices: &[usize]) -> serde_json::Value {
             serde_json::json!({ "RUNNABLE": counted + 1 }),
         );
     }
-    serde_json::json!({
-        "start": PROFILE_START_MILLIS + i64::try_from(earliest).unwrap_or(0),
-        "callgraph": serde_json::Value::Object(callgraph),
-    })
+    serde_json::json!({ "callgraph": serde_json::Value::Object(callgraph) })
 }
 
 /// `millis` from [`DAY_START_MILLIS`] as the (epoch seconds, sub-second nanoseconds) pair a
@@ -266,21 +265,19 @@ async fn a_length_alone_serves_the_latest_aggregated_profile_of_that_length() {
                 .expect("a serializable document"),
         );
         assert_eq!(
-            served, expected,
+            profile_data(&answer.body),
+            data_of(&expected),
             "case {case}: expected the profiles {:?} of the latest window, got {served}",
             row.expected
         );
-
-        // A window holding ONE profile is that profile, so its stored bytes are served as
-        // they were uploaded.
-        if let [only] = row.expected[..] {
-            assert_eq!(
-                answer.body,
-                posted_bytes(only),
-                "case {case}: expected profile {only}'s stored bytes, got {:?}",
-                String::from_utf8_lossy(&answer.body)
-            );
-        }
+        let (_, _, reported_agents) = aggregation_of(&case, &answer.body);
+        assert_eq!(
+            reported_agents,
+            i64::try_from(row.expected.len()).unwrap_or(0),
+            "case {case}: expected the latest window's {} submissions to be reported, got \
+             {served}",
+            row.expected.len()
+        );
 
         // No frame of a window the request did not ask about is in the answer — the
         // consequence the combination of every window would show.
@@ -336,7 +333,8 @@ async fn the_length_named_decides_which_aggregated_profile_is_served() {
             &serde_json::to_vec(&expected_document(expected)).expect("a serializable document"),
         );
         assert_eq!(
-            served, wanted,
+            profile_data(&answer.body),
+            data_of(&wanted),
             "case {case}: expected the profiles {expected:?}, got {served}"
         );
 

@@ -27,7 +27,9 @@ use aws_smithy_types::DateTime;
 use aws_smithy_types::date_time::Format;
 
 use crate::profile_times::place_receipts;
-use crate::profiling_group_lifecycle::{Answer, Harness, json_profile, servable_window};
+use crate::profiling_group_lifecycle::{
+    Answer, Harness, json_profile, pending_profile_start_millis, servable_window,
+};
 
 /// The fixed text a 404 about absent profile DATA carries
 /// (`state::NO_PROFILES_IN_TIME_RANGE`), restated here so this suite pins the wire text
@@ -342,7 +344,7 @@ async fn a_pending_profile_is_reported_by_no_profile_read_and_an_aggregated_one_
                 name,
                 "application/json",
                 None,
-                json_profile(1_600_000_000_000, 0)
+                json_profile(pending_profile_start_millis(), 0)
             )
             .await
             .status,

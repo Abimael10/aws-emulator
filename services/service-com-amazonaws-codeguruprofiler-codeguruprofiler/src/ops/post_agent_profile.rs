@@ -2,7 +2,9 @@
 
 //! @op PostAgentProfile
 //! Stores an agent profile against its profiling group — the bytes verbatim, the
-//! `Content-Type` it was posted under, and the receipt time — and records
+//! `Content-Type` it was posted under, the receipt time and the start of the period the
+//! submitted document states it covers, which is the window the service collects the
+//! profile into — and records
 //! `profilingStatus.latestAgentProfileReportedAt`. Idempotent on `profileToken`.
 //! The submitted data is PARSED first: data that is not a profile is refused with the
 //! operation's modelled `ValidationException` and stored nowhere.
@@ -140,7 +142,7 @@ fn ion_type_name(ion_type: IonType) -> &'static str {
     }
 }
 
-/// Why `bytes` are not an agent profile, or `None` when they are one.
+/// Why `bytes` are not an agent profile, or the DOCUMENT they are one as.
 ///
 /// The data is read as a document and judged on that document, NOT on the media type it
 /// was announced under: the `Content-Type` says how to read the bytes, it cannot make
@@ -149,12 +151,16 @@ fn ion_type_name(ion_type: IonType) -> &'static str {
 /// A SCALAR root is named first, from the Ion reading of the bytes: Ion's text encoding
 /// is a superset of JSON, so one reading names the root of profiling data in either
 /// representation, and a scalar is never a profile whatever else the bytes hold.
-fn not_a_profile(bytes: &[u8]) -> Option<NotAProfile> {
+///
+/// The document itself is answered rather than dropped: what the submission states about
+/// the period it covers is read off the SAME reading that decided it is a profile
+/// ([`period_start`]), so the data is parsed once.
+fn submitted_profile(bytes: &[u8]) -> Result<Element, NotAProfile> {
     if let Some(ion_type) = scalar_root_type(bytes) {
-        return Some(NotAProfile::Root(ion_type_name(ion_type)));
+        return Err(NotAProfile::Root(ion_type_name(ion_type)));
     }
     let Some(document) = super::get_profile::submitted_document(bytes) else {
-        return Some(NotAProfile::Unreadable);
+        return Err(NotAProfile::Unreadable);
     };
     // A null struct is a struct that carries no member at all, so it reaches the same
     // refusal as an empty one rather than being reported as a root of another type.
@@ -163,9 +169,36 @@ fn not_a_profile(bytes: &[u8]) -> Option<NotAProfile> {
             if fields
                 .fields()
                 .any(|(name, _)| name.text() == Some(PROFILE_START_MEMBER)));
-        return (!has_start).then_some(NotAProfile::NoStart);
+        if has_start {
+            return Ok(document);
+        }
+        return Err(NotAProfile::NoStart);
     }
-    Some(NotAProfile::Root(ion_type_name(document.ion_type())))
+    Err(NotAProfile::Root(ion_type_name(document.ion_type())))
+}
+
+/// The start of the period `document` states it covers, or `None` when the member states
+/// no instant.
+///
+/// A submitted profile states its own period as a number of epoch MILLISECONDS — the form
+/// an agent document carries its bounds in — so the member is read as that number and
+/// turned into an instant by the one reader of that form
+/// ([`crate::state::instant_from_epoch_millis`]). The number is read out of the same
+/// values every other number in a profile document is read out of
+/// ([`super::get_profile::document_number`]).
+///
+/// A `start` that states something else than a number (a string, a container) states no
+/// instant: the submission is still a profile — the member is there — and the store places
+/// its data where the upload arrived instead
+/// ([`crate::state::AgentProfile::period_start`]).
+fn period_start(document: &Element) -> Option<::aws_smithy_types::DateTime> {
+    let IonValue::Struct(fields) = document.value() else {
+        return None;
+    };
+    let (_, stated) = fields
+        .fields()
+        .find(|(name, _)| name.text() == Some(PROFILE_START_MEMBER))?;
+    crate::state::instant_from_epoch_millis(super::get_profile::document_number(stated)?)
 }
 
 /// The Ion type of the first value in `bytes` when that value is a SCALAR, and `None`
@@ -301,9 +334,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !guard.groups.contains_key(&input.profiling_group_name) {
                 return Err(PostAgentProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        // The agent plane words a missing group its own way:
-                        // account-qualified, unlike every other operation's text.
-                        message: crate::state::agent_group_not_found_message(
+                        // This operation's own sentence for a group it cannot resolve:
+                        // the lookup it performed, see
+                        // `crate::state::posted_profile_group_not_found_message`.
+                        message: crate::state::posted_profile_group_not_found_message(
                             &input.profiling_group_name,
                         ),
                     },
@@ -315,7 +349,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Submitted profiling data is PARSED before anything is stored, so data that is
         // not an agent profile is refused and leaves the group exactly as it was — its
         // `profilingStatus` reports no profile reported, and no aggregated profile
-        // carries it.
+        // carries it. The same reading answers the period the submission covers, which is
+        // the window the service collects it into.
         //
         // Reading the submitted bytes as a document is CPU work over a payload whose size
         // and shape the caller chose, so it runs on the blocking pool instead of on the
@@ -326,23 +361,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // copied to be read.
         let submitted = input.agent_profile;
         let read = ::tokio::task::spawn_blocking(move || {
-            let verdict = not_a_profile(&submitted);
+            let verdict = submitted_profile(&submitted).map(|document| period_start(&document));
             (verdict, submitted)
         })
         .await;
-        let (refused, submitted) = read.map_err(|_| {
+        let (verdict, submitted) = read.map_err(|_| {
             PostAgentProfileErrorModeled::InternalServerException(InternalServerException {
                 message: "reading the submitted profile did not complete".to_string(),
             })
         })?;
-        if let Some(refused) = refused {
-            return Err(PostAgentProfileErrorModeled::ValidationException(
-                ValidationException {
-                    message: refused.message(),
-                },
-            )
-            .into());
-        }
+        let stated_start = match verdict {
+            Ok(stated_start) => stated_start,
+            Err(refused) => {
+                return Err(PostAgentProfileErrorModeled::ValidationException(
+                    ValidationException {
+                        message: refused.message(),
+                    },
+                )
+                .into());
+            }
+        };
 
         // The store is locked again only now, for the write itself: the group was
         // resolved before the data was read, and a group deleted while it was being read
@@ -353,13 +391,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `profilingStatus.latestAgentProfileReportedAt`, and applies every retention
         // bound — the per-group profile count and byte caps and the store-wide profile
         // byte budget.
+        let received_at = crate::state::now();
         match guard.post_profile(
             &input.profiling_group_name,
             input.profile_token.as_deref(),
             crate::state::AgentProfile {
                 bytes: submitted,
                 content_type: input.content_type.clone(),
-                received_at: crate::state::now(),
+                received_at,
+                // The window the service collects this profile into is the one its DATA
+                // covers, so the period the submission states for itself is what is
+                // stored; a submission that states no instant there is placed where it
+                // arrived.
+                period_start: stated_start.unwrap_or(received_at),
             },
         ) {
             crate::state::PostedProfile::Stored | crate::state::PostedProfile::Replayed => {
@@ -368,9 +412,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::PostedProfile::UnknownGroup => Err(
                 PostAgentProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        // The agent plane words a missing group its own way:
-                        // account-qualified, unlike every other operation's text.
-                        message: crate::state::agent_group_not_found_message(
+                        // This operation's own sentence, as above.
+                        message: crate::state::posted_profile_group_not_found_message(
                             &input.profiling_group_name,
                         ),
                     },

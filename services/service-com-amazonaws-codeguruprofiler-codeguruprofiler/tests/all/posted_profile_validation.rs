@@ -278,7 +278,7 @@ async fn only_a_struct_stating_its_start_is_an_agent_profile() {
                     String::from_utf8_lossy(&answer.body)
                 );
                 // Stored means STORED: the group reports the profile as reported, and
-                // the aggregated profile reads back the submitted bytes.
+                // the aggregated profile reads back the submitted data.
                 let described = harness.describe(&name).await;
                 assert!(
                     described
@@ -299,9 +299,9 @@ async fn only_a_struct_stating_its_start_is_an_agent_profile() {
                     String::from_utf8_lossy(&served.body)
                 );
                 assert_eq!(
-                    served.body,
-                    case.bytes,
-                    "case {label:?}: expected the submitted bytes back, got {:?}",
+                    crate::profiling_group_lifecycle::profile_data(&served.body),
+                    crate::profiling_group_lifecycle::profile_data(&case.bytes),
+                    "case {label:?}: expected the submitted data back, got {:?}",
                     String::from_utf8_lossy(&served.body)
                 );
             }
@@ -431,9 +431,9 @@ async fn a_refused_submission_consumes_no_idempotency_token() {
     harness.complete_aggregation(name);
     let served = harness.get_profile(name, "").await;
     assert_eq!(
-        served.body,
-        profile,
-        "the stored profile must read back, got {:?}",
+        crate::profiling_group_lifecycle::profile_data(&served.body),
+        crate::profiling_group_lifecycle::profile_data(&profile),
+        "the stored profile's data must read back, got {:?}",
         String::from_utf8_lossy(&served.body)
     );
 }

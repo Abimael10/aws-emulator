@@ -26,7 +26,7 @@ use ion_rs::{Element, v1_0};
 
 use crate::interval_validation::{create_group, expected_refusal};
 use crate::profile_times::{place_profile, place_receipts};
-use crate::profiling_group_lifecycle::Harness;
+use crate::profiling_group_lifecycle::{AGGREGATION_MEMBERS, Harness, data_of, profile_data};
 
 /// The instant every case below places its stored profile at, in epoch seconds: long
 /// past, so the aggregation the profile is owed has fallen due and the only thing that
@@ -52,6 +52,28 @@ fn iso(millis: i64) -> String {
     )
     .fmt(Format::DateTime)
     .expect("a representable instant")
+}
+
+/// `value` without the members a served aggregated profile states about the AGGREGATION
+/// itself ([`crate::profiling_group_lifecycle::AGGREGATION_MEMBERS`]): the profiling DATA
+/// the document holds, which is what these cases compare against what was posted.
+fn data(value: &serde_json::Value) -> serde_json::Value {
+    let Some(fields) = value.as_object() else {
+        return value.clone();
+    };
+    serde_json::Value::Object(
+        fields
+            .iter()
+            .filter(|(name, _)| !AGGREGATION_MEMBERS.contains(&name.as_str()))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+/// The JSON body of one answer.
+fn served_json(case: &str, bytes: &[u8]) -> serde_json::Value {
+    serde_json::from_slice(bytes)
+        .unwrap_or_else(|error| panic!("case {case}: unreadable body: {error}"))
 }
 
 /// A group holding exactly one posted profile, placed at [`RECEIPT_SECONDS`].
@@ -164,9 +186,10 @@ async fn a_period_names_the_length_of_the_requested_window() {
             );
             if answer.status == 200 {
                 assert_eq!(
-                    answer.body,
-                    body,
-                    "case {period} / {label:?}: expected the stored profile, got {:?}",
+                    profile_data(&answer.body),
+                    profile_data(&body),
+                    "case {period} / {label:?}: expected the data of the stored profile, \
+                     got {:?}",
                     String::from_utf8_lossy(&answer.body)
                 );
             }
@@ -320,11 +343,11 @@ async fn max_depth_leaves_out_the_frames_nested_deeper_than_it() {
             "case maxDepth={max_depth}: expected the profile's own representation, got {:?}",
             answer.content_type
         );
-        let served: serde_json::Value = serde_json::from_slice(&answer.body)
-            .unwrap_or_else(|error| panic!("case maxDepth={max_depth}: unreadable body: {error}"));
+        let served = served_json(&format!("maxDepth={max_depth}"), &answer.body);
         assert_eq!(
-            served, expected,
-            "case maxDepth={max_depth}: expected {expected}, got {served}"
+            data(&served),
+            data(&expected),
+            "case maxDepth={max_depth}: expected the data of {expected}, got {served}"
         );
     }
 
@@ -355,21 +378,21 @@ async fn max_depth_leaves_out_the_frames_nested_deeper_than_it() {
         let answer = harness
             .get_profile("depth-lists", &format!("?maxDepth={max_depth}"))
             .await;
-        let served: serde_json::Value = serde_json::from_slice(&answer.body)
-            .unwrap_or_else(|error| panic!("case lists maxDepth={max_depth}: {error}"));
+        let served = served_json(&format!("lists maxDepth={max_depth}"), &answer.body);
         assert_eq!(
-            served, expected,
-            "case lists maxDepth={max_depth}: expected {expected}, got {served}"
+            data(&served),
+            data(&expected),
+            "case lists maxDepth={max_depth}: expected the data of {expected}, got {served}"
         );
     }
 
-    // No `maxDepth` bounds nothing, and the stored bytes are then the answer byte for
-    // byte — including the member order the caller posted, which no re-encoding touched.
+    // No `maxDepth` bounds nothing, so the aggregated profile holds all of the stored
+    // document's data.
     let whole = harness.get_profile("depth-json", "").await;
     assert_eq!(
-        whole.body,
-        serde_json::to_vec(&document).expect("a serializable document"),
-        "a read with no maxDepth must serve the stored bytes, got {:?}",
+        data(&served_json("no maxDepth", &whole.body)),
+        data(&document),
+        "a read with no maxDepth must serve all of the stored data, got {:?}",
         String::from_utf8_lossy(&whole.body)
     );
 }
@@ -399,7 +422,7 @@ fn ion_read(bytes: &[u8]) -> Element {
 
 /// `Accept` chooses which of the two representations the service serves a profile in, and
 /// the response says which one it served: the stored representation when the request
-/// accepts it (served byte for byte, since nothing has to be re-encoded), the other one
+/// accepts it, the other one
 /// when the request ranks it higher, and the stored one again when the request accepts
 /// neither — there is no third representation to answer with, and no refusal either.
 #[tokio::test]
@@ -448,16 +471,16 @@ async fn accept_chooses_the_representation_a_profile_is_served_in() {
         );
         if expected == JSON {
             assert_eq!(
-                answer.body,
-                body,
-                "case {label:?}: the stored representation is served byte for byte, got {:?}",
+                data(&served_json(label, &answer.body)),
+                data(&document),
+                "case {label:?}: expected the posted data as JSON, got {:?}",
                 String::from_utf8_lossy(&answer.body)
             );
         } else {
             // The same document, in Ion: a JSON text is itself valid Ion text, so the
             // served binary Ion is compared against the Ion reading of what was posted.
-            let served = ion_read(&answer.body);
-            let posted = ion_read(&body);
+            let served = data_of(&ion_read(&answer.body));
+            let posted = data_of(&ion_read(&body));
             assert_eq!(
                 served, posted,
                 "case {label:?}: expected the posted document in Ion, got {served}"
@@ -465,10 +488,12 @@ async fn accept_chooses_the_representation_a_profile_is_served_in() {
         }
     }
 
-    // Serving a profile changed nothing: the stored bytes still answer a plain read.
+    // Serving a profile changed nothing: the same aggregated profile answers the next
+    // read.
     let again = harness.get_profile("accept-json", "").await;
     assert_eq!(
-        again.body, body,
+        data(&served_json("a second read", &again.body)),
+        data(&document),
         "a read must not change what the next caller is served"
     );
 }
@@ -488,7 +513,7 @@ async fn an_ion_profile_is_served_in_either_representation() {
     let body = ion_bytes(&document);
     group_holding(&harness, "accept-ion", ION, body.clone()).await;
 
-    // Stored representation, no depth bound: the bytes as posted.
+    // Stored representation, no depth bound: the document's data as posted.
     for (label, accept) in [("no Accept at all", None), ("Ion itself", Some(ION))] {
         let answer = harness.get_profile_accepting("accept-ion", "", accept).await;
         assert_eq!(
@@ -498,8 +523,9 @@ async fn an_ion_profile_is_served_in_either_representation() {
             answer.content_type
         );
         assert_eq!(
-            answer.body, body,
-            "case {label:?}: expected the posted Ion bytes"
+            data_of(&ion_read(&answer.body)),
+            data_of(&document),
+            "case {label:?}: expected the posted Ion data"
         );
     }
 
@@ -519,8 +545,7 @@ async fn an_ion_profile_is_served_in_either_representation() {
         "case Ion served as JSON: expected {JSON}, got {:?}",
         answer.content_type
     );
-    let mut served: serde_json::Value = serde_json::from_slice(&answer.body)
-        .unwrap_or_else(|error| panic!("case Ion served as JSON: unreadable body: {error}"));
+    let mut served: serde_json::Value = data(&served_json("Ion served as JSON", &answer.body));
     // A timestamp carries over as its text; the text is Ion's rendering of that instant,
     // so the case asserts the instant it names rather than one spelling of it.
     let when = served
@@ -543,7 +568,6 @@ async fn an_ion_profile_is_served_in_either_representation() {
             "tag": "symbolic",
             "payload": "aGk=",
             "ratio": 1.5,
-            "start": 1_600_000_000_000i64,
         }),
         "case Ion served as JSON: expected the down-converted document, got {served}"
     );
@@ -556,12 +580,12 @@ async fn an_ion_profile_is_served_in_either_representation() {
         "case Ion bounded to depth 2: expected {ION}, got {:?}",
         bounded.content_type
     );
-    let served = ion_read(&bounded.body);
-    let expected = ion_document(
+    let served = data_of(&ion_read(&bounded.body));
+    let expected = data_of(&ion_document(
         r#"{ callgraph: { A: { } }, samples: 3, name: "demo", tag: symbolic,
              when: 2020-09-13T12:26:40Z, payload: {{aGk=}}, ratio: 1.5,
              start: 1600000000000 }"#,
-    );
+    ));
     assert_eq!(
         served, expected,
         "case Ion bounded to depth 2: expected {expected}, got {served}"

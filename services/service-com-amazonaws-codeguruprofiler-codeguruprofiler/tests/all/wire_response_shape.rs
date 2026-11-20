@@ -225,8 +225,9 @@ impl Harness {
         group.updated_at = updated_at;
     }
 
-    /// Place the receipt time of the one profile a group retains, and the group's
-    /// `latestAgentProfileReportedAt`, at a chosen instant — the stored fields
+    /// Place the receipt time of the one profile a group retains — and the period its
+    /// data covers, which is the window the service collects it into — and the group's
+    /// `latestAgentProfileReportedAt`, at a chosen instant: the stored fields
     /// `PostAgentProfile` itself writes.
     fn stamp_receipt_time(&self, name: &str, at: DateTime) {
         let state = self.state();
@@ -237,6 +238,7 @@ impl Harness {
             .unwrap_or_else(|| panic!("no stored group named {name}"));
         for profile in group.profiles.iter_mut() {
             profile.received_at = at;
+            profile.period_start = at;
         }
         group.latest_agent_profile_reported_at = Some(at);
     }
@@ -727,9 +729,19 @@ async fn a_create_omits_profiling_status_until_something_has_been_reported() {
             );
         }
         if case.post_profile {
+            // The profile covers the period the service is still collecting into, so the
+            // status reports the RECEIPT and no aggregated profile yet — which is what
+            // lets this case assert the container holds exactly what has happened.
             assert_eq!(
                 harness
-                    .post_agent_profile(name, br#"{"start":1600000000000,"frames":["A"]}"#.to_vec())
+                    .post_agent_profile(
+                        name,
+                        format!(
+                            "{{\"start\":{},\"frames\":[\"A\"]}}",
+                            crate::profiling_group_lifecycle::pending_profile_start_millis()
+                        )
+                        .into_bytes()
+                    )
                     .await
                     .status,
                 204,

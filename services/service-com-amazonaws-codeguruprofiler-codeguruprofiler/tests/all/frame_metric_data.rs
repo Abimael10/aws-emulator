@@ -748,9 +748,14 @@ async fn a_step_whose_aggregation_is_not_due_is_an_unprocessed_instance() {
         201,
         "create must succeed"
     );
-    let body = document(serde_json::json!({ "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }));
-    // Posted over HTTP, so the receipt is the clock's: the window it lands in is still
-    // open and its aggregation has not fallen due.
+    // Posted with the period the service is STILL COLLECTING into, so the window its data
+    // falls in has not closed and the aggregation that window owes has not fallen due.
+    let data_millis = crate::profiling_group_lifecycle::pending_profile_start_millis();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "callgraph": { "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } },
+        "start": data_millis,
+    }))
+    .expect("a serializable document");
     let before = now();
     assert_eq!(
         harness
@@ -788,9 +793,9 @@ async fn a_step_whose_aggregation_is_not_due_is_an_unprocessed_instance() {
     let all_steps: Vec<i64> = (1..=(period_end - period_start) / FIVE_MINUTES)
         .map(|step| first + step * FIVE_MINUTES)
         .collect();
-    // The receipt is somewhere in `[before, after]`, so the step holding it is the window
-    // containing either instant — the same window unless the post straddled a boundary.
-    let pending_candidates: Vec<i64> = [before, after]
+    // The data covers an instant in the window the service is still collecting into, so
+    // the step holding it is that window.
+    let pending_candidates: Vec<i64> = [data_millis.div_euclid(1_000)]
         .iter()
         .map(|at| at.div_euclid(FIVE_MINUTES) * FIVE_MINUTES + FIVE_MINUTES)
         .collect();

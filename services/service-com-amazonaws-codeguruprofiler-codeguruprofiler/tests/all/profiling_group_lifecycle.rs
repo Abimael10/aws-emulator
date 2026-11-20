@@ -41,11 +41,27 @@ pub(crate) fn group_arn(name: &str) -> String {
 ///
 /// `PostAgentProfile` parses the data it is handed and refuses a profile that does not
 /// state the start of the period it covers, so every case that submits one submits a
-/// profile that states it. The instant itself is immaterial to what these cases assert —
-/// the receipt time the store records is the clock's, and a case that needs another one
-/// places it ([`crate::profile_times::place_receipts`]). `pub(crate)` so every suite in
+/// profile that states it. The instant is one long past, so the window the data covers
+/// has closed and the aggregation it owes is due; a case about a window the service is
+/// still collecting into states [`pending_profile_start_millis`] instead, and a case that
+/// needs the data at a chosen instant places it
+/// ([`crate::profile_times::place_receipts`]). `pub(crate)` so every suite in
 /// this target builds a submittable profile the same way.
 pub(crate) const PROFILE_START_MILLIS: i64 = 1_600_000_000_000;
+
+/// The epoch-millisecond `start` a submission states to put its data in the window the
+/// service is STILL COLLECTING into: the clock's current instant, which is always inside
+/// the open window of every aggregation period.
+///
+/// A posted profile is collected into the window its data covers, so a case about the
+/// state before an aggregation has fallen due states a period that has not closed yet —
+/// and `complete_aggregation` is what then lets it fall due. `pub(crate)` so every suite
+/// about a pending aggregation names that period one way.
+pub(crate) fn pending_profile_start_millis() -> i64 {
+    const MILLIS_PER_SECOND: i64 = 1_000;
+    let now = aws_smithy_types::DateTime::from(std::time::SystemTime::now());
+    now.secs() * MILLIS_PER_SECOND + i64::from(now.subsec_nanos() / 1_000_000)
+}
 
 /// A submitted profile as JSON: its `start`, and `filler` bytes of padding so a case can
 /// name the SIZE of the payload it posts.
@@ -74,14 +90,15 @@ pub(crate) fn ion_profile(start: i64, filler: usize) -> Vec<u8> {
     .expect("an encodable Ion document")
 }
 
-/// Let the aggregation every profile a group holds is owed fall due, by moving each
-/// stored receipt time back past the span the service's aggregation takes.
+/// Let the aggregation every profile a group holds is owed fall due, by moving the data
+/// each stored profile covers — and its receipt — back past the span the service's
+/// aggregation takes.
 ///
-/// A posted agent profile is not part of an aggregated profile at the instant it is
-/// received — the window it belongs to is still open, and the aggregation pass runs
-/// after that window closes — so a case about what an AGGREGATED profile reads back as
-/// places the receipt in a window that has closed, the way `place_receipts` does for a
-/// case about several windows. This is [`complete_aggregation_of_period_in`] at the
+/// A posted agent profile is not part of an aggregated profile while the window its DATA
+/// covers is still open — the aggregation pass runs after that window closes — so a case
+/// about what an AGGREGATED profile reads back as places the data in a window that has
+/// closed, the way `place_receipts` does for a case about several windows. This is
+/// [`complete_aggregation_of_period_in`] at the
 /// FINEST period, the window a posted profile is first collected into (and the one a
 /// request naming a free-form range is served from). `pub(crate)` so every suite in this
 /// target ages a stored profile one way.
@@ -94,13 +111,13 @@ pub(crate) fn complete_aggregation_in(engine: &Arc<engine::InMemoryEngine>, name
 }
 
 /// Let the aggregation a `period_seconds`-long window owes fall due for every profile a
-/// group holds, by moving each stored receipt back past that window and the aggregation
-/// pass over it.
+/// group holds, by moving the period each profile covers — and its receipt — back past
+/// that window and the aggregation pass over it.
 ///
 /// The aggregated profile of a period is available only once the window OF THAT PERIOD
-/// holding the receipt has closed, so a case about a coarser period's aggregated profile
-/// ages the receipt past that period's window rather than past the finest one. This writes
-/// the same stored field `PostAgentProfile` wrote, through the one shared engine, and
+/// holding the data has closed, so a case about a coarser period's aggregated profile
+/// ages the data past that period's window rather than past the finest one. This writes
+/// the same stored fields `PostAgentProfile` wrote, through the one shared engine, and
 /// nothing else.
 pub(crate) fn complete_aggregation_of_period_in(
     engine: &Arc<engine::InMemoryEngine>,
@@ -122,6 +139,12 @@ pub(crate) fn complete_aggregation_of_period_in(
             profile.received_at.secs() - back,
             profile.received_at.subsec_nanos(),
         );
+        // The window a profile is collected into is the one its DATA covers, so letting
+        // the aggregation fall due places that data in a closed window. A profile posted
+        // over HTTP states its own period, which is where its agent collected the data
+        // and need not be near the receipt at all, so the data is placed at the aged
+        // receipt rather than moved relative to whatever the document stated.
+        profile.period_start = profile.received_at;
     }
 }
 
@@ -194,6 +217,84 @@ pub(crate) fn element_of(bytes: &[u8]) -> ion_rs::Element {
             String::from_utf8_lossy(bytes)
         )
     })
+}
+
+/// The members a served aggregated profile states about the AGGREGATION itself rather
+/// than about the profiling data it holds: the window it covers and what the aggregation
+/// holds. `GetProfile` derives all three — the window from the aggregated profile it
+/// served and the count from the submissions that window holds — so none of them is a
+/// value copied out of an upload. `pub(crate)` so every suite in this target names them
+/// once.
+pub(crate) const AGGREGATION_MEMBERS: [&str; 3] = ["start", "end", "aggregatedMetadata"];
+
+/// `document` without the members an aggregated profile states about itself
+/// ([`AGGREGATION_MEMBERS`]): the profiling DATA it holds.
+///
+/// This is what lets a case compare the data a served aggregated profile holds with the
+/// data the submissions contributed, and assert the window and the reported-agent count
+/// on their own ([`aggregation_of`]). A document whose root is no struct holds no member
+/// to leave out and is answered as it is.
+pub(crate) fn data_of(document: &ion_rs::Element) -> ion_rs::Element {
+    let Some(fields) = document.as_struct() else {
+        return document.clone();
+    };
+    let kept: Vec<(ion_rs::Symbol, ion_rs::Element)> = fields
+        .fields()
+        .filter(|(name, _)| {
+            name.text()
+                .is_none_or(|text| !AGGREGATION_MEMBERS.contains(&text))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    ion_rs::Element::from(ion_rs::Struct::from_iter(kept))
+        .with_annotations(document.annotations().iter().cloned())
+}
+
+/// The profiling data `bytes` hold: [`data_of`] over the document they are
+/// ([`element_of`]). `pub(crate)` so every suite compares a served aggregated profile's
+/// data with a submission's one way.
+pub(crate) fn profile_data(bytes: &[u8]) -> ion_rs::Element {
+    data_of(&element_of(bytes))
+}
+
+/// One instant as the form a SERVED aggregated profile states the bounds of its window
+/// in: the ISO 8601 UTC `date-time` with the millisecond field this service writes on
+/// every instant. `at` is in epoch seconds. `pub(crate)` so every suite that asserts a
+/// served window states that form one way.
+pub(crate) fn iso_millis(at: i64) -> String {
+    let whole_second = aws_smithy_types::DateTime::from_secs(at)
+        .fmt(aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| panic!("unformattable instant {at}: {error}"));
+    format!("{}.000Z", whole_second.trim_end_matches('Z'))
+}
+
+/// What the served aggregated profile `bytes` states about the aggregation: the start and
+/// end of the window it covers, as the strings the document carries, and the number of
+/// agents its `aggregatedMetadata` reports.
+///
+/// Panics naming `case` when any of the three is missing or is not of that form: an
+/// aggregated profile states all of them.
+pub(crate) fn aggregation_of(case: &str, bytes: &[u8]) -> (String, String, i64) {
+    let document = element_of(bytes);
+    let fields = document
+        .as_struct()
+        .unwrap_or_else(|| panic!("case {case}: an aggregated profile is a struct, got {document}"));
+    let text = |member: &str| {
+        fields
+            .get(member)
+            .and_then(ion_rs::Element::as_string)
+            .unwrap_or_else(|| {
+                panic!("case {case}: no {member} string in {document}")
+            })
+            .to_string()
+    };
+    let reported_agents = fields
+        .get("aggregatedMetadata")
+        .and_then(ion_rs::Element::as_struct)
+        .and_then(|metadata| metadata.get("numReportedAgents"))
+        .and_then(ion_rs::Element::as_i64)
+        .unwrap_or_else(|| panic!("case {case}: no aggregatedMetadata.numReportedAgents in {document}"));
+    (text("start"), text("end"), reported_agents)
 }
 
 /// One HTTP answer, reduced to what these tests assert on. `pub(crate)` so the other
@@ -887,7 +988,7 @@ fn profile_cases() -> Vec<ProfileCase> {
 }
 
 #[tokio::test]
-async fn a_posted_agent_profile_comes_back_byte_identical() {
+async fn a_posted_agent_profile_reads_back_in_the_aggregated_profile() {
     let harness = Harness::new();
 
     for (index, profile) in profile_cases().iter().enumerate() {
@@ -942,11 +1043,18 @@ async fn a_posted_agent_profile_comes_back_byte_identical() {
             String::from_utf8_lossy(&fetched.body)
         );
         assert_eq!(
-            fetched.body, profile.bytes,
-            "{}: GetProfile must return the posted bytes unchanged (got {} bytes, posted {})",
+            profile_data(&fetched.body),
+            profile_data(&profile.bytes),
+            "{}: the aggregated profile must hold the posted data, got {}",
             profile.label,
-            fetched.body.len(),
-            profile.bytes.len()
+            element_of(&fetched.body)
+        );
+        let (_, _, reported_agents) = aggregation_of(profile.label, &fetched.body);
+        assert_eq!(
+            reported_agents, 1,
+            "{}: one agent reported into the window, got {}",
+            profile.label,
+            element_of(&fetched.body)
         );
         assert_eq!(
             fetched.content_type.as_deref(),
@@ -985,7 +1093,8 @@ async fn a_posted_agent_profile_comes_back_byte_identical() {
         harness.complete_aggregation(&case.name);
         let after_replay = harness.get_profile(&case.name, "").await;
         assert_eq!(
-            after_replay.body, profile.bytes,
+            profile_data(&after_replay.body),
+            profile_data(&profile.bytes),
             "{}: a profileToken replay must not store a second profile",
             profile.label
         );
@@ -1303,18 +1412,22 @@ async fn posting_profiles_stays_inside_the_per_group_retention_bound() {
             String::from_utf8_lossy(&fetched.body)
         );
         // The aggregated profile of the window holds every profile the group still
-        // retains: these posts differ only in the start each profile states, so the
-        // combination states the earliest start among the retained ones — which is also
-        // how the newest profile's data reaches the answer — and carries their padding.
+        // retains: these posts differ only in the start each profile states and in their
+        // padding, so the DATA the combination holds is that padding — and the number of
+        // agents it reports is the number of profiles retained.
         let (retained, _, _) = harness.retained(&case.name);
-        let expected = json_profile(
-            PROFILE_START_MILLIS + i64::try_from(posts - retained).unwrap_or(0),
-            payload_bytes,
-        );
+        let expected = json_profile(PROFILE_START_MILLIS, payload_bytes);
         assert_eq!(
-            element_of(&fetched.body),
-            element_of(&expected),
+            profile_data(&fetched.body),
+            profile_data(&expected),
             "{label}: expected the {retained} retained profiles combined, got {}",
+            element_of(&fetched.body)
+        );
+        let (_, _, reported_agents) = aggregation_of(label, &fetched.body);
+        assert_eq!(
+            reported_agents,
+            i64::try_from(retained).unwrap_or(0),
+            "{label}: expected the {retained} retained submissions to be reported, got {}",
             element_of(&fetched.body)
         );
     }
@@ -1488,8 +1601,10 @@ async fn get_profile_selects_by_the_requested_time_range() {
         );
         if answer.status == 200 && !query.contains("maxDepth") {
             assert_eq!(
-                answer.body, body,
-                "case {label:?} ({query}): must return the posted bytes"
+                profile_data(&answer.body),
+                profile_data(&body),
+                "case {label:?} ({query}): must hold the posted data, got {}",
+                element_of(&answer.body)
             );
         }
     }

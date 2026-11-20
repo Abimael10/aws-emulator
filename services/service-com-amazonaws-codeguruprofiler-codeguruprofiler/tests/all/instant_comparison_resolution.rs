@@ -332,8 +332,9 @@ async fn get_profile_window_bounds_are_exact_at_nanosecond_resolution() {
         );
         if case.served {
             assert_eq!(
-                answer.body, payload,
-                "case {label:?}: the stored profile must be served byte for byte, got {:?}",
+                crate::profiling_group_lifecycle::profile_data(&answer.body),
+                crate::profiling_group_lifecycle::profile_data(&payload),
+                "case {label:?}: the stored profile's data must be served, got {:?}",
                 String::from_utf8_lossy(&answer.body)
             );
         } else {

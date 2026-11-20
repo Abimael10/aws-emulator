@@ -197,9 +197,9 @@ async fn an_uploaded_media_type_is_not_what_a_served_profile_is_announced_under(
             answer.content_type
         );
         assert_eq!(
-            answer.body,
-            body,
-            "case {case:?}: expected the stored bytes, got {:?}",
+            crate::profiling_group_lifecycle::profile_data(&answer.body),
+            crate::profiling_group_lifecycle::profile_data(&body),
+            "case {case:?}: expected the stored data, got {:?}",
             String::from_utf8_lossy(&answer.body)
         );
     }

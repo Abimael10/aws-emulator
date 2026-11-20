@@ -25,7 +25,7 @@
 //! harness, not a fork of it.
 
 use crate::interval_validation::{create_group, expected_refusal};
-use crate::profiling_group_lifecycle::{Harness, servable_window};
+use crate::profiling_group_lifecycle::{Harness, profile_data, servable_window};
 
 /// The group the served rows run against, created through the API like any other.
 const GROUP: &str = "get-profile-window";
@@ -384,9 +384,9 @@ async fn a_get_profile_window_that_is_not_an_interval_is_refused_however_it_is_n
         String::from_utf8_lossy(&served.body)
     );
     assert_eq!(
-        served.body,
-        PROFILE.to_vec(),
-        "a wide window must serve the posted profile, got {:?}",
+        profile_data(&served.body),
+        profile_data(PROFILE),
+        "a wide window must serve the posted profile's data, got {:?}",
         String::from_utf8_lossy(&served.body)
     );
 }

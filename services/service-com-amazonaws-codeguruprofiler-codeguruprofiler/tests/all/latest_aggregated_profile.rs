@@ -30,7 +30,7 @@ use aws_smithy_types::DateTime;
 use aws_smithy_types::date_time::Format;
 
 use crate::profile_times::place_receipts_at;
-use crate::profiling_group_lifecycle::{Answer, Harness};
+use crate::profiling_group_lifecycle::{Answer, Harness, pending_profile_start_millis};
 
 /// 2020-06-01T00:00:00Z. A whole number of days past the epoch, so a window aligned to
 /// UTC starts here for each of the three aggregation periods at once.
@@ -371,9 +371,9 @@ async fn a_group_reports_the_latest_aggregated_profile_its_stored_receipts_deriv
 #[tokio::test]
 async fn a_pending_aggregation_is_no_aggregated_profile_until_it_falls_due() {
     // Rows: how many profiles the group holds and the payload each carries. None of them
-    // is in an aggregated profile at the instant it is posted — the window it landed in is
-    // still open — so the status reports no aggregated profile until the aggregation the
-    // window owes has fallen due, and then reports exactly one window.
+    // is in an aggregated profile at the instant it is posted — each covers a period the
+    // service is still collecting — so the status reports no aggregated profile until the
+    // aggregation the window owes has fallen due, and then reports exactly one window.
     for (index, posts) in [1usize, 2, 3].into_iter().enumerate() {
         let harness = Harness::new();
         let name = format!("pending-aggregated-{index}");
@@ -390,8 +390,11 @@ async fn a_pending_aggregation_is_no_aggregated_profile_until_it_falls_due() {
                         &name,
                         "application/json",
                         Some(&format!("ptok-{index}-{post}")),
-                        format!("{{\"start\":1600000000000,\"profile\":\"{post}\"}}")
-                            .into_bytes(),
+                        format!(
+                            "{{\"start\":{},\"profile\":\"{post}\"}}",
+                            pending_profile_start_millis()
+                        )
+                        .into_bytes(),
                     )
                     .await
                     .status,

@@ -334,7 +334,7 @@ async fn no_document_read_holds_the_store_lock_or_the_async_worker() {
         );
         match (&case.read, case.status) {
             // A submission that was accepted is STORED: the aggregated profile reads back
-            // the submitted bytes, so the read off the lock wrote what it read.
+            // the submitted data, so the read off the lock wrote what it read.
             (Read::Submit { bytes, .. }, 204) => {
                 harness.complete_aggregation(&name);
                 let served = harness.get_profile(&name, "").await;
@@ -346,9 +346,9 @@ async fn no_document_read_holds_the_store_lock_or_the_async_worker() {
                     String::from_utf8_lossy(&served.body)
                 );
                 assert_eq!(
-                    served.body,
-                    *bytes,
-                    "case {label:?}: expected the submitted bytes back, got {} bytes",
+                    crate::profiling_group_lifecycle::profile_data(&served.body),
+                    crate::profiling_group_lifecycle::profile_data(bytes),
+                    "case {label:?}: expected the submitted data back, got {} bytes",
                     served.body.len()
                 );
             }

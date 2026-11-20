@@ -517,18 +517,32 @@ async fn a_group_that_does_not_exist_is_refused_with_the_services_not_found_text
     }
 }
 
-/// RULE 2: the AGENT plane states the same fact in its own account-qualified form.
+/// RULE 2: each operation of the AGENT plane states the same fact in ITS OWN form.
 ///
 /// The agent APIs are `ConfigureAgent` and `PostAgentProfile` — the two the model's own
 /// `ActionGroup` enum names ("Permission group type for Agent APIs - ConfigureAgent,
-/// PostAgentProfile") — so both rows of the operation axis must answer the agent text and
-/// never the text the readers above get.
+/// PostAgentProfile") — and each answers the sentence recorded for IT and never another
+/// operation's: `ConfigureAgent` the account-qualified one, `PostAgentProfile` the lookup
+/// it performed. Neither answers the text the readers above get.
 #[tokio::test]
-async fn the_agent_plane_states_its_own_account_qualified_not_found_text() {
+async fn each_agent_plane_operation_states_its_own_not_found_text() {
     let harness = Harness::new();
-    let agent_calls: [(&str, &str, &[u8]); 2] = [
-        ("ConfigureAgent", "/configureAgent", b"{}"),
-        ("PostAgentProfile", "/agentProfile", b"{\"ion\": true}"),
+    // (the operation, its path suffix, a body it accepts, the sentence it states for a
+    // name it cannot resolve)
+    type AgentCall = (&'static str, &'static str, &'static [u8], fn(&str) -> String);
+    let agent_calls: [AgentCall; 2] = [
+        (
+            "ConfigureAgent",
+            "/configureAgent",
+            b"{}",
+            |name| format!("Profiling group for {ACCOUNT}/{name} does not exist!"),
+        ),
+        (
+            "PostAgentProfile",
+            "/agentProfile",
+            b"{\"ion\": true}",
+            |name| format!("No profiling group found in account {ACCOUNT} with name {name}."),
+        ),
     ];
     // (case, the name asked for)
     let names: [(&str, String); 3] = [
@@ -541,7 +555,8 @@ async fn the_agent_plane_states_its_own_account_qualified_not_found_text() {
     ];
 
     for (case, name) in names {
-        for (operation, suffix, body) in agent_calls {
+        let mut seen: Vec<(&str, String)> = Vec::new();
+        for (operation, suffix, body, message) in agent_calls {
             let answer = harness
                 .send(
                     "POST",
@@ -549,7 +564,7 @@ async fn the_agent_plane_states_its_own_account_qualified_not_found_text() {
                     body.to_vec(),
                 )
                 .await;
-            let expected = format!("Profiling group for {ACCOUNT}/{name} does not exist!");
+            let expected = message(&name);
             assert_eq!(
                 answer.status, 404,
                 "case {case:?} on {operation}: expected 404, got {} ({})",
@@ -568,7 +583,16 @@ async fn the_agent_plane_states_its_own_account_qualified_not_found_text() {
                 "case {case:?} on {operation}: expected {expected:?}, got {:?}",
                 answer.message()
             );
+            seen.push((operation, answer.message()));
         }
+        // The two operations of this plane do NOT share one sentence: a client keying on
+        // the one it gets tells which call was refused.
+        let sentences: Vec<&String> = seen.iter().map(|(_, message)| message).collect();
+        assert_ne!(
+            sentences[0], sentences[1],
+            "case {case:?}: each agent operation states its own sentence, both said {:?}",
+            sentences[0]
+        );
     }
 }
 
@@ -742,10 +766,22 @@ async fn get_profile_states_its_fixed_text_for_a_window_no_profile_covers() {
         read_back.status,
         String::from_utf8_lossy(&read_back.body)
     );
+    // The served document is the service's OWN aggregated profile rather than a copy of
+    // the upload: it states the window it covers and what the aggregation holds, and
+    // carries the data the submission contributed.
+    let served = read_back.json();
     assert_eq!(
-        read_back.body,
-        b"{\"start\":1600000000000,\"ion\": \"payload\"}".to_vec(),
-        "case the stored profile: GetProfile must return the posted bytes"
+        served.get("ion").and_then(serde_json::Value::as_str),
+        Some("payload"),
+        "case the stored profile: the aggregated profile must carry the posted data, got \
+         {served}"
+    );
+    assert_eq!(
+        served
+            .pointer("/aggregatedMetadata/numReportedAgents")
+            .and_then(serde_json::Value::as_i64),
+        Some(1),
+        "case the stored profile: one agent reported into the window, got {served}"
     );
 
     // (case, the group, the window asked for)

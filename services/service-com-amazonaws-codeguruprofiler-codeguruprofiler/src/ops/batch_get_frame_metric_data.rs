@@ -434,8 +434,8 @@ fn sample_count(element: &Element) -> Option<f64> {
 /// the whole computation shares, so the product of the metrics asked about and the values
 /// the stored documents hold is bounded rather than each factor alone.
 ///
-/// `profiles` are the group's aggregated profiles of the series, each with the step its
-/// receipt falls in. Every profile is read as a document ONCE, however many metrics the
+/// `profiles` are the group's aggregated profiles of the series, each with the step the
+/// period it covers falls in. Every profile is read as a document ONCE, however many metrics the
 /// request asks about, because reading it is the expensive half and does not depend on
 /// the metric.
 fn frame_metric_data(
@@ -642,7 +642,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut pending: Vec<bool> = vec![false; steps.len()];
         let mut aggregated: Vec<(usize, crate::state::AgentProfile)> = Vec::new();
         for profile in stored {
-            let Some(step) = step_of(&steps, profile.received_at) else {
+            let Some(step) = step_of(&steps, profile.period_start) else {
                 continue;
             };
             if profile.is_aggregated(resolution_seconds, now) {

@@ -5,18 +5,14 @@
 //! combination of the window members the operation's doc allows, and no wider than the
 //! maximum time range it allows — in the
 //! representation the request accepts and bounded to the call-stack depth it asks for.
-//! The aggregated profile of the window is EVERY profile the group holds in it combined
-//! into one document: the window's profiles were collected into one aggregated profile,
-//! so the answer carries the frames and counts of all of them ([`combined`]). A request
+//! The aggregated profile of the window is the service's OWN document, not a copy of an
+//! upload: every profile the group holds in the window combined into one document
+//! ([`combined`]), stating the window it covers and what the aggregation holds
+//! ([`aggregated`]). A request
 //! that names the window's LENGTH and neither of its bounds names no window at all, and
 //! is answered with the group's LATEST aggregated profile of that length — the profiles of
 //! the last window of that length the group has anything aggregated in, and not those of
-//! every window it retains. A window
-//! holding ONE readable profile is that profile: its bytes exactly as `PostAgentProfile`
-//! uploaded them when the caller accepts the representation their bytes are a document in
-//! and asks for no depth bound, and otherwise the same document re-encoded in an accepted
-//! representation, carrying no
-//! frame nested deeper than `maxDepth`. A profile the group has received but that the service has not
+//! every window it retains. A profile the group has received but that the service has not
 //! yet collected into an aggregated profile is not servable, so a window covered by no
 //! aggregated profile is the operation's 404. Reporting only: it writes nothing.
 //!
@@ -459,54 +455,22 @@ fn quality_of(accept: &str, representation: Representation) -> Option<f32> {
 /// under one of the two media types this service serves.
 const DOCUMENT_NESTING_LIMIT: u32 = 128;
 
-/// The bytes to serve and the media type to announce them under, for `profile` read with
-/// the request's `accept` and `max_depth`.
+/// The bytes to serve and the media type to announce them under, for a stored profile
+/// whose bytes this service can read no document in.
 ///
-/// The two inputs are what the caller asks the service to do with the aggregated profile:
-/// serve it in a representation the caller understands (`accept`), and leave out the
-/// frames below a depth (`maxDepth`, whose doc: "if the maxDepth is set to 2, then the
-/// aggregated profile contains representations of methods A and B"). Neither is a
-/// constraint on the request, so neither can refuse one: a profile the caller accepts in
-/// the representation its bytes already are a document in and asks for no depth bound on
-/// is served byte for byte, and anything else is the stored document re-encoded. The
-/// representation a stored profile is read in is the one its bytes are a document in
-/// ([`stored_document`]), never the one they were announced under, so both members are
-/// honoured for every stored profile this service can read at all. `contentType` reports
-/// the representation the served bytes are announced in, which is always one of the two
-/// this service serves ([`Representation::media_type`]) and never a media type carried
-/// over from an upload: bytes that are a document in NEITHER representation hold no frames
-/// this service can see — there is nothing in them to re-encode or to bound — so they are
-/// served as stored, announced under the representation their stored media type names, or
-/// under the default ([`Representation::announced`]) when it names neither.
-fn served_profile(
-    profile: &crate::state::AgentProfile,
-    accept: Option<&str>,
-    max_depth: Option<i32>,
-) -> (Vec<u8>, String) {
-    let Some((stored, document)) = stored_document(profile) else {
-        // Bytes that are a document in neither representation: served as stored, and
-        // announced under the representation this service serves that their stored media
-        // type names — the default where it names neither, since a media type this service
-        // does not serve is not one `contentType` can report.
-        return (
-            profile.bytes.clone(),
-            Representation::announced(&profile.content_type)
-                .media_type()
-                .to_string(),
-        );
-    };
-    // The stored bytes, announced under the representation they ARE a document in: the
-    // answer whenever the document itself is not to be changed, and the one left when a
-    // document that was read cannot be written back out.
-    let as_read = || (profile.bytes.clone(), stored.media_type().to_string());
-
-    // The caller accepts the representation the profile already is a document in and asks
-    // for no depth bound: nothing is to be done to the document, so the stored bytes
-    // themselves are the answer.
-    if kept_depth(max_depth).is_none() && wanted_representation(stored, accept) == stored {
-        return as_read();
-    }
-    written(&document, stored, accept, max_depth).unwrap_or_else(as_read)
+/// Such bytes hold no frames this service can see — there is nothing in them to combine,
+/// re-encode or bound, and nothing to state a window on — so they are served exactly as
+/// they are stored. `contentType` still reports one of the two representations this
+/// service serves ([`Representation::media_type`]) and never a media type carried over
+/// from an upload: the representation the stored media type names, or the default
+/// ([`Representation::announced`]) when it names neither.
+fn served_as_stored(profile: &crate::state::AgentProfile) -> (Vec<u8>, String) {
+    (
+        profile.bytes.clone(),
+        Representation::announced(&profile.content_type)
+            .media_type()
+            .to_string(),
+    )
 }
 
 /// The call-stack depth a request bounds the served profile to, as a count of container
@@ -527,92 +491,223 @@ fn wanted_representation(stored: Representation, accept: Option<&str>) -> Repres
         .unwrap_or(stored)
 }
 
-/// `document` written out for a request that accepts `accept` and bounds the call-stack
-/// depth to `max_depth`, with the media type the written bytes are announced under — or
-/// `None` when the document cannot be bounded or written out at all.
+/// `document` written out in the representation a request accepting `accept` is served
+/// in, with the media type the written bytes are announced under — or `None` when it has
+/// no form in that representation.
 ///
-/// `stored` is the representation the document is already a document in, which is the one
-/// it is written in where the request accepts it. This is the one place the two members
-/// saying what to DO with an aggregated profile are applied, so a single stored profile
-/// ([`served_profile`]) and a combination of several ([`served_aggregate`]) honour them
-/// identically.
+/// `stored` is the representation the document's data is already a document in, which is
+/// the one it is written in where the request accepts it.
 fn written(
     document: &Element,
     stored: Representation,
     accept: Option<&str>,
-    max_depth: Option<i32>,
 ) -> Option<(Vec<u8>, String)> {
     let wanted = wanted_representation(stored, accept);
-    // No `maxDepth` bounds no depth, so the whole document is kept — up to the nesting
-    // this operation reads at all.
-    let keep = kept_depth(max_depth).unwrap_or(u32::MAX);
-    let document = bounded(document, keep, DOCUMENT_NESTING_LIMIT)?;
     Some((
-        encoded(&document, wanted)?,
+        encoded(document, wanted)?,
         wanted.media_type().to_string(),
     ))
 }
 
+/// The window the aggregated profile served for a RANGE covers: the part of the requested
+/// range the aggregated profiles `held` actually cover, or `None` when they cover none of
+/// it.
+///
+/// A free-form range names no aggregation period, so the windows its data is assembled
+/// from are the finest ones a posted profile is collected into
+/// ([`crate::state::finest_aggregation_period_seconds`], the resolution every other
+/// reader of such a range uses). The window served is those windows' span narrowed to the
+/// range the request asked about, which is what the operation's doc describes: "if the
+/// requested time range is from 00:00 to 00:20, and the existing aggregated profiles are
+/// from 00:15 and 00:25, then the aggregated profiles from 00:15 to 00:20 are returned" —
+/// the data's own window start where it is inside the request's range, and the request's
+/// bound where the data runs past it. A range with an open side is bounded by the data
+/// alone, since nothing was asked for on that side.
+fn range_window(
+    held: &[&crate::state::AgentProfile],
+    start: Option<::aws_smithy_types::DateTime>,
+    end: Option<::aws_smithy_types::DateTime>,
+) -> Option<(::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime)> {
+    let period_seconds = crate::state::finest_aggregation_period_seconds();
+    let window_of = |profile: &crate::state::AgentProfile| {
+        let window_start =
+            crate::state::aggregation_window_start(profile.period_start, period_seconds);
+        (
+            window_start,
+            crate::state::shifted(
+                window_start,
+                crate::state::span_nanos(Duration::from_secs(
+                    u64::try_from(period_seconds).unwrap_or(0),
+                )),
+            ),
+        )
+    };
+    let covered_from = held
+        .iter()
+        .map(|profile| window_of(profile).0)
+        .min_by_key(|at| crate::state::instant_key(*at))?;
+    let covered_to = held
+        .iter()
+        .map(|profile| window_of(profile).1)
+        .max_by_key(|at| crate::state::instant_key(*at))?;
+    let later = |left: ::aws_smithy_types::DateTime, right: ::aws_smithy_types::DateTime| {
+        if crate::state::instant_key(left) >= crate::state::instant_key(right) {
+            left
+        } else {
+            right
+        }
+    };
+    let earlier = |left: ::aws_smithy_types::DateTime, right: ::aws_smithy_types::DateTime| {
+        if crate::state::instant_key(left) <= crate::state::instant_key(right) {
+            left
+        } else {
+            right
+        }
+    };
+    Some((
+        start.map_or(covered_from, |asked| later(covered_from, asked)),
+        end.map_or(covered_to, |asked| earlier(covered_to, asked)),
+    ))
+}
+
+/// The member an aggregated profile states the START of the window it covers under: the
+/// same member a submitted agent profile states its own period's start under
+/// ([`super::post_agent_profile::PROFILE_START_MEMBER`]), since both documents state the
+/// period they describe under one name — the aggregated one as an instant
+/// ([`crate::state::iso8601`]), the submitted one as the epoch milliseconds its agent
+/// wrote.
+const WINDOW_START_MEMBER: &str = super::post_agent_profile::PROFILE_START_MEMBER;
+
+/// The member an aggregated profile states the END of the window it covers under.
+const WINDOW_END_MEMBER: &str = "end";
+
+/// The member an aggregated profile states what the AGGREGATION holds under.
+const AGGREGATED_METADATA_MEMBER: &str = "aggregatedMetadata";
+
+/// The member of [`AGGREGATED_METADATA_MEMBER`] that counts the agents whose profiles the
+/// aggregation holds.
+const REPORTED_AGENTS_MEMBER: &str = "numReportedAgents";
+
+/// `combination` as the AGGREGATED PROFILE of the window `window`, holding the data of
+/// `reported_agents` reporting agents.
+///
+/// An aggregated profile is the service's own document, not a copy of an upload: the
+/// service "collects posted agent profiles for a profiling group into aggregated
+/// profiles", so what it serves states the WINDOW it covers and what the aggregation of
+/// that window holds, while the submitted documents contribute the profiling data. The
+/// `AggregatedProfile` blob the operation returns carries no modelled schema, so the
+/// document's own members are recorded behaviour: the window is stated as the two
+/// instants `start` and `end`, in the ISO 8601 form with the millisecond field this
+/// service states every instant in ([`crate::state::iso8601`]) — and NOT as the epoch
+/// milliseconds a submitted profile states its own period in — beside an
+/// `aggregatedMetadata` object whose `numReportedAgents` counts the agents that reported
+/// into the window.
+///
+/// The three members are the aggregation's own, so they are stated whatever the combined
+/// documents said about themselves: a member of that name already in the combination is
+/// REPLACED where it sits, which is what keeps a served document's member order the one
+/// the uploads wrote, and a member none of them stated is appended. Every other member of
+/// the combination is left exactly as the profiles' data combined into it.
+///
+/// `reported_agents` is counted by the caller ([`served_aggregate`]) as the number of
+/// submissions the window holds, which is as close as this service can come to the
+/// DISTINCT agents that reported into it: `PostAgentProfile` carries no agent identity —
+/// neither its input nor the profile document it accepts has a member naming the agent or
+/// the profiling instance — so the only identity the store holds for a submission is the
+/// submission itself, and one agent posting twice into a window is counted twice. The
+/// identities a group does hold ([`crate::state::AgentReport`], what each profiling
+/// instance reported with its latest `ConfigureAgent` call) say nothing about WHICH
+/// instance a later submission came from, so they cannot narrow the count either.
+fn aggregated(
+    combination: &Element,
+    window: (::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime),
+    reported_agents: usize,
+) -> Element {
+    let (start, end) = window;
+    let stated: [(&str, Element); 3] = [
+        (
+            WINDOW_START_MEMBER,
+            Element::from(crate::state::iso8601(start)),
+        ),
+        (WINDOW_END_MEMBER, Element::from(crate::state::iso8601(end))),
+        (
+            AGGREGATED_METADATA_MEMBER,
+            Element::from(Struct::from_iter([(
+                ::ion_rs::Symbol::from(REPORTED_AGENTS_MEMBER),
+                Element::from(i64::try_from(reported_agents).unwrap_or(i64::MAX)),
+            )])),
+        ),
+    ];
+    // A profile document's root is a struct — `PostAgentProfile` accepts no other root —
+    // so a combination of them is one too; anything else holds no member to state the
+    // window on and is left as it is.
+    let IonValue::Struct(fields) = combination.value() else {
+        return combination.clone();
+    };
+    let mut members: Vec<(::ion_rs::Symbol, Element)> = fields
+        .fields()
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    for (name, value) in stated {
+        match members
+            .iter_mut()
+            .find(|(member, _)| member.text() == Some(name))
+        {
+            Some(member) => member.1 = value,
+            None => members.push((::ion_rs::Symbol::from(name), value)),
+        }
+    }
+    Element::from(IonValue::Struct(Struct::from_iter(members)))
+        .with_annotations(combination.annotations().iter().cloned())
+}
+
 /// The bytes to serve and the media type to announce them under, for the aggregated
-/// profile the stored profiles `profiles` — every profile the request's aggregated profile
-/// holds, oldest first — were collected into, read with the request's `accept` and
+/// profile of the window `window` that the stored profiles `profiles` — every profile that
+/// window holds, oldest first — were collected into, read with the request's `accept` and
 /// `max_depth`.
 ///
-/// The aggregated profile of a range is ALL of them, not one of them: the service
+/// The aggregated profile of a window holds ALL of them, not one of them: the service
 /// "collects posted agent profiles for a profiling group into aggregated profiles", an
 /// aggregation period's profile "contains profiles posted by the agent" during that
 /// period, and a range covering several of them is answered with "existing aggregated
 /// profiles from the requested time range and return them as one aggregated profile". So
-/// the profiles' documents are combined ([`combined`]) and the combination is the
-/// aggregated profile the request's `accept` and `maxDepth` are then applied to by the one
-/// writer a single stored profile goes through ([`written`]).
+/// the profiles' documents are combined ([`combined`]), the combination is bounded to the
+/// depth the request asks for, and the result becomes the
+/// aggregated profile of the window ([`aggregated`]) that is then written out in a
+/// representation the request accepts ([`written`]).
 ///
-/// A range holding ONE profile this service can read as a document has nothing to combine
-/// that profile with, so it is served as [`served_profile`] serves it — its stored bytes
-/// where the request asks for nothing to be done to them. A profile whose bytes are a
-/// document in neither representation holds no frames this service can see, so it
-/// contributes none to the combination; where NOT ONE of the range's profiles is readable
-/// there is no combination to write out, and the most recently received of them is served
-/// as it is stored.
+/// A profile whose bytes are a document in neither representation holds no frames this
+/// service can see, so it contributes none to the combination; where NOT ONE of the
+/// window's profiles is readable there is no document to aggregate at all, and the most
+/// recently received of them is served as it is stored ([`served_as_stored`]).
 fn served_aggregate(
     profiles: &[crate::state::AgentProfile],
     accept: Option<&str>,
     max_depth: Option<i32>,
+    window: (::aws_smithy_types::DateTime, ::aws_smithy_types::DateTime),
 ) -> (Vec<u8>, String) {
-    let read: Vec<(&crate::state::AgentProfile, Representation, Element)> = profiles
+    let read: Vec<(Representation, Element)> = profiles
         .iter()
-        .filter_map(|profile| {
-            stored_document(profile)
-                .map(|(representation, document)| (profile, representation, document))
-        })
+        .filter_map(stored_document)
         .collect();
 
-    // The answer for a range with nothing to combine: the one profile the aggregated
-    // profile is built from, served as [`served_profile`] serves it — the readable one
-    // where there is one, and otherwise the most recently received of the profiles the
-    // range holds, whose bytes are no document this service can combine anything with.
-    let alone = || {
-        let single = read
-            .first()
-            .map(|(profile, _, _)| *profile)
-            .or_else(|| profiles.last());
-        match single {
-            Some(profile) => served_profile(profile, accept, max_depth),
-            // Unreachable: a range holding no profile at all is the operation's 404,
-            // answered before anything is read. An empty range still has an empty answer
-            // rather than a panic, announced under the representation nothing else names.
-            None => (Vec::new(), Representation::DEFAULT.media_type().to_string()),
-        }
+    // The answer where there is no document to aggregate, and the one left where the
+    // aggregated document cannot be written out at all: the most recently received
+    // profile of the window, exactly as it is stored.
+    let as_stored = || match profiles.last() {
+        Some(profile) => served_as_stored(profile),
+        // Unreachable: a window holding no profile at all is the operation's 404,
+        // answered before anything is read. An empty window still has an empty answer
+        // rather than a panic, announced under the representation nothing else names.
+        None => (Vec::new(), Representation::DEFAULT.media_type().to_string()),
     };
-    let Some(newest) = read.last().filter(|_| read.len() > 1) else {
-        return alone();
+    // The window's most recent contributing profile decides the representation a request
+    // accepting both leaves the aggregated document in: the document is the service's
+    // own, so it has no stored bytes of its own to keep.
+    let Some((stored, _)) = read.last() else {
+        return as_stored();
     };
-    // The range's most recent contributing profile: its representation is what a request
-    // accepting both leaves the combination in — a combination of several documents has no
-    // stored bytes of its own to keep — and it is the profile left to serve where the
-    // combination cannot be written out at all.
-    let (newest_profile, stored) = (newest.0, newest.1);
-    let latest = || served_profile(newest_profile, accept, max_depth);
+    let stored = *stored;
 
     // The combination, folded oldest first, so the value a later profile reports for
     // something two of them cannot both state is the one that stands. Its size is the sum
@@ -620,7 +715,7 @@ fn served_aggregate(
     // nesting is bounded by [`DOCUMENT_NESTING_LIMIT`] — the bound both documents were
     // read within.
     let mut combination: Option<Element> = None;
-    for (_, _, document) in &read {
+    for (_, document) in &read {
         combination = Some(match combination {
             None => document.clone(),
             Some(earlier) => match combined(&earlier, document, DOCUMENT_NESTING_LIMIT, true) {
@@ -628,17 +723,33 @@ fn served_aggregate(
                 // Unreachable for documents this operation read at all: both were read
                 // within the nesting bound, so their combination is within it too. A
                 // combination that is not is no document to serve.
-                None => return latest(),
+                None => return as_stored(),
             },
         });
     }
-    let Some(document) = combination else {
-        return latest();
+    let Some(combination) = combination else {
+        return as_stored();
     };
 
-    // What the request asks be done with the aggregated profile, applied to the
-    // combination by the one writer a single stored profile goes through ([`written`]).
-    written(&document, stored, accept, max_depth).unwrap_or_else(latest)
+    // What the request asks be done with the profiling data: leave out the frames below
+    // the depth it bounds the call stacks to (`maxDepth`, whose doc: "if the maxDepth is
+    // set to 2, then the aggregated profile contains representations of methods A and
+    // B"). It bounds the stacks of the DATA, so it is applied to the combination and not
+    // to the members the aggregation states about itself: a caller asking for a shallow
+    // profile still learns which window it covers. No `maxDepth` bounds no depth, so the
+    // whole combination is kept — up to the nesting this operation reads at all.
+    let keep = kept_depth(max_depth).unwrap_or(u32::MAX);
+    let Some(data) = bounded(&combination, keep, DOCUMENT_NESTING_LIMIT) else {
+        return as_stored();
+    };
+
+    // The aggregated profile of the window. The agents the aggregation reports are
+    // counted by the submissions it covers, which is the only identity this service has
+    // for them ([`aggregated`]) — a profile whose bytes this service cannot read among
+    // them: its agent reported into the window even where the data it sent holds no frame
+    // this service can see.
+    let document = aggregated(&data, window, profiles.len());
+    written(&document, stored, accept).unwrap_or_else(as_stored)
 }
 
 /// `into` and `from` combined into the ONE value an aggregated profile states for them, or
@@ -1193,7 +1304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // document is read or written: re-encoding, combining or bounding documents a
         // caller posted is work whose size that caller chose, and holding the store's lock
         // across it would make one profile's size every other caller's latency.
-        let stored: Vec<crate::state::AgentProfile> = {
+        let (stored, window) = {
             let guard = state.lock();
             let group = guard.groups.get(&input.profiling_group_name).ok_or_else(|| {
                 GetProfileErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
@@ -1209,28 +1320,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // service states it with its own fixed text — the only thing distinguishing
             // the two, since both are 404 `ResourceNotFoundException`.
             let at = crate::state::now();
-            let profiles: Vec<crate::state::AgentProfile> = match requested {
-                Requested::Range { start, end } => group.aggregated_profiles_in(start, end, at),
-                Requested::Latest { span } => group.latest_aggregated_profiles(span, at),
-            }
-            .into_iter()
-            .cloned()
-            .collect();
-            if profiles.is_empty() {
+            let selected: Option<(Vec<&crate::state::AgentProfile>, _)> = match requested {
+                Requested::Range { start, end } => {
+                    let held = group.aggregated_profiles_in(start, end, at);
+                    range_window(&held, start, end).map(|window| (held, window))
+                }
+                // A length alone names the group's LATEST aggregated profile of that
+                // length, and the window that profile covers is the aligned one the store
+                // selected it by.
+                Requested::Latest { span } => {
+                    group.latest_aggregated_window(span, at).map(|(start, held)| {
+                        let length = crate::state::span_nanos(span);
+                        (held, (start, crate::state::shifted(start, length)))
+                    })
+                }
+            };
+            let Some((held, window)) = selected.filter(|(held, _)| !held.is_empty()) else {
                 return Err(GetProfileErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: crate::state::NO_PROFILES_IN_TIME_RANGE.to_string(),
                     },
                 )
                 .into());
-            }
-            profiles
+            };
+            let profiles: Vec<crate::state::AgentProfile> = held.into_iter().cloned().collect();
+            (profiles, window)
         };
 
         // What the caller asked the service to do with the aggregated profile: serve it
         // in a representation the request accepts, carrying no frame deeper than
-        // `maxDepth`. Both are stated once, in [`served_profile`], over the aggregated
-        // profile the window's profiles combine into ([`served_aggregate`]).
+        // `maxDepth`. Both are stated once, in [`written`], over the aggregated
+        // profile of the window the request selected ([`served_aggregate`]).
         //
         // Reading, combining and writing the documents is CPU work over payloads whose
         // size the caller chose (bounded by the store's retention caps and by
@@ -1242,7 +1362,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let accept = input.accept.clone();
         let max_depth = input.max_depth;
         let served = ::tokio::task::spawn_blocking(move || {
-            served_aggregate(&stored, accept.as_deref(), max_depth)
+            served_aggregate(&stored, accept.as_deref(), max_depth, window)
         })
         .await;
         let (bytes, content_type) = served.map_err(|_| {

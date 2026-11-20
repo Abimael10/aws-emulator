@@ -25,8 +25,9 @@
 //! aggregation is let fall due through the one shared helper every suite uses.
 
 use crate::profiling_group_lifecycle::{
-    Answer, Harness, PROFILE_START_MILLIS, element_of, ion_profile, json_profile,
-    servable_window, servable_window_from_start, servable_window_to_end,
+    Answer, Harness, aggregation_of, element_of, ion_profile, json_profile,
+    pending_profile_start_millis, profile_data, servable_window, servable_window_from_start,
+    servable_window_to_end,
 };
 
 /// The fixed text a 404 about absent profile DATA carries
@@ -101,8 +102,11 @@ struct Row {
 impl Row {
     /// The bytes of post `post`: a profile stating its own `start`, in the representation
     /// this row posts under, so no two posts of a row carry the same bytes.
+    ///
+    /// The period stated is the one the service is still collecting into, which is what
+    /// makes the aggregation this suite is about PENDING.
     fn posted_bytes(&self, post: usize) -> Vec<u8> {
-        let start = PROFILE_START_MILLIS + i64::try_from(post).unwrap_or(0);
+        let start = pending_profile_start_millis() + i64::try_from(post).unwrap_or(0);
         if self.content_type == "application/x-amzn-ion" {
             ion_profile(start, self.filler)
         } else {
@@ -283,26 +287,24 @@ async fn a_posted_profile_is_served_only_once_its_aggregation_is_due() {
             served.status,
             String::from_utf8_lossy(&served.body)
         );
-        // A row's posts differ only in the start each profile states, so the document the
-        // window's profiles combine into is the one the FIRST of them states (the earliest
-        // start, which is what the combination covers from), and a row posting one profile
-        // is served that profile's bytes exactly as they were uploaded.
-        let expected = row.posted_bytes(0);
-        if row.posts == 1 {
-            assert_eq!(
-                served.body, expected,
-                "case {case:?}: GetProfile must return the posted bytes ({} bytes)",
-                expected.len()
-            );
-        } else {
-            assert_eq!(
-                element_of(&served.body),
-                element_of(&expected),
-                "case {case:?}: expected the {} posted profiles combined, got {}",
-                row.posts,
-                element_of(&served.body)
-            );
-        }
+        // A row's posts differ only in the start each profile states, so the DATA the
+        // window's profiles combine into is the data of the first of them; the window the
+        // served document states is the aggregation's own, not any upload's.
+        let expected = profile_data(&row.posted_bytes(0));
+        assert_eq!(
+            profile_data(&served.body),
+            expected,
+            "case {case:?}: expected the posted data, got {}",
+            element_of(&served.body)
+        );
+        let (_, _, reported_agents) = aggregation_of(case, &served.body);
+        assert_eq!(
+            reported_agents,
+            i64::try_from(row.posts).unwrap_or(0),
+            "case {case:?}: expected the window's {} submissions to be reported, got {}",
+            row.posts,
+            element_of(&served.body)
+        );
         // The aggregation a window owes falls due only once THAT window has closed, so
         // each period's aggregated profile is reported once the window OF THAT PERIOD
         // holding the receipt has closed: the receipt is aged past that window before the
@@ -336,7 +338,11 @@ async fn reading_a_pending_aggregation_changes_nothing_a_later_caller_sees() {
         201,
         "create must succeed"
     );
-    let bytes = br#"{"start":1600000000000,"frames":["A"]}"#.to_vec();
+    let bytes = format!(
+        "{{\"start\":{},\"frames\":[\"A\"]}}",
+        pending_profile_start_millis()
+    )
+    .into_bytes();
     assert_eq!(
         harness
             .post_agent_profile(name, "application/json", None, bytes.clone())
@@ -390,7 +396,9 @@ async fn reading_a_pending_aggregation_changes_nothing_a_later_caller_sees() {
         "two reads of one aggregated profile must agree"
     );
     assert_eq!(
-        first.body, bytes,
-        "GetProfile must return the posted bytes unchanged"
+        profile_data(&first.body),
+        profile_data(&bytes),
+        "the aggregated profile must hold the posted data, got {}",
+        element_of(&first.body)
     );
 }
