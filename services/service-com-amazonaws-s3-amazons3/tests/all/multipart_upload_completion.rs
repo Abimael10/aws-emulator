@@ -31,6 +31,12 @@
 //!    `PreconditionFailed` once the key holds an object, `If-Match` serves exactly the
 //!    tag the key holds, and an `If-Match` at a key holding nothing — which has no tag to
 //!    match — is refused 404 `NoSuchKey`.
+//! 6. A completion of an upload whose object-level checksum is COMPOSED of its parts'
+//!    checksums must state every listed part's own checksum under the upload's algorithm: a
+//!    list that leaves one out is refused 400 `InvalidRequest` naming the algorithm and the
+//!    part, writes no object, and leaves the upload in progress so the completion succeeds
+//!    once the checksums are supplied. An upload whose checksum is over the whole object
+//!    composes nothing from the parts and requires none of them.
 
 use md5::{Digest, Md5};
 use smithy_server_runtime::MultiServiceRouter;
@@ -217,11 +223,35 @@ fn reported_parts(answer: &Answer) -> usize {
 /// ([`super::multipart_upload_event_notifications`]) completes its uploads with the same
 /// payload rather than keeping a second copy of the parts list.
 pub(crate) fn completion_payload(parts: &[(i32, String)]) -> String {
+    let named: Vec<NamedPart> = parts
+        .iter()
+        .map(|(number, etag)| (*number, etag.clone(), None))
+        .collect();
+    checksummed_completion_payload(&named)
+}
+
+/// One part a completion's list names: its number, the entity tag the part upload answered,
+/// and the per-part checksum element the list carries for it as `(element name, value)` —
+/// `None` for a part the list states no checksum of.
+pub(crate) type NamedPart = (i32, String, Option<(String, String)>);
+
+/// The same parts-list payload, each part carrying the per-part checksum element a row gives
+/// it as `(element name, value)` — `Checksum<ALGORITHM>` and the Base64 digest of that
+/// part's own bytes.
+///
+/// An upload whose object-level checksum is COMPOSED of its parts' checksums requires one of
+/// these elements on every part of the list, so a suite that completes such an upload builds
+/// its payload here.
+pub(crate) fn checksummed_completion_payload(parts: &[NamedPart]) -> String {
     let mut payload = String::from("<CompleteMultipartUpload>");
-    for (part_number, etag) in parts {
+    for (part_number, etag, checksum) in parts {
         payload.push_str(&format!(
-            "<Part><PartNumber>{part_number}</PartNumber><ETag>{etag}</ETag></Part>"
+            "<Part><PartNumber>{part_number}</PartNumber><ETag>{etag}</ETag>"
         ));
+        if let Some((element, value)) = checksum {
+            payload.push_str(&format!("<{element}>{value}</{element}>"));
+        }
+        payload.push_str("</Part>");
     }
     payload.push_str("</CompleteMultipartUpload>");
     payload
@@ -915,11 +945,21 @@ async fn a_completed_object_carries_the_checksum_its_upload_was_initiated_with()
         }
         let upload_id = initiate_with(&router, name, key, &headers).await;
         let parts = [filler(MIN_MULTIPART_PART_BYTES, 23), b"the tail".to_vec()];
-        let mut named: Vec<(i32, String)> = Vec::new();
+        // Each part is named with its own digest under the upload's algorithm, which a
+        // completion of a COMPOSITE upload requires of every part of its list; derived here
+        // from the part's bytes ([`super::multipart_part_checksums::digest`]).
+        let mut named: Vec<NamedPart> = Vec::new();
         for (index, body) in parts.iter().enumerate() {
             let number = i32::try_from(index).expect("a part index must be a part number") + 1;
             let etag = upload_part(&router, name, key, &upload_id, number, body).await;
-            named.push((number, etag));
+            named.push((
+                number,
+                etag,
+                Some((
+                    format!("Checksum{algorithm}"),
+                    super::multipart_part_checksums::digest(algorithm, body),
+                )),
+            ));
         }
         let assembled: Vec<u8> = parts.concat();
 
@@ -928,7 +968,7 @@ async fn a_completed_object_carries_the_checksum_its_upload_was_initiated_with()
             name,
             key,
             &upload_id,
-            &completion_payload(&named),
+            &checksummed_completion_payload(&named),
             &[],
         )
         .await;
@@ -1101,17 +1141,24 @@ async fn a_read_of_the_object_s_attributes_reports_the_parts_it_was_assembled_fr
         b"the tail of it".to_vec(),
     ];
     let numbers = [1, 4, 9];
-    let mut named: Vec<(i32, String)> = Vec::new();
+    let mut named: Vec<NamedPart> = Vec::new();
     for (number, body) in numbers.iter().zip(parts.iter()) {
         let etag = upload_part(&router, name, key, &upload_id, *number, body).await;
-        named.push((*number, etag));
+        named.push((
+            *number,
+            etag,
+            Some((
+                String::from("ChecksumSHA256"),
+                super::multipart_part_checksums::digest("SHA256", body),
+            )),
+        ));
     }
     let completed = complete(
         &router,
         name,
         key,
         &upload_id,
-        &completion_payload(&named),
+        &checksummed_completion_payload(&named),
         &[],
     )
     .await;
@@ -1201,8 +1248,8 @@ async fn a_read_of_the_object_s_attributes_reports_the_parts_it_was_assembled_fr
         );
     }
 
-    // One part per page: the page is the parts above the marker, and a page with parts left
-    // over reports the last one it carried as the next marker.
+    // One part per page: the page is the parts above the marker, and every page reports the
+    // marker it began after beside the one a next page resumes after.
     let first = get_object_attributes(
         &router,
         name,
@@ -1216,6 +1263,13 @@ async fn a_read_of_the_object_s_attributes_reports_the_parts_it_was_assembled_fr
         Some("true"),
         "case \"a page of one part\": expected a truncated page, got {:?}",
         first.element("IsTruncated")
+    );
+    assert_eq!(
+        first.element("PartNumberMarker").as_deref(),
+        Some("0"),
+        "case \"a page of one part\": a page the request named no marker for began after \
+         part 0, got {:?}",
+        first.element("PartNumberMarker")
     );
     assert_eq!(
         first.element("NextPartNumberMarker").as_deref(),
@@ -1246,9 +1300,25 @@ async fn a_read_of_the_object_s_attributes_reports_the_parts_it_was_assembled_fr
             .map(|(number, _, _)| *number)
             .collect::<Vec<i32>>(),
         vec![4, 9],
-        "case \"the parts above the marker\": expected the parts after 1, got {:?}",
+        "case {:?}: expected the parts after 1, got {:?}",
+        "the parts above the marker",
         reported_object_parts(&next, "ChecksumSHA256")
     );
+    // The last page is not truncated, and still reports both markers: where it began, and
+    // the part a listing resuming from it would continue after.
+    for (element, expected) in [
+        ("IsTruncated", "false"),
+        ("PartNumberMarker", "1"),
+        ("NextPartNumberMarker", "9"),
+    ] {
+        assert_eq!(
+            next.element(element).as_deref(),
+            Some(expected),
+            "case {:?}: expected {element} {expected:?}, got {:?}",
+            "the parts above the marker",
+            next.element(element)
+        );
+    }
 
     // An object one write stored whole was assembled from no parts, so there is no
     // collection to report for it. Its CHECKSUM is the default S3 adds to an upload that
@@ -1526,5 +1596,435 @@ async fn a_conditional_completion_is_judged_against_what_the_key_holds() {
                 text(&listed)
             );
         }
+    }
+}
+
+/// One row of the per-part checksum table: the `ChecksumAlgorithm` the upload is initiated
+/// with (none at all for a row that configures no checksum), the `ChecksumType` it asks for,
+/// the parts to upload as `(part number, bytes)` in ascending order, which part's checksum
+/// the first completion leaves out, and what the completion must then carry.
+struct PartChecksumCase {
+    case: &'static str,
+    algorithm: Option<&'static str>,
+    requested_type: Option<&'static str>,
+    parts: Vec<(i32, Vec<u8>)>,
+    omitted: i32,
+    /// Whether the completion that left that part's checksum out must be REFUSED, which is
+    /// so exactly when the upload's checksum is composed of its parts' checksums.
+    refused: bool,
+    /// The `Checksum*` element the completed object reports, and the `ChecksumType` beside
+    /// it — for a row naming no algorithm, the ones the default checksum every stored object
+    /// carries reports.
+    expected_element: &'static str,
+    expected_type: &'static str,
+}
+
+/// The per-part checksum table. The rows differ along what the rule generalises over: the
+/// algorithm (five of the ten `ChecksumAlgorithm` values publishes, including ones no
+/// recorded case named), how the checksum type was settled (taken from the algorithm, asked
+/// for explicitly, and the algorithm that is always a full-object checksum), how many parts
+/// the list names (one, two, three) and whether their numbers are consecutive, and WHICH
+/// part's checksum is left out (the only one, the first, a middle one, the last).
+fn part_checksum_cases() -> Vec<PartChecksumCase> {
+    vec![
+        PartChecksumCase {
+            case: "a two-part CRC32 upload missing the first part's checksum",
+            algorithm: Some("CRC32"),
+            requested_type: None,
+            parts: vec![
+                (1, filler(MIN_MULTIPART_PART_BYTES, 41)),
+                (2, b"the tail bytes".to_vec()),
+            ],
+            omitted: 1,
+            refused: true,
+            expected_element: "ChecksumCRC32",
+            expected_type: "COMPOSITE",
+        },
+        PartChecksumCase {
+            case: "a two-part SHA256 upload missing the last part's checksum",
+            algorithm: Some("SHA256"),
+            requested_type: None,
+            parts: vec![
+                (1, filler(MIN_MULTIPART_PART_BYTES, 43)),
+                (2, b"and the rest of it".to_vec()),
+            ],
+            omitted: 2,
+            refused: true,
+            expected_element: "ChecksumSHA256",
+            expected_type: "COMPOSITE",
+        },
+        PartChecksumCase {
+            case: "a three-part MD5 upload with gapped numbers, missing the middle one's",
+            algorithm: Some("MD5"),
+            requested_type: None,
+            parts: vec![
+                (2, filler(MIN_MULTIPART_PART_BYTES, 47)),
+                (5, filler(MIN_MULTIPART_PART_BYTES, 53)),
+                (9, b"the last of three".to_vec()),
+            ],
+            omitted: 5,
+            refused: true,
+            expected_element: "ChecksumMD5",
+            expected_type: "COMPOSITE",
+        },
+        PartChecksumCase {
+            case: "a one-part SHA1 upload missing its only part's checksum",
+            algorithm: Some("SHA1"),
+            requested_type: None,
+            parts: vec![(1, b"the whole object in one part".to_vec())],
+            omitted: 1,
+            refused: true,
+            expected_element: "ChecksumSHA1",
+            expected_type: "COMPOSITE",
+        },
+        PartChecksumCase {
+            case: "an XXHASH64 upload asked to compose its checksum explicitly",
+            algorithm: Some("XXHASH64"),
+            requested_type: Some("COMPOSITE"),
+            parts: vec![(3, b"one part, composed".to_vec())],
+            omitted: 3,
+            refused: true,
+            expected_element: "ChecksumXXHASH64",
+            expected_type: "COMPOSITE",
+        },
+        PartChecksumCase {
+            case: "a CRC32 upload whose checksum is over the whole object",
+            algorithm: Some("CRC32"),
+            requested_type: Some("FULL_OBJECT"),
+            parts: vec![(1, b"whole-object checksummed bytes".to_vec())],
+            omitted: 1,
+            refused: false,
+            expected_element: "ChecksumCRC32",
+            expected_type: "FULL_OBJECT",
+        },
+        PartChecksumCase {
+            case: "the algorithm whose checksum is always a full-object one",
+            algorithm: Some("CRC64NVME"),
+            requested_type: None,
+            parts: vec![(1, b"always a full object checksum".to_vec())],
+            omitted: 1,
+            refused: false,
+            expected_element: "ChecksumCRC64NVME",
+            expected_type: "FULL_OBJECT",
+        },
+        PartChecksumCase {
+            case: "an upload initiated under no checksum algorithm at all",
+            algorithm: None,
+            requested_type: None,
+            parts: vec![(1, b"no checksum was configured for this".to_vec())],
+            omitted: 1,
+            refused: false,
+            expected_element: "ChecksumCRC64NVME",
+            expected_type: "FULL_OBJECT",
+        },
+    ]
+}
+
+/// RULE: a completion of an upload whose object-level checksum is COMPOSED of its parts'
+/// checksums must state each listed part's own checksum under the upload's algorithm; one
+/// that leaves a part's out is refused 400 `InvalidRequest`, naming the algorithm and the
+/// part, and leaves the upload in progress so the same completion succeeds once the
+/// checksums are supplied. An upload whose checksum is over the whole object composes
+/// nothing from the parts and requires none of them.
+#[tokio::test]
+async fn a_completion_of_a_composed_upload_requires_every_parts_checksum() {
+    for row in part_checksum_cases() {
+        let PartChecksumCase {
+            case,
+            algorithm,
+            requested_type,
+            parts,
+            omitted,
+            refused,
+            expected_element,
+            expected_type,
+        } = row;
+
+        let router = router();
+        let name = "multipart-part-checksum-requirement-bucket";
+        bucket(&router, name).await;
+        let key = "composed/assembled.bin";
+
+        let mut headers: Vec<(&str, &str)> = Vec::new();
+        if let Some(algorithm) = algorithm {
+            headers.push(("x-amz-checksum-algorithm", algorithm));
+        }
+        if let Some(requested) = requested_type {
+            headers.push(("x-amz-checksum-type", requested));
+        }
+        let upload_id = initiate_with(&router, name, key, &headers).await;
+
+        // Every part, named with the digest of its OWN bytes under the upload's algorithm —
+        // derived here from the bytes ([`super::multipart_part_checksums::digest`]), so the
+        // list states what the parts really are rather than what the service answered.
+        let mut full: Vec<NamedPart> = Vec::new();
+        for (number, body) in &parts {
+            let etag = upload_part(&router, name, key, &upload_id, *number, body).await;
+            let checksum = algorithm.map(|algorithm| {
+                (
+                    format!("Checksum{algorithm}"),
+                    super::multipart_part_checksums::digest(algorithm, body),
+                )
+            });
+            full.push((*number, etag, checksum));
+        }
+        // The same list with ONE part's checksum left out.
+        let missing: Vec<NamedPart> = full
+            .iter()
+            .cloned()
+            .map(|(number, etag, checksum)| match number == omitted {
+                true => (number, etag, None),
+                false => (number, etag, checksum),
+            })
+            .collect();
+
+        let first = complete(
+            &router,
+            name,
+            key,
+            &upload_id,
+            &checksummed_completion_payload(&missing),
+            &[],
+        )
+        .await;
+        let completed = match refused {
+            false => first,
+            true => {
+                assert_eq!(
+                    first.status,
+                    400,
+                    "case {case:?}: expected HTTP 400 from the completion that left part \
+                     {omitted}'s checksum out, got {} with body {:?}",
+                    first.status,
+                    text(&first)
+                );
+                assert_eq!(
+                    first.error_code(),
+                    "InvalidRequest",
+                    "case {case:?}: expected the error code InvalidRequest, got {:?}",
+                    first.error_code()
+                );
+                let named = algorithm.expect("a refused row names an algorithm");
+                let expected_message = format!(
+                    "The upload was created using a {} checksum. The complete request must \
+                     include the checksum for each part. It was missing for part {omitted} \
+                     in the request.",
+                    named.to_ascii_lowercase()
+                );
+                assert_eq!(
+                    first.error_message(),
+                    expected_message,
+                    "case {case:?}: expected {expected_message:?}, got {:?}",
+                    first.error_message()
+                );
+
+                // The refused completion assembled nothing: the key holds no object, and a
+                // read of it is the XML error document S3 answers a key that is not there
+                // with.
+                let absent = head_object(&router, name, key).await;
+                assert_eq!(
+                    absent.status,
+                    404,
+                    "case {case:?}: expected the key of a refused completion to hold \
+                     nothing, HeadObject answered {}",
+                    absent.status
+                );
+                assert_eq!(
+                    absent.header("content-type").as_deref(),
+                    Some("application/xml"),
+                    "case {case:?}: expected the error response to be typed \
+                     application/xml, got {:?}",
+                    absent.header("content-type")
+                );
+
+                // And the upload is still in progress with every part it held, so the same
+                // completion is re-sent with the checksums it left out.
+                let listed = list_parts(&router, name, key, &upload_id).await;
+                assert_eq!(
+                    listed.status,
+                    200,
+                    "case {case:?}: expected the upload to still be in progress, ListParts \
+                     answered {} with body {:?}",
+                    listed.status,
+                    text(&listed)
+                );
+                assert_eq!(
+                    reported_parts(&listed),
+                    parts.len(),
+                    "case {case:?}: expected the upload to still hold its {} parts, got {}",
+                    parts.len(),
+                    reported_parts(&listed)
+                );
+                complete(
+                    &router,
+                    name,
+                    key,
+                    &upload_id,
+                    &checksummed_completion_payload(&full),
+                    &[],
+                )
+                .await
+            }
+        };
+
+        assert_eq!(
+            completed.status,
+            200,
+            "case {case:?}: expected HTTP 200 from the completion naming every part's \
+             checksum, got {} with body {:?}",
+            completed.status,
+            text(&completed)
+        );
+        let bodies: Vec<Vec<u8>> = parts.iter().map(|(_, body)| body.clone()).collect();
+        for (element, expected) in [
+            ("Bucket", name.to_string()),
+            ("Key", key.to_string()),
+            ("ETag", expected_multipart_etag(&bodies)),
+        ] {
+            assert_eq!(
+                completed.element(element).as_deref(),
+                Some(expected.as_str()),
+                "case {case:?}: expected the result to report {element} {expected:?}, got \
+                 {:?}",
+                completed.element(element)
+            );
+        }
+        assert!(
+            completed
+                .element("Location")
+                .is_some_and(|location| location.ends_with(&format!("/{name}/{key}"))),
+            "case {case:?}: expected the result to locate the object it assembled, got {:?}",
+            completed.element("Location")
+        );
+
+        // The checksum the composed object carries: the algorithm's digest over its parts'
+        // digests with the part count after a dash, or the digest of the whole object with
+        // no suffix at all.
+        let expected_value = match expected_type {
+            "COMPOSITE" => {
+                let named = algorithm.expect("a composed row names an algorithm");
+                let mut digests: Vec<u8> = Vec::new();
+                for body in &bodies {
+                    digests.extend_from_slice(
+                        &::aws_smithy_types::base64::decode(super::multipart_part_checksums::digest(
+                            named, body,
+                        ))
+                        .expect("a Base64 digest"),
+                    );
+                }
+                format!(
+                    "{}-{}",
+                    super::multipart_part_checksums::digest(named, &digests),
+                    bodies.len()
+                )
+            }
+            _ => super::multipart_part_checksums::digest(
+                algorithm.unwrap_or("CRC64NVME"),
+                &bodies.concat(),
+            ),
+        };
+        assert_eq!(
+            completed.element(expected_element).as_deref(),
+            Some(expected_value.as_str()),
+            "case {case:?}: expected {expected_element} {expected_value:?}, got {:?}",
+            completed.element(expected_element)
+        );
+        assert_eq!(
+            completed.element("ChecksumType").as_deref(),
+            Some(expected_type),
+            "case {case:?}: expected ChecksumType {expected_type:?}, got {:?}",
+            completed.element("ChecksumType")
+        );
+        // The encryption the object is stored under, which a bucket that configured none is
+        // still on: "by default, all buckets have a default encryption configuration that
+        // uses server-side encryption with Amazon S3 managed keys"
+        // (`GetBucketEncryption`'s own documentation).
+        assert_eq!(
+            completed.header("x-amz-server-side-encryption").as_deref(),
+            Some("AES256"),
+            "case {case:?}: expected the completion to report the encryption the object is \
+             stored under, got {:?}",
+            completed.header("x-amz-server-side-encryption")
+        );
+
+        // The object is really there afterwards.
+        let stored = head_object(&router, name, key).await;
+        assert_eq!(
+            stored.status,
+            200,
+            "case {case:?}: expected the assembled object to read back, HeadObject answered \
+             {}",
+            stored.status
+        );
+    }
+}
+
+/// RULE, same rule from the other side: what a part has to carry is the checksum under the
+/// upload's OWN algorithm, so a part naming another algorithm's checksum is still missing
+/// the one the composition needs.
+#[tokio::test]
+async fn a_part_naming_another_algorithms_checksum_is_still_missing_the_uploads() {
+    let router = router();
+    let name = "multipart-other-algorithm-checksum-bucket";
+    bucket(&router, name).await;
+    let key = "composed/other-algorithm.bin";
+
+    // Each row names a checksum of an algorithm that is NOT the upload's.
+    for (case, algorithm, other) in [
+        ("a SHA256 checksum on a CRC32 upload", "CRC32", "SHA256"),
+        ("a CRC32 checksum on a SHA256 upload", "SHA256", "CRC32"),
+        ("a CRC32C checksum on a SHA1 upload", "SHA1", "CRC32C"),
+    ] {
+        let upload_id = initiate_with(
+            &router,
+            name,
+            key,
+            &[("x-amz-checksum-algorithm", algorithm)],
+        )
+        .await;
+        let body = b"one part, checksummed under the wrong algorithm".to_vec();
+        let etag = upload_part(&router, name, key, &upload_id, 1, &body).await;
+        let refused = complete(
+            &router,
+            name,
+            key,
+            &upload_id,
+            &checksummed_completion_payload(&[(
+                1,
+                etag,
+                Some((
+                    format!("Checksum{other}"),
+                    super::multipart_part_checksums::digest(other, &body),
+                )),
+            )]),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {case:?}: expected HTTP 400, got {} with body {:?}",
+            refused.status,
+            text(&refused)
+        );
+        let expected_message = format!(
+            "The upload was created using a {} checksum. The complete request must include \
+             the checksum for each part. It was missing for part 1 in the request.",
+            algorithm.to_ascii_lowercase()
+        );
+        assert_eq!(
+            refused.error_message(),
+            expected_message,
+            "case {case:?}: expected {expected_message:?}, got {:?}",
+            refused.error_message()
+        );
+        // The upload is untouched, so the next row starts from a key holding nothing.
+        let listed = list_parts(&router, name, key, &upload_id).await;
+        assert_eq!(
+            listed.status,
+            200,
+            "case {case:?}: expected the upload to still be in progress, got {}",
+            listed.status
+        );
     }
 }

@@ -441,9 +441,18 @@ async fn the_settled_type_is_the_one_the_completed_object_carries() {
         // Guide, *Amazon S3 multipart upload limits*).
         let body = b"the whole of this object arrived as one part".to_vec();
         let etag = upload_part(&router, name, &key, &upload_id, 1, &body).await;
+        // A completion of a COMPOSITE upload names each part's own digest, which is what its
+        // object-level checksum is composed of; a FULL_OBJECT upload's is not asked for one.
+        let part_checksum = match expected_type == COMPOSITE {
+            true => format!(
+                "<Checksum{algorithm}>{}</Checksum{algorithm}>",
+                super::multipart_part_checksums::digest(algorithm, &body)
+            ),
+            false => String::new(),
+        };
         let payload = format!(
             "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag>\
-             </Part></CompleteMultipartUpload>"
+             {part_checksum}</Part></CompleteMultipartUpload>"
         );
         let completed = send(
             &router,

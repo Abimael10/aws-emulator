@@ -21,8 +21,10 @@
 //! 4. A read is a read: two reads of one upload report the same thing, and neither changes
 //!    it.
 //! 5. A page of parts is the parts above `part-number-marker`, at most `max-parts` of them,
-//!    reporting the last part it carried as the next marker exactly when parts are left
-//!    over.
+//!    and carries BOTH pagination markers: the position the page began after (`0` when the
+//!    request named none) and the position a next page resumes after — the last part the
+//!    page carried, or the page's own marker when it carried none. `IsTruncated` is what
+//!    says whether parts are left over.
 //! 6. A request this emulator cannot serve as asked is refused rather than recorded: a part
 //!    number outside the published 1..=10,000 range with 400 `InvalidArgument`, a
 //!    `Content-MD5` that is not the digest of the bytes with 400 `BadDigest`, an upload id
@@ -405,10 +407,19 @@ async fn uploaded_parts_answer_their_own_tag_and_read_back_in_part_number_order(
         listed.element("IsTruncated")
     );
     assert_eq!(
-        listed.element("NextPartNumberMarker"),
-        None,
-        "a page that carried every part reports no next marker, got {:?}",
+        listed.element("NextPartNumberMarker").as_deref(),
+        recorded
+            .last()
+            .map(|(part_number, _, _)| part_number.to_string())
+            .as_deref(),
+        "a page reports the last part it carried as the next marker, got {:?}",
         listed.element("NextPartNumberMarker")
+    );
+    assert_eq!(
+        listed.element("PartNumberMarker").as_deref(),
+        Some("0"),
+        "a page the request named no marker for began after part 0, got {:?}",
+        listed.element("PartNumberMarker")
     );
 
     // A read is a read: the second one reports exactly what the first did.
@@ -538,13 +549,15 @@ async fn parts_belong_to_the_upload_they_were_uploaded_into() {
 }
 
 /// One row of the paging table: the case, the query it adds to the read, the part numbers
-/// the page must carry, whether it is truncated and the next marker it must report.
+/// the page must carry, whether it is truncated, and the two pagination markers it must
+/// report — the position it began after and the position a next page resumes after.
 struct PageCase {
     case: &'static str,
     query: &'static str,
     expected: Vec<i32>,
     truncated: bool,
-    next_marker: Option<&'static str>,
+    marker: &'static str,
+    next_marker: &'static str,
 }
 
 #[tokio::test]
@@ -584,56 +597,72 @@ async fn a_page_of_parts_is_the_parts_above_the_marker_bounded_by_max_parts() {
             query: "",
             expected: numbers.to_vec(),
             truncated: false,
-            next_marker: None,
+            marker: "0",
+            next_marker: "25",
         },
         PageCase {
             case: "a page of two from the start",
             query: "&max-parts=2",
             expected: vec![1, 4],
             truncated: true,
-            next_marker: Some("4"),
+            marker: "0",
+            next_marker: "4",
         },
         PageCase {
             case: "a page of two above part 4",
             query: "&max-parts=2&part-number-marker=4",
             expected: vec![9, 16],
             truncated: true,
-            next_marker: Some("16"),
+            marker: "4",
+            next_marker: "16",
         },
         PageCase {
             case: "the last page above part 16",
             query: "&max-parts=2&part-number-marker=16",
             expected: vec![25],
             truncated: false,
-            next_marker: None,
+            marker: "16",
+            next_marker: "25",
         },
         PageCase {
             case: "a page as large as the upload holds",
             query: "&max-parts=5",
             expected: numbers.to_vec(),
             truncated: false,
-            next_marker: None,
+            marker: "0",
+            next_marker: "25",
         },
         PageCase {
             case: "a page larger than the upload holds",
             query: "&max-parts=50",
             expected: numbers.to_vec(),
             truncated: false,
-            next_marker: None,
+            marker: "0",
+            next_marker: "25",
         },
         PageCase {
             case: "a marker above every part",
             query: "&part-number-marker=25",
             expected: Vec::new(),
             truncated: false,
-            next_marker: None,
+            marker: "25",
+            next_marker: "25",
         },
         PageCase {
             case: "a page of none, with parts left over",
             query: "&max-parts=0",
             expected: Vec::new(),
             truncated: true,
-            next_marker: Some("0"),
+            marker: "0",
+            next_marker: "0",
+        },
+        PageCase {
+            case: "a page of one above a marker no part carries",
+            query: "&max-parts=1&part-number-marker=5",
+            expected: vec![9],
+            truncated: true,
+            marker: "5",
+            next_marker: "9",
         },
     ];
     for row in rows {
@@ -642,6 +671,7 @@ async fn a_page_of_parts_is_the_parts_above_the_marker_bounded_by_max_parts() {
             query,
             expected,
             truncated,
+            marker,
             next_marker,
         } = row;
         let listed = list_parts(&router, bucket, key, &upload_id, query).await;
@@ -668,9 +698,15 @@ async fn a_page_of_parts_is_the_parts_above_the_marker_bounded_by_max_parts() {
         );
         assert_eq!(
             listed.element("NextPartNumberMarker").as_deref(),
-            next_marker,
+            Some(next_marker),
             "case {case:?}: expected the next marker {next_marker:?}, got {:?}",
             listed.element("NextPartNumberMarker")
+        );
+        assert_eq!(
+            listed.element("PartNumberMarker").as_deref(),
+            Some(marker),
+            "case {case:?}: expected the page's own marker {marker:?}, got {:?}",
+            listed.element("PartNumberMarker")
         );
     }
 

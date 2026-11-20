@@ -510,25 +510,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 })
                 .collect();
-            // "When a list is truncated, this element specifies the last part in the list,
-            // as well as the value to use for the PartNumberMarker request parameter in a
-            // subsequent request" (`…Parts$NextPartNumberMarker`), so a page that carried
-            // every part above the marker reports no next marker and is not truncated.
-            let next_marker = truncated.then(|| {
-                parts
-                    .last()
-                    .and_then(|part| part.part_number)
-                    .unwrap_or(marker)
-                    .to_string()
-            });
+            // The two pagination markers of a part listing, both reported on EVERY page:
+            // "the marker for the current part" (`…Parts$PartNumberMarker`) — the position
+            // this page began after, `0` when the request named none — and the position a
+            // next page resumes after, "the last part in the list, as well as the value to
+            // use for the PartNumberMarker request parameter in a subsequent request"
+            // (`…Parts$NextPartNumberMarker`), which is the last part this page carried, or
+            // the page's own marker when it carried none. The same discipline `ListParts`
+            // reports its page's markers under, so a client paginating the parts of an
+            // object and the parts of an upload reads the same pair either way, with
+            // `IsTruncated` saying whether anything is left over.
+            let next_marker = parts
+                .last()
+                .and_then(|part| part.part_number)
+                .unwrap_or(marker)
+                .to_string();
             GetObjectAttributesParts {
                 // "The total number of parts" — every part the object was assembled from,
                 // not the count this page carried.
                 total_parts_count: Some(
                     i32::try_from(object.parts.len()).unwrap_or(crate::state::MAX_PART_NUMBER),
                 ),
-                part_number_marker: input.part_number_marker.clone(),
-                next_part_number_marker: next_marker,
+                part_number_marker: Some(marker.to_string()),
+                next_part_number_marker: Some(next_marker),
                 max_parts: Some(max_parts),
                 is_truncated: Some(truncated),
                 // "The response doesn't return the Part element" for an object with no

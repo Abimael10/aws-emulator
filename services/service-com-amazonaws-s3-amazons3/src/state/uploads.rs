@@ -1331,6 +1331,17 @@ impl<'a> DeclaredChecksums<'a> {
         ]
     }
 
+    /// The value the member for `algorithm` carried, or `None` when that member carried
+    /// none — the lookup in the other direction from [`Self::named_algorithm`], over the
+    /// same one mapping, so a caller that knows WHICH algorithm it needs the digest under
+    /// does not tabulate the members a second time.
+    pub fn for_algorithm(&self, algorithm: &str) -> Option<&'a str> {
+        self.pairs()
+            .into_iter()
+            .find_map(|(named, declared)| (named == algorithm).then_some(declared))
+            .flatten()
+    }
+
     /// How many of the ten members carried a value — what decides whether the write
     /// declared ONE checksum type or several, which S3 refuses
     /// ([`IntegrityRejection::MultipleChecksumTypes`]).

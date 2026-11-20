@@ -515,6 +515,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
         // form every document that carries the tag as a value rather than as the `ETag`
         // header carries it in), so what the envelope reports does not depend on whether the
         // client wrapped the tag it sent in HTTP's quoted-string syntax.
+        //
+        // The `ChecksumAlgorithm` every part of this list has to carry its own checksum
+        // under, if any: the algorithm the INITIATION settled, for an upload whose checksum
+        // is composed of its parts' checksums
+        // ([`crate::state::CHECKSUM_TYPE_COMPOSITE`]). The object-level checksum of such an
+        // upload is a composition over the parts' digests — the type "determines how
+        // part-level checksums are combined to create an object-level checksum for multipart
+        // objects" (`CompleteMultipartUploadRequest$ChecksumType`) — so the completion that
+        // composes it requires the caller to state each part's digest. An upload whose
+        // checksum is over the whole object, and one initiated under no algorithm at all,
+        // compose nothing from the parts and so require nothing of this list.
+        let required_part_checksum = upload
+            .checksum_algorithm
+            .as_deref()
+            .filter(|_| {
+                upload.checksum_type.as_deref() == Some(crate::state::CHECKSUM_TYPE_COMPOSITE)
+            })
+            .map(str::to_string);
+
         let mut assembled: Vec<&[u8]> = Vec::with_capacity(named_parts.len());
         for (position, named) in named_parts.iter().enumerate() {
             let number = named.part_number.unwrap_or_default();
@@ -532,6 +551,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CompleteMultipart
             };
             if named_etag != crate::state::etag_value(&held.etag) {
                 return Err(invalid_part());
+            }
+            // Each named part carries its OWN checksum when the upload's checksum is
+            // composed of them: the value has to be IN the request, because the composition
+            // the completion answers is over the parts' digests. A part whose member for
+            // that algorithm is absent leaves the composition unstated for that part, which
+            // S3 refuses `InvalidRequest` (400) with the sentence below
+            // ([`missing_part_checksum_message`]) — before anything is assembled, so the
+            // upload and every part it holds are still there for the caller to re-send the
+            // completion with the checksums it left out.
+            if let Some(algorithm) = required_part_checksum.as_deref() {
+                if part_checksums(named).for_algorithm(algorithm).is_none() {
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        crate::state::INVALID_REQUEST_CODE,
+                        crate::state::INVALID_REQUEST_STATUS,
+                        missing_part_checksum_message(algorithm, number),
+                    ));
+                }
             }
             // "Part size: 5 MiB to 5 GiB. There is no minimum size limit on the last part of
             // your multipart upload" (Amazon S3 User Guide, Amazon S3 multipart upload
@@ -925,6 +961,44 @@ fn declared_checksums(input: &CompleteMultipartUploadInput) -> crate::state::Dec
         xxhash3: input.checksum_xxhash3.as_deref(),
         xxhash128: input.checksum_xxhash128.as_deref(),
     }
+}
+
+/// The `Checksum*` members ONE `CompletedPart` of this request's list carries, read through
+/// the same member-to-`ChecksumAlgorithm` mapping as every other set of those members
+/// ([`crate::state::DeclaredChecksums`]) — `CompletedPart` declares the same ten members as
+/// the request itself (`smithy_query(query="shape",shape="CompletedPart")`), each carrying
+/// "the Base64 encoded … checksum of the part".
+fn part_checksums(part: &CompletedPart) -> crate::state::DeclaredChecksums<'_> {
+    crate::state::DeclaredChecksums {
+        crc32: part.checksum_crc32.as_deref(),
+        crc32c: part.checksum_crc32_c.as_deref(),
+        crc64nvme: part.checksum_crc64_nvme.as_deref(),
+        sha1: part.checksum_sha1.as_deref(),
+        sha256: part.checksum_sha256.as_deref(),
+        sha512: part.checksum_sha512.as_deref(),
+        md5: part.checksum_md5.as_deref(),
+        xxhash64: part.checksum_xxhash64.as_deref(),
+        xxhash3: part.checksum_xxhash3.as_deref(),
+        xxhash128: part.checksum_xxhash128.as_deref(),
+    }
+}
+
+/// The `<Message>` S3 refuses a completion of a checksum-composed upload that left one
+/// part's checksum out with.
+///
+/// The fixed text is "The upload was created using a ", " checksum. The complete request
+/// must include the checksum for each part. It was missing for part " and " in the
+/// request."; the two variable parts are the upload's own `ChecksumAlgorithm` — rendered
+/// LOWER case, the spelling the `x-amz-checksum-*` member names carry it in, as
+/// [`crate::state::incompatible_checksum_pair_message`] renders the same value — and the
+/// number of the part whose checksum the request did not state, so the sentence says which
+/// member of which part to add.
+fn missing_part_checksum_message(algorithm: &str, part_number: i32) -> String {
+    format!(
+        "The upload was created using a {} checksum. The complete request must include the \
+         checksum for each part. It was missing for part {part_number} in the request.",
+        algorithm.to_ascii_lowercase()
+    )
 }
 
 /// The refusal a completion whose object write the store refused answers with, named the

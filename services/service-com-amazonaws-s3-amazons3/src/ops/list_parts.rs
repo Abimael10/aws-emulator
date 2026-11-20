@@ -404,19 +404,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             })
             .collect();
-        // "When a list is truncated, this element specifies the last part in the list, as
-        // well as the value to use for the part-number-marker request parameter in a
-        // subsequent request" (`ListPartsOutput$NextPartNumberMarker`) — so a page that
-        // returned every part above the marker reports no next marker and is not
-        // truncated, and a truncated one reports the last part it carried (the marker it
-        // started from, when the page carried no part at all).
-        let next_marker = truncated.then(|| {
-            parts
-                .last()
-                .and_then(|part| part.part_number)
-                .unwrap_or(marker)
-                .to_string()
-        });
+        // The two pagination markers this listing is paginated by
+        // (`inputToken PartNumberMarker` / `outputToken NextPartNumberMarker`, from this
+        // operation's `@paginated` trait), both reported on EVERY page: the position the
+        // page began after, and the position the next page resumes after. "This element
+        // specifies the last part in the list, as well as the value to use for the
+        // part-number-marker request parameter in a subsequent request"
+        // (`ListPartsOutput$NextPartNumberMarker`) — so the next marker is the number of
+        // the last part the page carried, and the page's own marker when it carried none,
+        // which is the position a resumed listing continues from either way. A page that
+        // carried every part above the marker reports the same value and is not truncated:
+        // the marker says where the listing got to, `IsTruncated` says whether anything is
+        // left.
+        let next_marker = parts
+            .last()
+            .and_then(|part| part.part_number)
+            .unwrap_or(marker)
+            .to_string();
 
         // When the bucket's lifecycle configuration aborts this upload, if any rule does.
         let abort = bucket.multipart_upload_abort(&upload.key, upload.initiated_at);
@@ -430,9 +434,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "Maximum number of parts that were allowed in the response" — the effective
             // bound this page was computed under, not the raw request value.
             max_parts: Some(max_parts),
-            // Echoed as the page's starting point; a request that named none reports none.
-            part_number_marker: input.part_number_marker.clone(),
-            next_part_number_marker: next_marker,
+            // The page's own starting point, reported as the part NUMBER the listing began
+            // after — `0` when the request named no marker, since every part number is
+            // above it ("Only parts with higher part numbers will be listed",
+            // `ListPartsOutput$PartNumberMarker`). Reported from the marker the page was
+            // computed under rather than echoed from the request, so the two markers of one
+            // page are the same kind of value and a resumed listing can be read against the
+            // page it resumed from.
+            part_number_marker: Some(marker.to_string()),
+            next_part_number_marker: Some(next_marker),
             is_truncated: Some(truncated),
             parts: Some(parts),
             // "Container element that identifies who initiated the multipart upload"

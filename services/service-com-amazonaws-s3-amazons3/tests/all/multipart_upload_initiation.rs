@@ -429,9 +429,18 @@ async fn an_initiated_upload_answers_a_fresh_id_and_reads_back_as_it_was_initiat
              report none, got {:?}",
             read.body
         );
-        assert!(
-            read.element("NextPartNumberMarker").is_none(),
-            "case {case:?}: an untruncated page specifies no next marker, got {:?}",
+        assert_eq!(
+            read.element("PartNumberMarker").as_deref(),
+            Some("0"),
+            "case {case:?}: a page the request named no marker for began after part 0, got \
+             {:?}",
+            read.element("PartNumberMarker")
+        );
+        assert_eq!(
+            read.element("NextPartNumberMarker").as_deref(),
+            Some("0"),
+            "case {case:?}: a page that carried no part at all resumes after its own \
+             marker, got {:?}",
             read.element("NextPartNumberMarker")
         );
         assert!(

@@ -37,7 +37,7 @@ use aws_smithy_types::base64;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send, send_bytes, Answer};
-use super::multipart_upload_completion::completion_payload;
+use super::multipart_upload_completion::{checksummed_completion_payload, NamedPart};
 use super::object_and_tagging_roundtrip::{bucket, text};
 
 /// "Part size: 5 MiB to 5 GiB. There is no minimum size limit on the last part of your
@@ -193,13 +193,15 @@ pub(crate) async fn list_parts(
 }
 
 /// `POST /<bucket>/<key>?uploadId=<id>` — `CompleteMultipartUpload`, with the parts list as
-/// the payload and whatever checksum headers the row carries.
+/// the payload — each part naming the per-part checksum element the row gives it, which a
+/// completion of a COMPOSITE upload requires — and whatever checksum headers the row
+/// carries.
 async fn complete(
     router: &MultiServiceRouter,
     name: &str,
     key: &str,
     upload_id: &str,
-    parts: &[(i32, String)],
+    parts: &[NamedPart],
     headers: &[(&str, &str)],
 ) -> Answer {
     send(
@@ -207,7 +209,7 @@ async fn complete(
         "POST",
         &format!("/{name}/{key}?uploadId={upload_id}"),
         headers,
-        &completion_payload(parts),
+        &checksummed_completion_payload(parts),
     )
     .await
 }
@@ -378,7 +380,7 @@ async fn each_part_of_one_upload_carries_its_own_digest() {
     )
     .await;
     let header = checksum_header(algorithm);
-    let mut named: Vec<(i32, String)> = Vec::new();
+    let mut named: Vec<NamedPart> = Vec::new();
     let mut answered: Vec<String> = Vec::new();
     for (number, body) in numbers.iter().zip(parts.iter()) {
         let uploaded = upload_part(&router, name, key, &upload_id, *number, &[], body).await;
@@ -396,13 +398,14 @@ async fn each_part_of_one_upload_carries_its_own_digest() {
             Some(expected.as_str()),
             "part {number}: expected {header} = {expected:?}, got {carried:?}"
         );
-        answered.push(expected);
         named.push((
             *number,
             uploaded
                 .header("etag")
                 .expect("a part upload must report an ETag header"),
+            Some((format!("Checksum{algorithm}"), expected.clone())),
         ));
+        answered.push(expected);
     }
     // Different bytes, different digests: nothing collapsed the three parts into one value.
     answered.sort();
@@ -618,7 +621,7 @@ async fn a_wrong_declared_object_checksum_is_refused_and_stores_no_object() {
         )
         .await;
         let header = checksum_header(algorithm);
-        let mut named: Vec<(i32, String)> = Vec::new();
+        let mut named: Vec<NamedPart> = Vec::new();
         for (index, body) in parts.iter().enumerate() {
             let number = index as i32 + 1;
             let uploaded = upload_part(&router, name, &key, &upload_id, number, &[], body).await;
@@ -639,11 +642,17 @@ async fn a_wrong_declared_object_checksum_is_refused_and_stores_no_object() {
                 "case {case:?}: part {number} must answer its own digest {own:?}, got \
                  {carried:?}"
             );
+            // The completion names each part's own digest for a COMPOSITE upload, whose
+            // object-level checksum is composed of exactly those values; a FULL_OBJECT
+            // upload's completion is not asked for them.
+            let part_checksum = (requested_type == "COMPOSITE")
+                .then(|| (format!("Checksum{algorithm}"), own.clone()));
             named.push((
                 number,
                 uploaded
                     .header("etag")
                     .expect("a part upload must report an ETag header"),
+                part_checksum,
             ));
         }
 

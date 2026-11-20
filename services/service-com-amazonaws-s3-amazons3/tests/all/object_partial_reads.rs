@@ -129,6 +129,25 @@ pub(crate) async fn multipart_object(
         .element("UploadId")
         .expect("an initiation must report an UploadId");
 
+    // A completion of an upload whose object-level checksum is COMPOSED of its parts'
+    // checksums has to state each part's own checksum, so this fixture names them: the
+    // element is the one the initiation's algorithm names, and the value is the digest that
+    // part's own write answered. An upload under no algorithm, under the algorithm that is
+    // always a full-object checksum, or asking for a full-object checksum composes nothing
+    // from the parts and so names none.
+    let header_value = |headers: &[(&str, &str)], name: &str| {
+        headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.to_string())
+    };
+    let composed_algorithm = header_value(initiation, "x-amz-checksum-algorithm").filter(
+        |algorithm| {
+            algorithm != "CRC64NVME"
+                && header_value(initiation, "x-amz-checksum-type").as_deref() != Some("FULL_OBJECT")
+        },
+    );
+
     let mut payload = String::from("<CompleteMultipartUpload>");
     for (index, part) in parts.iter().enumerate() {
         let part_number = index + 1;
@@ -151,8 +170,20 @@ pub(crate) async fn multipart_object(
         let etag = uploaded
             .header("etag")
             .expect("a part upload must report an ETag header");
+        let checksum = composed_algorithm
+            .as_deref()
+            .map(|algorithm| {
+                let header = format!("x-amz-checksum-{}", algorithm.to_ascii_lowercase());
+                let value = uploaded.header(&header).unwrap_or_else(|| {
+                    panic!(
+                        "part {part_number} of an upload under {algorithm} must answer {header}"
+                    )
+                });
+                format!("<Checksum{algorithm}>{value}</Checksum{algorithm}>")
+            })
+            .unwrap_or_default();
         payload.push_str(&format!(
-            "<Part><PartNumber>{part_number}</PartNumber><ETag>{etag}</ETag></Part>"
+            "<Part><PartNumber>{part_number}</PartNumber><ETag>{etag}</ETag>{checksum}</Part>"
         ));
     }
     payload.push_str("</CompleteMultipartUpload>");

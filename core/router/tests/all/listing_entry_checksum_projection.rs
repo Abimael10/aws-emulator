@@ -317,9 +317,33 @@ impl Emulator {
         let etag = uploaded.header("etag").unwrap_or_else(|| {
             panic!("case {case:?}: expected the part write to report an ETag header")
         });
+        // A completion of an upload whose object-level checksum is COMPOSED of its parts'
+        // checksums has to state each part's own checksum, so this fixture names the one the
+        // part write answered. An upload under no algorithm, under the algorithm that is
+        // always a full-object checksum, or asking for a full-object checksum composes
+        // nothing from the parts and names none.
+        let header_value = |name: &str| {
+            headers
+                .iter()
+                .find(|(header, _)| header.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.to_string())
+        };
+        let part_checksum = header_value("x-amz-checksum-algorithm")
+            .filter(|algorithm| {
+                algorithm != "CRC64NVME"
+                    && header_value("x-amz-checksum-type").as_deref() != Some(FULL_OBJECT)
+            })
+            .map(|algorithm| {
+                let header = format!("x-amz-checksum-{}", algorithm.to_ascii_lowercase());
+                let value = uploaded.header(&header).unwrap_or_else(|| {
+                    panic!("case {case:?}: expected the part write to report {header}")
+                });
+                format!("<Checksum{algorithm}>{value}</Checksum{algorithm}>")
+            })
+            .unwrap_or_default();
         let payload = format!(
             "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag>\
-             </Part></CompleteMultipartUpload>"
+             {part_checksum}</Part></CompleteMultipartUpload>"
         );
         let completed = self
             .s3(
