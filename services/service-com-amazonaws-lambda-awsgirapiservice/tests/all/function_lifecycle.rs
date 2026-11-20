@@ -168,7 +168,7 @@ async fn get_function_at(
 
 /// The base64 SHA-256 of `bytes` — the independent computation of what `CodeSha256`
 /// must report, so the test never reads the value it is checking out of the response.
-fn expected_code_sha256(bytes: &[u8]) -> String {
+pub(crate) fn expected_code_sha256(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(bytes))
 }
 

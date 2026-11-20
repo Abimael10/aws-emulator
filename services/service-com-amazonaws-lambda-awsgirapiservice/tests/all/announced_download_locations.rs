@@ -40,7 +40,7 @@ use crate::function_lifecycle::{
 
 /// The bytes of a .zip archive holding one entry of `length` bytes — what an object read out
 /// of Amazon S3 has to be, because Lambda unzips the archive it stores.
-fn archive_bytes(length: usize) -> Vec<u8> {
+pub(crate) fn archive_bytes(length: usize) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);
@@ -82,7 +82,7 @@ const BASE: &str = "https://emulator.test:8443";
 /// Lambda and Amazon S3 on one engine, reached at `base`: an archive named by an Amazon S3
 /// location is read out of S3's own store, and `base` is the endpoint every URL this
 /// emulator announces has to lead back to.
-fn emulator_at(engine: &Arc<engine::InMemoryEngine>, base: &str) -> MultiServiceRouter {
+pub(crate) fn emulator_at(engine: &Arc<engine::InMemoryEngine>, base: &str) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.set_url_base(EndpointUrl::parse(base).expect("the test base URL must parse"));
@@ -105,7 +105,13 @@ fn s3_authorization() -> String {
 }
 
 /// One Amazon S3 request that must be served, through S3's own surface.
-async fn s3_ok(router: &MultiServiceRouter, case: &str, method: &str, uri: &str, body: &[u8]) {
+pub(crate) async fn s3_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    method: &str,
+    uri: &str,
+    body: &[u8],
+) {
     let host = format!("s3.{REGION}.amazonaws.com");
     let request = ::http::Request::builder()
         .method(method)
@@ -145,7 +151,7 @@ async fn get_layer_version_by_arn(router: &MultiServiceRouter, arn: &str) -> Ans
 }
 
 /// `GetFunction` on a function name, optionally at one qualifier.
-async fn get_function(
+pub(crate) async fn get_function(
     router: &MultiServiceRouter,
     name: &str,
     qualifier: Option<&str>,
@@ -156,13 +162,13 @@ async fn get_function(
 }
 
 /// `PublishVersion` on a function name.
-async fn publish_version(router: &MultiServiceRouter, name: &str) -> Answer {
+pub(crate) async fn publish_version(router: &MultiServiceRouter, name: &str) -> Answer {
     let uri = format!("/2015-03-31/functions/{name}/versions");
     json_call(router, "POST", &uri, &Value::Null).await
 }
 
 /// The location member of an answer, by JSON pointer, as the answered string.
-fn location_of(case: &str, answer: &Answer, pointer: &str) -> String {
+pub(crate) fn location_of(case: &str, answer: &Answer, pointer: &str) -> String {
     assert!(
         (200..300).contains(&answer.status),
         "case {case:?}: the read announcing the location must succeed, got {} {}",
@@ -184,7 +190,7 @@ fn location_of(case: &str, answer: &Answer, pointer: &str) -> String {
 
 /// Fetch a URL this service ANNOUNCED, the way a client follows a presigned URL: at the
 /// address the URL names, carrying no SigV4 `Authorization` header at all.
-async fn fetch(router: &MultiServiceRouter, method: &str, url: &str) -> Answer {
+pub(crate) async fn fetch(router: &MultiServiceRouter, method: &str, url: &str) -> Answer {
     let host = url
         .split_once("://")
         .and_then(|(_, rest)| rest.split('/').next())
