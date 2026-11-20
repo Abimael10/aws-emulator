@@ -490,8 +490,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// authority the connector links (smithy_query: operation CreateConnector).
 ///
 /// It is what this call's `ResourceNotFoundException` carries as its `ResourceType`, and the
-/// word its `Message` opens with: the resource this call creates is the connector, so the
-/// thing that was not found is not the resource it acts on but the parameter that named it.
+/// word its `Message` opens with, because that is the answer AWS gives this call: the
+/// resource this call creates is the connector, so the thing that was not found is not the
+/// resource it acts on but the parameter that named it, and that is what the error
+/// discriminates on. `ResourceType`'s own doc sentence ("can be either `Connector` or
+/// `Challenge`") names the two resource KINDS this service owns — the discriminator of a
+/// call addressed AT one of them — and a create is not such a call; its sibling
+/// `CreateChallenge` reports its own unresolvable reference the same way.
 const MISSING_MEMBER_CERTIFICATE_AUTHORITY_ARN: &str = "CertificateAuthorityArn";
 
 /// Amazon Web Services Private CA holds no certificate authority under the ARN the request

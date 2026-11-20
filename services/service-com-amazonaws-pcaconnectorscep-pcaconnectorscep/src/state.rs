@@ -64,7 +64,10 @@ pub const TYPE_GENERAL_PURPOSE: &str = "GENERAL_PURPOSE";
 pub const TYPE_INTUNE: &str = "INTUNE";
 
 /// `ResourceId`/`ResourceType` vocabulary of this service's errors: the `ResourceType`
-/// member's doc says it "can be either `Connector` or `Challenge`".
+/// member's doc says it "can be either `Connector` or `Challenge`", which are the two kinds
+/// of resource this service owns — the discriminator of a call addressed AT one of them. A
+/// create, whose own resource does not exist yet, reports the reference it could not resolve
+/// by the input member that carried it instead (see [`resource_not_found`]).
 pub const RESOURCE_TYPE_CONNECTOR: &str = "Connector";
 /// The other value `ResourceType` carries.
 pub const RESOURCE_TYPE_CHALLENGE: &str = "Challenge";
@@ -786,6 +789,13 @@ pub fn resource_type_of(resource_arn: &str) -> &'static str {
 /// addressed AT that resource, and the name of the input member that referenced it for a
 /// call that creates a different resource, since there the missing thing is the caller's
 /// parameter rather than the resource this call acts on.
+///
+/// Both halves of that are AWS's own answers, read off the wire: the member's doc sentence
+/// ("can be either `Connector` or `Challenge`") names the two resource KINDS this service
+/// owns, which is the discriminator of a call addressed at one of them, while the creates —
+/// whose own resource does not exist yet — report the unresolvable reference by the input
+/// member that carried it (`CertificateAuthorityArn` on `CreateConnector`, `ConnectorArn` on
+/// `CreateChallenge`), and word the sentence from the same string.
 pub fn resource_not_found(resource_type: &str, resource_id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: format!("{resource_type} was not found: {resource_id}."),

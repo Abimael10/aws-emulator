@@ -20,8 +20,10 @@
 //!    `CreateConnector`'s `CertificateAuthorityArn` names a private CA that Amazon Web
 //!    Services Private CA owns, and `CreateConnector` models `ResourceNotFoundException`
 //!    (HTTP 404): a CA that service reports it does not hold is that error, naming the input
-//!    member as `ResourceType` and the supplied ARN as `ResourceId`, and no connector is
-//!    created. So this suite mounts Private CA beside this service on ONE engine — what the
+//!    member as `ResourceType` and the supplied ARN as `ResourceId` whatever else the request
+//!    carries, and no connector is created. `ResourceType`'s two documented resource kinds
+//!    (`Connector`, `Challenge`) are what a call addressed AT one of them discriminates on,
+//!    which a create — whose own resource does not exist yet — is not. So this suite mounts Private CA beside this service on ONE engine — what the
 //!    assembled emulator does — and creates the CAs its accepting rows need through that
 //!    service's own API.
 //!
@@ -45,9 +47,15 @@ const ACCOUNT: &str = "000000000000";
 /// The Region these cases are signed for, deliberately not the emulator default.
 const REGION: &str = "eu-west-2";
 
-/// The name of the `CreateConnector` input member that references the private CA, which is
-/// what its `ResourceNotFoundException` carries as `ResourceType` (smithy_query
-/// operation=CreateConnector).
+/// The name of the `CreateConnector` input member that references the private CA (smithy_query
+/// operation=CreateConnector), which is what its `ResourceNotFoundException` carries as
+/// `ResourceType` and what its `Message` opens with.
+///
+/// `ResourceType`'s own doc sentence ("can be either `Connector` or `Challenge`") names the two
+/// resource KINDS this service owns, which is what a call addressed AT one of them
+/// discriminates on — the reads of `resource_not_found_message` assert exactly that. A create
+/// is not such a call: its own resource does not exist yet, so what could not be resolved is
+/// the reference it was handed, and AWS's answer to this call names the member that carried it.
 const MEMBER_CERTIFICATE_AUTHORITY_ARN: &str = "CertificateAuthorityArn";
 
 /// The sentence `ResourceNotFoundException` carries, spelled here independently of the
@@ -350,6 +358,34 @@ async fn create_challenge(router: &MultiServiceRouter, connector_arn: &str) -> S
         .to_string()
 }
 
+/// The whole refusal a create answers a reference it cannot resolve with: the modelled 404,
+/// the input member that carried the reference as `ResourceType`, the ARN the request supplied
+/// as `ResourceId`, and the sentence worded from those same two facts.
+fn assert_unresolvable_reference(answer: &Answer, case: &str, arn: &str) {
+    assert_eq!(
+        (answer.status, answer.error_type.as_str()),
+        (404, "ResourceNotFoundException"),
+        "case {case:?}: expected 404 ResourceNotFoundException for {arn:?}, got {} / {:?}",
+        answer.status,
+        answer.body
+    );
+    assert_eq!(
+        answer.message(),
+        expected_message(MEMBER_CERTIFICATE_AUTHORITY_ARN, arn),
+        "case {case:?}: expected AWS's not-found sentence, got {:?}",
+        answer.message()
+    );
+    assert_eq!(
+        (
+            answer.body["ResourceId"].as_str(),
+            answer.body["ResourceType"].as_str()
+        ),
+        (Some(arn), Some(MEMBER_CERTIFICATE_AUTHORITY_ARN)),
+        "case {case:?}: the refusal must name the supplied ARN and the input member, got {:?}",
+        answer.body
+    );
+}
+
 /// `CreateConnector` on a `CertificateAuthorityArn` Private CA holds no certificate authority
 /// under is the modelled 404, naming the input member and the ARN it was handed — and admits
 /// no connector.
@@ -396,29 +432,7 @@ async fn create_connector_refuses_a_private_ca_that_does_not_exist() {
             Some(json!({ "CertificateAuthorityArn": arn })),
         )
         .await;
-        assert_eq!(
-            (answer.status, answer.error_type.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: expected 404 ResourceNotFoundException for {arn:?}, got {} / {:?}",
-            answer.status,
-            answer.body
-        );
-        assert_eq!(
-            answer.message(),
-            expected_message(MEMBER_CERTIFICATE_AUTHORITY_ARN, arn),
-            "case {case:?}: expected AWS's not-found sentence, got {:?}",
-            answer.message()
-        );
-        assert_eq!(
-            (
-                answer.body["ResourceId"].as_str(),
-                answer.body["ResourceType"].as_str()
-            ),
-            (Some(arn.as_str()), Some(MEMBER_CERTIFICATE_AUTHORITY_ARN)),
-            "case {case:?}: the refusal must name the supplied ARN and the input member, got \
-             {:?}",
-            answer.body
-        );
+        assert_unresolvable_reference(&answer, case, arn);
 
         // Nothing was admitted: the refusal left no connector behind for any later call to
         // find.
@@ -484,4 +498,134 @@ async fn create_connector_admits_a_private_ca_that_exists() {
             read.body
         );
     }
+}
+
+/// The `ClientToken` a refused create carries, handed to a second create once the CA resolves.
+const REUSED_TOKEN: &str = "create-connector-retry-1";
+
+/// The same rule, independent of everything else the request carries and of what the store
+/// already holds: the member that carried the reference the create could not resolve is what
+/// the 404 discriminates on, and what its sentence opens with.
+///
+/// So a client branching on `ResourceType` reads the same discriminator whether the create was
+/// a bare one, a retryable one carrying a `ClientToken`, a tagged one, an Intune one, or one
+/// restricted to a VPC endpoint. And a refused create records nothing — not even the token it
+/// carried — so the reference is resolved again on the next call.
+#[tokio::test]
+async fn the_create_refusal_names_the_member_whatever_else_the_request_carries() {
+    let (router, engine) = emulator_with_private_ca();
+
+    // A CA Private CA DOES hold, in the status a create requires, and a settled connector
+    // created from it: no refusal below is answered out of an empty store.
+    let (held_ca, _certificate) =
+        harness::active_private_ca(&router, &engine, REGION, "scep-ca-held").await;
+    let live = create_connector(&router, json!({ "CertificateAuthorityArn": held_ca }))
+        .await
+        .text("ConnectorArn");
+    harness::release_pending(&engine, &live);
+
+    // The rows: every OTHER input this operation models, carried beside a CA ARN Private CA
+    // holds nothing under, and then all of them at once. Each row names a different CA id, so
+    // no assertion can pass by echoing one value, and every value satisfies its member's own
+    // `@pattern` (smithy_query operation=CreateConnector).
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "the reference alone",
+            "11111111-2222-3333-4444-555555555555",
+            json!({}),
+        ),
+        (
+            "a client token, which makes the call retryable",
+            "0123456f-89ab-cdef-0123-456789abcdef",
+            json!({ "ClientToken": REUSED_TOKEN }),
+        ),
+        (
+            "tags",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            json!({ "Tags": { "owner": "platform", "env": "test" } }),
+        ),
+        (
+            "an Intune configuration, which chooses the connector's Type",
+            "deadbeef-0000-1111-2222-333344445555",
+            json!({
+                "MobileDeviceManagement": {
+                    "Intune": {
+                        "AzureApplicationId": "01234567-89ab-cdef-0123-456789abcdef",
+                        "Domain": "contoso.example.com",
+                    },
+                },
+            }),
+        ),
+        (
+            "a VPC endpoint restriction",
+            "99999999-8888-7777-6666-555544443333",
+            json!({ "VpcEndpointId": "vpce-0123abcd" }),
+        ),
+        (
+            "every other input at once",
+            "abcdef01-2345-6789-abcd-ef0123456789",
+            json!({
+                "ClientToken": "create-connector-everything-1",
+                "Tags": { "owner": "platform" },
+                "MobileDeviceManagement": {
+                    "Intune": {
+                        "AzureApplicationId": "ab-cd-ef-gh-ijk",
+                        "Domain": "example.onmicrosoft.com",
+                    },
+                },
+                "VpcEndpointId": "vpce-0123abcd456789abc",
+            }),
+        ),
+    ];
+
+    for (case, ca_id, extra) in &rows {
+        let arn = ca_arn("aws", REGION, ACCOUNT, ca_id);
+        let mut request = json!({ "CertificateAuthorityArn": arn });
+        for (member, value) in extra.as_object().expect("the row's other input members") {
+            request[member.as_str()] = value.clone();
+        }
+
+        let answer = harness::call(&router, REGION, "POST", "/connectors", Some(request)).await;
+        assert_unresolvable_reference(&answer, case, &arn);
+
+        // The refusal admitted nothing: the store still holds only the connector seeded above.
+        let listed = harness::call(&router, REGION, "GET", "/connectors", None).await;
+        assert_eq!(
+            listed.count("Connectors"),
+            1,
+            "case {case:?}: the refused create must register no connector, got {:?}",
+            listed.body
+        );
+    }
+
+    // The reference is resolved on EVERY call, so the token a refused create carried stands for
+    // no connector: the same token with a CA Private CA holds mints one, and that connector
+    // reads back carrying exactly that CA.
+    let created = create_connector(
+        &router,
+        json!({ "CertificateAuthorityArn": held_ca, "ClientToken": REUSED_TOKEN }),
+    )
+    .await;
+    let minted = created.text("ConnectorArn");
+    harness::release_pending(&engine, &minted);
+
+    let read = harness::call(
+        &router,
+        REGION,
+        "GET",
+        &format!("/connectors/{}", label(&minted)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        read.status, 200,
+        "the connector the reused token minted must read back, got {} / {:?}",
+        read.status, read.body
+    );
+    assert_eq!(
+        read.connector("CertificateAuthorityArn"),
+        &json!(held_ca),
+        "the minted connector must carry the CA ARN it was created from, got {:?}",
+        read.body
+    );
 }
