@@ -1393,6 +1393,53 @@ pub(crate) const APIGATEWAYV2_API_UPDATE_PROPERTIES: &[&str] = &[
     "Version",
 ];
 
+/// The `AWS::ApiGatewayV2::Api` properties API Gateway v2 publishes a call for CLEARING, each
+/// with the URI segment that call is bound to under the api's own URI.
+///
+/// A property the new declaration no longer states has to be REMOVED from the api, and that
+/// is not something `UpdateApi` can do: it is a PATCH, so a member it omits leaves the stored
+/// value alone and a member it sends is a new value rather than a removal. The one property of
+/// this type the service publishes a removal for is its CORS configuration —
+/// `DeleteCorsConfiguration` (`DELETE /v2/apis/{ApiId}/cors`, 204), "deletes a CORS
+/// configuration" — so a declaration that drops `CorsConfiguration` reaches that call and a
+/// later `GetApi` reports the api with no CORS configuration at all.
+pub(crate) const APIGATEWAYV2_API_CLEARED_PROPERTIES: &[(&str, &str)] =
+    &[("CorsConfiguration", "cors")];
+
+/// Whether `properties` states a value for `property` — a member it carries as JSON null
+/// states none, the way an absent member does.
+fn states_property(properties: &Value, property: &str) -> bool {
+    properties
+        .get(property)
+        .is_some_and(|value| !value.is_null())
+}
+
+/// Clear every property of one API Gateway v2 resource that the new declaration no longer
+/// states and that service publishes a clearing call for.
+///
+/// `uri` addresses the resource itself and `cleared` names those properties with the URI
+/// segment of the call that clears each ([`APIGATEWAYV2_API_CLEARED_PROPERTIES`],
+/// [`ApiGatewayV2Child::cleared`]). A property the resource was not deployed with has nothing
+/// to clear, and a delete the service answers `NotFoundException` for has already left the
+/// resource in the state it asks for ([`api_gateway_deleted`]), so this is idempotent — a
+/// deployment that re-applies the same drop asks for the same thing twice and completes.
+async fn apigatewayv2_clear_dropped_properties(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    uri: &str,
+    cleared: &[(&str, &str)],
+) -> Result<(), Refusal> {
+    for (property, segment) in cleared {
+        if !states_property(&resource.properties, property) || states_property(declared, property) {
+            continue;
+        }
+        api_gateway_deleted(ctx, region, &format!("{uri}/{segment}")).await?;
+    }
+    Ok(())
+}
+
 /// Apply a changed `AWS::ApiGatewayV2::Api` declaration to the api the stack created, so a
 /// client that edits a mutable property of an HTTP or WebSocket API through CloudFormation
 /// gets that property changed on the api it already has — under the same `ApiId`, which is
@@ -1404,9 +1451,17 @@ pub(crate) const APIGATEWAYV2_API_UPDATE_PROPERTIES: &[&str] = &[
 /// this declaration states DIFFERENTLY from the ones the api was last deployed with, each
 /// under its own member name ([`APIGATEWAYV2_API_UPDATE_PROPERTIES`], re-cased by
 /// [`lower_camel_members`] as the create's members are) — and a property neither revision
-/// changed is not re-sent. A property the new declaration no longer states keeps the value an
-/// earlier deployment gave it rather than being sent as an empty value that call would refuse,
-/// which is the same reading [`update_mwaa_environment`] takes of a patch.
+/// changed is not re-sent. A property the new declaration no longer states is not sent as an
+/// empty value that call would refuse, which is the same reading [`update_mwaa_environment`]
+/// takes of a patch; it is CLEARED instead, see below.
+///
+/// A property the new declaration no longer states at all is a different kind of change: the
+/// api is brought to the declaration it is handed, so such a property is REMOVED from it
+/// rather than left at the value an earlier deployment gave it. A PATCH cannot carry a
+/// removal — a member it omits leaves the stored value alone — so the removal is the owning
+/// service's own delete, for each property it publishes one for
+/// ([`APIGATEWAYV2_API_CLEARED_PROPERTIES`]); a property that service publishes no such call
+/// for keeps the value it has, because there is no call that clears it.
 ///
 /// A declaration carrying a DEFINITION is applied by reading that definition over the api
 /// instead: `ReimportApi` (`PUT /v2/apis/{ApiId}`) "puts an Api resource" under the same
@@ -1458,14 +1513,27 @@ pub(crate) async fn update_apigatewayv2_api(
             request.insert(lower_initial(property), lower_camel_members(value, 0)?);
         }
     }
+    // The api this update addresses, named once for both calls below.
+    let uri = apigatewayv2_api_uri(&resource.physical_resource_id);
     let answered = call_rest_json_named(
         ctx,
         API_GATEWAY_SIGNING_NAME,
         region,
         "UpdateApi",
         "PATCH",
-        &apigatewayv2_api_uri(&resource.physical_resource_id),
+        &uri,
         Some(&Value::Object(request)),
+    )
+    .await?;
+    // ...and then the properties this declaration DROPPED are cleared on the api, which the
+    // patch above cannot carry.
+    apigatewayv2_clear_dropped_properties(
+        ctx,
+        region,
+        resource,
+        declared,
+        &uri,
+        APIGATEWAYV2_API_CLEARED_PROPERTIES,
     )
     .await?;
     apigatewayv2_api_created(&answered, region, "UpdateApi").map(Some)
@@ -1829,6 +1897,18 @@ pub(crate) struct ApiGatewayV2Child {
     /// resource ([`super::super::template::replacement_properties`] names them for the same
     /// reason). Empty for a type whose every other property that patch takes.
     pub(crate) create_only: &'static [&'static str],
+    /// The properties the owning service publishes a call for CLEARING, each with the URI
+    /// segment that call is bound to under the resource's own URI — the removal a PATCH cannot
+    /// carry, for a property the new declaration no longer states
+    /// ([`apigatewayv2_clear_dropped_properties`]). Empty for a type whose properties that
+    /// service publishes no such call for.
+    pub(crate) cleared: &'static [(&'static str, &'static str)],
+    /// The DATA-KEYED properties ([`Self::data_keys`]) whose ENTRIES that service publishes a
+    /// call for clearing, each with the URI segment of that call, which the entry's own key
+    /// follows. The same rule one level down: a key the new declaration no longer states is
+    /// removed from the map rather than left on the resource
+    /// ([`apigatewayv2_clear_dropped_entries`]).
+    pub(crate) cleared_entries: &'static [(&'static str, &'static str)],
 }
 
 /// `AWS::ApiGatewayV2::Integration`: `POST /v2/apis/{ApiId}/integrations`, whose answer
@@ -1862,6 +1942,10 @@ pub(crate) const APIGATEWAYV2_INTEGRATION_CHILD: ApiGatewayV2Child = ApiGatewayV
     // `UpdateIntegration` takes every member of the create but the api that holds the
     // integration, which is this type's `path`.
     create_only: &[],
+    // API Gateway v2 publishes no call that clears a member of an integration, so a dropped
+    // property of one keeps the value it has.
+    cleared: &[],
+    cleared_entries: &[],
 };
 
 /// `AWS::ApiGatewayV2::Route`: `POST /v2/apis/{ApiId}/routes`, whose answer carries the
@@ -1891,6 +1975,13 @@ pub(crate) const APIGATEWAYV2_ROUTE_CHILD: ApiGatewayV2Child = ApiGatewayV2Child
     ],
     // `UpdateRoute` takes every member of the create but the api that holds the route.
     create_only: &[],
+    // API Gateway v2 publishes no call that clears a whole property of a route.
+    cleared: &[],
+    // `DeleteRouteRequestParameter`
+    // (`DELETE /v2/apis/{ApiId}/routes/{RouteId}/requestparameters/{RequestParameterKey}`, 204)
+    // clears ONE request parameter of a route, which is the removal a declaration that no
+    // longer states that parameter asks for.
+    cleared_entries: &[("RequestParameters", "requestparameters")],
 };
 
 /// `AWS::ApiGatewayV2::Stage`: `POST /v2/apis/{ApiId}/stages`. "Ref returns the stage name",
@@ -1919,6 +2010,14 @@ pub(crate) const APIGATEWAYV2_STAGE_CHILD: ApiGatewayV2Child = ApiGatewayV2Child
     // are its two `@httpLabel`s — the api is this type's `path` and the name is what the
     // stage is created under ([`ApiGatewayV2Child::named_by`]).
     create_only: &[],
+    // `DeleteAccessLogSettings` (`DELETE /v2/apis/{ApiId}/stages/{StageName}/accesslogsettings`,
+    // 204) clears the access log settings of the stage it addresses, which is the removal a
+    // declaration dropping that property asks for.
+    cleared: &[("AccessLogSettings", "accesslogsettings")],
+    // `DeleteRouteSettings` (`DELETE .../stages/{StageName}/routesettings/{RouteKey}`, 204)
+    // clears the settings of ONE route key, which is the removal a declaration that no longer
+    // states that key asks for.
+    cleared_entries: &[("RouteSettings", "routesettings")],
 };
 
 /// `AWS::ApiGatewayV2::Deployment`: `POST /v2/apis/{ApiId}/deployments`, whose answer
@@ -1939,6 +2038,8 @@ pub(crate) const APIGATEWAYV2_DEPLOYMENT_CHILD: ApiGatewayV2Child = ApiGatewayV2
     // all — see [`super::super::Provisioner::update`] — so this list is what its REPLACEMENT
     // reading is written from.)
     create_only: &["StageName"],
+    cleared: &[],
+    cleared_entries: &[],
 };
 
 /// `AWS::ApiGatewayV2::Authorizer`: `POST /v2/apis/{ApiId}/authorizers`, whose answer
@@ -1966,6 +2067,9 @@ pub(crate) const APIGATEWAYV2_AUTHORIZER_CHILD: ApiGatewayV2Child = ApiGatewayV2
     // `UpdateAuthorizer` takes every member of the create but the api that holds the
     // authorizer.
     create_only: &[],
+    // API Gateway v2 publishes no call that clears a member of an authorizer.
+    cleared: &[],
+    cleared_entries: &[],
 };
 
 /// The collection path of a resource that lives directly inside an api: the `ApiId` its
@@ -2116,9 +2220,11 @@ pub(crate) fn apigatewayv2_data_keyed_map(value: &Value) -> Result<Value, Refusa
 /// and takes the same members the create does, each under the property's name with its
 /// initial letter lower-cased. Each is a PATCH, so the request carries exactly the
 /// properties this declaration states DIFFERENTLY from the ones the resource was last
-/// deployed with, and a property neither revision changed is not re-sent; a property the new
-/// declaration no longer states keeps the value an earlier deployment gave it, as it does
-/// for the api itself ([`update_apigatewayv2_api`]).
+/// deployed with, and a property neither revision changed is not re-sent; what this
+/// declaration DROPPED is cleared afterwards instead, through the calls that service
+/// publishes for clearing a property and a map entry ([`ApiGatewayV2Child::cleared`],
+/// [`ApiGatewayV2Child::cleared_entries`]), exactly as it is for the api itself
+/// ([`update_apigatewayv2_api`]).
 ///
 /// `Ok(None)` is a change that patch cannot make, so the deployment reports it as not
 /// applied rather than as a success that dropped it: a property that addresses the api the
@@ -2158,20 +2264,70 @@ pub(crate) async fn update_apigatewayv2_child(
             }
         }
     }
+    // The resource this update addresses, named once for every call below.
+    let uri = apigatewayv2_child_uri(resource, child)?;
     call_rest_json(
         ctx,
         API_GATEWAY_SIGNING_NAME,
         region,
         "PATCH",
-        &apigatewayv2_child_uri(resource, child)?,
+        &uri,
         Some(&Value::Object(request)),
     )
     .await?;
+    // ...and then what this declaration DROPPED is cleared on the resource, which the patch
+    // above cannot carry: a whole property that service publishes a removal for, and an entry
+    // of a data-keyed map it publishes one for.
+    apigatewayv2_clear_dropped_properties(ctx, region, resource, declared, &uri, child.cleared)
+        .await?;
+    apigatewayv2_clear_dropped_entries(ctx, region, resource, declared, &uri, child.cleared_entries)
+        .await?;
     // The patch answers the resource's own record, and its identity is unchanged — that
     // service assigned it when the resource was created — so there is nothing new for the
     // stack to publish about it, exactly as there is nothing the create answers beyond that
     // id.
     Ok(Some(Created::attributes(BTreeMap::new())))
+}
+
+/// Clear every ENTRY of a data-keyed property of one API Gateway v2 resource that the new
+/// declaration no longer states and that service publishes a clearing call for.
+///
+/// The same rule [`apigatewayv2_clear_dropped_properties`] applies one level down: the keys of
+/// such a map are the caller's own data, and the resource is brought to the declaration it is
+/// handed, so a key the declaration no longer states is removed rather than left on the
+/// resource. A key the new declaration states a DIFFERENT value for is not cleared: the patch
+/// carried that value, which is a change rather than a removal. Dropping the whole property
+/// drops each of its keys, so that case is this one too.
+async fn apigatewayv2_clear_dropped_entries(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    uri: &str,
+    cleared: &[(&str, &str)],
+) -> Result<(), Refusal> {
+    for (property, segment) in cleared {
+        let Some(deployed) = resource
+            .properties
+            .get(*property)
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let states = declared.get(*property).and_then(Value::as_object);
+        for key in deployed.keys() {
+            if states.is_some_and(|states| states.contains_key(key)) {
+                continue;
+            }
+            api_gateway_deleted(
+                ctx,
+                region,
+                &format!("{uri}/{segment}/{}", percent_encoded(key)),
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Delete one resource a stack created inside an api, addressed exactly as its own read is.
