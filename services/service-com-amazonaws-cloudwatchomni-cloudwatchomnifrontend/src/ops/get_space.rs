@@ -129,20 +129,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
-        match store.spaces.get(&input.space_id) {
-            Some(stored) => Ok(GetSpaceOutput {
-                space: stored.space.clone(),
-            }),
-            // An unknown id and a deleted one are the same answer: the record is gone.
-            None => Err(GetSpaceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::SPACE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_type: Some("Space".to_string()),
-                    resource_id: Some(input.space_id.clone()),
-                    error_code: None,
-                },
-            )
-            .into()),
-        }
+        // Reaching the space IS the authorization decision, and it is taken before
+        // anything is reported: a `spaceId` the account holds no space record under
+        // authorizes nobody, so an unknown id and a deleted one earn the same refusal and
+        // neither tells the caller which it was.
+        let space = store
+            .authorized_space(&input.space_id)
+            .map_err(GetSpaceErrorModeled::AccessDeniedException)?
+            .space
+            .clone();
+        Ok(GetSpaceOutput { space })
     }
 }

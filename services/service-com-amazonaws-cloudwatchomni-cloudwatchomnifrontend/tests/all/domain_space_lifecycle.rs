@@ -23,7 +23,10 @@
 //! * every derived member (id shape, ARN, endpoint URL, region, owner account,
 //!   status, encryption configuration) is computed from the stored resource;
 //! * a reader answers `ResourceNotFoundException` for a resource the store does not
-//!   hold, and a delete makes the reader answer that way;
+//!   hold, except where the resource is a SPACE: a space is the service's unit of
+//!   access, so an id the account holds no space record under authorizes nobody and
+//!   every space operation on it is refused `AccessDeniedException` (403) before
+//!   anything is read, written or reported;
 //! * a create is admitted only WITH the `clientToken` the model declares for it, and an
 //!   account holds at most one domain, so a further create conflicts with the one it
 //!   holds — both refusals before anything is minted, and both with the message AWS
@@ -834,30 +837,24 @@ async fn an_inconsistent_encryption_configuration_is_refused() {
 async fn a_resource_the_store_does_not_hold_is_not_found() {
     let omni = Omni::new();
 
-    expect_modelled_error(
+    // Every operation that NAMES a domain words the miss the same way, and AWS's sentence
+    // names the kind of resource alone: it quotes no `domainId`, so the rows below check
+    // the text as well as the status and the code.
+    expect_not_found(
         "unknown domain",
         omni.get_domain(MISSING_DOMAIN_ID).await,
-        404,
-        "ResourceNotFoundException",
+        DOMAIN_NOT_FOUND,
     );
-    expect_modelled_error(
-        "unknown space",
-        omni.get_space(MISSING_SPACE_ID).await,
-        404,
-        "ResourceNotFoundException",
-    );
-    expect_modelled_error(
+    expect_not_found(
         "space under an unknown domain",
         omni.create_space(&create_space_input("orphan-space", MISSING_DOMAIN_ID))
             .await,
-        404,
-        "ResourceNotFoundException",
+        DOMAIN_NOT_FOUND,
     );
-    expect_modelled_error(
+    expect_not_found(
         "spaces filtered by an unknown domain",
         omni.list_spaces(Some(MISSING_DOMAIN_ID), None, None).await,
-        404,
-        "ResourceNotFoundException",
+        DOMAIN_NOT_FOUND,
     );
     // The unfiltered listing names no resource, so it is an empty page rather than a miss.
     let unfiltered = omni
@@ -876,6 +873,160 @@ async fn a_resource_the_store_does_not_hold_is_not_found() {
     omni.get_domain(&created.domain_id)
         .await
         .expect("the domain created after the misses is readable");
+}
+
+/// AWS's sentence for a domain nothing holds: fixed text naming the kind of resource,
+/// written here rather than read from the crate so the assertion is independent of the
+/// implementation.
+const DOMAIN_NOT_FOUND: &str = "Domain not found";
+
+/// Require the modelled miss: HTTP 404 `ResourceNotFoundException` whose `message` is
+/// exactly `expected`.
+fn expect_not_found<O: std::fmt::Debug, E: OperationError + std::fmt::Debug>(
+    case: &str,
+    result: Result<O, E>,
+    expected: &str,
+) {
+    match result {
+        Ok(output) => {
+            panic!("case {case:?}: expected ResourceNotFoundException (404), got Ok({output:?})")
+        }
+        Err(error) => {
+            assert_eq!(
+                (error.shape_name(), error.http_status()),
+                ("ResourceNotFoundException", 404),
+                "case {case:?}: expected ResourceNotFoundException (404), got {error:?}"
+            );
+            let rendered = format!("{error:?}");
+            assert!(
+                rendered.contains(&format!("message: {expected:?}")),
+                "case {case:?}: expected the message {expected:?}, got {rendered:?}"
+            );
+        }
+    }
+}
+
+/// AWS's one refusal for a request the addressed space does not authorize: the fixed
+/// text the service states it with, written here rather than read from the crate so the
+/// assertion is independent of the implementation.
+///
+/// Shared with the suites of the resources a space's access control governs, so the
+/// refusal's required shape cannot drift between them.
+pub(crate) const AUTHORIZATION_FAILED: &str = "Authorization failed";
+
+/// Require the modelled authorization refusal: HTTP 403 `AccessDeniedException` carrying
+/// [`AUTHORIZATION_FAILED`] and quoting none of `withheld` — the values of the request
+/// the refusal must not disclose.
+pub(crate) fn expect_authorization_failure<
+    O: std::fmt::Debug,
+    E: OperationError + std::fmt::Debug,
+>(
+    case: &str,
+    result: Result<O, E>,
+    withheld: &[&str],
+) {
+    match result {
+        Ok(output) => {
+            panic!("case {case:?}: expected AccessDeniedException (403), got Ok({output:?})")
+        }
+        Err(error) => {
+            assert_eq!(
+                error.shape_name(),
+                "AccessDeniedException",
+                "case {case:?}: expected error code AccessDeniedException, got {error:?}"
+            );
+            assert_eq!(
+                error.http_status(),
+                403,
+                "case {case:?}: expected HTTP 403, got {} ({error:?})",
+                error.http_status()
+            );
+            let rendered = format!("{error:?}");
+            assert!(
+                rendered.contains(AUTHORIZATION_FAILED),
+                "case {case:?}: expected the refusal to read {AUTHORIZATION_FAILED:?}, \
+                 got {rendered:?}"
+            );
+            for value in withheld {
+                assert!(
+                    !rendered.contains(value),
+                    "case {case:?}: the refusal quotes {value:?}: {rendered:?}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_space_the_account_does_not_hold_authorizes_no_space_operation() {
+    let omni = Omni::new();
+    let parent = domain(&omni, "authorization", "omni-authorization", &["IAM"]).await;
+    let held = space(&omni, "authorization", "authorized-space", &parent.domain_id).await;
+    // A space of the account authorizes both operations, so the refusals below are about
+    // the id each request addressed and not about the operations themselves.
+    omni.get_space(&held.space_id)
+        .await
+        .expect("case \"a space the account holds\": GetSpace is authorized");
+
+    // Rows span the `SpaceId` class — nil digits, every hexadecimal digit, and an id one
+    // character from the held one — plus a space the account HELD and deleted, which is a
+    // record it no longer has and therefore authorizes nothing either.
+    let released = space(&omni, "released", "released-space", &parent.domain_id).await;
+    omni.delete_space(&released.space_id)
+        .await
+        .expect("case \"a released space\": the delete the account is authorized for");
+    for (case, space_id) in [
+        ("an id of nil digits", MISSING_SPACE_ID.to_string()),
+        (
+            "an id of every hexadecimal digit",
+            "0123456f-4567-89ab-cdef-0123456789ab".to_string(),
+        ),
+        (
+            "an id one character from the held space",
+            flip_last_digit(&held.space_id),
+        ),
+        ("a space the account deleted", released.space_id.clone()),
+    ] {
+        expect_authorization_failure(
+            &format!("GetSpace, {case}"),
+            omni.get_space(&space_id).await,
+            &[space_id.as_str()],
+        );
+        expect_authorization_failure(
+            &format!("DeleteSpace, {case}"),
+            omni.delete_space(&space_id).await,
+            &[space_id.as_str()],
+        );
+    }
+
+    // None of the refusals touched the store: the space the account holds is still there,
+    // still the only one listed, and still readable.
+    let listed = paged_space_ids(&omni, "after the refusals", Some(&parent.domain_id), None).await;
+    assert_eq!(
+        listed,
+        vec![held.space_id.clone()],
+        "the refused calls must leave the account's spaces alone, got {listed:?}"
+    );
+    let reread = omni
+        .get_space(&held.space_id)
+        .await
+        .expect("the space the account holds is still readable")
+        .space;
+    assert_eq!(
+        (reread.space_id.as_str(), reread.status.as_str()),
+        (held.space_id.as_str(), held.status.as_str()),
+        "the refused calls changed the space the account holds: {reread:?}"
+    );
+}
+
+/// `space_id` with its last hexadecimal digit replaced by a different one, which is a
+/// well-formed `SpaceId` naming another space.
+///
+/// Shared with the suites of the resources a space's access control governs.
+pub(crate) fn flip_last_digit(space_id: &str) -> String {
+    let (head, last) = space_id.split_at(space_id.len() - 1);
+    let replacement = if last == "0" { "1" } else { "0" };
+    format!("{head}{replacement}")
 }
 
 /// The message a `CreateDomain` carrying no `clientToken` is refused with: fixed text
@@ -1409,18 +1560,26 @@ async fn deleting_a_space_removes_it_and_a_domain_refuses_while_it_holds_spaces(
         .await
         .expect("the refused delete left the domain in place");
 
-    // DeleteSpace is @idempotent and declares no ResourceNotFoundException, so the
-    // second call succeeds exactly as the first.
+    // The space authorizes the delete while the account holds it; once it is gone the
+    // account holds no record of it, so the retry a client makes after a timeout is
+    // refused rather than answered as a delete that removed nothing — and the refusal
+    // says nothing about whether the id ever named a space.
+    omni.delete_space(&created.space_id)
+        .await
+        .expect("case \"the first DeleteSpace\": the space the account holds deletes");
     for attempt in 0..2 {
-        let case = format!("DeleteSpace attempt {attempt}");
-        omni.delete_space(&created.space_id)
-            .await
-            .unwrap_or_else(|error| panic!("case {case:?}: DeleteSpace failed: {error:?}"));
+        let case = format!("DeleteSpace retry {attempt}");
+        expect_modelled_error(
+            &case,
+            omni.delete_space(&created.space_id).await,
+            403,
+            "AccessDeniedException",
+        );
         expect_modelled_error(
             &case,
             omni.get_space(&created.space_id).await,
-            404,
-            "ResourceNotFoundException",
+            403,
+            "AccessDeniedException",
         );
         let remaining = paged_space_ids(&omni, &case, Some(&parent.domain_id), None).await;
         assert!(
@@ -1657,7 +1816,8 @@ async fn the_space_lifecycle_over_the_rpcv2cbor_wire() {
         "the wire response and the stored record disagree on the timestamps"
     );
 
-    // And a miss over the wire is the modelled 404 with its modelled error code.
+    // And over the wire a space the account does not hold is the modelled 403 carrying
+    // the service's one authorization refusal, with no mention of the id it addressed.
     let (status, body) = omni
         .over_the_wire(
             "GetSpace",
@@ -1669,12 +1829,21 @@ async fn the_space_lifecycle_over_the_rpcv2cbor_wire() {
         .await;
     let rendered = String::from_utf8_lossy(&body).to_string();
     assert_eq!(
-        status, 404,
-        "GetSpace over the wire answered {status} for a missing space: {rendered:?}"
+        status, 403,
+        "GetSpace over the wire answered {status} for a space the account does not hold: \
+         {rendered:?}"
     );
     assert!(
-        rendered.contains("ResourceNotFoundException"),
-        "the wire error body does not name ResourceNotFoundException: {rendered:?}"
+        rendered.contains("AccessDeniedException"),
+        "the wire error body does not name AccessDeniedException: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Authorization failed"),
+        "the wire error body does not carry AWS's authorization refusal: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains(MISSING_SPACE_ID),
+        "the wire error body quotes the space id it refused: {rendered:?}"
     );
 
     // A modelled constraint is refused before the handler runs, as a 400.

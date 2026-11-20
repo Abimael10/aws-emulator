@@ -132,6 +132,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
+        // Authorization first: the space the dashboard is addressed in decides whether
+        // the request may be served at all, so a `spaceId` the account holds no space
+        // record under is refused before the dashboard is looked for — and the refusal
+        // discloses neither the space nor the dashboard.
+        if let Some(refused) = store.space_authorization_rejection(&input.space_id) {
+            return Err(GetOmniDashboardErrorModeled::AccessDeniedException(refused).into());
+        }
         // A dashboard is addressed by its space AND its id, so a dashboard of another
         // space is not this request's dashboard: the record must be held under both.
         let found = store

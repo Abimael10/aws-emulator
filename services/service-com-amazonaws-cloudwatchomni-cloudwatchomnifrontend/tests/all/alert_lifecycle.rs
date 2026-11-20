@@ -817,7 +817,22 @@ async fn an_alert_needs_an_access_profile_a_trust_grant_authorizes_assuming() {
         ),
     ] {
         let result = omni.get_alert(space, alert_id).await;
-        expect_modelled_error(label, result, 404, "ResourceNotFoundException");
+        let missed = result
+            .err()
+            .unwrap_or_else(|| panic!("case {label:?}: expected a refusal"));
+        assert_eq!(
+            (missed.shape_name(), missed.http_status()),
+            ("ResourceNotFoundException", 404),
+            "case {label:?}: expected ResourceNotFoundException (404), got {missed:?}"
+        );
+        // AWS's sentence for an alert nothing holds names both identifiers the request
+        // addressed it by — its own and its space's — and carries no trailing period.
+        let rendered = format!("{missed:?}");
+        let expected = format!("No alert '{alert_id}' in space '{space}'");
+        assert!(
+            rendered.contains(&format!("message: {expected:?}")),
+            "case {label:?}: expected the message {expected:?}, got {rendered:?}"
+        );
     }
 }
 

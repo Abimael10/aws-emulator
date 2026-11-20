@@ -17,9 +17,11 @@
 //! * the patched record, not a second copy of it, to be what `GetSpace` and `ListSpaces`
 //!   report afterwards.
 //!
-//! The refusals are asserted the same way: a space the store does not hold is the modelled
-//! 404, an inconsistent `encryptionConfiguration` is the modelled 400, and neither writes
-//! anything. Each assertion names its case and the actual value.
+//! The refusals are asserted the same way: a space the ACCOUNT DOES NOT HOLD is the
+//! modelled 403 `AccessDeniedException` — the space is the unit of access, so the
+//! decision is taken before the request's own rules are judged — an inconsistent
+//! `encryptionConfiguration` on a space it does hold is the modelled 400, and neither
+//! writes anything. Each assertion names its case and the actual value.
 
 use std::sync::Arc;
 
@@ -642,47 +644,98 @@ async fn an_inconsistent_encryption_configuration_is_refused_and_changes_nothing
 }
 
 #[tokio::test]
-async fn updating_a_space_the_store_does_not_hold_is_not_found() {
+async fn updating_a_space_the_account_does_not_hold_is_refused_before_anything_is_read() {
     let omni = Omni::new();
-    // Well-formed `SpaceId`s that name nothing: an id the store never held, and one whose
-    // space was never created in this store at all.
-    for space_id in [
-        MISSING_SPACE_ID,
-        "ffffffff-ffff-4fff-bfff-ffffffffffff",
+    let parent = omni.domain("omni-update-space-missing").await;
+    let held = omni
+        .create_space("held", &parent, "space-authorized", None, None)
+        .await;
+
+    // Rows span the `SpaceId` class — nil digits, every hexadecimal digit, and an id one
+    // character from the space the account holds — because the decision is about whether
+    // the account holds a space under the id, not about its spelling.
+    for (case, space_id) in [
+        ("an id of nil digits", MISSING_SPACE_ID.to_string()),
+        (
+            "an id of every hexadecimal digit",
+            "0123456f-4567-89ab-cdef-0123456789ab".to_string(),
+        ),
+        (
+            "an id one character from the held space",
+            flip_last_digit(&held.space_id),
+        ),
     ] {
-        expect_modelled_error(
-            space_id,
-            omni.update_space(&UpdateSpaceInput {
-                space_id: space_id.to_string(),
-                name: Some("space-missing".to_string()),
-                ..Default::default()
-            })
-            .await,
-            404,
-            "ResourceNotFoundException",
-        );
+        // The patch is refused for a request the stored rules ACCEPT and for one they
+        // refuse alike: authorization is decided before the requested encryption is
+        // judged, so an unauthorized caller is never told to repair its payload.
+        for (patch_case, encryption) in [
+            ("a patch the rules accept", None),
+            (
+                "a patch the encryption rule refuses",
+                Some(EncryptionConfiguration {
+                    encryption_strategy: CUSTOMER_MANAGED.to_string(),
+                    kms_key_arn: None,
+                }),
+            ),
+        ] {
+            expect_authorization_failure(
+                &format!("UpdateSpace, {case}, {patch_case}"),
+                omni.update_space(&UpdateSpaceInput {
+                    space_id: space_id.clone(),
+                    name: Some("space-missing".to_string()),
+                    encryption_configuration: encryption,
+                    ..Default::default()
+                })
+                .await,
+                &[space_id.as_str(), "space-missing", "kmsKeyArn"],
+            );
+        }
     }
 
-    // A space created after the misses still updates: a miss is not a write.
-    let parent = omni.domain("omni-update-space-missing").await;
-    let created = omni
-        .create_space("after misses", &parent, "space-after-misses", None, None)
-        .await;
+    // In the space the account DOES hold, that same refused patch is the modelled 400:
+    // the decision changes which refusal comes first, not whether the rule is enforced.
+    expect_modelled_error(
+        "a patch the encryption rule refuses, in the held space",
+        omni.update_space(&UpdateSpaceInput {
+            space_id: held.space_id.clone(),
+            encryption_configuration: Some(EncryptionConfiguration {
+                encryption_strategy: CUSTOMER_MANAGED.to_string(),
+                kms_key_arn: None,
+            }),
+            ..Default::default()
+        })
+        .await,
+        400,
+        "ValidationException",
+    );
+
+    // The space the account holds still updates, and the refusals left it as it was: a
+    // refusal is not a write.
     let updated = omni
         .update_space(&UpdateSpaceInput {
-            space_id: created.space_id.clone(),
+            space_id: held.space_id.clone(),
             name: Some("space-after-misses-renamed".to_string()),
             ..Default::default()
         })
         .await
-        .expect("the space created after the misses updates")
+        .expect("the space the account holds updates")
         .space;
     assert_eq!(
         updated.name, "space-after-misses-renamed",
-        "the update after the misses did not persist, got {:?}",
+        "the update after the refusals did not persist, got {:?}",
         updated.name
     );
+    assert_eq!(
+        reported_encryption("after the refusals", &updated),
+        reported_encryption("as created", &held),
+        "a refused patch changed the space's encryption: {updated:?}"
+    );
 }
+
+/// The authorization refusal's required shape, and a `SpaceId` naming another space, from
+/// the suite that owns the space rule.
+use super::domain_space_lifecycle::{expect_authorization_failure, flip_last_digit};
+
 
 #[tokio::test]
 async fn the_modelled_update_constraints_refuse_what_they_declare() {
@@ -792,7 +845,8 @@ async fn update_space_over_the_rpcv2cbor_wire() {
         "the wire response did not keep the members the patch omitted: {patched:?}"
     );
 
-    // And a miss over the wire is the modelled 404 with its modelled error code.
+    // And over the wire a space the account does not hold is the modelled 403 carrying
+    // the service's one authorization refusal, with no mention of the id it addressed.
     let (status, body) = omni
         .over_the_wire(
             "UpdateSpace",
@@ -806,11 +860,16 @@ async fn update_space_over_the_rpcv2cbor_wire() {
         .await;
     let rendered = String::from_utf8_lossy(&body).to_string();
     assert_eq!(
-        status, 404,
-        "UpdateSpace over the wire answered {status} for a missing space: {rendered:?}"
+        status, 403,
+        "UpdateSpace over the wire answered {status} for a space the account does not hold: \
+         {rendered:?}"
     );
     assert!(
-        rendered.contains("ResourceNotFoundException"),
-        "the wire error body does not name ResourceNotFoundException: {rendered:?}"
+        rendered.contains("AccessDeniedException"),
+        "the wire error body does not name AccessDeniedException: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("Authorization failed"),
+        "the wire error body does not carry AWS's authorization refusal: {rendered:?}"
     );
 }

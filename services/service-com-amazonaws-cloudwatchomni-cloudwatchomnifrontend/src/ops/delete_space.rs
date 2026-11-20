@@ -127,6 +127,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
+        // The decision comes before the mutation: a `spaceId` the account holds no space
+        // record under authorizes nobody, so the delete is refused and performs nothing —
+        // and the refusal reports neither whether that id named a space nor that this
+        // delete would have been a no-op.
+        if let Some(refused) = store.space_authorization_rejection(&input.space_id) {
+            return Err(DeleteSpaceErrorModeled::AccessDeniedException(refused).into());
+        }
         store.spaces.remove(&input.space_id);
         // The access control the service provisioned WITH this space goes with it:
         // nothing can address those rows once the space is gone.

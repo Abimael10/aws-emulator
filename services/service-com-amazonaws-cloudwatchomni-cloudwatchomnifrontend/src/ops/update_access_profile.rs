@@ -153,6 +153,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
+        // Authorization first: the space the profile is addressed in decides whether the
+        // request may be served at all, so a `spaceId` the account holds no space record
+        // under is refused before the profile is reached and before anything is written.
+        if let Some(refused) = store.space_authorization_rejection(&input.space_id) {
+            return Err(UpdateAccessProfileErrorModeled::AccessDeniedException(refused).into());
+        }
+
         // A requested name that already identifies ANOTHER profile of the same space is a
         // conflict: `CreateAccessProfile` refuses a second profile under a live name, so a
         // rename cannot produce one either. Renaming a profile to the name it already

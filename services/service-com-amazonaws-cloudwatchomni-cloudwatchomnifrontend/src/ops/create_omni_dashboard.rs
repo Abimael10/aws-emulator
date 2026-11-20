@@ -158,6 +158,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created_by = crate::state::caller_principal(ctx);
         let mut store = state.lock();
 
+        // Authorization first — ahead of the idempotency replay, the body's schema
+        // validation and the parent lookup: a `spaceId` the account holds no space record
+        // under authorizes nobody, so an unauthorized caller is told to fix its access
+        // rather than invited to repair a payload that was never read.
+        if let Some(refused) = store.space_authorization_rejection(&input.space_id) {
+            audit(ctx, &input.space_id, &input.name, "", "refused_unauthorized");
+            return Err(CreateOmniDashboardErrorModeled::AccessDeniedException(refused).into());
+        }
+
         // @idempotencyToken: a replay returns the dashboard the token already created.
         // As in `CreateAccessProfile`, the token alone decides — the model declares no
         // error for a token reused with different members — and it is answered BEFORE
@@ -192,20 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // A dashboard is created IN a space, so the parent is resolved from the store
-        // rather than echoed back from the request.
-        if !store.spaces.contains_key(&input.space_id) {
-            audit(ctx, &input.space_id, &input.name, "", "refused_unknown_space");
-            return Err(CreateOmniDashboardErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::SPACE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_type: Some("Space".to_string()),
-                    resource_id: Some(input.space_id.clone()),
-                    error_code: None,
-                },
-            )
-            .into());
-        }
+        // A dashboard is created IN a space, and the authorization decision above
+        // resolved that parent from the store — the same record a lookup here would read
+        // — so there is no second parent check to make.
 
         // `name`'s model doc: "A name that identifies the dashboard", and a dashboard
         // belongs to one space — so a name that already identifies a dashboard of that

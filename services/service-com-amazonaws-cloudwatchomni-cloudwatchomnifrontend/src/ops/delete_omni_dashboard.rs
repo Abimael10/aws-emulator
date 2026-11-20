@@ -133,6 +133,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
+        // Authorization first: the space the dashboard is addressed in decides whether
+        // the request may be served at all, so a `spaceId` the account holds no space
+        // record under is refused rather than answered as a delete that removed nothing.
+        if let Some(refused) = store.space_authorization_rejection(&input.space_id) {
+            drop(store);
+            audit(
+                ctx,
+                &input.space_id,
+                &input.dashboard_id,
+                "refused_unauthorized",
+            );
+            return Err(DeleteOmniDashboardErrorModeled::AccessDeniedException(refused).into());
+        }
         // Addressed by space AND id, the way `GetOmniDashboard` resolves it: a record
         // held under another space is left where it is. The model declares no
         // `ResourceNotFoundException` and the operation is @idempotent, so a request

@@ -1126,24 +1126,16 @@ async fn an_update_of_a_record_the_store_does_not_hold_is_the_modelled_404() {
     omni.create_view("misses", "view.update-miss", "SELECT 1", None)
         .await;
 
-    // Rows: an id nothing names, a space nothing names, and a LIVE id addressed under
-    // another space — a record is addressed by its space AND its id, so the third is as
-    // much a miss as the first two.
+    // Rows: an id nothing names, and a LIVE id addressed under another space — a record
+    // is addressed by its space AND its id, so the second is as much a miss as the first.
+    // A space the ACCOUNT does not hold is a different answer and has its own test
+    // ([`a_space_the_account_does_not_hold_authorizes_no_patch`]).
     for (case, input) in [
         (
             "an unknown profileId",
             UpdateAccessProfileInput {
                 space_id: space_id.clone(),
                 profile_id: MISSING_PROFILE_ID.to_string(),
-                description: Some("second".to_string()),
-                ..Default::default()
-            },
-        ),
-        (
-            "a profile under an unknown spaceId",
-            UpdateAccessProfileInput {
-                space_id: MISSING_SPACE_ID.to_string(),
-                profile_id: profile.profile_id.clone(),
                 description: Some("second".to_string()),
                 ..Default::default()
             },
@@ -1227,6 +1219,121 @@ async fn an_update_of_a_record_the_store_does_not_hold_is_the_modelled_404() {
         "a refused patch wrote a description onto the view: {stored_view:?}"
     );
 }
+
+/// The authorization refusal's required shape and text, and a `SpaceId` naming another
+/// space, from the suite that owns the space rule.
+use super::domain_space_lifecycle::{
+    expect_authorization_failure, flip_last_digit, AUTHORIZATION_FAILED,
+};
+
+#[tokio::test]
+async fn a_space_the_account_does_not_hold_authorizes_no_patch() {
+    let omni = Omni::new();
+    let space_id = omni.space("authorization", "update-authorization").await;
+    let profile = omni
+        .create_profile("authorization", &space_id, "profile", None)
+        .await;
+    let dashboard = omni
+        .create_dashboard(
+            "authorization",
+            &space_id,
+            "dashboard",
+            PANELS_BODY,
+            None,
+        )
+        .await;
+
+    // Rows span the `SpaceId` class — nil digits, every hexadecimal digit, and an id one
+    // character from the space the account holds — because the decision is about whether
+    // the account holds a space under the id, not about its spelling.
+    for (case, unheld) in [
+        ("an id of nil digits", MISSING_SPACE_ID.to_string()),
+        (
+            "an id of every hexadecimal digit",
+            "0123456f-4567-89ab-cdef-0123456789ab".to_string(),
+        ),
+        (
+            "an id one character from the held space",
+            flip_last_digit(&space_id),
+        ),
+    ] {
+        expect_authorization_failure(
+            &format!("UpdateAccessProfile, {case}"),
+            omni.update_profile(&UpdateAccessProfileInput {
+                space_id: unheld.clone(),
+                profile_id: profile.profile_id.clone(),
+                description: Some("second".to_string()),
+                ..Default::default()
+            })
+            .await,
+            &[unheld.as_str(), profile.profile_id.as_str()],
+        );
+        // The dashboard patch is refused for a body the schema ACCEPTS and for one it
+        // refuses alike: authorization is decided before the body is read, so an
+        // unauthorized caller is never told to repair its payload.
+        for (body_case, body) in [
+            ("no body at all", None),
+            ("a body the schema accepts", Some(PANELS_BODY.to_string())),
+            (
+                "a body the schema refuses",
+                Some(r#"{"widgets":[]}"#.to_string()),
+            ),
+        ] {
+            expect_authorization_failure(
+                &format!("UpdateOmniDashboard, {case}, {body_case}"),
+                omni.update_dashboard(&UpdateOmniDashboardInput {
+                    space_id: unheld.clone(),
+                    dashboard_id: dashboard.dashboard_id.clone(),
+                    body,
+                    description: Some("second".to_string()),
+                    ..Default::default()
+                })
+                .await,
+                &[
+                    unheld.as_str(),
+                    dashboard.dashboard_id.as_str(),
+                    "constraint",
+                ],
+            );
+        }
+    }
+
+    // In the space the account DOES hold, that same refused body is the modelled 400: the
+    // decision changes which refusal comes first, not whether the schema is enforced.
+    expect_modelled_error(
+        "a body the schema refuses, in the held space",
+        omni.update_dashboard(&UpdateOmniDashboardInput {
+            space_id: space_id.clone(),
+            dashboard_id: dashboard.dashboard_id.clone(),
+            body: Some(r#"{"widgets":[]}"#.to_string()),
+            ..Default::default()
+        })
+        .await,
+        400,
+        "ValidationException",
+    );
+
+    // None of the refusals touched the records the account holds.
+    let stored_profile = omni
+        .stored_profile("authorization", &space_id, &profile.profile_id)
+        .await;
+    assert_eq!(
+        stored_profile.description, None,
+        "a refused patch wrote a description onto the profile: {stored_profile:?}"
+    );
+    let stored_dashboard = omni
+        .stored_dashboard("authorization", &space_id, &dashboard.dashboard_id)
+        .await;
+    assert_eq!(
+        (
+            stored_dashboard.description.clone(),
+            stored_dashboard.body.as_str()
+        ),
+        (None, PANELS_BODY),
+        "a refused patch changed the dashboard: {stored_dashboard:?}"
+    );
+}
+
 
 #[tokio::test]
 async fn a_rename_onto_a_name_a_sibling_holds_is_the_modelled_conflict_and_writes_nothing() {
@@ -2452,27 +2559,51 @@ async fn a_space_the_store_does_not_hold_is_one_text_whichever_operation_reports
             "ffffffff-ffff-4fff-bfff-ffffffffffff".to_string(),
         ),
     ] {
+        // The operations that address the SPACE, or a resource its access control
+        // governs, decide authorization from the account's space records first: an id the
+        // account holds no space under authorizes nobody, so these report the
+        // authorization refusal rather than a miss, and that refusal is one text too.
         let read = refusal_message!(
             case,
             omni.get_space(&space_id).await,
-            GetSpaceErrorModeled::ResourceNotFoundException,
-            NOT_FOUND.0,
-            NOT_FOUND.1
+            GetSpaceErrorModeled::AccessDeniedException,
+            "AccessDeniedException",
+            403
         );
         let patched = refusal_message!(
             case,
             omni.update_space(&space_id).await,
-            UpdateSpaceErrorModeled::ResourceNotFoundException,
-            NOT_FOUND.0,
-            NOT_FOUND.1
+            UpdateSpaceErrorModeled::AccessDeniedException,
+            "AccessDeniedException",
+            403
         );
         let profile = refusal_message!(
             case,
             omni.create_profile_in(&space_id, "orphan profile").await,
-            CreateAccessProfileErrorModeled::ResourceNotFoundException,
-            NOT_FOUND.0,
-            NOT_FOUND.1
+            CreateAccessProfileErrorModeled::AccessDeniedException,
+            "AccessDeniedException",
+            403
         );
+        for (operation, actual) in [
+            ("GetSpace", read),
+            ("UpdateSpace", patched),
+            ("CreateAccessProfile", profile),
+        ] {
+            assert_eq!(
+                actual, AUTHORIZATION_FAILED,
+                "case {case:?}: {operation} expected {AUTHORIZATION_FAILED:?}, got {actual:?}"
+            );
+            for disclosed in [space_id.as_str(), live_domain.as_str()] {
+                assert!(
+                    !actual.contains(disclosed),
+                    "case {case:?}: {operation} disclosed {disclosed:?}: {actual:?}"
+                );
+            }
+        }
+
+        // The operations that report the COLLECTION a space holds, and the grant create
+        // that names a space as a parent, are not gated on the space: they report the
+        // space that is missing, in one text.
         let dashboards = refusal_message!(
             case,
             omni.list_dashboards(&space_id).await,
@@ -2498,9 +2629,6 @@ async fn a_space_the_store_does_not_hold_is_one_text_whichever_operation_reports
             NOT_FOUND.1
         );
         for (operation, actual) in [
-            ("GetSpace", read),
-            ("UpdateSpace", patched),
-            ("CreateAccessProfile", profile),
             ("ListOmniDashboards", dashboards),
             ("ListAccessGrants", grants),
             ("CreateAccessGrant", grant),
@@ -2518,7 +2646,8 @@ async fn a_space_the_store_does_not_hold_is_one_text_whichever_operation_reports
         }
     }
 
-    // The live space still answers, so the refusals above are lookups that missed.
+    // The live space still answers, so the refusals above are decisions and lookups about
+    // the id each request carried, not a blanket answer.
     let held = omni
         .get_space(&live_space)
         .await

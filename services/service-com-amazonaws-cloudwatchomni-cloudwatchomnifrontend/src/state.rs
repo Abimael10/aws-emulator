@@ -1478,6 +1478,13 @@ mod resource_not_found;
 /// rather than about one request.
 mod domain_admission;
 
+/// Whether a request may act on the space it addresses. It lives beside the store
+/// because the decision is read from the account's space records, which every operation
+/// that addresses a space reads too.
+mod space_authorization;
+
+pub use space_authorization::{authorization_failed, AUTHORIZATION_FAILED};
+
 pub use domain_admission::{client_token_required_message, DOMAIN_ALREADY_EXISTS_FOR_ACCOUNT};
 
 pub use resource_not_found::{

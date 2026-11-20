@@ -149,6 +149,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        let mut store = state.lock();
+
+        // Authorization first — ahead of the encryption rule below and ahead of reaching
+        // the record: a `spaceId` the account holds no space record under authorizes
+        // nobody, so the patch is refused and changes nothing, and the refusal reports
+        // neither whether that id names a space nor anything else of the request.
+        if let Some(refused) = store.space_authorization_rejection(&input.space_id) {
+            return Err(UpdateSpaceErrorModeled::AccessDeniedException(refused).into());
+        }
+
         // The requested encryption is judged before the store is touched, so a refused
         // request leaves the space exactly as it was. The rule is
         // `EncryptionConfiguration`'s own, shared with every operation that accepts one.
@@ -162,9 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let mut store = state.lock();
+        // The decision above resolved the space from the store, so the record this patch
+        // writes is the one it admitted.
         let Some(stored) = store.spaces.get_mut(&input.space_id) else {
-            // An unknown id and a deleted one are the same answer: the record is gone.
             return Err(UpdateSpaceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::SPACE_NOT_FOUND_MESSAGE.to_string(),

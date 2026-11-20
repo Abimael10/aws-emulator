@@ -60,6 +60,9 @@ use omni::state::{
     ASSUME_ACCESS_PROFILE_ACTION, ASSUME_STATUS_ALLOWED, ASSUME_STATUS_DENIED,
 };
 
+/// A `SpaceId` naming another space, from the suite that owns the space rule.
+use super::domain_space_lifecycle::flip_last_digit;
+
 /// The region the suite signs for.
 const REGION: &str = "us-west-2";
 
@@ -906,5 +909,57 @@ async fn an_access_profile_cannot_be_deleted_while_access_grants_reference_it() 
                      {error:?}"
                 )
             });
+
+        // The idempotent success above is for a space the account HOLDS. A space it does
+        // not hold authorizes nobody, so the same delete is refused with the modelled
+        // 403 and the profile named in it is left where it is. Rows span the `SpaceId`
+        // class: nil digits, every hexadecimal digit, and an id one character from the
+        // space the account holds.
+        for (unheld_case, unheld) in [
+            (
+                "an id of nil digits",
+                "00000000-0000-4000-8000-000000000000".to_string(),
+            ),
+            (
+                "an id of every hexadecimal digit",
+                "0123456f-4567-89ab-cdef-0123456789ab".to_string(),
+            ),
+            (
+                "an id one character from the held space",
+                flip_last_digit(&elsewhere.space_id),
+            ),
+        ] {
+            let refused = omni
+                .delete_profile(&unheld, &elsewhere.profile_id)
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?} / {unheld_case:?}: a delete in a space the account does \
+                         not hold must be refused, not reported as a success"
+                    )
+                });
+            assert_eq!(
+                (refused.shape_name(), refused.http_status()),
+                ("AccessDeniedException", 403),
+                "case {case:?} / {unheld_case:?}: expected AccessDeniedException (403), \
+                 got {refused:?}"
+            );
+            let rendered = format!("{refused:?}");
+            assert!(
+                rendered.contains("Authorization failed") && !rendered.contains(&unheld),
+                "case {case:?} / {unheld_case:?}: expected the fixed refusal naming nothing of \
+                 the request, got {rendered:?}"
+            );
+            omni.read_profile(&elsewhere.space_id, &elsewhere.profile_id)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {case:?} / {unheld_case:?}: the refused delete must leave the \
+                         profile: {error:?}"
+                    )
+                });
+        }
     }
 }
+

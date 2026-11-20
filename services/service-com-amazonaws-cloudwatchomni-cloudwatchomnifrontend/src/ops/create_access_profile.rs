@@ -146,6 +146,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let created_by = crate::state::caller_principal(ctx);
         let mut store = state.lock();
 
+        // Authorization first — ahead of the idempotency replay, the parent lookup and
+        // every rule below: a `spaceId` the account holds no space record under
+        // authorizes nobody, so the create is refused without reporting whether that id
+        // names a space.
+        if let Some(refused) = store.space_authorization_rejection(&input.space_id) {
+            return Err(CreateAccessProfileErrorModeled::AccessDeniedException(refused).into());
+        }
+
         // @idempotencyToken: a replay returns the profile the token already created. As
         // in `CreateSpace`, the token alone decides — the model declares no error for a
         // token reused with different members, so a replay is answered with the original
@@ -163,19 +171,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // A profile is created IN a space, so the parent is resolved from the store
-        // rather than echoed back from the request.
-        if !store.spaces.contains_key(&input.space_id) {
-            return Err(CreateAccessProfileErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: crate::state::SPACE_NOT_FOUND_MESSAGE.to_string(),
-                    resource_type: Some("Space".to_string()),
-                    resource_id: Some(input.space_id.clone()),
-                    error_code: None,
-                },
-            )
-            .into());
-        }
+        // A profile is created IN a space, and the authorization decision above resolved
+        // that parent from the store — the same record a lookup here would read — so
+        // there is no second parent check to make.
 
         // `AccessProfileName`'s model doc: "A name that identifies an access profile",
         // and a profile belongs to one space — so a name that already identifies a

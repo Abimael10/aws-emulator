@@ -154,6 +154,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        let mut store = state.lock();
+
+        // Authorization first — ahead of the body's schema validation below and ahead of
+        // reaching the record: a `spaceId` the account holds no space record under
+        // authorizes nobody, so an unauthorized caller is told to fix its access rather
+        // than invited to repair a payload that was never read.
+        if let Some(refused) = store.space_authorization_rejection(&input.space_id) {
+            return Err(UpdateOmniDashboardErrorModeled::AccessDeniedException(refused).into());
+        }
+
         // A requested body is judged before the store is touched, so a refused request
         // leaves the dashboard exactly as it was. The rule is the dashboard body's own,
         // shared with the create that first accepted one.
@@ -168,8 +178,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         }
-
-        let mut store = state.lock();
 
         // A requested name that already identifies ANOTHER dashboard of the same space is
         // a conflict: `CreateOmniDashboard` refuses a second dashboard under a live name,

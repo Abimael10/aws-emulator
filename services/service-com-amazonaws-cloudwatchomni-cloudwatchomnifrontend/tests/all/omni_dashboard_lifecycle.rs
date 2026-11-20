@@ -22,6 +22,10 @@
 //!   is computed from the request and the store rather than fixed;
 //! * a dashboard is addressed by its space AND its id, so neither an unknown id nor a
 //!   known id under another space resolves;
+//! * a space is the unit of access: an id the account holds no space record under
+//!   authorizes nobody, so a read, a create, a patch or a delete addressing it is
+//!   refused `AccessDeniedException` (403) BEFORE the dashboard is looked for, before
+//!   anything is written and before the body's schema is read at all;
 //! * a name already identifying a dashboard of that space cannot identify a second one;
 //! * `@idempotencyToken` replays return the original dashboard.
 //!
@@ -682,7 +686,8 @@ async fn a_dashboard_is_addressed_by_its_space_and_its_id() {
         .expect("CreateOmniDashboard in an existing space")
         .omni_dashboard;
 
-    // Rows: the id under its own space resolves; everything else is the modelled 404.
+    // Rows: the id under its own space resolves; an id the space does not hold is the
+    // modelled 404.
     omni.get_dashboard(&home, &created.dashboard_id)
         .await
         .expect("case \"its own space\": the dashboard resolves");
@@ -693,11 +698,6 @@ async fn a_dashboard_is_addressed_by_its_space_and_its_id() {
             created.dashboard_id.as_str(),
         ),
         ("an unknown id", home.as_str(), MISSING_DASHBOARD_ID),
-        (
-            "a space the store does not hold",
-            MISSING_SPACE_ID,
-            created.dashboard_id.as_str(),
-        ),
     ] {
         expect_modelled_error(
             case,
@@ -706,16 +706,117 @@ async fn a_dashboard_is_addressed_by_its_space_and_its_id() {
             "ResourceNotFoundException",
         );
     }
+}
 
-    // And a create names its parent: a space the store does not hold is the same 404.
+/// The authorization refusal's required shape, and a `SpaceId` naming another space, from
+/// the suite that owns the space rule.
+use super::domain_space_lifecycle::{expect_authorization_failure, flip_last_digit};
+
+/// A `body` the dashboard-body schema refuses twice over: it declares no `panels` and
+/// carries a member the schema does not declare.
+const INVALID_BODY: &str = r#"{"widgets":[]}"#;
+
+#[tokio::test]
+async fn a_space_the_account_does_not_hold_authorizes_no_dashboard_operation() {
+    let omni = Omni::new();
+    let home = omni.space("home", "dashboard-authorization").await;
+    let created = omni
+        .create_dashboard(&create_input(&home, "authorized", EMPTY_PANELS_BODY))
+        .await
+        .expect("CreateOmniDashboard in a space the account holds")
+        .omni_dashboard;
+
+    // Rows span the `SpaceId` class — nil digits, every hexadecimal digit, and an id one
+    // character from the space the account holds — because the decision is about whether
+    // the account holds a space under the id, not about its spelling.
+    for (case, space_id) in [
+        ("an id of nil digits", MISSING_SPACE_ID.to_string()),
+        (
+            "an id of every hexadecimal digit",
+            "0123456f-4567-89ab-cdef-0123456789ab".to_string(),
+        ),
+        (
+            "an id one character from the held space",
+            flip_last_digit(&home),
+        ),
+    ] {
+        // A read is refused whether the dashboard id names a stored dashboard of another
+        // space or nothing at all: the space decides before the dashboard is looked for,
+        // so neither answer reveals which it was.
+        for (addressed, dashboard_id) in [
+            ("a dashboard of the held space", created.dashboard_id.as_str()),
+            ("a dashboard id naming nothing", MISSING_DASHBOARD_ID),
+        ] {
+            expect_authorization_failure(
+                &format!("GetOmniDashboard, {case}, {addressed}"),
+                omni.get_dashboard(&space_id, dashboard_id).await,
+                &[space_id.as_str(), dashboard_id],
+            );
+            // A delete declares no not-found of its own, so without the decision it would
+            // report an unauthorized caller a success.
+            expect_authorization_failure(
+                &format!("DeleteOmniDashboard, {case}, {addressed}"),
+                omni.delete_dashboard(&space_id, dashboard_id).await,
+                &[space_id.as_str(), dashboard_id],
+            );
+        }
+        // The create is refused for a body the schema ACCEPTS and for one it refuses
+        // alike: authorization is decided before the body is read, so an unauthorized
+        // caller is never told to repair its payload.
+        for (body_case, body) in [
+            ("a body the schema accepts", EMPTY_PANELS_BODY),
+            ("a body the schema refuses", INVALID_BODY),
+        ] {
+            expect_authorization_failure(
+                &format!("CreateOmniDashboard, {case}, {body_case}"),
+                omni.create_dashboard(&create_input(&space_id, "orphan", body))
+                    .await,
+                &[space_id.as_str(), "orphan", "panels", "constraint"],
+            );
+        }
+    }
+
+    // In a space the account DOES hold, that same refused body is the modelled 400: the
+    // decision changes which refusal comes first, not whether the schema is enforced.
     expect_modelled_error(
-        "a create in a space the store does not hold",
-        omni.create_dashboard(&create_input(MISSING_SPACE_ID, "orphan", EMPTY_PANELS_BODY))
+        "a body the schema refuses, in the held space",
+        omni.create_dashboard(&create_input(&home, "refused-body", INVALID_BODY))
             .await,
-        404,
-        "ResourceNotFoundException",
+        400,
+        "ValidationException",
+    );
+
+    // None of the refusals wrote anything: the dashboard the account holds is unchanged
+    // and the space still holds only it.
+    let listed = omni
+        .list_dashboards(&ListOmniDashboardsInput {
+            space_id: home.clone(),
+            ..Default::default()
+        })
+        .await
+        .expect("the held space still lists its dashboards");
+    assert_eq!(
+        listed
+            .items
+            .iter()
+            .map(|item| item.dashboard_id.as_str())
+            .collect::<Vec<&str>>(),
+        vec![created.dashboard_id.as_str()],
+        "the refused calls must leave the held space's dashboards alone, got {:?}",
+        listed.items
+    );
+    let reread = omni
+        .get_dashboard(&home, &created.dashboard_id)
+        .await
+        .expect("the dashboard of the held space is still readable")
+        .omni_dashboard;
+    assert_eq!(
+        (reread.name.as_str(), reread.body.as_str()),
+        (created.name.as_str(), created.body.as_str()),
+        "the refused calls changed the stored dashboard: {reread:?}"
     );
 }
+
 
 #[tokio::test]
 async fn a_name_identifies_one_dashboard_per_space() {

@@ -774,12 +774,22 @@ async fn a_grant_is_created_in_a_space_of_a_domain_the_store_holds() {
         );
     }
 
-    // A read names the grant alone, so an id the store does not hold is the same 404.
-    expect_modelled_error(
-        "a read of a grant the store does not hold",
-        omni.get_access_grant(MISSING_GRANT_ID).await,
-        404,
-        "ResourceNotFoundException",
+    // A read names the grant alone, so an id the store does not hold is the same 404 —
+    // and AWS's sentence for it names the kind of resource alone, quoting no `grantId`.
+    let missed = omni
+        .get_access_grant(MISSING_GRANT_ID)
+        .await
+        .expect_err("case \"a read of a grant the store does not hold\": expected a refusal");
+    assert_eq!(
+        (missed.shape_name(), missed.http_status()),
+        ("ResourceNotFoundException", 404),
+        "case \"a read of a grant the store does not hold\": got {missed:?}"
+    );
+    let rendered = format!("{missed:?}");
+    assert!(
+        rendered.contains("message: \"AccessGrant not found\""),
+        "case \"a read of a grant the store does not hold\": expected the message \
+         \"AccessGrant not found\", got {rendered:?}"
     );
 }
 
@@ -1846,13 +1856,26 @@ async fn deleting_a_space_releases_the_access_control_it_was_provisioned_with() 
             "ResourceNotFoundException",
         );
     }
-    expect_modelled_error(
-        "a read of the released profile",
-        omni.get_access_profile(&removed_space, &removed_profile.profile_id)
-            .await,
-        404,
-        "ResourceNotFoundException",
-    );
+    // The released profile is addressed in a space the account no longer holds, so the
+    // read is refused rather than answered: the space is the unit of access, and a space
+    // the account does not hold authorizes nobody.
+    match omni
+        .get_access_profile(&removed_space, &removed_profile.profile_id)
+        .await
+    {
+        Ok(output) => panic!(
+            "case \"a read of the released profile\": expected AccessDeniedException (403), \
+             got Ok({output:?})"
+        ),
+        Err(error) => {
+            assert_eq!(
+                (error.shape_name(), error.http_status()),
+                ("AccessDeniedException", 403),
+                "case \"a read of the released profile\": expected AccessDeniedException (403), \
+                 got {error:?}"
+            );
+        }
+    }
     let listed: Vec<String> = omni
         .list_access_grants(&ListAccessGrantsInput::default())
         .await

@@ -15,6 +15,10 @@
 //!   `assumeStatus`) is computed from the stored resource rather than echoed;
 //! * a profile is addressed by its space AND its id, so neither an unknown id nor a
 //!   known id under another space resolves;
+//! * a space is the unit of access: an id the account holds no space record under
+//!   authorizes nobody, so a read or a create addressing it is refused
+//!   `AccessDeniedException` (403) before the profile is looked for and before anything
+//!   is written;
 //! * a name already identifying a profile of that space cannot identify a second one,
 //!   while the same name in another space is a different profile;
 //! * `@idempotencyToken` replays return the original profile.
@@ -557,7 +561,8 @@ async fn a_profile_is_addressed_by_its_space_and_its_id() {
         .expect("CreateAccessProfile in an existing space")
         .access_profile;
 
-    // Rows: the id under its own space resolves; everything else is the modelled 404.
+    // Rows: the id under its own space resolves; an id the space does not hold is the
+    // modelled 404.
     omni.get_access_profile(&home, &created.profile_id)
         .await
         .expect("case \"its own space\": the profile resolves");
@@ -568,11 +573,6 @@ async fn a_profile_is_addressed_by_its_space_and_its_id() {
             created.profile_id.as_str(),
         ),
         ("an unknown id", home.as_str(), MISSING_PROFILE_ID),
-        (
-            "a space the store does not hold",
-            MISSING_SPACE_ID,
-            created.profile_id.as_str(),
-        ),
     ] {
         expect_modelled_error(
             case,
@@ -581,16 +581,71 @@ async fn a_profile_is_addressed_by_its_space_and_its_id() {
             "ResourceNotFoundException",
         );
     }
+}
 
-    // And a create names its parent: a space the store does not hold is the same 404.
-    expect_modelled_error(
-        "a create in a space the store does not hold",
-        omni.create_access_profile(&create_input(MISSING_SPACE_ID, "orphan"))
-            .await,
-        404,
-        "ResourceNotFoundException",
+/// The authorization refusal's required shape, and a `SpaceId` naming another space, from
+/// the suite that owns the space rule.
+use super::domain_space_lifecycle::{expect_authorization_failure, flip_last_digit};
+
+#[tokio::test]
+async fn a_space_the_account_does_not_hold_authorizes_no_profile_operation() {
+    let omni = Omni::new();
+    let home = omni.space("home", "profile-authorization").await;
+    let created = omni
+        .create_access_profile(&create_input(&home, "authorized"))
+        .await
+        .expect("CreateAccessProfile in a space the account holds")
+        .access_profile;
+
+    // Rows span the `SpaceId` class — nil digits, every hexadecimal digit, and an id one
+    // character from the space the account holds — because the decision is about whether
+    // the account holds a space under the id, not about its spelling.
+    for (case, space_id) in [
+        ("an id of nil digits", MISSING_SPACE_ID.to_string()),
+        (
+            "an id of every hexadecimal digit",
+            "0123456f-4567-89ab-cdef-0123456789ab".to_string(),
+        ),
+        (
+            "an id one character from the held space",
+            flip_last_digit(&home),
+        ),
+    ] {
+        // The read of a profile is refused whether the id names a stored profile of
+        // another space or nothing at all: the space decides before the profile is
+        // looked for, so neither answer reveals which it was.
+        for (addressed, profile_id) in [
+            ("a profile of the held space", created.profile_id.as_str()),
+            ("a profile id naming nothing", MISSING_PROFILE_ID),
+        ] {
+            expect_authorization_failure(
+                &format!("GetAccessProfile, {case}, {addressed}"),
+                omni.get_access_profile(&space_id, profile_id).await,
+                &[space_id.as_str(), profile_id],
+            );
+        }
+        expect_authorization_failure(
+            &format!("CreateAccessProfile, {case}"),
+            omni.create_access_profile(&create_input(&space_id, "orphan"))
+                .await,
+            &[space_id.as_str(), "orphan"],
+        );
+    }
+
+    // None of the refusals wrote anything: the profile the account holds is unchanged,
+    // and the space still holds only it.
+    let reread = omni
+        .get_access_profile(&home, &created.profile_id)
+        .await
+        .expect("the profile of the held space is still readable")
+        .access_profile;
+    assert_eq!(
+        (reread.profile_id.as_str(), reread.name.as_str()),
+        (created.profile_id.as_str(), created.name.as_str()),
+        "the refused calls changed the stored profile: {reread:?}"
     );
 }
+
 
 #[tokio::test]
 async fn a_name_identifies_one_profile_per_space() {
