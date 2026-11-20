@@ -1,0 +1,48 @@
+Issue-Severity: MEDIUM
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: appsync.http-data-source-resolver-forwards-backend-status-and-body appsync.http-data-source-sigv4-signing-toggles-backend-authorization
+Issue-Shape-Id: com.amazonaws.appsync#AWSDeepdishControlPlaneService
+Issue-Key: appsync.http-data-source-resolver-forwards-backend-status-and-body|run#13|AssertionError|assert identity_error == ("Sender", "MissingAuthenticationToken", "Request is missing Authentication Token"), (
+Issue-Key: appsync.http-data-source-sigv4-signing-toggles-backend-authorization|run#23|AssertionError|assert unsigned_error == ("Sender", "MissingAuthenticationToken", "Request is missing Authentication Token"), (
+Issue-Commit: c119c6290af0aef232d88082a679964269a74639
+
+# appsync: an HTTP data source's UNSIGNED backend call to STS is refused with InvalidClientTokenId instead of AWS's 403 MissingAuthenticationToken
+
+> _Note: this issue was identified against the code base at commit `c119c6290af0aef232d88082a679964269a74639`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+GetCallerIdentity
+
+## Description
+One net-new root cause in the appsync emulator's HTTP-data-source path, surfaced now that the data source is actually called (the forwarded status code is already correct) and the assertion has moved on to the backend's error identity.
+
+Cause 1 of 1: a backend request that an AppSync HTTP data source issues WITHOUT SigV4 (no serviceRoleArn / no httpConfig.authorizationConfig) reaches the target AWS endpoint carrying no usable credentials, and the target refuses it with the wrong error code and message.
+Failing check ids: appsync.http-data-source-resolver-forwards-backend-status-and-body, appsync.http-data-source-sigv4-signing-toggles-backend-authorization
+
+AWS: Smithy: the target is AWSSecurityTokenServiceV20110615 (awsQuery, sigv4; xmlNamespace https://sts.amazonaws.com/doc/2011-06-15/), operation GetCallerIdentity. MissingAuthenticationToken is a framework (unmodeled) refusal, so the error identity is recorded behavior only: a query-protocol AWS request that arrives with NO Authorization header is refused with HTTP 403 and the awsQuery error document <ErrorResponse><Error><Type>Sender</Type><Code>MissingAuthenticationToken</Code><Message>Request is missing Authentication Token</Message></Error><RequestId>…</RequestId></ErrorResponse>. The whole message is fixed text — "Request is missing Authentication Token" has no request- or state-derived part, and RequestId is per-run and not part of the contract. AWS reserves Code InvalidClientTokenId / Message "The security token included in the request is invalid." for the different condition of credentials that ARE presented but name an access key id that does not exist. The AppSync side of this is the documented HTTP-resolver contract: the non-2xx outcome is bound to $ctx.result as {statusCode, headers, body} and forwarded verbatim through the response template, so the GraphQL call itself is HTTP 200 with no `errors` member and the backend's status and body visible in the selected fields. Signing only happens when authorizationConfig.authorizationType is AWS_IAM; with no config the request must go out anonymous.
+Emulator: the status is right (403, so the forwarding itself works) but the forwarded body carries the wrong refusal: Type "Sender", Code "InvalidClientTokenId", Message "The security token included in the request is invalid." Both failing checks observe the identical triple, on a data source with no authorizationConfig at all (check 1) and on the deliberately unsigned twin of a correctly signed data source (check 2 — whose signed leg passes, returning 200 and an assumed-role ARN). Hypothesis: the emulator's request-authentication layer classifies an absent SigV4 Authorization header the same way it classifies an unknown access key id, or the HTTP-data-source sender injects placeholder credentials on the unsigned path instead of sending the request anonymously.
+Why: "no credentials were sent" and "the credentials sent are not valid" are distinct, separately handled conditions. A client (or an AppSync resolver inspecting $ctx.result.body, as both checks do) that branches on MissingAuthenticationToken to detect a missing/misconfigured authorizationConfig never sees it on the emulator, and instead gets an error that says its key material is bad — pointing debugging at credentials that were never involved. It also makes the signed-vs-unsigned differential, the only way to observe that AWS_IAM signing is actually being applied, unobservable from the error identity.
+Fix: the emulator's request-authentication/refusal layer for anonymous requests on the sts service crate (classify an absent Authorization header as 403 MissingAuthenticationToken with AWS's fixed message, keeping InvalidClientTokenId for a presented-but-unknown access key id), and, if it is the sender rather than the receiver, the appsync service crate's HTTP-data-source outbound request builder so a data source with no authorizationConfig sends no credentials at all.
+Related-but-not-covering: 20261117T120125Z-appsync-6-net-new-causes-http-data-sources.md (open) lists both of these check ids under its Cause 1 ("an HTTP data source is never called"), but its replay keys for them are the earlier failures (`run#9` on `assert identity_resp is not None …` and a 60 s timeout in `_poll_until`); the data source is now invoked and forwards the backend status, and this refusal-identity divergence is a different cause that issue does not carry a key for.
+Traces: appsync.http-data-source-resolver-forwards-backend-status-and-body (identityCall: statusCode 403 as expected, parsed STS error ('Sender','InvalidClientTokenId','The security token included in the request is invalid.')), appsync.http-data-source-sigv4-signing-toggles-backend-authorization (signed leg 200 + assumed-role ARN pass; unsignedCall: statusCode 403 as expected, same wrong error triple).
+
+## Evidence
+Cause 1 — appsync.http-data-source-resolver-forwards-backend-status-and-body
+Expected (AWS): the HTTP data source's unsigned GET / ?Action=GetCallerIdentity&Version=2011-06-15 is refused by STS with HTTP 403 and an ErrorResponse whose (Type, Code, Message) is ('Sender', 'MissingAuthenticationToken', 'Request is missing Authentication Token'); the GraphQL reply is 200 with data.identityCall = {statusCode: 403, body: <that XML>} and no `errors`.
+Actual (emulator): statusCode is forwarded as 403 correctly, but the body parses to ('Sender', 'InvalidClientTokenId', 'The security token included in the request is invalid.') — AssertionError: unexpected identity call error ('Sender', 'InvalidClientTokenId', 'The security token included in the request is invalid.')
+
+Cause 1 — appsync.http-data-source-sigv4-signing-toggles-backend-authorization
+Expected (AWS): signedCall (authorizationConfig AWS_IAM, signingServiceName 'sts', data-source service role) -> statusCode 200 with GetCallerIdentityResult/Arn starting arn:aws:sts::<account>:assumed-role/<role>/; unsignedCall (identical template, data source with NO authorizationConfig) -> statusCode 403 with ('Sender', 'MissingAuthenticationToken', 'Request is missing Authentication Token').
+Actual (emulator): the signed leg passes (200, assumed-role ARN), and the unsigned leg returns 403 but with ('Sender', 'InvalidClientTokenId', 'The security token included in the request is invalid.') — AssertionError: unexpected unsigned call error ('Sender', 'InvalidClientTokenId', 'The security token included in the request is invalid.')
+
+The recorded Type ('Sender') and HTTP status (403) match; only the Code and Message diverge. No per-run value is involved: AWS's message for this class is fixed text with no request- or state-derived part.
+
+## Steps to Reproduce
+1. CreateGraphqlApi(name=<n>, authenticationType='API_KEY'); CreateApiKey(apiId).
+2. StartSchemaCreation with `type BackendResponse { statusCode: Int body: String }` / `type Query { identityCall: BackendResponse }` and poll GetSchemaCreationStatus to SUCCESS.
+3. CreateDataSource(apiId, name=<ds>, type='HTTP', httpConfig={'endpoint': 'https://sts.<region>.amazonaws.com'}) — note: NO serviceRoleArn and NO authorizationConfig, so the outbound request must be anonymous.
+4. CreateResolver(apiId, typeName='Query', fieldName='identityCall', dataSourceName=<ds>, requestMappingTemplate='{"version":"2018-05-29","method":"GET","resourcePath":"/","params":{"query":{"Action":"GetCallerIdentity","Version":"2011-06-15"}}}', responseMappingTemplate='{"statusCode": $ctx.result.statusCode, "body": $util.toJson($ctx.result.body)}').
+5. POST {"query":"{ identityCall { statusCode body } }"} to uris.GRAPHQL with header x-api-key: <key>.
+6. Parse data.identityCall.body as the awsQuery ErrorResponse XML and read Error/Type, Error/Code, Error/Message. AWS: ('Sender','MissingAuthenticationToken','Request is missing Authentication Token'); the emulator: ('Sender','InvalidClientTokenId','The security token included in the request is invalid.').
+7. For the signing differential, add a second data source over the same endpoint with serviceRoleArn=<role appsync.amazonaws.com can assume> and httpConfig.authorizationConfig={'authorizationType':'AWS_IAM','awsIamConfig':{'signingRegion':<region>,'signingServiceName':'sts'}} plus a resolver on a `signedCall` field, and query both: the signed field returns 200 with the assumed-role ARN (correct today) while the unsigned field must carry MissingAuthenticationToken.
