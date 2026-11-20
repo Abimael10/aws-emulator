@@ -6,7 +6,8 @@
 //! `ZonalShift` body of `StartZonalShift`, `CancelZonalShift` and `UpdateZonalShift`,
 //! the `ZonalShiftSummary` of `ListZonalShifts`, the `ZonalShiftInResource` of
 //! `GetManagedResource` and `ListManagedResources`, and the `StartPracticeRunResponse`
-//! of `StartPracticeRun` — so what they declare is what every read of a shift reports.
+//! and `CancelPracticeRunResponse` of the practice run operations — so what they
+//! declare is what every read of a shift reports.
 //!
 //! They are declared here rather than beside the other shapes because AWS answers with
 //! one member the published model snapshot does not declare, and that snapshot is kept
@@ -113,6 +114,22 @@ pub struct ZonalShiftInResource {
     pub comment: String,
     pub shift_type: Option<String>,
     pub practice_run_outcome: Option<String>,
+    /// See [`StartZonalShiftOutput::az_group_id`].
+    pub az_group_id: Option<String>,
+}
+
+/// The practice run zonal shift `CancelPracticeRun` answers 200 with — a practice run is
+/// a zonal shift, so the cancel reports the same group the start of the run reported.
+#[smithy_macros::smithy(shape = "com.amazonaws.arczonalshift#CancelPracticeRunResponse")]
+#[derive(Debug, Clone)]
+pub struct CancelPracticeRunOutput {
+    pub zonal_shift_id: String,
+    pub resource_identifier: String,
+    pub away_from: String,
+    pub expiry_time: ::aws_smithy_types::DateTime,
+    pub start_time: ::aws_smithy_types::DateTime,
+    pub status: String,
+    pub comment: String,
     /// See [`StartZonalShiftOutput::az_group_id`].
     pub az_group_id: Option<String>,
 }

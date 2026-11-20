@@ -99,7 +99,7 @@ fn unknown_resource_identifiers() -> Vec<(&'static str, &'static str)> {
 /// with pattern `^[A-Za-z0-9-]+$` (`smithy_query(query="shape",
 /// shape="ZonalShiftId")`), so each end of that range and each kind of character it
 /// admits is a row.
-const UNKNOWN_ZONAL_SHIFT_IDS: &[(&str, &str)] = &[
+pub(crate) const UNKNOWN_ZONAL_SHIFT_IDS: &[(&str, &str)] = &[
     ("zs-0000009999", "an id of the form this service mints"),
     ("abcdef", "the shortest id the model accepts"),
     (

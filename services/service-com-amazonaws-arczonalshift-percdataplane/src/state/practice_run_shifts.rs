@@ -14,7 +14,10 @@
 //! * WHETHER one can start at all: the practice run configuration ARC holds for the
 //!   resource names the conditions that block a run, and each blocker is a conflict
 //!   in the resource's current state, answered with the
-//!   `ConflictExceptionReason` the model names for it ([`practice_run_blocker`]).
+//!   `ConflictExceptionReason` the model names for it ([`practice_run_blocker`]);
+//! * WHICH shift a practice-run cancel may act on: only a shift of the practice run
+//!   type, every other kind of shift being refused as a value this operation does not
+//!   take a target of ([`unsupported_practice_cancel_shift_type`]).
 //!
 //! The alarms a configuration names are Amazon CloudWatch's, not ARC's: their state
 //! is read out of the CloudWatch emulator's OWN alarm store through the shared
@@ -32,7 +35,9 @@ use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801 as cloudwat
 
 use super::practice_runs::{names_the_day_of, window_contains};
 use super::{ShiftType, ZonalShift};
-use crate::ops::types::{ConflictException, ControlCondition, PracticeRunConfiguration};
+use crate::ops::types::{
+    ConflictException, ControlCondition, PracticeRunConfiguration, ValidationException,
+};
 
 /// How long an on-demand practice run goes on for.
 ///
@@ -98,6 +103,38 @@ pub const PRACTICE_OUTSIDE_ALLOWED_WINDOWS_MESSAGE: &str =
 
 /// The `ConflictExceptionReason` the model names for that blocker.
 pub const PRACTICE_OUTSIDE_ALLOWED_WINDOWS_REASON: &str = "PracticeOutsideAllowedWindows";
+
+/// The message ARC answers when the shift a practice-run cancel names is a zonal shift
+/// of another kind, up to the shift type it ends with.
+///
+/// `CancelPracticeRun` "cancel[s] an in-progress practice run zonal shift", so the only
+/// shift it takes a target of is one of the practice run type; a customer-initiated
+/// shift, an autoshift and the shift an FIS experiment drives are each canceled through
+/// `CancelZonalShift`, which documents all of them. The one variable part of the sentence
+/// is the KIND of shift the caller's `zonalShiftId` turned out to name, read off the
+/// stored shift ([`super::ShiftType::as_refusal_name`]); the shift's id, its resource and
+/// its status stay out of the text.
+pub const UNSUPPORTED_PRACTICE_CANCEL_SHIFT_TYPE_MESSAGE: &str =
+    "Cannot cancel practice run with shift type: ";
+
+/// The `ValidationExceptionReason` the model names for that mismatch
+/// (`smithy_query(query="shape", shape="ValidationExceptionReason")`): the one value of
+/// that enum about cancelling a practice run.
+pub const UNSUPPORTED_PRACTICE_CANCEL_SHIFT_TYPE_REASON: &str =
+    "UnsupportedPracticeCancelShiftType";
+
+/// The refusal a caller gets for aiming a practice-run cancel at a shift that is not a
+/// practice run, naming the kind of shift it is.
+#[must_use]
+pub fn unsupported_practice_cancel_shift_type(shift_type: ShiftType) -> ValidationException {
+    ValidationException {
+        message: format!(
+            "{UNSUPPORTED_PRACTICE_CANCEL_SHIFT_TYPE_MESSAGE}{}",
+            shift_type.as_refusal_name()
+        ),
+        reason: UNSUPPORTED_PRACTICE_CANCEL_SHIFT_TYPE_REASON.to_string(),
+    }
+}
 
 /// The expiry time a practice run that has reached the one it reported takes next, or
 /// `None` when its run is over and the shift is therefore `EXPIRED`.

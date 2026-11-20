@@ -15,7 +15,8 @@
 //!
 //! The sites it is asserted at are every one this service reports a shift from:
 //! `StartZonalShift`, `UpdateZonalShift`, `CancelZonalShift`, `ListZonalShifts`,
-//! `GetManagedResource`, `ListManagedResources` and `StartPracticeRun`.
+//! `GetManagedResource`, `ListManagedResources`, `StartPracticeRun` and
+//! `CancelPracticeRun`.
 //!
 //! The rows differ along what the rule generalises over: the REGION the resource lives in
 //! (four commercial Regions, one in another partition), the partition itself, how the
@@ -36,6 +37,7 @@
 
 use serde_json::{Map, Value};
 
+use super::practice_run_cancel::cancel_practice_run;
 use super::practice_run_configuration::get_managed_resource;
 use super::practice_run_start::{given_configuration, start_practice_run};
 use super::registered_managed_resources::register;
@@ -68,6 +70,7 @@ const SHIFT_SHAPES: &[&str] = &[
     "com.amazonaws.arczonalshift#ZonalShiftSummary",
     "com.amazonaws.arczonalshift#ZonalShiftInResource",
     "com.amazonaws.arczonalshift#StartPracticeRunResponse",
+    "com.amazonaws.arczonalshift#CancelPracticeRunResponse",
 ];
 
 /// One resource a shift is started for: how it reaches ARC, the ARN that names it, the
@@ -420,6 +423,23 @@ async fn a_practice_run_names_the_zone_group_of_its_resource() {
             case,
             "the ListZonalShifts entry of the practice run",
             &listed[0],
+            row.az_group_id,
+        );
+
+        // The cancel of the practice run: the same shift, so the same group.
+        let shift_id = started["zonalShiftId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: a minted zonalShiftId, got {started}"))
+            .to_string();
+        let (status, canceled) = cancel_practice_run(&router, &shift_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CancelPracticeRun answers 200, got {status} {canceled}"
+        );
+        assert_group(
+            case,
+            "the CancelPracticeRun body",
+            &canceled,
             row.az_group_id,
         );
     }

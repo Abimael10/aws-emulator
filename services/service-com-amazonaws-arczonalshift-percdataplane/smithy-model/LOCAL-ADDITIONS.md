@@ -25,16 +25,18 @@ traits, no hand-written schema or serializer. The same mechanism is used by
   `CancelZonalShift` (200) bodies each carry it for a load balancer in one
   Region, with the same value on all four.
 - **What the snapshot declares**: `ZonalShift`, `ZonalShiftSummary`,
-  `ZonalShiftInResource` and `StartPracticeRunResponse` with the members
-  `zonalShiftId`, `resourceIdentifier`, `awayFrom`, `expiryTime`, `startTime`,
-  `comment` (and `status`, `appliedStatus`, `shiftType`, `practiceRunOutcome`
-  variously), none of them `azGroupId`, and no shape of that name at all.
+  `ZonalShiftInResource`, `StartPracticeRunResponse` and
+  `CancelPracticeRunResponse` with the members `zonalShiftId`,
+  `resourceIdentifier`, `awayFrom`, `expiryTime`, `startTime`, `comment` (and
+  `status`, `appliedStatus`, `shiftType`, `practiceRunOutcome` variously), none
+  of them `azGroupId`, and no shape of that name at all.
 - **Where it is declared**: `src/ops/types/zonal_shift_types.rs`, which holds
   every type this crate reports a zonal shift through — the `ZonalShift` output
   of `StartZonalShift`, `CancelZonalShift` and `UpdateZonalShift`, the
   `ZonalShiftSummary` of `ListZonalShifts`, the `ZonalShiftInResource` of
   `GetManagedResource` and `ListManagedResources`, and the
-  `StartPracticeRunResponse` of `StartPracticeRun`. It is generated from
+  `StartPracticeRunResponse` and `CancelPracticeRunResponse` of the practice run
+  operations. It is generated from
   `local-additions.json`, which restates the members the snapshot declares —
   with their own targets, so every length, pattern and enum constraint is
   captured exactly as the snapshot spells it — and adds `azGroupId`. An open
@@ -43,9 +45,6 @@ traits, no hand-written schema or serializer. The same mechanism is used by
 - **What else is in the overlay**: only the shapes those members target, and
   only as much of each as codegen reads — the enums carry their values, the
   strings their length and pattern, the timestamps their type.
-- **Not in the overlay**: `CancelPracticeRunResponse`, the one remaining shift
-  shape, because `CancelPracticeRun` is still scaffolded (HTTP 501) and reports
-  no shift at all; it joins the overlay when that operation is implemented.
 
 `tests/all/zonal_shift_az_group.rs` pins both halves: the member on the wire,
 over a set of resources in different Regions and through every operation that

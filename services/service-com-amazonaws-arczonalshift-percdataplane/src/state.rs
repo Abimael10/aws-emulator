@@ -45,12 +45,13 @@ mod practice_run_shifts;
 
 pub use practice_run_shifts::{
     alarms_in_alarm_state, practice_run_blocker, practice_run_expiry_time,
-    PRACTICE_BLOCKING_ALARMS_RED_MESSAGE, PRACTICE_BLOCKING_ALARMS_RED_REASON,
-    PRACTICE_IN_BLOCKED_DATES_MESSAGE, PRACTICE_IN_BLOCKED_DATES_REASON,
-    PRACTICE_IN_BLOCKED_WINDOWS_MESSAGE, PRACTICE_IN_BLOCKED_WINDOWS_REASON,
-    PRACTICE_OUTCOME_ALARMS_RED_MESSAGE, PRACTICE_OUTCOME_ALARMS_RED_REASON,
-    PRACTICE_OUTSIDE_ALLOWED_WINDOWS_MESSAGE, PRACTICE_OUTSIDE_ALLOWED_WINDOWS_REASON,
-    PRACTICE_RUN_DURATION, PRACTICE_RUN_EXPIRY_WINDOW,
+    unsupported_practice_cancel_shift_type, PRACTICE_BLOCKING_ALARMS_RED_MESSAGE,
+    PRACTICE_BLOCKING_ALARMS_RED_REASON, PRACTICE_IN_BLOCKED_DATES_MESSAGE,
+    PRACTICE_IN_BLOCKED_DATES_REASON, PRACTICE_IN_BLOCKED_WINDOWS_MESSAGE,
+    PRACTICE_IN_BLOCKED_WINDOWS_REASON, PRACTICE_OUTCOME_ALARMS_RED_MESSAGE,
+    PRACTICE_OUTCOME_ALARMS_RED_REASON, PRACTICE_OUTSIDE_ALLOWED_WINDOWS_MESSAGE,
+    PRACTICE_OUTSIDE_ALLOWED_WINDOWS_REASON, PRACTICE_RUN_DURATION, PRACTICE_RUN_EXPIRY_WINDOW,
+    UNSUPPORTED_PRACTICE_CANCEL_SHIFT_TYPE_MESSAGE, UNSUPPORTED_PRACTICE_CANCEL_SHIFT_TYPE_REASON,
 };
 
 /// The refusals every zonal-shift mutation answers, each worded once for the class it
@@ -211,6 +212,21 @@ impl ShiftType {
             Self::FisExperiment => "FIS_EXPERIMENT",
             Self::ZonalAutoshift => "ZONAL_AUTOSHIFT",
             Self::PracticeRun => "PRACTICE_RUN",
+        }
+    }
+
+    /// The name ARC states this shift type by when it refuses a call for being aimed
+    /// at a shift of the wrong kind.
+    ///
+    /// ARC states a CUSTOMER-INITIATED shift as `MANUAL` there — the shift a customer
+    /// started by hand, as against the ones ARC runs itself — rather than by the
+    /// `ShiftType` token the wire carries for it; the shifts ARC runs are named as the
+    /// model's `ShiftType` names them.
+    #[must_use]
+    pub fn as_refusal_name(self) -> &'static str {
+        match self {
+            Self::ZonalShift => "MANUAL",
+            Self::FisExperiment | Self::ZonalAutoshift | Self::PracticeRun => self.as_wire(),
         }
     }
 

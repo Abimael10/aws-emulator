@@ -940,17 +940,9 @@ async fn every_wire_value_this_service_writes_is_one_the_model_declares() {
 async fn the_operations_this_slice_leaves_unimplemented_still_answer_501() {
     let (router, _engine) = emulator();
     // The operations outside this slice answer "not written yet", never an empty
-    // success. Rows differ along the method and the shape of the request: a DELETE
-    // keyed by a URI label, and a GET with no member at all.
-    let cases: &[(&str, &str, &str, &str)] = &[
-        (
-            "CancelPracticeRun",
-            "DELETE",
-            "/practiceruns/zs-0000000001",
-            "",
-        ),
-        ("ListAutoshifts", "GET", "/autoshifts", ""),
-    ];
+    // success. The request's shape is beside the point: a GET with no member at all is
+    // answered the same way as one keyed by a URI label.
+    let cases: &[(&str, &str, &str, &str)] = &[("ListAutoshifts", "GET", "/autoshifts", "")];
     for (operation, method, uri, body) in cases {
         let (status, answered) = call(&router, method, uri, body).await;
         assert_eq!(

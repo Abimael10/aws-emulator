@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelPracticeRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelPracticeRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Cancels an in-progress PRACTICE RUN zonal shift: its status becomes `CANCELED`, so it
+//! stops being one of the resource's shifts in progress and the weights it moved go back
+//! to 1.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelPracticeRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The only shift this operation takes a target of is one of the practice run type; every
+//! other kind of zonal shift is canceled through `CancelZonalShift`, which documents all
+//! of them.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +81,11 @@
 //!   identifier of the practice run zonal shift in Amazon Application Recovery Controller
 //!   that was canceled.
 //!
+//! Beside the members above, every zonal shift AWS reports carries `azGroupId` — the
+//! Availability Zone group of the Region the shifted resource lives in — which this model
+//! snapshot does not declare. It is declared in this crate instead; see
+//! `smithy-model/LOCAL-ADDITIONS.md` and `crate::state::az_group_id`.
+//!
 //! ## Errors
 //!
 //! * `AccessDeniedException` (HTTP 403) — You do not have sufficient access to perform this
@@ -98,6 +101,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    as_date_time, az_group_id, unsupported_practice_cancel_shift_type, zonal_shift_not_active,
+    ShiftType, ZonalShiftStatus,
+};
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -172,18 +180,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelPracticeRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelPracticeRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelPracticeRun"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelPracticeRunError::from(CancelPracticeRunErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the ARC zonal shift store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        let mut store = state.lock();
+        // A practice run whose 30 minutes are up is EXPIRED, and one still running has its
+        // expiry renewed, whether or not anybody called — so the status checked below is
+        // the one the clock has already made due.
+        store.expire_due_shifts(SystemTime::now());
+
+        // The caller's authorization on the named target is decided BEFORE the target is
+        // resolved: a zonalShiftId ARC holds no shift for is refused 403
+        // AccessDeniedException, disclosing nothing about what exists — and stating no
+        // reason, a shift id being no resource the denial could speak about. One helper
+        // takes this branch for every operation that acts on a target.
+        let shift = store
+            .authorized_shift_mut(&input.zonal_shift_id)
+            .map_err(CancelPracticeRunErrorModeled::AccessDeniedException)?;
+
+        // WHAT the shift is comes before what state it is in: this operation cancels a
+        // practice run, so a shift of any other type is no target it takes at all and is
+        // refused as a value that fails the service's constraints, with the
+        // `ValidationExceptionReason` the model names for the mismatch.
+        if shift.shift_type != ShiftType::PracticeRun {
+            return Err(CancelPracticeRunErrorModeled::ValidationException(
+                unsupported_practice_cancel_shift_type(shift.shift_type),
+            )
+            .into());
+        }
+
+        // Cancelling is only meaningful while the run is going on: one already canceled, or
+        // whose run is over, has nothing left to cancel. The refusal is the one sentence
+        // ARC states for that precondition, shared with every other site that runs into
+        // it.
+        if shift.status != ZonalShiftStatus::Active {
+            return Err(CancelPracticeRunErrorModeled::ConflictException(
+                zonal_shift_not_active(&shift.zonal_shift_id),
+            )
+            .into());
+        }
+
+        // The resource's applied weights and shifts in progress are derived from this
+        // status, so moving it is the whole of the cancel.
+        shift.status = ZonalShiftStatus::Canceled;
+
+        let canceled = CancelPracticeRunOutput {
+            zonal_shift_id: shift.zonal_shift_id.clone(),
+            // The group of the shifted resource's Region, the same value the start of this
+            // practice run reported: one reading of it serves every site.
+            az_group_id: az_group_id(&shift.resource_identifier),
+            resource_identifier: shift.resource_identifier.clone(),
+            away_from: shift.away_from.clone(),
+            expiry_time: as_date_time(shift.expiry_time),
+            start_time: as_date_time(shift.start_time),
+            status: shift.status.as_wire().to_string(),
+            comment: shift.comment.clone(),
+        };
+        // This call completed a shift, so it is one of the sites that bound the store's
+        // completed records; a read never prunes.
+        store.prune_completed_shifts();
+
+        Ok(canceled)
     }
 }
