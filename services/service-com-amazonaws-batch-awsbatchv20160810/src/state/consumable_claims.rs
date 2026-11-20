@@ -152,8 +152,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
     }
 
-    /// Give back what `id` holds of each consumable resource, and answer whether it held
-    /// anything at all.
+    /// Give back what `id` holds of each consumable resource.
     ///
     /// Called from the ONE terminal path ([`Self::finish_job`]), so every route into a
     /// terminal status releases the quantity the job held — the clock, `CancelJob`,
@@ -161,12 +160,17 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// resource is "available to be re-used after a job completes", so only its
     /// `inUseQuantity` goes back down; a `NON_REPLENISHABLE` one is not, so the quantity this
     /// job consumed leaves its `totalQuantity` as well and is never offered again.
-    pub(super) fn release_consumable_claims(&mut self, id: &str) -> bool {
+    ///
+    /// A job that holds nothing gives nothing back, which is why this answers nothing: what
+    /// the release makes due — the placements of the jobs that were waiting for a quantity or
+    /// for the capacity this job held — is owed by the terminal path itself
+    /// ([`Self::rearm_resting_jobs`]) and not by what was released here.
+    pub(super) fn release_consumable_claims(&mut self, id: &str) {
         let claims = match self.jobs.get_mut(id) {
             Some(job) if !job.consumable_claims_held.is_empty() => {
                 ::std::mem::take(&mut job.consumable_claims_held)
             }
-            _ => return false,
+            _ => return,
         };
         for claim in claims {
             if let Some(resource) = self.consumable_resources.get_mut(&claim.resource_name) {
@@ -180,6 +184,5 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 }
             }
         }
-        true
     }
 }

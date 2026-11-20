@@ -45,9 +45,14 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// own doc: "a job queue can't have both a `serviceEnvironmentOrder` and a
     /// `computeEnvironmentOrder` field" — so this is the one of the two that has jobs waiting
     /// on it.
-    pub fn front_of_queue(&self, arn: &str) -> Vec<QueuedEntry> {
+    ///
+    /// `now` is the instant the order is reported as at: a fair-share queue's order is decided
+    /// by what each share has used over the window its policy measures
+    /// ([`Self::in_queue_dispatch_order`]), so the reading instant is passed in rather than taken
+    /// here — the caller's own `now`, the same one its `materialize_due` used.
+    pub fn front_of_queue(&self, arn: &str, now: i64) -> Vec<QueuedEntry> {
         let mut entries: Vec<QueuedEntry> = self
-            .runnable_jobs_of_queue(arn)
+            .runnable_jobs_of_queue(arn, now)
             .into_iter()
             .map(|job| QueuedEntry {
                 job_arn: job.job_arn.clone(),
@@ -76,11 +81,17 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// The `RUNNABLE` service jobs of the queue `arn`, in the order that queue dispatches
     /// them.
     ///
-    /// The same ordering the queue's container jobs are in
-    /// ([`Self::runnable_jobs_of_queue`]): the job's own `schedulingPriority` decides first on
-    /// a queue that dispatches by priority ([`Self::queue_orders_by_priority`]), and
-    /// submission order — the `createdAt` the submit recorded, with the job id breaking a tie
-    /// — decides the rest, so one instant answers one order.
+    /// The job's own `schedulingPriority` decides first on a queue that dispatches by priority
+    /// ([`Self::queue_orders_by_priority`]), and submission order — the `createdAt` the submit
+    /// recorded, with the job id breaking a tie — decides the rest, so one instant answers one
+    /// order.
+    ///
+    /// A container job's ordering reads one thing more
+    /// ([`Self::runnable_jobs_of_queue`]): what its share has USED of the queue's compute
+    /// capacity, weighted by that share's `weightFactor` ([`super::compute_capacity`]). A
+    /// service job holds no vCPUs of a compute environment — it is bounded by the
+    /// `CapacityLimit`s its service environments and quota shares publish
+    /// ([`Self::quota_share_admits`]) — so there is no such usage to weigh here.
     pub fn runnable_service_jobs_of_queue(&self, arn: &str) -> Vec<&ServiceJob> {
         let by_priority = self.queue_orders_by_priority(arn);
         let mut queued: Vec<&ServiceJob> = self

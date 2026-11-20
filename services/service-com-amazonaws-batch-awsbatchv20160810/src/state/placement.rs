@@ -400,16 +400,26 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// A resting job owes nothing while its queue's compute environments offer no capacity,
     /// so what makes its next move due is the change that publishes some: a compute
     /// environment reaching the end of its creation, one a caller re-enabled
-    /// (`UpdateComputeEnvironment`), or a queue given a different `computeEnvironmentOrder`
-    /// (`UpdateJobQueue`). The placement then falls due as the capacity behind the queue
-    /// decides ([`Self::placement_due_at`]) — counted from `at`, the instant the capacity was
-    /// published, so what a later caller sees does not depend on when it called. The twin
-    /// of [`Self::rearm_resting_service_jobs`] for container jobs.
+    /// (`UpdateComputeEnvironment`), a queue given a different `computeEnvironmentOrder`
+    /// (`UpdateJobQueue`), or a job that was holding capacity — the vCPUs of its compute
+    /// environment ([`compute_capacity`]) or the quantity of a consumable resource
+    /// ([`consumable_claims`]) — reaching a terminal status. The placement then falls due as
+    /// the capacity behind the queue decides ([`Self::placement_due_at`]) — counted from `at`,
+    /// the instant the capacity was published, so what a later caller sees does not depend on
+    /// when it called. The twin of [`Self::rearm_resting_service_jobs`] for container jobs.
+    ///
+    /// A job whose container is already OWED to Amazon ECS as a task is left alone: it is
+    /// reported in `RUNNABLE` until that task exists ([`ecs_task`]) but it is not waiting for
+    /// capacity — it has been given some — so re-arming it would place one container twice.
     pub fn rearm_resting_jobs(&mut self, at: i64) {
         let resting: Vec<String> = self
             .jobs
             .values()
-            .filter(|job| job.status == JOB_RUNNABLE && job.next_phase_due_at.is_none())
+            .filter(|job| {
+                job.status == JOB_RUNNABLE
+                    && job.next_phase_due_at.is_none()
+                    && job.task_dispatch == JobTaskDispatch::Waiting
+            })
             .map(|job| job.job_id.clone())
             .filter(|id| self.job_is_placeable(id))
             .collect();

@@ -196,9 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The first 100 RUNNABLE jobs in the job queue are listed in order of
             // dispatch." Which order that is belongs to the QUEUE, not to this report
             // (`crate::state::ComAmazonawsBatchAwsbatchv20160810State::front_of_queue`):
-            // submission order, with a job's own priority deciding first on a queue with a
-            // fair-share policy attached, over whichever kind of job the queue holds.
-            let queued = state.front_of_queue(&queue_arn);
+            // submission order, with a job's own priority and its share's usage deciding
+            // first on a queue with a fair-share policy attached, over whichever kind of job
+            // the queue holds.
+            let queued = state.front_of_queue(&queue_arn, now);
             let jobs: Vec<FrontOfQueueJobSummary> = queued
                 .iter()
                 .map(|entry| FrontOfQueueJobSummary {

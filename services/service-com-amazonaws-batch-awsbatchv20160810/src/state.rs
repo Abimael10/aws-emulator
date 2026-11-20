@@ -57,6 +57,8 @@
 //! lines it wrote. A fetch the registry refused, and a program this emulator performs none
 //! of (the one inside the caller's own image), end the job without a run: no `startedAt`
 //! and no `exitCode` is invented for a container nothing ran.
+//! WHICH of the jobs waiting on one environment is placed when room is free is the
+//! environment's own maximum and the queues' own ordering ([`compute_capacity`]).
 //! Everything around it — accepting, resolving, scheduling, placing, running, listing,
 //! cancelling, terminating — is real.
 //!
@@ -94,6 +96,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod array_jobs;
 mod attempt_timeout;
+mod compute_capacity;
 mod consumable_claims;
 mod container_run;
 mod described_collections;
@@ -734,6 +737,11 @@ pub const MAX_SCHEDULING_POLICY_NAME_LEN: usize = 128;
 pub const MIN_SHARE_DECAY_SECONDS: i32 = 0;
 /// See [`MIN_SHARE_DECAY_SECONDS`].
 pub const MAX_SHARE_DECAY_SECONDS: i32 = 604_800;
+
+/// The `FairsharePolicy$shareDecaySeconds` a policy that states none — or states the
+/// documented zero — measures a share's usage over, from the member's own doc: "A value of
+/// zero (0) indicates the default minimum time window (600 seconds)."
+pub const DEFAULT_SHARE_DECAY_SECONDS: i32 = 600;
 
 /// The bounds of `FairsharePolicy$computeReservation`, from the member's own doc: "The
 /// minimum value is 0 and the maximum value is 99."
@@ -3240,8 +3248,16 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                         // consumable resources its own requirements claim: a quantity is a
                         // concurrency bound, so a job whose claim does not fit waits here
                         // until a job holding that quantity gives it back
-                        // ([`consumable_claims`]).
-                        if !self.job_is_placeable(id) || !self.consumable_claims_admit(id) {
+                        // ([`consumable_claims`]). The compute capacity behind the queue is a
+                        // concurrency bound in exactly the same way
+                        // (`ComputeResource$maxvCpus`), and which of the jobs waiting on it
+                        // is given the room that is free is decided by the queues' own
+                        // priorities and each queue's scheduling policy
+                        // ([`compute_capacity`]).
+                        if !self.job_is_placeable(id)
+                            || !self.consumable_claims_admit(id)
+                            || !self.capacity_admits(id, now)
+                        {
                             self.set_job_due(id, None);
                             None
                         } else if let Some(fetch) = self.image_fetch_of(id) {
@@ -3704,35 +3720,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .is_some_and(|policy| policy.quota_share_policy.is_none())
     }
 
-    /// The key a job is ordered by in its queue's `RUNNABLE` ordering: the job's own
-    /// priority, NEGATED so the higher priority dispatches first, and nothing else.
-    ///
-    /// Submission order is what decides between the jobs of ONE priority — and so between
-    /// the jobs of one share, which carry one priority unless a submit overrode it — and
-    /// that order needs no key at all: [`Self::jobs_by_queue`] holds a queue's jobs in
-    /// submission order and the sort below is stable, so equal keys come out as submitted,
-    /// whatever resolution the clock reports. `GetJobQueueSnapshot`'s `frontOfQueue` doc:
-    /// "For first-in-first-out (FIFO) job queues, jobs are ordered based on their
-    /// submission time."
-    ///
-    /// The priority is read only for a queue that dispatches by it
-    /// ([`Self::queue_orders_by_priority`]); every other queue is first-in-first-out. A job
-    /// that names no `schedulingPriority` is ordered at the lowest the member documents
-    /// ("The minimum supported value is 0", [`MIN_SCHEDULING_PRIORITY`]).
-    fn queue_order_key(job: &Job, by_priority: bool) -> i32 {
-        if by_priority {
-            job.scheduling_priority
-                .unwrap_or(MIN_SCHEDULING_PRIORITY)
-                .saturating_neg()
-        } else {
-            0
-        }
-    }
-
-    /// The `RUNNABLE` jobs of the queue `arn`, in the order the queue dispatches them.
-    pub fn runnable_jobs_of_queue(&self, arn: &str) -> Vec<&Job> {
-        let by_priority = self.queue_orders_by_priority(arn);
-        let mut queued: Vec<&Job> = self
+    /// The `RUNNABLE` jobs of the queue `arn`, in the order the queue dispatches them —
+    /// which is the order the scheduler admits them onto capacity in
+    /// ([`Self::in_queue_dispatch_order`], the ONE key both readers take).
+    pub fn runnable_jobs_of_queue(&self, arn: &str, now: i64) -> Vec<&Job> {
+        let queued: Vec<&Job> = self
             .jobs_by_queue
             .get(arn)
             .into_iter()
@@ -3740,9 +3732,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .filter_map(|id| self.jobs.get(id))
             .filter(|job| job.status == JOB_RUNNABLE)
             .collect();
-        // STABLE, so the submission order `jobs_by_queue` is kept in survives every tie.
-        queued.sort_by_key(|job| Self::queue_order_key(job, by_priority));
-        queued
+        self.in_queue_dispatch_order(queued, now)
     }
 
     /// Move every `RUNNABLE` job BEHIND `departed` in its queue to its new position at
@@ -3756,7 +3746,7 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             return;
         };
         let queue_arn = gone.job_queue_arn.clone();
-        let ordered = self.runnable_jobs_of_queue(&queue_arn);
+        let ordered = self.runnable_jobs_of_queue(&queue_arn, at);
         let Some(position) = ordered.iter().position(|job| job.job_id == departed) else {
             return;
         };
@@ -3839,11 +3829,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         }
         self.record_job_state_change(id, ended_at);
         // The job can consume nothing more, so what it HELD of each consumable resource goes
-        // back ([`consumable_claims`]) — and the jobs whose own claim did not fit while it
-        // held that quantity are owed their placement from this instant.
-        if self.release_consumable_claims(id) {
-            self.rearm_resting_jobs(ended_at);
-        }
+        // back ([`consumable_claims`]).
+        self.release_consumable_claims(id);
         // The job no longer needs capacity, so the compute environments behind its queue are
         // scaled to the demand that is left ([`ec2_capacity`]) — back to the vCPUs they
         // maintain once nothing of theirs is outstanding any more.
@@ -3853,6 +3840,11 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .map(|job| job.job_queue_arn.clone())
             .unwrap_or_default();
         self.rescale_queue_capacity(&queue_arn, ended_at);
+        // Whatever this job was holding — the quantity of a consumable resource, the vCPUs of
+        // the compute environment it was placed on ([`compute_capacity`]) — is free from this
+        // instant, so the jobs that were waiting for it are owed their placement from here and
+        // never from the instant somebody happened to call ([`Self::rearm_resting_jobs`]).
+        self.rearm_resting_jobs(ended_at);
         let waiting = self.dependents.get(id).cloned().unwrap_or_default();
         for dependent in waiting {
             let still_waiting = self.jobs.get(&dependent).is_some_and(|job| {

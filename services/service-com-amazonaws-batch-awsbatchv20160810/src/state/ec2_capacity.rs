@@ -233,10 +233,14 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
 /// ("the number of vCPUs reserved for the container"), else the `vcpus` member its container
 /// carries, and at least [`MIN_JOB_VCPUS`].
 ///
+/// The ONE reading of a job's reservation: the demand a compute environment scales out to
+/// here, and the capacity a placed job holds against that environment's maximum
+/// ([`super::compute_capacity`]), are the same figure.
+///
 /// A Fargate job may reserve a FRACTION of a vCPU ("0.25") while the capacity an environment
 /// scales out to is whole vCPUs, so a fraction is rounded up: capacity holding a quarter of a
 /// vCPU is one vCPU of an instance.
-fn job_vcpus(job: &Job) -> i32 {
+pub(super) fn job_vcpus(job: &Job) -> i32 {
     let Some(container) = job.container.as_ref() else {
         return MIN_JOB_VCPUS;
     };
