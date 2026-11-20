@@ -51,6 +51,13 @@ use smithy_server_runtime::MultiServiceRouter;
 #[path = "thing_type_registry/deletion.rs"]
 mod deletion;
 
+/// WHICH parts of a registered thing type `UpdateThingType` changes and which it leaves
+/// alone. A child of THIS suite for the same reason the deletion coverage is: it is
+/// coverage of the same registry resource, read back through the same reader, and the
+/// `#[path]` keeps it one suite.
+#[path = "thing_type_registry/update.rs"]
+mod update;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.

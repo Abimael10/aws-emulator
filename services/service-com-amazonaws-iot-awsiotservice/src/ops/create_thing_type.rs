@@ -157,42 +157,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // keeps it and compares it: absent properties (or properties carrying no
         // list) are the empty lists, which is what the type then has.
         //
-        // How MANY entries each of those lists may carry is bounded: neither
+        // How MANY entries each of those lists may carry is bounded, by the one rule both
+        // writers of a thing type enforce
+        // (`crate::state::over_long_thing_type_property_list`): neither
         // `searchableAttributes` nor `mqtt5Configuration.propagatingAttributes` has a
         // modelled maximum, and the record keeps what the writer sent so a reader can
         // hand it back, so without the ceiling one request would choose how large a
         // single record is. The refusal is the modelled `InvalidRequestException`
         // ("The request is not valid", HTTP 400), naming the member and the limit.
         let properties = input.thing_type_properties.unwrap_or_default();
-        let entry_counts = [
-            (
-                "searchableAttributes",
-                properties
-                    .searchable_attributes
-                    .as_ref()
-                    .map_or(0, Vec::len),
-            ),
-            (
-                "mqtt5Configuration.propagatingAttributes",
-                properties
-                    .mqtt5_configuration
-                    .as_ref()
-                    .and_then(|configuration| configuration.propagating_attributes.as_ref())
-                    .map_or(0, Vec::len),
-            ),
-        ];
-        for (member, count) in entry_counts {
-            if count > crate::state::MAX_THING_TYPE_PROPERTY_ENTRIES {
-                return Err(CreateThingTypeErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(format!(
-                            "a thing type's {member} may carry at most {} entries; this request carries {count}",
-                            crate::state::MAX_THING_TYPE_PROPERTY_ENTRIES
-                        )),
-                    },
-                )
-                .into());
-            }
+        if let Some(message) = crate::state::over_long_thing_type_property_list(&properties) {
+            return Err(CreateThingTypeErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
         let requested = crate::state::ThingTypeConfiguration::from(properties);
         // `Tag$Key` is `@required` and keys a resource's tag set, so the last value

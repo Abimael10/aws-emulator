@@ -3532,6 +3532,14 @@ pub use thing_group_hierarchy::{over_deep_hierarchy_message, MAX_THING_GROUP_HIE
 pub mod thing_type_deletion;
 pub use thing_type_deletion::{ThingTypeDeletionRefusal, DEPRECATION_DELETION_WAIT};
 
+// What a thing type's PROPERTIES may carry, and how a write of them changes a registered
+// type — the bound both writers of a type enforce and the one update write — lives in
+// `state/thing_type_properties.rs`.
+pub mod thing_type_properties;
+pub use thing_type_properties::{
+    over_long_thing_type_property_list, ThingTypeUpdate, ThingTypeUpdateRefusal,
+};
+
 // What a DOMAIN CONFIGURATION is — the record one holds, the server certificate it
 // presents and what every reader of one reports — lives in
 // `state/domain_configurations.rs`.

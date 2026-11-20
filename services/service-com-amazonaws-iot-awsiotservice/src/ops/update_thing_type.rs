@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateThingType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateThingType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateThingType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the configuration of a thing type the registry already holds. The properties
+//! the request PROVIDES are the ones the type carries afterwards; the ones it omits are
+//! left as they stand, and the type's identity and its creation and deprecation instants
+//! are not part of an update at all — see
+//! [`crate::state::thing_type_properties`], where that rule and the one registry write
+//! that applies it live.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +142,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateThingType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateThingTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateThingType"))
+        // `ctx` carries request metadata only: an update addresses a type that is already
+        // registered, so nothing it changes is region-scoped — the ARN the type carries
+        // was minted, with its region, when it was created.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateThingTypeErrorModeled::InternalFailureException(InternalFailureException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // The properties the request carried, bounded by the ONE rule both writers of a
+        // thing type enforce: the lists a record keeps have no modelled maximum, so an
+        // update may no more grow one past the ceiling than a create may. The refusal is
+        // the modelled `InvalidRequestException` ("The request is not valid", HTTP 400),
+        // naming the member and the limit.
+        let properties = input.thing_type_properties.unwrap_or_default();
+        if let Some(message) = crate::state::over_long_thing_type_property_list(&properties) {
+            return Err(UpdateThingTypeErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // The ONE registry write that changes a thing type's configuration
+        // (`crate::state::ComAmazonawsIotAwsiotserviceState::update_thing_type`): it
+        // resolves the name before it writes, so an update addressing a type the account
+        // does not hold leaves the registry untouched and is the modelled
+        // `ResourceNotFoundException` ("The specified resource does not exist", HTTP 404),
+        // worded as every reader and writer of one thing type words that miss.
+        store
+            .update_thing_type(&input.thing_type_name, properties.into())
+            .map_err(|refusal| {
+                let message = Some(refusal.message());
+                match refusal {
+                    crate::state::ThingTypeUpdateRefusal::NotRegistered(_) => {
+                        UpdateThingTypeErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException { message },
+                        )
+                    }
+                }
+            })?;
+
+        // `UpdateThingTypeResponse` has no members: what the update did is read back
+        // through `DescribeThingType`, which reports the record this write left.
+        Ok(UpdateThingTypeOutput {})
     }
 }
