@@ -238,28 +238,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // The terms the request names are REFERENCES into another namespace, and an
-        // association may not write a reference that resolves to nothing: every id is
-        // resolved against the glossary term store first, so an id this account holds no
-        // live term under — never created, or deleted since an earlier association named it
-        // — refuses the whole call with the modelled `InvalidInputException` before anything
-        // is merged. The refusal names the FIRST id that resolved to nothing, in the order
-        // the request listed them. No recording pins whether this resolution or the asset's
-        // own comes first, so it is done here, where nothing has been mutated yet.
-        if let Some(unheld) = store.first_unheld_glossary_term(&input.glossary_term_identifiers) {
-            return Err(AssociateGlossaryTermsErrorModeled::InvalidInputException(
-                InvalidInputException {
-                    message: Some(crate::state::unassociable_glossary_term_message(unheld)),
-                    from_federation_source: None,
-                },
-            )
-            .into());
-        }
-
-        // The asset the association targets has to be one this account holds, and it is
-        // resolved ONCE, mutably, under the lock the merge happens under — so the record
-        // the refusal was decided against is the record the merge writes to.
-        let Some(asset) = store.asset_mut(&input.asset_identifier) else {
+        // The asset the association targets has to be one this account holds, and it is the
+        // resource the request ADDRESSES, so it is resolved FIRST — ahead of the terms the
+        // request references — and a request whose asset and whose terms are all absent is
+        // refused naming the asset.
+        if store.asset(&input.asset_identifier).is_none() {
             return Err(AssociateGlossaryTermsErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
                     // The same miss the asset's own reader answers, worded the one way the
@@ -273,14 +256,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        };
+        }
 
         // An association that names an ITEM targets that item inside one of the asset's
-        // iterable forms. Nothing writes an iterable form onto an asset — the model binds
-        // no operation that stores one, so every asset this store holds carries none — so
-        // such a request names an entity that does not exist and is refused with the same
-        // modelled miss the asset's own resolution answers with, in the one wording this
-        // surface refuses that target with
+        // iterable forms, so the item is part of what the request ADDRESSES and is resolved
+        // with the asset, ahead of the terms it references. Nothing writes an iterable form
+        // onto an asset — the model binds no operation that stores one, so every asset this
+        // store holds carries none — so such a request names an entity that does not exist
+        // and is refused with the same modelled miss the asset's own resolution answers with,
+        // in the one wording this surface refuses that target with
         // (`crate::state::iterable_form_not_found_message`).
         if let Some(iterable_form_name) = input.iterable_form_name.as_deref() {
             return Err(AssociateGlossaryTermsErrorModeled::EntityNotFoundException(
@@ -294,6 +278,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // The terms the request names are REFERENCES into another namespace, and an
+        // association may not write a reference that resolves to nothing: every id is
+        // resolved against the glossary term store after the target above, so an id this
+        // account holds no live term under — never created, or deleted since an earlier
+        // association named it — refuses the whole call with the modelled
+        // `InvalidInputException` before anything is merged. The refusal names the FIRST id
+        // that resolved to nothing, in the order the request listed them.
+        if let Some(unheld) = store.first_unheld_glossary_term(&input.glossary_term_identifiers) {
+            return Err(AssociateGlossaryTermsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(crate::state::unassociable_glossary_term_message(unheld)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // The record every refusal above was decided against is the record the merge writes
+        // to: it is resolved once, mutably, under the lock the merge happens under.
+        let Some(asset) = store.asset_mut(&input.asset_identifier) else {
+            return Err(AssociateGlossaryTermsErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::asset_not_found_message(
+                        &input.asset_identifier,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
 
         let Some(associated) = asset.associate_glossary_terms(&input.glossary_term_identifiers)
         else {

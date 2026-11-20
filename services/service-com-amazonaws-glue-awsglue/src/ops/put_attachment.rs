@@ -9,7 +9,9 @@
 //! many writes land on it. The `FormTypeId` names a form type in the SAME store, by the
 //! `FormTypeId` the catalog minted for it or by the `FormTypeName` it was registered under,
 //! so a write naming an asset or a form type this account does not hold is refused with the
-//! modelled `EntityNotFoundException` rather than stored.
+//! modelled `EntityNotFoundException` rather than stored. The asset is the resource this
+//! write ADDRESSES, so it is resolved before the form type the attachment references: a
+//! request whose asset and whose form type are both absent is refused naming the asset.
 //!
 //! ## Shape of an operation
 //!
@@ -222,18 +224,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // "The identifier of the form type for this attachment": the form type resolves
-        // against this store's form types, exactly as the form type a form of an asset
-        // names does (`src/ops/put_asset.rs`), so a write naming a form type that was never
-        // registered is refused with the modelled `EntityNotFoundException` rather than
-        // stored. It is resolved before the asset because the ASSET is then resolved once,
-        // mutably, and the write lands on that same record: no recording or doc pins which
-        // of the two misses a request carrying both is refused with.
-        if store.form_type_by_reference(&input.form_type_id).is_none() {
+        // "The unique identifier of the asset to attach the form to": the attachment is
+        // written ONTO an asset, so the TARGET of the write is resolved FIRST — before any
+        // other reference the request carries — and a write naming an asset this account
+        // holds none of addresses an entity that does not exist and is refused with the
+        // modelled `EntityNotFoundException`, worded the one way the catalog's asset surface
+        // words a miss (`crate::state::asset_not_found_message`). A request whose asset and
+        // whose form type are both absent therefore reports the ASSET, the resource it
+        // addressed.
+        if store.asset(&input.asset_identifier).is_none() {
             return Err(PutAttachmentErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::form_type_not_found_message(
-                        &input.form_type_id,
+                    message: Some(crate::state::asset_not_found_message(
+                        &input.asset_identifier,
                     )),
                     from_federation_source: None,
                 },
@@ -242,10 +245,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // An attachment that names an ITEM targets that item inside one of the asset's
-        // iterable forms. Nothing writes an iterable form onto an asset, so such a request
-        // names an entity that does not exist and is refused with the same modelled miss the
-        // asset's own resolution answers with, in the one wording this surface refuses that
-        // target with (`crate::state::iterable_form_not_found_message`).
+        // iterable forms, so the item is part of what the request ADDRESSES and is resolved
+        // with the asset, ahead of the form type the attachment references. Nothing writes an
+        // iterable form onto an asset, so such a request names an entity that does not exist
+        // and is refused with the same modelled miss the asset's own resolution answers with,
+        // in the one wording this surface refuses that target with
+        // (`crate::state::iterable_form_not_found_message`).
         if let Some(iterable_form_name) = input.iterable_form_name.as_deref() {
             return Err(PutAttachmentErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
@@ -259,13 +264,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // "The unique identifier of the asset to attach the form to": the attachment is
-        // written ONTO an asset, so a write naming an asset this account holds none of
-        // addresses an entity that does not exist and is refused with the modelled
-        // `EntityNotFoundException`, worded the one way the catalog's asset surface words a
-        // miss (`crate::state::asset_not_found_message`). The record is resolved mutably,
-        // under the lock the whole write runs under, so the record the refusals were decided
-        // against is the record this write lands on.
+        // "The identifier of the form type for this attachment": the form type is a
+        // REFERENCE the attachment carries, not the resource the request addresses, so it is
+        // resolved after the target above. It resolves against this store's form types,
+        // exactly as the form type a form of an asset names does (`src/ops/put_asset.rs`), so
+        // a write naming a form type that was never registered is refused with the modelled
+        // `EntityNotFoundException` rather than stored.
+        if store.form_type_by_reference(&input.form_type_id).is_none() {
+            return Err(PutAttachmentErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(crate::state::form_type_not_found_message(
+                        &input.form_type_id,
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
+        // The record every refusal above was decided against is the record this write lands
+        // on: it is resolved once, mutably, under the lock the whole write runs under.
         let Some(asset) = store.asset_mut(&input.asset_identifier) else {
             return Err(PutAttachmentErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
