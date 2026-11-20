@@ -455,6 +455,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // it is read from the instant retrieval starts at
             // (`crate::state::kinesis_source`).
             source_positions: ::std::collections::BTreeMap::new(),
+            // And nothing has been asked about that source's role yet.
+            source_read_decision: None,
         };
         let destination_id = stream.mint_destination_id();
         stream.destinations.push(crate::state::Destination {

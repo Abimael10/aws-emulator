@@ -19,6 +19,13 @@
 //!   resolved against the Amazon Kinesis Data Streams service's own store: the one register
 //!   of streams, shards and records in this emulator, so what a producer's `PutRecord` wrote
 //!   there is exactly what is read back here.
+//! * UNDER WHOSE PERMISSIONS — the `RoleARN` that same source configuration names, which is
+//!   the role the retrieval is made under, so it happens only where the permissions in force
+//!   on that role allow the Kinesis Data Streams calls it is made of
+//!   ([`source_read_authorization`]). A read the role may not make takes nothing, leaves the
+//!   shard positions where they are, and is reported through the destination's own
+//!   `CloudWatchLoggingOptions` — the only thing an operator can observe of it, since no
+//!   client call is made for a source-fed stream at all.
 //! * FROM WHERE — `DeliveryStartTimestamp`, since "Firehose starts retrieving records from
 //!   the Kinesis data stream starting with this timestamp"
 //!   (`KinesisStreamSourceDescription$DeliveryStartTimestamp`): a record the source held
@@ -49,7 +56,8 @@
 //! Three steps, each holding ONE store's lock: this service's store is read for the sources
 //! it has, the Kinesis service's store is then read for their new records, and this service's
 //! store is locked again to buffer them. The two locks are never held at once, and nothing in
-//! the Kinesis service reaches into this one, so a cycle between them is unreachable.
+//! the Kinesis service reaches into this one, so a cycle between them is unreachable. IAM is
+//! asked between the first and the second step, with no lock of either store held.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -58,9 +66,19 @@ use ::service_com_amazonaws_kinesis_kinesis_20131202::state::{
     sequence_number_le, ComAmazonawsKinesisKinesis20131202State,
 };
 
+use crate::state::delivery::destination_logging::DestinationLogging;
+use crate::state::delivery::DeliveryHop;
 use crate::state::{
     push_record, service_state, ComAmazonawsFirehoseFirehose20150804State, DeliveryStream,
     StreamStatus,
+};
+
+/// Whether the role a stream's source names may be read under at all, and what a read it may
+/// not make reports.
+pub mod source_read_authorization;
+
+pub use source_read_authorization::{
+    SourceReadDecision, KINESIS_ACCESS_DENIED, SOURCE_AUTHORIZATION_SPAN,
 };
 
 /// The `DeliveryStreamType` whose records come from a Kinesis data stream:
@@ -99,17 +117,33 @@ const MAX_BYTES_PER_POLL: usize =
 
 /// Where one Firehose stream has consumed its source to, as a poll starts.
 #[derive(Debug, Clone)]
-struct SourceCursor {
+pub(crate) struct SourceCursor {
     /// The Firehose stream's own name — the key its buffer is reached by.
     stream: String,
+    /// The Firehose stream's own ARN, which is what an event reporting a read it could not
+    /// make names, and whose Region that read's authorization question is asked in.
+    stream_arn: String,
+    /// `VersionId` as it stands at this poll, which such an event names too.
+    version_id: u64,
     /// `KinesisStreamSourceDescription$KinesisStreamARN`: the source stream to read.
     source_arn: String,
+    /// `KinesisStreamSourceDescription$RoleARN`: the role the retrieval is made under, which
+    /// is what decides whether it may be made at all ([`source_read_authorization`]). `None`
+    /// for a source configuration naming none.
+    role_arn: Option<String>,
+    /// Where each of this stream's destinations reports what went wrong, for the destinations
+    /// whose `CloudWatchLoggingOptions` report anything at all.
+    loggings: Vec<DestinationLogging>,
     /// `KinesisStreamSourceDescription$DeliveryStartTimestamp`, where the source carries one:
     /// the instant retrieval starts at, which is where a shard nothing has been consumed from
     /// yet is read from.
     delivery_start: Option<SystemTime>,
     /// The sequence number of the last record consumed from each shard, by shard id.
     positions: BTreeMap<String, String>,
+    /// What IAM last answered about this stream's source read, with when it was asked
+    /// ([`DeliveryStream::source_read_decision`]): the answer this poll stands on while it is
+    /// still fresh.
+    read_decision: Option<SourceReadDecision>,
 }
 
 /// One record a poll took out of a source stream, with where in the source it came from.
@@ -177,7 +211,16 @@ pub fn next_poll_at(
 /// Writes only records the source ALREADY held at `now`, so a caller reading the destination
 /// sees nothing it would not have seen had this not been called: what is buffered here is
 /// still delivered on its own `BufferingHints` window ([`crate::state::delivery`]).
-pub fn ingest_from_sources<Eng: Send + Sync + 'static>(engine: &Eng, now: SystemTime) {
+///
+/// `hop` is how the question each stream's retrieval has to put to IAM is asked — whether the
+/// role its source configuration names may make the read at all
+/// ([`source_read_authorization`]) — so a stream whose role may not reads nothing and reports
+/// the refusal instead.
+pub async fn ingest_from_sources<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    hop: &DeliveryHop,
+    now: SystemTime,
+) {
     let Some(state) = service_state(engine) else {
         return;
     };
@@ -188,6 +231,22 @@ pub fn ingest_from_sources<Eng: Send + Sync + 'static>(engine: &Eng, now: System
         store.streams.values().filter_map(cursor_of).collect()
     };
     if sources.is_empty() {
+        return;
+    }
+    // The retrieval is the SOURCE ROLE's to make, so what that role is allowed to do decides
+    // whether it is made at all: a stream whose role IAM answers may not make the read reads
+    // nothing this poll, and the refusal is reported through the stream's own logging as the
+    // answer is taken. Asked with no store of this service locked.
+    let mut readable = Vec::with_capacity(sources.len());
+    for cursor in sources {
+        if source_read_authorization::source_read_refusal(engine, hop, &cursor, now)
+            .await
+            .is_none()
+        {
+            readable.push(cursor);
+        }
+    }
+    if readable.is_empty() {
         return;
     }
     let Some(kinesis) =
@@ -205,7 +264,7 @@ pub fn ingest_from_sources<Eng: Send + Sync + 'static>(engine: &Eng, now: System
     let fetched: Vec<(String, Vec<SourceRecord>)> = {
         let source_store = kinesis.lock();
         let mut budget = MAX_BYTES_PER_POLL;
-        sources
+        readable
             .into_iter()
             .map(|cursor| {
                 let records = records_after(&source_store, &cursor, now, &mut budget);
@@ -241,11 +300,22 @@ fn cursor_of(stream: &DeliveryStream) -> Option<SourceCursor> {
     }
     Some(SourceCursor {
         stream: stream.name.clone(),
+        stream_arn: stream.arn.clone(),
+        version_id: stream.version_id,
         source_arn,
+        role_arn: source.role_arn.clone(),
+        loggings: stream
+            .destinations
+            .iter()
+            .filter_map(|destination| {
+                DestinationLogging::of(destination.config.cloud_watch_logging_options())
+            })
+            .collect(),
         delivery_start: source
             .delivery_start_timestamp
             .and_then(|at| SystemTime::try_from(at).ok()),
         positions: stream.source_positions.clone(),
+        read_decision: stream.source_read_decision,
     })
 }
 

@@ -438,6 +438,7 @@ impl Emulator {
                 next_destination_id: 1,
                 delivery_retry_at: None,
                 source_positions: Default::default(),
+                source_read_decision: None,
             },
         );
     }

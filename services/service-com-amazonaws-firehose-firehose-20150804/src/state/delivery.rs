@@ -197,7 +197,10 @@ impl DeliveryHop {
 
     /// The emulator a delivery asks IAM about a destination role through, and `None` where
     /// there is none to ask.
-    fn emulator(&self) -> Option<&::smithy_server_runtime::EmbeddedEmulator> {
+    ///
+    /// `pub(crate)` because the consumption of a stream's SOURCE asks IAM the same question
+    /// about the role that source names ([`crate::state::kinesis_source`]).
+    pub(crate) fn emulator(&self) -> Option<&::smithy_server_runtime::EmbeddedEmulator> {
         self.emulator.as_ref()
     }
 }
@@ -2757,7 +2760,10 @@ async fn withheld_writes(
 /// signed for, which is the Region its roles and destinations are resolved in. A value that
 /// is not a Firehose stream ARN names no Region, which leaves the question unanswerable and
 /// so withholds nothing.
-fn delivery_region(stream_arn: &str) -> Option<&str> {
+///
+/// `pub(crate)` because the consumption of a stream's SOURCE asks its own authorization
+/// question in that same Region ([`crate::state::kinesis_source`]).
+pub(crate) fn delivery_region(stream_arn: &str) -> Option<&str> {
     ::service_common::arn::region_of(stream_arn, FIREHOSE_ARN_VENDOR)
 }
 
@@ -4160,7 +4166,8 @@ pub fn drive_delivery_clock<Eng: Send + Sync + 'static>(engine: &Arc<Eng>, hop: 
             // A stream whose data comes from a configured source is fed by that source and
             // by no Firehose call at all, so the wake-up reads what the source has taken
             // since before it delivers what that made due.
-            crate::state::kinesis_source::ingest_from_sources(&*engine, SystemTime::now());
+            crate::state::kinesis_source::ingest_from_sources(&*engine, &hop, SystemTime::now())
+                .await;
             deliver_due(&*engine, SystemTime::now(), Extractions::Run, &hop).await;
         }
         if capped {

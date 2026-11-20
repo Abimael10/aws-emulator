@@ -30,7 +30,8 @@ pub mod stream_metrics;
 
 use crate::ops::types::{
     AmazonOpenSearchServerlessDestinationConfiguration,
-    AmazonopensearchserviceDestinationConfiguration, DeliveryStreamEncryptionConfiguration,
+    AmazonopensearchserviceDestinationConfiguration, CloudWatchLoggingOptions,
+    DeliveryStreamEncryptionConfiguration,
     DeliveryStreamEncryptionConfigurationInput, ElasticsearchDestinationConfiguration,
     ExtendedS3DestinationConfiguration, HttpEndpointDestinationConfiguration,
     IcebergDestinationConfiguration, ProcessingConfiguration, ProcessorParameter,
@@ -281,6 +282,30 @@ impl DestinationConfigKind {
             Self::Snowflake(config) => config.processing_configuration.as_ref(),
             Self::AmazonOpenSearchServerless(config) => config.processing_configuration.as_ref(),
             Self::Iceberg(config) => config.processing_configuration.as_ref(),
+        }
+    }
+
+    /// Where this destination reports what went wrong, whatever variant it is: "The Amazon
+    /// CloudWatch logging options for your Firehose stream"
+    /// (`CloudWatchLoggingOptions`), which every destination shape carries a member for.
+    ///
+    /// Read by the delivery that failed ([`delivery::destination_logging`]) and by the
+    /// consumption of the stream's configured source, which reports a read it could not make
+    /// through the same channel ([`kinesis_source`]).
+    pub fn cloud_watch_logging_options(&self) -> Option<&CloudWatchLoggingOptions> {
+        match self {
+            Self::S3(config) => config.cloud_watch_logging_options.as_ref(),
+            Self::ExtendedS3(config) => config.cloud_watch_logging_options.as_ref(),
+            Self::Redshift(config) => config.cloud_watch_logging_options.as_ref(),
+            Self::Elasticsearch(config) => config.cloud_watch_logging_options.as_ref(),
+            Self::AmazonOpenSearchService(config) => config.cloud_watch_logging_options.as_ref(),
+            Self::Splunk(config) => config.cloud_watch_logging_options.as_ref(),
+            Self::HttpEndpoint(config) => config.cloud_watch_logging_options.as_ref(),
+            Self::Snowflake(config) => config.cloud_watch_logging_options.as_ref(),
+            Self::AmazonOpenSearchServerless(config) => {
+                config.cloud_watch_logging_options.as_ref()
+            }
+            Self::Iceberg(config) => config.cloud_watch_logging_options.as_ref(),
         }
     }
 
@@ -569,6 +594,10 @@ pub struct DeliveryStream {
     /// that has consumed nothing yet — which reads its source from the instant retrieval
     /// starts at instead ([`kinesis_source`]).
     pub source_positions: BTreeMap<String, String>,
+    /// What IAM last answered about this stream's retrieval from its source, and when it was
+    /// asked ([`kinesis_source::SourceReadDecision`]). `None` for a stream nothing has been
+    /// asked about yet.
+    pub source_read_decision: Option<kinesis_source::SourceReadDecision>,
 }
 
 impl DeliveryStream {

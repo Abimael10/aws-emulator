@@ -15,6 +15,12 @@
 //! to, the destination it was going to, the stream's version, the condition's own
 //! `errorCode` and the message that code states ([`DestinationError`]).
 //!
+//! The same channel carries what went wrong BEFORE a delivery as well: a stream fed by a
+//! configured source whose source read failed publishes its own `errorCode` here
+//! ([`source_error_event`]), because that read is the stream's work and no client call is
+//! made for it either. Every event of this service's own logging is written by one writer
+//! ([`report_events`]).
+//!
 //! The events go into the store CloudWatch Logs' own readers answer from — that service's
 //! record types, through its own ceilings — so a delivery error and `GetLogEvents` /
 //! `FilterLogEvents` cannot disagree. They do not travel over `PutLogEvents`: this is the
@@ -129,7 +135,61 @@ fn error_event(stream_arn: &str, version_id: u64, report: &DeliveryErrorReport) 
     .to_string()
 }
 
+/// The event document a failure to READ the stream's configured source is published as.
+///
+/// The same members a failed delivery's document carries, minus the destination: a source
+/// read that failed never reached one, so there is no destination to name — what the event
+/// states is the stream the read was for, its `VersionId`, the condition's `errorCode` and
+/// the message that code states.
+#[must_use]
+pub fn source_error_event(
+    stream_arn: &str,
+    version_id: u64,
+    error_code: &str,
+    message: &str,
+) -> String {
+    ::serde_json::json!({
+        "deliveryStreamARN": stream_arn,
+        "deliveryStreamVersionId": version_id,
+        "message": message,
+        "errorCode": error_code,
+    })
+    .to_string()
+}
+
+/// ONE log event a stream's `CloudWatchLoggingOptions` report, and where it goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportedEvent {
+    /// Where it is reported.
+    pub logging: DestinationLogging,
+    /// The event document, as the stream publishes it ([`source_error_event`]).
+    pub message: String,
+}
+
 /// Write one log event per report of `reports` into the group and stream each names.
+///
+/// The documents are rendered from the stream and the destination configuration in force
+/// ([`error_event`]) and then written by the one writer every event of this service's own
+/// logging goes through ([`report_events`]).
+pub fn report_delivery_errors<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    stream_arn: &str,
+    version_id: u64,
+    reports: &[DeliveryErrorReport],
+    now: SystemTime,
+) {
+    let events: Vec<ReportedEvent> = reports
+        .iter()
+        .map(|report| ReportedEvent {
+            logging: report.logging.clone(),
+            message: error_event(stream_arn, version_id, report),
+        })
+        .collect();
+    report_events(engine, region, events, now);
+}
+
+/// Write each event of `events` into the group and stream its own options name.
 ///
 /// `region` is the Region the reporting stream lives in, so a group or stream this has to
 /// open carries the ARN its own reader reports for it. A destination's configured group or
@@ -143,15 +203,13 @@ fn error_event(stream_arn: &str, version_id: u64, report: &DeliveryErrorReport) 
 /// `CreateLogStream` admits one against) and how much one stream retains (its own
 /// `enforce_storage_ceiling`), so the events a retried delivery writes are bounded by that
 /// store rather than by the attempts made.
-pub fn report_delivery_errors<Eng: Send + Sync + 'static>(
+pub fn report_events<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,
-    stream_arn: &str,
-    version_id: u64,
-    reports: &[DeliveryErrorReport],
+    events: Vec<ReportedEvent>,
     now: SystemTime,
 ) {
-    if reports.is_empty() {
+    if events.is_empty() {
         return;
     }
     let Some(state) = logs::service_state(engine) else {
@@ -163,7 +221,7 @@ pub fn report_delivery_errors<Eng: Send + Sync + 'static>(
     };
     let timestamp = epoch_millis(now);
     let mut store = state.lock();
-    for report in reports {
+    for report in events {
         let now_ms = logs::now_ms();
         if !store.log_groups.contains_key(&report.logging.log_group)
             && store.log_groups.len() >= logs::MAX_LOG_GROUPS
@@ -182,7 +240,7 @@ pub fn report_delivery_errors<Eng: Send + Sync + 'static>(
             .get(&report.logging.log_group)
             .map(|group| store.data_protection_identifiers_for(group))
             .unwrap_or_default();
-        let message = error_event(stream_arn, version_id, report);
+        let message = report.message;
         // The customer managed key the destination group is associated with, under which the
         // data it takes in is encrypted — by whichever path the events arrive.
         let ingest_kms_key_id = store
