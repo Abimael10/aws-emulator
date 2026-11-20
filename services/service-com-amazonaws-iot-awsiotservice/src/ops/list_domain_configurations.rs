@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let region = crate::state::request_region(ctx.parts());
-        let data_endpoint = crate::state::account_data_endpoint(ctx);
+        let data_endpoint = crate::state::account_data_endpoint(&*self.engine, ctx);
         let now = ::std::time::SystemTime::now();
 
         let store = state.lock();
@@ -212,8 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (page, next_marker) =
             crate::state::page_of(positions, &scope, resume_after.as_deref(), page_size);
 
-        // Each entry is projected from the stored record, so what a listing reports and
-        // what `DescribeDomainConfiguration` reports cannot drift.
+        // Each entry is projected from the record the same single-configuration reader
+        // projects, so what a listing reports and what `DescribeDomainConfiguration`
+        // reports cannot drift.
         Ok(ListDomainConfigurationsOutput {
             domain_configurations: Some(
                 page.iter()

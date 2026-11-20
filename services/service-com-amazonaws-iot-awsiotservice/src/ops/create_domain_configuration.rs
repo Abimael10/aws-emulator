@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         // WHERE this account's IoT data plane answers, which is the domain an
         // AWS-managed configuration configures (it names none of its own).
-        let data_endpoint = crate::state::account_data_endpoint(ctx);
+        let data_endpoint = crate::state::account_data_endpoint(&*self.engine, ctx);
 
         // `Tag$Key` is `@required` and keys a resource's tag set, so the last value given
         // for a key is the one the resource carries, and how MANY tags one request may

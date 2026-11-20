@@ -418,14 +418,33 @@ pub fn effective_tls_config(requested: Option<TlsConfig>) -> TlsConfig {
 ///
 /// A configuration for an AWS-managed domain names no domain of the caller's own: the
 /// domain it configures is the account's own endpoint, so its `domainName` is the
-/// address that endpoint is published at — the one value `DescribeEndpoint` answers
-/// with, read from the same place
-/// ([`::service_common::data_plane_addressing::emulator_endpoint_authority`]), so the
-/// endpoint a client discovers and the domain a configuration names cannot drift.
+/// address that endpoint is published at — the value `DescribeEndpoint` answers with,
+/// resolved the way that operation resolves it, so the endpoint a client discovers and
+/// the domain a configuration names cannot drift:
+///
+/// * the MESSAGE BROKER's own socket once a call has opened one, which is where a data
+///   endpoint is published (`crate::ops::describe_endpoint`, whose data endpoint serves
+///   MQTT over TLS and the HTTPS data plane on that socket);
+/// * otherwise the address this emulator serves its whole surface at
+///   ([`::service_common::data_plane_addressing::emulator_endpoint_authority`]), which is
+///   also what that operation falls back to on an emulator that could open no socket of
+///   its own.
+///
+/// The broker is only READ here: opening one is the endpoint call's own work, so a read of
+/// a domain configuration starts nothing.
 ///
 /// `None` for an emulator that is served at no address at all, rather than a
 /// `domainName` naming nothing.
-pub fn account_data_endpoint(ctx: &::smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+pub fn account_data_endpoint<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Option<String> {
+    let broker = ::service_common::iot_mqtt_broker::broker_state(engine)
+        .and_then(|broker| broker.lock().authority())
+        .filter(|authority| !authority.trim().is_empty());
+    if broker.is_some() {
+        return broker;
+    }
     let endpoint = ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx);
     (!endpoint.trim().is_empty()).then_some(endpoint)
 }

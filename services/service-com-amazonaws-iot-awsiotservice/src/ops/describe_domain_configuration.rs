@@ -181,7 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let region = crate::state::request_region(ctx.parts());
-        let data_endpoint = crate::state::account_data_endpoint(ctx);
+        let data_endpoint = crate::state::account_data_endpoint(&*self.engine, ctx);
         let now = ::std::time::SystemTime::now();
 
         // Reported from the stored record, member for member, so a reader and the create

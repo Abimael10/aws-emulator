@@ -168,17 +168,44 @@ pub fn invalid_confirmation_url_message(url: &str) -> String {
 /// that it was not accepted, not what this service holds.
 pub const INVALID_CONFIRMATION_TOKEN_MESSAGE: &str = "Invalid confirmation token.";
 
-/// `TopicRuleDestination$statusReason` for a destination that is `IN_PROGRESS` because its
-/// confirmation has not completed: "Additional details or reason why the topic rule
-/// destination is in the current status".
+/// `TopicRuleDestination$statusReason` of a destination that is `IN_PROGRESS` and whose
+/// confirmation message has NOT gone out yet: "Additional details or reason why the topic
+/// rule destination is in the current status".
 ///
 /// A destination enters the lifecycle "created but has not been confirmed"
-/// (`TopicRuleDestinationStatus$IN_PROGRESS`) and a fresh challenge puts it back there, so
-/// this is the reason both a create and a requested challenge leave on the record — fixed
-/// text, with nothing of the request in it.
+/// (`TopicRuleDestinationStatus$IN_PROGRESS`) and a fresh challenge puts it back there, and
+/// the challenge itself is dispatched after the call that asked for one has answered
+/// ([`start_confirmation_challenge`]) — so this is the state the create and the requested
+/// challenge leave the record in: awaiting a confirmation whose message is still to be
+/// sent. Fixed text, with nothing of the request in it.
 pub const AWAITING_CONFIRMATION_REASON: &str =
     "Awaiting confirmation. The confirmation message has not been sent to the destination \
      endpoint yet.";
+
+/// `TopicRuleDestination$statusReason` of a destination whose confirmation message HAS gone
+/// out to its endpoint and whose confirmation has not come back.
+///
+/// It is the next phase of the same unconfirmed state: the service has sent the
+/// `DestinationConfirmation` message to the configured `confirmationUrl` and the endpoint
+/// took it ([`send_confirmation_challenge`]), and what is still outstanding is the TOKEN
+/// coming back through `ConfirmTopicRuleDestination`. Fixed text, for the same reason
+/// [`AWAITING_CONFIRMATION_REASON`] is.
+pub const CONFIRMATION_SENT_REASON: &str =
+    "Awaiting confirmation. The confirmation message has been sent to the destination \
+     endpoint.";
+
+/// `TopicRuleDestination$statusReason` of a destination whose endpoint did not take the
+/// confirmation message.
+///
+/// The third phase of the unconfirmed state: the message was dispatched to the configured
+/// `confirmationUrl` and that endpoint did not accept it — it answered outside `2xx`, or
+/// nothing there answered at all — so no token can come back from it and the destination
+/// stays `IN_PROGRESS` until a fresh challenge is asked for. Fixed text: WHICH endpoint and
+/// what it answered are the configuration's and the endpoint's, not something this sentence
+/// echoes.
+pub const CONFIRMATION_UNDELIVERED_REASON: &str =
+    "Awaiting confirmation. The confirmation message could not be sent to the destination \
+     endpoint.";
 
 /// How an update refuses a `status` the destination cannot be moved to from the one it
 /// holds: the two statuses, in the order the sentence states them.
@@ -304,6 +331,39 @@ impl RegisteredTopicRuleDestination {
         self.status_reason = None;
         self.confirmed_due_at = None;
         self.last_updated_at = now;
+    }
+
+    /// Record what became of the confirmation message of the challenge `token` carries:
+    /// `delivered` is whether the destination's endpoint took it. Answers whether anything
+    /// changed.
+    ///
+    /// It is the one thing the dispatch itself tells the record
+    /// ([`challenge_destination`]), and it moves the destination to the phase of the same
+    /// unconfirmed state the owner can then read: the message sent and the token not back
+    /// ([`CONFIRMATION_SENT_REASON`]), or an endpoint that did not take it
+    /// ([`CONFIRMATION_UNDELIVERED_REASON`]). Nothing else about the destination changes —
+    /// the dispatch is the service's own work and not an update of what the owner
+    /// configured, so `lastUpdatedAt` stays where the write that asked for the challenge
+    /// left it.
+    ///
+    /// A destination whose outstanding token is no longer `token` has been challenged
+    /// again, or confirmed, since: that later state stands, so nothing is written.
+    pub fn record_confirmation_message_sent(&mut self, token: &str, delivered: bool) -> bool {
+        if self.confirmation_token != token
+            || self.status != DESTINATION_IN_PROGRESS
+            || self.is_confirmed()
+        {
+            return false;
+        }
+        self.status_reason = Some(
+            if delivered {
+                CONFIRMATION_SENT_REASON
+            } else {
+                CONFIRMATION_UNDELIVERED_REASON
+            }
+            .to_string(),
+        );
+        true
     }
 
     /// Materialise the move out of `IN_PROGRESS` the clock already owes at `now`, and
@@ -851,12 +911,24 @@ pub async fn challenge_destination<Eng: Send + Sync + 'static>(
         };
         ConfirmationChallenge::new(destination, endpoint)
     };
-    if let Err(reason) = send_confirmation_challenge(transport, &challenge).await {
-        ::tracing::warn!(
-            destination = %arn,
-            reason = %reason,
-            "a topic rule destination's confirmation challenge was not taken, so the \
-             destination is still unconfirmed"
-        );
+    let delivered = match send_confirmation_challenge(transport, &challenge).await {
+        Ok(()) => true,
+        Err(reason) => {
+            ::tracing::warn!(
+                destination = %arn,
+                reason = %reason,
+                "a topic rule destination's confirmation challenge was not taken, so the \
+                 destination is still unconfirmed"
+            );
+            false
+        }
+    };
+    // What became of the message is what the destination can then explain about the status
+    // it is in ([`RegisteredTopicRuleDestination::record_confirmation_message_sent`]): what
+    // CONFIRMS it is the token coming back, not this request's own answer. The guard is
+    // taken again here because none was held across the request above.
+    let mut store = state.lock();
+    if let Some(destination) = store.topic_rule_destinations.get_mut(arn) {
+        destination.record_confirmation_message_sent(&challenge.confirmation_token, delivered);
     }
 }

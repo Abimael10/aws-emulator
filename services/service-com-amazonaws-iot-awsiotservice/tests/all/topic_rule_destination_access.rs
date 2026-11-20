@@ -22,8 +22,8 @@
 //! * `TopicRuleDestination$statusReason` ("Additional details or reason why the topic rule
 //!   destination is in the current status") is populated for a destination that is
 //!   `IN_PROGRESS` because its confirmation has not completed — "a topic rule destination
-//!   was created but has not been confirmed" (`TopicRuleDestinationStatus`) — and is
-//!   readable back through `GetTopicRuleDestination`.
+//!   was created but has not been confirmed" (`TopicRuleDestinationStatus`) — stating which
+//!   phase of that state it is in, and is readable back through `GetTopicRuleDestination`.
 //!
 //! The `confirmationUrl` a create will not take is refused in the one sentence this service
 //! states for a value that is no HTTPS URL, over a table of the ways a URL can fail it.
@@ -57,9 +57,41 @@ const ACCOUNT_ID: &str = "000000000000";
 /// not been confirmed".
 const IN_PROGRESS: &str = "IN_PROGRESS";
 
-/// The reason a destination whose confirmation has not completed reports.
+/// The reason a destination carries while its confirmation message has NOT gone out yet,
+/// which is the state a create leaves the record in.
 const AWAITING_CONFIRMATION: &str = "Awaiting confirmation. The confirmation message has not \
                                      been sent to the destination endpoint yet.";
+
+/// The reason it carries once that message HAS gone out and the endpoint took it — the
+/// next phase of the same unconfirmed state.
+const CONFIRMATION_SENT: &str =
+    "Awaiting confirmation. The confirmation message has been sent to the destination \
+     endpoint.";
+
+/// The reason it carries when the endpoint did NOT take that message, which is the phase
+/// every destination in this suite reaches: nothing in this emulator answers at the
+/// confirmation URLs these cases configure.
+const CONFIRMATION_UNDELIVERED: &str =
+    "Awaiting confirmation. The confirmation message could not be sent to the destination \
+     endpoint.";
+
+/// Whether `reason` is one of the three an UNCONFIRMED destination explains itself with:
+/// the confirmation message still to go out, gone out and taken by the endpoint, or not
+/// taken by it.
+///
+/// WHICH of the three a read lands on is decided by the dispatch, which runs off the
+/// response path of the call that asked for the challenge — so a case in this suite, whose
+/// reads race that dispatch, asserts the exact sentence only where the phase is fixed (the
+/// create's own answer, written before its challenge went out) and otherwise asserts that
+/// the destination explains itself at all. The per-phase sentences are asserted where the
+/// dispatch is OBSERVABLE: `topic_rule_destination_lifecycle`, whose endpoint reads the
+/// message this service sent it.
+fn explains_an_unconfirmed_destination(reason: Option<&str>) -> bool {
+    matches!(
+        reason,
+        Some(AWAITING_CONFIRMATION | CONFIRMATION_SENT | CONFIRMATION_UNDELIVERED)
+    )
+}
 
 /// One HTTP answer, reduced to what a client branches on.
 #[derive(Debug)]
@@ -196,7 +228,37 @@ impl Emulator {
         )
         .await
     }
+
+    /// The destination's `statusReason`, read again until it is `expected` or a generous
+    /// deadline passes; answered with the last reason read either way.
+    ///
+    /// The confirmation message goes out AFTER the call that asked for it has answered, so
+    /// the phase a reason reports is reached by that dispatch and not by the call: the
+    /// condition is polled for rather than waited out.
+    async fn reason_within(&self, case: &str, arn: &str, expected: &str) -> Option<String> {
+        let deadline = ::std::time::SystemTime::now() + REASON_DEADLINE;
+        loop {
+            let read = self.get_destination(arn).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: GetTopicRuleDestination answered {} {:?}",
+                read.status, read.body
+            );
+            let reason = read.status_reason();
+            if reason.as_deref() == Some(expected) || ::std::time::SystemTime::now() >= deadline {
+                return reason;
+            }
+            ::tokio::time::sleep(REASON_POLL_INTERVAL).await;
+        }
+    }
 }
+
+/// How long a phase of the unconfirmed state is waited for before a case fails: far
+/// longer than anything this emulator takes, so a loaded machine does not fail a case.
+const REASON_DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(10);
+
+/// How often the destination is read again while waiting for that phase.
+const REASON_POLL_INTERVAL: ::std::time::Duration = ::std::time::Duration::from_millis(25);
 
 /// Every way this plane addresses ONE destination by ARN, so each rule below is asserted on
 /// all of them rather than on the one a recording happened to use.
@@ -417,8 +479,12 @@ async fn a_well_formed_arn_no_destination_answers_to_is_denied() {
 /// that reason is readable back — on the create's own answer and on every later read.
 ///
 /// The rows differ along the confirmation URL (a path-only URL, one carrying a query
-/// string, one naming a port, a longer path), none of which the reason depends on: it is
-/// fixed text about the state the destination is in.
+/// string, one naming a port, a longer path), none of which the reason depends on: what it
+/// states is the phase the unconfirmed state is in. The create answers before its own
+/// challenge is dispatched, so its reason is the message still to go out; and nothing in
+/// this emulator answers at any of these URLs, so the phase each row then reaches is the
+/// endpoint not taking the message — polled for, because the dispatch runs off the
+/// response path.
 #[tokio::test]
 async fn an_unconfirmed_destination_states_why_and_reads_it_back() {
     let emulator = Emulator::new();
@@ -446,8 +512,8 @@ async fn an_unconfirmed_destination_states_why_and_reads_it_back() {
             created.destination()
         );
         assert_eq!(
-            created.status_reason(),
-            Some(AWAITING_CONFIRMATION.to_string()),
+            created.status_reason().as_deref(),
+            Some(AWAITING_CONFIRMATION),
             "case {case:?}: expected the create to state why the destination is \
              {IN_PROGRESS}, got {:?}",
             created.status_reason()
@@ -460,15 +526,26 @@ async fn an_unconfirmed_destination_states_why_and_reads_it_back() {
             "case {case:?}: GetTopicRuleDestination answered {} {:?}",
             read.status, read.body
         );
-        assert_eq!(
-            read.status_reason(),
-            created.status_reason(),
-            "case {case:?}: expected the reader to report the stored reason, got {:?}",
+        assert!(
+            explains_an_unconfirmed_destination(read.status_reason().as_deref()),
+            "case {case:?}: expected the reader to explain the unconfirmed destination, got \
+             {:?}",
             read.status_reason()
+        );
+        // Nothing answers at the configured URL, so that endpoint does not take the
+        // message and the destination says so once the dispatch has run.
+        assert_eq!(
+            emulator
+                .reason_within(case, &arn, CONFIRMATION_UNDELIVERED)
+                .await
+                .as_deref(),
+            Some(CONFIRMATION_UNDELIVERED),
+            "case {case:?}: expected the destination to state that its endpoint did not \
+             take the confirmation message"
         );
 
         // A requested fresh challenge puts the destination back in the same unconfirmed
-        // state, so the same reason is what a reader then finds.
+        // state, which its fresh message then goes out of the same way.
         let challenged = emulator.update_destination(&arn, IN_PROGRESS).await;
         assert_eq!(
             challenged.status, 200,
@@ -477,11 +554,23 @@ async fn an_unconfirmed_destination_states_why_and_reads_it_back() {
         );
         let reread = emulator.get_destination(&arn).await;
         assert_eq!(
-            (reread.status_value(), reread.status_reason()),
-            (IN_PROGRESS.to_string(), Some(AWAITING_CONFIRMATION.to_string())),
+            (
+                reread.status_value(),
+                explains_an_unconfirmed_destination(reread.status_reason().as_deref()),
+            ),
+            (IN_PROGRESS.to_string(), true),
             "case {case:?}: expected a re-challenged destination to state why it is \
              {IN_PROGRESS}, got {:?}",
             reread.destination()
+        );
+        assert_eq!(
+            emulator
+                .reason_within(case, &arn, CONFIRMATION_UNDELIVERED)
+                .await
+                .as_deref(),
+            Some(CONFIRMATION_UNDELIVERED),
+            "case {case:?}: expected the re-challenged destination to state that its \
+             endpoint did not take the fresh confirmation message either"
         );
     }
 }

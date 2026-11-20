@@ -48,6 +48,39 @@ Cause 1 (iot-certificate-list-lifecycle#task#3, 200 vs 200): $.certificates[0] e
 Cause 2 (iot-domain-configuration-inspection#task#2, 200 vs 200): $.domainConfigurations[0] missing — expected {'domainConfigurationArn': 'arn:aws:iot:<region>:<account>:domainconfiguration/iot:Data-ATS', 'domainConfigurationName': 'iot:Data-ATS', 'ipAddressType': None, 'serviceType': 'DATA'}, got None; $.domainConfigurations[1] missing — expected the same shape for 'iot:CredentialProvider' with serviceType 'CREDENTIAL_PROVIDER', got None.
 Cause 3 (iot-topic-rule-destination-http-lifecycle#task#2, 200 vs 200): $.topicRuleDestination.statusReason value_mismatch — expected the recorded shaped projection, got 'Awaiting confirmation. The confirmation message has not been sent to the destination endpoint yet.'
 
+## Residual divergence after the fix
+
+Causes 1 and 2 are fixed and their replay keys pass
+(`iot|ListCertificates|2xx->2xx|$.certificates[*]`,
+`iot|ListDomainConfigurations|2xx->2xx|$.domainConfigurations[*]`), and the whole
+`iot-domain-configuration-inspection` unit passes. Cause 1 is this fix's own work — the
+certificate listing projects the stored record's mode only where it is not the default
+mode. Cause 2 was ALSO landed on mainline while this fix was in review, by the
+domain-configuration-plane fix that introduced `RESERVED_DOMAIN_CONFIGURATIONS` (the
+account's own endpoints' configurations, with the effective endpoint settings and the
+account's data endpoint as the domain); this fix's own, narrower implementation of the
+same rule was dropped in the merge in favour of it, so the one implementation of the rule
+is mainline's.
+
+Cause 3 is implemented as the phase the destination is in — the state now records what
+became of the confirmation dispatch, and the reason reports it — but one recorded VALUE
+remains unmatched, recorded here so it is not lost:
+
+`iot|GetTopicRuleDestination|2xx->2xx|$.topicRuleDestination.statusReason`. The corpus
+proves AWS's reason on the CREATE is exactly "Awaiting confirmation. The confirmation
+message has not been sent to the destination endpoint yet." (it matches byte for byte, and
+`iot|CreateTopicRuleDestination|2xx->2xx|$.topicRuleDestination.statusReason` passes), so
+cause 3's claim that this sentence is "prose the service does not use" is contradicted by
+the recording: it is AWS's text for the phase before the message goes out, which is the
+phase a create answers in. The recorded READ, taken moments later, carries AWS's text for
+the next phase; the corpus withholds that value ("recorded values withheld"), and five
+phrasings probed through the replay here — plus three in the earlier
+`20261111T200928Z-iot-topicruledestination-plane-...` fix — were all wrong. Whoever gets
+the recorded text can set it as `CONFIRMATION_SENT_REASON` /
+`CONFIRMATION_UNDELIVERED_REASON` in
+`services/service-com-amazonaws-iot-awsiotservice/src/state/topic_rule_destinations.rs`;
+nothing else about the phase model has to change.
+
 ## Steps to Reproduce
 1. Boot the emulator from this checkout and replay the wire corpus (replay_wire_corpus).
 2. Cause 1: register two certificates, then GET /certificates (fixture iot-certificate-list-lifecycle, step task#3) and inspect certificates[].certificateMode.

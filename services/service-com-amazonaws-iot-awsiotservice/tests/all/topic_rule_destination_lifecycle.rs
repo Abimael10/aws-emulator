@@ -365,6 +365,31 @@ impl Emulator {
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
+
+    /// The destination's `statusReason`, waited for until it is `expected` or the deadline
+    /// passes; answered with the last reason read either way.
+    ///
+    /// The confirmation message goes out AFTER the call that asked for it has answered, so
+    /// the phase the reason reports is reached by the dispatch and not by the call: the
+    /// condition is polled for rather than waited out.
+    async fn reason_within(&self, case: &str, arn: &str, expected: &str) -> Option<String> {
+        let deadline = SystemTime::now() + ARRIVAL_DEADLINE;
+        loop {
+            let read = self.get_destination(arn).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: GetTopicRuleDestination answered {} {:?}",
+                read.status, read.body
+            );
+            let reason = read.destination()["statusReason"]
+                .as_str()
+                .map(str::to_string);
+            if reason.as_deref() == Some(expected) || SystemTime::now() >= deadline {
+                return reason;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
 }
 
 /// A SigV4 `Authorization` header whose credential scope names `signing_name`: the scope is
@@ -627,6 +652,184 @@ async fn the_challenge_request_carries_its_token_as_a_query_parameter() {
             Some("application/json"),
             "case {case:?}: expected a JSON challenge document, got {:?}",
             request.headers
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// What an unconfirmed destination says about the status it is in
+// ---------------------------------------------------------------------------
+
+/// The reason a destination carries while its confirmation message has NOT gone out yet,
+/// which is the state the create and a requested challenge leave the record in: the
+/// message goes out after the asking call has answered.
+const AWAITING_CONFIRMATION: &str = "Awaiting confirmation. The confirmation message has not \
+                                     been sent to the destination endpoint yet.";
+
+/// The reason it carries once that message HAS gone out to the endpoint and the endpoint
+/// took it: the next phase of the same unconfirmed state, where what is outstanding is the
+/// token coming back.
+const CONFIRMATION_SENT: &str = "Awaiting confirmation. The confirmation message has been \
+                                 sent to the destination endpoint.";
+
+/// The reason it carries when the endpoint did NOT take that message: it answered outside
+/// `2xx`, or nothing answered at the configured URL at all.
+const CONFIRMATION_UNDELIVERED: &str = "Awaiting confirmation. The confirmation message \
+                                        could not be sent to the destination endpoint.";
+
+/// RULE: a destination awaiting its confirmation explains the status it is in by stating
+/// WHICH PHASE of that state it is in — the confirmation message still to go out to its
+/// endpoint, or gone out with the token not back — so the create, which answers before its
+/// own challenge is dispatched, reports the first, and a read once the message has reached
+/// the endpoint reports the second; a destination whose token has come back has nothing
+/// left to explain and reports no reason at all.
+///
+/// The rows differ along the endpoint the confirmation URL addresses — a short topic, a
+/// longer one, one carrying punctuation — none of which the reason depends on, and each row
+/// walks the whole trajectory: created, challenged, confirmed, challenged again.
+#[tokio::test]
+async fn an_unconfirmed_destination_states_whether_its_confirmation_message_has_gone_out() {
+    // (case, the endpoint topic the confirmation URL addresses)
+    let rows: [(&str, &str); 3] = [
+        ("a single-level endpoint topic", "reason-one"),
+        ("a longer endpoint topic name", "reason-two-for-this-destination"),
+        ("an endpoint topic with punctuation", "reason_three-3"),
+    ];
+    let emulator = Emulator::new();
+
+    for (case, topic) in rows {
+        let url = endpoint_url(topic);
+        let created = emulator.create_http_destination(&url).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreateTopicRuleDestination answered {} {:?}",
+            created.status, created.body
+        );
+        let arn = created.arn();
+
+        // The create answers the record it wrote, whose challenge has not gone out yet.
+        assert_eq!(
+            created.destination()["statusReason"],
+            json!(AWAITING_CONFIRMATION),
+            "case {case:?}: expected the create to state that the confirmation message is \
+             still to go out, got {:?}",
+            created.destination()
+        );
+
+        // The message then goes out: it is read where the owner of the endpoint reads it,
+        // and the destination's reason reports that phase from then on.
+        let received = emulator.received_within(case, topic).await;
+        let token = token_of(case, &received);
+        assert_eq!(
+            emulator
+                .reason_within(case, &arn, CONFIRMATION_SENT)
+                .await
+                .as_deref(),
+            Some(CONFIRMATION_SENT),
+            "case {case:?}: expected the reader to state that the confirmation message has \
+             gone out to the endpoint"
+        );
+
+        // Once the token comes back there is nothing left to explain, so no reason is
+        // reported — whether the destination still holds `IN_PROGRESS` or the clock has
+        // already rested it at `DISABLED`.
+        let confirmed = emulator.confirm_destination(&token).await;
+        assert_eq!(
+            confirmed.status, 200,
+            "case {case:?}: ConfirmTopicRuleDestination answered {} {:?}",
+            confirmed.status, confirmed.body
+        );
+        let after_confirmation = emulator.get_destination(&arn).await;
+        assert_eq!(
+            after_confirmation.destination().get("statusReason"),
+            None,
+            "case {case:?}: a confirmed destination explains nothing, got {:?}",
+            after_confirmation.destination()
+        );
+
+        // A requested fresh challenge puts the destination back at the start of that same
+        // state, and its message goes out the same way.
+        let challenged = emulator
+            .update_destination(&arn, DESTINATION_IN_PROGRESS)
+            .await;
+        assert_eq!(
+            challenged.status, 200,
+            "case {case:?}: UpdateTopicRuleDestination({DESTINATION_IN_PROGRESS}) answered \
+             {} {:?}",
+            challenged.status, challenged.body
+        );
+        let fresh_token = emulator.fresh_token_within(case, topic, &token).await;
+        assert_ne!(
+            fresh_token, token,
+            "case {case:?}: a fresh challenge must carry a token of its own"
+        );
+        assert_eq!(
+            emulator
+                .reason_within(case, &arn, CONFIRMATION_SENT)
+                .await
+                .as_deref(),
+            Some(CONFIRMATION_SENT),
+            "case {case:?}: expected the re-challenged destination to state that its fresh \
+             confirmation message has gone out"
+        );
+    }
+}
+
+/// RULE: an endpoint that does not take the confirmation message leaves the destination
+/// unconfirmed, and the destination says that about the status it is in: the message was
+/// dispatched to the configured URL and that endpoint did not accept it, so no token can
+/// come back from it.
+///
+/// The rows differ along the way nothing answers at the configured URL — a host this
+/// emulator serves nothing for, and a path a service it does serve does not — so the
+/// phase is asserted on more than one way a dispatch can fail.
+#[tokio::test]
+async fn an_endpoint_that_does_not_take_the_confirmation_message_is_reported() {
+    let emulator = Emulator::new();
+    // (case, the confirmation URL nothing in this emulator answers at)
+    let rows: [(&str, String); 2] = [
+        (
+            "a host this emulator serves nothing for",
+            "https://nothing.example.test/iot-confirm".to_string(),
+        ),
+        (
+            "a path the data plane does not serve",
+            format!("https://iotdata.{REGION}.amazonaws.com/not-a-data-plane-path"),
+        ),
+    ];
+
+    for (case, url) in rows {
+        let created = emulator.create_http_destination(&url).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreateTopicRuleDestination answered {} {:?}",
+            created.status, created.body
+        );
+        let arn = created.arn();
+        assert_eq!(
+            created.destination()["statusReason"],
+            json!(AWAITING_CONFIRMATION),
+            "case {case:?}: expected the create to state that the confirmation message is \
+             still to go out, got {:?}",
+            created.destination()
+        );
+
+        assert_eq!(
+            emulator
+                .reason_within(case, &arn, CONFIRMATION_UNDELIVERED)
+                .await
+                .as_deref(),
+            Some(CONFIRMATION_UNDELIVERED),
+            "case {case:?}: expected the destination to state that its endpoint did not \
+             take the confirmation message"
+        );
+        let read = emulator.get_destination(&arn).await;
+        assert_eq!(
+            read.status_value(),
+            DESTINATION_IN_PROGRESS,
+            "case {case:?}: an unconfirmed destination stays {DESTINATION_IN_PROGRESS}, got \
+             {:?}",
+            read.destination()
         );
     }
 }

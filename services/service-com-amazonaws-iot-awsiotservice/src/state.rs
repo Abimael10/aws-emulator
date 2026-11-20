@@ -3226,9 +3226,9 @@ pub use topic_rule_destinations::{
     http_action_is_allowed, invalid_confirmation_url_message, invalid_status_transition_message,
     settle_destinations, start_confirmation_challenge, topic_rule_destination_arn,
     unaddressable_arn, unreadable_topic_rule_destination_message, RegisteredTopicRuleDestination,
-    AWAITING_CONFIRMATION_REASON, DESTINATION_DELETING, DESTINATION_DISABLED, DESTINATION_ENABLED,
-    DESTINATION_ERROR, DESTINATION_IN_PROGRESS, INVALID_CONFIRMATION_TOKEN_MESSAGE,
-    MAX_TOPIC_RULE_DESTINATIONS,
+    AWAITING_CONFIRMATION_REASON, CONFIRMATION_SENT_REASON, CONFIRMATION_UNDELIVERED_REASON,
+    DESTINATION_DELETING, DESTINATION_DISABLED, DESTINATION_ENABLED, DESTINATION_ERROR,
+    DESTINATION_IN_PROGRESS, INVALID_CONFIRMATION_TOKEN_MESSAGE, MAX_TOPIC_RULE_DESTINATIONS,
 };
 
 // What a BULK THING PROVISIONING task does — the thing each line of its input file

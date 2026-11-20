@@ -13,8 +13,9 @@
 //! create persisted, and returns a continuation token only when records remain, which
 //! resumes that same listing exactly once; the listing writes nothing. Here that means
 //! `ListCertificates` reports every certificate of the account as the modelled
-//! `Certificate` — `certificateArn`, `certificateId`, `status`, `certificateMode` and
-//! `creationDate`, and no certificate material — ordered by creation date, ascending
+//! `Certificate` — `certificateArn`, `certificateId`, `status`, `creationDate` and, only
+//! for a certificate whose mode is not the default one, `certificateMode` — and no
+//! certificate material — ordered by creation date, ascending
 //! when `ascendingOrder` is true and descending otherwise
 //! (`smithy_query(query="operation",operation="ListCertificates")`), with at most
 //! `pageSize` entries per page and the documented default page size of 25 when the
@@ -27,12 +28,15 @@
 //! the store from none upward, and the statuses the stored records carry.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::Value;
 use service_com_amazonaws_iot_awsiotservice::state::{
-    CERTIFICATE_MODE_DEFAULT, CERTIFICATE_STATUS_ACTIVE, CERTIFICATE_STATUS_INACTIVE,
-    DEFAULT_CERTIFICATE_PAGE_SIZE, MAX_LIST_PAGE_SIZE,
+    certificate_arn, service_state, RegisteredCertificate, CERTIFICATE_MODE_DEFAULT,
+    CERTIFICATE_STATUS_ACTIVE, CERTIFICATE_STATUS_INACTIVE, DEFAULT_CERTIFICATE_PAGE_SIZE,
+    FIRST_CERTIFICATE_CUSTOMER_VERSION, MAX_LIST_PAGE_SIZE,
 };
+use service_com_amazonaws_iot_awsiotservice::state::ca_certificates::CERTIFICATE_MODE_SNI_ONLY;
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -110,9 +114,11 @@ struct Issued {
 }
 
 /// The emulator under test: ONE shared engine with the IoT service mounted on it,
-/// reached the way the production router reaches it.
+/// reached the way the production router reaches it. The engine is kept so a case can
+/// record a certificate whose mode no implemented operation mints.
 struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -120,8 +126,8 @@ impl Emulator {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
     }
 
     async fn call(&self, method: &str, path: &str) -> Reply {
@@ -199,6 +205,38 @@ impl Emulator {
     async fn describe(&self, certificate_id: &str) -> Reply {
         self.call("GET", &format!("/certificates/{certificate_id}"))
             .await
+    }
+
+    /// Record one certificate in the account's store directly, in `mode`.
+    ///
+    /// It is the only way to hold a certificate whose `certificateMode` is not the one
+    /// `CreateKeysAndCertificate` resolves for what it generates: the operations that
+    /// register a certificate of the caller's own in another mode are still scaffolds, so
+    /// no wire path writes such a record yet.
+    fn record_certificate_in_mode(&self, index: usize, mode: &str, now: SystemTime) -> String {
+        // A `certificateId` is `length 64..64, pattern ^(0x)?[a-fA-F0-9]+$`
+        // (`smithy_query(query="operation",operation="DescribeCertificate")`), so the
+        // index is rendered as hex and padded to the one length the model admits.
+        let certificate_id = format!("{:0>64}", format!("{index:x}"));
+        let state = service_state(&*self.engine).expect("the IoT state store");
+        state.lock().certificates.insert(
+            certificate_id.clone(),
+            RegisteredCertificate {
+                certificate_id: certificate_id.clone(),
+                certificate_arn: certificate_arn(REGION, &certificate_id),
+                certificate_pem: String::new(),
+                status: CERTIFICATE_STATUS_ACTIVE.to_string(),
+                owned_by: ACCOUNT_ID.to_string(),
+                creation_date: now,
+                last_modified_date: now,
+                customer_version: FIRST_CERTIFICATE_CUSTOMER_VERSION,
+                generation_id: format!("recorded-in-{mode}"),
+                not_before: now,
+                not_after: now,
+                certificate_mode: mode.to_string(),
+            },
+        );
+        certificate_id
     }
 
     /// `ListCertificates`: `GET /certificates`, with every input member bound as an
@@ -407,9 +445,10 @@ async fn each_entry_is_the_stored_record_and_carries_no_certificate_material() {
             issued.status
         );
         assert_eq!(
-            entry.get("certificateMode").and_then(Value::as_str),
-            Some(CERTIFICATE_MODE_DEFAULT),
-            "case {label:?}: a service-generated certificate is in DEFAULT mode, got {entry:?}"
+            entry.get("certificateMode"),
+            None,
+            "case {label:?}: a certificate in the default mode has no mode to report in a \
+             listing, got {entry:?}"
         );
         assert_eq!(
             entry.get("creationDate").and_then(Value::as_f64),
@@ -636,6 +675,84 @@ async fn listing_certificates_changes_nothing_a_later_caller_sees() {
                 .and_then(Value::as_f64),
             Some(issued.creation_date),
             "case {label:?}: a listing must not re-time the certificate, got {read:?}"
+        );
+    }
+}
+
+/// RULE: a listing reports a certificate's `certificateMode` only where the certificate
+/// is in a mode a registration had to ask for — `SNI_ONLY`, the mode of a certificate
+/// "registered without an issuer CA", whose devices "must send the SNI extension when
+/// connecting" — and reports no mode at all for one in `DEFAULT` mode, whose devices
+/// "aren't required to send" it and which is what a certificate IoT generated itself is
+/// (`smithy_query(query="shape",shape="Certificate")`, member `certificateMode`). The
+/// single-certificate reader is the other way round: its contract is the whole record, so
+/// it reports the stored mode whichever one it is.
+#[tokio::test]
+async fn a_listing_reports_a_certificate_mode_only_where_it_is_not_the_default_mode() {
+    let emulator = Emulator::new();
+    let now = SystemTime::now();
+    let generated = emulator.issue(true).await.certificate_id;
+
+    // The rows span the modes a stored certificate can be in
+    // (`smithy_query(query="shape",shape="CertificateMode")`: DEFAULT, SNI_ONLY), with the
+    // default mode in both the forms it is reached by — a certificate this service
+    // generated, and a record registered in that mode.
+    // (case, certificateId, the stored mode, the mode a listing reports)
+    let rows: [(&str, String, &str, Option<&str>); 3] = [
+        (
+            "a certificate this service generated",
+            generated,
+            CERTIFICATE_MODE_DEFAULT,
+            None,
+        ),
+        (
+            "a certificate registered in the default mode",
+            emulator.record_certificate_in_mode(1, CERTIFICATE_MODE_DEFAULT, now),
+            CERTIFICATE_MODE_DEFAULT,
+            None,
+        ),
+        (
+            "a certificate registered without an issuer CA",
+            emulator.record_certificate_in_mode(2, CERTIFICATE_MODE_SNI_ONLY, now),
+            CERTIFICATE_MODE_SNI_ONLY,
+            Some(CERTIFICATE_MODE_SNI_ONLY),
+        ),
+    ];
+
+    let page = emulator
+        .list(Order::Ascending, Some(MAX_LIST_PAGE_SIZE), None)
+        .await;
+    assert_eq!(
+        page.status, 200,
+        "the listing must report every stored certificate, got {page:?}"
+    );
+    let entries = page
+        .certificates()
+        .unwrap_or_else(|| panic!("the listing must report a certificates list, got {page:?}"))
+        .clone();
+
+    for (case, certificate_id, stored_mode, listed_mode) in &rows {
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                entry.get("certificateId").and_then(Value::as_str) == Some(certificate_id.as_str())
+            })
+            .unwrap_or_else(|| panic!("case {case:?}: the listing must report it, got {page:?}"));
+        assert_eq!(
+            entry.get("certificateMode").and_then(Value::as_str),
+            *listed_mode,
+            "case {case:?}: expected the listing to report certificateMode \
+             {listed_mode:?}, got {entry:?}"
+        );
+        let read = emulator.describe(certificate_id).await;
+        assert_eq!(
+            read.body
+                .get("certificateDescription")
+                .and_then(|description| description.get("certificateMode"))
+                .and_then(Value::as_str),
+            Some(*stored_mode),
+            "case {case:?}: expected the reader of one certificate to report the stored \
+             mode {stored_mode:?}, got {read:?}"
         );
     }
 }

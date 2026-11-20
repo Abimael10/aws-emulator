@@ -1025,7 +1025,10 @@ async fn the_listing_reports_the_configurations_the_account_holds() {
     for (service_type, created) in [
         ("DATA", vec!["data-custom", "data-managed"]),
         ("JOBS", vec!["jobs-managed"]),
-        ("CREDENTIAL_PROVIDER", vec!["credentials-managed"]),
+        (
+            "CREDENTIAL_PROVIDER",
+            vec!["credentials-managed"],
+        ),
     ] {
         let mut expected: Vec<&str> = RESERVED
             .iter()
