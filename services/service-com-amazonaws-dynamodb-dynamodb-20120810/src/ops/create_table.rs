@@ -1659,6 +1659,10 @@ pub(crate) fn validated_index_key_schema(
 /// ProjectionType of INCLUDE" (`Projection$ProjectionType` /
 /// `Projection$NonKeyAttributes`).
 ///
+/// A projection that states NO type states no value of that enum, so it describes an index
+/// the service cannot build and the whole declaration is refused
+/// ([`UNKNOWN_PROJECTION_TYPE_MESSAGE`]) — there is no type the member falls back to.
+///
 /// So the member pair is checked BOTH ways: a projection that names non-key attributes
 /// under another type projects something no type projects, and an `INCLUDE` projection
 /// that names none states which attributes are projected nowhere. Either way the index
@@ -1667,11 +1671,17 @@ pub(crate) fn validated_projection(
     index_name: &str,
     projection: &Projection,
 ) -> Result<(), crate::state::RequestError> {
-    let projection_type = projection.projection_type.as_deref().unwrap_or("ALL");
-    if !matches!(projection_type, "ALL" | "KEYS_ONLY" | "INCLUDE") {
+    // A projection that states no type states nothing the enum names, so there is no
+    // projection to build: AWS reports the value it could not place, and the value a
+    // request left out — or sent as JSON `null` — reads as `null`
+    // ([`UNKNOWN_PROJECTION_TYPE_VALUE`]).
+    let projection_type = projection
+        .projection_type
+        .as_deref()
+        .unwrap_or(UNKNOWN_PROJECTION_TYPE_VALUE);
+    if !PROJECTION_TYPE_VALUES.contains(&projection_type) {
         return Err(crate::state::RequestError::Validation(format!(
-            "Invalid Projection for index {index_name}: ProjectionType {projection_type} must be \
-             ALL, KEYS_ONLY or INCLUDE"
+            "{UNKNOWN_PROJECTION_TYPE_MESSAGE}{projection_type}"
         )));
     }
     let non_key = projection
@@ -1691,6 +1701,20 @@ pub(crate) fn validated_projection(
     }
     Ok(())
 }
+
+/// AWS's fixed text for a projection whose `ProjectionType` is not one of the enum's
+/// values, with the value the request carried appended after it.
+///
+/// `Projection$ProjectionType` targets the `ProjectionType` enum, whose value set is
+/// [`PROJECTION_TYPE_VALUES`] (ALL, KEYS_ONLY, INCLUDE); a projection that names none of
+/// them describes an index the service cannot build, so no table is created for it.
+pub(crate) const UNKNOWN_PROJECTION_TYPE_MESSAGE: &str =
+    "One or more parameter values were invalid: Unknown ProjectionType: ";
+
+/// How that refusal reports a `ProjectionType` the request did not state: an absent member
+/// and a JSON `null` are one and the same value to a reader of the request, and `null` is
+/// what AWS names it.
+pub(crate) const UNKNOWN_PROJECTION_TYPE_VALUE: &str = "null";
 
 /// AWS's fixed text for an `INCLUDE` projection that names no `NonKeyAttributes`: the
 /// whole sentence is fixed, naming the two members rather than the index — the pair is

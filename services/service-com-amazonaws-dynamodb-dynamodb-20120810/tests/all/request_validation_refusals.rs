@@ -115,14 +115,22 @@ async fn a_projection_of_include_names_the_attributes_it_projects() {
         }
     }
 
-    // A projection with no type at all defaults to ALL ("When using the DynamoDB
-    // console, ALL is selected by default"), so it needs no attribute list.
-    ok(
+    // A projection with no type at all states nothing the `ProjectionType` enum names, so
+    // there is no index for the service to build and the create is refused: the whole set
+    // of inputs that rule covers is in
+    // `tests/all/secondary_index_projection_type_admission.rs`.
+    let case = "a projection with no ProjectionType";
+    let stated = refusal(
         &router,
+        case,
         "CreateTable",
         create_with_index_projection("proj-default", json!({})),
     )
     .await;
+    assert_eq!(
+        stated, "One or more parameter values were invalid: Unknown ProjectionType: null",
+        "case {case:?}: expected the unknown-projection-type sentence, got {stated:?}"
+    );
 
     // The same rule for a LOCAL secondary index, which carries the same `Projection`.
     let case = "a local secondary index projecting INCLUDE with no attributes";

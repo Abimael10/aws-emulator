@@ -256,11 +256,15 @@ async fn an_update_moves_the_series_to_the_capacity_the_table_now_reports() {
          got {twin:?}"
     );
 
-    let described = update(&router, provisioned, Some((1, 4))).await;
-    let reported = described["TableDescription"]["ProvisionedThroughput"]["WriteCapacityUnits"]
+    update(&router, provisioned, Some((1, 4))).await;
+    // The figure the series must reach is the one the move left IN FORCE, which is what a
+    // read of the settled table reports: `UpdateTable`'s own answer reports the capacity
+    // the table was still serving while the move it started was in flight.
+    let described = describe_when_active(&router, case, provisioned).await;
+    let reported = described["ProvisionedThroughput"]["WriteCapacityUnits"]
         .as_f64()
         .unwrap_or_else(|| {
-            panic!("case {case:?}: UpdateTable reported no write capacity in {described}")
+            panic!("case {case:?}: the settled table reported no write capacity in {described}")
         });
     let carried = carried_values(&router, PROVISIONED_WRITE, provisioned, None).await;
     let highest = carried

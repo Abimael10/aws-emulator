@@ -734,6 +734,9 @@ async fn a_capacity_move_raises_the_warm_pair_it_cannot_lower_and_stamps_the_inc
         // far has raised it: that, and nothing about the request's wording, is what
         // decides whether the increase is stamped.
         let mut before = row.created_capacity.unwrap_or((0, 0));
+        // The warm pair in force as each move starts, which is what that move's own answer
+        // reports beside the capacity.
+        let mut warm_in_force = row.created_warm;
         let mut increased = false;
         for step in row.moves {
             let mut update = json!({"TableName": row.name});
@@ -745,25 +748,30 @@ async fn a_capacity_move_raises_the_warm_pair_it_cannot_lower_and_stamps_the_inc
                     json!({"ReadCapacityUnits": read, "WriteCapacityUnits": write});
             }
             let updated = ok(&router, "UpdateTable", update).await;
-            increased |= step.reported.0 > before.0 || step.reported.1 > before.1;
-            before = step.reported;
 
+            // The move is asynchronous, so its own answer reports the capacity and the
+            // warm pair the table is STILL serving.
             let description = &updated["TableDescription"];
             assert_eq!(
+                (reported_capacity(description), reported_warm(description)),
                 (
-                    reported_capacity(description),
-                    reported_warm(description),
-                    stamped_increase(description),
+                    (json!(before.0), json!(before.1)),
+                    (json!(warm_in_force.0), json!(warm_in_force.1)),
                 ),
-                (
-                    (json!(step.reported.0), json!(step.reported.1)),
-                    (json!(step.warm.0), json!(step.warm.1)),
-                    increased,
-                ),
-                "case {case:?}: expected capacity {:?}, {:?} kept warm and an increase \
-                 stamped={increased} after the move to {:?}, got {description}",
-                step.reported,
-                step.warm,
+                "case {case:?}: expected the answer to the move to {:?} to report the capacity \
+                 {before:?} and the pair {warm_in_force:?} still in force, got {description}",
+                step.capacity
+            );
+            increased |= step.reported.0 > before.0 || step.reported.1 > before.1;
+            before = step.reported;
+            warm_in_force = step.warm;
+            // The instant of the last increase is stamped when the move is ACCEPTED, so
+            // this answer already carries it.
+            assert_eq!(
+                stamped_increase(description),
+                increased,
+                "case {case:?}: expected an increase stamped={increased} on the answer to the \
+                 move to {:?}, got {description}",
                 step.capacity
             );
 

@@ -382,12 +382,13 @@ async fn last_update_to_pay_per_request_records_when_on_demand_was_last_set() {
     );
     assert_eq!(
         switched["TableDescription"]["ProvisionedThroughput"]["ReadCapacityUnits"],
-        json!(0),
-        "case \"switched to on-demand\": an on-demand table reports no provisioned \
-         capacity, got {switched}"
+        json!(5),
+        "case \"switched to on-demand\": the switch is asynchronous, so its own answer still \
+         reports the capacity in force, got {switched}"
     );
-    // The reported capacity went from 5/5 to 0/0: the last time it went down is now,
-    // while the day's COUNTED decreases (the documented daily allowance) stay unspent.
+    // The reported capacity goes from 5/5 to 0/0: the last time it went down is now —
+    // stamped when the move was accepted, so this answer carries it — while the day's
+    // COUNTED decreases (the documented daily allowance) stay unspent.
     let throughput = &switched["TableDescription"]["ProvisionedThroughput"];
     assert_eq!(
         throughput["NumberOfDecreasesToday"],
@@ -402,7 +403,9 @@ async fn last_update_to_pay_per_request_records_when_on_demand_was_last_set() {
             .is_some_and(|instant| instant > 0.0),
         "case \"switched to on-demand\": expected LastDecreaseDateTime, got {throughput}"
     );
-    // An index's capacity is withdrawn with the table's, and reads the same way.
+    // An index's capacity is withdrawn with the table's, and reads the same way: its own
+    // pair is the one still in force while the switch settles, beside the instant the
+    // withdrawal was stamped at.
     let index = &switched["TableDescription"]["GlobalSecondaryIndexes"][0];
     assert_eq!(
         (
@@ -410,9 +413,9 @@ async fn last_update_to_pay_per_request_records_when_on_demand_was_last_set() {
             index["ProvisionedThroughput"]["WriteCapacityUnits"].clone(),
             index["ProvisionedThroughput"]["NumberOfDecreasesToday"].clone(),
         ),
-        (json!(0), json!(0), json!(0)),
-        "case \"switched to on-demand\": an on-demand index reports no provisioned \
-         capacity and no counted decrease, got {index}"
+        (json!(3), json!(2), json!(0)),
+        "case \"switched to on-demand\": an index reports the capacity it is still serving \
+         and no counted decrease, got {index}"
     );
     assert!(
         index["ProvisionedThroughput"]
@@ -423,6 +426,22 @@ async fn last_update_to_pay_per_request_records_when_on_demand_was_last_set() {
          {index}"
     );
     wait_out_transition();
+
+    // Once the switch has settled, the on-demand table and its index report no provisioned
+    // capacity at all: "on-demand mode does not use provisioned throughput".
+    let settled = ok(&router, "DescribeTable", json!({"TableName": "ModeSwitch"})).await;
+    assert_eq!(
+        (
+            settled["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
+            settled["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"].clone(),
+            settled["Table"]["GlobalSecondaryIndexes"][0]["ProvisionedThroughput"]
+                ["ReadCapacityUnits"]
+                .clone(),
+        ),
+        (json!(0), json!(0), json!(0)),
+        "case \"switched to on-demand\": the settled table and its index report no \
+         provisioned capacity, got {settled}"
+    );
 
     // Every later description reports the same instant.
     let on_demand = ok(&router, "DescribeTable", json!({"TableName": "ModeSwitch"})).await;
@@ -570,6 +589,9 @@ async fn number_of_decreases_today_counts_the_decreases_applied_today() {
     .await;
     wait_out_transition();
 
+    // How many of the day's decreases had been APPLIED when each move was accepted, which
+    // is what that move's own answer reports: a decrease counts once it has taken effect.
+    let mut applied_decreases = 0;
     for step in CAPACITY_MOVES {
         let case = step.case;
         let updated = ok(
@@ -586,9 +608,9 @@ async fn number_of_decreases_today_counts_the_decreases_applied_today() {
         let throughput = &updated["TableDescription"]["ProvisionedThroughput"];
         assert_eq!(
             throughput["NumberOfDecreasesToday"],
-            json!(step.decreases),
-            "case {case:?}: expected {} decreases applied today, got {throughput}",
-            step.decreases
+            json!(applied_decreases),
+            "case {case:?}: expected the {applied_decreases} decreases applied so far, got \
+             {throughput}"
         );
         assert_eq!(
             throughput
@@ -609,13 +631,20 @@ async fn number_of_decreases_today_counts_the_decreases_applied_today() {
             step.increased
         );
 
-        // The same figures come back from a plain read of the stored table.
+        // The same figures come back from a plain read of the stored table, which is where
+        // the decrease this move made is counted.
         wait_out_transition();
+        applied_decreases = step.decreases;
         let described = ok(&router, "DescribeTable", json!({"TableName": "Capacity"})).await;
         assert_eq!(
-            described["Table"]["ProvisionedThroughput"]["NumberOfDecreasesToday"],
-            json!(step.decreases),
-            "case {case:?}: DescribeTable reports the same count, got {described}"
+            (
+                described["Table"]["ProvisionedThroughput"]["NumberOfDecreasesToday"].clone(),
+                described["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
+                described["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"].clone(),
+            ),
+            (json!(step.decreases), json!(step.read), json!(step.write)),
+            "case {case:?}: DescribeTable reports the count and the capacity the move left, \
+             got {described}"
         );
     }
 }
@@ -637,7 +666,7 @@ async fn warm_throughput_reports_the_pair_in_force_and_its_own_status() {
     wait_out_transition();
 
     // A change is in flight for the span the clock owes it, so the SETTING is UPDATING
-    // while the new pair is already what the table reports.
+    // while the pair the table reports is still the one in force.
     let updated = ok(
         &router,
         "UpdateTable",
@@ -654,9 +683,13 @@ async fn warm_throughput_reports_the_pair_in_force_and_its_own_status() {
             warm["WriteUnitsPerSecond"].clone(),
             warm["Status"].clone(),
         ),
-        (json!(48_000), json!(16_000), json!("UPDATING")),
-        "case \"a warm throughput change in flight\": expected the new pair, UPDATING, \
-         got {updated}"
+        (
+            json!(DEFAULT_WARM_READ_UNITS_PER_SECOND),
+            json!(DEFAULT_WARM_WRITE_UNITS_PER_SECOND),
+            json!("UPDATING"),
+        ),
+        "case \"a warm throughput change in flight\": expected the pair still in force, \
+         UPDATING, got {updated}"
     );
 
     wait_out_transition();
@@ -741,15 +774,23 @@ async fn warm_throughput_reports_the_pair_in_force_and_its_own_status() {
         )
         .await;
         assert_eq!(
+            accepted["TableDescription"]["WarmThroughput"]["Status"],
+            json!("UPDATING"),
+            "case {case:?}: expected the setting reported UPDATING while the change is in \
+             flight, got {accepted}"
+        );
+        wait_out_transition();
+        // The pair the request named is what the settled table keeps warm.
+        let described = ok(&router, "DescribeTable", json!({"TableName": "Warm"})).await;
+        assert_eq!(
             (
-                accepted["TableDescription"]["WarmThroughput"]["ReadUnitsPerSecond"].clone(),
-                accepted["TableDescription"]["WarmThroughput"]["WriteUnitsPerSecond"].clone(),
+                described["Table"]["WarmThroughput"]["ReadUnitsPerSecond"].clone(),
+                described["Table"]["WarmThroughput"]["WriteUnitsPerSecond"].clone(),
             ),
             (json!(read), json!(write)),
             "case {case:?}: expected the requested pair to be stored and reported, got \
-             {accepted}"
+             {described}"
         );
-        wait_out_transition();
     }
 }
 

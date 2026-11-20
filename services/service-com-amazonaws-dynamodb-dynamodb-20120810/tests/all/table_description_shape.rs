@@ -424,16 +424,35 @@ async fn a_capacity_change_moves_the_warm_throughput_nobody_named() {
     )
     .await;
     let description = &updated["TableDescription"];
+    // The move is asynchronous, so its own answer reports the pair each resource is still
+    // keeping warm — the capacity it was provisioned for before the call.
     assert_eq!(
         description["WarmThroughput"],
-        expected_warm((9, 6)),
-        "case \"capacity raised\": expected the table to keep its new capacity warm, \
+        expected_warm((2, 2)),
+        "case \"capacity raised\": expected the table to report the pair still in force, \
          got {description}"
     );
     assert_eq!(
         index_named(description, "by-gsi_pk")["WarmThroughput"],
+        expected_warm((2, 2)),
+        "case \"capacity raised\": expected the index to report the pair still in force, \
+         got {description}"
+    );
+
+    // Once the move has settled, each resource keeps the capacity it was given warm.
+    wait_until_active(&router, "warm_moving").await;
+    let described = ok(&router, "DescribeTable", json!({"TableName": "warm_moving"})).await;
+    let table = &described["Table"];
+    assert_eq!(
+        table["WarmThroughput"],
+        expected_warm((9, 6)),
+        "case \"capacity raised\": expected the table to keep its new capacity warm, \
+         got {described}"
+    );
+    assert_eq!(
+        index_named(table, "by-gsi_pk")["WarmThroughput"],
         expected_warm((8, 4)),
         "case \"capacity raised\": expected the index to keep its new capacity warm, \
-         got {description}"
+         got {described}"
     );
 }

@@ -21,6 +21,15 @@
 //! moment the call returns, which is what `DescribeTable` and the capacity accounting
 //! report.
 //!
+//! The `TableDescription` this call ANSWERS with is a description of the table, so every
+//! capacity figure it carries is the one the table is serving at the instant the call
+//! returns: an asynchronous move has not happened yet, so the response reports the
+//! `ProvisionedThroughput` and the warm pair still in force — the table's own and each
+//! index's — and a `NumberOfDecreasesToday` that does not yet count the decrease just
+//! accepted ([`crate::state::CapacityInForce`]). The pair's `Status` beside those figures
+//! is the move's own `UPDATING`, and a later read is what reports the figures the move
+//! left.
+//!
 //! A request that names NO updatable member at all is refused as a `ValidationException`
 //! before any of that: it is permanently invalid rather than a transient conflict. So is
 //! an on-demand capacity ceiling named for a table the update leaves in the PROVISIONED
@@ -418,6 +427,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let stored_billing_mode = stored.billing_mode.clone();
         let stored_encryption = stored.encryption.clone();
+        // The capacity the table is SERVING at the instant this call arrives, kept for the
+        // description the call answers with: a capacity move is asynchronous, so what that
+        // description reports is the capacity in force rather than the one the request
+        // asks for ([`crate::state::CapacityInForce`]).
+        let capacity_in_force = crate::state::CapacityInForce::of(&stored.describe(now));
         match stored.status(now) {
             crate::state::TableStatus::Active => {}
             crate::state::TableStatus::Creating => {
@@ -766,7 +780,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The description answers from the stored table, read back after every write this
         // update made — including the ones the replica actions made to it.
-        let description = store.table(&region, &name).map_err(lift)?.describe(now);
+        let mut description = store.table(&region, &name).map_err(lift)?.describe(now);
+        // Every capacity figure in it is the one the table is SERVING: the move this call
+        // started outlives the call, so its figures are what the reads after it report and
+        // this response carries the generation still in force
+        // ([`crate::state::CapacityInForce::restate`]).
+        capacity_in_force.restate(&mut description);
         // The audit record for a state-changing call: who asked, what the table carries
         // after the change and that it succeeded. Never a credential — only the access
         // key id the caller presented.

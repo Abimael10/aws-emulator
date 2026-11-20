@@ -450,6 +450,8 @@ async fn a_withdrawn_provisioned_capacity_leaves_the_warm_throughput_it_kept_in_
         )
         .await;
         let description = &switched["TableDescription"];
+        // The switch is asynchronous, so its own answer reports the capacity each resource
+        // is still provisioned for.
         assert_eq!(
             (
                 description["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
@@ -458,9 +460,13 @@ async fn a_withdrawn_provisioned_capacity_leaves_the_warm_throughput_it_kept_in_
                     ["ReadCapacityUnits"]
                     .clone(),
             ),
-            (json!(0), json!(0), json!(0)),
-            "case {case:?}: expected the on-demand switch to withdraw every provisioned \
-             capacity, got {description}"
+            (
+                json!(row.table_capacity.0),
+                json!(row.table_capacity.1),
+                json!(row.index_capacity.0),
+            ),
+            "case {case:?}: expected the switch to report the capacity still in force, got \
+             {description}"
         );
         assert_warm(
             case,
@@ -471,9 +477,23 @@ async fn a_withdrawn_provisioned_capacity_leaves_the_warm_throughput_it_kept_in_
         );
         wait_out_transition();
 
-        // Read back through DescribeTable: the pairs are stored, not an artefact of the
-        // response the switch wrote.
+        // Read back through DescribeTable: the switch withdrew the provisioned capacity of
+        // the table and of its index — both report zero capacity from here on — and left
+        // what each was keeping warm exactly as it was. The pairs are stored, not an
+        // artefact of the response the switch wrote.
         let described = ok(&router, "DescribeTable", json!({"TableName": row.name})).await;
+        assert_eq!(
+            (
+                described["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
+                described["Table"]["ProvisionedThroughput"]["WriteCapacityUnits"].clone(),
+                index_named(&described["Table"], "by-gsi_pk")["ProvisionedThroughput"]
+                    ["ReadCapacityUnits"]
+                    .clone(),
+            ),
+            (json!(0), json!(0), json!(0)),
+            "case {case:?}: expected the settled on-demand table to report no provisioned \
+             capacity at either level, got {described}"
+        );
         assert_warm(
             case,
             "DescribeTable",
@@ -509,14 +529,24 @@ async fn a_withdrawn_provisioned_capacity_leaves_the_warm_throughput_it_kept_in_
             }),
         )
         .await;
+        // The restoring move is asynchronous too, so its answer reports the pair each
+        // resource is still keeping warm; the move raises it once it has settled.
         assert_warm(
             case,
             "the restoring UpdateTable",
             &restored["TableDescription"],
+            row.table_warm,
+            row.index_warm,
+        );
+        wait_out_transition();
+        let described = ok(&router, "DescribeTable", json!({"TableName": row.name})).await;
+        assert_warm(
+            case,
+            "DescribeTable after the restore",
+            &described["Table"],
             row.restored_table_warm,
             row.restored_index_warm,
         );
-        wait_out_transition();
 
         // And the delete echo projects the same stored table one last time.
         let deleted = ok(&router, "DeleteTable", json!({"TableName": row.name})).await;

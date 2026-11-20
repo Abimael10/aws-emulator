@@ -573,6 +573,9 @@ async fn update_table_moves_the_capacity_it_is_given() {
         ("read up and write down", 40, 2, 2),
         ("back to the starting capacity", 10, 10, 3),
     ];
+    // The capacity the table is serving as each row starts, which is what that row's
+    // `UpdateTable` answer reports: the move it starts is asynchronous.
+    let mut in_force = (10, 10);
     for (case, read, write, decreases_today) in cases {
         let updated = ok(
             &router,
@@ -599,8 +602,9 @@ async fn update_table_moves_the_capacity_it_is_given() {
                 description["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
                 description["ProvisionedThroughput"]["WriteCapacityUnits"].clone(),
             ),
-            (json!(read), json!(write)),
-            "case {case}: the new capacity is in effect from the call, got {updated}"
+            (json!(in_force.0), json!(in_force.1)),
+            "case {case}: the answer reports the capacity still in force while the move it \
+             started settles, got {updated}"
         );
 
         // A second UpdateTable inside the span is refused: "While it's UPDATING, you
@@ -638,6 +642,7 @@ async fn update_table_moves_the_capacity_it_is_given() {
             "case {case}: NumberOfDecreasesToday counts the decreases applied today, got \
              {described}"
         );
+        in_force = (read, write);
     }
 
     // An index's capacity moves on its own: "New provisioned throughput parameters for
@@ -676,8 +681,10 @@ async fn update_table_moves_the_capacity_it_is_given() {
             index["ProvisionedThroughput"]["WriteCapacityUnits"].clone(),
             index["IndexStatus"].clone(),
         ),
-        (json!(77), json!(88), json!("UPDATING")),
-        "case index-only update: the index moves and is reported UPDATING, got {updated}"
+        // Nothing has moved the index since it was created, so 10/10 is what it serves.
+        (json!(10), json!(10), json!("UPDATING")),
+        "case index-only update: the index is reported UPDATING at the capacity it is still \
+         serving, got {updated}"
     );
     let described = wait_until_active(&router, region, "Capacity").await;
     let index = index_named(&described["Table"], "ByOwner");
@@ -882,23 +889,35 @@ async fn update_table_moves_the_capacity_it_is_given() {
         json!("PAY_PER_REQUEST"),
         "case billing-mode switch: the new mode is reported, got {updated}"
     );
+    // The withdrawal is asynchronous, so the switch's own answer still reports the capacity
+    // the table and its index are serving; the settled table reports none.
     assert_eq!(
-        description["ProvisionedThroughput"]["ReadCapacityUnits"],
+        (
+            description["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
+            index_named(description, "ByKind")["ProvisionedThroughput"]["WriteCapacityUnits"]
+                .clone(),
+        ),
+        (json!(10), json!(2)),
+        "case billing-mode switch: the answer reports the capacity still in force, got \
+         {updated}"
+    );
+    let settled = wait_until_active(&router, region, "Capacity").await;
+    assert_eq!(
+        settled["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"],
         json!(0),
         "case billing-mode switch: an on-demand table reports zero provisioned read \
-         capacity, got {updated}"
+         capacity, got {settled}"
     );
     assert_eq!(
-        index_named(description, "ByKind")["ProvisionedThroughput"]["WriteCapacityUnits"],
+        index_named(&settled["Table"], "ByKind")["ProvisionedThroughput"]["WriteCapacityUnits"],
         json!(0),
-        "case billing-mode switch: its indexes report zero too, got {updated}"
+        "case billing-mode switch: its indexes report zero too, got {settled}"
     );
 
     // Switching BACK needs initial capacity for the table AND for every index — "When
     // switching from pay-per-request to provisioned capacity, initial provisioned
     // capacity values must be set" — so a switch that names only the table's is refused
     // naming the index that has none.
-    wait_until_active(&router, region, "Capacity").await;
     let (status, parsed) = call(
         &router,
         region,
@@ -936,15 +955,29 @@ async fn update_table_moves_the_capacity_it_is_given() {
     )
     .await;
     let description = &updated["TableDescription"];
+    // The restore is asynchronous too: the answer reports the zeroes the on-demand table
+    // was still serving, and the capacity it sets is what the settled table reports.
     assert_eq!(
         (
             description["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
             index_named(description, "ByKind")["ProvisionedThroughput"]["ReadCapacityUnits"]
                 .clone(),
         ),
+        (json!(0), json!(0)),
+        "case switch back with index capacity: the answer reports the capacity still in \
+         force, got {updated}"
+    );
+    let settled = wait_until_active(&router, region, "Capacity").await;
+    assert_eq!(
+        (
+            settled["Table"]["ProvisionedThroughput"]["ReadCapacityUnits"].clone(),
+            index_named(&settled["Table"], "ByKind")["ProvisionedThroughput"]
+                ["ReadCapacityUnits"]
+                .clone(),
+        ),
         (json!(3), json!(6)),
         "case switch back with index capacity: the table and the index report the \
-         capacity the switch set, got {updated}"
+         capacity the switch set, got {settled}"
     );
 }
 

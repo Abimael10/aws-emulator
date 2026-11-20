@@ -4831,6 +4831,13 @@ pub use addressing::*;
 mod index_backfill;
 pub use index_backfill::*;
 
+/// Which GENERATION of a table's capacity figures the description an ASYNCHRONOUS capacity
+/// move answers with carries, in its own file: it is about one description's figures rather
+/// than about what the store holds. Re-exported below, so every caller still names it
+/// `crate::state::…`.
+mod async_capacity;
+pub use async_capacity::*;
+
 /// How the VECTOR-INDEX declarations one request carries are refused — more of them than a
 /// table may carry, a search-schema element nothing declares, and two of them disagreeing
 /// about one vector attribute's dimensions — in its own file, because all three are facts
