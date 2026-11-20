@@ -5,13 +5,13 @@
 //! Sets the provisioned request rate this account holds for the API category a
 //! limit definition identifies, and reports the limit as it now stands.
 //!
-//! The request has to ADJUST the limit, to a rate within the account's range:
-//! at least the rate the category includes at no additional cost, at most the
-//! account's maximum. Every rate in that range that differs from the rate in
-//! force is stored; re-requesting the rate a read just reported adjusts
-//! nothing and is refused as a bad parameter. A refused request stores
-//! nothing, so the limit a later read reports is the one that was already in
-//! force.
+//! Every rate within the account's range for the limit — at least the rate the
+//! category includes at no additional cost, at most the account's maximum — is
+//! stored and echoed back, including the rate a read of the limit just
+//! reported, so a caller can write the limit from the state it observed. Only a
+//! repeat of a rate this account already PROVISIONED adjusts nothing and is
+//! refused as a bad parameter. A refused request stores nothing, so the limit a
+//! later read reports is the one that was already in force.
 //!
 //! ## Shape of an operation
 //!
@@ -213,11 +213,13 @@ fn invalid_definition(failure: crate::state::LimitLookupFailure) -> UpdateProvis
 /// request exceeded your account's service quota. To increase your limit, use
 /// or submit a Service Quotas increase request" (this service's model).
 ///
-/// The other is a malformed PARAMETER — `InvalidParameterException`,
+/// The other two are malformed PARAMETERS — `InvalidParameterException`,
 /// "thrown when the Amazon Cognito service encounters an invalid parameter"
 /// (this service's model) — and nothing about the account: a rate below the
 /// rate the limit includes is under the bottom of the range this operation
-/// accepts.
+/// accepts, and a rate repeating one this account already provisioned asks
+/// this operation to set the provisioned limit to the value the account itself
+/// set, which adjusts nothing.
 fn refused(refusal: crate::state::RateRefusal) -> UpdateProvisionedLimitError {
     use crate::state::RateRefusal;
     let message = Some(refusal.message());
@@ -227,7 +229,7 @@ fn refused(refusal: crate::state::RateRefusal) -> UpdateProvisionedLimitError {
                 ServiceQuotaExceededException { message },
             )
         }
-        RateRefusal::BelowFreeRate { .. } => {
+        RateRefusal::AlreadyInForce | RateRefusal::BelowFreeRate { .. } => {
             UpdateProvisionedLimitErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message,
