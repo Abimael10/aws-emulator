@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What a RUNNING pipe does with the report its TARGET answers about the batch it was
-//! handed, end to end over the wire with pipes, Amazon SQS and Lambda mounted on ONE
-//! engine.
+//! Which records of a polled batch a RUNNING pipe is FINISHED with its source for, end to
+//! end over the wire with pipes, Amazon SQS and Lambda mounted on ONE engine.
 //!
-//! The RULE asserted over the table below: a target whose call answers a document of its own
+//! RULE 1, asserted over the first table below: a target whose call answers a document of its own
 //! reports which records of the batch it did NOT process — a `batchItemFailures` list naming
 //! each by the identifier its source names it by — and the pipe finishes the batch with its
 //! source only for the records that report leaves processed, so exactly the records the
@@ -13,10 +12,21 @@
 //! or every record of it) leaves nothing of the batch processed and the whole of it is handed
 //! over again.
 //!
-//! The rows differ along what the rule generalises over: how many records the batch holds,
+//! Its rows differ along what the rule generalises over: how many records the batch holds,
 //! which of them the report names (none, the first, the last, two of four, every one of
 //! them), whether the report also names an identifier that is no record of the batch, and
 //! the `BatchSize` the records are polled under.
+//!
+//! RULE 2, asserted over the second table: the same accounting one stage earlier. A record
+//! the pipe's ENRICHMENT could not handle is retained at its source — never deleted, so it
+//! is handed over again once its checkout lapses — and withheld from the target, while the
+//! records the enrichment DID handle are rendered and delivered to the target and finished
+//! with their source. So a batch holding one record the enrichment raises on delivers the
+//! rest of itself and retains that one record alone.
+//!
+//! Its rows differ along what that rule generalises over: which records of the batch the
+//! enrichment raises on (none, the one at its head, one in the middle, two of four, every one
+//! of them), how many records the batch holds and the `BatchSize` they are polled under.
 //!
 //! Nothing in this suite invokes the function and nothing receives from a source queue: the
 //! only data-plane calls a row makes are the `SendMessage`s that put its records on its own
@@ -37,7 +47,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::pipe_data_plane::{collect_during, sqs, LOOK_AGAIN};
+use crate::pipe_data_plane::{collect_at_least, collect_during, sqs, LOOK_AGAIN};
 use crate::pipe_lambda_target::{
     emulator, given_function, RESULT_QUEUE_VARIABLE as RESULT_QUEUE,
 };
@@ -477,6 +487,210 @@ async fn only_the_records_the_target_reported_are_handed_over_again() {
             left, 0,
             "case {case:?}: expected the source queue drained once every record had been \
              processed, it still holds {left}"
+        );
+    }
+}
+
+/// What a record's body carries to make the ENRICHMENT raise on the batch holding it rather
+/// than echo it.
+const POISON_MARKER: &str = "POISON";
+
+/// The environment variable the enrichment below reads that marker from. Not read by the
+/// emulator: it is the handler's own.
+const POISON_MARKER_VARIABLE: &str = "POISON_MARKER";
+
+/// The enrichment every row of the second table runs: handed a batch, it echoes the BODY of
+/// each record of it — so one message on the target queue is one record this enrichment
+/// handled — and raises instead, echoing nothing at all, as soon as the batch it was handed
+/// holds a record whose body carries [`POISON_MARKER`].
+///
+/// So a record the enrichment can handle is one it can only handle in a batch that holds no
+/// poisoned record, which is what makes the rule observable: a target message for a record is
+/// a record the enrichment was asked about on its own or beside other records it handles.
+fn enrichment_source() -> String {
+    format!(
+        r#"
+import os
+
+POISON_MARKER = os.environ["{POISON_MARKER_VARIABLE}"]
+
+
+def lambda_handler(event, context):
+    if not isinstance(event, list):
+        raise ValueError("a batch is handed over as a list, got " + type(event).__name__)
+    for record in event:
+        if POISON_MARKER in record["body"]:
+            raise ValueError("this record cannot be enriched: " + record["body"])
+    return [record["body"] for record in event]
+"#
+    )
+}
+
+/// One row of the enrichment-failure table.
+struct EnrichmentRow {
+    case: &'static str,
+    /// What each record of the row carries as a suffix of its body: the empty string for a
+    /// record the enrichment handles, [`POISON_MARKER`] for one it raises on.
+    records: &'static [&'static str],
+    /// `SourceParameters.SqsQueueParameters.BatchSize`.
+    batch_size: i64,
+}
+
+impl EnrichmentRow {
+    /// The body of each record this row sends: `<case>-<index>`, with the marker that makes
+    /// the enrichment raise appended for the poisoned ones. Distinct per row and per record,
+    /// so a delivery can be attributed to the record it carried.
+    fn bodies(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .enumerate()
+            .map(|(index, marker)| {
+                let case = self.case;
+                if marker.is_empty() {
+                    format!("{case}-{index}")
+                } else {
+                    format!("{case}-{index}-{marker}")
+                }
+            })
+            .collect()
+    }
+
+    /// The bodies the enrichment HANDLES, sorted: the ones the target must receive.
+    fn handled(&self) -> Vec<String> {
+        let mut handled: Vec<String> = self
+            .bodies()
+            .into_iter()
+            .filter(|body| !body.ends_with(POISON_MARKER))
+            .collect();
+        handled.sort();
+        handled
+    }
+
+    /// How many records the enrichment raises on: the ones that stay on the source.
+    fn retained(&self) -> i64 {
+        let retained = self
+            .records
+            .iter()
+            .filter(|marker| !marker.is_empty())
+            .count();
+        i64::try_from(retained).unwrap_or_default()
+    }
+}
+
+/// The `CreatePipe` body of one enrichment row: the row's queues, its `BatchSize` and the one
+/// enrichment every row shares.
+fn enrichment_pipe_body(
+    row: &EnrichmentRow,
+    source_arn: &str,
+    target_arn: &str,
+    enrichment: &str,
+) -> Value {
+    json!({
+        "Source": source_arn,
+        "Target": target_arn,
+        "Enrichment": enrichment,
+        "RoleArn": ROLE,
+        "DesiredState": "RUNNING",
+        "SourceParameters": {
+            "SqsQueueParameters": { "BatchSize": row.batch_size },
+        },
+    })
+}
+
+/// RULE: a record the pipe's ENRICHMENT could not handle is retained at its source and
+/// withheld from the target, while every record of the same batch the enrichment DID handle is
+/// delivered to the target and finished with that source — so a batch holding a poisoned
+/// record delivers the rest of itself and retains that record alone, and a batch holding
+/// nothing but poisoned records delivers nothing and retains all of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_records_an_enrichment_could_not_handle_are_retained_and_the_rest_delivered() {
+    let rows = [
+        EnrichmentRow {
+            case: "no-record-poisoned",
+            records: &["", "", ""],
+            batch_size: 10,
+        },
+        EnrichmentRow {
+            case: "one-poisoned-in-the-middle",
+            records: &["", POISON_MARKER, ""],
+            batch_size: 10,
+        },
+        EnrichmentRow {
+            case: "poisoned-at-the-head",
+            records: &[POISON_MARKER, ""],
+            batch_size: 10,
+        },
+        EnrichmentRow {
+            case: "two-poisoned-of-four",
+            records: &[POISON_MARKER, "", POISON_MARKER, ""],
+            batch_size: 10,
+        },
+        EnrichmentRow {
+            case: "every-record-poisoned",
+            records: &[POISON_MARKER, POISON_MARKER],
+            batch_size: 10,
+        },
+        EnrichmentRow {
+            case: "one-record-per-batch",
+            records: &[POISON_MARKER, ""],
+            batch_size: 1,
+        },
+    ];
+    let router = emulator();
+    // ONE enrichment serves every row: which records it raises on it reads off the record's
+    // own body, so a row differs only in what it sends and how it configures its pipe.
+    let enrichment = given_function(
+        &router,
+        "enrichment-failure",
+        "enrichment-raiser",
+        &enrichment_source(),
+        json!({ POISON_MARKER_VARIABLE: POISON_MARKER }),
+    )
+    .await;
+
+    for row in &rows {
+        let case = row.case;
+        let (source_url, source_arn) =
+            given_queue(&router, &format!("{case}-source"), SOURCE_VISIBILITY).await;
+        // The target holds what it is sent for the whole row, so a delivery this row has read
+        // can never come back and be counted twice.
+        let (target_url, target_arn) =
+            given_queue(&router, &format!("{case}-target"), RESULT_VISIBILITY).await;
+        send(&router, case, &source_url, &row.bodies()).await;
+
+        let created = create_pipe(
+            &router,
+            case,
+            enrichment_pipe_body(row, &source_arn, &target_arn, &enrichment),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: CreatePipe answered {} {}",
+            created.status, created.body
+        );
+
+        // Delivered: exactly the records the enrichment handled reach the target, each once —
+        // and nothing more, so a record it raised on is withheld rather than delayed.
+        let handled = row.handled();
+        let mut delivered = collect_at_least(&router, &target_url, handled.len(), BUDGET).await;
+        delivered.extend(collect_during(&router, &target_url, QUIET).await);
+        delivered.sort();
+        assert_eq!(
+            delivered, handled,
+            "case {case:?}: expected the records the enrichment handled {handled:?} on the \
+             target {target_arn}, got {delivered:?}"
+        );
+
+        // Retained: the records the enrichment could not handle are still the source's own —
+        // never deleted, so the queue hands each of them over again — and the ones it handled
+        // are gone from it.
+        let retained = row.retained();
+        let left = held(&router, &source_url, retained, BUDGET).await;
+        assert_eq!(
+            left, retained,
+            "case {case:?}: expected the {retained} record(s) the enrichment could not handle \
+             to be the only ones left on the source, it holds {left}"
         );
     }
 }

@@ -38,7 +38,11 @@
 //!   array of record envelopes, and what the enrichment RETURNS — not the source batch —
 //!   is what the target stage delivers. So an enrichment that collapses a batch into one
 //!   aggregate produces fewer target deliveries than there were source records, one that
-//!   returns several events produces more, and one that returns nothing produces none.
+//!   returns several events produces more, and one that returns nothing produces none. A
+//!   FAILURE of this stage is accounted per RECORD rather than per batch: a record the
+//!   enrichment could not handle is retained at its source and withheld from the target,
+//!   while the records it did handle go on to the target stage, so one record it raises on
+//!   costs that record alone ([`enrichment`]).
 //! * TARGET. How many calls the array handed to the target stage comes to is the TARGET's
 //!   own, never the pipe's: an Amazon SQS queue's `SendMessage` takes ONE payload per
 //!   call, and `PipeTargetSqsQueueParameters` carries only `MessageGroupId` and
@@ -95,11 +99,13 @@
 //! others: the records a receive handed over are hidden from every other consumer for the
 //! queue's own `VisibilityTimeout`, and when that span lapses they are visible again,
 //! their delivery count raised, for whoever receives them next. So a pipe that could not
-//! move a batch waits that checkout out before it reads the source again, and leaves the
-//! records it failed visible for a grace of their own ([`source_free_again`]): a pipe
-//! retrying a delivery it keeps failing paces its reads by that rather than by the
-//! interval a healthy pipe polls at, so the release of the records it is holding is
-//! something the other consumers of its source can see and act on.
+//! move a batch leaves the records it failed to the queue for a grace of their own once they
+//! come back ([`source_free_again`], [`leaves_source_alone`]): the release of the records it
+//! was holding is something the other consumers of its source can see and act on, rather than
+//! being re-claimed inside the interval a healthy pipe polls at. While that checkout lasts
+//! the queue is hiding those records from every consumer anyway, so the pipe goes on reading
+//! what the queue DOES offer: the records waiting behind a failure are not the ones it
+//! failed, and they are moved rather than held back with them.
 //!
 //! The poller is started by the operations that make a pipe RUNNING (`CreatePipe`,
 //! `StartPipe`, `UpdatePipe`) and ends itself as soon as the pipe's `CurrentState` is no
@@ -159,6 +165,7 @@ use crate::ops::types::{PipeSourceParameters, PipeTargetParameters};
 
 mod called_service;
 mod dead_letter;
+mod enrichment;
 mod event_bus;
 mod execution_log;
 mod input_template;
@@ -197,16 +204,19 @@ const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 /// would make that release unobservable to any other consumer. This span is the
 /// EMULATOR's choice of "paced like a service rather than like a loop": long enough that a
 /// consumer polling the queue sees the records come back and reads the delivery count they
-/// came back with, short enough that a pipe whose target recovers moves them promptly.
+/// came back with, short enough that a pipe whose target recovers moves them promptly. It
+/// begins when those records come back ([`source_free_again`]) and not when the batch failed:
+/// while the checkout lasts the queue is hiding them from every consumer anyway, so the pipe
+/// goes on reading what that queue does offer ([`leaves_source_alone`]).
 const RELEASED_RECORD_GRACE: Duration = Duration::from_secs(5);
 
-/// The longest a pipe leaves its source unread after a batch it could not move.
+/// The longest a pipe puts off the release of a batch it could not move.
 ///
 /// The checkout a failed batch left behind is as long as the queue says
-/// (`VisibilityTimeout` reaches 12 hours), and the records that arrive while the pipe waits
-/// are not the ones it failed. This is the EMULATOR's bound on that wait, so a pipe whose
-/// target keeps refusing it still takes up what arrives afterwards instead of standing
-/// still for the whole of a long checkout.
+/// (`VisibilityTimeout` reaches 12 hours), and what [`RELEASED_RECORD_GRACE`] is counted from
+/// is the instant that checkout lapses. This is the EMULATOR's bound on that count, so a pipe
+/// whose target keeps refusing it leaves its failed records to the queue's other consumers
+/// within a span one of them can act in rather than after half a day.
 const MAX_SOURCE_HOLD_OFF: Duration = Duration::from_secs(60);
 
 /// How often a pipe that keeps failing says so: the first failure, and every this many
@@ -519,11 +529,13 @@ async fn poll_pipe(
     // what the retries its source parameters allow are spent against.
     let mut attempts = BatchAttempts::default();
     let mut failures = 0u32;
-    // When this poller may read its source again. A batch it could not move left its
-    // records checked out of that source, and they are the source's to hand to its other
-    // consumers once that checkout lapses ([`source_free_again`]), so the source is left
-    // alone until then.
-    let mut hold_source_until: Option<Instant> = None;
+    // When the records a batch this pipe could not move left behind come BACK to their
+    // source, for a source they are checked out of ([`source_free_again`]). From that instant
+    // they are the source's to hand to its other consumers, and this poller leaves them there
+    // for [`RELEASED_RECORD_GRACE`] rather than re-claiming them inside its own poll interval.
+    // BEFORE it the source itself is holding them, so the pipe keeps reading what that source
+    // does offer: the records waiting BEHIND a failure are not the ones it failed.
+    let mut records_come_back: Option<Instant> = None;
     loop {
         let pass = {
             let mut store = state.lock();
@@ -587,15 +599,17 @@ async fn poll_pipe(
                 // A RUNNING pipe publishes for every minute it runs, so its counters
                 // exist and read 0 for a minute in which nothing of their kind happened.
                 metrics.open_window();
-                if hold_source_until.is_some_and(|until| Instant::now() < until) {
-                    // Waiting out the checkout of a batch this pipe could not move: it is
-                    // running — it keeps publishing, and it keeps re-reading its own
-                    // record — but it takes nothing from its source, so the records it
-                    // failed are the queue's to hand over when they come back.
+                let now = Instant::now();
+                if leaves_source_alone(records_come_back, now) {
+                    // The records this pipe could not move have just come back to their
+                    // source: it is running — it keeps publishing, and it keeps re-reading its
+                    // own record — but it takes nothing out of that source for this span, so
+                    // the release is something the queue's other consumers can act on.
                     ::tokio::time::sleep(POLL_INTERVAL).await;
                     continue;
                 }
-                hold_source_until = None;
+                // Once that span has run there is nothing left to leave alone.
+                records_come_back = records_come_back.filter(|back| now < *back);
                 let moved = move_one_batch(
                     callback,
                     &mut clients,
@@ -656,7 +670,7 @@ async fn poll_pipe(
                             metrics.count(metric, 1);
                         }
                         failures = 0;
-                        hold_source_until = None;
+                        records_come_back = None;
                         ::tracing::warn!(
                             pipe = %pipe_name,
                             stage = %stage.name(),
@@ -705,10 +719,10 @@ async fn poll_pipe(
                                  target; the records stay on the source and it tries again"
                             );
                         }
-                        // The records it failed are still checked out of the source: it
-                        // reads that source again once they have come back and been left
-                        // for its other consumers to take.
-                        hold_source_until = source_free_again(
+                        // The records it failed are still checked out of the source: once
+                        // they have come back it leaves them for its other consumers to take
+                        // before it reads that source again.
+                        records_come_back = source_free_again(
                             callback,
                             &mut clients,
                             &record,
@@ -732,19 +746,42 @@ fn retry_backoff(failures: u32) -> Duration {
         .min(MAX_RETRY_BACKOFF)
 }
 
-/// When this poller may read its source again, after a batch it could not move left
-/// records checked out of that source.
+/// Whether the poller leaves its source ALONE at `now`, having failed a batch whose records
+/// come back to that source at `records_come_back`.
+///
+/// Only for [`RELEASED_RECORD_GRACE`] from that instant: the span the records a pipe could not
+/// move are the source's own, so another consumer of that source can see the release and take
+/// them. Before it the source is still holding them — a received Amazon SQS message is
+/// invisible to every consumer for the queue's `VisibilityTimeout` — so a poll then takes only
+/// what the source DOES offer, which is the records waiting behind the failure and never the
+/// ones it failed. A pipe that stopped polling for the whole of that checkout would hold back
+/// traffic the failure has nothing to do with.
+fn leaves_source_alone(records_come_back: Option<Instant>, now: Instant) -> bool {
+    records_come_back.is_some_and(|back| now >= back && now < back + RELEASED_RECORD_GRACE)
+}
+
+/// When the records a batch this poller could not move left behind COME BACK to their
+/// source, for a source they were checked out of.
 ///
 /// A polled Amazon SQS batch is a CHECKOUT: the records a receive handed over are hidden
 /// from every other consumer of the queue for the queue's own `VisibilityTimeout` — "the
 /// length of time, in seconds, that a message received from a queue will be invisible to
 /// other receiving components" (`SetQueueAttributes$Attributes`) — and when that span
 /// lapses they are visible again, their delivery count raised, for whoever receives them
-/// next. A pipe that could not move them has not finished with them, so it waits that
-/// checkout out and then leaves them to the queue for [`RELEASED_RECORD_GRACE`] rather than
-/// re-claiming them inside its own poll interval, which no other consumer could observe.
-/// The wait is capped at [`MAX_SOURCE_HOLD_OFF`], so a long checkout does not stop the pipe
-/// from taking up what arrives while it waits.
+/// next. That lapse is what this answers: a pipe that could not move them has not finished
+/// with them, so from the instant they come back it leaves them to the queue for
+/// [`RELEASED_RECORD_GRACE`] ([`leaves_source_alone`]) rather than re-claiming them inside
+/// its own poll interval, which no other consumer could observe. While the CHECKOUT itself
+/// lasts the queue is holding them, so the pipe keeps polling: what it then receives is the
+/// records waiting behind the failure. The answer is capped at [`MAX_SOURCE_HOLD_OFF`], so a
+/// long checkout does not put the release off for the whole of it.
+///
+/// The queue's own timeout is read with `GetQueueAttributes`, one of the calls an Amazon SQS
+/// source's own stage makes and the role is asked about ([`LiveRecord::refusal`]). `None` —
+/// the plain [`retry_backoff`] is what paces the retry — for a failure that checked nothing
+/// out, for a source whose records are no checkout (a stream read is not), and for a queue
+/// whose timeout this pipe may not read or that did not answer: nothing is then known about
+/// when the records come back.
 ///
 /// The queue's own timeout is read with `GetQueueAttributes`, one of the calls an Amazon SQS
 /// source's own stage makes and the role is asked about ([`LiveRecord::refusal`]). `None` —
@@ -794,7 +831,7 @@ async fn source_free_again(
         .get(&::aws_sdk_sqs::types::QueueAttributeName::VisibilityTimeout)?
         .parse()
         .ok()?;
-    let held = Duration::from_secs(seconds).saturating_add(RELEASED_RECORD_GRACE);
+    let held = Duration::from_secs(seconds);
     Some(checked_out + held.min(MAX_SOURCE_HOLD_OFF))
 }
 
@@ -1291,7 +1328,7 @@ async fn run_stages(
     // The filter decides which of the polled records enter the pipe, BEFORE the
     // enrichment: one the pipe's patterns do not admit reaches neither stage. It is still
     // consumed, so the source moves on from it rather than offering it again.
-    let batch = admitted(decided, batch);
+    let batch = admitted(decided, batch, &identifiers);
     if batch.is_empty() {
         let advance = finish_batch(
             callback,
@@ -1307,43 +1344,23 @@ async fn run_stages(
     }
 
     // What the TARGET stage delivers: the enrichment's answer when the pipe has one,
-    // the polled batch itself when it has none. An enrichment is handed the records
-    // rendered through ITS input template, when the pipe carries one, because that
-    // template is what it receives instead of the record.
-    let events = match &decided.enrichment {
-        None => batch,
-        Some(enrichment) => {
-            let handed = match transformed(
-                decided.enrichment_template.as_deref(),
-                batch,
-                &decided.template_variables(),
-            ) {
-                Ok(handed) => handed,
-                Err(detail) => return Err(FailedAttempt::withheld(Stage::Enrichment, detail)),
-            };
-            if let Some(detail) =
-                record.refusal(enrichment.invocation_action(), enrichment.arn())
-            {
-                return Err(FailedAttempt::withheld(Stage::Enrichment, detail));
-            }
-            log.stage_started(Stage::Enrichment, &handed);
-            match invoke_enrichment(callback, clients, enrichment, &handed).await {
-                Ok(events) => {
-                    log.stage_succeeded(Stage::Enrichment, Some(&events));
-                    events
-                }
-                Err(failure) => {
-                    // The service the enrichment was called on refused it, which is the
-                    // one signal a client has that its enrichment is failing: the record
-                    // naming that refusal is written before the execution's own verdict.
-                    if let Some(refusal) = &failure.refusal {
-                        log.invocation_failed(Stage::Enrichment, &handed, refusal);
-                    }
-                    return Err(FailedAttempt::from_call(Stage::Enrichment, failure));
-                }
-            }
-        }
-    };
+    // the polled batch itself when it has none ([`enrichment`]). A record the enrichment
+    // could not handle is WITHHELD from the target and retained at its source, while the
+    // records it did handle go on — so one record it raises on costs that record alone.
+    let enrichment::Enriched {
+        events,
+        withheld,
+        failure: withholding,
+    } = enrichment::enriched(
+        callback,
+        clients,
+        record,
+        decided,
+        batch,
+        polled.retains_each_record(),
+        log,
+    )
+    .await?;
 
     // The target stage makes the same call on the same resource for every event of the
     // batch, so the role is asked about it once for the batch — and only when there is an
@@ -1405,9 +1422,15 @@ async fn run_stages(
             ),
         ));
     }
-    let processed =
+    let processed: Vec<String> =
         ::service_common::batch_item_failures::processed_records(&report, &identifiers)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            // A record the enrichment WITHHELD was no part of what the target was handed, so
+            // nothing the target answered about the batch it was handed can finish it: it is
+            // retained at its source and handed over again when its checkout lapses.
+            .filter(|identifier| !withheld.contains(identifier.as_str()))
+            .collect();
     if !events.is_empty() {
         // The target took what it was handed. WHICH of the batch's records it reported as
         // processed is the finish below; the stage itself answered the caller.
@@ -1425,7 +1448,15 @@ async fn run_stages(
     };
     let advance =
         finish_batch(callback, clients, positions, record, decided, polled, &finished).await;
-    moved_or_standing_still(advance, decided, taken, checked_out)
+    let moved = moved_or_standing_still(advance, decided, taken, checked_out)?;
+    match withholding {
+        // The pass delivered what the enrichment handled and the records it could not handle
+        // are retained at their source: it is still the failed attempt that stage made, which
+        // is what the execution reports, what the pass is counted as and what the retries this
+        // batch spends are counted against.
+        Some(failure) => Err(failure),
+        None => Ok(moved),
+    }
 }
 
 /// The pass's outcome for a batch whose events were all delivered, from what finishing it
@@ -1878,6 +1909,22 @@ impl Polled {
         match self {
             Self::Messages { checked_out, .. } => Some(*checked_out),
             Self::Records(_) | Self::KinesisRecords(_) => None,
+        }
+    }
+
+    /// Whether the source these records came off hands them over — and takes them back —
+    /// ONE BY ONE, so a record the pipe could not move can be retained by itself while the
+    /// records beside it are finished with.
+    ///
+    /// An Amazon SQS receive is such a hand-over: each message is checked out under its own
+    /// receipt and deleted on its own, so leaving one behind leaves exactly that one. A
+    /// stream read is not: a shard has ONE position, so the records a read can be finished
+    /// with are the run at the HEAD of the batch ([`checkpointed_through`]) and a record left
+    /// behind holds every record after it.
+    fn retains_each_record(&self) -> bool {
+        match self {
+            Self::Messages { .. } => true,
+            Self::Records(_) | Self::KinesisRecords(_) => false,
         }
     }
 
@@ -2566,7 +2613,22 @@ async fn get_records(
     ))
 }
 
-/// The events of `batch` the pipe's filters admit, in the order they were polled.
+/// One polled record the pipe's filters ADMITTED: the envelope the stages after the filter
+/// are handed, beside the identifier its SOURCE names the record by.
+///
+/// The two travel together because a record can be decided about ON ITS OWN: a record the
+/// enrichment could not handle is retained at its source while the records beside it are
+/// finished with ([`enrichment`]), and which record of the source that is, is what the
+/// identifier says.
+struct Admitted {
+    /// What the record's source names it by ([`Polled::identifiers`]).
+    identifier: String,
+    /// The record envelope itself, body as sent.
+    event: Value,
+}
+
+/// The events of `batch` the pipe's filters admit, in the order they were polled, each
+/// beside the identifier `identifiers` names it by.
 ///
 /// "The collection of event patterns used to filter events": a record that matches ANY of
 /// the patterns enters the pipe, and a pipe carrying no filter admits every record. The
@@ -2579,20 +2641,25 @@ async fn get_records(
 /// pipe's own account of where the record came from and are no part of the event the
 /// source published, so a clause written for one of them matches nothing — while the
 /// envelope the later stages are handed carries them, untouched.
-fn admitted(run: &RunningPipe, batch: Vec<Value>) -> Vec<Value> {
+fn admitted(run: &RunningPipe, batch: Vec<Value>, identifiers: &[String]) -> Vec<Admitted> {
+    // Both come off the same poll, so the identifier of a record is the one at its own place
+    // in the batch.
+    let records = batch.into_iter().enumerate().map(|(place, event)| Admitted {
+        identifier: identifiers.get(place).cloned().unwrap_or_default(),
+        event,
+    });
     if run.filters.is_empty() {
-        return batch;
+        return records.collect();
     }
     let poller_added = run.source.poller_added_members();
     let mut budget =
         ::service_common::event_pattern::MatchBudget::new(MAX_FILTER_STEPS_PER_BATCH);
-    batch
-        .into_iter()
-        .filter(|event| {
+    records
+        .filter(|record| {
             // The record is matched as the FILTER reads it, which is not always as the
             // envelope carries it; what the later stages are handed is the envelope
             // itself, untouched.
-            let view = FilterView::of(event, poller_added);
+            let view = FilterView::of(&record.event, poller_added);
             run.filters
                 .iter()
                 .any(|pattern| view.admits(pattern, &mut budget))
@@ -4045,9 +4112,10 @@ mod test_support {
 #[cfg(test)]
 mod tests {
     use super::{
-        checkpointed_through, dead_letter_refusal, enrichment_events, path_view, render_template,
-        resolved_parameter, target_body, PipeSourceParameters, PipeVariables, MAX_TEMPLATE_BYTES,
-        MESSAGE_GROUP_ID, TRIM_HORIZON_POSITION,
+        checkpointed_through, dead_letter_refusal, enrichment_events, leaves_source_alone,
+        path_view, render_template, resolved_parameter, target_body, Duration, Instant,
+        PipeSourceParameters, PipeVariables, MAX_TEMPLATE_BYTES, MESSAGE_GROUP_ID,
+        RELEASED_RECORD_GRACE, TRIM_HORIZON_POSITION,
     };
     use ::serde_json::{json, Value};
     use ::std::collections::BTreeSet;
@@ -4220,6 +4288,57 @@ mod tests {
             assert_eq!(
                 through, expected,
                 "case {case:?}: expected the shard read on from {expected:?}, got {through:?}"
+            );
+        }
+    }
+
+    /// RULE: a poller that failed a batch leaves its source alone only for
+    /// [`RELEASED_RECORD_GRACE`] from the instant the records it failed come BACK to that
+    /// source — the span another consumer has to see the release and take them — and reads
+    /// that source as usual before and after it, because while the checkout lasts the source
+    /// is hiding those records from every consumer anyway.
+    ///
+    /// The rows differ along where `now` falls relative to that instant, which is what the
+    /// rule generalises over: no failed batch at all, before the records come back, the
+    /// instant they do, inside the grace, its last moment and past it.
+    #[test]
+    fn a_failed_batch_leaves_its_source_alone_only_while_its_records_are_back_on_it() {
+        let back = Instant::now();
+        // (case, when a failed batch's records come back, now, whether the source is left
+        // alone)
+        let rows: [(&str, Option<Instant>, Instant, bool); 6] = [
+            ("no batch has failed", None, back, false),
+            (
+                "the records are still checked out",
+                Some(back),
+                back - Duration::from_millis(1),
+                false,
+            ),
+            ("the records have just come back", Some(back), back, true),
+            (
+                "inside the grace",
+                Some(back),
+                back + RELEASED_RECORD_GRACE / 2,
+                true,
+            ),
+            (
+                "the last moment of the grace",
+                Some(back),
+                back + RELEASED_RECORD_GRACE - Duration::from_millis(1),
+                true,
+            ),
+            (
+                "the grace has run",
+                Some(back),
+                back + RELEASED_RECORD_GRACE,
+                false,
+            ),
+        ];
+        for (case, records_come_back, now, expected) in rows {
+            let answered = leaves_source_alone(records_come_back, now);
+            assert_eq!(
+                answered, expected,
+                "case {case:?}: expected the source left alone: {expected}, got {answered}"
             );
         }
     }
