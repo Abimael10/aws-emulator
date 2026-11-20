@@ -317,7 +317,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
 
         // The store guard lives in THIS block and no longer: everything the run needs is
         // copied out of the record here, and the run below happens with no guard held.
-        let (mut invocation, function_name, resource, kms_key_arn, stopped, qualifier) = {
+        let (mut invocation, function_name, metered, kms_key_arn, stopped, qualifier) = {
             let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(
             &mut store,
@@ -437,7 +437,8 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         let stopped = crate::state::guardrail(record, chain.as_deref(), now)
             == crate::state::Guardrail::Stopped;
         let function_name = record.config.name.clone();
-        let resource = crate::state::invoked_resource(&function_name, &version);
+        let metered =
+            crate::state::InvokedTarget::new(&function_name, &version, &executed_version);
         // Everything the RUN needs is copied out of the record here, because the run
         // happens with no store guard held.
         let invocation = crate::state::Invocation {
@@ -504,15 +505,14 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             // the failure it came to (`crate::state::metrics`).
             metrics: Some(crate::state::InvocationMetrics::new(
                 &*self.engine,
-                &function_name,
-                &resource,
+                &metered,
             )),
         };
         let kms_key_arn = resolved_config.kms_key_arn.clone();
             (
                 invocation,
                 function_name,
-                resource,
+                metered,
                 kms_key_arn,
                 stopped,
                 version,
@@ -535,7 +535,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         {
             Ok(admitted) => admitted,
             Err(refused) => {
-                crate::state::publish_throttle(&*self.engine, &function_name, &resource);
+                crate::state::publish_throttle(&*self.engine, &metered);
                 return Err(throttled(refused));
             }
         };
@@ -550,6 +550,14 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             admitted.concurrent_executions,
             now,
         );
+        // An invocation of a qualifier with provisioned concurrency is metered on the
+        // provisioned-concurrency family for what the admission found, exactly as on `Invoke`
+        // (`crate::state::metrics`).
+        crate::state::publish_provisioned_concurrency(
+            &*self.engine,
+            &metered,
+            &admitted.provisioned,
+        );
         // The invocation this call runs is the one its answer names, exactly as on `Invoke`.
         crate::service::request_id_header::serving_invocation(&invocation.request_id);
         // The invocation is admitted to the function at this point, so it is metered as one
@@ -557,7 +565,7 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
         // (`crate::state::metrics`) before the run is attempted: the count is of invocation
         // requests that reached the function, and says nothing about what the execution
         // produced.
-        crate::state::publish_invocation(&*self.engine, &function_name, &resource);
+        crate::state::publish_invocation(&*self.engine, &metered);
 
         // A function whose environment variables are encrypted with a customer managed key
         // is only invoked while that key can decrypt them, exactly as on `Invoke`.

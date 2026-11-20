@@ -33,13 +33,18 @@
 //! ([`series`], [`observation`], [`append`]), so every metric this service publishes —
 //! the per-function ones here, the invocations Lambda admits to a function
 //! ([`publish_invocation`]), what each of those invocations came to once it had run
-//! ([`InvocationMetrics`]), the requests Lambda throttled ([`publish_throttle`]), the
-//! invocations Lambda's recursive-loop guardrail drops
-//! ([`super::recursion`]) and the account-level concurrency metering in
+//! ([`InvocationMetrics`]), the requests Lambda throttled ([`publish_throttle`]), what a
+//! qualifier's provisioned concurrency served them with
+//! ([`publish_provisioned_concurrency`]), the invocations Lambda's recursive-loop guardrail
+//! drops ([`super::recursion`]) and the account-level concurrency metering in
 //! [`super::concurrency_metering`] — reaches the store the same way and carries the same
 //! resolution. An account-level series carries NO dimension: "a metric is uniquely defined
 //! by a name, a namespace, and zero or more dimensions", and the quantity such a series
 //! measures belongs to the Region rather than to one function.
+//!
+//! A series about ONE INVOCATION is published in every dimension set that invocation belongs
+//! to ([`InvokedTarget`]): the function's own, the resource the call addressed, and — for a
+//! call that addressed a qualifier — the version that served it.
 
 use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as cloudwatch;
 
@@ -73,6 +78,16 @@ pub const FUNCTION_NAME_DIMENSION: &str = "FunctionName";
 /// an alias and one of the function at large are both invocations of that function, so they
 /// share the per-function series and differ in this one.
 pub const RESOURCE_DIMENSION: &str = "Resource";
+
+/// The dimension that names the VERSION THAT RAN an invocation, beside the function it belongs
+/// to and the resource the call addressed ([`RESOURCE_DIMENSION`]).
+///
+/// `ExecutedVersion` is "the version of the function that executed. When you invoke a function
+/// with an alias, this indicates which version the alias resolved to" (`Invoke`), so a series
+/// carrying it is the traffic of ONE version of the resource the call named. That is how the
+/// invocations an alias splits between two versions are attributed to the version that really
+/// served each of them, which the function's series and the resource's own cannot tell apart.
+pub const EXECUTED_VERSION_DIMENSION: &str = "ExecutedVersion";
 
 /// The dimension a series about ONE EVENT SOURCE MAPPING's own work is reported per: that
 /// mapping's `UUID`, which is "The identifier of the event source mapping". The work such a
@@ -261,6 +276,48 @@ pub const ERRORS_METRIC: &str = "Errors";
 /// [`INVOCATIONS_METRIC`].
 pub const THROTTLES_METRIC: &str = "Throttles";
 
+/// How many invocations were served by one of the execution environments a qualifier's
+/// PROVISIONED CONCURRENCY keeps initialised.
+///
+/// The name is the one Lambda's own series carries in [`METRIC_NAMESPACE`]:
+/// `ProvisionedConcurrencyInvocations`. Provisioned concurrency "initializes a requested number
+/// of execution environments so that they are prepared to respond immediately to your
+/// function's invocations" (`PutProvisionedConcurrencyConfig`), and this counts the invocations
+/// those environments served: one observation of 1 in [`COUNT_UNIT`] per such invocation, so a
+/// reader summing a window gets the traffic the warm pool took in it and a qualifier with no
+/// allocation has no datapoint at all.
+pub const PROVISIONED_CONCURRENCY_INVOCATIONS_METRIC: &str = "ProvisionedConcurrencyInvocations";
+
+/// How many invocations of a qualifier WITH provisioned concurrency were served on demand
+/// because every provisioned environment was already busy.
+///
+/// The name is the one Lambda's own series carries in [`METRIC_NAMESPACE`]:
+/// `ProvisionedConcurrencySpilloverInvocations`, counted in [`COUNT_UNIT`]. It is the other side
+/// of the split [`PROVISIONED_CONCURRENCY_INVOCATIONS_METRIC`] measures — one observation of 1
+/// per invocation that spilled past the allocation, and none at all for one the pool served — so
+/// a window holding no datapoint is one in which the allocation was never exhausted, which is
+/// the sizing signal the feature is read for.
+pub const PROVISIONED_CONCURRENCY_SPILLOVER_INVOCATIONS_METRIC: &str =
+    "ProvisionedConcurrencySpilloverInvocations";
+
+/// How much of a qualifier's provisioned-concurrency allocation is in use.
+///
+/// The name is the one Lambda's own series carries in [`METRIC_NAMESPACE`]:
+/// `ProvisionedConcurrencyUtilization`, "the fraction of the allocated provisioned concurrency
+/// that is in use" — the provisioned environments serving an invocation divided by the
+/// environments allocated, so it is a fraction between zero and one and carries no unit of its
+/// own ([`UTILIZATION_UNIT`]).
+///
+/// It is a GAUGE rather than a count: the quantity has a value at every instant, and one
+/// observation of it is published at each admission that RAISES it, so `Maximum` over a window
+/// is the highest the allocation was seen to be used in that window however short the
+/// executions were — the same reason the per-function concurrency gauge is observed where it
+/// rises ([`super::concurrency_metering::publish_function_concurrency`]).
+pub const PROVISIONED_CONCURRENCY_UTILIZATION_METRIC: &str = "ProvisionedConcurrencyUtilization";
+
+/// The unit a FRACTION carries: none at all, which CloudWatch's `StandardUnit` spells `None`.
+pub const UTILIZATION_UNIT: &str = cloudwatch::UNIT_NONE;
+
 /// How many invocation REQUESTS Lambda dropped because it detected the function being
 /// invoked as part of a recursive loop and the function's recursive loop detection
 /// configuration told it to stop the chain.
@@ -384,6 +441,86 @@ pub fn invoked_resource(function_name: &str, qualifier: &str) -> String {
     format!("{function_name}:{qualifier}")
 }
 
+/// The dimension set of a series reported per VERSION THAT RAN: the function, the version the
+/// invocation executed ([`EXECUTED_VERSION_DIMENSION`]) and the resource it addressed.
+#[must_use]
+pub fn executed_version_dimensions(
+    function_name: &str,
+    executed_version: &str,
+    resource: &str,
+) -> cloudwatch::DimensionSet {
+    [
+        (
+            FUNCTION_NAME_DIMENSION.to_string(),
+            function_name.to_string(),
+        ),
+        (
+            EXECUTED_VERSION_DIMENSION.to_string(),
+            executed_version.to_string(),
+        ),
+        (RESOURCE_DIMENSION.to_string(), resource.to_string()),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// WHAT one invocation's series are reported for: the function it ran on, the resource the call
+/// addressed, and the version that served it.
+///
+/// Every series about one invocation is published once per dimension set this target belongs to
+/// ([`Self::dimension_sets`]), because "a metric is uniquely defined by a name, a namespace, and
+/// zero or more dimensions": a reader asking for the function's invocations, one asking for an
+/// alias's and one asking for those of the version that alias resolved to are asking for three
+/// different series, and each must carry the invocations it is of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvokedTarget {
+    /// The function the invocation ran on ([`FUNCTION_NAME_DIMENSION`]).
+    pub function_name: String,
+    /// The resource the invocation addressed, as [`RESOURCE_DIMENSION`] names it
+    /// ([`invoked_resource`]).
+    pub resource: String,
+    /// The version that RAN it ([`EXECUTED_VERSION_DIMENSION`]), for an invocation that
+    /// addressed a QUALIFIER \u2014 an alias or a published version. `None` for one that addressed
+    /// the function itself, whose executed version is the unpublished version the function is
+    /// addressed by and which the function's own series already reports.
+    pub executed_version: Option<String>,
+}
+
+impl InvokedTarget {
+    /// The target of an invocation of `function_name` that named `qualifier` \u2014 an alias name, a
+    /// published version number or the unpublished version \u2014 and ran `executed_version`, which
+    /// is the version the qualifier resolved to for that one invocation.
+    #[must_use]
+    pub fn new(function_name: &str, qualifier: &str, executed_version: &str) -> Self {
+        Self {
+            function_name: function_name.to_string(),
+            resource: invoked_resource(function_name, qualifier),
+            executed_version: (qualifier != crate::state::VERSION_LATEST)
+                .then(|| executed_version.to_string()),
+        }
+    }
+
+    /// Every dimension set a series about this invocation is published in: the function's own
+    /// ([`function_dimensions`]), the invoked resource's ([`resource_dimensions`]) and \u2014 for an
+    /// invocation that addressed a qualifier \u2014 that of the version which served it
+    /// ([`executed_version_dimensions`]).
+    #[must_use]
+    pub fn dimension_sets(&self) -> Vec<cloudwatch::DimensionSet> {
+        let mut sets = vec![
+            function_dimensions(&self.function_name),
+            resource_dimensions(&self.function_name, &self.resource),
+        ];
+        if let Some(executed_version) = self.executed_version.as_deref() {
+            sets.push(executed_version_dimensions(
+                &self.function_name,
+                executed_version,
+                &self.resource,
+            ));
+        }
+        sets
+    }
+}
+
 /// The dimension set of a series reported per event source mapping: the mapping whose
 /// poller did the work.
 #[must_use]
@@ -469,52 +606,56 @@ pub fn append(
 }
 
 /// Publish the ONE datapoint an invocation Lambda admitted to a function is metered by: a
-/// count of 1 on the [`INVOCATIONS_METRIC`] series of the function `function_name` names and
-/// on that of the resource `resource` addresses, so a reader summing a window over either
-/// gets the invocations of that window.
+/// count of 1 on the [`INVOCATIONS_METRIC`] series of every dimension set `target` belongs to
+/// ([`InvokedTarget::dimension_sets`]), so a reader summing a window over any of them gets the
+/// invocations of that window.
 ///
 /// It goes into the CloudWatch store of the SAME engine, which is the store
 /// `GetMetricStatistics`, `GetMetricData` and `ListMetrics` answer from. An engine carrying
 /// no CloudWatch has nowhere to publish to, so nothing is. Call it with no Lambda store lock
 /// held: it takes the CloudWatch store's own.
-pub fn publish_invocation<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    function_name: &str,
-    resource: &str,
-) {
-    FunctionMetrics::new(cloudwatch_state(engine)).publish_invocation(function_name, resource);
+pub fn publish_invocation<Eng: Send + Sync + 'static>(engine: &Eng, target: &InvokedTarget) {
+    FunctionMetrics::new(cloudwatch_state(engine)).publish_invocation(target);
 }
 
 /// Publish the ONE datapoint an invocation request Lambda THROTTLED is metered by: a count of
-/// 1 on the [`THROTTLES_METRIC`] series of the function and of the resource the refused
-/// request addressed.
+/// 1 on the [`THROTTLES_METRIC`] series of every dimension set the refused request's target
+/// belongs to.
 ///
 /// It reaches the same store, under the same conditions, as [`publish_invocation`].
-pub fn publish_throttle<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    function_name: &str,
-    resource: &str,
-) {
-    FunctionMetrics::new(cloudwatch_state(engine)).publish_throttle(function_name, resource);
+pub fn publish_throttle<Eng: Send + Sync + 'static>(engine: &Eng, target: &InvokedTarget) {
+    FunctionMetrics::new(cloudwatch_state(engine)).publish_throttle(target);
 }
 
 /// Publish the ONE datapoint an asynchronous event Lambda ACCEPTED onto the invocation queue
-/// is metered by: a count of 1 on the [`ASYNC_EVENTS_RECEIVED_METRIC`] series of the function
-/// and of the resource the accepting call addressed.
+/// is metered by: a count of 1 on the [`ASYNC_EVENTS_RECEIVED_METRIC`] series of every
+/// dimension set the accepting call's target belongs to.
 ///
 /// It reaches the same store, under the same conditions, as [`publish_invocation`].
 pub fn publish_async_event_received<Eng: Send + Sync + 'static>(
     engine: &Eng,
-    function_name: &str,
-    resource: &str,
+    target: &InvokedTarget,
 ) {
-    FunctionMetrics::new(cloudwatch_state(engine)).publish_both(
+    FunctionMetrics::new(cloudwatch_state(engine)).publish_each(
         ASYNC_EVENTS_RECEIVED_METRIC,
-        function_name,
-        resource,
+        target,
         1.0,
         COUNT_UNIT,
     );
+}
+
+/// Publish what the PROVISIONED CONCURRENCY of the qualifier an invocation addressed was
+/// serving when that invocation was admitted: which side of the provisioned/spillover split it
+/// was served on, and how much of the allocation that left in use
+/// ([`FunctionMetrics::publish_provisioned_concurrency`]).
+///
+/// It reaches the same store, under the same conditions, as [`publish_invocation`].
+pub fn publish_provisioned_concurrency<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    target: &InvokedTarget,
+    served: &super::execution_slot::ProvisionedConcurrencyUse,
+) {
+    FunctionMetrics::new(cloudwatch_state(engine)).publish_provisioned_concurrency(target, served);
 }
 
 /// The AWS/Lambda series ONE invocation is metered on once it has RUN, held by the invocation
@@ -528,26 +669,19 @@ pub fn publish_async_event_received<Eng: Send + Sync + 'static>(
 pub struct InvocationMetrics {
     /// Where the datapoints go.
     publisher: FunctionMetrics,
-    /// The function the invocation ran on.
-    function_name: String,
-    /// The resource the invocation addressed, as [`RESOURCE_DIMENSION`] names it.
-    resource: String,
+    /// What the series are reported for: the function, the resource the invocation addressed
+    /// and the version that ran it.
+    target: InvokedTarget,
 }
 
 impl InvocationMetrics {
-    /// The series an invocation of `function_name` addressed at `resource`
-    /// ([`invoked_resource`]) is metered on, publishing into the CloudWatch store of the
-    /// SAME engine.
+    /// The series an invocation of `target` ([`InvokedTarget`]) is metered on, publishing into
+    /// the CloudWatch store of the SAME engine.
     #[must_use]
-    pub fn new<Eng: Send + Sync + 'static>(
-        engine: &Eng,
-        function_name: &str,
-        resource: &str,
-    ) -> Self {
+    pub fn new<Eng: Send + Sync + 'static>(engine: &Eng, target: &InvokedTarget) -> Self {
         Self {
             publisher: FunctionMetrics::new(cloudwatch_state(engine)),
-            function_name: function_name.to_string(),
-            resource: resource.to_string(),
+            target: target.clone(),
         }
     }
 
@@ -559,53 +693,51 @@ impl InvocationMetrics {
     /// published for a run that RETURNED as much as for one that failed, carrying 0 for it, so
     /// a period of healthy traffic reads an explicit zero rather than nothing at all.
     pub fn publish_outcome(&self, duration: ::std::time::Duration, errored: bool) {
-        self.publisher.publish_duration(
-            &self.function_name,
-            &self.resource,
-            duration.as_secs_f64() * 1000.0,
-        );
         self.publisher
-            .publish_error(&self.function_name, &self.resource, errored);
+            .publish_duration(&self.target, duration.as_secs_f64() * 1000.0);
+        self.publisher.publish_error(&self.target, errored);
     }
 
     /// Publish that this invocation request was THROTTLED ([`THROTTLES_METRIC`]).
     pub fn publish_throttle(&self) {
+        self.publisher.publish_throttle(&self.target);
+    }
+
+    /// Publish what the PROVISIONED CONCURRENCY of the qualifier this invocation addressed was
+    /// serving when it was admitted
+    /// ([`FunctionMetrics::publish_provisioned_concurrency`]).
+    pub fn publish_provisioned_concurrency(
+        &self,
+        served: &super::execution_slot::ProvisionedConcurrencyUse,
+    ) {
         self.publisher
-            .publish_throttle(&self.function_name, &self.resource);
+            .publish_provisioned_concurrency(&self.target, served);
     }
 
     /// Publish that the invocation RECORD of this completed asynchronous invocation did not
     /// reach its destination ([`DESTINATION_DELIVERY_FAILURES_METRIC`]).
     pub fn publish_destination_delivery_failure(&self) {
-        self.publisher
-            .publish_both(
-                DESTINATION_DELIVERY_FAILURES_METRIC,
-                &self.function_name,
-                &self.resource,
-                1.0,
-                COUNT_UNIT,
-            );
-    }
-
-    /// Publish that this invocation's event did not reach the function's dead-letter target
-    /// ([`DEAD_LETTER_ERRORS_METRIC`]).
-    pub fn publish_dead_letter_error(&self) {
-        self.publisher.publish_both(
-            DEAD_LETTER_ERRORS_METRIC,
-            &self.function_name,
-            &self.resource,
+        self.publisher.publish_each(
+            DESTINATION_DELIVERY_FAILURES_METRIC,
+            &self.target,
             1.0,
             COUNT_UNIT,
         );
     }
 
+    /// Publish that this invocation's event did not reach the function's dead-letter target
+    /// ([`DEAD_LETTER_ERRORS_METRIC`]).
+    pub fn publish_dead_letter_error(&self) {
+        self.publisher
+            .publish_each(DEAD_LETTER_ERRORS_METRIC, &self.target, 1.0, COUNT_UNIT);
+    }
+
     /// Publish how long this invocation's event waited in the asynchronous queue before the
     /// function was invoked with it ([`ASYNC_EVENT_AGE_METRIC`]).
     pub fn publish_async_event_age(&self, waited: ::std::time::Duration) {
-        self.publisher.publish_both(
+        self.publisher.publish_each(
             ASYNC_EVENT_AGE_METRIC,
-            &self.function_name,
-            &self.resource,
+            &self.target,
             waited.as_secs_f64() * 1000.0,
             MILLISECONDS_UNIT,
         );
@@ -614,13 +746,8 @@ impl InvocationMetrics {
     /// Publish that this invocation's event was DROPPED without the function having
     /// processed it ([`ASYNC_EVENTS_DROPPED_METRIC`]).
     pub fn publish_async_event_dropped(&self) {
-        self.publisher.publish_both(
-            ASYNC_EVENTS_DROPPED_METRIC,
-            &self.function_name,
-            &self.resource,
-            1.0,
-            COUNT_UNIT,
-        );
+        self.publisher
+            .publish_each(ASYNC_EVENTS_DROPPED_METRIC, &self.target, 1.0, COUNT_UNIT);
     }
 
     /// Publish that the function code was invoked once more for this invocation
@@ -631,8 +758,7 @@ impl InvocationMetrics {
     /// accepting call metered the one attempt it admitted, and each further attempt is
     /// metered here, where that attempt is made.
     pub fn publish_retry_invocation(&self) {
-        self.publisher
-            .publish_invocation(&self.function_name, &self.resource);
+        self.publisher.publish_invocation(&self.target);
     }
 }
 
@@ -674,59 +800,89 @@ impl FunctionMetrics {
         self.publish(ITERATOR_AGE_METRIC, function_name, age_millis, ITERATOR_AGE_UNIT);
     }
 
-    /// Publish the ONE invocation of `function_name` that was admitted to the function,
-    /// addressed as `resource` ([`invoked_resource`]): a single observation of
-    /// [`INVOCATIONS_METRIC`], counting that one invocation.
+    /// Publish the ONE invocation of `target` that was admitted to the function: a single
+    /// observation of [`INVOCATIONS_METRIC`], counting that one invocation.
     ///
-    /// It is published TWICE, once in each of the dimension sets the invocation belongs to —
-    /// the function's own ([`function_dimensions`]) and the invoked resource's
-    /// ([`resource_dimensions`]) — because "a metric is uniquely defined by a name, a
+    /// It is published once in EACH of the dimension sets the invocation belongs to
+    /// ([`InvokedTarget::dimension_sets`]), because "a metric is uniquely defined by a name, a
     /// namespace, and zero or more dimensions", so a reader asking for the function's
-    /// invocations and one asking for an alias's are asking for two different series and
-    /// each must carry the invocations it is of. Both observations are taken at the same
-    /// instant, so a window sums the same count over either.
-    pub fn publish_invocation(&self, function_name: &str, resource: &str) {
-        self.publish_both(
-            INVOCATIONS_METRIC,
-            function_name,
-            resource,
-            1.0,
-            COUNT_UNIT,
-        );
+    /// invocations, one asking for an alias's and one asking for those of the version the
+    /// alias resolved to are asking for different series and each must carry the invocations
+    /// it is of. Every observation is taken at the same instant, so a window sums the same
+    /// count over any of them.
+    pub fn publish_invocation(&self, target: &InvokedTarget) {
+        self.publish_each(INVOCATIONS_METRIC, target, 1.0, COUNT_UNIT);
     }
 
-    /// Publish how long ONE finished run of `function_name`, addressed as `resource`, took:
-    /// a single observation of [`DURATION_METRIC`] in [`MILLISECONDS_UNIT`].
+    /// Publish how long ONE finished run of `target` took: a single observation of
+    /// [`DURATION_METRIC`] in [`MILLISECONDS_UNIT`].
     ///
-    /// Published on both of the dimension sets the invocation belongs to, for the reason
+    /// Published on each of the dimension sets the invocation belongs to, for the reason
     /// [`Self::publish_invocation`] is: a reader asking for the function's durations and one
     /// asking for an alias's are asking for two different series.
-    pub fn publish_duration(&self, function_name: &str, resource: &str, millis: f64) {
-        self.publish_both(
-            DURATION_METRIC,
-            function_name,
-            resource,
-            millis,
-            MILLISECONDS_UNIT,
-        );
+    pub fn publish_duration(&self, target: &InvokedTarget, millis: f64) {
+        self.publish_each(DURATION_METRIC, target, millis, MILLISECONDS_UNIT);
     }
 
-    /// Publish WHAT one invocation of `function_name`, addressed as `resource`, came to: a
-    /// single observation of [`ERRORS_METRIC`], carrying 1 for a run that reported a function
-    /// error and 0 for one that returned.
+    /// Publish WHAT one invocation of `target` came to: a single observation of
+    /// [`ERRORS_METRIC`], carrying 1 for a run that reported a function error and 0 for one
+    /// that returned.
     ///
     /// The indicator is published either way because the series is a binary indicator of one
     /// invocation's outcome ([`ERRORS_METRIC`]): the zero is what an invocation that failed
     /// nothing contributes, so a window of healthy traffic reads 0 instead of reading nothing.
-    pub fn publish_error(&self, function_name: &str, resource: &str, errored: bool) {
+    pub fn publish_error(&self, target: &InvokedTarget, errored: bool) {
         let value = if errored { 1.0 } else { 0.0 };
-        self.publish_both(ERRORS_METRIC, function_name, resource, value, COUNT_UNIT);
+        self.publish_each(ERRORS_METRIC, target, value, COUNT_UNIT);
     }
 
-    /// Publish that ONE invocation request for `function_name`, addressed at `resource`, was
-    /// throttled: a single observation of [`THROTTLES_METRIC`].
-    pub fn publish_throttle(&self, function_name: &str, resource: &str) {
-        self.publish_both(THROTTLES_METRIC, function_name, resource, 1.0, COUNT_UNIT);
+    /// Publish that ONE invocation request for `target` was throttled: a single observation of
+    /// [`THROTTLES_METRIC`].
+    pub fn publish_throttle(&self, target: &InvokedTarget) {
+        self.publish_each(THROTTLES_METRIC, target, 1.0, COUNT_UNIT);
+    }
+
+    /// Publish what the PROVISIONED CONCURRENCY of the qualifier an invocation of `target`
+    /// addressed was serving when that invocation was admitted (`served`).
+    ///
+    /// Three series carry it, each on every dimension set the invocation belongs to:
+    ///
+    /// * WHICH SIDE OF THE SPLIT served it. An invocation one of the provisioned environments
+    ///   took is counted on [`PROVISIONED_CONCURRENCY_INVOCATIONS_METRIC`], and one served on
+    ///   demand past a full allocation on
+    ///   [`PROVISIONED_CONCURRENCY_SPILLOVER_INVOCATIONS_METRIC`] — each a count of the
+    ///   invocations that happened that way, so only the side an invocation was served on gets
+    ///   a datapoint and a window's sum over either is the traffic it took.
+    /// * HOW MUCH OF THE ALLOCATION that left in use
+    ///   ([`PROVISIONED_CONCURRENCY_UTILIZATION_METRIC`]), the reading of that gauge at this
+    ///   admission.
+    ///
+    /// Nothing is published for a qualifier with no provisioned concurrency ready: the family
+    /// measures an allocation, so a qualifier that has none has no series at all rather than a
+    /// zero — which is what tells a client "this alias is not provisioned" from "its pool
+    /// served nothing".
+    pub fn publish_provisioned_concurrency(
+        &self,
+        target: &InvokedTarget,
+        served: &super::execution_slot::ProvisionedConcurrencyUse,
+    ) {
+        if !served.provisioned() {
+            return;
+        }
+        let at_secs = cloudwatch::now_secs();
+        let counted = if served.served_from_pool {
+            PROVISIONED_CONCURRENCY_INVOCATIONS_METRIC
+        } else {
+            PROVISIONED_CONCURRENCY_SPILLOVER_INVOCATIONS_METRIC
+        };
+        self.publish_each_at(counted, target, 1.0, COUNT_UNIT, at_secs);
+        self.publish_each_at(
+            PROVISIONED_CONCURRENCY_UTILIZATION_METRIC,
+            target,
+            served.utilization(),
+            UTILIZATION_UNIT,
+            at_secs,
+        );
     }
 
     /// Publish that ONE invocation of the function `function_name` names was dropped by
@@ -801,23 +957,33 @@ impl FunctionMetrics {
         );
     }
 
-    /// Append one observation of `metric` on BOTH of the dimension sets an invocation
-    /// belongs to — the function's own and the invoked resource's — at one instant, so a
-    /// window reads the same measurement over either.
-    fn publish_both(
+    /// Append one observation of `metric` on EACH of the dimension sets an invocation belongs
+    /// to ([`InvokedTarget::dimension_sets`]) at one instant, so a window reads the same
+    /// measurement over any of them.
+    fn publish_each(&self, metric: &str, target: &InvokedTarget, value: f64, unit: &str) {
+        self.publish_each_at(metric, target, value, unit, cloudwatch::now_secs());
+    }
+
+    /// [`Self::publish_each`] at a given instant, for a caller publishing SEVERAL series of
+    /// one invocation: they are one measurement of that invocation, so they carry one
+    /// time stamp.
+    fn publish_each_at(
         &self,
         metric: &str,
-        function_name: &str,
-        resource: &str,
+        target: &InvokedTarget,
         value: f64,
         unit: &str,
+        at_secs: f64,
     ) {
-        let at_secs = cloudwatch::now_secs();
-        for dimensions in [
-            function_dimensions(function_name),
-            resource_dimensions(function_name, resource),
-        ] {
-            self.publish_series(metric, dimensions, value, unit, at_secs, function_name);
+        for dimensions in target.dimension_sets() {
+            self.publish_series(
+                metric,
+                dimensions,
+                value,
+                unit,
+                at_secs,
+                &target.function_name,
+            );
         }
     }
 

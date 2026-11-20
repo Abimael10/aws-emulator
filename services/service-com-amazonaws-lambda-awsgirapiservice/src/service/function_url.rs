@@ -453,6 +453,14 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
                     admitted.concurrent_executions,
                     ::std::time::SystemTime::now(),
                 );
+                // An invocation of a qualifier with provisioned concurrency is metered on the
+                // provisioned-concurrency family for what the admission found, exactly as on
+                // `Invoke` (`crate::state::metrics`).
+                crate::state::publish_provisioned_concurrency(
+                    &*self.engine,
+                    &prepared.metered,
+                    &admitted.provisioned,
+                );
                 Some(admitted.slot)
             }
             Some(Err(throttled_by)) => {
@@ -465,24 +473,17 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
                 );
                 // Answered the throttle, so metered as one request the service throttled,
                 // exactly as on `Invoke` (`crate::state::metrics`).
-                crate::state::publish_throttle(
-                    &*self.engine,
-                    &prepared.invocation.function_name,
-                    &prepared.resource,
-                );
+                crate::state::publish_throttle(&*self.engine, &prepared.metered);
                 return throttle_response(throttled_by.reason, &throttled_by.message);
             }
             None => None,
         };
         // The invocation is admitted to the function at this point, so it is metered as one
-        // `Invocations` datapoint of the function and of the resource the URL addressed,
-        // before the run is attempted: the count is of invocation requests that reached the
-        // function, and says nothing about what the execution produced.
-        crate::state::publish_invocation(
-            &*self.engine,
-            &prepared.invocation.function_name,
-            &prepared.resource,
-        );
+        // `Invocations` datapoint of the function, of the resource the URL addressed and of the
+        // version that served it, before the run is attempted: the count is of invocation
+        // requests that reached the function, and says nothing about what the execution
+        // produced.
+        crate::state::publish_invocation(&*self.engine, &prepared.metered);
         // A function URL request starts no durable execution: the endpoint invokes the
         // function, so the run it makes is no execution's run and reports no step onto one.
         let invoked = match crate::state::run_invocation(prepared.invocation, None).await {
@@ -629,6 +630,9 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             .config_of(&executed_version)
             .cloned()
             .unwrap_or_else(|| record.config.clone());
+        // What every series about this invocation is reported for: the function, the resource
+        // the URL addressed and the version that served it (`crate::state::metrics`).
+        let metered = crate::state::InvokedTarget::new(&function_name, &version, &executed_version);
         let invocation = crate::state::Invocation {
             function_name: function_name.clone(),
             executed_version: executed_version.clone(),
@@ -691,14 +695,10 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             // What this invocation is metered by once it has run, exactly as on `Invoke`:
             // the time the run took and the failure it came to
             // (`crate::state::metrics`).
-            metrics: Some(crate::state::InvocationMetrics::new(
-                &*self.engine,
-                &function_name,
-                &crate::state::invoked_resource(&function_name, &version),
-            )),
+            metrics: Some(crate::state::InvocationMetrics::new(&*self.engine, &metered)),
         };
         Ok(Prepared {
-            resource: crate::state::invoked_resource(&function_name, &version),
+            metered,
             qualifier: version,
             kms_key_arn: resolved_config.kms_key_arn.clone(),
             invocation,
@@ -861,8 +861,9 @@ struct Incoming<'r> {
 struct Prepared {
     /// The invocation to run.
     invocation: crate::state::Invocation,
-    /// The resource this invocation is metered against.
-    resource: String,
+    /// What the series about this invocation are reported for: the function, the resource the
+    /// URL addressed and the version that served it.
+    metered: crate::state::InvokedTarget,
     /// The version label the URL addressed — the alias the URL is attached to, or the
     /// unpublished version — which the invocation is admitted against.
     qualifier: String,

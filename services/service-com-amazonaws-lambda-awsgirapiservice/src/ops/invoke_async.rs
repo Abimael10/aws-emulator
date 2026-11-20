@@ -378,7 +378,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cloned()
             .unwrap_or_else(|| record.config.clone());
         let function_name = record.config.name.clone();
-        let resource = crate::state::invoked_resource(&function_name, &version);
+        let metered =
+            crate::state::InvokedTarget::new(&function_name, &version, &executed_version);
         // The invocation this call accepts is the one its answer names: the id the run
         // reports as `context.aws_request_id` and logs its own lines under (see
         // `crate::service::request_id_header`).
@@ -456,8 +457,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // (`crate::state::metrics`).
                 metrics: Some(crate::state::InvocationMetrics::new(
                     &*self.engine,
-                    &function_name,
-                    &resource,
+                    &metered,
                 )),
             };
             record.queue_async_invocation(&version, &request_id, input.invoke_args, now);
@@ -468,11 +468,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // An invocation nothing stopped is one Lambda ADMITTED to the function, which is
             // metered as one `Invocations` datapoint of the function and of the resource this
             // call addressed (`crate::state::metrics`), exactly as `Invoke` meters its own.
-            crate::state::publish_invocation(&*self.engine, &function_name, &resource);
+            crate::state::publish_invocation(&*self.engine, &metered);
             // It is also one asynchronous event ACCEPTED onto the invocation queue, which is
             // the other thing this call does and is metered as one `AsyncEventsReceived`
             // datapoint (`crate::state::metrics`).
-            crate::state::publish_async_event_received(&*self.engine, &function_name, &resource);
+            crate::state::publish_async_event_received(&*self.engine, &metered);
             // `InvokeAsync` is the deprecated invocation API and carries no
             // `DurableExecutionName` member at all, so it starts no durable execution and
             // its delivery settles none.

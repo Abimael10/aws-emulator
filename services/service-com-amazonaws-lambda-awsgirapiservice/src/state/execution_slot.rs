@@ -37,7 +37,9 @@
 //!   environments serves reports `AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency` to
 //!   the runtime. So the admission that finds the addressed qualifier's allocation ready and
 //!   not yet full is the one served that way, and everything past the allocation is served
-//!   on demand.
+//!   on demand. What that admission found ([`ProvisionedConcurrencyUse`]) is also what the
+//!   provisioned-concurrency metric family is published from, so a client reads the same split
+//!   the runtime was told about (see [`super::metrics`]).
 //!
 //! Admission is ONE critical section — the pool is read and the slot taken under the same
 //! store guard — so two invocations arriving at once cannot both be admitted into the last
@@ -161,6 +163,52 @@ pub struct Admitted {
     /// between resolving it and admitting the invocation: it joined no pool, so it is no
     /// reading of one.
     pub concurrent_executions: i32,
+    /// What the PROVISIONED CONCURRENCY of the qualifier this invocation addressed was serving
+    /// at this admission, which is what the caller meters the provisioned-concurrency family
+    /// from ([`super::metrics::publish_provisioned_concurrency`]).
+    pub provisioned: ProvisionedConcurrencyUse,
+}
+
+/// What the PROVISIONED CONCURRENCY of the qualifier an invocation addressed was serving when
+/// that invocation was admitted.
+///
+/// It is a MEASUREMENT of the allocation at one instant, taken where the admission reads it, so
+/// the series published from it report the pool the invocation really ran against rather than a
+/// quantity read later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProvisionedConcurrencyUse {
+    /// How many execution environments the qualifier's allocation keeps initialised and READY
+    /// at this instant: none for a qualifier nobody allocated provisioned concurrency for, and
+    /// none while Lambda is still initialising one that was asked for
+    /// ([`FunctionRecord::ready_provisioned_concurrency`]).
+    pub allocated: i32,
+    /// How many of those environments are serving an invocation now that this one has joined
+    /// them — never more than the allocation itself, because the invocations past it are served
+    /// on demand.
+    pub in_use: i32,
+    /// Whether one of those environments served THIS invocation. `false` is the SPILLOVER: the
+    /// invocation was served on demand because every provisioned environment was already busy.
+    pub served_from_pool: bool,
+}
+
+impl ProvisionedConcurrencyUse {
+    /// Whether the qualifier has provisioned concurrency ready at all: an allocation of nothing
+    /// is no pool, so an invocation of it was neither served from one nor a spillover past one.
+    #[must_use]
+    pub fn provisioned(&self) -> bool {
+        self.allocated > 0
+    }
+
+    /// "The fraction of the allocated provisioned concurrency that is in use": the environments
+    /// serving an invocation divided by the environments allocated, so it lies between zero and
+    /// one. Zero for a qualifier with no allocation to use.
+    #[must_use]
+    pub fn utilization(&self) -> f64 {
+        if self.allocated <= 0 {
+            return 0.0;
+        }
+        f64::from(self.in_use) / f64::from(self.allocated)
+    }
 }
 
 /// Admit one invocation of `function_name` addressed at `qualifier` to the function, or
@@ -188,6 +236,7 @@ pub fn admit_invocation(
             },
             initialization_type: INITIALIZATION_TYPE_ON_DEMAND,
             concurrent_executions: 0,
+            provisioned: ProvisionedConcurrencyUse::default(),
         });
     };
     // "The number of simultaneous executions to reserve for the function": the invocation is
@@ -211,13 +260,16 @@ pub fn admit_invocation(
     // Which environment serves it is decided BEFORE the slot is taken: the invocations that
     // fit inside the qualifier's ready allocation are the ones its initialised environments
     // serve, and this one fits when the qualifier is processing fewer than that already.
+    // Everything past the allocation is served on demand, which is the SPILLOVER the
+    // provisioned-concurrency family reports (`super::metrics`).
     let allocated = record.ready_provisioned_concurrency(qualifier, now);
     let in_flight_on_qualifier = record
         .in_flight_by_qualifier
         .get(qualifier)
         .copied()
         .unwrap_or_default();
-    let initialization_type = if in_flight_on_qualifier < allocated {
+    let served_from_pool = in_flight_on_qualifier < allocated;
+    let initialization_type = if served_from_pool {
         INITIALIZATION_TYPE_PROVISIONED_CONCURRENCY
     } else {
         INITIALIZATION_TYPE_ON_DEMAND
@@ -236,6 +288,14 @@ pub fn admit_invocation(
         },
         initialization_type,
         concurrent_executions: record.concurrent_executions,
+        provisioned: ProvisionedConcurrencyUse {
+            allocated,
+            // What the allocation is serving now that this invocation has joined the
+            // qualifier's in-flight invocations, which is all of it once they have reached it:
+            // the invocations past the allocation are served on demand and use none of it.
+            in_use: in_flight_on_qualifier.saturating_add(1).min(allocated),
+            served_from_pool,
+        },
     })
 }
 

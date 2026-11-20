@@ -239,8 +239,8 @@ pub use capacity_provider::{
 pub mod event_source_poller;
 pub mod metrics;
 pub use metrics::{
-    invoked_resource, publish_async_event_received, publish_invocation, publish_throttle,
-    InvocationMetrics,
+    invoked_resource, publish_async_event_received, publish_invocation,
+    publish_provisioned_concurrency, publish_throttle, InvocationMetrics, InvokedTarget,
 };
 pub mod sqs_poller;
 pub use sqs_poller::{
@@ -2546,7 +2546,8 @@ pub mod alias_routing;
 /// module's own header.
 pub mod execution_slot;
 pub use execution_slot::{
-    admit_invocation, Admitted, ExecutionSlot, Throttled, ACCOUNT_CONCURRENCY_REASON,
+    admit_invocation, Admitted, ExecutionSlot, ProvisionedConcurrencyUse, Throttled,
+    ACCOUNT_CONCURRENCY_REASON,
 };
 
 /// The FUNCTION RECORD: one Lambda function as this emulator holds it, and everything a

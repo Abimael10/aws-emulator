@@ -279,6 +279,12 @@ pub fn deliver(
             ) {
                 Ok(admitted) => {
                     let _slot = admitted.slot;
+                    // An attempt served by one of the environments the qualifier's provisioned
+                    // concurrency keeps initialised is metered on that family, exactly as a
+                    // synchronous invocation of the same qualifier is (`super::metrics`).
+                    if let Some(metrics) = invocation.metrics.as_ref() {
+                        metrics.publish_provisioned_concurrency(&admitted.provisioned);
+                    }
                     super::execution::run_invocation(invocation.clone(), journal).await
                 }
                 Err(refused) => {

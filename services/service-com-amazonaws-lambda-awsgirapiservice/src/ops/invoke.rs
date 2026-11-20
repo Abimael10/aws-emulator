@@ -486,7 +486,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store guard lives in THIS block and no longer: everything the run needs is
         // copied out of the record here, and the run below happens with no guard held, so
         // one caller's handler cannot stall another caller's request.
-        let (invocation, slot, function_name, resource, kms_key_arn, version) = {
+        let (invocation, slot, function_name, metered, kms_key_arn, version) = {
             let mut store = state.lock();
         let (record, version) = crate::state::resolve_function(
             &mut store,
@@ -649,14 +649,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             == crate::state::Guardrail::Stopped;
         let function_name = record.config.name.clone();
         // An invocation the guardrail did not stop is one Lambda ADMITS to the function, and
-        // every admitted invocation is metered as one `Invocations` datapoint of the function
-        // and of the resource this call addressed (`crate::state::metrics`). The count is of
-        // invocation requests that reached the function, whatever the execution each one
-        // started comes to, so it is published for the run this emulator refuses below as
-        // much as for one it serves — and never for a request refused before the function is
-        // reached (an unresolvable name, a function that cannot be invoked yet, a payload
-        // over the limit or not JSON, the dry run that returns above, a stopped invocation).
-        let resource = crate::state::invoked_resource(&function_name, &version);
+        // every admitted invocation is metered as one `Invocations` datapoint of the function,
+        // of the resource this call addressed and of the version that served it
+        // (`crate::state::metrics`). The count is of invocation requests that reached the
+        // function, whatever the execution each one started comes to, so it is published for
+        // the run this emulator refuses below as much as for one it serves — and never for a
+        // request refused before the function is reached (an unresolvable name, a function that
+        // cannot be invoked yet, a payload over the limit or not JSON, the dry run that returns
+        // above, a stopped invocation).
+        let metered =
+            crate::state::InvokedTarget::new(&function_name, &version, &executed_version);
 
         if invocation_type == INVOCATION_TYPE_EVENT {
             // An accepted event whose invocation the guardrail stopped is still ACCEPTED —
@@ -792,8 +794,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // path (`crate::state::metrics`).
                     metrics: Some(crate::state::InvocationMetrics::new(
                         &*self.engine,
-                        &function_name,
-                        &resource,
+                        &metered,
                     )),
                 };
                 record.queue_async_invocation(&version, &invocation.request_id, payload, now);
@@ -812,15 +813,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The de-duplicated repeat is the SAME invocation answered again rather than a
             // second one, so it is not counted a second time either.
             if let Some(invocation) = delivered {
-                crate::state::publish_invocation(&*self.engine, &function_name, &resource);
+                crate::state::publish_invocation(&*self.engine, &metered);
                 // It is also one asynchronous event ACCEPTED onto the invocation queue,
                 // metered as one `AsyncEventsReceived` datapoint
                 // (`crate::state::metrics`).
-                crate::state::publish_async_event_received(
-                    &*self.engine,
-                    &function_name,
-                    &resource,
-                );
+                crate::state::publish_async_event_received(&*self.engine, &metered);
                 // The run this delivery makes is the durable execution's own run, when the
                 // start above registered one, so the execution it names is settled on what
                 // that run comes to (`crate::state::durable_run`).
@@ -892,7 +889,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             Ok(admitted) => admitted,
             Err(refused) => {
-                crate::state::publish_throttle(&*self.engine, &function_name, &resource);
+                crate::state::publish_throttle(&*self.engine, &metered);
                 return Err(throttled(refused));
             }
         };
@@ -905,6 +902,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &function_name,
             admitted.concurrent_executions,
             now,
+        );
+        // The admission also decided which kind of execution environment serves this
+        // invocation, and an invocation of a qualifier with provisioned concurrency is metered
+        // on the provisioned-concurrency family for it: the side of the split that served it,
+        // and how much of the allocation that left in use (`crate::state::metrics`).
+        crate::state::publish_provisioned_concurrency(
+            &*self.engine,
+            &metered,
+            &admitted.provisioned,
         );
         let invocation = crate::state::Invocation {
             function_name: function_name.clone(),
@@ -969,15 +975,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the failure it came to (`crate::state::metrics`).
             metrics: Some(crate::state::InvocationMetrics::new(
                 &*self.engine,
-                &function_name,
-                &resource,
+                &metered,
             )),
         };
             (
                 invocation,
                 admitted.slot,
                 function_name,
-                resource,
+                metered,
                 kms_key_arn,
                 version,
             )
@@ -989,7 +994,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The invocation is admitted to the function at this point, so it is metered before
         // the run is attempted: the datapoint counts this invocation request, and reports
         // nothing about what the execution produced.
-        crate::state::publish_invocation(&*self.engine, &function_name, &resource);
+        crate::state::publish_invocation(&*self.engine, &metered);
 
         // A function whose environment variables are encrypted with a customer managed key
         // is only invoked while that key can decrypt them: the invocation begins with that
