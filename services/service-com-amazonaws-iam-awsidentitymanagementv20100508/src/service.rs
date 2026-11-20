@@ -282,14 +282,17 @@ fn stated_refusal(violations: &[Violation]) -> Option<Refused> {
 /// answers an unresolvable credential with.
 const UNUSABLE_CREDENTIAL_CODE: &str = "InvalidClientTokenId";
 
-/// The two codes this service answers a request the emulator's authentication layer refused
+/// The codes this service answers a request the emulator's authentication layer refused
 /// with (see [`::service_common::authentication_refusal`], which owns the rule and the
 /// sentences): the `awsQuery` unknown-credential code — the same one the deactivated-key
-/// refusal above answers with — for an access key id that resolves to no credential, and the
-/// SigV4 signature code for one that resolves and whose signature does not verify.
+/// refusal above answers with — for an access key id that resolves to no credential, the
+/// SigV4 signature code for one that resolves and whose signature does not verify, and the
+/// code AWS's SigV4 front door answers a request that presented NO credential at all with,
+/// which an `awsQuery` service names unqualified.
 const AUTHENTICATION_REFUSAL: StatedAuthenticationRefusal = StatedAuthenticationRefusal {
     unresolved_credential: UNUSABLE_CREDENTIAL_CODE,
     signature_mismatch: "SignatureDoesNotMatch",
+    missing_credential: Some("MissingAuthenticationToken"),
 };
 
 /// The issuer segment and the document `uri` addresses, and `None` for every other path.

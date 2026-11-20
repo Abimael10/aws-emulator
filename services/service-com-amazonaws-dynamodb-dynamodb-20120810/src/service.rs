@@ -1503,15 +1503,20 @@ fn resource_arn_violation(violations: &[Violation]) -> Option<&Option<String>> {
 /// is read one way on both sides.
 const STREAMS_TARGET_SERVICE_KEY: &str = "dynamodbstreams";
 
-/// The two codes this service answers a request the emulator's authentication layer refused
+/// The codes this service answers a request the emulator's authentication layer refused
 /// with (see [`service_common::authentication_refusal`], which owns the rule and the
 /// sentences): the `awsJson` unknown-credential code for an access key id that resolves to
 /// no credential, and the `awsJson` signature code for one that resolves and whose signature
 /// does not verify. Neither is `AccessDenied`, which is this service's answer to a KNOWN
 /// principal whose policies do not permit the action.
+///
+/// A request that presented NO credential at all is named by this endpoint's OWN front door
+/// instead ([`request_signature`], whose class is namespaced and whose status is the one a
+/// fault in the request carries), so none is named here.
 const AUTHENTICATION_REFUSAL: StatedAuthenticationRefusal = StatedAuthenticationRefusal {
     unresolved_credential: "UnrecognizedClientException",
     signature_mismatch: "InvalidSignatureException",
+    missing_credential: None,
 };
 
 /// The `com-amazonaws-dynamodb-dynamodb-20120810` emulated service: the generated [`ServiceDefinition`] plus

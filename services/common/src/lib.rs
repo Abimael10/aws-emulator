@@ -341,6 +341,10 @@ pub mod audited_operation;
 /// unknown-credential failure and the signature failure, each in that service's own code,
 /// so neither is collapsed into the authorization denial `AccessDenied`.
 pub mod authentication_refusal;
+/// The ONE reading of whether a request PRESENTS a SigV4 credential at all — in either of
+/// SigV4's two presentations — and AWS's fixed sentence for one that presents none, which is
+/// a different failure class from a credential that is presented and not accepted.
+pub mod sigv4_presentation;
 /// The ONE refusal of a request presenting a long-term access key the account holds and will
 /// not accept — one whose stored `Status` it has moved off `Active` — stated in each
 /// service's own unknown-credential vocabulary, before any operation runs.

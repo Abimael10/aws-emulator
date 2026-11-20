@@ -238,19 +238,33 @@ const SIGNATURE_MISMATCH_CODE: &str = "SignatureDoesNotMatch";
 const SIGNATURE_MISMATCH_MESSAGE: &str =
     ::service_common::authentication_refusal::SIGNATURE_MISMATCH_MESSAGE;
 
-/// WHAT a request presented to authenticate with: the access key id SigV4 carried, and
-/// whether a SESSION TOKEN travelled with it.
-///
-/// Both halves decide which refusal AWS words, so both are read off the request itself (see
-/// [`PRESENTED_CREDENTIAL`]).
+/// The error code AWS answers a request that presented NO credential at all with: neither
+/// of SigV4's two presentations, so there was never a caller to look up. The ABSENCE of a
+/// credential is a class of its own — it is what tells a client whose credential chain came
+/// up EMPTY that credential discovery is what failed, where the code above says the
+/// credentials it found were rejected — and an `awsQuery` front door names it unqualified.
+const MISSING_CREDENTIAL_CODE: &str = "MissingAuthenticationToken";
+
+/// The codes this service answers the failures the emulator's AUTHENTICATION layer NAMED
+/// ITSELF with, which the seam below cannot see and so must not re-derive: a security token
+/// that resolves to no issued session, and a request that presented no credential at all.
+/// The rule, the precedence and the sentences are the tree's one copy
+/// ([`::service_common::authentication_refusal`]) and only the codes — this service's own —
+/// are named here.
+const AUTHENTICATION_REFUSAL:
+    ::service_common::authentication_refusal::StatedAuthenticationRefusal =
+    ::service_common::authentication_refusal::StatedAuthenticationRefusal {
+        unresolved_credential: UNRESOLVED_CREDENTIAL_CODE,
+        signature_mismatch: SIGNATURE_MISMATCH_CODE,
+        missing_credential: Some(MISSING_CREDENTIAL_CODE),
+    };
+
+/// WHAT a request presented to authenticate with: the access key id SigV4 carried, which is
+/// where a service reads WHICH credential signed (see [`PRESENTED_CREDENTIAL`]).
 #[derive(Debug, Clone)]
 struct PresentedCredential {
-    /// The access key id, which is where a service reads WHICH credential signed.
+    /// The access key id, read from wherever SigV4 put it.
     access_key_id: String,
-    /// Whether the request carried a session token at all — the header a temporary
-    /// credential is served with, or the field a presigned URL carries it in. Only its
-    /// PRESENCE is read, and the value never leaves this note.
-    session_token_presented: bool,
 }
 
 thread_local! {
@@ -270,23 +284,10 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-/// The header a temporary credential's session token travels in, and the field a presigned
-/// URL carries the same token in — the two places SigV4 puts it, as the emulator's own
-/// verifier reads them.
-const SESSION_TOKEN_HEADER: &str = "x-amz-security-token";
-const SESSION_TOKEN_FIELD: &str = "X-Amz-Security-Token";
-
 /// Record the credential `parts` presented as the one this thread is serving.
 fn remember_presented_access_key_id(parts: &http::request::Parts) {
-    let presented_token = parts.headers.contains_key(SESSION_TOKEN_HEADER)
-        || ::service_common::query_parameter(
-            parts.uri.query().unwrap_or_default(),
-            SESSION_TOKEN_FIELD,
-        )
-        .is_some();
     let credential = PresentedCredential {
         access_key_id: ::service_common::request_access_key_id(parts),
-        session_token_presented: presented_token,
     };
     PRESENTED_CREDENTIAL.with(|presented| {
         *presented.borrow_mut() = Some(credential);
@@ -432,10 +433,15 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// dispatch path state their message as a text node too (see [`message_text`]) and name
     /// the request they answer in the `awsQuery` error envelope's `<RequestId>`, as every
     /// other error of this service does (see
-    /// [`::service_common::query_error_envelope`]). Identity, the protocol and the routing
-    /// table are the generated entry's untouched.
+    /// [`::service_common::query_error_envelope`]), and so that a failure the emulator's
+    /// AUTHENTICATION layer itself named is stated in this service's own vocabulary
+    /// ([`AUTHENTICATION_REFUSAL`]) rather than re-derived from the credential a refused
+    /// request presented. Identity, the protocol and the routing table are the generated
+    /// entry's untouched.
     entry: ::service_common::query_error_envelope::RequestIdEnvelopeDefinition<
-        message_text::StatedMessageDefinition<Eng>,
+        ::service_common::authentication_refusal::AuthenticationRefusalDefinition<
+            message_text::StatedMessageDefinition<Eng>,
+        >,
     >,
     /// The SAME shared engine the generated entry threaded into every operation, kept
     /// here too because the refusal wording below has to ask whether the account holds
@@ -466,7 +472,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         let stated = management_events::audited_table(&engine);
         Self {
             entry: ::service_common::query_error_envelope::RequestIdEnvelopeDefinition::new(
-                message_text::StatedMessageDefinition::new(Arc::clone(&engine)),
+                ::service_common::authentication_refusal::AuthenticationRefusalDefinition::new(
+                    message_text::StatedMessageDefinition::new(Arc::clone(&engine)),
+                    AUTHENTICATION_REFUSAL,
+                ),
             ),
             engine,
             protocol: QuerySignedCalls::new(),
@@ -507,8 +516,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             .is_some_and(|sts| sts.lock().session(access_key_id).is_some())
     }
 
-    /// How this service words a request authentication refused, which is TWO refusals AWS
-    /// words differently:
+    /// How this service words a request authentication refused for a reason the layer did
+    /// NOT name, which is TWO refusals AWS words differently:
     ///
     /// * a key id that resolves to no credential at all — never issued, or deleted — is
     ///   `InvalidClientTokenId`, the authentication failure an SDK's credential-refresh
@@ -522,21 +531,17 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// ([`Self::account_holds_credential`]), because the framework's structural refusal
     /// does not carry it.
     ///
-    /// A TEMPORARY credential presented WITHOUT its session token is the first case and not
-    /// the second: temporary credentials are served only with the token minted beside them,
-    /// so a request carrying the key and the secret alone presents a security token AWS
-    /// resolves to nothing — the signature is beside the point, and the answer is the
-    /// unknown-credential code, which is what makes an SDK re-resolve its credential chain.
+    /// Only that derivation is this seam's. A failure the authentication layer NAMED — the
+    /// request's security token resolving to no issued session, and a request presenting no
+    /// credential at all — is a verdict this seam is not handed and so cannot re-derive: a
+    /// token that belongs to no session is an unknown credential however well the request
+    /// was signed, and a request that presented nothing never named a credential to resolve.
+    /// Both are stated from the layer's own verdict and the request's presentation, by the
+    /// one layer that is handed them ([`AUTHENTICATION_REFUSAL`]), ahead of whatever this
+    /// derivation chose.
     fn unauthenticated_refusal(&self) -> Refused {
-        let presented = presented_credential();
-        let token_missing = presented.as_ref().is_some_and(|presented| {
-            !presented.session_token_presented
-                && self.account_holds_session(&presented.access_key_id)
-        });
-        let resolves = !token_missing
-            && presented.is_some_and(|presented| {
-                self.account_holds_credential(&presented.access_key_id)
-            });
+        let resolves = presented_credential()
+            .is_some_and(|presented| self.account_holds_credential(&presented.access_key_id));
         if resolves {
             return Refused {
                 code: SIGNATURE_MISMATCH_CODE.to_string(),
@@ -623,12 +628,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service reword it. Returning `None` keeps the framework's default
         // wording.
         match refusal {
-            // AWS answers a request authentication refused with ONE of two codes, and
+            // AWS answers a request authentication refused with ONE of several codes, and
             // which one it is depends on the credential the request presented, not on
             // the structure of the refusal — see [`Self::unauthenticated_refusal`]. The
             // framework collapses every pre-dispatch authentication refusal into one
-            // structural case, so this service states the two cases the way AWS states
-            // them.
+            // structural case, so this service states the cases it can tell apart from the
+            // credential presented; the ones the authentication layer NAMED are stated from
+            // that verdict, ahead of this choice ([`AUTHENTICATION_REFUSAL`]).
             Refusal::Unauthenticated => Some(self.unauthenticated_refusal()),
             // A refusal of the request's VALUES is stated the way AWS states one: the
             // framework's own envelope and member paths, with the code STS answers a
@@ -867,23 +873,27 @@ mod tests {
         EmulatedService::new(engine)
     }
 
-    /// An authentication refusal is worded for the CREDENTIAL the request presented: a key
-    /// id the account holds, presented with everything that credential is served with, is a
-    /// signature mismatch; a key id it does not hold, and a TEMPORARY credential presented
-    /// without the session token it is served with, resolve to nothing.
+    /// An authentication refusal the layer did not name is worded for the CREDENTIAL the
+    /// request presented: a key id the account holds is a signature mismatch, and a key id it
+    /// does not hold resolves to nothing.
     ///
     /// The rows differ along what the rule generalises over: which kind of credential the key
     /// id names (an IAM user's long-term key, a session this service minted, a key id that
-    /// names nothing, no credential at all) and whether a session token travelled with it.
+    /// names nothing, one a character off a held one, no credential at all).
+    ///
+    /// The failures the authentication layer NAMES itself — a security token belonging to no
+    /// issued session, and a request presenting no credential at all — are not this seam's to
+    /// choose and are not rows here: their rule is tabled where it lives
+    /// (`service_common::authentication_refusal`) and driven over this service's wire by
+    /// `tests/all/sigv4_front_door_refusals.rs`.
     #[test]
     fn an_authentication_refusal_names_the_failure_the_presented_credential_had() {
         let service = service();
-        /// One row: the access key id the refused request presented, whether it carried a
-        /// session token, and the code and message AWS words for that credential's failure.
+        /// One row: the access key id the refused request presented, and the code and
+        /// message AWS words for that credential's failure.
         struct Row {
             case: &'static str,
             access_key_id: Option<&'static str>,
-            session_token: bool,
             code: &'static str,
             message: &'static str,
         }
@@ -891,37 +901,24 @@ mod tests {
             Row {
                 case: "an IAM user's own access key, which the account holds",
                 access_key_id: Some("AKIAEMULATORUSERKEY1"),
-                session_token: false,
                 code: SIGNATURE_MISMATCH_CODE,
                 message: SIGNATURE_MISMATCH_MESSAGE,
             },
             Row {
-                case: "a session this service minted, presented with its session token",
+                case: "a session this service minted",
                 access_key_id: Some("ASIAEMULATORSESSION1"),
-                session_token: true,
                 code: SIGNATURE_MISMATCH_CODE,
                 message: SIGNATURE_MISMATCH_MESSAGE,
-            },
-            Row {
-                // The key and the secret of a temporary credential alone: AWS resolves no
-                // security token for it, whatever the signature says.
-                case: "that same session presented without its session token",
-                access_key_id: Some("ASIAEMULATORSESSION1"),
-                session_token: false,
-                code: UNRESOLVED_CREDENTIAL_CODE,
-                message: UNRESOLVED_CREDENTIAL_MESSAGE,
             },
             Row {
                 case: "a syntactically valid key id that was never issued",
                 access_key_id: Some("AKIAIOSFODNN7EXAMPLE"),
-                session_token: false,
                 code: UNRESOLVED_CREDENTIAL_CODE,
                 message: UNRESOLVED_CREDENTIAL_MESSAGE,
             },
             Row {
                 case: "a key id one character off a held one",
                 access_key_id: Some("AKIAEMULATORUSERKEY2"),
-                session_token: false,
                 code: UNRESOLVED_CREDENTIAL_CODE,
                 message: UNRESOLVED_CREDENTIAL_MESSAGE,
             },
@@ -930,7 +927,6 @@ mod tests {
                 // sentinel `default`, which names no credential.
                 case: "no credential at all",
                 access_key_id: None,
-                session_token: false,
                 code: UNRESOLVED_CREDENTIAL_CODE,
                 message: UNRESOLVED_CREDENTIAL_MESSAGE,
             },
@@ -939,13 +935,7 @@ mod tests {
         for row in rows {
             let case = row.case;
             let scope = row.access_key_id.map(|key| (key, SIGNING_NAME));
-            let mut parts = parts("POST", "/", scope, None, None, Some(QUERY_CONTENT_TYPE));
-            if row.session_token {
-                parts.headers.insert(
-                    super::SESSION_TOKEN_HEADER,
-                    super::http::HeaderValue::from_static("a-session-token"),
-                );
-            }
+            let parts = parts("POST", "/", scope, None, None, Some(QUERY_CONTENT_TYPE));
             remember_presented_access_key_id(&parts);
             let refused = service.unauthenticated_refusal();
             assert_eq!(

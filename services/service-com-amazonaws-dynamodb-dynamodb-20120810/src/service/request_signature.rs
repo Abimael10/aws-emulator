@@ -51,7 +51,7 @@
 //! is echoed back either — every sentence above is fixed text — so a refusal cannot reflect
 //! the caller's own `Authorization` header to whoever sent it.
 //!
-//! # Why this reads the presentation itself rather than calling the verifier's reader
+//! # Why this reads the presentation rather than calling the verifier's reader
 //!
 //! The framework's SigV4 verifier reads the same two forms
 //! (`vendor/server/src/request_authentication.rs`, whose `authorization_field` and
@@ -60,24 +60,23 @@
 //! only ever asked about a presentation that reader has already declined, so the two cannot
 //! be the same function, and the differences are the point:
 //!
-//! * a header is a SigV4 presentation here when it names the AWS4 FAMILY
-//!   ([`SIGV4_FAMILY_PREFIX`]), not when it carries the one algorithm token the verifier
-//!   requires — that is what tells `Authorization: AWS4-` (an incomplete SigV4 presentation)
-//!   from `Authorization: X` (no AWS signature at all), which the recorded wire answers with
-//!   two different classes; the components are then read after whichever token the header
-//!   names, so a complete presentation naming another algorithm is complete here and goes to
-//!   the verifier rather than being told it left out fields it sent;
+//! * a header is a SigV4 presentation when it names the AWS4 FAMILY, not when it carries the
+//!   one algorithm token the verifier requires — that is what tells `Authorization: AWS4-` (an
+//!   incomplete SigV4 presentation) from `Authorization: X` (no AWS signature at all), which
+//!   the recorded wire answers with two different classes; the components are then read after
+//!   whichever token the header names, so a complete presentation naming another algorithm is
+//!   complete here and goes to the verifier rather than being told it left out fields it sent;
 //! * only the NAMES of the query parameters are compared, by the tree's own reader of a raw
 //!   query string ([`::service_common::query_parameter`]), which compares them as written —
 //!   a SigV4 signer spells them literally because they are part of the string it signed. The
 //!   VALUES, which are what `presigned_field` percent-decodes, are never read here: this
 //!   layer asks which components are present, never what they say.
 //!
-//! Nothing in it is DynamoDB's own but the classes it names and the media type it answers in,
-//! so the home for it, when a second `awsJson` service needs the same rule, is
-//! `services/common` beside `authentication_refusal` — parameterised by those classes exactly
-//! as `StatedAuthenticationRefusal` is. It lives here while one service needs it, rather than
-//! being hoisted on this change's evidence alone.
+//! WHICH presentation a request carries, and the sentence an absent one is told, are not
+//! DynamoDB's own: they are the same for every front door the emulator signs for, so they are
+//! read from the module that owns them ([`::service_common::sigv4_presentation`]). What stays
+//! here is what this endpoint alone decides — the classes it names, the status it answers a
+//! request fault with, the components it lists as missing, and the media type it answers in.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema_server::ProtocolError;
@@ -102,10 +101,14 @@ const CORAL_NAMESPACE: &str = "com.amazon.coral.service";
 const MISSING_TOKEN: &str = "com.amazon.coral.service#MissingAuthenticationTokenException";
 
 /// Its sentence, which is fixed: a request that carries no signature is told so, and nothing
-/// of the request is echoed in it. The wording is the recorded one — the sibling report
+/// of the request is echoed in it. The wording belongs to every front door the emulator signs
+/// for rather than to this one, so it is read from the module that owns it
+/// ([`::service_common::sigv4_presentation`]) — the sibling report
 /// `issues/.../20261117T172826Z-dynamodb-5-net-new-causes-malformed-sigv4-answers.md` quotes
-/// this endpoint's whole answer to an unsigned request, class and sentence together.
-const MISSING_TOKEN_MESSAGE: &str = "Request is missing Authentication Token";
+/// this endpoint's whole answer to an unsigned request, class and sentence together, and it is
+/// that same sentence under the namespaced class above.
+const MISSING_TOKEN_MESSAGE: &str =
+    ::service_common::sigv4_presentation::MISSING_CREDENTIAL_MESSAGE;
 
 /// The class AWS's front door names a presentation with components missing.
 const INCOMPLETE_SIGNATURE: &str = "com.amazon.coral.service#IncompleteSignatureException";
@@ -113,11 +116,6 @@ const INCOMPLETE_SIGNATURE: &str = "com.amazon.coral.service#IncompleteSignature
 /// The sentence that closes an incomplete QUERY-string presentation, after the clause for
 /// each parameter the request left out.
 const RE_EXAMINE_QUERY: &str = "Re-examine the query-string parameters.";
-
-/// The prefix every member of the AWS4 signature family shares. A header carrying it is a
-/// SigV4 presentation — one missing components is INCOMPLETE rather than absent — and a
-/// header carrying anything else presents no AWS signature at all.
-const SIGV4_FAMILY_PREFIX: &str = "AWS4-";
 
 /// The header a request presents a signature in.
 const AUTHORIZATION: &str = "authorization";
@@ -149,13 +147,6 @@ const QUERY_PARAMETERS: [&str; 5] = [
     "X-Amz-SignedHeaders",
     "X-Amz-Signature",
 ];
-
-/// The query parameter whose presence means the query string is PRESENTING a signature,
-/// however much of the rest of it is missing: the algorithm it names, which is the query
-/// form's counterpart of the header's algorithm token. A query string carrying signature
-/// parameters but not THIS one presents no signature at all, exactly as a header that does
-/// not name an AWS algorithm presents none.
-const QUERY_PRESENTATION: &str = "X-Amz-Algorithm";
 
 /// The response header a media type is announced in.
 const CONTENT_TYPE: &str = "content-type";
@@ -214,10 +205,17 @@ impl SignatureFault {
 /// signature to recompute.
 #[must_use]
 pub fn presentation_fault(req: &RtRequest) -> Option<SignatureFault> {
-    // A header naming the AWS4 family presents a signature, however incomplete the rest of
-    // it is; one naming any other scheme presents no AWS signature at all.
-    let header = authorization(req).filter(|value| value.starts_with(SIGV4_FAMILY_PREFIX));
-    let presents_in_query = query_parameter(req, QUERY_PRESENTATION).is_some();
+    // WHICH of SigV4's presentations a request carries is one rule for every front door the
+    // emulator signs for, so both halves are read through the module that owns it
+    // ([`::service_common::sigv4_presentation`]): a header naming the AWS4 family presents a
+    // signature, however incomplete the rest of it is, and one naming any other scheme
+    // presents no AWS signature at all.
+    let header = ::service_common::sigv4_presentation::presenting_authorization(
+        req.headers().get(AUTHORIZATION),
+    );
+    let presents_in_query = ::service_common::sigv4_presentation::query_presents_a_credential(
+        req.uri().split_once('?').map(|(_, query)| query),
+    );
     match (header, presents_in_query) {
         (Some(_), true) => Some(SignatureFault::TwoForms),
         (None, false) => Some(SignatureFault::Absent),
@@ -270,13 +268,6 @@ fn incomplete_query(req: &RtRequest) -> Option<SignatureFault> {
     }
     clauses.push(RE_EXAMINE_QUERY.to_string());
     Some(SignatureFault::Incomplete(clauses.join(" ")))
-}
-
-/// The `Authorization` header `req` carries, trimmed of surrounding space; `None` when it
-/// carries none, or carries an empty one.
-fn authorization(req: &RtRequest) -> Option<&str> {
-    let value = req.headers().get(AUTHORIZATION)?.trim();
-    (!value.is_empty()).then_some(value)
 }
 
 /// The field list of a header presentation: everything after the algorithm token it names,
