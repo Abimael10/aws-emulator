@@ -24,11 +24,13 @@
 //! The rows differ along what the rule generalises over: whether the account holds a provider
 //! under the name at all, where the key lives (`MANAGED`, named and implied, and `EXTERNAL`),
 //! the shape and length of the provider's name, the size of the key, and whether the request
-//! carried tags.
+//! carried tags. Idempotence is an invariant rather than a value, so it is also driven as a
+//! property over generated names and repeat counts, from a reported seed.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -43,6 +45,30 @@ const VAULT: &str = "default";
 /// The longest name `CredentialProviderName` admits: length 1..128, pattern
 /// `^[a-zA-Z0-9\-_]+$` (`smithy_query(query="shape",shape="CredentialProviderName")`).
 const MAX_PROVIDER_NAME_LEN: usize = 128;
+
+/// Every character `CredentialProviderName`'s pattern `^[a-zA-Z0-9\-_]+$` admits
+/// (`smithy_query(query="shape",shape="CredentialProviderName")`) — the alphabet the
+/// idempotence property generates its names from.
+const PROVIDER_NAME_ALPHABET: &[u8] =
+    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+
+/// How many generated names the idempotence property drives: bounded, so the suite stays
+/// fast whatever the host.
+const IDEMPOTENCE_CASES: usize = 24;
+
+/// The most times one generated name's delete is repeated.
+const MAX_DELETE_REPEATS: u32 = 4;
+
+/// A name `CredentialProviderName` admits: 1..=128 characters of its pattern's alphabet.
+fn generated_provider_name(rng: &mut StdRng) -> String {
+    let length = rng.random_range(1..=MAX_PROVIDER_NAME_LEN);
+    (0..length)
+        .map(|_| {
+            let index = rng.random_range(0..PROVIDER_NAME_ALPHABET.len());
+            char::from(PROVIDER_NAME_ALPHABET[index])
+        })
+        .collect()
+}
 
 /// The name the secret holding a managed provider's key is created under. Spelled out here
 /// rather than read off the implementation, so a drift in either is a failing test.
@@ -583,6 +609,94 @@ async fn a_provider_delete_that_resolves_nothing_succeeds_and_deletes_nothing() 
         secret.status, 200,
         "a delete of a name nothing resolves leaves the secret behind the provider alone, \
          got {} ({})",
+        secret.status, secret.body
+    );
+}
+
+/// The invariant behind the rule, over GENERATED names rather than a hand-picked set: for
+/// any name `CredentialProviderName` admits, and whether or not this account holds a
+/// provider under it, every delete of that name answers the empty 204 success and leaves
+/// the name resolving nothing — so repeating a delete any number of times answers exactly
+/// as the first one did. The names are drawn from the pattern's own alphabet across its
+/// whole length range; the seed is reported so a failing draw can be replayed.
+#[tokio::test]
+async fn deleting_any_name_the_model_admits_is_idempotent() {
+    /// The provider none of the generated deletes names, so each case also shows the
+    /// delete reaches only the name it carries.
+    const BYSTANDER: &str = "property-bystander-key";
+
+    let seed: u64 = rand::random();
+    println!("deleting_any_name_the_model_admits_is_idempotent: seed {seed}");
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let emulator = Emulator::new();
+    let bystander = emulator
+        .create_provider(&json!({"name": BYSTANDER, "apiKey": "sk-property-0007"}))
+        .await;
+    assert_eq!(
+        bystander.status, 201,
+        "seed {seed}: the bystander provider must be created, got {} ({})",
+        bystander.status, bystander.body
+    );
+
+    for index in 0..IDEMPOTENCE_CASES {
+        let name = generated_provider_name(&mut rng);
+        if name == BYSTANDER {
+            continue;
+        }
+        // Half the draws delete a provider this account really holds, half a name it
+        // never held: the rule spans both, because the delete is satisfied by absence.
+        let held = rng.random_bool(0.5);
+        if held {
+            let created = emulator
+                .create_provider(&json!({"name": name, "apiKey": format!("sk-{index}")}))
+                .await;
+            assert_eq!(
+                created.status, 201,
+                "seed {seed}, case {index}, name {name:?}: the provider under test must be \
+                 created, got {} ({})",
+                created.status, created.body
+            );
+        }
+
+        let repeats = rng.random_range(1..=MAX_DELETE_REPEATS);
+        for attempt in 1..=repeats {
+            let answered = emulator.delete_provider(&name).await;
+            assert_empty_success(
+                &format!(
+                    "seed {seed}, case {index}, name {name:?} (held: {held}), attempt \
+                     {attempt} of {repeats}"
+                ),
+                &answered,
+            );
+            // After every one of them the name resolves nothing, which is what makes the
+            // next delete answer the same way.
+            let read = emulator.get_provider(&name).await;
+            assert_eq!(
+                (read.status, read.error_code(), read.message()),
+                (
+                    404,
+                    "ResourceNotFoundException".to_string(),
+                    not_found_message(&name)
+                ),
+                "seed {seed}, case {index}, name {name:?} (held: {held}), attempt {attempt}: \
+                 the deleted name resolves nothing, got {} ({})",
+                read.status,
+                read.body
+            );
+        }
+    }
+
+    let intact = emulator.get_provider(BYSTANDER).await;
+    assert_eq!(
+        intact.status, 200,
+        "seed {seed}: no generated delete reached the bystander provider, got {} ({})",
+        intact.status, intact.body
+    );
+    let secret = emulator.get_secret_value(&managed_secret_name(BYSTANDER)).await;
+    assert_eq!(
+        secret.status, 200,
+        "seed {seed}: the secret behind the bystander provider is left alone, got {} ({})",
         secret.status, secret.body
     );
 }

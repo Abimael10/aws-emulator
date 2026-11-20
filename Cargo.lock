@@ -10731,6 +10731,7 @@ dependencies = [
  "hex",
  "html-escape",
  "http",
+ "rand 0.9.5",
  "serde_json",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

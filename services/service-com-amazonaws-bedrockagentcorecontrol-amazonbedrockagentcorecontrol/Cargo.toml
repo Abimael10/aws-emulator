@@ -83,6 +83,9 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # references is one it really holds, sealed under a real KMS key.
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# Generates the credential-provider names the API-key-credential-provider deletion
+# suite drives its idempotence property over, from a seed it reports.
+rand = "0.9"
 
 [lints]
 workspace = true
