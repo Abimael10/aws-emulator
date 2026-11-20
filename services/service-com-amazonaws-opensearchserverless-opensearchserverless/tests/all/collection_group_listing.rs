@@ -13,7 +13,9 @@
 //!    record's own summary — the minted id, its ARN, its name, its creation instant, its
 //!    effective capacity limits, its generation, its storage configuration, and the number
 //!    of collections that name it, counted from the collections themselves — in one stable
-//!    order, and it carries no member `CollectionGroupSummary` does not model;
+//!    order, and it carries no member `CollectionGroupSummary` does not model; the storage
+//!    configuration is a function of the group's own stored generation alone, so no write
+//!    this service offers after the create moves what a row reports;
 //! 2. the page `maxResults` and `nextToken` select is a window on that one order: a page
 //!    holds at most `maxResults` rows (20 when the request names none), a `nextToken`
 //!    comes back exactly while rows remain after the page, and resuming with it walks the
@@ -30,7 +32,9 @@
 //! count and up to `maxResults`' own published maximum.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_opensearchserverless_opensearchserverless::state::SERVERLESS_GENERATION_CLASSIC;
+use service_com_amazonaws_opensearchserverless_opensearchserverless::state::{
+    SERVERLESS_GENERATION_CLASSIC, SERVERLESS_GENERATION_NEXTGEN,
+};
 
 use crate::collection_group_capacity::{expected_capacity_limits, expected_storage_configuration};
 use crate::collection_group_lifecycle::{batch_get, create_group, detail_at};
@@ -360,6 +364,196 @@ async fn every_listing_row_reports_the_storage_configuration_of_its_group() {
                 at(&read, "storageConfiguration"),
                 "case {case}: a listing row must report the group's storage mode exactly as a \
                  read of the same group does, got {row} beside {read}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 1, continued: the block a row reports is a function of the group's stored
+// generation alone, so no later write around the group moves it.
+// ---------------------------------------------------------------------------
+
+/// The one member `CollectionGroupStorageConfiguration` models
+/// (`smithy_query(query="shape", shape="CollectionGroupStorageConfiguration")`), so a
+/// reported block carries this key and no other.
+const STORAGE_CONFIGURATION_MEMBERS: [&str; 1] = ["v2Enabled"];
+
+/// A write this service offers around a stored collection group. None of them carries a
+/// `generation` member — `UpdateCollectionGroup` takes `id`, `description`,
+/// `capacityLimits` and `clientToken` (`smithy_query(query="operation",
+/// operation="UpdateCollectionGroup")`) — so none of them may move the group's storage
+/// stack.
+#[derive(Debug, Clone, Copy)]
+enum WriteAfterCreate {
+    /// Nothing written after the create: the base row of the table.
+    Nothing,
+    /// An update restating the description.
+    Description,
+    /// An update restating the capacity limits.
+    CapacityLimits,
+    /// A collection joining the group, so its `numberOfCollections` moves.
+    CollectionJoins,
+    /// The delete of a DIFFERENT group, so the store around this one changes.
+    AnotherGroupDeleted,
+}
+
+/// Apply `write` to the group `id`, named `name`.
+async fn write_after_create(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    write: WriteAfterCreate,
+    id: &str,
+    name: &str,
+) {
+    let request = match write {
+        WriteAfterCreate::Nothing => return,
+        WriteAfterCreate::Description => {
+            json!({ "id": id, "description": "written after the create" })
+        }
+        WriteAfterCreate::CapacityLimits => json!({
+            "id": id,
+            "capacityLimits": { "minSearchCapacityInOCU": 2.0, "maxSearchCapacityInOCU": 8.0 },
+        }),
+        WriteAfterCreate::CollectionJoins => {
+            create_collection_in(router, &format!("joined-{name}"), name).await;
+            return;
+        }
+        WriteAfterCreate::AnotherGroupDeleted => {
+            let doomed = create_group(
+                router,
+                "us-east-1",
+                json!({ "name": format!("doomed-{name}"), "standbyReplicas": "ENABLED" }),
+            )
+            .await;
+            let doomed = text(&doomed, "id");
+            let (status, code, answer) =
+                call(router, "DeleteCollectionGroup", json!({ "id": &doomed })).await;
+            assert_eq!(
+                status, 200,
+                "case DeleteCollectionGroup({doomed}): expected 200, got {status} {code} with {answer}"
+            );
+            return;
+        }
+    };
+    let case = request.to_string();
+    let (status, code, answer) = call(router, "UpdateCollectionGroup", request).await;
+    assert_eq!(
+        status, 200,
+        "case UpdateCollectionGroup({case}): expected 200, got {status} {code} with {answer}"
+    );
+}
+
+/// Every row the listing reports, walked a page at a time with `max_results`.
+async fn rows_with_bound(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    max_results: Option<i64>,
+) -> Vec<Value> {
+    let mut rows = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let (page, next) = list_page(router, max_results, token.as_deref()).await;
+        rows.extend(page);
+        match next {
+            Some(next) => token = Some(next),
+            None => return rows,
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_write_after_the_create_moves_the_storage_configuration_a_row_reports() {
+    let router = emulator();
+
+    // `ServerlessGeneration` is `CLASSIC | NEXTGEN` (`smithy_query(query="shape",
+    // shape="ServerlessGeneration")`); `None` is the omitted case, which stores the
+    // service default.
+    let generations: [Option<&str>; 3] = [
+        None,
+        Some(SERVERLESS_GENERATION_CLASSIC),
+        Some(SERVERLESS_GENERATION_NEXTGEN),
+    ];
+    let writes = [
+        WriteAfterCreate::Nothing,
+        WriteAfterCreate::Description,
+        WriteAfterCreate::CapacityLimits,
+        WriteAfterCreate::CollectionJoins,
+        WriteAfterCreate::AnotherGroupDeleted,
+    ];
+
+    // (id, stored generation, the write applied to it).
+    let mut stored: Vec<(String, String, WriteAfterCreate)> = Vec::new();
+    for (write_index, write) in writes.into_iter().enumerate() {
+        for (generation_index, requested) in generations.into_iter().enumerate() {
+            let name = format!("stack-group-{write_index}{generation_index}");
+            let mut request = json!({
+                "name": &name,
+                // Both `StandbyReplicas` members across the table, so a block that
+                // followed that setting instead of the generation would show up here.
+                "standbyReplicas": if generation_index % 2 == 0 { "ENABLED" } else { "DISABLED" },
+            });
+            if let Some(requested) = requested {
+                request["generation"] = json!(requested);
+            }
+            let detail = create_group(&router, "us-east-1", request).await;
+            let generation = requested.unwrap_or(SERVERLESS_GENERATION_CLASSIC).to_string();
+            let case = format!("the create of {name} ({generation}, then {write:?})");
+            assert_eq!(
+                at(&detail, "storageConfiguration"),
+                &expected_storage_configuration(&generation),
+                "case {case}: storageConfiguration must follow the stored generation, got {detail}"
+            );
+            write_after_create(&router, write, &text(&detail, "id"), &name).await;
+            stored.push((text(&detail, "id"), generation, write));
+        }
+    }
+
+    // The table covers a group on each storage stack, so the expectations below are not
+    // all the same row.
+    assert!(
+        stored
+            .iter()
+            .any(|(_, generation, _)| generation == SERVERLESS_GENERATION_NEXTGEN)
+            && stored
+                .iter()
+                .any(|(_, generation, _)| generation == SERVERLESS_GENERATION_CLASSIC),
+        "case the table: it must cover a group on each storage stack, got {stored:?}"
+    );
+
+    // After every one of those writes, each group's row still reports the block its own
+    // generation selects — wherever the paging puts the row — and never disagrees with a
+    // read of the same group.
+    for bound in [Some(1_i64), Some(4), Some(100), None] {
+        let rows = rows_with_bound(&router, bound).await;
+        for (id, generation, write) in &stored {
+            let case = format!("the row of {id} ({generation}) after {write:?}, maxResults={bound:?}");
+            let row = rows
+                .iter()
+                .find(|row| &text(row, "id") == id)
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert!(
+                row.get("storageConfiguration").is_some(),
+                "case {case}: every listing row carries a storageConfiguration block, got {row}"
+            );
+            assert_eq!(
+                at(&row, "storageConfiguration"),
+                &expected_storage_configuration(generation),
+                "case {case}: expected v2Enabled to follow the stored generation, got {row}"
+            );
+            let members: Vec<String> = at(&row, "storageConfiguration")
+                .as_object()
+                .map(|block| block.keys().cloned().collect())
+                .unwrap_or_default();
+            assert_eq!(
+                members, STORAGE_CONFIGURATION_MEMBERS,
+                "case {case}: the block carries exactly {STORAGE_CONFIGURATION_MEMBERS:?}, got {row}"
+            );
+            let read = detail_at(&batch_get(&router, "us-east-1", json!({ "ids": [id] })).await, 0);
+            assert_eq!(
+                at(&row, "storageConfiguration"),
+                at(&read, "storageConfiguration"),
+                "case {case}: a listing row and a read of the same group cannot disagree, \
+                 got {row} beside {read}"
             );
         }
     }
