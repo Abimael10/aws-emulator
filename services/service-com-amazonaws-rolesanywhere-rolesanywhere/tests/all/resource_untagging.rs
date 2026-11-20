@@ -740,3 +740,168 @@ async fn untag_resource_frees_room_under_the_per_resource_tag_quota() {
         "case \"over-the-list-bound\": a refused call must leave the stored set alone"
     );
 }
+
+/// One row of the lifecycle table: a write that changes something OTHER than the tags of
+/// the resource it addresses, so the tag set it leaves behind is the one the removal left.
+struct LifecycleWrite {
+    name: &'static str,
+    method: &'static str,
+    path: String,
+    body: Option<Value>,
+}
+
+/// The writes this service offers for a resource of `kind` besides the tag operations
+/// themselves, at the HTTP bindings `smithy_query(query="digest")` lists for them. Every
+/// row's partial update carries only `name`, which each of the three update inputs models
+/// as an optional `ResourceName` (`@pattern("^[ a-zA-Z0-9-_]*$")`).
+///
+/// A certificate revocation list has only its update here: `DisableCrl` and `EnableCrl`
+/// still answer 501 in this emulator, so they write nothing to assert against.
+fn lifecycle_writes(kind: Kind, id: &str) -> Vec<LifecycleWrite> {
+    let segment = match kind {
+        Kind::TrustAnchor => "trustanchor",
+        Kind::Profile => "profile",
+        Kind::Crl => "crl",
+    };
+    let mut writes = vec![LifecycleWrite {
+        name: "update",
+        method: "PATCH",
+        path: format!("/{segment}/{id}"),
+        body: Some(json!({"name": "renamed after untagging"})),
+    }];
+    if !matches!(kind, Kind::Crl) {
+        writes.push(LifecycleWrite {
+            name: "disable",
+            method: "POST",
+            path: format!("/{segment}/{id}/disable"),
+            body: None,
+        });
+        writes.push(LifecycleWrite {
+            name: "enable",
+            method: "POST",
+            path: format!("/{segment}/{id}/enable"),
+            body: None,
+        });
+    }
+    match kind {
+        // `NotificationEvent` is an enum of two values
+        // (`smithy_query(query="shape", shape="NotificationEvent")`); one is enough here,
+        // because the rule is about the tag set these writes must not touch.
+        Kind::TrustAnchor => {
+            writes.push(LifecycleWrite {
+                name: "put-notification-settings",
+                method: "PATCH",
+                path: "/put-notifications-settings".to_string(),
+                body: Some(json!({
+                    "trustAnchorId": id,
+                    "notificationSettings": [{"enabled": true, "event": "CA_CERTIFICATE_EXPIRY"}],
+                })),
+            });
+            writes.push(LifecycleWrite {
+                name: "reset-notification-settings",
+                method: "PATCH",
+                path: "/reset-notifications-settings".to_string(),
+                body: Some(json!({
+                    "trustAnchorId": id,
+                    "notificationSettingKeys": [{"event": "CA_CERTIFICATE_EXPIRY"}],
+                })),
+            });
+        }
+        // `CertificateField` is an enum too; one field with one mapping rule exercises the
+        // mapping writes without restating the mapping suite's own table.
+        Kind::Profile => writes.push(LifecycleWrite {
+            name: "put-attribute-mapping",
+            method: "PUT",
+            path: format!("/profiles/{id}/mappings"),
+            body: Some(json!({
+                "certificateField": "x509Subject",
+                "mappingRules": [{"specifier": "CN"}],
+            })),
+        }),
+        Kind::Crl => {}
+    }
+    writes
+}
+
+/// A removal is the resource's own state, not a projection taken over a create-time copy:
+/// every later write to the same resource leaves the removed keys removed, and a removed
+/// key is no tombstone — attaching it again stores it with its new value, and removing it
+/// again removes it. The rows span every taggable resource type of this service and each
+/// of the non-tag writes it offers for one.
+#[tokio::test]
+async fn a_removal_survives_the_resources_other_writes_and_is_not_a_tombstone() {
+    let client = Client::new();
+
+    for kind in [Kind::TrustAnchor, Kind::Profile, Kind::Crl] {
+        // Three create-time tags, two of which the removal below names: what is left is
+        // what every later read must report.
+        let held = pairs(&[("Environment", "first"), ("owner", "team"), ("kept", "value")]);
+        let surviving: BTreeMap<String, String> =
+            pairs(&[("kept", "value")]).into_iter().collect();
+        let arn = create_resource(
+            &client,
+            kind,
+            &format!("untag-across-writes-{}", kind.label()),
+            &held,
+        )
+        .await;
+        let id = arn.rsplit('/').next().unwrap_or_default().to_string();
+
+        let removed = client
+            .untag_resource(&arn, &keys(&["Environment", "owner"]))
+            .await;
+        assert_eq!(
+            removed.status,
+            200,
+            "case {:?}: expected UntagResource 200, got {removed:?}",
+            kind.label()
+        );
+
+        for write in lifecycle_writes(kind, &id) {
+            let case = format!("{}/{}", kind.label(), write.name);
+            let answer = client.send(write.method, &write.path, write.body).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected the write to answer 200, got {answer:?}"
+            );
+            let listed = client.list_tags(&arn).await;
+            assert_eq!(
+                listed_tags(&case, &listed),
+                surviving,
+                "case {case:?}: a write to the resource must not resurrect a removed key"
+            );
+        }
+
+        // The removed key is attachable again, with a different value than it first had.
+        let case = format!("{}/re-tagged", kind.label());
+        let retagged = client
+            .tag_resource(&arn, &pairs(&[("Environment", "second")]))
+            .await;
+        assert_eq!(
+            retagged.status, 201,
+            "case {case:?}: expected TagResource 201, got {retagged:?}"
+        );
+        let listed = client.list_tags(&arn).await;
+        assert_eq!(
+            listed_tags(&case, &listed),
+            pairs(&[("Environment", "second"), ("kept", "value")])
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+            "case {case:?}: a key removed earlier must be storable again with its new value"
+        );
+
+        // And removable again, leaving exactly the set that survived the first removal.
+        let case = format!("{}/removed-again", kind.label());
+        let removed_again = client.untag_resource(&arn, &keys(&["Environment"])).await;
+        assert_eq!(
+            removed_again.status, 200,
+            "case {case:?}: expected UntagResource 200, got {removed_again:?}"
+        );
+        let listed = client.list_tags(&arn).await;
+        assert_eq!(
+            listed_tags(&case, &listed),
+            surviving,
+            "case {case:?}: removing the re-attached key must leave the surviving set"
+        );
+    }
+}
